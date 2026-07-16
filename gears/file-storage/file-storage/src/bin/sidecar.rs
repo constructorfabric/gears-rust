@@ -562,6 +562,34 @@ async fn upload(
         // already ran, a transport failure, or no control plane configured)
         // is reported as `409` rather than `502` — see `upload`'s doc
         // comment for the full decision table.
+        //
+        // Why reporting *this* attempt's digest here cannot poison metadata:
+        // finalize never trusts the size/hash the sidecar reports, in this
+        // `!created` case or any other. `finalize_upload_by_token`
+        // (`domain/service/write.rs`) independently re-reads the actual
+        // stored blob at `version.backend_path` and recomputes both size and
+        // hash from those bytes (`read_back_and_hash_streaming`,
+        // `write.rs:757`), then rejects the request if that recomputed pair
+        // doesn't match what was reported (`write.rs`'s `actual_size !=
+        // size` / `actual_hash != hash_value` checks, immediately after the
+        // read-back). So there are exactly two possible outcomes here, and
+        // both are safe:
+        //   - this retry's bytes are identical to what's already published
+        //     (the common case: same client resending the same body) — the
+        //     reported digest matches the read-back digest, finalize
+        //     succeeds, and metadata reflects the one real object on disk;
+        //   - this retry's bytes differ from what's already published (an
+        //     adversarial or corrupted replay) — the reported digest does
+        //     NOT match the read-back digest of the *actual*, untouched
+        //     object, so finalize's own re-verification rejects it and the
+        //     version is never marked `available` from this call. The
+        //     version simply stays whatever it already was (`pending` or
+        //     `available` from the original successful publish); this
+        //     attempt cannot make it `available` with mismatched metadata.
+        // In neither case does the sidecar's self-reported digest get
+        // persisted unverified — `publish_exclusive` returning
+        // `created: false` only ever changes what gets *asserted* to
+        // finalize, never what finalize actually *trusts*.
         return if state.control_base_url.is_empty() || finalize_result.is_err() {
             (
                 StatusCode::CONFLICT,

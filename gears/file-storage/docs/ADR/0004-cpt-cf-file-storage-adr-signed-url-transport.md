@@ -164,7 +164,7 @@ codec, exactly like the PASETO path it stands in for, **MUST NOT** be used in an
 the provider behind it is swapped for a FIPS-validated module (or a FIPS-approved alternative such as ECDSA P-256 over
 a validated module) — which, because the codec is opaque and evolvable, requires no change to the token format, the
 claim-set, or the rest of this design, only to the provider implementation (and, for the PASETO migration itself, to
-the codec module tracked under Tier 4 item 4.9).
+the codec module — as noted above, no dedicated ticket exists in this repo yet).
 
 ### Claim-set evolution (P2 1.11, 2026-07)
 

@@ -1153,6 +1153,119 @@ async fn idempotency_same_key_returns_same_file() {
     assert_eq!(t1.version_id, t2.version_id);
 }
 
+/// Extract the `max_size` upload constraint from a signed `fs-token` URL.
+fn max_size_claim(url: &str, verifier: &file_storage::infra::signed_url::Verifier) -> Option<u64> {
+    let token_start = url.find("fs-token=").expect("fs-token in URL") + "fs-token=".len();
+    let token = &url[token_start..];
+    let now = time::OffsetDateTime::now_utc();
+    verifier
+        .verify(token, now)
+        .expect("token must verify")
+        .upload
+        .max_size
+}
+
+/// A replay must re-mint the signed upload URL under the CURRENT policy's
+/// `max_size`, not just re-validate MIME/metadata against it: the original
+/// ticket's `upload_url` was signed once, against whatever policy was in
+/// effect at the original `create_file` call. If an operator tightens the
+/// size limit afterward, a cached/retried request with the same
+/// `idempotency_key` must not still be able to hand out (or use) a token
+/// carrying the old, larger `max_size` claim for the rest of the
+/// idempotency TTL.
+///
+/// @cpt-cf-file-storage-fr-upload-idempotency
+/// @cpt-cf-file-storage-fr-size-limits-policy
+#[tokio::test]
+async fn idempotency_replay_reflects_tightened_size_policy() {
+    use file_storage::infra::signed_url::Issuer;
+
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let verifier = issuer.verifier();
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
+    let svc = Arc::new(FileService::new(
+        store,
+        backends,
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
+    ));
+    let psvc = PolicyService::new(policy_store, authorizer);
+
+    let ctx = ctx(Uuid::now_v7());
+
+    // Permissive policy at the time of the original create: 1 MiB cap.
+    psvc.set_policy(
+        &ctx,
+        PolicyScope::Tenant,
+        None,
+        PolicyBody {
+            size_limits: SizeLimits {
+                max_bytes: Some(1024 * 1024),
+                ..SizeLimits::default()
+            },
+            ..PolicyBody::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let nf = new_file();
+    let key = "size-policy-replay-key".to_owned();
+    let original = svc
+        .create_file(&ctx, nf.clone(), Some(key.clone()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        max_size_claim(&original.upload_url, &verifier),
+        Some(1024 * 1024),
+        "the original ticket's token must carry the permissive policy's max_size"
+    );
+
+    // Tighten the policy to 10 bytes, then replay with the same key.
+    psvc.set_policy(
+        &ctx,
+        PolicyScope::Tenant,
+        None,
+        PolicyBody {
+            size_limits: SizeLimits {
+                max_bytes: Some(10),
+                ..SizeLimits::default()
+            },
+            ..PolicyBody::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let replayed = svc.create_file(&ctx, nf, Some(key)).await.unwrap();
+    assert_eq!(replayed.file_id, original.file_id);
+    assert_eq!(replayed.version_id, original.version_id);
+
+    assert_eq!(
+        max_size_claim(&replayed.upload_url, &verifier),
+        Some(10),
+        "a replay must re-mint the upload URL against the CURRENT (tightened) policy's \
+         max_size, not silently replay the original ticket's now-stale, larger constraint"
+    );
+}
+
 // -- 4b. Idempotency replay body-match verification (P2 remediation 2.1) -----
 
 /// A retry with the same `idempotency_key` but a different `name` must be
@@ -3122,9 +3235,12 @@ async fn introspect_expired_session_returns_state_without_urls() {
     }
 }
 
-/// A resume `upload_url`'s token `exp` must be capped at the session's own
-/// remaining `expires_at`, never a fresh full TTL -- a resumed upload must
-/// not outlive the session it resumes.
+/// A resume `upload_url`'s token `exp` must never exceed the session's own
+/// remaining `expires_at` -- a resumed upload must not outlive the session
+/// it resumes. (Here `url_ttl_secs` and the session TTL are configured
+/// equal, so `min(session.expires_at, now + url_ttl_secs)` collapses to
+/// `session.expires_at`; see `initiate_session_expiry_uses_dedicated_session_ttl_not_url_ttl`
+/// below for the case where the URL-TTL cap actually bites.)
 ///
 /// @cpt-cf-file-storage-fr-multipart-upload
 #[tokio::test]
@@ -3361,10 +3477,13 @@ async fn initiate_rejects_declared_size_beyond_max_part_size_times_max_part_coun
 // per-part signed URLs keep using the short `url_ttl_secs`.
 
 /// (d) The session's persisted `expires_at` must reflect the dedicated
-/// session TTL, not the (much shorter) per-part signed-URL TTL -- and a
-/// resume token minted by `introspect` can legitimately carry an `exp`
-/// beyond `url_ttl_secs`, since it is capped at the session's own
-/// (long-lived) `expires_at` rather than a fresh short-TTL token.
+/// session TTL, not the (much shorter) per-part signed-URL TTL -- the
+/// *session* may legitimately outlive the URL TTL (that is the whole point
+/// of resume/introspect). But each individual resume token minted by
+/// `introspect` is still capped at `now + url_ttl_secs`, never handed the
+/// session's own long-lived `expires_at` -- otherwise an early resume URL
+/// would stay valid for the session's full lifetime (e.g. ~24h in
+/// production), defeating the short-URL-TTL design.
 #[tokio::test]
 async fn initiate_session_expiry_uses_dedicated_session_ttl_not_url_ttl() {
     let db = build_db().await;
@@ -3450,10 +3569,17 @@ async fn initiate_session_expiry_uses_dedicated_session_ttl_not_url_ttl() {
         plan.expires_at
     );
 
-    // Resume tokens are capped at the session's own expires_at, so an
-    // introspect call right after initiate can mint a resume URL whose `exp`
-    // is far beyond url_ttl_secs (60s) -- proving the session TTL, not the
-    // URL TTL, now governs resumability.
+    // The session outlives the URL TTL (asserted above): session.expires_at
+    // is ~3600s out while url_ttl_secs is only 60s. That must NOT let a
+    // resume token mint with the session's long-lived expiry -- each minted
+    // resume URL is still capped at `now + url_ttl_secs`.
+    assert!(
+        session.expires_at > time::OffsetDateTime::now_utc() + time::Duration::seconds(60),
+        "sanity check: the session must outlive the url_ttl_secs window for this test to be \
+         meaningful"
+    );
+
+    let introspect_started = time::OffsetDateTime::now_utc();
     let status = msvc
         .introspect_multipart_upload(&ctx, ticket.file_id, plan.upload_id)
         .await
@@ -3473,9 +3599,16 @@ async fn initiate_session_expiry_uses_dedicated_session_ttl_not_url_ttl() {
         .verify(token, time::OffsetDateTime::now_utc())
         .expect("resume token must verify");
     assert!(
-        claims.exp > (before + time::Duration::seconds(60)).unix_timestamp(),
-        "resume token exp ({}) can exceed default_url_ttl_secs (60s from initiate) because it is \
-         capped by the session's own long-lived expires_at instead",
+        claims.exp <= (introspect_started + time::Duration::seconds(60 + 5)).unix_timestamp(),
+        "resume token exp ({}) must be capped at now + url_ttl_secs (60s), not minted with the \
+         session's long-lived expires_at",
         claims.exp
+    );
+    assert!(
+        claims.exp < session.expires_at.unix_timestamp(),
+        "resume token exp ({}) must be strictly less than the session's own expires_at ({}) -- \
+         proving the URL TTL cap actually bites when it is much shorter than the session TTL",
+        claims.exp,
+        session.expires_at.unix_timestamp()
     );
 }

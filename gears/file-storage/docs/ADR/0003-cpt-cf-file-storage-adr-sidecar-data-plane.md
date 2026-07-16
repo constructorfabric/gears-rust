@@ -204,7 +204,13 @@ platform auth module's token revocation, not the URL layer.
   calls the same `FinalizeAuth::verify`). A durable fix (deriving the part
   hash from a sidecar-side value the control plane can independently trust,
   or re-hashing the assembled object) is future work, out of scope for this
-  remediation.
+  remediation. A related, separate gap sits in the same release gate:
+  `StorageBackend::publish_exclusive`'s default implementation
+  (`infra/backend/mod.rs`) is a non-atomic (TOCTOU) `exists`-then-`put`, and
+  `S3Backend` is still left on that default rather than an atomic
+  conditional-PUT override — closing it (e.g. an `If-None-Match: *`
+  conditional write mapped from S3's `412`) is required before S3 leaves its
+  ADR-0005 release gate, same as the part-hash trust gap above.
 * A new signed-URL contract (`cpt-cf-file-storage-fr-signed-urls`) and the constraint model become
   part of the public surface; the response-header set the sidecar must echo verbatim is baked into
   the signed URL.
