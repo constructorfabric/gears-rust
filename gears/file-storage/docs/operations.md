@@ -23,24 +23,38 @@ pass — see the file/line pointers in each entry.
 ## Control-plane config: `FileStorageConfig`
 
 All fields are `#[serde(default = "…")]`, so an operator's YAML only needs to override what it wants to change; a
-gear started with no `file-storage` config section at all gets every default below. `FileStorageConfig::validate()`
-(called at gear init, before anything is wired up) rejects two specific invalid combinations — noted inline.
+gear started with no `file-storage` config section at all gets every default below — **except that it still cannot
+actually boot**: `require_signing_key_seed` defaults to `true` with `signing_key_seed` unset, and
+`FileStorageConfig::validate()` fails gear init on exactly that combination (see `require_signing_key_seed` below).
+A genuinely zero-config deployment is dev/test-only (set `require_signing_key_seed: false` there).
+`FileStorageConfig::validate()` (called at gear init, before anything is wired up) currently rejects **seven**
+invalid configurations — three missing-secret/zero-interval guards (`sweep_interval_secs == 0` with the sweep
+enabled; `signing_key_seed` absent while required; `finalize_internal_secret` absent while required) and four
+cross-field ordering invariants (`default_url_ttl_secs` vs. `max_url_ttl_secs`; `default_page_size` vs.
+`max_page_size`; `default_url_ttl_secs` vs. `orphan_grace_secs`; `multipart_session_ttl_secs` vs.
+`default_url_ttl_secs`) — noted inline below. Function names (rather than line numbers) are used as source pointers
+throughout this table since line numbers drift with every edit.
 
 | Field | Default | Source |
 |---|---|---|
-| `default_url_ttl_secs` | `900` (15 min) | `default_default_url_ttl_secs()`, `config.rs:184` |
-| `max_url_ttl_secs` | `604800` (7 days) | `default_max_url_ttl_secs()`, `config.rs:190` |
-| `sidecar_base_url` | `"http://localhost:8087"` | `default_sidecar_base_url()`, `config.rs:195` |
-| `default_page_size` | `50` | `default_page_size()`, `config.rs:199` |
-| `max_page_size` | `1000` | `default_max_page_size()`, `config.rs:203` |
-| `storage_root` | `"./.file-storage-data"` | `default_storage_root()`, `config.rs:207` |
-| `signing_key_seed` | `None` (no `#[serde(default = …)]`, just `Option::default()`) | `config.rs:53-54` |
-| `require_signing_key_seed` | `true` | `default_require_signing_key_seed()`, `config.rs:227` |
-| `idempotency_ttl_secs` | `86400` (24h) | `default_idempotency_ttl_secs()`, `config.rs:211` |
-| `orphan_grace_secs` | `3600` (1h) | `default_orphan_grace_secs()`, `config.rs:215` |
-| `sweep_interval_secs` | `3600` (1h) | `default_sweep_interval_secs()`, `config.rs:219` |
-| `enable_background_sweep` | `true` | `default_enable_background_sweep()`, `config.rs:223` |
-| `enable_in_memory_backend` | `false` (bare `#[serde(default)]`) | `config.rs:106-107` |
+| `default_url_ttl_secs` | `900` (15 min) | `default_default_url_ttl_secs()` |
+| `max_url_ttl_secs` | `604800` (7 days) | `default_max_url_ttl_secs()` |
+| `multipart_session_ttl_secs` | `86400` (24h) | `default_multipart_session_ttl_secs()` |
+| `sidecar_base_url` | `"http://localhost:8087"` | `default_sidecar_base_url()` |
+| `default_page_size` | `50` | `default_page_size()` |
+| `max_page_size` | `1000` | `default_max_page_size()` |
+| `storage_root` | `"./.file-storage-data"` | `default_storage_root()` |
+| `signing_key_seed` | `None` (no `#[serde(default = …)]`, just `Option::default()`) | struct field default |
+| `require_signing_key_seed` | `true` | `default_require_signing_key_seed()` |
+| `idempotency_ttl_secs` | `86400` (24h) | `default_idempotency_ttl_secs()` |
+| `orphan_grace_secs` | `3600` (1h) | `default_orphan_grace_secs()` |
+| `sweep_interval_secs` | `3600` (1h) | `default_sweep_interval_secs()` |
+| `enable_background_sweep` | `true` | `default_enable_background_sweep()` |
+| `enable_in_memory_backend` | `false` (bare `#[serde(default)]`) | struct field default |
+| `s3_backends` | `[]` (empty, bare `#[serde(default)]`) | struct field default |
+| `default_backend_id` | `None` (bare `#[serde(default)]`) | struct field default |
+| `finalize_internal_secret` | `None` (bare `#[serde(default)]`) | struct field default |
+| `require_finalize_internal_secret` | `false` (bare `#[serde(default)]`) | struct field default |
 
 ### `default_url_ttl_secs`
 Default TTL (seconds) baked into every signed URL the control plane mints (`900` = 15 minutes), unless the caller's
@@ -72,8 +86,7 @@ Pagination defaults/ceiling for `GET /files` (and similar list endpoints) — `5
 **Production recommendation**: the defaults are reasonable starting points; raise `max_page_size` only if clients
 have a proven need for larger pages and the DB/latency budget supports it. **Misconfiguration risk**: a very large
 `max_page_size` lets a caller force an expensive, unbounded-feeling listing query; a `default_page_size` larger than
-`max_page_size` would be self-contradictory (not validated by `FileStorageConfig::validate()` — not asserted to be
-rejected at startup).
+`max_page_size` would be self-contradictory — `FileStorageConfig::validate()` rejects this combination at startup.
 
 ### `storage_root`
 Local filesystem root for the default `local-fs` backend (default `./.file-storage-data`, i.e. **relative to the
@@ -140,14 +153,46 @@ policy will appear to exist via `GET /retention-rules` but never actually delete
 grows without bound.
 
 ### `enable_in_memory_backend`
-When `true` (default `false`), an additional non-durable `memory` backend (`memory-fs` or similar id) is registered
-alongside the default `local-fs` backend. **Production recommendation**: leave at `false` in any deployment where
-data loss is unacceptable — the in-memory backend loses all content on restart. Its only legitimate use is
-dev/test scenarios that want a second backend id to exercise multi-backend code paths (e.g. `migrate_backend`)
-without provisioning real durable storage. **Misconfiguration risk**: enabling it in production, combined with a
-file or policy that routes content onto it, is **silent, guaranteed data loss** on the next restart — `migrate_backend`
-additionally requires the caller's `ADMIN_POLICY` authorization scope (not just `WRITE`) specifically to make this
-an explicit, elevated-privilege action rather than an accident.
+When `true` (default `false`), an additional non-durable backend registered under the id `memory` (`MEMORY_ID`,
+`gear.rs`) is registered alongside the default `local-fs` backend. **Production recommendation**: leave at `false`
+in any deployment where data loss is unacceptable — the in-memory backend loses all content on restart. Its only
+legitimate use is dev/test scenarios that want a second backend id to exercise multi-backend code paths (e.g.
+`migrate_backend`) without provisioning real durable storage. **Misconfiguration risk**: enabling it in production,
+combined with a file or policy that routes content onto it, is **silent, guaranteed data loss** on the next restart
+— `migrate_backend` additionally requires the caller's `ADMIN_POLICY` authorization scope (not just `WRITE`)
+specifically to make this an explicit, elevated-privilege action rather than an accident.
+
+### `s3_backends`
+Zero or more S3-compatible backends (`S3BackendConfig` entries: `id`, `endpoint`, `region`, `bucket`,
+`access_key_id`, `secret_access_key`, `path_style`) registered alongside `local-fs` (and `memory` if enabled). Empty
+by default — a deployment opts in explicitly. Each entry becomes one `S3Backend` in the registry, keyed by its own
+`id`; ids must be unique across the whole registry (`BackendRegistry::new` rejects a collision at startup).
+**Production recommendation**: omit `access_key_id`/`secret_access_key` and resolve credentials from the process
+environment (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) instead of embedding them in gear YAML.
+**Misconfiguration risk**: a bad endpoint or missing credentials with no env fallback fails gear init (fail-fast,
+not a runtime surprise).
+
+### `default_backend_id`
+Backend id `build_backend_registry` designates as the registry's default — the backend new `create`/
+`initiate_multipart` calls write to. `None` (the default) keeps `local-fs` as the default. Set this to one of
+`s3_backends`' configured ids to make that S3 backend the default instead. **Misconfiguration risk**: an id that
+does not name a registered backend surfaces as a fail-fast gear-init error, never a panic.
+
+### `finalize_internal_secret`
+Interim gear-local shared secret the s2s finalize/report-part callback routes additionally require, on top of the
+signed upload token, via the `x-fs-internal-token` request header. `None` (the default) preserves the token-only
+trust model. This is a stop-gap until the platform's `toolkit-security::internal_auth` profiles are deployable in
+this gear (see [ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)'s trust-model section).
+**Production recommendation**: set this to a strong shared secret and set the matching `FS_SIDECAR_INTERNAL_TOKEN`
+on every sidecar talking to this control plane, then flip `require_finalize_internal_secret` to `true`. Never
+logged (`FileStorageConfig`'s manual `Debug` impl redacts it).
+
+### `require_finalize_internal_secret`
+When `true`, gear init fails fast if `finalize_internal_secret` is absent instead of silently accepting the
+token-only trust model for the finalize/report-part callbacks. Mirrors `require_signing_key_seed`. Defaults to
+`false` so existing deployments — and any sidecar not yet redeployed with `FS_SIDECAR_INTERNAL_TOKEN` — keep
+working. **Production recommendation**: flip to `true` only after every sidecar talking to this control plane has
+been redeployed with the matching `FS_SIDECAR_INTERNAL_TOKEN` env var (see the migration-path note in the ADR).
 
 ## Sidecar config: `FS_SIDECAR_*` environment variables
 
@@ -163,6 +208,13 @@ share `FileStorageConfig`. All of these are read once in `main()`.
 | `FS_SIDECAR_MAX_BODY_BYTES` | `5368709120` (5 GiB) | Raises axum's blanket request-body floor (default 2 MiB) for the `PUT` route. This is a transport-layer ceiling only — the real per-request limit is the signed token's `max_size`/`exact_size` claim. **Misconfiguration risk**: setting it below the largest policy-permitted single-part upload causes legitimate uploads to be rejected at the transport layer before the token-level check even runs. |
 | `FS_SIDECAR_FINALIZE_TIMEOUT_SECS` | `10` | Total request timeout for the sidecar → control-plane finalize/report-part callbacks. |
 | `FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS` | `5` | Connect timeout for the same callbacks. Together with the timeout above, bounds how long a client's upload request can be held open by an unreachable or hung control plane (P2 remediation 1.5) — before this existed, a hung control plane could block the client indefinitely. **Misconfiguration risk**: too low in a high-latency network path causes spurious `502 Bad Gateway` responses to clients on otherwise-successful uploads; too high re-opens the "held open indefinitely" problem these timeouts exist to close. |
+| `FS_SIDECAR_INTERNAL_TOKEN` | unset (header omitted) | Interim shared secret sent as `x-fs-internal-token` on both the finalize and report-part control-plane callbacks — the sidecar's half of the control plane's `finalize_internal_secret`/`require_finalize_internal_secret` (see above). Unset/empty = the header is not sent, matching a control plane with the check disabled. Must match the control plane's configured secret once it flips `require_finalize_internal_secret` on. |
+| `FS_SIDECAR_S3_BACKENDS` | unset (no S3 backends) | Optional JSON array of `S3BackendConfig` entries (mirrors the control plane's `s3_backends`), folded into the sidecar's own `BackendRegistry` alongside the always-present `local-fs` backend so a control-plane-registered `S3Backend` is reachable by real traffic dispatched per-request via `claims.backend_id`. Credentials embedded in this JSON blob are acceptable for the sidecar (the one component authorized to hold them, per ADR-0003) but should be sourced from a secrets manager / mounted file in production where supported. |
+
+Every `FS_SIDECAR_*` numeric env var (`FS_SIDECAR_MAX_BODY_BYTES`, the two timeout vars) fails sidecar startup with a
+descriptive error if the value is *set but does not parse* (`parse_optional`/`parse_env_or_default`,
+`src/bin/sidecar.rs`) — it does **not** silently fall back to the default on a typo like
+`FS_SIDECAR_MAX_BODY_BYTES=5GB`. Only a genuinely unset variable uses the default.
 
 A failed finalize/report-part callback (after the sidecar's retry budget, see `post_with_retry` /
 `CALLBACK_MAX_ATTEMPTS` in `src/bin/sidecar.rs`) returns `502 Bad Gateway` to the client. The upload itself is
@@ -235,8 +287,10 @@ was designed for. No `QuotaClient` implementation exists to wire in — the Quot
 (`gears/system/quota-enforcement/`) is docs-only (PRD/DESIGN/ADRs, no Rust crate, no SDK). **Operators must not
 assume any storage limit is in effect** until this is wired.
 
-Content-hash modes (whole-object SHA-256; multipart offset-manifest) are a proposed future design — see
-[ADR-0006](./ADR/0006-cpt-cf-file-storage-adr-content-hash-modes.md); not implemented.
+Content-hash modes (whole-object SHA-256 for single-part uploads; a multipart offset-manifest composite SHA-256 for
+multipart uploads) are **shipped** — see [ADR-0006](./ADR/0006-cpt-cf-file-storage-adr-content-hash-modes.md) and
+`docs/features/content-hash-modes.md`. The `hash_mode`/`part_count` columns and the `version_hash_manifest` table
+were added by migration `m20260707_000001_content_hash_modes`.
 
 ## The `SignatureProvider` / `SignatureVerifier` abstraction
 

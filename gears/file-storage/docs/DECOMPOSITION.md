@@ -63,6 +63,18 @@ ADR-0006 ahead of its own implementation and has since shipped alongside the res
   `docs/DESIGN.md` §3.7 and the gear's migrations) — ownership-transfer and backend-migration introduce no new tables
   of their own, only new mutation paths over `files`/`file_versions`.
 
+**Deferred items** (carried over from the now-deleted temporary planning docs; re-audited against current code —
+everything else those docs once tracked as open has since shipped):
+
+- **`files.content_id → file_versions(version_id)` FK (`ON DELETE RESTRICT`)** — deliberately not implemented.
+  `files.content_id` has no DB-level foreign key today; the active protection is the predicate guard in
+  `VersionRepo::delete` (refuses to delete a row with `is_current = true`) plus `delete_version`'s
+  zero-rows-affected → conflict handling. A real FK is Postgres-only (SQLite cannot `ALTER TABLE … ADD CONSTRAINT`),
+  this gear's test suite runs entirely on SQLite (no Postgres-backed test harness in CI), and the FK would form a
+  circular reference with `file_versions.file_id → files ON DELETE CASCADE` that needs verification against a real
+  Postgres flow before shipping. The prerequisite unique index (`file_versions_version_id_unique_idx`, needed for a
+  single-column FK target) already exists (shipped with the ADR-0006 migration). Re-open once a Postgres-backed test
+  harness exists.
 
 ## 2. Entries
 

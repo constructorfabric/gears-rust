@@ -209,6 +209,35 @@ impl MultipartRepo {
         Ok(())
     }
 
+    /// Delete all `multipart_upload_parts` rows for `upload_id`. Returns the
+    /// number of rows removed.
+    ///
+    /// Part rows are otherwise unbounded growth: the session row itself is
+    /// never deleted (only its `state` column flips to `aborted`/`completed`),
+    /// and there is no DB-level cascade from a state flip to its part rows —
+    /// see [`crate::infra::storage::entity::multipart_upload_part`], which
+    /// defines no `Relation`. Called from the abort flow (both the
+    /// user-driven `DELETE .../multipart/{upload_id}` and the
+    /// orphan-reconciliation sweep's expired-session cleanup) per
+    /// `docs/features/multipart-coordinator.md`'s abort `DoD`
+    /// (`inst-abort-delete-parts`). Deliberately **not** called from
+    /// `complete_multipart_upload` -- the docs do not list part-row deletion
+    /// as part of `complete`'s contract.
+    pub async fn delete_parts_for_upload<C: DBRunner>(
+        &self,
+        conn: &C,
+        upload_id: Uuid,
+    ) -> Result<u64, DomainError> {
+        let res = PartEntity::delete_many()
+            .filter(PartColumn::UploadId.eq(upload_id))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected)
+    }
+
     /// List all parts for an upload, ordered by `part_number` ascending.
     pub async fn list_parts<C: DBRunner>(
         &self,

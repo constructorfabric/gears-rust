@@ -334,9 +334,16 @@ impl Store {
                         events_repo.enqueue(tx, &ev).await?;
                     }
                     // Persist the idempotency record in the same transaction, so
-                    // a committed create always has a replay record. A PK
-                    // conflict (concurrent duplicate) is tolerated inside the
-                    // repo; any real DB error rolls the whole creation back.
+                    // a committed create always has a replay record. Only a
+                    // *lapsed* row for the same key is deleted first inside the
+                    // repo (an expired row's PK would otherwise collide with a
+                    // legitimate new insert); a live-key PK conflict from a
+                    // concurrent duplicate create is NOT tolerated — every
+                    // failure, including that conflict, is propagated by
+                    // `IdempotencyRepo::insert` and rolls this whole creation
+                    // back, so the racing caller retries and replays the
+                    // winner's record via `get` instead of ending up with two
+                    // files (see `IdempotencyRepo::insert`'s doc comment).
                     if let Some(idem) = idempotency {
                         idempotency_repo.insert(tx, &idem, file_id, now).await?;
                     }

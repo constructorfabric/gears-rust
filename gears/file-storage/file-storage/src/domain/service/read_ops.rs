@@ -42,6 +42,19 @@ impl FileService {
         Ok((file, meta))
     }
 
+    /// Batched custom-metadata lookup for `list_files`'s page of results:
+    /// one `IN (...)` query for every file id in `file_ids` instead of one
+    /// `list_metadata` call per file (`GET /files` was previously built with
+    /// an empty `custom_metadata` on every item -- see `handlers::list_files`).
+    /// Authorization for each individual file was already established by the
+    /// `list_files` call that produced `file_ids`; this is a pure data fetch.
+    pub async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        self.store.list_metadata_for_files(file_ids).await
+    }
+
     /// List files for a mandatory owner filter, offset-paginated.
     pub async fn list_files(
         &self,

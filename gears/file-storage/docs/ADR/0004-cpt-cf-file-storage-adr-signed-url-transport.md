@@ -152,8 +152,8 @@ Contract below (only control and sidecar parse it), it is signed with Ed25519 ex
 control plane remains the sole minter with the sidecar verify-only — every property this ADR actually cares about
 (atomicity, opacity, asymmetric sign/verify, evolvability) holds. What differs is only the concrete codec (bespoke vs.
 the PASETO `v4.public` wire format) and the absence of `kid`-based key rotation. Migrating the codec to a literal
-PASETO `v4.public` library, and adding a `kid`/key-rotation story, is tracked as Tier 4 item 4.9 in the P2 remediation
-plan (`docs/IMPLEMENTATION_PLAN_TEMP.txt`).
+PASETO `v4.public` library, and adding a `kid`/key-rotation story, remains a tracked P3/Tier-4 follow-up; no
+dedicated ticket exists in this repo yet.
 
 **This does not relax the FIPS posture above.** Restating it for this codec: the bespoke format still signs with
 Ed25519 through the in-house `SignatureProvider`/`SignatureVerifier` abstraction (`Ed25519Provider`), not a hard-wired
