@@ -526,8 +526,11 @@ avoid leaving this unswept sibling behind.
   per-URL rate/connection cap; this remains an open design point (scoping to one `(file_id, op)` and cross-instance
   coordination across the sidecar fleet), not a shipped capability.
 - **Outside the token:** the `Range` header, conditional headers, and the `PUT` body are not part of the token — so one
-  signed URL serves many ranges, and body integrity is enforced by `max_size`/`expected_hash` during the stream + the
-  hash at bind.
+  signed URL serves many ranges, and body integrity is enforced by `max_size`/`expected_hash` during the stream plus a
+  control-plane re-verification at `finalize`, which re-reads the stored blob and recomputes its size/hash rather than
+  trusting the sidecar's report (single-part); a multipart upload instead derives the composite hash from the
+  reported per-part hashes at `finalize`. `bind` performs no integrity check of its own — it only swaps `content_id`
+  to point at an already-finalized (`Available`) version, guarded by the `If-Match` content-ETag precondition above.
 - **"Baked response headers" claim — NOT implemented.** The token carries only the two specific `content_type`/`etag`
   claims (download-only, above); there is no general response-header-set claim and the sidecar does not echo an
   arbitrary `Content-Disposition`/`Cache-Control`/etc. from the token. See "Response headers" below for what the
