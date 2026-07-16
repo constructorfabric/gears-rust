@@ -68,8 +68,13 @@ pub(crate) fn register_routes(
     .path_param("version_id", "Version UUID")
     .handler(handlers::finalize_version)
     .json_response(StatusCode::NO_CONTENT, "Version finalized")
+    // 400: the reported hash/size does not match what the sidecar observed
+    // (see handlers::finalize_version's mismatch check).
+    .error_400(openapi)
     .error_403(openapi)
     .error_404(openapi)
+    // 409: the version was already finalized (double-finalize callback).
+    .error_409(openapi)
     .error_500(openapi)
     .register(router, openapi);
 
@@ -97,8 +102,13 @@ pub(crate) fn register_routes(
     .path_param("part_number", "1-based part number")
     .handler(handlers::report_multipart_part)
     .json_response(StatusCode::NO_CONTENT, "Part reported")
+    // 400: malformed/wrong-length hash_hex, or a reported size that does not
+    // match the planned per-part size from the token.
+    .error_400(openapi)
     .error_403(openapi)
     .error_404(openapi)
+    // 409: the session is no longer `in_progress` (already completed/aborted/expired).
+    .error_409(openapi)
     .error_500(openapi)
     .register(router, openapi);
 
@@ -115,6 +125,8 @@ pub(crate) fn register_routes(
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
+        // 409: an idempotency key was reused with a different request body.
+        .error_409(openapi)
         .error_500(openapi)
         .register(router, openapi);
 
@@ -128,6 +140,8 @@ pub(crate) fn register_routes(
         .path_param("id", "File UUID")
         .handler(handlers::presign_version)
         .json_response_with_schema::<dto::UploadTicketDto>(openapi, StatusCode::OK, "Presigned")
+        // 400: the requested MIME type is rejected by the effective policy.
+        .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)

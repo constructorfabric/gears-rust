@@ -482,6 +482,97 @@ async fn list_files_filters_by_owner() {
     assert!(empty.is_empty());
 }
 
+/// `GET /files` (`handlers::list_files`) previously always built each list
+/// entry with an empty `custom_metadata` (`FileDto::from_parts(f, vec![])`),
+/// silently diverging from `GET /files/{id}`, which fetches the real rows.
+/// The fix batches one `list_metadata_for_files` call across the whole page
+/// (`FileService::list_metadata_for_files`) instead of returning an empty
+/// list. This test drives that same two-call sequence the handler uses --
+/// `list_files` then `list_metadata_for_files` over the returned ids -- and
+/// asserts every file's batched metadata matches what `get_file_with_metadata`
+/// (the known-correct single-file path) reports.
+#[tokio::test]
+async fn list_files_returns_each_files_custom_metadata() {
+    let (svc, _dp) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let owner = Uuid::now_v7();
+
+    let mut nf_a = new_file();
+    nf_a.owner_id = owner;
+    let file_a = svc.create_file(&ctx, nf_a, None).await.unwrap();
+    svc.update_metadata(
+        &ctx,
+        file_a.file_id,
+        CustomMetadataPatch {
+            entries: vec![("tag".to_owned(), Some("a-value".to_owned()))],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut nf_b = new_file();
+    nf_b.owner_id = owner;
+    let file_b = svc.create_file(&ctx, nf_b, None).await.unwrap();
+    svc.update_metadata(
+        &ctx,
+        file_b.file_id,
+        CustomMetadataPatch {
+            entries: vec![("tag".to_owned(), Some("b-value".to_owned()))],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    // A third file with no custom metadata at all (`new_file()` seeds one
+    // `tag` entry by default, so it's overridden to empty here) -- must
+    // simply be absent from the batched map (see `list_for_files`'s doc
+    // comment on "absent" vs. "empty"), not cause an error or an
+    // empty-but-present entry.
+    let mut nf_c = new_file();
+    nf_c.owner_id = owner;
+    nf_c.custom_metadata = vec![];
+    let file_c = svc.create_file(&ctx, nf_c, None).await.unwrap();
+
+    let owner_filter = OwnerFilter {
+        owner_kind: OwnerKind::User,
+        owner_id: owner,
+    };
+    let files = svc
+        .list_files(&ctx, owner_filter, Some(10), 0)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 3, "sanity: all three files listed");
+
+    let file_ids: Vec<Uuid> = files.iter().map(|f| f.file_id).collect();
+    let mut batched = svc.list_metadata_for_files(&file_ids).await.unwrap();
+    assert!(
+        !batched.contains_key(&file_c.file_id),
+        "a file with no custom metadata must have no entry in the batched map"
+    );
+
+    for file in &files {
+        let (_f, expected) = svc
+            .get_file_with_metadata(&ctx, file.file_id)
+            .await
+            .unwrap();
+        let expected_map: std::collections::BTreeMap<_, _> =
+            expected.into_iter().map(|e| (e.key, e.value)).collect();
+        let got_map: std::collections::BTreeMap<_, _> = batched
+            .remove(&file.file_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.key, e.value))
+            .collect();
+        assert_eq!(
+            got_map, expected_map,
+            "batched metadata for {} must match get_file_with_metadata's",
+            file.file_id
+        );
+    }
+}
+
 /// `GET /files/{id}/versions` must cap at `ServiceConfig::max_page_size` even
 /// when a file has more versions than that — both with no explicit `limit`
 /// (clamped to `max_page_size`) and with an explicit `limit` above

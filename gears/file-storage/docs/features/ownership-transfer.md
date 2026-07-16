@@ -111,9 +111,13 @@ owner changed but no audit trail exists for it, or vice versa.
 - The file's `owner_kind`/`owner_id` are atomically replaced; an audit row and
   a `file.owner_transferred` event are recorded in the same transaction; usage
   deltas are reported for the old and new owner; the caller receives the
-  updated `File` representation (captured metadata is read **before** the
-  transfer, since the caller may lose read access under the new owner
-  immediately afterward)
+  updated `File` representation, reflecting the new owner and bumped
+  `last_modified_at` — both the `File` row and its custom metadata are
+  captured **before** the transfer and the known post-transfer field changes
+  applied locally, rather than re-read from the DB afterward, since an
+  owner-constrained `AccessScope` captured before the swap would no longer
+  match the row under its new owner and a successful transfer would otherwise
+  incorrectly surface as `404`
 
 **Error Scenarios**:
 - `new_owner_id` is the nil UUID — `400` (`Validation`, field `new_owner_id`)
@@ -131,6 +135,8 @@ owner changed but no audit trail exists for it, or vice versa.
 3. [x] - `p1` - API: parse `new_owner_kind`; reject anything other than `"user"`/`"app"` with `400` - `inst-transfer-kind-parse`
 4. [x] - `p1` - Control plane: load the file scoped to the caller's tenant; authorize `WRITE` on `file_id` - `inst-transfer-authz`
 5. [x] - `p1` - Control plane: capture the file's custom metadata **before** the transfer, so a caller who loses read access under the new owner still receives accurate metadata in the response - `inst-transfer-capture-meta`
+
+   The `File` row itself is already held from step 4's prefetch; it is *not* re-read after the commit — the response is built by applying the known post-transfer field changes (`owner_kind`, `owner_id`, `last_modified_at`) to that pre-transfer row, avoiding a post-commit re-read under a now-stale, potentially owner-constrained `AccessScope`.
 6. [x] - `p1` - Build the `TransferOwnership` audit row and the `file.owner_transferred` file event, both carrying `from_owner_kind`/`from_owner_id`/`to_owner_kind`/`to_owner_id` - `inst-transfer-build-audit-event`
 7. [x] - `p1` - DB: `transfer_ownership_atomic` — in one transaction, `UPDATE files SET owner_kind, owner_id` scoped to the tenant + `file_id`, insert the audit row (only if the update matched a row), insert the event row; RETURN whether a row was updated - `inst-transfer-atomic-update`
 8. [x] - `p1` - **IF** no row was updated (file not found, or removed by a concurrent delete): RETURN `404 FileNotFound`, no audit row, no event - `inst-transfer-not-found`

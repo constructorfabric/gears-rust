@@ -17,7 +17,8 @@ use crate::infra::content::hash;
 use crate::infra::content::hash_mode::Manifest;
 
 use super::{
-    BackendCapabilities, MultipartCompletionPart, StorageBackend, build_manifest_and_root,
+    BackendCapabilities, MultipartCompletionPart, PublishOutcome, StorageBackend,
+    build_manifest_and_root,
 };
 
 /// In-progress multipart state per handle: (blob path, ordered parts).
@@ -100,6 +101,45 @@ impl StorageBackend for InMemoryBackend {
         let digest = hash::digest_to_array(hash::sha256(&buf));
         self.lock_blobs()?.insert(path.to_owned(), Bytes::from(buf));
         Ok((bytes_written, digest))
+    }
+
+    /// Create-exclusive publish (P2 remediation — replay-`PUT` overwrite
+    /// fix). The existence check and the insert happen under the same
+    /// `blobs` lock guard, so no concurrent `publish_exclusive`/`put` call
+    /// can interleave between them — unlike the trait's default TOCTOU
+    /// fallback. See [`StorageBackend::publish_exclusive`] for the full
+    /// contract.
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        mut stream: BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<PublishOutcome, DomainError> {
+        let mut buf = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| DomainError::backend(&self.id, e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+            if max_size.is_some_and(|m| buf.len() as u64 > m) {
+                return Err(DomainError::validation("size", "exceeds max_size"));
+            }
+        }
+        let bytes_written = buf.len() as u64;
+        let digest = hash::digest_to_array(hash::sha256(&buf));
+
+        let mut blobs = self.lock_blobs()?;
+        if blobs.contains_key(path) {
+            return Ok(PublishOutcome {
+                bytes_written,
+                digest,
+                created: false,
+            });
+        }
+        blobs.insert(path.to_owned(), Bytes::from(buf));
+        Ok(PublishOutcome {
+            bytes_written,
+            digest,
+            created: true,
+        })
     }
 
     async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
