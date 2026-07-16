@@ -222,6 +222,13 @@ impl FileService {
                     &version.mime_type,
                     backend.capabilities().max_size_bytes,
                 );
+                // Quota preflight on replay too: re-minting the upload URL
+                // grants a fresh, usable storage capability, so it must clear
+                // the CURRENT quota exactly like the fresh-create path below.
+                // Otherwise a quota exhausted after the original create could
+                // still be bypassed by replaying the idempotency key.
+                self.check_quota(tenant_id, owner_id, effective_max, "create_file")
+                    .await?;
                 let upload_url = self.sign_url(
                     Op::Put,
                     &VersionRef {

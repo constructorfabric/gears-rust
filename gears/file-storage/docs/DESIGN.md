@@ -347,7 +347,7 @@ tooling is a P3 deliverable (`cpt-cf-file-storage-fr-runtime-backends`).
 | `ByteRange`           | Parsed `Range` request: `Inclusive(start, end)`, `OpenEnded(start)`, `Suffix(length)`                                                       |
 | `HashPolicy`          | **Not implemented.** No `HashPolicy`/`hash_policy` config surface exists in code (P1/P2 hash algorithm is hard-coded SHA-256; see ADR-0006 for the two shipped `hash_mode`s instead) |
 | `BackendCapabilities` | Per-backend feature flags: `multipart_native`, `encryption_native`, `range_native`, `presigned_url_internal` (no `versioning_native` — versioning is FS-level) |
-| `BackendConfig`       | Declared instance: `id`, `kind`, `endpoint`, `credentials`, `capabilities`, `hash_policy`. Loaded from the platform gear YAML config in P1 (control plane); the sidecar loads its own equivalent set from `FS_SIDECAR_*` env vars |
+| `BackendConfig`       | Declared instance: `id`, `kind`, `endpoint`, `credentials`, `capabilities` (no `hash_policy` — that surface is not implemented, see above). Loaded from the platform gear YAML config in P1 (control plane); the sidecar loads its own equivalent set from `FS_SIDECAR_*` env vars |
 
 **Relationships**:
 
@@ -1289,7 +1289,7 @@ in P2 (`cpt-cf-file-storage-fr-metadata-limits`); in P1 only sanity limits apply
 | Table                              | Phase | Purpose                                                                                  | Forward reference                                                |
 |------------------------------------|-------|------------------------------------------------------------------------------------------|------------------------------------------------------------------|
 | `multipart_uploads`                | P2    | In-flight multipart sessions: `upload_id`, `file_id`, parts list with per-part hashes    | `cpt-cf-file-storage-fr-multipart-upload`                        |
-| `multipart_upload_parts`           | P2    | One row per uploaded part: `backend_etag`/offset, `size`, `part_hash` (SHA-256 of the part's bytes, computed on-the-fly; persisted but not read back at `complete` — see ADR-0006 for a proposed manifest-building use) | `cpt-cf-file-storage-fr-multipart-upload`                        |
+| `multipart_upload_parts`           | P2    | One row per uploaded part: `backend_etag`/offset, `size`, `part_hash` (SHA-256 of the part's bytes, computed on-the-fly; folded into the offset-manifest composite at `complete`, no re-read — ADR-0006, shipped) | `cpt-cf-file-storage-fr-multipart-upload`                        |
 | `idempotency_keys`                 | P2    | Owner-scoped idempotency for uploads                                                      | `cpt-cf-file-storage-fr-upload-idempotency`                      |
 | `audit_outbox`                     | P2    | Transactional-outbox rows drained by `audit-publisher` to the audit sink                 | `cpt-cf-file-storage-fr-audit-trail`                             |
 | `events_outbox`                    | P2    | Outbox for EventBroker file-write events                                                 | `cpt-cf-file-storage-fr-file-events`                             |
@@ -1873,9 +1873,11 @@ resumes** without re-uploading what already landed. Same hosts as §4.6. The stu
        { "part": 4, "offset": 201326592, "size": 67108864, "url": ".../parts/4?fs-token=v4.public...cccp4D" },
        { "part": 5, "offset": 268435456, "size": 67108864, "url": ".../parts/5?fs-token=v4.public...cccp5E" } ] }
    ```
-   Each part URL carries a PASETO token exactly like §4.5: an `op=part` claim, the `file_id`/`upload_id`/part number in
-   the **path** (`/files/9c2a4f10/multipart/u7f1b2c3/parts/3`), and a short `exp` (here ~1 hour). The parts complete
-   via a SHA-256 re-hash of the assembled object (§4.2); an offset-manifest mode is proposed in ADR-0006.
+   Each part URL carries a signed token exactly like §4.5: an `op=part` claim, the `file_id`/`upload_id`/part number in
+   the **path** (`/files/9c2a4f10/multipart/u7f1b2c3/parts/3`), and a short `exp` (here ~1 hour). At `complete` the
+   control plane folds the persisted per-part SHA-256 digests and offsets into a canonical offset-manifest and stores
+   `root = sha256(manifest)` — no re-read or re-hash of the assembled object (the shipped multipart-composite mode,
+   ADR-0006; see §4.2).
 
 #### Phase B — Upload parts (with durable per-part state)
 
