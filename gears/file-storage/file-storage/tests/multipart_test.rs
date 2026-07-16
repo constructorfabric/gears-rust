@@ -554,6 +554,119 @@ async fn multipart_complete_after_already_finalized_is_rejected() {
     );
 }
 
+// -- 1b. abort deletes part rows (P2 remediation) -----------------------------
+
+/// `DELETE /files/{id}/multipart/{upload_id}` must delete the session's
+/// `multipart_upload_parts` rows (`docs/features/multipart-coordinator.md`'s
+/// abort DoD, `inst-abort-delete-parts`), in addition to aborting the backend
+/// handle and deleting the pending version row. Before this fix,
+/// `MultipartService::abort_multipart_upload` never deleted part rows at
+/// all -- they accumulated forever, since the session row itself is never
+/// deleted (only its `state` column flips to `aborted`).
+///
+/// @cpt-cf-file-storage-fr-multipart-upload
+#[tokio::test]
+async fn abort_multipart_upload_deletes_part_rows_and_pending_version() {
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
+    ));
+    let msvc = Arc::new(MultipartService::new(
+        Arc::clone(&multipart_store),
+        backends,
+        Arc::clone(&authorizer),
+        None,
+        issuer,
+        "http://sidecar.test".to_owned(),
+        3600,
+    ));
+    let ctx = ctx(Uuid::now_v7());
+
+    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let declared_size = 13u64;
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            declared_size,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let session = multipart_store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session must exist");
+    let backend_path = format!("/{}/{}", ticket.file_id, plan.version_id);
+    simulate_sidecar_put_part(
+        &multipart_store,
+        &backend,
+        &plan,
+        &backend_path,
+        &session.backend_upload_handle,
+        1,
+        Bytes::from_static(b"Hello, World!"),
+    )
+    .await;
+
+    // Sanity: the part row exists before abort.
+    let parts_before = store.list_multipart_parts(plan.upload_id).await.unwrap();
+    assert_eq!(parts_before.len(), 1, "part row must exist before abort");
+
+    msvc.abort_multipart_upload(&ctx, ticket.file_id, plan.upload_id)
+        .await
+        .unwrap();
+
+    // Part rows must be gone.
+    let parts_after = store.list_multipart_parts(plan.upload_id).await.unwrap();
+    assert!(
+        parts_after.is_empty(),
+        "abort must delete multipart_upload_parts rows, found {parts_after:?}"
+    );
+
+    // The pending version row must also be gone (pre-existing behavior,
+    // unchanged by this fix).
+    let version = store
+        .get_version(ticket.file_id, plan.version_id)
+        .await
+        .unwrap();
+    assert!(
+        version.is_none(),
+        "abort must delete the pending version row"
+    );
+
+    // The session must be marked aborted (row retained, not deleted).
+    let session_after = store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("the session row itself is aborted, not deleted");
+    assert_eq!(session_after.state, MultipartUploadState::Aborted);
+}
+
 // -- 1c. multipart-complete MIME validation (P2 remediation item 1.10) -------
 
 /// Minimal JPEG signature (`infer` recognizes `image/jpeg` from these leading
@@ -1917,6 +2030,142 @@ async fn report_part_rejects_forged_size() {
     );
 }
 
+/// Integrity remediation (Bug 2): `finalize_version` already rejects a hash
+/// that does not decode to exactly 32 bytes (SHA-256); `report_multipart_part`
+/// must mirror that check instead of hex-decoding and persisting whatever
+/// length was reported. Before this fix a wrong-length hash got a `204` here
+/// and only surfaced later as an opaque `400` at `complete` — against the
+/// wrong actor (whoever calls `complete`, not the caller that reported the
+/// bad hash).
+///
+/// @cpt-cf-file-storage-fr-multipart-upload
+#[tokio::test]
+async fn report_part_rejects_short_hash() {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use sea_orm::EntityTrait;
+    use toolkit_db::secure::SecureEntityExt;
+    use toolkit_security::AccessScope;
+    use tower::ServiceExt;
+
+    use file_storage::api::rest::handlers;
+    use file_storage::infra::signed_url::Verifier;
+    use file_storage::infra::storage::entity::multipart_upload_part;
+
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let verifier: Arc<Verifier> = Arc::new(issuer.verifier());
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
+    ));
+    let msvc = Arc::new(MultipartService::new(
+        Arc::new(store.clone()) as Arc<dyn MultipartStore>,
+        backends,
+        authorizer,
+        None,
+        Arc::clone(&issuer),
+        "http://sidecar.test".to_owned(),
+        3600,
+    ));
+
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+
+    let declared_size: u64 = 100;
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            declared_size,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.parts.len(),
+        1,
+        "small declared_size must plan one part"
+    );
+    let part = &plan.parts[0];
+    let planned_size = i64::try_from(part.size).unwrap();
+
+    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None));
+
+    let router = Router::new()
+        .route(
+            "/api/file-storage/v1/files/{file_id}/versions/{version_id}/multipart/{upload_id}/parts/{part_number}/report",
+            post(handlers::report_multipart_part),
+        )
+        .layer(axum::Extension(Arc::clone(&verifier)))
+        .layer(axum::Extension(finalize_auth))
+        .layer(axum::Extension(Arc::clone(&msvc)));
+
+    let token_start =
+        part.upload_url.find("fs-token=").expect("fs-token in URL") + "fs-token=".len();
+    let token = &part.upload_url[token_start..];
+
+    // A 16-byte hash (half of a valid SHA-256 digest), correctly hex-encoded
+    // but the wrong length.
+    let body = serde_json::json!({
+        "backend_etag": "some-etag",
+        "hash_hex": hex::encode([7u8; 16]),
+        "size": planned_size,
+    });
+    let uri = format!(
+        "/api/file-storage/v1/files/{}/versions/{}/multipart/{}/parts/{}/report",
+        ticket.file_id, plan.version_id, plan.upload_id, part.part_number
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-fs-token", token)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = router.clone().oneshot(req).await.expect("router dispatch");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a wrong-length (16-byte) hash must be rejected at report-part, not accepted"
+    );
+
+    // No part row must have been persisted for the rejected report.
+    let conn = db.conn().expect("conn");
+    let rows = multipart_upload_part::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .all(&conn)
+        .await
+        .expect("query multipart_upload_parts directly");
+    assert!(
+        rows.is_empty(),
+        "a rejected wrong-length-hash report must not persist any part row"
+    );
+}
+
 // -- 11. Table-driven: multipart accept/reject tracks backend capability ----
 
 /// Table-driven per P2 0.2: a `local-fs`-only registry rejects initiate
@@ -2967,5 +3216,266 @@ async fn introspect_resume_urls_expire_with_session() {
         "resume token exp ({}) must not exceed the session's own expires_at ({})",
         claims.exp,
         session.expires_at.unix_timestamp()
+    );
+}
+
+// -- 9. MAX_PART_COUNT ceiling at initiate (authenticated-DoS remediation) ---
+//
+// Before this remediation, `MultipartService::initiate_multipart_upload`
+// validated only `preferred_part_size`, leaving `declared_size` unbounded
+// whenever no size-limit policy exists (the default). `compute_plan` then
+// did `Vec::with_capacity(n_parts)` for a `declared_size`-proportional
+// `n_parts` -- an absurd `declared_size` (e.g. `u64::MAX`) drove a ~84 TB
+// allocation attempt (process abort), and any survivable-but-still-huge
+// `declared_size` minted one signed URL per part with no ceiling at all,
+// well past what any backend (S3 caps at 10,000) can actually accept.
+
+/// (a) An absurd `declared_size` (`u64::MAX`) must be rejected quickly with
+/// a `400`-class (`DomainError::Validation`) error -- never drive a giant
+/// allocation or hang the request.
+#[tokio::test]
+async fn initiate_multipart_rejects_absurd_declared_size_quickly() {
+    let (svc, msvc, _dp) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let err = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            u64::MAX,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(err, DomainError::Validation { .. }),
+        "expected Validation for an absurd declared_size, got {err:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "rejecting an absurd declared_size must be fast, not attempt a huge allocation; took \
+         {elapsed:?}"
+    );
+}
+
+/// (b) A `declared_size` that would need more parts than `MAX_PART_COUNT` at
+/// the default part size must not be rejected outright -- the server widens
+/// `part_size` (never past `MAX_PART_SIZE`) so the plan fits within
+/// `MAX_PART_COUNT` parts, and every part still gets a valid signed URL.
+#[tokio::test]
+async fn initiate_widens_part_size_to_stay_within_max_part_count() {
+    use file_storage::domain::multipart::{DEFAULT_MIN_PART_SIZE, MAX_PART_SIZE};
+
+    let (svc, msvc, _dp) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+
+    // Just over MAX_PART_COUNT (10_000) parts at the default part size.
+    let declared_size = 10_001 * DEFAULT_MIN_PART_SIZE;
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            declared_size,
+            None, // preferred_part_size: falls back to DEFAULT_MIN_PART_SIZE
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        plan.part_size > DEFAULT_MIN_PART_SIZE,
+        "part_size must be widened above the default, got {}",
+        plan.part_size
+    );
+    assert!(
+        plan.part_size <= MAX_PART_SIZE,
+        "widened part_size must never exceed MAX_PART_SIZE, got {}",
+        plan.part_size
+    );
+    assert!(
+        plan.parts.len() <= 10_000,
+        "plan must fit within MAX_PART_COUNT parts, got {}",
+        plan.parts.len()
+    );
+    let total: u64 = plan.parts.iter().map(|p| p.size).sum();
+    assert_eq!(
+        total, declared_size,
+        "sum of part sizes must still equal declared_size after widening"
+    );
+    for p in &plan.parts {
+        assert!(
+            !p.upload_url.is_empty(),
+            "every widened part still needs a valid upload_url"
+        );
+    }
+}
+
+/// (c) A `declared_size` beyond `MAX_PART_SIZE * MAX_PART_COUNT` cannot be
+/// widened away -- there is no legal part size that keeps it within
+/// `MAX_PART_COUNT` parts, so it must be rejected with a clear `400`-class
+/// error rather than minting a plan that exceeds the ceiling.
+#[tokio::test]
+async fn initiate_rejects_declared_size_beyond_max_part_size_times_max_part_count() {
+    use file_storage::domain::multipart::MAX_PART_SIZE;
+
+    let (svc, msvc, _dp) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+
+    let declared_size = MAX_PART_SIZE * 10_000 + 1;
+    let err = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            declared_size,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, DomainError::Validation { .. }),
+        "expected Validation: size too large for multipart on this backend, got {err:?}"
+    );
+}
+
+// -- 10. Multipart session TTL is decoupled from the per-part URL TTL -------
+//
+// Before this remediation, the session `expires_at` was hard-wired to
+// `default_url_ttl_secs` (the short per-part signed-URL TTL, e.g. 15 min),
+// capping every multipart upload's total time budget at that same short
+// window regardless of upload size -- self-defeating for the very
+// large-upload use case multipart exists for. `MultipartService` now takes a
+// separate `session_ttl_secs` (wired from the new `multipart_session_ttl_secs`
+// config key in a real deployment via `with_session_ttl_secs`), while
+// per-part signed URLs keep using the short `url_ttl_secs`.
+
+/// (d) The session's persisted `expires_at` must reflect the dedicated
+/// session TTL, not the (much shorter) per-part signed-URL TTL -- and a
+/// resume token minted by `introspect` can legitimately carry an `exp`
+/// beyond `url_ttl_secs`, since it is capped at the session's own
+/// (long-lived) `expires_at` rather than a fresh short-TTL token.
+#[tokio::test]
+async fn initiate_session_expiry_uses_dedicated_session_ttl_not_url_ttl() {
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(100_000).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 60, // short per-part URL TTL
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = Arc::new(FileService::new(
+        store,
+        backends.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
+    ));
+    // url_ttl_secs = 60s (per-part URLs), session_ttl_secs = 3600s (60x
+    // longer) -- mirrors gear.rs wiring `default_url_ttl_secs` vs the
+    // dedicated `multipart_session_ttl_secs`.
+    let msvc = Arc::new(
+        MultipartService::new(
+            Arc::clone(&multipart_store),
+            backends,
+            Arc::clone(&authorizer),
+            None,
+            Arc::clone(&issuer),
+            "http://sidecar.test".to_owned(),
+            60,
+        )
+        .with_session_ttl_secs(3600),
+    );
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+
+    let before = time::OffsetDateTime::now_utc();
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            13,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let after = time::OffsetDateTime::now_utc();
+
+    // The plan's own `expires_at` (per-part URL expiry) must reflect the
+    // short url_ttl_secs, not the session TTL.
+    assert!(
+        plan.expires_at <= after + time::Duration::seconds(60 + 5),
+        "plan.expires_at must use the short url_ttl_secs, got {} (now ~ {after})",
+        plan.expires_at
+    );
+
+    // The persisted session row must use the much longer session_ttl_secs.
+    let session = multipart_store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session must exist");
+    assert!(
+        session.expires_at >= before + time::Duration::seconds(3600 - 5),
+        "session.expires_at must be ~ now + session_ttl_secs (3600s), got {} (initiated ~ \
+         {before})",
+        session.expires_at
+    );
+    assert!(
+        session.expires_at > plan.expires_at,
+        "the session must outlive its own first batch of per-part URLs: session {} vs plan {}",
+        session.expires_at,
+        plan.expires_at
+    );
+
+    // Resume tokens are capped at the session's own expires_at, so an
+    // introspect call right after initiate can mint a resume URL whose `exp`
+    // is far beyond url_ttl_secs (60s) -- proving the session TTL, not the
+    // URL TTL, now governs resumability.
+    let status = msvc
+        .introspect_multipart_upload(&ctx, ticket.file_id, plan.upload_id)
+        .await
+        .unwrap();
+    let missing = status
+        .missing
+        .first()
+        .expect("single-part upload has exactly one missing part");
+    let upload_url = missing
+        .upload_url
+        .as_deref()
+        .expect("a live session must mint a resume URL");
+    let token_start = upload_url.find("fs-token=").expect("fs-token in URL") + "fs-token=".len();
+    let token = &upload_url[token_start..];
+    let verifier = issuer.verifier();
+    let claims = verifier
+        .verify(token, time::OffsetDateTime::now_utc())
+        .expect("resume token must verify");
+    assert!(
+        claims.exp > (before + time::Duration::seconds(60)).unix_timestamp(),
+        "resume token exp ({}) can exceed default_url_ttl_secs (60s from initiate) because it is \
+         capped by the session's own long-lived expires_at instead",
+        claims.exp
     );
 }

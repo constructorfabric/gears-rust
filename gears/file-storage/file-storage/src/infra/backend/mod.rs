@@ -71,6 +71,23 @@ pub(crate) fn build_manifest_and_root(
     // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-return
 }
 
+/// Result of [`StorageBackend::publish_exclusive`]: the measured size/digest
+/// of the stream that was just read, plus whether the write actually landed.
+///
+/// `created: true` means `path` held nothing before this call and now holds
+/// exactly the streamed bytes. `created: false` means `path` already held a
+/// blob and this call left it untouched — the destination was **never**
+/// overwritten. `bytes_written`/`digest` are always populated (describing
+/// *this* attempt's bytes) even when `created` is `false`, so a caller can
+/// still run a server-side idempotency check (e.g. the sidecar's finalize
+/// callback) without a second read of the backend.
+#[derive(Debug, Clone, Copy)]
+pub struct PublishOutcome {
+    pub bytes_written: u64,
+    pub digest: [u8; 32],
+    pub created: bool,
+}
+
 /// Optional features a backend may declare
 /// (`cpt-cf-file-storage-fr-backend-capabilities`). Versioning is **not** here —
 /// it is implemented at the `FileStorage` level on every backend.
@@ -142,6 +159,78 @@ pub trait StorageBackend: Send + Sync {
             crate::infra::content::hash::digest_to_array(crate::infra::content::hash::sha256(&buf));
         self.put(path, Bytes::from(buf)).await?;
         Ok((bytes_written, digest))
+    }
+
+    /// Publish a blob at `path`, but **only if nothing is stored there yet**
+    /// (create-exclusive semantics) — unlike [`Self::put_stream`], which is
+    /// documented as overwrite-allowed and stays that way for its existing
+    /// callers (per-part multipart writes, which are deliberately
+    /// overwrite-safe for resume; `migrate_backend`'s write to a fresh
+    /// backend). This method exists for exactly one call site: the sidecar's
+    /// single-shot upload handler, publishing a version's *final*, canonical
+    /// object at `/{file_id}/{version_id}`.
+    ///
+    /// # Why this must not just overwrite (P2 remediation — replay-`PUT` fix)
+    /// A `PUT` token's signature covers `op`/`file_id`/`version_id`/size/hash
+    /// *constraints*, never the body bytes (DESIGN.md, ADR-0003), and stays
+    /// valid until `exp`. Once a version has been finalized and bound as a
+    /// file's live content, a holder of that same still-unexpired token could
+    /// otherwise re-`PUT` different bytes to the same backend path and
+    /// silently replace the live, already-served content out from under the
+    /// recorded size/hash/`ETag`/MIME — a HIGH-severity immutability break,
+    /// not the merely-orphans-a-version consequence the design previously
+    /// assumed. Making this call create-exclusive closes that: only the
+    /// *first* write to a given path ever lands; every subsequent attempt
+    /// observes `created: false` and the existing bytes are provably
+    /// untouched.
+    ///
+    /// The default implementation is a non-atomic (TOCTOU) `exists` check
+    /// followed by `put` — good enough for a backend with no cheaper atomic
+    /// primitive, but a real race window exists between the check and the
+    /// write. [`LocalFsBackend`](super::LocalFsBackend) (`std::fs::hard_link`,
+    /// which atomically fails with `AlreadyExists` if the target already has
+    /// a directory entry) and [`InMemoryBackend`](super::InMemoryBackend)
+    /// (a single mutex guards both the check and the insert) both override
+    /// this with a truly atomic implementation. `S3Backend` is left on this
+    /// default fallback (out of scope for this remediation — see its own
+    /// module doc for the ADR-0005 merge gate).
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<PublishOutcome, DomainError> {
+        use futures::StreamExt;
+
+        let mut buf = Vec::new();
+        let mut stream = stream;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| DomainError::backend(self.id(), e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+            if max_size.is_some_and(|m| buf.len() as u64 > m) {
+                return Err(DomainError::validation("size", "exceeds max_size"));
+            }
+        }
+        let bytes_written = buf.len() as u64;
+        let digest =
+            crate::infra::content::hash::digest_to_array(crate::infra::content::hash::sha256(&buf));
+
+        // Non-atomic check-then-act: see this method's doc comment for the
+        // race this fallback accepts as the price of a backend-agnostic
+        // default.
+        if self.exists(path).await? {
+            return Ok(PublishOutcome {
+                bytes_written,
+                digest,
+                created: false,
+            });
+        }
+        self.put(path, Bytes::from(buf)).await?;
+        Ok(PublishOutcome {
+            bytes_written,
+            digest,
+            created: true,
+        })
     }
 
     /// Read the whole blob at `path`.

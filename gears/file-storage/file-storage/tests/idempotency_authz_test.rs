@@ -29,6 +29,9 @@ use uuid::Uuid;
 
 use file_storage::domain::authz::{Authorizer, actions};
 use file_storage::domain::error::DomainError;
+use file_storage::domain::policy::{PolicyBody, PolicyScope};
+use file_storage::domain::policy_service::PolicyService;
+use file_storage::domain::ports::PolicyStore;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::signed_url::Issuer;
@@ -112,6 +115,7 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
 
 struct Harness {
     file_svc: Arc<FileService>,
+    policy_svc: Arc<PolicyService>,
     authz: Arc<ScopedTestAuthorizer>,
 }
 
@@ -130,10 +134,22 @@ async fn build_harness() -> Harness {
         idempotency_ttl_secs: 86400,
     };
     let store = Store::new(Arc::clone(&db));
+    let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
     let file_svc = Arc::new(FileService::new(
-        store, backends, issuer, authorizer, cfg, None, None,
+        store,
+        backends,
+        issuer,
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
     ));
-    Harness { file_svc, authz }
+    let policy_svc = Arc::new(PolicyService::new(policy_store, authorizer));
+    Harness {
+        file_svc,
+        policy_svc,
+        authz,
+    }
 }
 
 fn ctx(tenant: Uuid, subject: Uuid) -> SecurityContext {
@@ -243,4 +259,59 @@ async fn idempotency_key_scoped_to_subject() {
         replay_a.file_id, ticket_a.file_id,
         "caller A's replay must return A's original ticket"
     );
+}
+
+// ── idempotency_replay_rejected_after_policy_tightened ──────────────────────
+
+/// A policy tightened *after* the original `create_file` must also reject a
+/// replay of a stored idempotency ticket — not just a fresh request. Before
+/// the fix, the replay path (`create.rs`, the `idempotency_key` branch)
+/// returned the stored ticket unconditionally once the request-hash and
+/// subject checks passed, entirely before the policy-resolution block that
+/// runs for a fresh create — bypassing a tightened policy for the whole
+/// idempotency TTL (24h default).
+#[tokio::test]
+async fn idempotency_replay_rejected_after_policy_tightened() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let subject = Uuid::now_v7();
+    let ctx_caller = ctx(tenant, subject);
+    let key = "idem-policy-tighten-1".to_owned();
+
+    // No policy configured yet: the original create succeeds (mime type is
+    // "application/octet-stream", see `new_file`).
+    let first = h
+        .file_svc
+        .create_file(&ctx_caller, new_file(subject), Some(key.clone()))
+        .await
+        .expect("initial create should succeed with no policy configured");
+
+    // Tighten the tenant policy to allow only a different mime type.
+    h.policy_svc
+        .set_policy(
+            &ctx_caller,
+            PolicyScope::Tenant,
+            None,
+            PolicyBody {
+                allowed_mime_types: vec!["image/png".to_owned()],
+                ..PolicyBody::default()
+            },
+        )
+        .await
+        .expect("tighten tenant policy");
+
+    // Replaying the same key must now be rejected: the stored request's mime
+    // type is no longer permitted by the CURRENT effective policy.
+    let replay = h
+        .file_svc
+        .create_file(&ctx_caller, new_file(subject), Some(key))
+        .await;
+    assert!(
+        matches!(
+            replay,
+            Err(DomainError::PolicyMimeNotAllowed { ref mime_type }) if mime_type == "application/octet-stream"
+        ),
+        "expected PolicyMimeNotAllowed on replay after policy tightened, got {replay:?}"
+    );
+    assert_ne!(first.file_id, Uuid::nil());
 }

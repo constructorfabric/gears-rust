@@ -236,6 +236,49 @@ async fn update_metadata_leaves_audit_row() {
     assert_eq!(meta_rows[0].outcome, "success");
 }
 
+// ── 4b. update_metadata enqueues a "file.metadata_updated" event ────────────
+
+/// Regression test: `patch_metadata_atomic` previously wrote only the audit
+/// row, silently skipping the `file.metadata_updated` event required by
+/// `cpt-cf-file-storage-fr-file-events` (docs/migration.sql's `events_outbox`
+/// catalog lists the event type, but nothing ever enqueued it). This proves
+/// the event is now enqueued exactly once, in the same transaction as the
+/// audit row and the metadata mutation.
+///
+/// @cpt-cf-file-storage-fr-file-events
+/// @cpt-cf-file-storage-fr-audit-trail
+#[tokio::test]
+async fn update_metadata_enqueues_metadata_updated_event() {
+    let (svc, _msvc, _dp, store) = build_service().await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let patch = CustomMetadataPatch {
+        entries: vec![("k".to_owned(), Some("v".to_owned()))],
+    };
+    svc.update_metadata(&ctx, ticket.file_id, patch, None)
+        .await
+        .unwrap();
+
+    let events = store.list_file_events(ticket.file_id).await.unwrap();
+    let meta_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "file.metadata_updated")
+        .collect();
+    assert_eq!(
+        meta_events.len(),
+        1,
+        "expected exactly 1 file.metadata_updated event"
+    );
+    assert_eq!(meta_events[0].file_id, ticket.file_id);
+    assert_eq!(meta_events[0].tenant_id, tenant);
+    assert!(
+        meta_events[0].published_at.is_none(),
+        "event must not be published yet"
+    );
+}
+
 // ── 5. delete_file leaves a "delete_file" audit row ──────────────────────────
 
 /// @cpt-cf-file-storage-fr-audit-trail
