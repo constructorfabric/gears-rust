@@ -1,5 +1,7 @@
 //! Repository for the `files_custom_metadata` table (user key/value pairs).
 
+use std::collections::HashMap;
+
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, secure_insert};
@@ -38,6 +40,43 @@ impl MetadataRepo {
             .await
             .map_err(db_err)?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Batched counterpart of `list`: fetch custom-metadata entries for many
+    /// files in a single `IN (...)` query, grouped by `file_id`. Used by
+    /// `GET /files` listing so that rendering a page of `N` files' metadata
+    /// costs one query instead of `N` (see `Store::list_metadata_for_files`).
+    /// A `file_id` with no custom metadata simply has no entry in the
+    /// returned map (never an empty `Vec` — callers should treat "absent" and
+    /// "empty" the same way, e.g. via `.get(&id).cloned().unwrap_or_default()`).
+    pub async fn list_for_files<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        if file_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = Entity::find()
+            .filter(Column::FileId.is_in(file_ids.iter().copied()))
+            .order_by_asc(Column::Key)
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_err)?;
+        let mut grouped: HashMap<Uuid, Vec<CustomMetadataEntry>> = HashMap::new();
+        for row in rows {
+            grouped
+                .entry(row.file_id)
+                .or_default()
+                .push(CustomMetadataEntry {
+                    key: row.key,
+                    value: row.value,
+                });
+        }
+        Ok(grouped)
     }
 
     /// Upsert one key (delete-then-insert; merge-patch semantics live in the

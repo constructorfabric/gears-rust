@@ -68,8 +68,9 @@ pub struct MultipartUploadSession {
 /// `manifest` is included so a client can independently re-verify the
 /// composite hash (`docs/features/content-hash-modes.md` §"Client-Side
 /// Manifest Re-Verification") without a second round-trip. At ~90 bytes per
-/// part this is ~1 MiB at the 10k-part ceiling — acceptable for a one-shot
-/// response.
+/// part this is ~1 MiB at the [`MAX_PART_COUNT`] ceiling, which
+/// [`compute_plan`] now actually enforces (independent of backend) —
+/// acceptable for a one-shot response.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct CompletedMultipartUpload {
@@ -208,6 +209,20 @@ pub const DEFAULT_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 /// defense-in-depth for callers that bypass that boundary.
 pub const MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
+/// Hard ceiling on the number of parts a single multipart plan may contain,
+/// enforced by [`compute_plan`] independently of any one backend's own
+/// native limit (ADR-0006 §"Manifest storage", `docs/features/
+/// content-hash-modes.md` §12 risk 1: "a backend without such a native limit
+/// cannot silently produce an unbounded manifest").
+///
+/// `10_000` matches S3's own hard multipart-part limit (`S3Backend::upload_part`
+/// rejects `part_number > 10_000`), so this ceiling never makes an S3-backed
+/// plan any more restrictive than the backend already is — it only closes the
+/// gap for backends (e.g. the in-memory dev/test backend) that impose no such
+/// limit of their own, and bounds the manifest size (~800 KB worst case at
+/// ~90 bytes/entry) and the per-initiate signed-URL minting cost.
+pub const MAX_PART_COUNT: u64 = 10_000;
+
 /// Compute the server-chosen `part_size` and generate the plan skeleton
 /// (without URLs — those are injected by `MultipartService`).
 ///
@@ -217,6 +232,11 @@ pub const MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 ///   SHA-256 is used in P2).
 /// - `parts = ceil(declared_size / part_size)`.
 /// - The last part's `size` is `declared_size - (parts - 1) * part_size`.
+/// - If that part count would exceed [`MAX_PART_COUNT`], `part_size` is
+///   **widened** (never exceeding [`MAX_PART_SIZE`]) just enough to bring the
+///   plan back under the ceiling; if even [`MAX_PART_SIZE`] cannot fit
+///   `declared_size` within [`MAX_PART_COUNT`] parts, the plan is rejected
+///   rather than minted (see "Errors" below).
 ///
 /// One raw part entry from `compute_plan`: `(part_number, offset, size)`.
 pub type RawPartEntry = (u32, u64, u64);
@@ -224,11 +244,21 @@ pub type RawPartEntry = (u32, u64, u64);
 /// Returns `(part_size, parts_count)` ready to be used by the caller.
 ///
 /// # Errors
-/// Returns [`DomainError::Validation`] if the part-size arithmetic would
-/// overflow `u64`. Callers are expected to have already validated
-/// `preferred_part_size` against a sane range (P2 remediation 2.11); this is
-/// a defense-in-depth guard against a huge/adversarial value reaching this
-/// function by another path, rather than panicking or silently wrapping.
+/// Returns [`DomainError::Validation`] if:
+/// - the part-size arithmetic would overflow `u64`. Callers are expected to
+///   have already validated `preferred_part_size` against a sane range (P2
+///   remediation 2.11); this is a defense-in-depth guard against a huge/
+///   adversarial value reaching this function by another path, rather than
+///   panicking or silently wrapping.
+/// - `declared_size` is so large that even the maximum permissible part size
+///   ([`MAX_PART_SIZE`]) would require more than [`MAX_PART_COUNT`] parts —
+///   there is no part size this backend/plan can use that keeps the upload
+///   within the enforced part-count ceiling.
+///
+/// This check (and any part-size widening it triggers) runs *before* the
+/// plan `Vec` is allocated, so an attacker-controlled `declared_size` (up to
+/// and including `u64::MAX`) is rejected without ever allocating memory
+/// proportional to it.
 pub fn compute_plan(
     declared_size: u64,
     preferred_part_size: Option<u64>,
@@ -238,7 +268,7 @@ pub fn compute_plan(
     let preferred = preferred_part_size.unwrap_or(min);
     // Part size = max(preferred, backend_min), rounded up to the nearest `min`.
     let raw = preferred.max(min);
-    let part_size = round_up_to(raw, min).ok_or_else(|| {
+    let mut part_size = round_up_to(raw, min).ok_or_else(|| {
         DomainError::validation(
             "preferred_part_size",
             format!("part-size computation overflowed for preferred={preferred}, min={min}"),
@@ -247,6 +277,31 @@ pub fn compute_plan(
 
     if declared_size == 0 {
         return Ok((part_size, vec![(1, 0, 0)]));
+    }
+
+    // Enforce the MAX_PART_COUNT ceiling *before* computing/allocating the
+    // parts vector: a declared_size that would blow past the ceiling at the
+    // chosen part_size must either widen part_size to fit, or be rejected
+    // outright -- never silently produce (or attempt to allocate space for)
+    // an unbounded number of parts.
+    if declared_size.div_ceil(part_size) > MAX_PART_COUNT {
+        // Smallest part_size that keeps this declared_size within
+        // MAX_PART_COUNT parts.
+        let minimal_required = declared_size.div_ceil(MAX_PART_COUNT);
+        if minimal_required > MAX_PART_SIZE {
+            return Err(DomainError::validation(
+                "declared_size",
+                format!(
+                    "declared_size {declared_size} bytes is too large for multipart upload on \
+                     this backend: even at the maximum part size of {MAX_PART_SIZE} bytes it \
+                     would require more than {MAX_PART_COUNT} parts"
+                ),
+            ));
+        }
+        // Widen part_size just enough to fit; `minimal_required <= MAX_PART_SIZE`
+        // was just checked, and `minimal_required > part_size` follows from the
+        // `div_ceil` check above, so this can only increase part_size.
+        part_size = minimal_required.max(part_size).min(MAX_PART_SIZE);
     }
 
     let n_parts = declared_size.div_ceil(part_size);
@@ -308,5 +363,75 @@ mod tests {
     fn compute_plan_returns_validation_error_on_overflowing_preferred_part_size() {
         let err = compute_plan(u64::MAX, Some(u64::MAX), None).unwrap_err();
         assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    /// An absurd `declared_size` (`u64::MAX`, with no `preferred_part_size`
+    /// hint, i.e. the P2 remediation 2.11 boundary check on the client hint
+    /// never fires) must be rejected quickly as a domain error instead of
+    /// driving a `Vec::with_capacity` allocation proportional to
+    /// `declared_size / DEFAULT_MIN_PART_SIZE` (~3.5e12 entries, ~84 TB).
+    #[test]
+    fn compute_plan_rejects_absurd_declared_size_without_allocating() {
+        let err = compute_plan(u64::MAX, None, None).unwrap_err();
+        assert!(
+            matches!(err, DomainError::Validation { .. }),
+            "expected Validation, got {err:?}"
+        );
+    }
+
+    /// A `declared_size` that would need more than `MAX_PART_COUNT` parts at
+    /// the caller's preferred part size must not be rejected outright --
+    /// `compute_plan` should first try widening `part_size` (never beyond
+    /// `MAX_PART_SIZE`) to bring the plan back within the ceiling.
+    #[test]
+    fn compute_plan_widens_part_size_to_stay_within_max_part_count() {
+        // 15,000 parts at DEFAULT_MIN_PART_SIZE would exceed MAX_PART_COUNT.
+        let declared_size = 15_000 * DEFAULT_MIN_PART_SIZE;
+        let (part_size, parts) = compute_plan(declared_size, Some(DEFAULT_MIN_PART_SIZE), None)
+            .expect("must widen instead of rejecting");
+
+        assert!(
+            part_size > DEFAULT_MIN_PART_SIZE,
+            "part_size must have been widened above the caller's preferred value, got {part_size}"
+        );
+        assert!(
+            part_size <= MAX_PART_SIZE,
+            "widened part_size must never exceed MAX_PART_SIZE, got {part_size}"
+        );
+        assert!(
+            (parts.len() as u64) <= MAX_PART_COUNT,
+            "plan must fit within MAX_PART_COUNT parts, got {}",
+            parts.len()
+        );
+        let total: u64 = parts.iter().map(|(_, _, size)| *size).sum();
+        assert_eq!(
+            total, declared_size,
+            "sum of part sizes must equal declared_size"
+        );
+    }
+
+    /// A `declared_size` too large to fit within `MAX_PART_COUNT` parts even
+    /// at `MAX_PART_SIZE` (the backend's absolute max part size) cannot be
+    /// widened away -- it must be rejected with a clear domain error rather
+    /// than minting a plan that would exceed the ceiling.
+    #[test]
+    fn compute_plan_rejects_declared_size_beyond_max_part_size_times_max_part_count() {
+        let declared_size = MAX_PART_SIZE * MAX_PART_COUNT + 1;
+        let err = compute_plan(declared_size, None, None).unwrap_err();
+        assert!(
+            matches!(err, DomainError::Validation { .. }),
+            "expected Validation, got {err:?}"
+        );
+    }
+
+    /// Exactly at the `MAX_PART_SIZE * MAX_PART_COUNT` boundary, the plan
+    /// must still be accepted (widened to exactly `MAX_PART_SIZE`).
+    #[test]
+    fn compute_plan_accepts_declared_size_exactly_at_the_boundary() {
+        let declared_size = MAX_PART_SIZE * MAX_PART_COUNT;
+        let (part_size, parts) =
+            compute_plan(declared_size, None, None).expect("boundary value must be accepted");
+        assert_eq!(part_size, MAX_PART_SIZE);
+        assert_eq!(parts.len() as u64, MAX_PART_COUNT);
     }
 }
