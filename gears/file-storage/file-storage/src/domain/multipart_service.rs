@@ -111,8 +111,29 @@ pub struct MultipartService {
     issuer: Arc<Issuer>,
     /// Base URL of the sidecar (e.g. `"http://sidecar.example.com"`).
     sidecar_base_url: String,
-    /// Signed-URL TTL in seconds (shared with the session expiry).
+    /// Signed-URL TTL in seconds, applied to every per-part upload URL
+    /// (`default_url_ttl_secs` -- kept short to bound the stale-permission
+    /// window, DESIGN §4.5). Independent of [`Self::session_ttl_secs`] since
+    /// the `multipart-session-ttl` remediation: a large upload's session
+    /// lifetime must not be capped at the same short window used for
+    /// individual signed URLs -- see [`Self::session_ttl_secs`]'s own doc.
     url_ttl_secs: i64,
+    /// Lifetime (seconds) of the multipart session itself -- i.e. how long
+    /// `expires_at` on the `multipart_uploads` row is set to at initiate
+    /// time. Defaults to [`Self::url_ttl_secs`] in [`Self::new`] (preserving
+    /// the pre-remediation behavior for callers that don't opt in), but
+    /// `gear.rs` overrides it via [`Self::with_session_ttl_secs`] to a much
+    /// longer, dedicated `multipart_session_ttl_secs` config value. Before
+    /// this remediation the session shared `url_ttl_secs` (a short,
+    /// stale-permission bound meant for individual signed URLs, DESIGN
+    /// §4.5), which capped every multi-GB multipart upload's *total* time
+    /// budget at 15 minutes by default -- self-defeating for the very
+    /// large-upload use case multipart exists for, and for the
+    /// introspect/resume feature (`cpt-cf-file-storage-flow-
+    /// multipart-introspect`), whose resume-token expiry is capped at the
+    /// session's own `expires_at` and so could never extend a session past
+    /// that same 15 minutes.
+    session_ttl_secs: i64,
     /// Metrics port (P2 1.8 remediation). Defaults to a no-op implementation
     /// (see [`Self::new`]); `gear.rs` opts into the real OTel-backed meter via
     /// [`Self::with_metrics`].
@@ -141,9 +162,24 @@ impl MultipartService {
             issuer,
             sidecar_base_url,
             url_ttl_secs,
+            // Defaults to url_ttl_secs so existing `MultipartService::new(...)`
+            // call sites across the integration-test suite keep compiling and
+            // behaving unchanged; `gear.rs` opts into a real, decoupled value
+            // via `with_session_ttl_secs`.
+            session_ttl_secs: url_ttl_secs,
             metrics: Arc::new(NoopMetrics),
             usage_reporter: None,
         }
+    }
+
+    /// Install a dedicated multipart-session lifetime, decoupled from the
+    /// per-part signed-URL TTL (`multipart-session-ttl` remediation). Same
+    /// builder shape as [`Self::with_metrics`] -- existing
+    /// `MultipartService::new(...)` call sites keep compiling unchanged.
+    #[must_use]
+    pub fn with_session_ttl_secs(mut self, session_ttl_secs: i64) -> Self {
+        self.session_ttl_secs = session_ttl_secs;
+        self
     }
 
     /// Install a real metrics port (P2 1.8 remediation). Kept as a builder
@@ -479,6 +515,12 @@ impl MultipartService {
         // Compute the server-authoritative parts plan (FEATURE §3).
         // `backend_min_part_size` is not yet exposed by the BackendCapabilities
         // API so we fall back to the `DEFAULT_MIN_PART_SIZE` constant.
+        //
+        // `compute_plan` enforces the `MAX_PART_COUNT` ceiling itself (widening
+        // `part_size` where possible, rejecting where even the max part size
+        // cannot fit `declared_size` within the ceiling) *before* allocating
+        // the parts vector, so an unbounded/adversarial `declared_size` never
+        // drives an allocation proportional to it here.
         let (chosen_part_size, raw_parts) = compute_plan(declared_size, preferred_part_size, None)?;
 
         // Pre-register the pending file_versions row.
@@ -496,8 +538,17 @@ impl MultipartService {
         // Initiate the multipart upload on the backend.
         let backend_handle = backend.initiate_multipart(&backend_path).await?;
 
-        // Use the configured TTL for both the session row and the signed URLs.
-        let expires_at = now + time::Duration::seconds(self.url_ttl_secs.max(1));
+        // The session's own lifetime (`multipart_session_ttl_secs`, e.g. 24h)
+        // is a dedicated, much longer-lived budget than the per-part signed
+        // URLs' TTL (`default_url_ttl_secs`, e.g. 15 min) -- a multi-GB
+        // upload needs real wall-clock time to complete, while any one
+        // signed URL should stay short-lived to bound the stale-permission
+        // window (DESIGN §4.5). A session that outlives its own URLs is the
+        // whole point of the introspect/resume flow: the client re-fetches
+        // fresh part URLs (capped at the session's own `expires_at`, see
+        // `introspect_multipart_upload`) as earlier ones expire.
+        let session_expires_at = now + time::Duration::seconds(self.session_ttl_secs.max(1));
+        let url_expires_at = now + time::Duration::seconds(self.url_ttl_secs.max(1));
 
         // Persist the session row. On failure, best-effort compensate to avoid
         // orphaning the backend handle and the pending version row.
@@ -511,7 +562,7 @@ impl MultipartService {
                 declared_mime,
                 declared_size,
                 chosen_part_size,
-                expires_at,
+                session_expires_at,
                 now,
             )
             .await
@@ -533,7 +584,7 @@ impl MultipartService {
         // P2 1.8: every part of the same upload shares one correlation id, so
         // the sidecar's report-part callbacks for this upload all echo back
         // the same `x-request-id`.
-        let exp = expires_at.unix_timestamp();
+        let exp = url_expires_at.unix_timestamp();
         let request_id = Uuid::now_v7().to_string();
         let mut parts = Vec::with_capacity(raw_parts.len());
         for (part_number, offset, size) in raw_parts {
@@ -567,7 +618,7 @@ impl MultipartService {
             part_hash_algorithm: "SHA-256".to_owned(),
             part_size: chosen_part_size,
             parts,
-            expires_at,
+            expires_at: url_expires_at,
         })
     }
 

@@ -320,6 +320,97 @@ async fn local_fs_get_stream_missing_errors() {
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
+/// P2 remediation (replay-`PUT` overwrite fix): the first `publish_exclusive`
+/// call to a fresh path must create it; a second call to the SAME path with
+/// DIFFERENT bytes must report `created: false` and must leave the
+/// already-published bytes completely untouched — the core integrity
+/// guarantee `StorageBackend::publish_exclusive` exists for.
+#[tokio::test]
+async fn local_fs_publish_exclusive_rejects_second_write_to_same_path() {
+    let root = unique_root();
+    let b = LocalFsBackend::new("fs", &root);
+
+    let stream1: BoxStream<'_, std::io::Result<Bytes>> =
+        Box::pin(stream::iter(vec![Ok(Bytes::from_static(b"first"))]));
+    let outcome1 = b
+        .publish_exclusive("fid/vid", stream1, None)
+        .await
+        .expect("first publish_exclusive call must succeed");
+    assert!(
+        outcome1.created,
+        "first publish_exclusive call to a fresh path must create it"
+    );
+    assert_eq!(
+        b.get("fid/vid").await.unwrap(),
+        Bytes::from_static(b"first")
+    );
+
+    let stream2: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(vec![Ok(
+        Bytes::from_static(b"second-different-bytes"),
+    )]));
+    let outcome2 = b
+        .publish_exclusive("fid/vid", stream2, None)
+        .await
+        .expect("second publish_exclusive call must not error, just report created=false");
+    assert!(
+        !outcome2.created,
+        "a second publish_exclusive call to an already-published path must not overwrite it"
+    );
+    // The measured bytes/digest of THIS (rejected) attempt are still
+    // reported, so a caller can still run a server-side idempotency check.
+    assert_eq!(
+        outcome2.bytes_written,
+        "second-different-bytes".len() as u64
+    );
+
+    // The backend must still hold the FIRST call's bytes, byte for byte —
+    // this is the actual immutability guarantee under test.
+    assert_eq!(
+        b.get("fid/vid").await.unwrap(),
+        Bytes::from_static(b"first"),
+        "an already-published blob must never be overwritten by publish_exclusive"
+    );
+
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+/// Same guarantee as `local_fs_publish_exclusive_rejects_second_write_to_same_path`,
+/// for `InMemoryBackend` (the check-then-insert happens under one lock guard,
+/// so it is atomic rather than the trait default's TOCTOU fallback).
+#[tokio::test]
+async fn in_memory_publish_exclusive_rejects_second_write_to_same_path() {
+    let b = InMemoryBackend::new("mem");
+
+    let stream1: BoxStream<'_, std::io::Result<Bytes>> =
+        Box::pin(stream::iter(vec![Ok(Bytes::from_static(b"first"))]));
+    let outcome1 = b
+        .publish_exclusive("fid/vid", stream1, None)
+        .await
+        .expect("first publish_exclusive call must succeed");
+    assert!(
+        outcome1.created,
+        "first publish_exclusive call to a fresh path must create it"
+    );
+
+    let stream2: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(vec![Ok(
+        Bytes::from_static(b"second-different-bytes"),
+    )]));
+    let outcome2 = b
+        .publish_exclusive("fid/vid", stream2, None)
+        .await
+        .expect("second publish_exclusive call must not error, just report created=false");
+    assert!(
+        !outcome2.created,
+        "a second publish_exclusive call to an already-published path must not overwrite it"
+    );
+
+    assert_eq!(
+        b.get("fid/vid").await.unwrap(),
+        Bytes::from_static(b"first"),
+        "an already-published blob must never be overwritten by publish_exclusive"
+    );
+}
+
 #[tokio::test]
 async fn registry_resolves_default_and_unknown() {
     let mem: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));

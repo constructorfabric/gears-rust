@@ -171,6 +171,25 @@ impl FileService {
                         "idempotency key reused with a different request body",
                     ));
                 }
+
+                // @cpt-cf-file-storage-fr-allowed-types-policy
+                // @cpt-cf-file-storage-fr-size-limits-policy
+                // @cpt-cf-file-storage-fr-metadata-limits
+                // A replay must clear the CURRENT effective policy, not just
+                // the policy in effect when the original ticket was minted —
+                // otherwise a policy tightened after the original create
+                // would be silently bypassed for the idempotency TTL (the
+                // stored `upload_url` is replayed byte-for-byte, never
+                // re-signed; see `IdempotencyTicket`'s `Into<UploadTicket>`).
+                // Mirrors the same checks the fresh-create path below runs,
+                // against the same (already-hash-verified-unchanged)
+                // `new.mime_type`/`initial_meta`.
+                let policy = self
+                    .get_effective_policy_internal(tenant_id, owner_id)
+                    .await?;
+                PolicyResolver::check_allowed_mime(&policy, &new.mime_type)?;
+                PolicyResolver::check_metadata_limits(&policy, &initial_meta)?;
+
                 let ticket: UploadTicket =
                     serde_json::from_str::<IdempotencyTicket>(&record.response_body)
                         .map(Into::into)

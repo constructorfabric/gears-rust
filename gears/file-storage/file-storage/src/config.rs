@@ -1,8 +1,8 @@
 //! Gear configuration for file-storage.
 //!
-//! In P1 storage backends are loaded from static TOML at startup
-//! (`cpt-cf-file-storage-fr-backend-config-source`). M0 pinned the basic knobs;
-//! the backend table and data-plane URL are added here.
+//! Storage backends are loaded from the gear's own platform YAML config section
+//! (`cpt-cf-file-storage-fr-backend-config-source`), not a standalone TOML file.
+//! M0 pinned the basic knobs; the backend table and data-plane URL are added here.
 
 use std::fmt;
 
@@ -25,10 +25,27 @@ pub struct FileStorageConfig {
     pub default_url_ttl_secs: u64,
 
     /// Hard ceiling on URL TTL (seconds) the control plane will sign; recommended
-    /// 7 days. The control plane refuses to mint beyond this.
+    /// 7 days. `Issuer::issue` silently clamps `exp` down to `now + max_url_ttl_secs`
+    /// when a caller-requested TTL would exceed it, rather than refusing to mint.
     /// See `cpt-cf-file-storage-fr-signed-urls`.
     #[serde(default = "default_max_url_ttl_secs")]
     pub max_url_ttl_secs: u64,
+
+    /// Lifetime (seconds) of a multipart upload *session* -- i.e. how long
+    /// `MultipartUploadSession::expires_at` is set to at initiate time.
+    /// **Deliberately independent of `default_url_ttl_secs`**: before this
+    /// field existed, the session shared `default_url_ttl_secs` (a short
+    /// bound meant for individual signed URLs, DESIGN §4.5), which capped
+    /// every multi-GB multipart upload's total time budget at 15 minutes by
+    /// default -- self-defeating for the large-upload use case multipart
+    /// exists for, and for the introspect/resume flow (`cpt-cf-file-storage-
+    /// flow-multipart-introspect`), whose resume-token expiry is capped at
+    /// the session's own `expires_at` and so could never extend a session
+    /// past that same short window. Default: 86400 (24 hours). Per-part
+    /// signed-URL TTLs are unaffected and continue to use
+    /// `default_url_ttl_secs`.
+    #[serde(default = "default_multipart_session_ttl_secs")]
+    pub multipart_session_ttl_secs: u64,
 
     /// Public base URL of the data-plane sidecar that signed URLs point at.
     #[serde(default = "default_sidecar_base_url")]
@@ -276,6 +293,86 @@ impl FileStorageConfig {
                  require_finalize_internal_secret: false to allow the token-only trust model)"
             );
         }
+        // `default_url_ttl_secs` is what every mint uses absent a caller
+        // override, so it must itself respect the ceiling the control plane
+        // is supposed to enforce -- otherwise the very first signed URL
+        // minted with no override already violates `max_url_ttl_secs`.
+        if self.default_url_ttl_secs > self.max_url_ttl_secs {
+            anyhow::bail!(
+                "invalid file-storage config: default_url_ttl_secs ({}) must not exceed \
+                 max_url_ttl_secs ({})",
+                self.default_url_ttl_secs,
+                self.max_url_ttl_secs
+            );
+        }
+        // Same reasoning for listing: `default_page_size` is what `GET /files`
+        // uses absent a caller-supplied `limit`, so it must not itself exceed
+        // the cap the config claims to enforce on every page.
+        if self.default_page_size > self.max_page_size {
+            anyhow::bail!(
+                "invalid file-storage config: default_page_size ({}) must not exceed \
+                 max_page_size ({})",
+                self.default_page_size,
+                self.max_page_size
+            );
+        }
+        // The live-multipart-session guard (retention-cleanup.md §"Live-Multipart-
+        // Session Guard") reasons that a long-running upload can legitimately keep
+        // its backing pending version alive past `orphan_grace_secs`, for exactly
+        // as long as the signed URL driving it remains valid. That reasoning
+        // applies verbatim to single-part PUT URLs too, but nothing else enforces
+        // it for them (there is no session row to guard on). `default_url_ttl_secs`
+        // exceeding `orphan_grace_secs` is a direct self-contradiction -- every
+        // upload minted with the default TTL would risk the sweep deleting its
+        // still-pending version out from under a still-valid in-flight PUT -- so
+        // it is rejected outright.
+        if self.default_url_ttl_secs > self.orphan_grace_secs {
+            anyhow::bail!(
+                "invalid file-storage config: default_url_ttl_secs ({}) must not exceed \
+                 orphan_grace_secs ({}) -- otherwise every signed PUT URL minted at the \
+                 default TTL risks the orphan-reconciliation sweep deleting its still-pending \
+                 version while the URL is still valid",
+                self.default_url_ttl_secs,
+                self.orphan_grace_secs
+            );
+        }
+        // A multipart session must outlive (or at least match) the per-part
+        // signed URLs minted at initiate time -- otherwise the very first
+        // batch of upload URLs would carry an `exp` beyond the session's own
+        // `expires_at`, and `complete_multipart_upload`'s defense-in-depth
+        // expiry check (or a client uploading right up to the URL's `exp`)
+        // could reject an upload whose signed URLs were technically still
+        // valid. This mirrors the `default_url_ttl_secs`-vs-`orphan_grace_secs`
+        // self-contradiction check above.
+        if self.multipart_session_ttl_secs < self.default_url_ttl_secs {
+            anyhow::bail!(
+                "invalid file-storage config: multipart_session_ttl_secs ({}) must be >= \
+                 default_url_ttl_secs ({}) -- otherwise a signed upload URL minted at initiate \
+                 time could remain valid past the multipart session's own expiry",
+                self.multipart_session_ttl_secs,
+                self.default_url_ttl_secs
+            );
+        }
+        // `max_url_ttl_secs` is deliberately NOT hard-bailed on the same
+        // condition: the recommended defaults are `max_url_ttl_secs = 7 days`
+        // and `orphan_grace_secs = 1 hour`, so a bail here would reject every
+        // default deployment. A caller that justifies a longer-lived
+        // single-part URL (up to `max_url_ttl_secs`, via a per-call TTL
+        // override) only risks the same race if it did not also raise
+        // `orphan_grace_secs` accordingly -- surfaced as a warning so an
+        // operator notices, rather than a hard failure that would break the
+        // defaults.
+        if self.max_url_ttl_secs > self.orphan_grace_secs {
+            tracing::warn!(
+                max_url_ttl_secs = self.max_url_ttl_secs,
+                orphan_grace_secs = self.orphan_grace_secs,
+                "file-storage: max_url_ttl_secs exceeds orphan_grace_secs -- a single-part PUT \
+                 URL justified up to the configured maximum TTL can outlive orphan_grace_secs, \
+                 so the orphan-reconciliation sweep may delete its still-pending version while \
+                 an in-flight PUT against that URL is still valid. Raise orphan_grace_secs to \
+                 at least max_url_ttl_secs to close this window."
+            );
+        }
         Ok(())
     }
 }
@@ -285,6 +382,10 @@ impl fmt::Debug for FileStorageConfig {
         f.debug_struct("FileStorageConfig")
             .field("default_url_ttl_secs", &self.default_url_ttl_secs)
             .field("max_url_ttl_secs", &self.max_url_ttl_secs)
+            .field(
+                "multipart_session_ttl_secs",
+                &self.multipart_session_ttl_secs,
+            )
             .field("sidecar_base_url", &self.sidecar_base_url)
             .field("default_page_size", &self.default_page_size)
             .field("max_page_size", &self.max_page_size)
@@ -325,6 +426,7 @@ impl Default for FileStorageConfig {
         Self {
             default_url_ttl_secs: default_default_url_ttl_secs(),
             max_url_ttl_secs: default_max_url_ttl_secs(),
+            multipart_session_ttl_secs: default_multipart_session_ttl_secs(),
             sidecar_base_url: default_sidecar_base_url(),
             default_page_size: default_page_size(),
             max_page_size: default_max_page_size(),
@@ -353,6 +455,11 @@ fn default_default_url_ttl_secs() -> u64 {
 fn default_max_url_ttl_secs() -> u64 {
     // 7 days, the recommended maximum from the signed-URL FR.
     7 * 24 * 60 * 60
+}
+
+fn default_multipart_session_ttl_secs() -> u64 {
+    86400 // 24 hours: a real time budget for a multi-GB upload, independent
+    // of the short default_url_ttl_secs used for individual signed URLs.
 }
 
 fn default_sidecar_base_url() -> String {

@@ -274,9 +274,28 @@ impl CleanupEngine {
     /// hardcoded `0`) so this debit stays correct even if that invariant
     /// ever changes.
     ///
+    /// The delete itself is status-guarded (`delete_pending_version`, only
+    /// removes the row while it is still `status = pending`) -- the same CAS
+    /// pattern `sweep_expired_multipart`'s step already uses. Between
+    /// `list_abandoned_pending_versions` returning this row and this call
+    /// running, a client's `finalize_upload` can race in and flip the version
+    /// `pending -> available`; an unconditional delete would then remove a
+    /// just-finalized version row (and its backend blob) out from under the
+    /// caller. The guard makes that race a no-op here instead: `Ok(false)` is
+    /// returned and neither the row, the blob, nor the reclaimed-bytes debit
+    /// are touched.
+    ///
     /// Returns `(pending_versions_deleted, orphan_files_deleted)`, each `0`
     /// or `1`.
-    async fn delete_abandoned_pending_version(
+    ///
+    /// `pub` (rather than private) solely so a unit test can invoke it
+    /// directly to exercise the narrow mid-flight interleaving window
+    /// deterministically, without real concurrency -- mirroring why
+    /// [`Self::cleanup_expired_session_version`] is `pub` for the same
+    /// reason on step 2's sibling race. This function is otherwise only ever
+    /// called from `sweep_abandoned_pending` with a snapshot straight out of
+    /// `list_abandoned_pending_versions`.
+    pub async fn delete_abandoned_pending_version(
         &self,
         file_id: Uuid,
         version_id: Uuid,
@@ -299,7 +318,11 @@ impl CleanupEngine {
             }),
             occurred_at: OffsetDateTime::now_utc(),
         };
-        match self.store.delete_version(file_id, version_id, audit).await {
+        match self
+            .store
+            .delete_pending_version(file_id, version_id, audit)
+            .await
+        {
             // @cpt-end:cpt-cf-file-storage-algo-sweep-abandoned-pending:p1:inst-sweep-pending-audit-delete
             Ok(true) => {
                 // @cpt-cf-file-storage-fr-usage-reporting
@@ -331,7 +354,11 @@ impl CleanupEngine {
                 (1, files_deleted)
             }
             Ok(false) => {
-                // Already removed by a concurrent sweep -- fine.
+                // Either already removed by a concurrent sweep, or -- the
+                // race this guard exists for -- a client's `finalize_upload`
+                // flipped it `pending -> available` between the list query
+                // and this delete. Either way there is nothing left to
+                // reclaim: no blob delete, no orphan-file check, no debit.
                 (0, 0)
             }
             Err(e) => {
@@ -607,29 +634,55 @@ impl CleanupEngine {
     /// window deterministically, without real concurrency: this function is
     /// otherwise only ever called from `abort_expired_multipart_session`
     /// after that method has already won the session CAS.
+    ///
+    /// The version row backing this session may already be gone by the time
+    /// this runs: step 1 of the same sweep (`sweep_abandoned_pending`) only
+    /// excludes sessions with `expires_at > now` (still live), so an
+    /// *expired-but-still-`in_progress`* session's pending version can be
+    /// reclaimed by step 1 before step 2 (this method) ever sees it. When
+    /// that happens the backend multipart upload handle must still be
+    /// aborted -- otherwise it leaks (e.g. an incomplete S3 multipart upload
+    /// and its uploaded parts) -- so the backend abort is attempted
+    /// regardless of whether the version row is still present, falling back
+    /// to the default backend and the deterministic `(file_id, version_id)`
+    /// path when it is not (mirrors `MultipartService::abort_multipart_upload`'s
+    /// own `version.is_none()` fallback for the same reason).
     pub async fn cleanup_expired_session_version(&self, session: &MultipartUploadSession) {
-        let Ok(Some(ver)) = self
+        let ver = self
             .store
             .get_version(session.file_id, session.version_id)
             .await
-        else {
-            return;
-        };
+            .ok()
+            .flatten();
 
         // Best-effort: tell the backend to discard the in-progress upload.
+        // Resolve `(backend_id, backend_path)` from the version row when it
+        // is still there; otherwise fall back to the default backend and the
+        // deterministic path -- see the doc comment above for why this must
+        // not be skipped just because the version row is already reclaimed.
+        let (backend_id, backend_path) = ver.as_ref().map_or_else(
+            || {
+                (
+                    self.backends.default_id().to_owned(),
+                    expired_session_backend_path(session.file_id, session.version_id),
+                )
+            },
+            |v| (v.backend_id.clone(), v.backend_path.clone()),
+        );
         self.backend_abort_multipart_best_effort(
-            &ver.backend_id,
-            &ver.backend_path,
+            &backend_id,
+            &backend_path,
             &session.backend_upload_handle,
             session.upload_id,
         )
         .await;
 
-        // Best-effort: delete the pending version row. Status-guarded (P2 0.3
-        // step 5): only deletes if the row is still `pending`, so a version
-        // that a racing `complete_multipart_upload` already flipped to
-        // `available` (via `finalize_version`, ahead of its own session CAS)
-        // is left untouched -- the DELETE simply matches zero rows.
+        // Best-effort: delete the pending version row (a no-op, matching
+        // zero rows, when step 1 already reclaimed it above). Status-guarded
+        // (P2 0.3 step 5): only deletes if the row is still `pending`, so a
+        // version that a racing `complete_multipart_upload` already flipped
+        // to `available` (via `finalize_version`, ahead of its own session
+        // CAS) is left untouched -- the DELETE simply matches zero rows.
         let del_audit = orphan_reconcile_audit(
             session.file_id,
             self.store
@@ -928,6 +981,19 @@ impl CleanupEngine {
 }
 
 // ── free helpers ──────────────────────────────────────────────────────────────
+
+/// Deterministic backend path for a `(file_id, version_id)` pair.
+///
+/// Mirrors `FileService::backend_path`/`MultipartService::backend_path` (both
+/// `format!("/{file_id}/{version_id}")`) -- duplicated here rather than
+/// reached into from another domain service, since it is a pure, stateless
+/// computation with no dependency on either service. Used only as a fallback
+/// by [`CleanupEngine::cleanup_expired_session_version`] when the version row
+/// backing an expired multipart session is already gone (reclaimed by step 1
+/// of the same sweep) and so cannot supply its own `backend_path` column.
+fn expired_session_backend_path(file_id: Uuid, version_id: Uuid) -> String {
+    format!("/{file_id}/{version_id}")
+}
 
 /// Build a system-actor `OrphanReconcile` audit entry.
 fn orphan_reconcile_audit(file_id: Uuid, tenant_id: Uuid, detail: serde_json::Value) -> AuditEntry {
