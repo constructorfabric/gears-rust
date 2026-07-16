@@ -184,16 +184,37 @@ pub trait StorageBackend: Send + Sync {
     /// observes `created: false` and the existing bytes are provably
     /// untouched.
     ///
-    /// The default implementation is a non-atomic (TOCTOU) `exists` check
-    /// followed by `put` — good enough for a backend with no cheaper atomic
-    /// primitive, but a real race window exists between the check and the
-    /// write. [`LocalFsBackend`](super::LocalFsBackend) (`std::fs::hard_link`,
-    /// which atomically fails with `AlreadyExists` if the target already has
-    /// a directory entry) and [`InMemoryBackend`](super::InMemoryBackend)
-    /// (a single mutex guards both the check and the insert) both override
-    /// this with a truly atomic implementation. `S3Backend` is left on this
-    /// default fallback (out of scope for this remediation — see its own
-    /// module doc for the ADR-0005 merge gate).
+    /// # This default implementation is explicitly non-atomic (TOCTOU) — read before relying on it
+    /// It is an `exists` check followed by a separate `put`, with a real race
+    /// window in between: two concurrent callers can both observe "nothing
+    /// there yet" and both proceed to `put`, so two racing publishes to the
+    /// same `path` can each report `created: true` and the second `put`'s
+    /// bytes silently win, defeating the create-exclusive guarantee this
+    /// method exists to provide. It is only "good enough" as a
+    /// backend-agnostic fallback for a backend that cannot yet do better —
+    /// not a substitute for a real atomic primitive.
+    ///
+    /// [`LocalFsBackend`](super::LocalFsBackend) (`std::fs::hard_link`, which
+    /// atomically fails with `AlreadyExists` if the target already has a
+    /// directory entry) and [`InMemoryBackend`](super::InMemoryBackend) (a
+    /// single mutex guards both the check and the insert) both override this
+    /// with a truly atomic implementation, closing the race for those two
+    /// backends completely.
+    ///
+    /// **`S3Backend` is the one backend still left on this non-atomic
+    /// default**, and that is a deliberate, currently-accepted gap, not an
+    /// oversight: S3 support is opt-in (`s3_backends` config) and
+    /// release-gated by [ADR-0005](../../../docs/ADR/0005-cpt-cf-file-storage-adr-s3-client-selection.md)
+    /// (also see [ADR-0003](../../../docs/ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)'s
+    /// "Known gap" paragraph). Before S3 leaves that release gate for
+    /// general availability, this default TOCTOU fallback **MUST** be
+    /// replaced with a real atomic conditional-PUT override on `S3Backend`
+    /// (e.g. an `If-None-Match: *` conditional write on the signed `PUT`,
+    /// mapping the resulting `412 Precondition Failed` to the same
+    /// `created: false` outcome `LocalFsBackend`/`InMemoryBackend` already
+    /// produce) — shipping S3 without that override means the exclusive-
+    /// publish race this method exists to close is still open for S3-backed
+    /// uploads.
     async fn publish_exclusive(
         &self,
         path: &str,

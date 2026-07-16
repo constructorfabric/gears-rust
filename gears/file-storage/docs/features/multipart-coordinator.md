@@ -249,7 +249,7 @@ Manifest Re-Verification").
 4. [x] - `p1` - DB: SELECT all reported rows from multipart_upload_parts WHERE upload_id = ? - `inst-introspect-load-parts`
 5. [x] - `p1` - Diff the plan's expected part numbers against the reported ones using the same `cpt-cf-file-storage-algo-compute-parts-plan`-derived helper `complete` uses (item 3.3's `missing_part_numbers`) -- `inst-introspect-diff`
 6. [x] - `p1` - FOR EACH missing part number: recompute its `(offset, size)` from the session's persisted `(declared_size, part_size)` columns - `inst-introspect-recompute-bounds`
-7. [x] - `p1` - **IF** state == in_progress AND expires_at > now: mint a fresh signed part URL for each missing part, reusing the initiate path's per-part token-minting helper, with the token `exp` capped at the session's own `expires_at` (never a fresh full TTL) - `inst-introspect-mint-urls`
+7. [x] - `p1` - **IF** state == in_progress AND expires_at > now: mint a fresh signed part URL for each missing part, reusing the initiate path's per-part token-minting helper, with the token `exp = min(session.expires_at, now + url_ttl_secs)` -- capped at the session's own expiry, but never longer than the standard per-part URL TTL either, so a long-lived session cannot be used to mint effectively-non-expiring resume URLs - `inst-introspect-mint-urls`
 8. [x] - `p1` - **ELSE** (terminal or expired session): omit `upload_url` from every missing part - `inst-introspect-no-urls`
 9. [x] - `p1` - RETURN 200 {upload_id, version_id, state, declared_mime, declared_size, part_size, created_at, expires_at, received: [{part_number, size, uploaded_at}], missing: [{part_number, offset, size, upload_url?}]} - `inst-introspect-return`
 
@@ -411,8 +411,10 @@ session's current state, the parts already reported (from `multipart_upload_part
 (their `(offset, size)` recomputed from the session's persisted `declared_size`/`part_size` columns via the same
 `missing_part_numbers` helper item 3.3 extracted for `complete`). While the session is still `in_progress` and
 unexpired, each missing part also gets a freshly-minted resume URL, reusing the initiate path's per-part
-token-minting helper -- capped at the session's own remaining `expires_at`, never a fresh full TTL, so a resumed
-upload cannot outlive the session it resumes. A terminal (`completed`/`aborted`) or expired session reports state and
+token-minting helper, with `exp = min(session.expires_at, now + url_ttl_secs)`: capped so a resumed upload can never
+outlive the session it resumes, but also never minted with a longer TTL than any other signed URL just because the
+session itself is long-lived (`multipart_session_ttl_secs`, e.g. 24h, is deliberately decoupled from the short
+per-part URL TTL -- see `operations.md`'s `multipart_session_ttl_secs` entry). A terminal (`completed`/`aborted`) or expired session reports state and
 part accounting only, with no URLs. Authorized on `actions::WRITE` (not `READ`), matching initiate/complete/abort --
 introspect hands out live upload URLs, so it is not opened to a read-capable-but-not-write principal. A foreign or
 missing `upload_id` is masked as `404`, identical to `complete`'s guard.
@@ -471,9 +473,10 @@ The system **MUST** add `version_id uuid NOT NULL`, `declared_size bigint NOT NU
 - [x] `POST .../complete` accepts `If-Match` and returns `400` (`FailedPrecondition`; this platform has no `412`
   canonical-error variant) on a stale precondition, directly (not via a separate `bind` call) (P2 remediation item 3.3)
 - [x] `GET /files/{id}/multipart/{upload_id}` (introspect) returns the session state plus `received`/`missing` part
-  lists; missing parts of a still-`in_progress`, unexpired session each carry a fresh resume `upload_url` capped at
-  the session's own `expires_at`; a terminal or expired session omits the URLs; a foreign or missing `upload_id` is
-  masked as `404` (item 3.4, SHIP decision)
+  lists; missing parts of a still-`in_progress`, unexpired session each carry a fresh resume `upload_url` whose
+  `exp = min(session.expires_at, now + url_ttl_secs)` (never longer than the standard per-part URL TTL, even though
+  the session itself may still have much longer left to live); a terminal or expired session omits the URLs; a
+  foreign or missing `upload_id` is masked as `404` (item 3.4, SHIP decision)
 - [x] `POST .../complete` returns `200 {version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest}`
   instead of `204` (P2 remediation item 3.3)
 - [x] `POST .../complete` enumerates missing part numbers in its `409` body instead of a bare size comparison (P2 remediation item 3.3)

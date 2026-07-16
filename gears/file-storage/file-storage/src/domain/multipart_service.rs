@@ -1102,10 +1102,17 @@ impl MultipartService {
             String::new()
         };
 
-        // Resume tokens are capped at the session's own remaining
-        // `expires_at`, never a fresh full TTL -- a resumed upload must not
-        // outlive the session it resumes (item 3.4 requirement).
-        let exp = session.expires_at.unix_timestamp();
+        // Resume tokens get the same short URL TTL as any freshly-minted
+        // part URL, capped so they never outlive the session -- NOT the
+        // session's own (long-lived, `multipart_session_ttl_secs`) expiry.
+        // The session may legitimately outlive any one URL's TTL (that is
+        // the whole point of resume/introspect); minting a resume URL with
+        // `exp = session.expires_at` would let an early resume URL stay
+        // valid for the session's full lifetime (e.g. ~24h), defeating the
+        // short-URL-TTL design (DESIGN §4.5). So: `exp = min(session
+        // expiry, now + url_ttl_secs)`.
+        let url_ttl_cap = now + time::Duration::seconds(self.url_ttl_secs.max(1));
+        let exp = session.expires_at.min(url_ttl_cap).unix_timestamp();
         let request_id = Uuid::now_v7().to_string();
         let backend_path = Self::backend_path(file_id, session.version_id);
 
