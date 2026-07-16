@@ -67,7 +67,8 @@ The P1 architecture is deliberately narrow:
 - One hash algorithm — SHA-256, computed on the sidecar's streaming upload path (see
   [ADR-0002](./ADR/0002-cpt-cf-file-storage-adr-content-hash-selection.md)); the full configurable hash-policy surface
   is exposed from P1 with a locked allow-list of `["SHA-256"]`
-- Static TOML backend configuration; runtime/DB configuration is P3
+- Backend configuration via the platform's gear YAML config (control plane) and `FS_SIDECAR_*` env vars (sidecar);
+  runtime/DB configuration is P3
 - Content is an **immutable blob per version** at `/{file_id}/{version_id}`; a file's live content is the `content_id`
   pointer, swapped under optimistic CAS. Backend objects are **never mutated in place**
 - Signed URLs carry an opaque **PASETO `v4.public`** token (Ed25519), stateless, pointing only at the sidecar. FileStorage issues no anonymous, per-recipient,
@@ -104,7 +105,7 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 
 | PRD FR ID                                              | Design Response                                                                                                                                                          |
 |--------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `cpt-cf-file-storage-fr-upload-file`                   | Control `POST /files` (authz) → signed PUT URL to the sidecar; sidecar streams bytes through `content-pipeline` (hash + magic-bytes) to the backend object `/{file_id}/{version_id}`, then calls the token-authenticated **finalize** callback (`pending → available`); the client then separately **binds** the version (`content_id`) under `If-Match`                                                |
+| `cpt-cf-file-storage-fr-upload-file`                   | Control `POST /files` (authz) → signed PUT URL to the sidecar; sidecar streams bytes (incremental SHA-256, no in-stream MIME check) to the backend object `/{file_id}/{version_id}`, then calls the token-authenticated **finalize** callback (`pending → available`, control-plane MIME check on read-back); the client then separately **binds** the version (`content_id`) under `If-Match`                                                |
 | `cpt-cf-file-storage-fr-download-file`                 | Control presign (authz) → signed GET URL to the sidecar; the sidecar streams the current `content_id` blob from its `backend-abstraction` driver                                                                                 |
 | `cpt-cf-file-storage-fr-delete-file`                   | Control `DELETE /files/{id}` (requires `If-Match`): **metadata-row-first** — the `files` row and **all** its version rows are deleted in a committed transaction and `204` is returned, *then* the sidecar deletes the backend objects best-effort; a failed backend delete leaves only unreferenced objects swept by the P2 cleanup engine (never a row pointing at missing bytes). Idempotent: re-deleting returns `404`. Sequence in §3.6 |
 | `cpt-cf-file-storage-fr-get-metadata`                  | Control `GET /files/{id}` (metadata JSON) and `HEAD /files/{id}` (headers) read `files` + `files_custom_metadata` via `metadata-service` — no content on this surface                                          |
@@ -120,7 +121,7 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 | `cpt-cf-file-storage-fr-retention-indefinite`          | No background purge in P1; files live until owner deletes                                                                                                                |
 | `cpt-cf-file-storage-fr-backend-abstraction`           | `StorageBackend` async trait (in the **sidecar**) with capability sub-traits; P1 drivers: `local-filesystem`, `s3-compatible`                                                                 |
 | `cpt-cf-file-storage-fr-backend-capabilities`          | `BackendCapabilities` struct per driver, exposed via `GET /storages`; **no `versioning_native`** (versioning is FileStorage-level); P1 optional capabilities inactive                     |
-| `cpt-cf-file-storage-fr-backend-config-source`         | TOML file loaded at gear startup → in-memory `BackendRegistry`; surfaced read-only via `/storages`                                                                     |
+| `cpt-cf-file-storage-fr-backend-config-source`         | Platform gear YAML config (`gear_config`) loaded at gear startup → in-memory `BackendRegistry`; sidecar loads its own equivalent set from `FS_SIDECAR_*` env vars; surfaced read-only via `/storages`                                                                     |
 | `cpt-cf-file-storage-fr-rest-api`                      | Control-plane Axum router under `/api/file-storage/v1`: metadata, listing, version bind, and signed-URL issuance via OperationBuilder — **no content endpoints** (content lives on the sidecar)                                                   |
 | `cpt-cf-file-storage-fr-range-requests`                | See §4.1 Random Read Access for the full mechanics                                                                                                                       |
 | `cpt-cf-file-storage-fr-conditional-requests`          | Content-only `ETag` derived from `(file_id, content_id)`; `If-None-Match`/`If-Match` enforced on the sidecar for reads, on the control plane for bind/delete |
@@ -181,7 +182,6 @@ graph LR
     SCGW -.->|HTTP POST finalize<br/>token-authenticated (fs-token)| Meta
     SUI -.->|mint PASETO token| SCGW
     AZ -->|PolicyEnforcer| AuthZ[Authorization Service]
-    SC --> DB
     S3D -.->|HTTPS| S3[(S3 / MinIO)]
     LFS -.->|fs| Disk[(Local Disk)]
 ```
@@ -189,10 +189,10 @@ graph LR
 | Layer          | Plane    | Responsibility                                                                                                  | Technology                                                                       |
 |----------------|----------|-----------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------|
 | API            | control  | Metadata routing, conditional-request semantics, signed-URL issuance, version bind; **no content**              | axum, hyper, tower middleware, OperationBuilder                                  |
-| Data plane     | sidecar  | Signature + token verification, streaming upload/download, Range, hash + magic-bytes, response-header echo       | axum/hyper streaming, `aws-sdk-s3`, `tokio::fs`                                  |
+| Data plane     | sidecar  | Signature + token verification, streaming upload/download, Range, SHA-256 hashing (no in-stream MIME check), response-header echo | axum/hyper streaming, `aws-sdk-s3`, `tokio::fs`                                  |
 | Application    | both     | Orchestration: presign, bind/CAS, metadata CRUD, capability discovery (control); byte pipeline (sidecar)        | Rust async services (tokio)                                                      |
 | Domain         | control  | File identity, ownership, `content_id`/`meta_version`, ETag derivation, versions                                | Rust structs + SeaORM entities                                                   |
-| Infrastructure | both     | Postgres metadata (control + sidecar via SDK); backend drivers (sidecar); PolicyEnforcer; TOML config; PASETO/Ed25519 keys | SeaORM + SecureORM + SecureConn; `aws-sdk-s3`; `tokio::fs`; a PASETO v4 lib (`ed25519-dalek`)      |
+| Infrastructure | both     | Postgres metadata (control plane only — the sidecar has no DB connection); backend drivers (sidecar); PolicyEnforcer; platform gear YAML config (control) / env vars (sidecar backends); PASETO/Ed25519 keys | SeaORM + SecureORM + SecureConn; `aws-sdk-s3`; `tokio::fs`; a PASETO v4 lib (`ed25519-dalek`)      |
 
 ## 2. Principles & Constraints
 
@@ -295,7 +295,7 @@ the generated SDK trait via ClientHub. There is no out-of-process gRPC variant o
 SDK path is reserved as a P3 escape hatch (it hands callers a signed URL rather than streaming through the control
 plane).
 
-#### Sidecar is a separate deployable over the shared DB
+#### Sidecar is a separate deployable with no DB access
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-constraint-sidecar`
 
@@ -347,7 +347,7 @@ tooling is a P3 deliverable (`cpt-cf-file-storage-fr-runtime-backends`).
 | `ByteRange`           | Parsed `Range` request: `Inclusive(start, end)`, `OpenEnded(start)`, `Suffix(length)`                                                       |
 | `HashPolicy`          | **Not implemented.** No `HashPolicy`/`hash_policy` config surface exists in code (P1/P2 hash algorithm is hard-coded SHA-256; see ADR-0006 for the two shipped `hash_mode`s instead) |
 | `BackendCapabilities` | Per-backend feature flags: `multipart_native`, `encryption_native`, `range_native`, `presigned_url_internal` (no `versioning_native` — versioning is FS-level) |
-| `BackendConfig`       | Declared instance: `id`, `kind`, `endpoint`, `credentials`, `capabilities`, `hash_policy`. Loaded from TOML in P1                          |
+| `BackendConfig`       | Declared instance: `id`, `kind`, `endpoint`, `credentials`, `capabilities`, `hash_policy`. Loaded from the platform gear YAML config in P1 (control plane); the sidecar loads its own equivalent set from `FS_SIDECAR_*` env vars |
 
 **Relationships**:
 
@@ -457,15 +457,18 @@ minter** (holds the private key).
 
 ##### Responsibility scope
 
-- Mint a **PASETO `v4.public`** token carrying the claims `(op, file_id, content_id/version_id, exp, constraints,
-  response-headers; kid in footer)`, signed with the control-plane Ed25519 private key (§4.5). It is returned as a
-  `?fs-token=<token>` URL or to be sent as an `X-FS-Token` header; `backend_id`/path are not in the token (resolved from the
-  version row)
+- Mint a **PASETO `v4.public`**-equivalent token carrying the claims `(op, file_id, version_id, backend_id,
+  backend_path, exp, constraints, and, for downloads, content_type/etag)`, signed with the control-plane Ed25519
+  private key (§4.5). It is returned as a `?fs-token=<token>` URL or to be sent as an `X-FS-Token` header. As shipped,
+  **`backend_id`/`backend_path` ARE carried in the token** (not resolved from the version row at verify time) — the
+  sidecar has no DB connection and cannot resolve them any other way; see §4.5 for the one authoritative token
+  contract
 - Resolve the target: for download, the file's current `content_id` (or an explicit `version_id`); for upload, allocate
   nothing here (the version is pre-registered by the control plane itself, in the same request that returns this
   token — see `bind-service`)
-- Attach AND-combined constraints (`exp` required; optional `ip`/CIDR; optional token-claim predicates) and any
-  response-header overrides the caller requested
+- Attach AND-combined constraints: `exp` required; `max_size`/`exact_size`/`expected_hash` optional (upload); optional
+  `ip`/CIDR and token-claim predicates are a **NOT implemented** design intent (see §4.5), not a shipped capability;
+  `content_type`/`etag` are populated on download tokens only, not general response-header overrides
 - Never emit a backend-addressable URL — the URL host is always the sidecar
 
 ##### Responsibility boundaries
@@ -520,13 +523,15 @@ independently re-reads and re-hashes the backend object rather than persisting t
 
 ##### Why this component exists
 
-The **sidecar's** HTTP entry point on its own domain. Verifies the signed URL and (when a token-claim predicate is
-present) the platform token, then drives the byte path. The only component clients hit for content.
+The **sidecar's** HTTP entry point on its own domain. Verifies the signed URL, then drives the byte path. The only
+component clients hit for content.
 
 ##### Responsibility scope
 
-- Verify the **PASETO `v4.public`** token (Ed25519) with the control-distributed public key; check `exp`, `ip`, and token-claim predicates
-  (validating a real platform JWT when a predicate references a claim); reject with `403` on any failure
+- Verify the signed token (Ed25519, §4.5) with the control-distributed public key; check the signature, `exp`, and
+  the `op`/`file_id`/`version_id` binding (plus `part_number` for multipart-part tokens); reject with `403` on any
+  failure. `ip`/CIDR and token-claim predicates (`tok.<claim>`) are **NOT implemented** — `Claims` carries no such
+  fields and the sidecar makes no platform-JWT call of any kind (see §4.5's verification checklist)
 - Parse the `Range` header (to `ByteRange`) and conditional headers; serve `200`/`206`/`304`/`416` for downloads
 - On upload: stream the body through `stream-proxy` to the backend first (the version was already pre-registered by
   the control plane at presign time — the sidecar does **not** pre-register); once bytes have landed, call the
@@ -534,8 +539,10 @@ present) the platform token, then drives the byte path. The only component clien
   delegation, no FS SDK call) to flip the version `pending → available`. The sidecar does **not** bind — binding
   (the CAS swap of `content_id`) is a separate request the client issues to the control plane afterwards
 - Echo verbatim the response headers baked into the token; advertise `Accept-Ranges: bytes`
-- Own the **best-effort cleanup**: on the `415` magic-bytes abort (or any error after `put()` started), delete the
-  partially-written object; a hard crash leaves an orphan swept by the P2 cleanup engine
+- Own the **best-effort cleanup**: on any error after `put()` started (the sidecar itself aborts only on stream
+  errors and the shipped size/hash constraint checks — there is no in-sidecar `415` magic-bytes abort, see
+  `content-pipeline` above), delete the partially-written object; a hard crash leaves an orphan swept by the P2
+  cleanup engine
 
 ##### Auth model (exception to gateway-auth)
 
@@ -543,9 +550,9 @@ Because the sidecar is **not** fronted by the API Gateway (it is the data-plane 
 **not** receive a gateway-derived `SecurityContext`. Authorization for a content request is carried entirely by the
 **signed token** (the delegated authorization artifact, see §4.5): the sidecar verifies the token's signature and
 claims and treats that as the access decision for this resource + operation until `exp` — it performs **no fresh PDP
-call**. A platform **JWT in `Authorization`** is validated **only** when the token carries a token-claim predicate
-(e.g. `sub`/`tenant_id`), in which case the sidecar checks the JWT and matches each predicate; absent a predicate the
-JWT is not required. The sidecar derives no tenant/owner `SecurityContext` of its own beyond what the token asserts.
+call** and makes **no platform-JWT call of any kind**. A platform JWT in `Authorization` gated by a token-claim
+predicate is a **NOT implemented** design intent (see §4.5) — the sidecar never validates one today. The sidecar
+derives no tenant/owner `SecurityContext` of its own beyond what the token asserts.
 Request-id propagation and rate-limiting are the sidecar's own responsibility (it is not behind the gateway): it
 honours/propagates `X-Request-Id` and applies its own per-instance connection/bandwidth limits (the per-URL
 `max_rate`/`max_conns` claims are **P2**, see §4.5).
@@ -568,15 +575,15 @@ token-authenticated HTTP callback (not the FS SDK, no delegated identity); it ne
 
 ##### Why this component exists
 
-The data plane. Wires the byte path from HTTP body ↔ `content-pipeline` ↔ backend driver, in both upload and download
+The data plane. Wires the byte path from HTTP body ↔ hashing tap ↔ backend driver, in both upload and download
 directions, without buffering the whole file at any point.
 
 ##### Responsibility scope
 
 - **Upload path**: receive the raw `axum::body::Body` of the signed `PUT` (or one multipart part); tee chunks through
-  `content-pipeline` (which updates SHA-256 and runs magic-bytes detection on the first chunks); forward chunks to the
-  selected backend driver via `StorageBackend::put()` at `/{file_id}/{version_id}`. On stream completion, emit final
-  hash and the persisted `ObjectRef` from the driver
+  the incremental SHA-256 hasher (no in-stream MIME/magic-byte check — see `content-pipeline` above for why); forward
+  chunks to the selected backend driver via `StorageBackend::put()` at `/{file_id}/{version_id}`. On stream
+  completion, emit final hash and the persisted `ObjectRef` from the driver
 - **Download path**: invoke `StorageBackend::get(backend_path, range)` and pipe the returned `Stream<Bytes>` into
   the HTTP response body. Pass `ByteRange` through to backends that declare `range_native = true`; otherwise the
   driver's own range adapter applies (see §4.1)
@@ -602,8 +609,12 @@ come from the pre-registered version carried in the signed-URL context.
 
 ##### Why this component exists
 
-Centralizes the two streaming taps that *must* run on every upload: SHA-256 hashing and mime detection from magic
-bytes. Implementing them as a single composable tap on a `Stream<Bytes>` avoids re-reading the body.
+Originally conceived to centralize two streaming taps on every upload — SHA-256 hashing and MIME detection from magic
+bytes — as a single composable tap on a `Stream<Bytes>`, avoiding a re-read of the body. **Only the hashing half
+shipped that way.** As implemented (see the responsibility scope below), the sidecar's streaming path computes
+SHA-256 only; there is no in-stream MIME/magic-byte tap and no in-sidecar `415` abort. MIME validation is a
+control-plane, post-write check at `finalize`/`complete` instead — do not implement an in-stream sidecar MIME check
+against this component's original name.
 
 ##### Responsibility scope — design intent above superseded by the shipped split (see §4.8)
 
@@ -678,7 +689,8 @@ Versioning is **not** a backend capability — FileStorage versions via distinct
 - Define capability sub-traits: `MultipartCapable`, `EncryptionCapable` (both P2/P3 use, but the trait shapes are
   declared from P1 so consumers can downcast/probe)
 - Maintain the `BackendRegistry` — in-sidecar map of `backend_id → Arc<dyn StorageBackend>` populated at startup from
-  the TOML config (the same backend registry the control plane is configured with)
+  the sidecar's own `FS_SIDECAR_*` env vars (a separately-configured set, not shared state read from the control
+  plane's YAML config or the DB)
 - P1 drivers:
   - `local-filesystem` — `tokio::fs` reads/writes under a configured root directory; native Range via `seek + take`
   - `s3-compatible` — `aws-sdk-s3` (works against AWS S3, MinIO, Backblaze B2, Wasabi, etc.); native Range via
@@ -811,8 +823,9 @@ architecture the server owns the plan.)
 - Each **per-part signed URL carries the part's exact `size` as a token claim**; the sidecar rejects a body whose
   length ≠ the claim (`413`) **before** writing, so oversized bytes never reach the backend — per-part size enforcement
   is therefore transfer-time, not deferred to `complete`
-- Each part's hash is persisted by the sidecar (via SDK) in `multipart_upload_parts.part_hash` in the shared DB —
-  durable so an upload is resumable and survives a sidecar crash
+- Each part's hash is reported by the sidecar to the control plane over a token-authenticated `report-part` HTTP
+  callback (never a direct DB write — the sidecar has no DB connection) and persisted by the control plane in
+  `multipart_upload_parts.part_hash` — durable so an upload is resumable and survives a sidecar crash
 - `complete` binds the new version exactly like single-shot (CAS on `content_id`, `400 failed_precondition` → rebind)
 
 `part_hash` is a SHA-256 of each part's bytes (`hash::sha256(&data)`). Per
@@ -1224,11 +1237,11 @@ and is immutable.
 | `version_id`      | `uuid`                                | FileStorage-assigned version identity; backend object key suffix             |
 | `mime_type`       | `text`                                | Declared & validated mime of this version                                    |
 | `size`            | `bigint`                              | Content size in bytes                                                        |
-| `hash_algorithm`  | `text`                                | Always `'SHA-256'` (P1 and P2, single mode); the `hash_mode` discriminator ADR-0006 describes is shipped — see `docs/migration.sql`'s `file_versions.hash_mode`/`part_count` columns and its `version_hash_manifest` table (this design table predates that addition) |
+| `hash_algorithm`  | `text`                                | Always `'SHA-256'` (P1 and P2, single **algorithm** — no algorithm widening); there are two shipped hash **modes** (whole-object and multipart-composite), not two algorithms — see the `hash_mode` discriminator ADR-0006 describes, `docs/migration.sql`'s `file_versions.hash_mode`/`part_count` columns, and its `version_hash_manifest` table (this design table predates that addition) |
 | `hash_value`      | `bytea`                               | Content digest (32 bytes for SHA-256)                                        |
 | `status`          | `text` (`'pending'` \| `'available'`) | `'pending'` from pre-register until **finalize** (sidecar's post-`PUT` callback), then `'available'`. `bind` is a separate step (swaps `content_id`) and does not gate this column |
 | `is_current`      | `boolean`                             | Whether this version is the file's current content (matches `files.content_id`) |
-| `backend_id`      | `text`                                | `BackendConfig` that holds the bytes (TOML in P1)                            |
+| `backend_id`      | `text`                                | `BackendConfig` that holds the bytes (platform YAML config in P1)            |
 | `backend_path`    | `text`                                | Opaque per-driver path (`/{file_id}/{version_id}` convention)                |
 | `created_at`      | `timestamptz`                         | Version creation time                                                        |
 
@@ -1282,7 +1295,7 @@ in P2 (`cpt-cf-file-storage-fr-metadata-limits`); in P1 only sanity limits apply
 | `events_outbox`                    | P2    | Outbox for EventBroker file-write events                                                 | `cpt-cf-file-storage-fr-file-events`                             |
 | `policies`                         | P2    | Tenant + user policy definitions                                                         | `cpt-cf-file-storage-fr-allowed-types-policy`, etc.              |
 | `retention_rules`                  | P2    | Auto-expiration definitions                                                              | `cpt-cf-file-storage-fr-retention-policies`                      |
-| `storage_backends_runtime`         | P3    | DB-resident backend configuration that supersedes the P1 TOML file                       | `cpt-cf-file-storage-fr-runtime-backends`                        |
+| `storage_backends_runtime`         | P3    | DB-resident backend configuration that supersedes the P1 YAML-configured backend set      | `cpt-cf-file-storage-fr-runtime-backends`                        |
 
 ### 3.8 Deployment Topology
 
@@ -1310,7 +1323,8 @@ and the sidecar (a separate data-plane deployable on its own domain). The releva
   filesystem mount). For `local-filesystem`, the same physical (or networked) filesystem MUST be mounted on every
   sidecar replica; for `s3-compatible`, every sidecar replica must have network access and credentials. The control
   plane needs the backend **registry/capabilities** (to resolve `backend_id` and build signed URLs) but not the
-  content credentials. Credentials live in environment variables / mounted secret files referenced from the TOML config
+  content credentials. Credentials live in environment variables / mounted secret files referenced from the platform
+  gear YAML config (control plane) or from the sidecar's own `FS_SIDECAR_*` env vars
 - **Signing keys**: the control plane holds the Ed25519 **private** key; the sidecar holds the **public** key. P1 uses
   one static keypair distributed by configuration (no rotation; key rotation + keyset is P2)
 - **Metadata DB**: shared Postgres cluster with the platform; `file_storage` schema; migrations applied at startup by
@@ -1462,9 +1476,10 @@ cache-validator surface from the hash-algorithm surface.
 Every request flows through async tokio tasks; no thread-pool style blocking. The two design rules:
 
 - **No request-scoped buffering.** Upload and download paths use `axum::body::Body` and `futures::Stream<Bytes>` end
-  to end. Chunks flow through `content-pipeline`'s SHA-256 updater and magic-bytes detector synchronously (negligible
-  CPU per chunk), then onward. The `Stream<Bytes>` from a backend `get()` is plumbed directly into the response body
-  without `.collect()`
+  to end. On upload, chunks flow through the sidecar's incremental SHA-256 hasher synchronously (negligible CPU per
+  chunk; no magic-byte/MIME detector runs in this stream — that check is control-plane, post-write, see
+  `content-pipeline` in §3.3), then onward. The `Stream<Bytes>` from a backend `get()` is plumbed directly into the
+  response body without `.collect()`
 - **Backpressure propagates.** A slow client makes the response stream block; that blocks `stream-proxy` from
   consuming more chunks from the backend; that blocks the backend driver from reading more bytes; that throttles the
   backend connection. The same applies in the upload direction. There is no internal queue that can grow without
@@ -1633,8 +1648,10 @@ intermediaries (ADR-0004 "Token Opacity Contract"). Observability is sanitized s
 never by decoding the token at the edge.
 
 **Keys = the control↔sidecar sync.** Distributing the **PASETO verification public key** (and, in P2, the `kid` set)
-plus the backend registry/config is the only state the control plane "synchronizes" to the sidecar; metadata is not
-replicated — the sidecar reads the shared DB via SDK.
+is the only state the control plane "synchronizes" to the sidecar; the backend registry/config is configured
+independently on each plane (platform YAML on the control plane, `FS_SIDECAR_*` env vars on the sidecar — see §3.8).
+Metadata is not replicated to the sidecar at all — it has no DB connection of any kind and resolves everything it
+needs from the verified token's claims (§4.5, §4.8).
 
 **Signing locality & cost.** Minting a token requires the **private key**, which only the control plane holds. A PASETO
 `v4.public` sign (Ed25519) is a CPU-only operation of tens of microseconds — no DB hit, no network in the signing step.
@@ -1672,7 +1689,8 @@ while every control decision stays mediated by the LMS.
    `size` and content `hash` it already knows. The optional values let the control plane tighten the token: a declared
    `size` is baked as the `exact_size` claim (otherwise a policy-driven `max_size` applies), and a declared `hash` is
    baked as `expected_hash` — so the sidecar verifies the upload against exactly what the client committed up front.
-   (`mime_type` is always required because the sidecar validates it against the content's magic bytes.)
+   (`mime_type` is always required; it is validated against the content's magic bytes on the **control plane** at
+   `finalize`/`complete`, not by the sidecar in-stream — see §4.8.)
 2. The LMS backend runs its own business checks first (assessment open, attempt ownership, limits, allowed type/size
    for this question), then **proxies** to FSCP via the FileStorage **SDK** (on behalf of the student). The control
    plane runs its own authz (`write` on `gts.cf.fstorage.file.type.v1~x.lms.assessment.image.v1~`), creates the
@@ -1711,8 +1729,9 @@ while every control decision stays mediated by the LMS.
    | `tok.sub` | `stu_91a2` | token-claim predicate — caller's `sub` must equal the student |
    | *(footer)* `kid` | `fs-2026-06` | key id (P2 rotation; single key in P1) |
 
-   No `backend_id` in the token — control picks the backend and returns it to the sidecar at pre-register. A
-   programmatic caller could instead receive the token to send as an `X-FS-Token` header (same bytes).
+   As shipped, the token also carries `backend_id`/`backend_path` claims (omitted from the table above for brevity) —
+   the sidecar has no DB connection and cannot resolve them any other way (see §4.5). A programmatic caller could
+   instead receive the token to send as an `X-FS-Token` header (same bytes).
 
 3. The LMS hands `upload_url` to the browser, which uploads the bytes straight to the **sidecar** (no extra headers
    needed beyond the platform JWT the predicate requires):
@@ -1863,9 +1882,10 @@ resumes** without re-uploading what already landed. Same hosts as §4.6. The stu
 3. The browser uploads parts in parallel (up to the `concurrency` hint), each straight to the **sidecar**:
    `PUT .../parts/1`, `PUT .../parts/2`, `PUT .../parts/3`. For each part the sidecar verifies the signature, streams
    the bytes to the backend (`PutPart` on a native backend, or an offset-write into the single new-version object
-   otherwise), computes the part's SHA-256 hash on-the-fly, validates magic bytes on **part 1**
-   (`video/mp4`), and
-   **persists the part state in the shared DB** (`multipart_upload_parts`: `backend_etag`/offset, `size`, `part_hash`).
+   otherwise), and computes the part's SHA-256 hash on-the-fly (no in-stream MIME/magic-byte check — that runs on the
+   control plane at `complete`, see §4.8). The sidecar then reports the part's hash/size over the token-authenticated
+   `report-part` callback, and the control plane **persists the part state** (`multipart_upload_parts`:
+   `backend_etag`/offset, `size`, `part_hash`) — the sidecar itself never writes the DB.
 4. Say parts **1, 3, 4** land successfully (rows written) but parts **2 and 5** fail mid-flight, then the student's
    session breaks — they are logged out and walk away. Note the gap is **non-contiguous** (a middle part and the last
    part are missing). Crucially, the durable part rows for 1, 3, 4 survive in the DB, and the `multipart_uploads` row
