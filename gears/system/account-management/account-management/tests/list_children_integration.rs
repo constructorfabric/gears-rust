@@ -426,33 +426,123 @@ async fn list_children_rejects_ordered_comparison_on_status() {
     );
 }
 
-/// `$orderby=status` is rejected by the framework before the
-/// effective-order is composed: the column is exposed as a string on
-/// the wire but is `SMALLINT` in storage, so the cursor codec would
-/// either fail to decode the token (decoded as a String when the
-/// model side returned a `SmallInt`) or compare against the wrong
-/// SQL type on the next page. `TenantODataMapper::is_orderable`
-/// returns `false` for `Status`, which the framework's order-
-/// validation loop trips on.
+/// `$orderby=status` sorts children by the lifecycle ordinal
+/// (`Active = 1 < Suspended = 2 < Deleted = 3`), the order the
+/// Tenants-page Status column uses. Insertion (`created_at`) order is
+/// deliberately NOT the ordinal order, so a passing assertion proves
+/// the sort honoured `status`, not the chronological default.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_children_rejects_orderby_on_status() {
+async fn list_children_orderby_status_sorts_by_lifecycle_ordinal() {
     let h = setup_sqlite().await.expect("harness");
     let root = Uuid::from_u128(ROOT_ID);
     seed_root(&h, root).await;
+
+    let type_a = Uuid::from_u128(0xAA);
+    let suspended_old = Uuid::from_u128(0x701);
+    let active_new = Uuid::from_u128(0x702);
+    let suspended_new = Uuid::from_u128(0x703);
+    seed_tenant_at(&h, suspended_old, root, SUSPENDED, false, type_a, ts_at(1)).await;
+    seed_tenant_at(&h, active_new, root, ACTIVE, false, type_a, ts_at(2)).await;
+    seed_tenant_at(&h, suspended_new, root, SUSPENDED, false, type_a, ts_at(3)).await;
 
     let query = ODataQuery::default().with_order(ODataOrderBy(vec![OrderKey {
         field: "status".to_owned(),
         dir: SortDir::Asc,
     }]));
-    let err = h
+    let page = h
         .repo
         .list_children(&allow_all(), root, &query)
         .await
-        .expect_err("$orderby=status MUST be rejected");
-    let detail = format!("{err:?}");
-    assert!(
-        detail.contains("status") || detail.contains("InvalidOrderByField"),
-        "expected order-validation rejection; got {detail}"
+        .expect("$orderby=status must be accepted");
+
+    // Effective order is (status ASC, id ASC): active first, then the
+    // two suspended rows tie-broken by id.
+    assert_eq!(
+        ids_of(&page.items),
+        vec![active_new, suspended_old, suspended_new],
+        "`$orderby=status asc` MUST sort by lifecycle ordinal with id tiebreak"
+    );
+}
+
+/// Cursor guard: ordering by `status` must survive the cursor
+/// round-trip. The cursor token carries the storage ordinal
+/// (`cursor_kind = I64` on the AM mapper), so page 2+ predicates
+/// compare SMALLINT-to-integer — the exact wire-vs-storage mismatch
+/// that used to force `is_orderable = false` for this field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_children_orderby_status_cursor_roundtrip() {
+    let h = setup_sqlite().await.expect("harness");
+    let root = Uuid::from_u128(ROOT_ID);
+    seed_root(&h, root).await;
+
+    let type_a = Uuid::from_u128(0xAA);
+    // 5 children, statuses interleaved so every page boundary lands
+    // inside or between ordinal groups.
+    let seeds: Vec<(Uuid, i16)> = vec![
+        (Uuid::from_u128(0x711), SUSPENDED),
+        (Uuid::from_u128(0x712), ACTIVE),
+        (Uuid::from_u128(0x713), SUSPENDED),
+        (Uuid::from_u128(0x714), ACTIVE),
+        (Uuid::from_u128(0x715), ACTIVE),
+    ];
+    for (i, (id, status)) in seeds.iter().enumerate() {
+        seed_tenant_at(
+            &h,
+            *id,
+            root,
+            *status,
+            false,
+            type_a,
+            ts_at(1) + Duration::seconds(i64::try_from(i).unwrap()),
+        )
+        .await;
+    }
+
+    // Expected effective order (status ASC, id ASC): the three active
+    // rows by id, then the two suspended rows by id.
+    let expected = vec![
+        Uuid::from_u128(0x712),
+        Uuid::from_u128(0x714),
+        Uuid::from_u128(0x715),
+        Uuid::from_u128(0x711),
+        Uuid::from_u128(0x713),
+    ];
+
+    // Bound the walk: a mapper/codec regression that emits a repeated
+    // `next_cursor` would otherwise loop forever instead of failing. A
+    // cursor seen twice is a hard assertion, not a hang.
+    let mut seen_cursors = std::collections::HashSet::new();
+    let mut collected = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut q = ODataQuery::default().with_limit(2);
+        if let Some(c) = cursor.take() {
+            assert!(
+                seen_cursors.insert(c.clone()),
+                "cursor walk returned a repeated cursor — pagination is not advancing"
+            );
+            q = q.with_cursor(CursorV1::decode(&c).expect("decode status cursor"));
+        } else {
+            q = q.with_order(ODataOrderBy(vec![OrderKey {
+                field: "status".to_owned(),
+                dir: SortDir::Asc,
+            }]));
+        }
+        let page = h
+            .repo
+            .list_children(&allow_all(), root, &q)
+            .await
+            .expect("status-ordered cursor page must not fail");
+        collected.extend(ids_of(&page.items));
+        match page.page_info.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(
+        collected, expected,
+        "cursor walk over `$orderby=status` MUST visit every row exactly \
+         once in (status ASC, id ASC) order"
     );
 }
 

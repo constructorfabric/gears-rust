@@ -17,7 +17,7 @@ use toolkit_db::odata::sea_orm_filter::{
     FieldToColumn, LimitCfg, ODataFieldMapping, PaginateOdataTryError, paginate_odata_try,
 };
 use toolkit_db::secure::SecureEntityExt;
-use toolkit_odata::filter::{FilterOp, ODataValue};
+use toolkit_odata::filter::{FieldKind, FilterField as _, FilterOp, ODataValue};
 use toolkit_odata::{ODataQuery, Page, SortDir, ast};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -136,23 +136,20 @@ impl FieldToColumn<TenantInfoFilterField> for TenantODataMapper {
         }
     }
 
-    /// Reject `$orderby=status` and `status` cursor keys: the column
-    /// is exposed as a string contract on the wire while it is
-    /// `SMALLINT` in storage, and there is no consistent ordering
-    /// across the two shapes — alphabetical (`active < deleted <
-    /// suspended`) versus numeric (`Active = 1 < Suspended = 2 <
-    /// Deleted = 3`). The framework rejects the `$orderby` clause as
-    /// `InvalidOrderByField` before composing the effective order, so
-    /// the cursor codec never sees a translated-shape value.
+    /// `$orderby=status` sorts by the lifecycle ordinal (`Active = 1 <
+    /// Suspended = 2 < Deleted = 3`), NOT alphabetically by the wire
+    /// string — a deliberate categorical order (healthy first,
+    /// tombstones last, and inverted via `desc`) that operator UIs sort
+    /// their Status column by. Cursor pages are safe: both
+    /// the effective-order comparison and `extract_cursor_value` speak
+    /// the storage `SMALLINT`, so the codec never sees a
+    /// translated-shape value.
+    ///
+    /// `$orderby=tenant_type` stays rejected: it compares via a derived
+    /// `UUIDv5`, and an ordered comparison on a derived UUID has no
+    /// honest meaning.
     fn is_orderable(field: TenantInfoFilterField) -> bool {
-        // `status` and `tenant_type` are exposed as strings on the wire but
-        // compared via a translated storage shape (SMALLINT / derived
-        // UUIDv5); neither has a consistent wire-vs-storage order, so
-        // `$orderby` on them is rejected before the effective order composes.
-        !matches!(
-            field,
-            TenantInfoFilterField::Status | TenantInfoFilterField::TenantType
-        )
+        !matches!(field, TenantInfoFilterField::TenantType)
     }
 }
 
@@ -182,6 +179,17 @@ impl ODataFieldMapping<TenantInfoFilterField> for TenantODataMapper {
             TenantInfoFilterField::UpdatedAt => {
                 sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.updated_at)))
             }
+        }
+    }
+
+    /// `status` is a wire string but sorts (and therefore cursors) by
+    /// its storage lifecycle ordinal — encode/parse its cursor token as
+    /// an integer, not with the wire `String` kind. Every
+    /// other field's cursor shape matches its wire kind.
+    fn cursor_kind(field: TenantInfoFilterField) -> FieldKind {
+        match field {
+            TenantInfoFilterField::Status => FieldKind::I64,
+            other => other.kind(),
         }
     }
 }
@@ -646,6 +654,17 @@ mod tenant_type_filter_tests {
     fn tenant_type_is_not_orderable() {
         assert!(!<Mapper as FieldToColumn<Field>>::is_orderable(
             Field::TenantType
+        ));
+    }
+
+    // Regression guard: the Tenants-page Status column sorts via
+    // `$orderby=status`; the field must be orderable (lifecycle-ordinal
+    // order — see `is_orderable` docs), not rejected with
+    // `InvalidOrderByField` → 400 as it used to be.
+    #[test]
+    fn status_is_orderable() {
+        assert!(<Mapper as FieldToColumn<Field>>::is_orderable(
+            Field::Status
         ));
     }
 }

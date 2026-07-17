@@ -750,14 +750,18 @@ components:
         `SMALLINT` ordinal at the repo boundary. Examples:
         `status eq 'active'`, `status eq 'pending'`,
         `target_mode eq 'self_managed'`, `initiator_side eq 'child'`.
-        Only `eq`, `ne`, and `in` are admissible on these columns;
-        ordered comparisons (`gt`/`ge`/`lt`/`le`) and `$orderby` are
-        rejected with `400 INVALID_FILTER` because there is no
-        consistent ordering across the wire (alphabetical) and
-        storage (numeric) shapes. Response bodies
-        return the same field as a string (`"pending"`, `"active"`,
-        etc.) for human readability — the filter is the one place
-        the wire surface diverges from the response shape.
+        Only `eq`, `ne`, and `in` are admissible in `$filter` on these
+        columns; ordered comparisons (`gt`/`ge`/`lt`/`le`) are rejected
+        with `400 INVALID_FILTER` because the wire strings carry no
+        meaningful order. `$orderby` on the `conversion_requests`
+        enum columns is likewise rejected. `$orderby=status` on the
+        tenant children listing IS supported and sorts by the
+        lifecycle ordinal (`active` < `suspended` < `deleted`), not
+        alphabetically — operator UIs sort their Status column with
+        it. Filters and response bodies use the same public string
+        values (`"pending"`, `"active"`, etc.); the divergence is
+        between the wire contract (strings) and the `SMALLINT` storage
+        ordinal, not between the filter and the response shape.
       schema:
         type: string
     ODataOrderBy:

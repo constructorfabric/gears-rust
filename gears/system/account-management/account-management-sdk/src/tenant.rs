@@ -240,7 +240,11 @@ pub struct TenantInfoQuery {
     /// (the serde rename on the SDK enum). The `OData` parser only
     /// validates the value is a String; arbitrary unknown values
     /// (including the AM-internal `"provisioning"`) reach storage and
-    /// are mapped to a domain error downstream.
+    /// are mapped to a domain error downstream. `$orderby=status` is
+    /// supported and sorts by the lifecycle ordinal (`active` <
+    /// `suspended` < `deleted`), not alphabetically — operator UIs sort
+    /// their Status column with it; filter comparisons stay
+    /// membership-only (`eq` / `ne` / `in`).
     #[odata(filter(kind = "String"))]
     pub status: String,
     /// Deterministic `UUIDv5` of the registered tenant-type schema id.
@@ -259,7 +263,7 @@ pub struct TenantInfoQuery {
     /// string is mapped server-side to its deterministic `UUIDv5` and
     /// compared against `tenant_type_uuid`; ordered operators and
     /// `$orderby` are rejected (sorting by a derived UUID is
-    /// meaningless), mirroring `status`.
+    /// meaningless).
     #[odata(filter(kind = "String"))]
     pub tenant_type: String,
     /// `tenants.self_managed` flag. Useful to surface "boundary"

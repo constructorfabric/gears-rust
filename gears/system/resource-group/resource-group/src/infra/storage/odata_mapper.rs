@@ -6,6 +6,7 @@
 //! This gear maps from DTO-level filter fields to `SeaORM` Column types.
 
 use toolkit_db::odata::sea_orm_filter::{FieldToColumn, ODataFieldMapping};
+use toolkit_odata::filter::{FieldKind, FilterField as _};
 
 use crate::infra::storage::entity::gts_type::{
     Column as TypeColumn, Entity as TypeEntity, Model as TypeModel,
@@ -77,6 +78,18 @@ impl ODataFieldMapping<GroupFilterField> for GroupODataMapper {
             GroupFilterField::Type => sea_orm::Value::SmallInt(Some(model.gts_type_id)),
         }
     }
+
+    /// `type` is a wire string but its cursor value is the storage
+    /// `SMALLINT` gts ordinal — without this override the cursor codec
+    /// would try to encode the `SmallInt` under the wire `String` kind
+    /// and fail with `InvalidCursor` on any `$orderby=type` page
+    /// overflow (same wire-vs-storage seam as AM's `status`).
+    fn cursor_kind(field: GroupFilterField) -> FieldKind {
+        match field {
+            GroupFilterField::Type => FieldKind::I64,
+            other => other.kind(),
+        }
+    }
 }
 
 /// `OData` mapper for hierarchy queries (not used for `paginate_odata`; hierarchy
@@ -101,6 +114,14 @@ impl ODataFieldMapping<HierarchyFilterField> for HierarchyODataMapper {
         match field {
             HierarchyFilterField::HierarchyDepth => sea_orm::Value::Int(None),
             HierarchyFilterField::Type => sea_orm::Value::SmallInt(Some(model.gts_type_id)),
+        }
+    }
+
+    /// Same wire-string / storage-SMALLINT seam as `GroupODataMapper`.
+    fn cursor_kind(field: HierarchyFilterField) -> FieldKind {
+        match field {
+            HierarchyFilterField::Type => FieldKind::I64,
+            HierarchyFilterField::HierarchyDepth => field.kind(),
         }
     }
 }
@@ -135,6 +156,14 @@ impl ODataFieldMapping<MembershipFilterField> for MembershipODataMapper {
             MembershipFilterField::ResourceId => {
                 sea_orm::Value::String(Some(Box::new(model.resource_id.clone())))
             }
+        }
+    }
+
+    /// Same wire-string / storage-SMALLINT seam as `GroupODataMapper`.
+    fn cursor_kind(field: MembershipFilterField) -> FieldKind {
+        match field {
+            MembershipFilterField::ResourceType => FieldKind::I64,
+            other => other.kind(),
         }
     }
 }
