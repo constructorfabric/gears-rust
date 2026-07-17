@@ -1,0 +1,60 @@
+{
+  "$id": "gts://gts.cf.core.events.consumer_group.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Consumer group resource. Persistent broker resource (evbk_consumer_group). Two creation paths: anonymous (broker-minted UUID via POST /v1/consumer-groups) and named (vendor-namespaced via types_registry upsert).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "tenant_id", "owner_principal_id", "kind"],
+  "properties": {
+    "id": {
+      "description": "Full GTS consumer-group identifier. Broker-minted for anonymous groups; registered via types_registry for named groups. Always server-set — clients MUST NOT supply this field on creation.",
+      "type": "string",
+      "readOnly": true
+    },
+    "tenant_id": {
+      "description": "Owner tenant (from SecurityContext at create time). Non-overridable.",
+      "type": "string",
+      "format": "uuid",
+      "readOnly": true
+    },
+    "owner_principal_id": {
+      "description": "Creator principal (from SecurityContext at create time). For named groups, this is the registering module's principal. Non-overridable.",
+      "type": "string",
+      "readOnly": true
+    },
+    "kind": {
+      "description": "Group kind — derived from id-instance shape, stored for fast filtering.",
+      "type": "string",
+      "enum": ["named", "anonymous"],
+      "readOnly": true
+    },
+    "description": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "readOnly": true
+    }
+  },
+  "definitions": {
+    "CreateRequest": {
+      "description": "Request body for POST /v1/consumer-groups. The broker mints the identifier server-side; this body MUST NOT carry an id.",
+      "type": "object",
+      "required": ["client_agent"],
+      "additionalProperties": false,
+      "properties": {
+        "client_agent": {
+          "description": "RFC 9110 User-Agent grammar; ASCII; 1-256 bytes. Diagnostic hint surfaced in operational logs. No broker-side semantic beyond logging.",
+          "type": "string",
+          "pattern": "^[\\x20-\\x7E]+$",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

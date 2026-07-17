@@ -1,0 +1,16 @@
+error[E0599]: no method named `build` found for struct `ProducerBuilder<producer::direct::Missing, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has>` in the current scope
+  --> tests/trybuild/producer/missing_direct_broker.rs:10:10
+   |
+ 4 |       let _ = Producer::builder()
+   |  _____________-
+ 5 | |         .security_context(toolkit_security::SecurityContext::anonymous())
+ 6 | |         .identity(ProducerIdentity::new().source("orders"))
+ 7 | |         .deduplication(DirectDeduplication::stateless())
+ 8 | |         .topics(["orders"])
+ 9 | |         .event_type_patterns(["orders.*"])
+10 | |         .build();
+   | |         -^^^^^ method not found in `ProducerBuilder<producer::direct::Missing, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has>`
+   | |_________|
+   |
+   |
+   = note: the method was found for `ProducerBuilder<producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has>`

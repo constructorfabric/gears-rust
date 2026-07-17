@@ -1,0 +1,19 @@
+[package]
+name = "cf-gears-toolkit-stable-hash"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Stable non-cryptographic hash implementations for CF/Gears"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "hashing", "murmur3"]
+categories = ["algorithms"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "toolkit_stable_hash"
+
+[lints]
+workspace = true

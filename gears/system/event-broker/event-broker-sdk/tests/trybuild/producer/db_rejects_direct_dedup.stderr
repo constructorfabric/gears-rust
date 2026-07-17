@@ -1,0 +1,24 @@
+error[E0277]: the trait bound `DbDeduplication: From<DirectDeduplication>` is not satisfied
+ --> tests/trybuild/producer/db_rejects_direct_dedup.rs:4:49
+  |
+4 |     let _ = DbProducer::builder().deduplication(DirectDeduplication::stateless());
+  |                                   ------------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `From<DirectDeduplication>` is not implemented for `DbDeduplication`
+  |                                   |
+  |                                   required by a bound introduced by this call
+  |
+help: the trait `From<DirectDeduplication>` is not implemented for `DbDeduplication`
+      but trait `From<producer::types::ManagedDeduplicationBuilder>` is implemented for it
+ --> src/producer/types.rs
+  |
+  | impl From<ManagedDeduplicationBuilder> for DbDeduplication {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = help: for that trait implementation, expected `producer::types::ManagedDeduplicationBuilder`, found `DirectDeduplication`
+  = note: required for `DirectDeduplication` to implement `Into<DbDeduplication>`
+note: required by a bound in `DbProducerBuilder::<B, Db, C, I, D, T, P>::deduplication`
+ --> src/producer/db.rs
+  |
+  |     pub fn deduplication(
+  |            ------------- required by a bound in this associated function
+  |         self,
+  |         deduplication: impl Into<DbDeduplication>,
+  |                             ^^^^^^^^^^^^^^^^^^^^^ required by this bound in `DbProducerBuilder::<B, Db, C, I, D, T, P>::deduplication`

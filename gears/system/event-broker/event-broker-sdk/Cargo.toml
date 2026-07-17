@@ -1,0 +1,53 @@
+[package]
+name = "cf-gears-event-broker-sdk"
+description = "SDK for the Event Broker: high-level typed event publishing and consumption"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["cyberfabric", "cf-gears", "event-broker"]
+categories = ["asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+name = "event_broker_sdk"
+path = "src/lib.rs"
+
+[features]
+default = []
+db = ["dep:sea-orm", "dep:toolkit-db", "toolkit-db/sqlite"]
+outbox = ["db", "toolkit-db/preview-outbox"]
+integration = []
+test-util = ["dep:async-stream"]
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4", "v5", "v7", "serde"] }
+chrono = { workspace = true, features = ["clock", "serde"] }
+tracing = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio-util = { workspace = true, features = ["rt"] }
+async-stream = { workspace = true, optional = true }
+toolkit-security = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-stable-hash = { workspace = true }
+jsonschema = { workspace = true }
+
+gts-id = { workspace = true }
+toolkit-gts = { workspace = true }
+toolkit-db = { workspace = true, optional = true }
+sea-orm = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+trybuild = { workspace = true }

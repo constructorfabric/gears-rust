@@ -1,0 +1,134 @@
+{
+  "$id": "gts://gts.cf.core.events.event.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Event schema. Single canonical resource shape used by both publish input (POST /v1/events, POST /v1/events:batch) and read responses (poll / query). Per-direction semantics are encoded via JSON Schema field-level markers: `writeOnly` fields (meta) are accepted on publish and stripped on read; `readOnly` fields (partition, sequence, sequence_time) are server-stamped on read and rejected with 400 BadRequest if supplied on publish. The top-level `required` list is the union of publish-required and read-required fields; strict-validator producers must filter `readOnly` fields before submission. See ADR/0003-event-schema.md.",
+  "type": "object",
+  "required": [
+    "id",
+    "type",
+    "topic",
+    "tenant_id",
+    "source",
+    "subject",
+    "subject_type",
+    "occurred_at",
+    "partition",
+    "sequence",
+    "sequence_time"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "description": "Client-provided unique event identifier (UUID).",
+      "type": "string",
+      "format": "uuid"
+    },
+    "type": {
+      "description": "Full GTS event-type identifier. ASCII only.",
+      "type": "string",
+      "pattern": "^[\\x20-\\x7E]+$",
+      "maxLength": 512
+    },
+    "topic": {
+      "description": "Full GTS topic identifier. ASCII only.",
+      "type": "string",
+      "pattern": "^[\\x20-\\x7E]+$",
+      "maxLength": 512
+    },
+    "tenant_id": {
+      "description": "Tenant the event belongs to. Producer-supplied. Ingest validates the producer's principal is authorized to publish to this tenant via the platform's authz resolver; unauthorized publishes are rejected with 403 TenantIdNotAuthorized.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "source": {
+      "description": "Origin of the event (e.g., service name). ASCII only.",
+      "type": "string",
+      "pattern": "^[\\x20-\\x7E]+$",
+      "maxLength": 256
+    },
+    "subject": {
+      "description": "Subject entity identifier for event correlation, filtering, and consumer semantics. Producers that need subject-level ordering set `partition_key` to the subject value. ASCII only.",
+      "type": "string",
+      "pattern": "^[\\x20-\\x7E]+$",
+      "maxLength": 1024,
+      "minLength": 1
+    },
+    "subject_type": {
+      "description": "Full GTS subject-type identifier — the type of the entity the event is about. Required and NOT derivable from `type`: event types may be generic (e.g., `rule_applied`) across multiple subject kinds, and events may have no `data` body to introspect. ASCII only.",
+      "type": "string",
+      "pattern": "^[\\x20-\\x7E]+$",
+      "maxLength": 512
+    },
+    "partition_key": {
+      "description": "Optional producer-supplied routing key for partition selection. When present: partition = murmur3_32(ascii_bytes(partition_key)) % topic.partitions. When absent: same hash applied to `tenant_id` (per-tenant ordering by default). There is no explicit producer-set partition override. See ADR/0002-partition-selection.md. ASCII only, max 1024 bytes.",
+      "type": "string",
+      "pattern": "^[\\x20-\\x7E]*$",
+      "maxLength": 1024
+    },
+    "occurred_at": {
+      "description": "When the event occurred (producer-stamped). ISO 8601 / RFC 3339 timestamp.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "trace_parent": {
+      "description": "W3C Trace Context parent. Carries the trace context the event was produced under; surfaced on read responses for consumer-side trace correlation. Validated against the W3C traceparent header format.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
+    },
+    "data": {
+      "description": "Event payload, validated against the event type's data_schema at ingest. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).",
+      "type": "object"
+    },
+    "partition": {
+      "description": "Server-stamped partition for the event, surfaced on read. Computed at ingest via the partition contract (see ADR/0002-partition-selection.md). Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.",
+      "type": "integer",
+      "format": "int32",
+      "minimum": 0,
+      "readOnly": true
+    },
+    "sequence": {
+      "description": "Server-assigned monotonic ordering key per (topic, partition), surfaced on read. The only sequence consumers paginate by. Distinct from `meta.sequence` (publish-only producer-side chain field). Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.",
+      "type": "integer",
+      "format": "int64",
+      "minimum": 0,
+      "readOnly": true
+    },
+    "sequence_time": {
+      "description": "Server-stamped timestamp recording when `sequence` was assigned. Surfaced on read. Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.",
+      "type": "string",
+      "format": "date-time",
+      "readOnly": true
+    },
+    "meta": {
+      "description": "Optional publish-time transport-metadata block. Carries producer-protocol fields (producer_id, previous, sequence) for chained / monotonic modes. Omit entirely for stateless publish. Stripped on read responses; consumers MUST NOT rely on it. See ADR/0003-event-schema.md § Decision and ADR/0004-idempotent-producer-protocol.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version"],
+      "writeOnly": true,
+      "properties": {
+        "version": {
+          "description": "Meta-block schema version. The broker accepts version <= current_supported and rejects newer with 400 UnknownMetaVersion.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "producer_id": {
+          "description": "Producer registered via POST /v1/producers; bound to the calling principal. Required for chained / monotonic mode publishes. Omit for stateless. ASCII (UUID format).",
+          "type": "string",
+          "format": "uuid"
+        },
+        "previous": {
+          "description": "Predecessor's sequence for chain dedup. Required and only valid in chained mode (validated server-side against the registered mode of meta.producer_id). On the first chained-mode publish for a (producer_id, topic, partition), set to 0.",
+          "type": "integer",
+          "format": "int64",
+          "minimum": 0
+        },
+        "sequence": {
+          "description": "Producer-assigned monotonic sequence per (producer_id, topic, partition). Required in chained and monotonic modes; omitted in stateless. The broker validates ordering rules per the registered mode. Distinct from the top-level `sequence` field (which appears only on read responses and is server-assigned).",
+          "type": "integer",
+          "format": "int64",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

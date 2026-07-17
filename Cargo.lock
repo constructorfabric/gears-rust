@@ -1716,6 +1716,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-event-broker-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-security",
+ "cf-gears-toolkit-stable-hash",
+ "chrono",
+ "futures-core",
+ "futures-util",
+ "gts-id",
+ "jsonschema",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "trybuild",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-example-server"
 version = "0.6.1"
 dependencies = [
@@ -2860,6 +2887,10 @@ dependencies = [
  "trybuild",
  "uuid",
 ]
+
+[[package]]
+name = "cf-gears-toolkit-stable-hash"
+version = "0.1.0"
 
 [[package]]
 name = "cf-gears-toolkit-transport-grpc"
