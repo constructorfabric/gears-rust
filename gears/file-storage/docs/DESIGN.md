@@ -1927,12 +1927,14 @@ resumes** without re-uploading what already landed. Same hosts as §4.6. The stu
    ```http
    POST https://api.example.com/api/file-storage/v1/files/9c2a4f10/multipart/u7f1b2c3/complete
    ```
-   The control plane reads all reported part rows, asks the backend to assemble/verify them
+   The control plane reads all reported part rows, asks the backend to assemble them
    (`CompleteMultipartUpload` on a `multipart_native` backend), and **finalizes** the version (`status = available`)
-   from the assembled object's real size/hash — this flips `pending → available` exactly like single-shot finalize,
-   but it does **not** bind: `content_id` is untouched. This endpoint takes no `If-Match` and returns `204`
-   with no body (see [features/multipart-coordinator.md](./features/multipart-coordinator.md) for the tracked gap
-   between this and the richer `If-Match`/`200`-with-body contract this document originally described). The client
+   from the **reported total part size** and the **composite manifest root** (`root = sha256(manifest)`, folded from
+   the persisted per-part `(offset, part_hash)` pairs — no re-read or re-hash of the assembled object; the only
+   complete-time read is the bounded ~8 KiB MIME-sniff, §4.2). This flips `pending → available` like single-shot
+   finalize, but it does **not** bind: `content_id` is untouched. The endpoint accepts an **optional** `If-Match`
+   and returns `200` with a JSON body `{version_id, size, hash_algorithm, content_hash, hash_mode, part_count,
+   manifest}` (see [features/multipart-coordinator.md](./features/multipart-coordinator.md)). The client
    still issues a **separate** `POST /files/9c2a4f10/bind {version_id: "5e0db7a2"}` afterwards, under the same
    `If-Match` CAS as single-shot completion, to make the assembled content live. The `multipart_uploads` row flips to
    `completed` once `complete` succeeds, independently of whether the client has bound it yet.
