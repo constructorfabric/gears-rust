@@ -1,0 +1,123 @@
+# chat-engine (toolkit) gated by BOTH real account-engine plugins:
+#   authn-resolver-plugin (v0.0.2) — validates JWTs against the dev IdP
+#   authz-resolver-plugin (v0.0.3) — PDP client → external authorization engine
+#
+# Build & run:
+#   mkdir -p /tmp/hyperspot-files
+#   CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build -p cf-gears-example-server \
+#     --features chat-engine,authn-plugin,authz-plugin,static-tenants
+#   ./target/debug/cf-gears-example-server --config config/chat-engine-authz-full.yaml run
+#
+# BEFORE RUNNING: fill in <AUTHZ_ENGINE_URL>, <PIP_CLIENT_ID>, <PIP_CLIENT_SECRET>.
+# The authz plugin FAILS to start if pip_client_id/secret are empty.
+
+server:
+  home_dir: "~/.cf-gears-authz-full"
+
+database:
+  servers:
+    sqlite_dev:
+      engine: "sqlite"
+      params:
+        WAL: "true"
+        synchronous: "NORMAL"
+        busy_timeout: "5000"
+      pool:
+        max_conns: 5
+        acquire_timeout: "30s"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/chat-engine-authz-full.log"
+    file_level: debug
+
+gears:
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8087"
+      enable_docs: true
+      cors_enabled: false
+      openapi:
+        title: "CF/Gears — chat-engine + real AuthN/AuthZ plugins"
+        version: "0.1.0"
+      defaults:
+        body_limit_bytes: 64000000
+        rate_limit:
+          rps: 1000
+          burst: 200
+          in_flight: 64
+      auth_disabled: false
+      require_auth_by_default: true
+
+  # ── AuthN: real account-engine plugin against the dev IdP ──────────────────
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+  authn-resolver-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      issuers:
+        - "https://dev-constructor.dev/idp"
+      # Empty → skip aud validation. For strict: "https://dev-constructor.dev/idp/resources"
+      audience: ""
+      token_endpoint: "https://dev-constructor.dev/idp/connect/token"
+      # This IdP carries the tenant in the `tid` claim (not the default tenant_id).
+      tenant_id_claim: "tid"
+      # Tenant assigned to S2S/application tokens (no user tenant claim).
+      default_tenant_id: "46f09f8d-e59b-4c3d-a7a4-c5e9fafbd2c4"
+
+  # ── AuthZ: real account-engine PDP-client plugin ───────────────────────────
+  #    Needs a reachable authorization engine + M2M PIP credentials.
+  authz-resolver:
+    config:
+      vendor: "constructorfabric"
+  authz-resolver-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      # BASE url only — the plugin appends `/api/authorization-engine/v1/policies/resolve`,
+      # yielding https://dev-constructor.dev/api/authorization-engine/v1/policies/resolve
+      engine_url: "https://dev-constructor.dev"
+      pip_client_id: "ai-chat-engine-api"
+      # Secret is NOT committed — provide it via env: export AUTHZ_PIP_CLIENT_SECRET=...
+      pip_client_secret: "${AUTHZ_PIP_CLIENT_SECRET}"
+
+  # ── Tenant resolver (root tenant matching the token's `tid`) ───────────────
+  tenant-resolver:
+    config:
+      vendor: "constructorfabric"
+  static-tr-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 20
+      tenants:
+        - id: "46f09f8d-e59b-4c3d-a7a4-c5e9fafbd2c4"
+          name: "dev-root"
+          parent_id: null
+          status: active
+
+  types-registry:
+    config: {}
+
+  file-parser:
+    config:
+      allowed_local_base_dir: /tmp/hyperspot-files
+
+  simple-user-settings:
+    database:
+      server: "sqlite_dev"
+      file: "settings_chat_engine.db"
+    config: {}
+
+  chat-engine:
+    database:
+      server: "sqlite_dev"
+      file: "chat_engine.db"
+
+  resource-group:
+    database:
+      server: "sqlite_dev"
+      file: "resource_group.db"
+    config: {}
