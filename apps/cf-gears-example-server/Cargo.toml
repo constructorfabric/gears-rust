@@ -20,6 +20,8 @@ single-tenant = ["dep:single-tenant-tr-plugin"]
 static-tenants = ["dep:static-tr-plugin"]
 static-authn = ["dep:static-authn-plugin"]
 static-authz = ["dep:static-authz-plugin"]
+authn-plugin = ["dep:authn-resolver-plugin"]
+authz-plugin = ["dep:authz-resolver-plugin"]
 tr-authz = ["dep:tr-authz-plugin"]
 tenant-resolver-rg = ["dep:rg-tr-plugin"]
 static-credstore = ["dep:static-credstore-plugin"]
@@ -54,7 +56,14 @@ rg-tr-plugin = { package = "cf-gears-rg-tr-plugin", path = "../../gears/system/t
 
 # Optional authn/authz plugins
 static-authn-plugin = { package = "cf-gears-static-authn-plugin", path = "../../gears/system/authn-resolver/plugins/static-authn-plugin", optional = true }
+# Production account-engine AuthN plugin (now on cf-gears-toolkit); its published
+# cf-gears-* deps are redirected to this workspace's local crates via the root
+# [patch.crates-io] block so it shares one ClientHub/SDK identity.
+authn-resolver-plugin = { package = "authn-resolver-plugin", git = "https://gitlab.constr.dev/platform/aps/account-engine/authn-resolver-plugin.git", tag = "v0.0.2", optional = true }
 static-authz-plugin = { package = "cf-gears-static-authz-plugin", path = "../../gears/system/authz-resolver/plugins/static-authz-plugin", optional = true }
+# Production account-engine AuthZ plugin (PDP client → external authorization
+# engine); its published cf-gears-* deps are redirected via root [patch.crates-io].
+authz-resolver-plugin = { package = "authz-resolver-plugin", git = "https://gitlab.constr.dev/platform/aps/account-engine/authz-resolver-plugin.git", tag = "v0.0.3", optional = true }
 tr-authz-plugin = { package = "cf-gears-tr-authz-plugin", path = "../../gears/system/authz-resolver/plugins/tr-authz-plugin", optional = true }
 
 # Optional credstore plugins
