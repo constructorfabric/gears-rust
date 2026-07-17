@@ -74,6 +74,13 @@ use static_idp_plugin as _;
 #[cfg(feature = "account-management")]
 use account_management as _;
 
+#[cfg(feature = "bss-rate-provider")]
+use bss_rate_provider as _;
+#[cfg(feature = "bss-rate-provider")]
+use bss_rate_provider_ecb_plugin as _;
+#[cfg(feature = "bss-rate-provider")]
+use bss_rate_provider_http_json_plugin as _;
+
 #[cfg(feature = "bss-ledger")]
 use bss_ledger as _;
 

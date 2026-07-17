@@ -121,12 +121,18 @@ impl RateSyncJob {
                     // A CONFIGURED provider failed: the local store goes stale, so
                     // FX-needing posts will block at lock time. Alarm + log; never
                     // abort the gear.
+                    // `request_id` on both the log line and the alarm: it is the
+                    // only link from this one failed tick to the adapter's
+                    // per-source attempt lines, which carry the same id. The error
+                    // here is a composite's LAST source's, so on its own it names
+                    // neither the outage nor how many sources were tried.
                     tracing::error!(
                         provider = self.provider.provider_id(),
+                        request_id = %request_id,
                         error = %e,
                         "bss-ledger: FX rate-sync provider fetch failed; raising FX_SNAPSHOT_MISSING"
                     );
-                    self.emit_snapshot_missing(&ctx, self.provider.provider_id(), &e)
+                    self.emit_snapshot_missing(&ctx, self.provider.provider_id(), &request_id, &e)
                         .await;
                 }
                 return Ok(RateSyncReport::default());
@@ -146,7 +152,9 @@ impl RateSyncJob {
 
         // Fan the global rates out to every provisioned tenant's local store.
         let tenants = self.provisioned_tenants().await?;
-        let provider_id = self.provider.provider_id();
+        // The adapter's identity, for log attribution only — each stored row's
+        // `provider` comes from the rate that carries it (see `upsert_tenant`).
+        let adapter_id = self.provider.provider_id();
         let mut report = RateSyncReport {
             fetched: true,
             rates: u64::try_from(rates.len()).unwrap_or(u64::MAX),
@@ -154,11 +162,11 @@ impl RateSyncJob {
             failed_tenants: 0,
         };
         for tenant in tenants {
-            if let Err(e) = self.upsert_tenant(tenant, &rates, provider_id).await {
+            if let Err(e) = self.upsert_tenant(tenant, &rates, adapter_id).await {
                 report.failed_tenants += 1;
                 tracing::error!(
                     tenant_id = %tenant,
-                    provider = provider_id,
+                    adapter = adapter_id,
                     error = %e,
                     "bss-ledger: FX rate upsert failed for tenant; continuing"
                 );
@@ -189,13 +197,20 @@ impl RateSyncJob {
     }
 
     /// Upsert every fetched rate into one tenant's `ledger_fx_rate` store under
-    /// the provider id. A whole tenant is one isolation unit (the caller logs +
-    /// continues on `Err`).
+    /// the provider that published it. A whole tenant is one isolation unit (the
+    /// caller logs + continues on `Err`).
+    ///
+    /// The stored `provider` is taken from each rate's own
+    /// [`ProviderRate::provider`], not from the adapter's `provider_id()`: a
+    /// composite adapter serves one whole document from whichever source
+    /// answered first, so the publishing upstream varies between calls and only
+    /// the rate itself knows which one it was. `adapter_id` is the adapter's
+    /// constant identity and is used for log attribution only.
     async fn upsert_tenant(
         &self,
         tenant: Uuid,
         rates: &[ProviderRate],
-        provider_id: &str,
+        adapter_id: &str,
     ) -> anyhow::Result<()> {
         for rate in rates {
             // Never poison the local store with a non-positive quote: a rate
@@ -207,7 +222,8 @@ impl RateSyncJob {
                 tracing::warn!(
                     target: "bss-ledger.rate-sync",
                     tenant = %tenant,
-                    provider = provider_id,
+                    adapter = adapter_id,
+                    provider = %rate.provider,
                     base = %rate.base,
                     quote = %rate.quote,
                     rate_micro = rate.rate_micro,
@@ -220,14 +236,19 @@ impl RateSyncJob {
                     tenant_id: tenant,
                     base_currency: rate.base.clone(),
                     quote_currency: rate.quote.clone(),
-                    provider: provider_id.to_owned(),
+                    provider: rate.provider.clone(),
                     rate_micro: rate.rate_micro,
                     as_of: rate.as_of,
                     fallback_order: SYNC_FALLBACK_ORDER,
                 })
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!("upsert {}->{} ({provider_id}): {e}", rate.base, rate.quote)
+                    anyhow::anyhow!(
+                        "upsert {}->{} ({}, via adapter {adapter_id}): {e}",
+                        rate.base,
+                        rate.quote,
+                        rate.provider
+                    )
                 })?;
         }
         Ok(())
@@ -242,6 +263,7 @@ impl RateSyncJob {
         &self,
         ctx: &SecurityContext,
         provider_id: &str,
+        request_id: &str,
         err: &RateProviderError,
     ) {
         let category = AlarmCategory::FxSnapshotMissing;
@@ -251,14 +273,31 @@ impl RateSyncJob {
             tenant_id: Uuid::nil(),
             scope: "fx-rate-sync".to_owned(),
             code: category.as_str().to_owned(),
-            detail: format!(
-                "FX rate-sync provider '{provider_id}' fetch failed: {err}; \
-                 local rate store not refreshed"
-            ),
+            detail: snapshot_missing_detail(provider_id, request_id, err),
             affected: vec![],
         };
         self.publisher.emit_invariant_alarm(ctx, alarm).await;
     }
+}
+
+/// Build the `FX_SNAPSHOT_MISSING` alarm detail.
+///
+/// Split out from [`RateSyncJob::emit_snapshot_missing`] so the wording — the
+/// `request_id` in particular — is assertable without a recording publisher.
+///
+/// `request_id` is the load-bearing field. `provider_id` is the *composite
+/// adapter's* id rather than the source that broke, and `err` is only the LAST
+/// source's error, since a composite tries its sources in order and can return
+/// just one error value. The individual attempts survive as the adapter's `warn`
+/// lines, each stamped with this same `request_id`. Without it here, an operator
+/// holding the alarm has no key to filter those lines by and cannot tell which
+/// source actually failed, or whether the others failed too.
+fn snapshot_missing_detail(provider_id: &str, request_id: &str, err: &RateProviderError) -> String {
+    format!(
+        "FX rate-sync provider '{provider_id}' fetch failed: {err}; \
+         local rate store not refreshed; request_id={request_id} \
+         (filter the rate-provider adapter's logs by it for the per-source attempts)"
+    )
 }
 
 #[cfg(test)]

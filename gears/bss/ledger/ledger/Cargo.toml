@@ -113,6 +113,9 @@ toolkit-db = { workspace = true, features = ["pg", "sqlite"] }
 # crate as a direct dev-dep).
 toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 tokio = { workspace = true }
+# In-memory `MockTypesRegistryClient` for the rate-provider lazy-discovery test
+# (`module_tests.rs` exercising `resolve_rate_provider`).
+types-registry-sdk = { workspace = true, features = ["test-util"] }
 # Postgres testcontainers harness; tests reach `testcontainers` items through
 # the `testcontainers_modules::testcontainers` re-export, so the bare
 # `testcontainers` crate is not a direct dep. Raw SQL in tests goes through

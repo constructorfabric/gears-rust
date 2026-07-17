@@ -1101,15 +1101,112 @@ dependencies = [
 
 [[package]]
 name = "bss-ledger-sdk"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
  "chrono",
+ "gts",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "uuid",
+]
+
+[[package]]
+name = "bss-rate-provider"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bss-ledger-sdk",
+ "bss-rate-provider-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "chrono",
+ "inventory",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "bss-rate-provider-ecb-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bss-ledger-sdk",
+ "bss-rate-provider-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-http",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "chrono",
+ "inventory",
+ "quick-xml 0.41.0",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "bss-rate-provider-http-json-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bss-ledger-sdk",
+ "bss-rate-provider-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-http",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "chrono",
+ "inventory",
+ "secrecy",
+ "serde",
+ "serde-saphyr 0.0.22",
+ "serde_json",
+ "temp-env",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "bss-rate-provider-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bss-ledger-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-http",
+ "cf-gears-types-registry-sdk",
+ "chrono",
+ "gts",
+ "http",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "rust_decimal",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1802,6 +1899,9 @@ version = "0.6.1"
 dependencies = [
  "anyhow",
  "bss-ledger",
+ "bss-rate-provider",
+ "bss-rate-provider-ecb-plugin",
+ "bss-rate-provider-http-json-plugin",
  "calculator",
  "calculator-gateway",
  "cf-chat-engine",

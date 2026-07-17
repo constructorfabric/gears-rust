@@ -20,13 +20,25 @@ pub struct CurrencyPair {
 
 /// A rate as published by a provider at a point in time. `rate_micro` is the
 /// fixed-precision multiplier (functional per unit transaction × 1e6). `as_of`
-/// drives the ledger's staleness rule; the provider id is recorded separately.
+/// drives the ledger's staleness rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderRate {
     pub base: String,
     pub quote: String,
     pub rate_micro: i64,
     pub as_of: chrono::DateTime<chrono::Utc>,
+    /// The concrete upstream that published THIS rate (`"ecb"`, `"bank-x"`, …),
+    /// stamped by the serving source itself.
+    ///
+    /// Provenance is per-rate, not per-call. A composite adapter serves one
+    /// whole document from whichever source answered first — it never merges
+    /// rates from several sources — so which upstream supplied a given batch
+    /// varies between calls. An adapter shared by more than one caller therefore
+    /// cannot answer "who served the batch you just fetched?" through a separate
+    /// [`RateProviderV1::provider_id`] call without racing. Recording it on the
+    /// rate keeps `ledger_fx_rate.provider` / `rate_snapshot.provider` truthful
+    /// for audit regardless of call interleaving.
+    pub provider: String,
 }
 
 /// A rate-provider failure. Semantic (the ledger maps it to a sync-job alarm, or
@@ -49,8 +61,16 @@ pub enum RateProviderError {
 /// `ClientHub` by GTS instance. See the module docs.
 #[async_trait]
 pub trait RateProviderV1: Send + Sync {
-    /// Stable id recorded verbatim on every `rate_snapshot.provider`; the
-    /// fallback-order key. E.g. "ecb", "bank-x", "psp-stripe".
+    /// Stable identity of the *adapter* — e.g. `"ecb"` for a single-source
+    /// plugin, or the composite's configured id. E.g. "ecb", "bank-x",
+    /// "psp-stripe"; `"none"` is reserved for
+    /// [`UnconfiguredRateProviderV1`] and means "no adapter wired".
+    ///
+    /// MUST be a constant identity, not "whoever served last": per-rate
+    /// provenance belongs on [`ProviderRate::provider`], because this call
+    /// carries no information about which `fetch_latest` it relates to. Used for
+    /// alarm/log attribution and the unconfigured-sentinel check, never to stamp
+    /// a stored rate.
     fn provider_id(&self) -> &str;
 
     /// Fetch the latest published rates for the requested pairs — one round-trip.
@@ -68,18 +88,47 @@ pub trait RateProviderV1: Send + Sync {
         request_id: &str,
     ) -> Result<Vec<ProviderRate>, RateProviderError>;
 
-    /// Liveness probe for the sync-job reachability alarm. Default = a trivial
-    /// `fetch_latest`; an adapter MAY override with a cheaper ping.
+    /// **Reachability probe only** — "would a request to this provider get
+    /// through right now?", never "would the next fetch produce usable rates?".
+    ///
+    /// ## What counts as reachable
+    ///
+    /// `Ok(())` means **the endpoint answered**. Any HTTP response is an answer,
+    /// including `4xx` and `5xx`: a `503` proves the request arrived, and a `405`
+    /// is a normal reply from a feed that simply does not accept the probe's
+    /// method. Only a *transport* failure — DNS, connect, TLS, timeout — is
+    /// `Err`, because only then did nothing get through.
+    ///
+    /// That line is deliberate. "Reachable" and "serving correctly" are different
+    /// questions, and folding the second into this one would make `Ok(())` mean
+    /// something no cheap probe can actually establish. Reading a non-2xx as
+    /// unhealthy also breaks the probe on feeds that answer a `HEAD` with `405`
+    /// while serving `GET` perfectly.
+    ///
+    /// ## What it does NOT tell you
+    ///
+    /// An adapter can be reachable while every real fetch fails on a malformed,
+    /// empty, or wrongly-shaped body. Feed freshness is a separate signal and
+    /// MUST NOT be inferred from this one: `fx_provider_last_success_timestamp`
+    /// advances only on a fetch that actually parsed, and that gauge — not this
+    /// probe — is what a stalled-feed alert reads.
+    ///
+    /// ## No default implementation, on purpose
+    ///
+    /// There is deliberately no default. A default delegating to `fetch_latest`
+    /// gave adapters that did not override it a *parsing* health check by
+    /// accident, so one method carried two different guarantees depending on the
+    /// vendor, and `Ok(())` could only ever be read as the weakest of them.
+    /// Every adapter now states its own probe, so the contract above is what
+    /// each one implements rather than what it happens to inherit.
     ///
     /// # Errors
-    /// [`RateProviderError`] when the provider is unreachable.
+    /// [`RateProviderError`] when nothing got through to the provider at all.
     async fn health(
         &self,
         ctx: &SecurityContext,
         request_id: &str,
-    ) -> Result<(), RateProviderError> {
-        self.fetch_latest(ctx, &[], request_id).await.map(|_| ())
-    }
+    ) -> Result<(), RateProviderError>;
 }
 
 /// Fail-safe default until a real adapter is wired: every fetch fails, so the
@@ -109,6 +158,19 @@ impl RateProviderV1 for UnconfiguredRateProviderV1 {
         _pairs: &[CurrencyPair],
         _request_id: &str,
     ) -> Result<Vec<ProviderRate>, RateProviderError> {
+        Err(RateProviderError::Unreachable(
+            "no FX rate adapter configured".to_owned(),
+        ))
+    }
+
+    /// Always unreachable: there is no endpoint to probe. This sentinel exists
+    /// precisely because nothing is wired, so reporting reachable would be a
+    /// false green — the one thing the probe must never be.
+    async fn health(
+        &self,
+        _ctx: &SecurityContext,
+        _request_id: &str,
+    ) -> Result<(), RateProviderError> {
         Err(RateProviderError::Unreachable(
             "no FX rate adapter configured".to_owned(),
         ))

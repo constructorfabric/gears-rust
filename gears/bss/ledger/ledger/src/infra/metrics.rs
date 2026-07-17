@@ -94,6 +94,16 @@ const LEDGER_FX_PROVIDER_FALLBACK: &str = "ledger_fx_provider_fallback_total";
 // magnitude moved through `FX_GAIN_LOSS` on a cross-currency allocation close,
 // labelled by functional currency + gain/loss direction.
 const LEDGER_FX_REALIZED_MINOR: &str = "ledger_fx_realized_minor";
+// FX rate-sync scheduler heartbeat: one increment per `RateSyncJob` tick started.
+// Plural + past tense on purpose — `fx_rate_sync_tick` is already the name of the
+// *interval* (`FxConfig::rate_sync_tick_secs`), and the two sit two lines apart in
+// the ticker loop.
+const LEDGER_FX_RATE_SYNC_TICKS: &str = "ledger_fx_rate_sync_ticks_total";
+// Whole-pass duration of one `RateSyncJob` tick, discovery + every sequential
+// source attempt included. Distinct from the adapter's per-source
+// `fx_provider_fetch_duration_seconds`: the pass is what must fit inside the
+// configured interval, and only its own series can be compared against that.
+const LEDGER_FX_RATE_SYNC_DURATION: &str = "ledger_fx_rate_sync_duration_seconds";
 // ── Slice 7 Phase 3 reconciliation (design §9 / spec §3.5 J4) ─────────────────
 // The per-check signed-variance gauge, the run + out-of-tolerance counters (both
 // by check_type; out_of_tolerance/runs = the breach rate), the period-close-
@@ -182,6 +192,8 @@ pub struct LedgerMetricsMeter {
     fx_revaluation_duration: Histogram<f64>,
     fx_provider_fallback: Counter<u64>,
     fx_realized_minor: Counter<u64>,
+    fx_rate_sync_ticks: Counter<u64>,
+    fx_rate_sync_duration: Histogram<f64>,
     reconciliation_variance_minor: Gauge<i64>,
     reconciliation_runs: Counter<u64>,
     reconciliation_out_of_tolerance: Counter<u64>,
@@ -402,6 +414,21 @@ impl LedgerMetricsMeter {
                 .with_description(
                     "Realized FX magnitude (minor units) on a cross-currency close, by \
                      functional currency + gain/loss direction",
+                )
+                .build(),
+            fx_rate_sync_ticks: meter
+                .u64_counter(LEDGER_FX_RATE_SYNC_TICKS)
+                .with_description(
+                    "FX rate-sync scheduler ticks started (job-liveness heartbeat; a flat \
+                     counter means the ticker is dead, not that the feed is)",
+                )
+                .build(),
+            fx_rate_sync_duration: meter
+                .f64_histogram(LEDGER_FX_RATE_SYNC_DURATION)
+                .with_description(
+                    "FX rate-sync pass wall time in seconds, discovery and every sequential \
+                     source attempt included (compare against fx.rate_sync_tick_secs: a pass \
+                     that outgrows its own interval starves refreshes)",
                 )
                 .build(),
             reconciliation_variance_minor: meter
@@ -675,6 +702,13 @@ impl LedgerMetricsPort for LedgerMetricsMeter {
                 KeyValue::new("direction", direction.to_owned()),
             ],
         );
+    }
+    fn fx_rate_sync_ticked(&self) {
+        self.fx_rate_sync_ticks.add(1, &[]);
+    }
+
+    fn fx_rate_sync_duration(&self, secs: f64) {
+        self.fx_rate_sync_duration.record(secs, &[]);
     }
 
     fn reconciliation_variance_minor(&self, check_type: &str, variance_minor: i64) {

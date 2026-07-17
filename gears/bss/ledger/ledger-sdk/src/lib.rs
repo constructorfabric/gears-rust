@@ -15,6 +15,7 @@ pub mod posting;
 pub mod provisioning;
 pub mod psp_settlement_feed;
 pub mod rate_provider;
+pub mod rate_provider_plugin;
 
 pub use api::LedgerClientV1;
 pub use bill_run_finished::{BillRunFinishedV1, UnconfiguredBillRunFinishedV1};
@@ -46,3 +47,4 @@ pub use psp_settlement_feed::{
 pub use rate_provider::{
     CurrencyPair, ProviderRate, RateProviderError, RateProviderV1, UnconfiguredRateProviderV1,
 };
+pub use rate_provider_plugin::RateProviderPluginSpecV1;

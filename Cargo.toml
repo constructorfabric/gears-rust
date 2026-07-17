@@ -112,6 +112,10 @@ members = [
     "gears/llm-gateway/llm-gateway-sdk",
     "gears/bss/ledger/ledger",
     "gears/bss/ledger/ledger-sdk",
+    "gears/bss/rate-provider/rate-provider-sdk",
+    "gears/bss/rate-provider/rate-provider",
+    "gears/bss/rate-provider/plugins/ecb-plugin",
+    "gears/bss/rate-provider/plugins/http-json-plugin",
     "gears/bss/libs/coord",
     "gears/system/event-broker/event-broker-sdk",
     "gears/system/event-broker/event-broker",
@@ -311,7 +315,8 @@ oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.5", path = "gears/sys
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.2", path = "gears/system/usage-collector/usage-collector-sdk" }
 
 # BSS gears (ported from vhp-core)
-bss-ledger-sdk = { path = "gears/bss/ledger/ledger-sdk" }
+bss-ledger-sdk = { path = "gears/bss/ledger/ledger-sdk", version = "0.1.0" }
+bss-rate-provider-sdk = { path = "gears/bss/rate-provider/rate-provider-sdk", version = "0.1.0" }
 coord = { path = "gears/bss/libs/coord" }
 # FIPS-validated SHA-256 for the ledger idempotency payload fingerprint.
 aws-lc-rs = "1.17"
