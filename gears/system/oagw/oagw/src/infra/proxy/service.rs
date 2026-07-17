@@ -85,6 +85,7 @@ impl DataPlaneServiceImpl {
     pub fn new(
         cp: Arc<dyn ControlPlaneService>,
         credstore: Arc<dyn CredStoreClientV1>,
+        token_store: Arc<dyn crate::infra::oauth::UserTokenStore>,
         policy_enforcer: PolicyEnforcer,
         token_http_config: Option<toolkit_http::HttpClientConfig>,
         token_cache_config: TokenCacheConfig,
@@ -92,8 +93,12 @@ impl DataPlaneServiceImpl {
         proxy: Arc<HttpProxy<PingoraProxy>>,
         metrics: Arc<dyn OagwMetricsPort>,
     ) -> Self {
-        let auth_registry =
-            AuthPluginRegistry::with_builtins(credstore, token_http_config, token_cache_config);
+        let auth_registry = AuthPluginRegistry::with_builtins(
+            credstore,
+            token_store,
+            token_http_config,
+            token_cache_config,
+        );
         let guard_registry = GuardPluginRegistry::with_builtins();
         let transform_registry = TransformPluginRegistry::with_builtins();
         let rate_limiter = RateLimiter::new();
@@ -689,6 +694,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
             let auth_result = execute_auth_plugin(
                 &self.auth_registry,
                 auth,
+                upstream.id,
                 &outbound_headers,
                 &ctx,
                 &instance_uri,
@@ -1212,6 +1218,7 @@ impl DataPlaneServiceImpl {
 async fn execute_auth_plugin(
     auth_registry: &AuthPluginRegistry,
     auth: &crate::domain::model::AuthConfig,
+    upstream_id: uuid::Uuid,
     outbound_headers: &HeaderMap,
     ctx: &SecurityContext,
     instance_uri: &str,
@@ -1228,6 +1235,7 @@ async fn execute_auth_plugin(
         headers: headers::header_map_to_hash_map(outbound_headers),
         config: auth.config.clone().unwrap_or_default(),
         security_context: ctx.clone(),
+        upstream_id,
     };
     plugin
         .authenticate(&mut auth_ctx)
@@ -1251,6 +1259,19 @@ async fn execute_auth_plugin(
             crate::domain::plugin::PluginError::AuthFailed(_) => {
                 DomainError::AuthenticationFailed {
                     reason: reason::auth::PLUGIN_FAILED,
+                    detail: e.to_string(),
+                    instance: instance_uri.to_string(),
+                }
+            }
+            crate::domain::plugin::PluginError::AuthorizationRequired(_) => {
+                // No usable per-user authorization exists yet — the caller must
+                // complete an interactive OAuth flow. Distinct from
+                // PLUGIN_FAILED (credentials present but rejected) so consumers
+                // can branch on "must (re-)authorize" vs "refresh credentials".
+                // mini-chat gates unconnected servers out of tool resolution,
+                // so this is a safety net rather than the primary signal.
+                DomainError::AuthenticationFailed {
+                    reason: reason::auth::AUTHORIZATION_REQUIRED,
                     detail: e.to_string(),
                     instance: instance_uri.to_string(),
                 }
@@ -1771,6 +1792,12 @@ fn build_proxy_response(
 
 /// Normalize a URL path: collapse consecutive slashes and resolve `.`/`..` segments.
 /// Segments that would escape above the root are discarded.
+///
+/// A meaningful trailing slash is preserved: some upstreams mount an endpoint
+/// at `/path/` and issue a 307 redirect when it is requested at `/path`
+/// (e.g. MCP Streamable HTTP servers). The trailing slash is only re-added when
+/// there is at least one path segment, so root (`/`) and the empty path are
+/// unaffected.
 fn normalize_path(path: &str) -> String {
     let mut segments: Vec<&str> = Vec::new();
     for seg in path.split('/') {
@@ -1787,6 +1814,9 @@ fn normalize_path(path: &str) -> String {
         result.push('/');
     }
     result.push_str(&segments.join("/"));
+    if path.ends_with('/') && !segments.is_empty() && !result.ends_with('/') {
+        result.push('/');
+    }
     result
 }
 
@@ -1821,6 +1851,25 @@ mod tests {
     #[test]
     fn normalize_preserves_clean_path() {
         assert_eq!(normalize_path("/alias/v1/chat"), "/alias/v1/chat");
+    }
+
+    #[test]
+    fn normalize_preserves_trailing_slash() {
+        // Meaningful for upstreams that mount at `/path/` and 307-redirect
+        // `/path` (e.g. MCP Streamable HTTP endpoints).
+        assert_eq!(normalize_path("/mcp/"), "/mcp/");
+        assert_eq!(normalize_path("/alias/v1/chat/"), "/alias/v1/chat/");
+    }
+
+    #[test]
+    fn normalize_trailing_slash_with_double_slashes() {
+        assert_eq!(normalize_path("/alias//v1//chat/"), "/alias/v1/chat/");
+    }
+
+    #[test]
+    fn normalize_root_stays_single_slash() {
+        assert_eq!(normalize_path("/"), "/");
+        assert_eq!(normalize_path(""), "");
     }
 
     // -----------------------------------------------------------------------
@@ -1921,6 +1970,24 @@ mod tests {
                 _key: &SecretRef,
             ) -> Result<Option<GetSecretResponse>, CredStoreError> {
                 Ok(None)
+            }
+
+            async fn put(
+                &self,
+                _ctx: &SecurityContext,
+                _key: &SecretRef,
+                _value: credstore_sdk::SecretValue,
+                _sharing: credstore_sdk::SharingMode,
+            ) -> Result<(), CredStoreError> {
+                Ok(())
+            }
+
+            async fn delete(
+                &self,
+                _ctx: &SecurityContext,
+                _key: &SecretRef,
+            ) -> Result<(), CredStoreError> {
+                Ok(())
             }
         }
 
@@ -2024,9 +2091,13 @@ mod tests {
             pingora,
         ));
 
+        let token_store: Arc<dyn crate::infra::oauth::UserTokenStore> = Arc::new(
+            crate::infra::oauth::CredStoreUserTokenStore::new(credstore.clone()),
+        );
         DataPlaneServiceImpl::new(
             cp,
             credstore,
+            token_store,
             policy_enforcer,
             None,
             TokenCacheConfig::default(),

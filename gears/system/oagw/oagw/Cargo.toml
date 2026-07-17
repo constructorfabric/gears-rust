@@ -76,7 +76,7 @@ mime = { workspace = true }
 form_urlencoded = "1"
 pingora-memory-cache = "0.8"
 futures-util = { workspace = true, features = ["sink"] }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "sync"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 # Pingora proxy engine

@@ -23,9 +23,12 @@ dylint_linting::declare_early_lint! {
     ///
     /// ### Known Exclusions
     ///
-    /// None — all direct call sites have been replaced. The allow-list in
-    /// `lint_utils::is_in_hasher_allow_list` is empty but can be extended
-    /// if a legitimate usage is introduced.
+    /// The allow-list in `lint_utils::is_in_hasher_allow_list` holds one
+    /// reviewed, non-cryptographic call site (file-storage content hashing) and
+    /// can be extended if a further legitimate usage is introduced. Sites that
+    /// need a real SHA-256 (e.g. the toolkit-auth PKCE `S256` code-challenge)
+    /// route through the FIPS-validated `aws-lc-rs` provider instead, so they
+    /// require no allow-list entry.
     ///
     /// ### Example
     ///

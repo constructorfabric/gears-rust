@@ -36,6 +36,8 @@ pub const OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID: &str =
     gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1");
 pub const OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID: &str =
     gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1");
+pub const OAUTH2_AUTH_CODE_AUTH_PLUGIN_ID: &str =
+    gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_auth_code.v1");
 
 // -- Builtin guard plugin instances --
 pub const TIMEOUT_GUARD_PLUGIN_ID: &str =

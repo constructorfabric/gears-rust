@@ -34,6 +34,7 @@ mod tests {
                 .subject_id(Uuid::nil())
                 .build()
                 .unwrap(),
+            upstream_id: Uuid::nil(),
         };
 
         plugin.authenticate(&mut ctx).await.unwrap();
