@@ -1,0 +1,40 @@
+[package]
+name = "bss-rate-provider-sdk"
+edition.workspace = true
+license.workspace = true
+description = "BSS FX rate-provider SDK: the source-plugin GTS spec + shared source utilities (conversion, error mapping, fetch metrics)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The fixed cross-gear contract the sources implement (RateProviderError / ProviderRate).
+bss-ledger-sdk = { workspace = true }
+# GTS PluginV1 base + the `#[gts_type_schema]` / `gts_id!` macros for the source-plugin spec.
+toolkit-gts = { workspace = true }
+# The macro expansion references the `gts` crate directly (same as other -sdk crates).
+gts = { workspace = true }
+# `#[gts_type_schema]` expands to `schemars`-derived JSON-schema code.
+schemars = { workspace = true }
+# GearCtx, ClientHub/ClientScope, gts::PluginV1 re-export — shared plugin-registration
+# + HTTP-client-builder helpers wire straight into a gear's init().
+toolkit = { workspace = true }
+# Plugin registration (RegisterResult, TypesRegistryClient) for the shared registration helper.
+types-registry-sdk = { workspace = true }
+# Outbound HTTP error type mapped by `error::map_http_error`; shared client builder + fetch helper.
+toolkit-http = { workspace = true, features = ["otel"] }
+# OTel metrics seam for the shared fetch metrics.
+opentelemetry = { workspace = true }
+# Exact-decimal parse + banker's rounding for rate_micro (never f64).
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Error propagation for the shared gear-wiring helpers (registration, HTTP client build).
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# Constructs an `HttpError::HttpStatus` fixture in error_tests.rs.
+http = { workspace = true }

@@ -368,6 +368,27 @@ gears:
         # rather than silently shipping a half-wired stack.
         required: true
 
+  # FX rate-provider subsystem (plugin-based): the core `bss-rate-provider` gear
+  # discovers + composes source plugins; the ledger discovers the composite LAZILY
+  # from the types-registry each rate-sync tick (no deps edge). Compiled via the
+  # server `bss-rate-provider` feature. LEFT UNCONFIGURED here on purpose: an active
+  # ECB plugin makes the ledger's RateSyncJob fetch the LIVE ECB feed on its first
+  # tick (network egress in E2E). Enable in a deployment (or a gated FX E2E with a
+  # mock server) by uncommenting all sections; keep the vendors aligned across the
+  # core gear, the source plugins, and the ledger's `fx.provider_vendor`:
+  #
+  # bss-rate-provider:                 # core gear: discover source plugins + compose
+  #   config:
+  #     vendor: cf.bss                 # advertised to the ledger's fx.provider_vendor
+  #     source_vendor: cf.bss          # selects which source plugins to compose
+  # bss-rate-provider-ecb-plugin:      # ECB source plugin (primary; priority 100)
+  #   config:
+  #     id: ecb
+  #     vendor: cf.bss
+  #     priority: 100
+  #     base_url: "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+  # # bss-rate-provider-http-json-plugin: add later for a fallback REST feed.
+  #
   bss-ledger:
     # Gear-specific database (SQLite for E2E, like the other user gears; the
     # gear ships dual PG/SQLite migrations). No config block needed — the

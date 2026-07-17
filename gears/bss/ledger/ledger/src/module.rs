@@ -140,11 +140,15 @@ pub(crate) struct LedgerRuntime {
     pub recognition_run_tick: Duration,
     /// Chain-verifier tick cadence.
     pub verify_tick: Duration,
-    /// FX rate-provider plugin (Slice 5) resolved from `ClientHub` — the
-    /// fail-safe `UnconfiguredRateProviderV1` default when no adapter-gear is
-    /// registered. The `RateSyncJob` pulls `fetch_latest` from it each
-    /// `fx_rate_sync_tick` into the local rate store.
-    pub rate_provider: Arc<dyn RateProviderV1>,
+    /// Process `ClientHub` handle used to LAZILY discover the FX rate-provider
+    /// plugin each rate-sync tick (the composite the external `bss-rate-provider`
+    /// core gear registers as a `RateProviderPluginSpecV1` instance). Resolving
+    /// per tick — rather than once at init — means a late-registered adapter is
+    /// picked up on the next tick and there is no init-ordering dependency; absent
+    /// an adapter the resolver yields the fail-safe `UnconfiguredRateProviderV1`.
+    pub rate_provider_hub: Arc<toolkit::client_hub::ClientHub>,
+    /// Vendor selecting which rate-provider plugin instance the ticker resolves.
+    pub rate_provider_vendor: String,
     /// FX rate store (the `RateSyncJob` upsert target / the lock-time
     /// `RateSource` read target).
     pub fx_repo: crate::infra::storage::repo::FxRepo,
@@ -169,6 +173,11 @@ pub(crate) struct LedgerRuntime {
 // broker-free no-op/metrics-only publisher). Declaring it would make the gear
 // unschedulable (the orchestrator can't satisfy a dep no gear provides). Re-add
 // it here once the broker gear exists and `events_enabled` is wired to it.
+//
+// NOTE: the FX rate-provider adapter is NOT a `deps` edge — the `RateSyncJob`
+// discovers it lazily from the types-registry each tick (see `resolve_rate_provider`),
+// so a late-registered adapter self-heals and the ledger stays decoupled from
+// (and schedulable without) the external `bss-rate-provider` gear.
 #[toolkit::gear(name = "bss-ledger", capabilities = [db, rest, stateful], deps = [types_registry, authz_resolver, account_management], lifecycle(entry = "serve", stop_timeout = "30s"))]
 pub struct BssLedgerGear {
     /// Typed runtime built inside [`Gear::init`] and consumed by
@@ -183,6 +192,41 @@ impl Default for BssLedgerGear {
         Self {
             runtime: ArcSwapOption::from(None),
         }
+    }
+}
+
+/// Discover the FX rate-provider plugin from the types-registry (the composite
+/// the external `bss-rate-provider` core gear registers), selecting the instance
+/// by `vendor` + `priority`. Called fresh each rate-sync tick, so a
+/// late-registered adapter is picked up on the next tick — no init-ordering
+/// dependency. Falls back to the fail-safe
+/// [`UnconfiguredRateProviderV1`](bss_ledger_sdk::UnconfiguredRateProviderV1)
+/// whenever the registry is unavailable or no plugin is registered, so a missing
+/// adapter is a benign deployment state (the sync job logs at debug, no alarm),
+/// never a books defect.
+async fn resolve_rate_provider(
+    hub: &toolkit::client_hub::ClientHub,
+    vendor: &str,
+) -> Arc<dyn RateProviderV1> {
+    let fallback = || Arc::new(UnconfiguredRateProviderV1) as Arc<dyn RateProviderV1>;
+    let Ok(registry) = hub.get::<dyn types_registry_sdk::TypesRegistryClient>() else {
+        return fallback();
+    };
+    let type_id = bss_ledger_sdk::RateProviderPluginSpecV1::gts_type_id();
+    let Ok(instances) = registry
+        .list_instances(types_registry_sdk::InstanceQuery::new().with_pattern(format!("{type_id}*")))
+        .await
+    else {
+        return fallback();
+    };
+    match toolkit::plugins::choose_plugin_instance::<bss_ledger_sdk::RateProviderPluginSpecV1>(
+        vendor,
+        instances.iter().map(|e| (e.id.as_ref(), &e.object)),
+    ) {
+        Ok(gts_id) => hub
+            .try_get_scoped::<dyn RateProviderV1>(&toolkit::client_hub::ClientScope::gts_id(&gts_id))
+            .unwrap_or_else(fallback),
+        Err(_) => fallback(),
     }
 }
 
@@ -247,9 +291,16 @@ impl BssLedgerGear {
                     biased;
                     () = token.cancelled() => break,
                     _ = iv.tick() => {
+                        // Discover the rate-provider plugin fresh each tick (lazy,
+                        // self-healing) — the fail-safe default when none is registered.
+                        let provider = resolve_rate_provider(
+                            &rt.rate_provider_hub,
+                            &rt.rate_provider_vendor,
+                        )
+                        .await;
                         let job = crate::infra::jobs::rate_sync::RateSyncJob::new(
                             rt.db.clone(),
-                            Arc::clone(&rt.rate_provider),
+                            provider,
                             rt.fx_repo.clone(),
                             Arc::clone(&rt.publisher),
                         );
@@ -946,18 +997,17 @@ impl Gear for BssLedgerGear {
         let rt_enforcer = Arc::clone(&enforcer);
         let rt_metrics = Arc::clone(&metrics);
 
-        // FX rate-provider plugin (Slice 5): resolved from `ClientHub` like the
-        // other cross-gear clients, but with a fail-safe DEFAULT — the external
-        // ECB/bank adapter-gear is out of Slice 5 scope, so absent the adapter the
-        // gear falls back to `UnconfiguredRateProviderV1` (every fetch errors → the
-        // local rate store stays empty → FX-needing posts block at lock time,
-        // never a silent wrong rate). Unlike authz, a missing rate adapter is NOT
-        // fatal to init. The `RateSyncJob` (serve loop) pulls into `fx_repo`, whose
-        // db clone is captured here before `db` moves into the client below.
-        let rate_provider: Arc<dyn RateProviderV1> = ctx
-            .client_hub()
-            .get::<dyn RateProviderV1>()
-            .unwrap_or_else(|_| Arc::new(UnconfiguredRateProviderV1));
+        // FX rate-provider plugin (Slice 5): discovered LAZILY from the
+        // types-registry each rate-sync tick (see `resolve_rate_provider`), not
+        // resolved once here — so a late-registered adapter is picked up next tick
+        // and the ledger needs no `deps` edge on it. Absent an adapter the resolver
+        // yields the fail-safe `UnconfiguredRateProviderV1` (every fetch errors →
+        // the local store stays empty → FX-needing posts block at lock time, never
+        // a silent wrong rate); a missing adapter is NOT fatal to init. The hub
+        // handle + selection vendor are captured for the serve-loop ticker. The
+        // `fx_repo` db clone is captured before `db` moves into the client below.
+        let rate_provider_hub = ctx.client_hub();
+        let rate_provider_vendor = cfg.fx.provider_vendor.clone();
         let fx_repo = crate::infra::storage::repo::FxRepo::new(db.clone());
 
         // Slice 7 Phase 3: the three launch-blocking control feeds (issued-invoice
@@ -1420,7 +1470,8 @@ impl Gear for BssLedgerGear {
             aged_alarm_tick: cfg.jobs.aged_alarm_interval(),
             recognition_run_tick: cfg.recognition.recognition_run_interval(),
             verify_tick: cfg.jobs.verify_interval(),
-            rate_provider,
+            rate_provider_hub,
+            rate_provider_vendor,
             fx_repo,
             fx_rate_sync_tick: cfg.fx.rate_sync_interval(),
             fx_config: cfg.fx.clone(),
@@ -1560,3 +1611,7 @@ impl RestApiCapability for BssLedgerGear {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "module_tests.rs"]
+mod tests;

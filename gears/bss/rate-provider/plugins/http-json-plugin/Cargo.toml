@@ -1,0 +1,37 @@
+[package]
+name = "bss-rate-provider-http-json-plugin"
+edition.workspace = true
+license.workspace = true
+description = "BSS FX rate-provider generic http-json source plugin: config-mapped GET-JSON feed registered as a RateProviderV1 plugin instance"
+
+[lints]
+workspace = true
+
+[dependencies]
+bss-rate-provider-sdk = { workspace = true }
+bss-ledger-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+# The `deps = [types_registry]` gear-macro edge re-exports `::types_registry`, so
+# the gear crate must be a direct dependency (init-ordering; not used in code).
+types-registry = { workspace = true }
+toolkit = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-http = { workspace = true, features = ["otel"] }
+inventory = { workspace = true }
+
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# DateTime<Utc> parse for the publication timestamp; no `clock` feature.
+chrono = { workspace = true }
+# `SecretString` for `api_key`: redacts on Debug/log, matches the
+# authn-resolver convention for optional secret config fields.
+secrecy = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# In-process HTTP server for the integration test.
+axum = { workspace = true }
+tower = { workspace = true }

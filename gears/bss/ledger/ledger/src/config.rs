@@ -302,6 +302,10 @@ pub struct FxConfig {
     /// Deterministic provider fallback order (by `provider_id`); empty until an
     /// adapter is configured.
     pub provider_order: Vec<String>,
+    /// Vendor of the FX rate-provider plugin the `RateSyncJob` discovers each tick
+    /// from the types-registry (`RateProviderPluginSpecV1` instances). Must match
+    /// the external `bss-rate-provider` core gear's advertised `vendor`.
+    pub provider_vendor: String,
 }
 
 impl Default for FxConfig {
@@ -313,6 +317,7 @@ impl Default for FxConfig {
             rate_sync_tick_secs: 3_600,
             revaluation_run_tick_secs: 86_400,
             provider_order: Vec::new(),
+            provider_vendor: "cf.bss".to_owned(),
         }
     }
 }

@@ -1,0 +1,42 @@
+[package]
+name = "bss-rate-provider-ecb-plugin"
+edition.workspace = true
+license.workspace = true
+description = "BSS FX rate-provider ECB source plugin: fetches ECB daily reference rates and registers as a RateProviderV1 plugin instance"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Shared source utilities (conversion, error mapping, metrics) + the source-plugin GTS spec.
+bss-rate-provider-sdk = { workspace = true }
+# The RateProviderV1 contract this source implements + its types.
+bss-ledger-sdk = { workspace = true }
+# Plugin registration into the types-registry.
+types-registry-sdk = { workspace = true }
+# The `deps = [types_registry]` gear-macro edge re-exports `::types_registry`, so
+# the gear crate must be a direct dependency (init-ordering; not used in code).
+types-registry = { workspace = true }
+# Gear macro, GearCtx, ClientHub/ClientScope, gts::PluginV1, config.
+toolkit = { workspace = true }
+# SecurityContext in the fetch_latest signature.
+toolkit-security = { workspace = true }
+# Outbound HTTPS client.
+toolkit-http = { workspace = true, features = ["otel"] }
+# inventory::submit! emitted by the gear macro.
+inventory = { workspace = true }
+
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+# NaiveDate / DateTime<Utc> for as_of; no `clock` feature.
+chrono = { workspace = true }
+# ECB daily reference-rate XML parsing.
+quick-xml = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# In-process HTTP server for the integration test.
+axum = { workspace = true }
+tower = { workspace = true }
