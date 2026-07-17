@@ -151,7 +151,18 @@ pub(crate) fn for_retention_sweep(tenant_id: Uuid) -> SecurityContext {
 
 /// User-groups cascade-cleanup hook — fired when a tenant is
 /// hard-deleted and AM must walk its user-group memberships in RG.
-/// `tenant_id` is the tenant being deleted.
+/// `tenant_id` is the tenant being deleted; it rides the audit log
+/// line only.
+///
+/// Platform-scoped, NOT scoped to `tenant_id`: the subject
+/// tenant here is by definition a `Deleted` row mid-purge, and the
+/// `AuthZ` resolver's system-actor grant would root a tenant-subtree
+/// scope at it — deleted roots are clamped out of scope
+/// materialization, the subtree resolves to zero tenants, and every
+/// RG cascade call fails closed. The reaper then defers the whole
+/// backlog forever. Platform scope (nil tenant → Global grant) is
+/// honest for this flow: the cascade addresses explicit group ids of
+/// a tenant that is being erased, not a live tenant's data.
 #[must_use]
 pub(crate) fn for_user_groups_cascade(tenant_id: Uuid) -> SecurityContext {
     tracing::info!(
@@ -160,7 +171,7 @@ pub(crate) fn for_user_groups_cascade(tenant_id: Uuid) -> SecurityContext {
         tenant_id = %tenant_id,
         "am system actor constructed",
     );
-    build_inner(Some(tenant_id))
+    build_inner(None)
 }
 
 #[cfg(test)]
@@ -193,7 +204,6 @@ mod tests {
             ("bootstrap", for_bootstrap(tenant)),
             ("provisioning_reaper", for_provisioning_reaper(tenant)),
             ("retention_sweep", for_retention_sweep(tenant)),
-            ("user_groups_cascade", for_user_groups_cascade(tenant)),
         ] {
             assert_eq!(
                 ctx.subject_id(),
@@ -211,5 +221,21 @@ mod tests {
                 "{label}: subject_tenant_id MUST carry the supplied tenant"
             );
         }
+    }
+
+    // The cascade hook's subject tenant is a Deleted row
+    // mid-purge — a subtree grant rooted at it materializes to zero
+    // tenants and fails the whole reaper closed. The factory MUST be
+    // platform-scoped (nil tenant → Global grant at the resolver).
+    #[test]
+    fn user_groups_cascade_is_platform_scoped() {
+        let ctx = for_user_groups_cascade(Uuid::from_u128(0xDEAD_BEEF_FACE_CAFE));
+        assert_eq!(ctx.subject_id(), AM_SYSTEM_ACTOR_UUID);
+        assert_eq!(ctx.subject_type(), Some(AM_SYSTEM_SUBJECT_TYPE));
+        assert_eq!(
+            ctx.subject_tenant_id(),
+            Uuid::nil(),
+            "cascade context must be platform-scoped, not scoped to the deleted tenant"
+        );
     }
 }
