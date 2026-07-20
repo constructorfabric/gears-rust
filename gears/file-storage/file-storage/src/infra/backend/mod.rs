@@ -201,20 +201,23 @@ pub trait StorageBackend: Send + Sync {
     /// with a truly atomic implementation, closing the race for those two
     /// backends completely.
     ///
-    /// **`S3Backend` is the one backend still left on this non-atomic
-    /// default**, and that is a deliberate, currently-accepted gap, not an
-    /// oversight: S3 support is opt-in (`s3_backends` config) and
+    /// [`S3Backend`](super::backend::S3Backend) **overrides** this default with
+    /// an atomic conditional-write implementation (`If-None-Match: *` on the
+    /// terminal `PutObject`/`CompleteMultipartUpload`, mapping the resulting
+    /// `412 Precondition Failed` to `created: false` — the same outcome
+    /// `LocalFsBackend`/`InMemoryBackend` produce), so no shipping backend is
+    /// left on this racy default. That override's guarantee is
+    /// provider-dependent: it requires an endpoint that honours S3 conditional
+    /// writes (native AWS S3 since 2024-08, and S3-compatible stores that
+    /// implement it). S3 support is opt-in (`s3_backends` config) and
     /// release-gated by [ADR-0005](../../../docs/ADR/0005-cpt-cf-file-storage-adr-s3-client-selection.md)
     /// (also see [ADR-0003](../../../docs/ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)'s
-    /// "Known gap" paragraph). Before S3 leaves that release gate for
-    /// general availability, this default TOCTOU fallback **MUST** be
-    /// replaced with a real atomic conditional-PUT override on `S3Backend`
-    /// (e.g. an `If-None-Match: *` conditional write on the signed `PUT`,
-    /// mapping the resulting `412 Precondition Failed` to the same
-    /// `created: false` outcome `LocalFsBackend`/`InMemoryBackend` already
-    /// produce) — shipping S3 without that override means the exclusive-
-    /// publish race this method exists to close is still open for S3-backed
-    /// uploads.
+    /// "Known gap" paragraph); validating a specific target deployment's
+    /// conditional-write support is part of that gate.
+    ///
+    /// This default therefore remains only as a backend-agnostic fallback for a
+    /// hypothetical future backend that cannot do better — every backend wired
+    /// today (`local-fs`, `in-memory`, `s3`) provides an atomic override.
     async fn publish_exclusive(
         &self,
         path: &str,
