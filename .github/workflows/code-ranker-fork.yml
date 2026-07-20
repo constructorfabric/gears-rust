@@ -1,0 +1,30 @@
+# .github/workflows/code-ranker-fork.yml
+#
+# Fork-PR companion to code-ranker.yml. Fork PRs run with a read-only GITHUB_TOKEN
+# and no OIDC id-token, so the main workflow (report.yml) skips the report upload
+# and the sticky PR comment for them, and instead publishes the HTML report as an
+# ordinary artifact. This workflow is phase B: it runs AFTER the main workflow, in
+# the privileged BASE-repo context (via workflow_run), downloads that artifact,
+# performs the OIDC upload, and posts the sticky comment on the fork PR.
+#
+# workflow_run is the SAFE trigger here -- NOT pull_request_target. The reusable
+# workflow never checks out or executes fork code; it treats the artifact as
+# opaque data and correlates the PR from GitHub-controlled metadata.
+name: code-ranker fork report
+on:
+  workflow_run:
+    workflows: ["code-ranker"]
+    types: [completed]
+jobs:
+  publish:
+    # Only for fork PRs (cross-repository); same-repo PRs are fully handled by
+    # code-ranker.yml itself.
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name != github.repository
+    uses: code-ranker-com/actions/.github/workflows/fork-report.yml@v1
+    permissions:
+      id-token: write          # OIDC upload from the privileged base context
+      pull-requests: write     # post the sticky comment on the fork PR
+      actions: read            # download the artifact from the triggering run
+      contents: read
