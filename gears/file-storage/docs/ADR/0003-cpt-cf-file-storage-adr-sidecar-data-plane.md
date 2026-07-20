@@ -92,13 +92,12 @@ planes:
   metadata except through the control plane's own, independently-verifying handlers. The alternative
   **direct-DB** mode — the sidecar as a full FileStorage instance over the shared metadata DB (lower
   latency, no control round-trip) — remains a deferred, unscheduled co-located-deployment optimization.
-  > **Implementation note (P2).** An earlier P1 draft of this ADR described the sidecar reaching the
-  > control plane over the FS SDK in s2s REST mode, using its own app-token plus an on-behalf-of
-  > `<user>` claim, to pre-register *and auto-bind* a version. That delegation model was never
-  > implemented. What shipped instead is the plain token-authenticated finalize/report-part callback
-  > described above, plus a client-driven `bind` step that never runs automatically. Pre-registration
-  > also happens earlier than originally drafted: the control plane pre-registers the `pending` version
-  > itself, in the same request that returns the signed PUT URL, not in a later sidecar-initiated call.
+  The control plane pre-registers the version itself, in `pending` status, in the same request that
+  returns the signed PUT URL — never via a later sidecar-initiated call.
+  > **Implemented as above (P2).** An earlier P1 draft of this ADR instead described the sidecar
+  > reaching the control plane over the FS SDK in s2s REST mode, with its own app-token plus an
+  > on-behalf-of `<user>` claim, to pre-register *and auto-bind* a version. That delegation model was
+  > never built.
 
 The critical difference from the direct-to-backend model the prior proxy-all design rejected: **the signed URL points
 at our own sidecar, never at the raw backend.** Therefore every property the prior proxy-all design protected is
@@ -204,18 +203,19 @@ platform auth module's token revocation, not the URL layer.
   calls the same `FinalizeAuth::verify`). A durable fix (deriving the part
   hash from a sidecar-side value the control plane can independently trust,
   or re-hashing the assembled object) is future work, out of scope for this
-  remediation. A related gap in the same release gate is now closed in code
-  but stays provider-conditional: `StorageBackend::publish_exclusive`'s default
-  implementation (`infra/backend/mod.rs`) is a non-atomic (TOCTOU)
-  `exists`-then-`put`, but `S3Backend` **overrides** it with an atomic
-  conditional write (`If-None-Match: *` on the terminal
-  `PutObject`/`CompleteMultipartUpload`, mapping S3's `412 Precondition Failed`
-  to a `created: false` outcome). That guarantee holds only against an endpoint
-  that honours S3 conditional writes (native AWS S3 since 2024-08, and
-  S3-compatible stores that implement it); confirming a specific target
-  deployment actually enforces the precondition — rather than silently ignoring
-  the header and degrading to last-write-wins — is a required check before S3
-  leaves its ADR-0005 release gate, same as the part-hash trust gap above.
+  remediation. A related gap in the same release gate is now closed in code for every shipping
+  backend, though the closure differs by backend: `StorageBackend::publish_exclusive`'s **default**
+  implementation (`infra/backend/mod.rs`) is a non-atomic (TOCTOU) `exists`-then-`put`, but no
+  shipping backend relies on that default. `LocalFsBackend` (`std::fs::hard_link`, which atomically
+  fails `AlreadyExists` if the target already exists) and `InMemoryBackend` (a single mutex guarding
+  both the check and the insert) each override it with a fully atomic, provider-independent
+  implementation; `S3Backend` **overrides** it with an atomic conditional write (`If-None-Match: *`
+  on the terminal `PutObject`/`CompleteMultipartUpload`, mapping S3's `412 Precondition Failed` to a
+  `created: false` outcome). Unlike the other two, S3's guarantee is **provider-dependent**: it holds
+  only against an endpoint that honours S3 conditional writes (native AWS S3 since 2024-08, and
+  S3-compatible stores that implement it); confirming a specific target deployment actually enforces
+  the precondition — rather than silently ignoring the header and degrading to last-write-wins — is
+  a required check before S3 leaves its ADR-0005 release gate, same as the part-hash trust gap above.
 * A new signed-URL contract (`cpt-cf-file-storage-fr-signed-urls`) and the constraint model become
   part of the public surface; the response-header set the sidecar must echo verbatim is baked into
   the signed URL.

@@ -136,7 +136,10 @@ CREATE TABLE file_storage.file_versions (
     mime_type        text         NOT NULL,
     size             bigint       NOT NULL  CHECK (size >= 0),  -- 0 permitted (empty file)
 
-    -- Content hash. P1 allow-list locked to SHA-256 per ADR-0002; widened in P2.
+    -- Content hash. P1 allow-list locked to SHA-256 per ADR-0002. ADR-0002's P2
+    -- vision of widening this CHECK (hash_policy/allowed_algorithms) was
+    -- superseded by ADR-0006 and never implemented: this CHECK stays locked to
+    -- SHA-256 as actually shipped (see the "P2 hash-policy widening" note below).
     hash_algorithm   text         NOT NULL  DEFAULT 'SHA-256'
                                   CHECK (hash_algorithm = 'SHA-256'),
     hash_value       bytea        NOT NULL  CHECK (octet_length(hash_value) = 32),
@@ -181,7 +184,7 @@ CREATE TABLE file_storage.file_versions (
 COMMENT ON TABLE file_storage.file_versions IS
     'Immutable content versions. Backend object /{file_id}/{version_id} is never mutated; a content write is a new version + a pointer swap (files.content_id).';
 
--- ADR-0006 (shipped): hash_mode = 'multipart-composite-sha256' <=> part_count IS NOT NULL.
+-- ADR-0006: hash_mode = 'multipart-composite-sha256' <=> part_count IS NOT NULL.
 ALTER TABLE file_storage.file_versions
     ADD CONSTRAINT file_versions_part_count_presence_check
         CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL));
@@ -347,7 +350,7 @@ CREATE TABLE file_storage.idempotency_keys (
     response_body   text        NOT NULL,
     response_etag   text        NOT NULL,
 
-    -- P2 remediation 0.10: the authenticated subject that created this key.
+    -- The authenticated subject that created this key.
     -- Not part of the PK (the composite key below is unchanged); the domain
     -- layer fetches by the composite key and then verifies
     -- `record.subject_id == ctx.subject_id()`, treating a mismatch as
@@ -356,7 +359,7 @@ CREATE TABLE file_storage.idempotency_keys (
     -- match a real subject.
     subject_id     uuid         NOT NULL  DEFAULT '00000000-0000-0000-0000-000000000000',
 
-    -- P2 remediation 2.1: SHA-256 over a canonicalized, length-prefixed
+    -- SHA-256 over a canonicalized, length-prefixed
     -- encoding of the identity-relevant request fields (owner_kind, owner_id,
     -- name, gts_file_type, mime_type, custom_metadata) at insert time. A
     -- replay recomputes this hash from the current request and rejects a
@@ -462,7 +465,7 @@ CREATE TABLE file_storage.policies (
 CREATE INDEX policies_scope_idx
     ON file_storage.policies (tenant_id, scope, scope_owner_id);
 
--- P2 remediation 2.4: two partial unique indexes (not one plain composite
+-- Two partial unique indexes (not one plain composite
 -- unique index) close the upsert delete-then-insert race. Postgres (and
 -- SQLite) treat every NULL as distinct for uniqueness, so a single
 -- `UNIQUE (tenant_id, scope, scope_owner_id)` index would dedupe user-scope

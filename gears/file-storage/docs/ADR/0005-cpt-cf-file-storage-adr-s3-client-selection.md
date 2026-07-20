@@ -157,7 +157,11 @@ whichever client is ultimately vendored — `rusty-s3` (+ `quick-xml`) per this 
 later invokes the documented fallback — **must clear a team security review before being merged as a real
 dependency**. The team has selected `rusty-s3` as the S3 client pending that review; this ADR records the comparison
 and the team's decision, but does not itself constitute the review. That is why this ADR's status is `proposed`, not
-`accepted`.
+`accepted`. The same gate also covers `S3Backend`'s create-exclusive `publish_exclusive` override (see Consequences
+below): it is implemented and opt-in (S3 itself is only used when a deployment configures `s3_backends`), but its
+atomic-write guarantee is provider-dependent, and confirming that a specific target endpoint actually honours
+`If-None-Match: *` conditional writes — rather than silently ignoring the header — is a required part of this
+review before S3 leaves the gate (see also ADR-0003's "Known gap" discussion of the same override).
 
 **Current implementation status (2026-07-08).** The branch contains working S3 backend code and runtime dependency
 wiring so integration tests and operator config can exercise the selected design. This does **not** close the gate
@@ -190,6 +194,11 @@ off.
   `ListObjectsV2` requests, extracting the continuation token from each `quick-xml`-parsed response and looping until
   exhausted, then flattening into `StorageBackend`'s contractual `Vec<String>`. Unlike an auto-paginating client
   abstraction, this pagination loop is code this gear owns and tests directly.
+* `StorageBackend::publish_exclusive` (the sidecar's single-shot upload path, ADR-0003) is implemented for `S3Backend`
+  as an atomic conditional write: `If-None-Match: *` on the terminal `PutObject`/`CompleteMultipartUpload`, mapping
+  S3's `412 Precondition Failed` to a `created: false` outcome instead of the trait's non-atomic `exists`-then-`put`
+  default. Like the rest of `S3Backend`, this is opt-in (only exercised once a deployment configures `s3_backends`)
+  and its guarantee is provider-dependent — see the Security-review gate above and ADR-0003's "Known gap" discussion.
 * **In-house XML/error-handling burden.** Because `rusty-s3` is sign-only, this gear — not the crate — owns parsing
   every S3 XML response body (`ListObjectsV2`, `CompleteMultipartUpload`) and mapping S3's XML error schema to
   `StorageBackend`'s error types, via `quick-xml`. This is an accepted, explicit trade-off for zero HTTP/TLS stack
@@ -215,6 +224,9 @@ off.
   `multipart_native: true` (already set by `InMemoryBackend`) — the first backend type to combine both in a way that
   also survives a distributed, multi-replica deployment — and that it implements `get_range` and `size`/`exists`
   natively rather than via the trait's default (whole-object) fallbacks.
+* Confirming, against the specific target S3-compatible endpoint(s) a deployment intends to use, that conditional
+  writes (`If-None-Match: *`) are actually enforced rather than silently ignored — required before `S3Backend`'s
+  `publish_exclusive` override can be relied on for the create-exclusive guarantee ADR-0003 describes.
 * `cargo tree` (or equivalent) run against the crate with `rusty-s3` and `quick-xml` added, confirming no second
   `reqwest`/`hyper`/TLS major version is pulled in beyond what the crate already links.
 * Integration tests (item 1.7's test strategy, `s3s-fs`-backed) covering: `put`/`get` round-trip, `Range` `get`,

@@ -1,4 +1,4 @@
-# FileStorage — HTTP API (P1 + declared P2)
+# FileStorage — HTTP API
 
 
 <!-- toc -->
@@ -39,15 +39,17 @@ operation is at least two requests: a control request to obtain a signed URL, th
   - the **signed token is the delegated authorization artifact** for exactly one resource + operation until `exp`; a
     valid token *is* the access decision (made by the control plane at signing). The sidecar performs **no
     request-time PDP/AuthZ call** and reads no tenant/owner permission state;
-  - a platform **JWT in `Authorization`** would be validated by the sidecar when the token carries a `tok.<claim>`
-    predicate — but `tok.<claim>` (and the `ip`/CIDR constraint) are **NOT implemented**: `Claims` has no such
+  - a platform **JWT in `Authorization`** would be validated by the sidecar only if the token carried a `tok.<claim>`
+    predicate — but `tok.<claim>` (and an `ip`/CIDR constraint) are **not implemented**: `Claims` has no such
     fields, so the sidecar never validates a platform JWT under any circumstance (see "Signed URLs" below);
-  - request-id propagation is shipped (`request_id`/`x-request-id`); per-instance connection/bandwidth limits
-    (`max_conns`/`max_rate`) are **NOT implemented** — see "Signed URLs" below.
+  - `request_id`/`x-request-id` correlation propagates end-to-end; per-instance connection/bandwidth limits
+    (`max_conns`/`max_rate`) are **not implemented** — see "Signed URLs" below.
 
   Because clients never hand-write sidecar URLs (they always receive a ready, opaque signed URL from the control
   plane), the sidecar surface is **outside the generated OpenAPI flow**; its byte-level contract is specified
-  normatively in this document. (A standalone OpenAPI document for the sidecar is deferred to P2.)
+  normatively in this document instead.
+- **No other surface.** This gear exposes no file-sharing (public/anonymous-link) endpoints and no WebDAV interface;
+  every request against it is one of the two planes above.
 
 Encoding conventions:
 - Control bodies are `application/json`. The sidecar `PUT` body is the **raw** object bytes (no `multipart/form-data`).
@@ -80,15 +82,14 @@ Encoding conventions:
 ```
 
 Notes:
-- There is **no** `HEAD /files/{id}` route (an earlier draft of this document listed one; no such route exists in
-  `src/api/rest/routes.rs`, and there is no other evidence it was ever separately planned).
+- There is **no** `HEAD /files/{id}` route; no such route exists in `src/api/rest/routes.rs`.
 - `POST /files` request body (`application/json`, `CreateFileReq`): `{ "owner_kind": "user"|"app", "owner_id":
   "<uuid>", "name": "<string>", "gts_file_type": "<gts uri>", "mime_type": "<string>", "custom_metadata":
   [{"key": "...", "value": "..."}] (optional, default []), "idempotency_key": "<string>" (optional) }`. `idempotency_key`
   is the field documented under "Idempotent-create semantics" (`operations.md`) — see the `409` cause in "Status code
   summary" for what happens on a reused key with a different body.
 - `POST /files/{id}/versions` takes **no** request body and does **not** read `If-Match` (`handlers::presign_version`
-  has no JSON extractor and no header parameter) — despite an earlier draft of this doc describing one.
+  has no JSON extractor and no header parameter).
 - `GET /files` **requires** both `owner_kind` and `owner_id` query params (`400` if either is missing/invalid). A
   caller listing their own files (`owner_id == ` the caller's own subject id) proceeds under the ordinary `READ`
   grant; listing **any other** owner's files additionally requires the caller's `ADMIN_POLICY` authorization scope
@@ -107,8 +108,9 @@ Notes:
   (ADR-0006). `hash` is lowercase-hex; `hash_algorithm` is always `"SHA-256"`. `hash_mode` is `"whole-sha256"` (then
   `hash` = `sha256(object bytes)` and `part_count` is omitted) or `"multipart-composite-sha256"` (then `hash` =
   `sha256(manifest)`, the offset-manifest composite root, and `part_count` is the number of parts). The manifest text
-  itself is stored server-side (`version_hash_manifest`) and used by `migrate_backend`/re-verification; it is not
-  currently surfaced as a REST field.
+  itself is stored server-side (`version_hash_manifest`) and used by `migrate_backend`/re-verification. **It is not
+  returned by this or any other metadata endpoint** — the only place `manifest` appears on the wire is the multipart
+  `complete` response (see "P2 — Multipart upload" below).
 - `GET /files/{id}/download-url` returns `{ download_url, etag, version_id }`. By default it pins the current
   `content_id`; `?version_id=<v>` pins a specific version.
 - Restoring a prior version is `POST /files/{id}/bind` with that `version_id` (a pointer swap, no re-upload).
@@ -122,37 +124,36 @@ S1. PUT    <signed upload url>             upload the new version's bytes (raw b
 S2. GET    <signed download url>           download content                                        — Range
 ```
 
-**Planned, not implemented**: a sidecar `HEAD <signed download url>` route and `If-None-Match` → `304` support on the
-sidecar `GET`. Neither exists in `src/bin/sidecar.rs` today — the router has no `HEAD` route at all, and `download`'s
-only conditional-ish behavior is the `Range` handling below. (`If-None-Match` → `304` **is** implemented on the
-control plane's `GET /files/{id}`, which is a distinct surface — see "Conditional headers" below.)
+**Planned / not implemented**: a sidecar `HEAD <signed download url>` route and `If-None-Match` → `304` support on the
+sidecar `GET`. Neither exists in `src/bin/sidecar.rs` — the router has no `HEAD` route at all, and `download`'s only
+conditional-ish behavior is the `Range` handling below. (`If-None-Match` → `304` **is** implemented on the control
+plane's `GET /files/{id}`, which is a distinct surface — see "Conditional headers" below.)
 
 The sidecar verifies the signed token and its claims before serving — a valid token is the delegated authorization
 decision, so there is no request-time PDP call and no platform-JWT check of any kind (the `tok.<claim>` predicate
-mentioned as a design intent above is not implemented). On `PUT` it streams bytes to the backend and then calls the
-control-plane finalize callback, authorized solely by that same signed upload token (see
-[Data-plane callbacks](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated) below) — the P1 sidecar
-holds **no** direct DB connection and is a thin, stateless byte-mover (a direct-DB mode is a possible P2+ co-located
-optimization; see ADR-0003). The sidecar never binds — see "Upload, bind, and the conflict retry" below.
+described above is not implemented). On `PUT` it streams bytes to the backend and then calls the control-plane
+finalize callback, authorized solely by that same signed upload token (see
+[Data-plane callbacks](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated) below) — the sidecar
+holds **no** direct DB connection and is a thin, stateless byte-mover (a direct-DB mode is a possible future
+co-located optimization; see ADR-0003). The sidecar never binds — see "Upload, bind, and the conflict retry" below.
 
 ## Data-plane callbacks (sidecar → control plane, s2s token-authenticated)
 
 These control-plane endpoints are called by the **sidecar**, not by end clients, and are registered `.public()` —
 the api-gateway does **not** require an end-user JWT for them. The signed upload/part token (in the `x-fs-token`
-request header) is the sole authorization; there is no request-time PDP call. Reflects the current (P2 remediation
-0.1, "option 2") implementation: the client-supplied `size`/`hash_hex` are **not** trusted — the control plane reads
-the blob back from the backend and recomputes both before persisting anything.
+request header) is the sole authorization; there is no request-time PDP call. The client-supplied `size`/`hash_hex`
+are not trusted: the control plane reads the blob back from the backend and recomputes both before persisting
+anything.
 
-**Internal credential (P2 remediation 0.1, remaining half).** The `fs-token` is client-visible (returned in
-plaintext inside `upload_url`), so on its own it does not prove the caller is the sidecar rather than the
-uploading client itself. Both routes below optionally require a second factor: when
-`FileStorageConfig::finalize_internal_secret` is configured, the request must also carry a matching
-`x-fs-internal-token` header (constant-time-compared; `403` on missing/mismatch), checked *after* `fs-token`
-verification. `None` (the default) preserves the token-only behavior above; see
-`docs/ADR/0003-…-sidecar-data-plane.md`'s trust-model section for the mechanism (interim gear-local shared
-secret) and the required rollout order (`FS_SIDECAR_INTERNAL_TOKEN` must reach every sidecar before
-`require_finalize_internal_secret` is flipped `true`). With this second factor configured, the `fs-token`
-remaining client-visible is no longer a way to drive these two routes.
+**Internal credential.** The `fs-token` is client-visible (returned in plaintext inside `upload_url`), so on its own
+it does not prove the caller is the sidecar rather than the uploading client itself. Both routes below optionally
+require a second factor: when `FileStorageConfig::finalize_internal_secret` is configured, the request must also
+carry a matching `x-fs-internal-token` header (constant-time-compared; `403` on missing/mismatch), checked *after*
+`fs-token` verification. `None` (the default) preserves the token-only behavior above; see
+`docs/ADR/0003-…-sidecar-data-plane.md`'s trust-model section for the mechanism (interim gear-local shared secret)
+and the required rollout order (`FS_SIDECAR_INTERNAL_TOKEN` must reach every sidecar before
+`require_finalize_internal_secret` is flipped `true`). With this second factor configured, a client-visible
+`fs-token` alone can no longer drive these two routes.
 
 ```text
 D1. POST /files/{file_id}/versions/{version_id}/finalize
@@ -176,9 +177,8 @@ each part write in the multipart case — see `D2`).
 - This endpoint does **not** bind the version as current — `POST /files/{id}/bind` remains a separate, explicit
   client call.
 
-**`D2` report-part** — added in P2 remediation 0.2 group B: called by the sidecar after each successful multipart
-part write, closing the gap where nothing previously populated `multipart_upload_parts` in a real (non-test)
-deployment.
+**`D2` report-part** — called by the sidecar after each successful multipart part write; this callback is what
+populates `multipart_upload_parts`, the table `complete` assembles from.
 - **Header**: `x-fs-token: <signed multipart-part token>` (`op` must be `MultipartPart`; `file_id`/`version_id`/
   `upload_id`/`part_number` must match the path).
 - **Request body** (`application/json`): `{ "backend_etag": "<string>", "hash_hex": "<64-char lowercase hex>", "size": <i64> }`
@@ -193,9 +193,8 @@ deployment.
 
 ## P2 — Multipart upload
 
-> **Implementation status**: **shipped** (server-authoritative flow; see the status note further below). Multipart
-> is **server-authoritative**: the client sends desired parameters and the control plane returns the exact parts
-> plan (sizes/offsets) with **one signed URL per part** pointing at the sidecar.
+Multipart is **server-authoritative**: the client sends desired parameters and the control plane returns the exact
+parts plan (sizes/offsets) with **one signed URL per part** pointing at the sidecar.
 
 ```text
 P2-1. POST /files/{id}/multipart            initiate (JSON: declared_mime, declared_size, preferred part size, concurrency); returns the parts plan + per-part signed URLs
@@ -206,23 +205,30 @@ P2-5. GET /files/{id}/multipart/{upload_id}             introspect/resume; retur
 ```
 
 Notes:
+- `P2-1` (`initiate`) always targets the backend registry's **default** backend (`FileStorageConfig::default_backend_id`,
+  or `local-fs` if unset — see `operations.md`); there is no per-request target-backend choice, unlike `migrate`. That
+  backend must advertise the `multipart_native` capability, and `local-fs` does **not** — so multipart initiate
+  against the plain default configuration is rejected with `400` (`MULTIPART_NOT_SUPPORTED`). A configured S3 backend
+  or the dev/test `memory` backend both advertise `multipart_native: true`, so multipart becomes available once one
+  of them is made the default (`default_backend_id`) or the only backend.
 - `P2-3` (`complete`) does **not** bind the version as current — like the single-part flow, `POST /files/{id}/bind`
-  is a separate, explicit client call. It takes an **optional** `If-Match` header (item 3.3): a concrete value is
-  checked against the file's current content ETag (`400` on mismatch — `FailedPrecondition` collapses to `400` on
-  this platform); `*` or an absent header is unconditional (backward compatible with the pre-3.3 contract). As of
-  item 3.3 the route declares `401`/`403`/`404`/`409`/`400`/`500`.
-- `P2-3` (`complete`) returns **`200`** (not `204` as of item 3.3) with a JSON body — see the response shape below.
-- `P2-5` (`GET .../multipart/{upload_id}`, introspect/resume) is **shipped** (item 3.4, SHIP decision). It is
-  authorized on `write` (like initiate/complete/abort, not `read`) since it hands out live resume upload URLs. A
-  foreign or missing `upload_id` is masked as `404`, identical to `complete`'s guard. The route declares
-  `401`/`403`/`404`/`500`. See the response shape below.
+  is a separate, explicit client call. It takes an **optional** `If-Match` header: a concrete value is checked
+  against the file's current content ETag (`400` on mismatch — `FailedPrecondition` collapses to `400` on this
+  platform); `*` or an absent header is unconditional. The route declares `401`/`403`/`404`/`409`/`400`/`500`.
+- `P2-3` (`complete`) returns **`200`** with a JSON body — see the response shape below.
+- `P2-5` (`GET .../multipart/{upload_id}`, introspect/resume) is authorized on `write` (like initiate/complete/abort,
+  not `read`) since it hands out live resume upload URLs. A foreign or missing `upload_id` is masked as `404`,
+  identical to `complete`'s guard. The route declares `401`/`403`/`404`/`500`. See the response shape below.
+- There is no control-plane route for uploading individual parts (e.g. a `PUT /files/{id}/multipart/{upload_id}/parts/{n}`
+  against the control plane); bytes flow exclusively to the sidecar via the per-part signed URLs in the initiate
+  response (ADR-0003, "no bytes through the control plane").
 
 **`P2-1` initiate request body** (`application/json`):
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `declared_mime` | `string` | yes | MIME type of the file being uploaded (e.g. `video/mp4`). Validated against the effective allowed-types policy. |
-| `declared_size` | `uint64` | yes | Total file size in bytes. The control plane validates this against the effective policy size limit and storage quota at initiate time — exactly like single-part upload does at presign time — so that oversized or quota-exceeding uploads are rejected before any bytes are transferred. `400` if it exceeds the policy size limit; `429` if it would exceed the storage quota. **Implementation status (P2)**: the `429` quota path only fires when a `QuotaClient` is configured — none is, in any deployment (`gear.rs`'s `quota_client: None`, Tier 1 item 1.4) — so callers do not observe quota rejections; see [operations.md](./operations.md#storage-quota-not-enforced). |
+| `declared_size` | `uint64` | yes | Total file size in bytes. The control plane validates this against the effective policy size limit and storage quota at initiate time — exactly like single-part upload does at presign time — so that oversized or quota-exceeding uploads are rejected before any bytes are transferred. `400` if it exceeds the policy size limit; `429` if it would exceed the storage quota. The `429` quota path only fires when a `QuotaClient` is configured; none is wired in any deployment (`gear.rs`'s `quota_client: None`), so callers do not currently observe quota rejections — see [operations.md](./operations.md#storage-quota-not-enforced). |
 | `preferred_part_size` | `uint64` | no | Client hint for the part size in bytes; the server may widen it (see the `MAX_PART_COUNT` note below) or otherwise adjust it to satisfy backend minimums. Rejected with `400` if outside `[DEFAULT_MIN_PART_SIZE (5 MiB), MAX_PART_SIZE (5 GiB)]`. |
 | `concurrency` | `uint32` | no | Advisory hint for client-side upload concurrency; does not change the parts plan itself. |
 
@@ -267,15 +273,16 @@ finishes streaming:
   before returning `400`, rather than leaving a mismatched part object behind.
 
 Re-`PUT` of the same part is idempotent (enables resume — a fresh `PUT` simply overwrites/re-buffers). For a
-`multipart_native` backend the sidecar drives the backend multipart API; otherwise it offset-writes each part into
-its own object as above. Per-part **SHA-256** hashes are reported to the control plane via the `D2` report-part
-callback (see
+`multipart_native` backend the sidecar drives the backend multipart API; the sidecar's write path also has a
+non-native, `local-fs`-style offset-object fallback, though it is not reachable through the real initiate flow today
+since initiate rejects any default backend that isn't `multipart_native` (see the Notes above). Per-part **SHA-256**
+hashes are reported to the control plane via the `D2` report-part callback (see
 [Data-plane callbacks](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated)) and persisted in
 `multipart_upload_parts.part_hash`; `complete` assembles from the reported parts. The sidecar's `200` response body
 for a successful part `PUT` is `{ "part_number": <u32>, "etag": "<backend-assigned or hash-derived string>",
 "hash_algorithm": "SHA-256", "hash": "<64-char lowercase hex>" }`.
 
-**`P2-3` complete response** (`application/json`, `200` — item 3.3, replacing the previous bare `204`):
+**`P2-3` complete response** (`application/json`, `200`):
 
 ```json
 {
@@ -289,15 +296,16 @@ for a successful part `PUT` is `{ "part_number": <u32>, "etag": "<backend-assign
 }
 ```
 
-Before `complete` assembles anything it now also diffs the plan's expected part numbers (`ceil(declared_size /
-part_size)`) against the parts actually reported; a non-empty diff is rejected with `409` and the missing part
-numbers in the error detail, **before** ever calling the backend's native multipart completion — a caller debugging
-a stalled upload gets an actionable list instead of the opaque total-assembled-size mismatch that was previously the
-only signal. `manifest` lets a client independently re-verify the composite hash (see
-[content-hash-modes.md](./features/content-hash-modes.md) §"Client-Side Manifest Re-Verification") without a second
-round-trip.
+Before `complete` assembles anything it diffs the plan's expected part numbers (`ceil(declared_size / part_size)`)
+against the parts actually reported; a non-empty diff is rejected with `409` and the missing part numbers in the
+error detail, **before** ever calling the backend's native multipart completion — giving a caller debugging a
+stalled upload an actionable list instead of an opaque total-assembled-size mismatch. `manifest` lets a client
+independently re-verify the composite hash (see [content-hash-modes.md](./features/content-hash-modes.md)
+§"Client-Side Manifest Re-Verification") without a second round-trip. This is also the **only** endpoint that
+returns `manifest` — it is not part of `GET /files/{id}/versions` or any other metadata response (see the note in
+"P1 — Control plane" above).
 
-**`P2-5` introspect response** (`application/json`, `200` — item 3.4):
+**`P2-5` introspect response** (`application/json`, `200`):
 
 ```json
 {
@@ -328,16 +336,6 @@ but every `missing` entry omits `upload_url`.
 Full request/response envelopes, error taxonomy, token claims, persistence, and resumability are specified in the
 FEATURE artifact **[features/multipart-coordinator.md](./features/multipart-coordinator.md)**.
 
-> **Implementation status**: the server-authoritative flow is **shipped**. `POST /files/{id}/multipart` computes the
-> parts plan and returns one signed sidecar URL per part (each token carrying `upload_id`, `part_number`, `offset`, and
-> the exact `size` claim); the sidecar enforces the per-part size at transfer with `413` **before** any write. The
-> initiate-time `declared_size` gate is in place and `declared_size`/`part_size` are persisted on the session row so the
-> plan can be reconstituted for resume. The interim client-driven control-plane byte route (`PUT .../parts/{n}`) has
-> been **removed** — bytes flow exclusively to the sidecar (ADR-0003, FEATURE §8 migration). The complete-time
-> total-size check (assembled size == `declared_size`) remains as the defence-in-depth backstop. Per-part hashes are
-> **SHA-256** in P2. The introspect/resume endpoint (`P2-5`, item 3.4) is also **shipped**: it reconstitutes the
-> plan's missing parts from the session's persisted columns and re-mints their signed URLs for a live session.
-
 ## P2 — Policy engine
 
 Per-tenant and per-user policies (allowed MIME types, size limits, metadata limits, enabled event types). The
@@ -359,6 +357,8 @@ GET  /policy/effective?user_owner_id=<uuid>              compute the effective (
   optional hint to include a specific user level in the resolution. Response fields are all "effective" (most
   restrictive already resolved): `allowed_mime_types` (`null` = unrestricted), `max_bytes`, `per_mime_max_bytes`,
   `metadata_limits`.
+- `enabled_event_types` (inside the policy body) is stored and returned but does not currently gate anything: file
+  events are enqueued into `events_outbox` unconditionally, independent of this field's configured value.
 - **There is no `DELETE /policy` route.** To relax a policy, `PUT` a replacement body (e.g. an empty/permissive one);
   there is no way to remove a stored policy row entirely via the API.
 - A concurrent `PUT /policy` race for the same scope is closed at the DB level by two partial unique indexes on
@@ -446,12 +446,12 @@ avoid leaving this unswept sibling behind.
 ## Signed URLs
 
 - **Ed25519-signed compact token, asymmetric, stateless — codec-equivalent to PASETO `v4.public`, not literal
-  PASETO.** ADR-0004 specifies PASETO `v4.public`; what ships is `base64url(JSON payload).base64url(signature)`
+  PASETO.** ADR-0004 specifies PASETO `v4.public`; the wire format is `base64url(JSON payload).base64url(signature)`
   (`infra::signed_url::Issuer`/`Verifier`) — same asymmetric control-signs/sidecar-verifies property and the same
-  opaque, evolvable claim-set, but **no PASETO footer and no `kid`** (key rotation is not implemented; one static
-  keypair today). The control plane signs with the Ed25519 private key (sole minter); the sidecar verifies with the
-  public key and can never mint. **Not JWT** (no `alg` field → no algorithm-confusion). No DB lookup to verify. No
-  per-token revocation — emergency revocation is the platform auth module's token revocation. See
+  opaque, evolvable claim-set, but **no PASETO footer and no `kid`** (no key rotation; a single static keypair). The
+  control plane signs with the Ed25519 private key (sole minter); the sidecar verifies with the public key and can
+  never mint. **Not JWT** (no `alg` field → no algorithm-confusion). No DB lookup to verify. No per-token
+  revocation — emergency revocation is the platform auth module's token revocation. See
   [ADR-0004](./ADR/0004-cpt-cf-file-storage-adr-signed-url-transport.md).
   - **Implementation note:** because the token is opaque (below), the concrete codec is an internal detail of
     control + sidecar and may move to a literal PASETO library (with a real footer/`kid`) later without any
@@ -472,33 +472,33 @@ avoid leaving this unswept sibling behind.
   "Response headers" below and ADR-0003), so it cannot resolve them any other way. The sidecar resolves the object
   purely from the verified claims, never from a "version row" lookup.
 - **Claims (inside the token; AND-combined; all optional except `exp` and `op`):**
-  | Claim | Req. | Status | Applies | Violation |
+  | Claim | Req. | Enforced? | Applies | Violation |
   |---|---|---|---|---|
-  | `exp` | yes | **shipped** | all | `403` (at/past `exp`, exclusive boundary) |
-  | `op` (+ method check) | yes | **shipped** | all | `403` |
-  | `backend_id` / `backend_path` | yes | **shipped** | all | n/a — used to resolve the object, no DB lookup |
-  | `ip` (addr/CIDR) | no | **NOT implemented** (planned) | all | — |
-  | `tok.<claim>` | no | **NOT implemented** (planned; would need JWT) | all | — |
-  | `max_size` | no | **shipped** | upload | `413` |
-  | `exact_size` | no | **shipped** | upload | `400`¹ |
-  | `expected_hash` = `<alg>:<hex>` | no | **shipped** | upload | `400`² |
-  | `max_rate` | no | **NOT implemented** (planned) | up/down | — |
-  | `max_conns` | no | **NOT implemented** (planned) | up/down | — |
-  | `content_type` | no | **shipped** (P2 1.11) | download (`op = get`) | n/a — echoed as `Content-Type`³ |
-  | `etag` | no | **shipped** (P2 1.11) | download (`op = get`) | n/a — echoed as `ETag`³ |
+  | `exp` | yes | yes | all | `403` (at/past `exp`, exclusive boundary) |
+  | `op` (+ method check) | yes | yes | all | `403` |
+  | `backend_id` / `backend_path` | yes | yes | all | n/a — used to resolve the object, no DB lookup |
+  | `ip` (addr/CIDR) | no | **not implemented (planned)** | all | — |
+  | `tok.<claim>` | no | **not implemented (planned; would need JWT)** | all | — |
+  | `max_size` | no | yes | upload | `413` |
+  | `exact_size` | no | yes | upload | `400`¹ |
+  | `expected_hash` = `<alg>:<hex>` | no | yes | upload | `400`² |
+  | `max_rate` | no | **not implemented (planned)** | up/down | — |
+  | `max_conns` | no | **not implemented (planned)** | up/down | — |
+  | `content_type` | no | yes | download (`op = get`) | n/a — echoed as `Content-Type`³ |
+  | `etag` | no | yes | download (`op = get`) | n/a — echoed as `ETag`³ |
 
-  `Claims` has no `ip`, `tok.<claim>`, `max_rate`, or `max_conns` field today (`infra/signed_url/mod.rs`) — the
-  sidecar performs no client-address check, no platform-JWT validation of any kind, and no rate/connection limiting.
-  These rows are retained as tracked design intent, not shipped behavior.
+  `Claims` has no `ip`, `tok.<claim>`, `max_rate`, or `max_conns` field (`infra/signed_url/mod.rs`). The sidecar
+  validates only: the token's signature and expiry (`exp`); `op` against the HTTP method; the `file_id`/`version_id`
+  (and, for a multipart part, `upload_id`/`part_number`) binding against the request path; and the upload size/hash
+  constraints (`max_size`/`exact_size`/`expected_hash`) below. It performs no client-address check, no platform-JWT
+  validation of any kind, and no rate/connection limiting.
 
   ¹ `exact_size` is checked only after the stream fully drains (mismatch → `400`, "size does not match exact_size");
-  it can never itself trigger `413` (that's `max_size`'s mid-stream abort, and the two claims are documented as
-  mutually exclusive). **Unverified further**: `rg -n "exact_size:" src/` finds the field only in its struct
-  definition and in tests — no presign path (`create.rs`/`write.rs`) was found actually setting it on an issued
-  token as of this doc pass, so this claim/status pairing may be dead code; flagged for the team, not
-  fixed here (out of scope for this doc pass).<br>
-  ² previously documented as `422`; `bin/sidecar.rs`'s `expected_hash` check returns `(StatusCode::BAD_REQUEST, ...)`
-  (`400`), not `422` — no `422` response exists anywhere in this gear.<br>
+  it can never itself trigger `413` (that's `max_size`'s mid-stream abort, and the two claims are mutually
+  exclusive). No presign path (`create.rs`/`write.rs`) currently sets this claim on an issued token, so `exact_size`
+  enforcement exists in the verifier but is not currently exercised by any control-plane code path.<br>
+  ² `bin/sidecar.rs`'s `expected_hash` check returns `(StatusCode::BAD_REQUEST, ...)` (`400`) — no `422` response
+  exists anywhere in this gear.<br>
   ³ these two claims are populated only on a **download** (`op = get`) token, at `download-url` issuance time — the
   control plane reads `version.mime_type` and computes the content ETag (`domain::etag::content_etag`) once and
   stamps both into the claims, so the sidecar (no DB access) can emit the real `Content-Type`/`ETag` response
@@ -514,17 +514,17 @@ avoid leaving this unswept sibling behind.
   later). **Stale-permission trade-off:** authorization is evaluated at signing and there is no per-token
   revocation, so the TTL bounds the exposure window — hence the short default for private content; the 7-day
   ceiling is an explicitly accepted trade-off for low-sensitivity / deliberately long-lived cases (bare query-token
-  URLs in particular MUST use a short TTL; durable/anonymous sharing is P3 FileShare). "Available to everyone for 5
-  minutes" = only `exp` (the `tok.<claim>` predicate mentioned in some earlier drafts of this doc is **not
-  implemented** — see the claims table above).
+  URLs in particular MUST use a short TTL; durable/anonymous sharing is handled by a separate FileShare gear, not
+  yet built — see "Two planes" above). "Available to everyone for 5 minutes" = only `exp` (the `tok.<claim>`
+  predicate is not implemented — see the claims table above).
 - **`max_size` and `exact_size` are mutually exclusive by construction** — no code path mints a token with both set —
   but this is **not independently validated** as a "both present" error at presign or verify time; there is no
   dedicated rejection path for that combination.
-- **`expected_hash`** `<alg>` must be in the backend allow-list (P1: `SHA-256`); lowercase hex; baked by the control
-  plane (may carry a client-supplied value from the presign request).
-- **`max_rate` / `max_conns` are NOT implemented.** No such claims exist on `Claims` and the sidecar enforces no
+- **`expected_hash`** `<alg>` must be in the backend allow-list (currently `SHA-256` only); lowercase hex; baked by
+  the control plane (may carry a client-supplied value from the presign request).
+- **`max_rate` / `max_conns` are not implemented.** No such claims exist on `Claims` and the sidecar enforces no
   per-URL rate/connection cap; this remains an open design point (scoping to one `(file_id, op)` and cross-instance
-  coordination across the sidecar fleet), not a shipped capability.
+  coordination across the sidecar fleet).
 - **Outside the token:** the `Range` header, conditional headers, and the `PUT` body are not part of the token — so one
   signed URL serves many ranges, and body integrity is enforced by `max_size`/`expected_hash` during the stream plus a
   control-plane re-verification at `finalize`, which re-reads the stored blob and recomputes its size/hash rather than
@@ -532,7 +532,7 @@ avoid leaving this unswept sibling behind.
   reported per-part hashes during `complete` (no full assembled-object read-back — only a bounded MIME-sniff read).
   `bind` performs no integrity check of its own — it only swaps `content_id`
   to point at an already-finalized (`Available`) version, guarded by the `If-Match` content-ETag precondition above.
-- **"Baked response headers" claim — NOT implemented.** The token carries only the two specific `content_type`/`etag`
+- **"Baked response headers" claim — not implemented.** The token carries only the two specific `content_type`/`etag`
   claims (download-only, above); there is no general response-header-set claim and the sidecar does not echo an
   arbitrary `Content-Disposition`/`Cache-Control`/etc. from the token. See "Response headers" below for what the
   sidecar actually emits.
@@ -543,9 +543,11 @@ avoid leaving this unswept sibling behind.
   control plane (`FailedPrecondition` collapses to `400` on this platform — see "Status code summary" below). The
   sidecar's data-plane `PUT` does not check `If-Match` at all — it only streams bytes and calls finalize; conditional
   concurrency on content is enforced solely by the control-plane `bind` handler.
-- `If-Match-Metadata: <u64>`: **optional** on metadata-only `PATCH`; matched against the current `meta_version` (the
-  value published as `X-FS-Metadata-Revision`). Mismatch → `400` (same `FailedPrecondition` → `400` mapping). Absent
-  → last-write-wins (back-compatible default); clients keeping meaningful state in custom metadata opt in.
+- `If-Match-Metadata: <u64>`: **optional** on metadata-only `PATCH`; matched against the current `meta_version`.
+  Mismatch → `400` (same `FailedPrecondition` → `400` mapping). `meta_version` is returned in the JSON body
+  (`FileDto.meta_version`) on every file read/mutation response; there is **no** `X-FS-Metadata-Revision` response
+  header (see "Response headers" below). Clients that omit `If-Match-Metadata` get last-write-wins; clients that
+  want to detect concurrent metadata edits opt in by sending it.
 - `If-None-Match`: optional on control-plane `GET /files/{id}` (metadata) only; match → `304 Not Modified`. **Not**
   implemented on the sidecar's download `GET` (see "P1 — Sidecar" above) — there is also no `HEAD` route on either
   plane.
@@ -553,8 +555,8 @@ avoid leaving this unswept sibling behind.
   hash. It changes exactly when content is (re)bound; a metadata-only `PATCH` does not change it. The content
   hash algorithm+value are exposed in the `GET /files/{id}/versions` body (`hash_algorithm`, `hash`), not as
   response headers (see "Response headers" below — the sidecar does not emit `X-FS-Hash-*`). Content-hash modes
-  (whole-object vs. multipart offset-manifest composite) are **shipped**, not proposed —
-  see [ADR-0006](./ADR/0006-cpt-cf-file-storage-adr-content-hash-modes.md) and `hash_mode`/`part_count` above (§P1
+  (whole-object vs. multipart offset-manifest composite) are implemented — see
+  [ADR-0006](./ADR/0006-cpt-cf-file-storage-adr-content-hash-modes.md) and `hash_mode`/`part_count` above (§P1
   control plane notes).
 
 ## Range support
@@ -578,7 +580,7 @@ Served by the **sidecar**.
 
 ## Response headers (download, on the sidecar)
 
-Shipped (`src/bin/sidecar.rs`'s `download`/`download_range`/`download_whole` handlers):
+Emitted by the sidecar's download handlers (`src/bin/sidecar.rs`'s `download`/`download_range`/`download_whole`):
 
 ```text
 Accept-Ranges: bytes
@@ -589,13 +591,12 @@ Content-Range: bytes <s>-<e>/<n>     # only on 206 (and "bytes */<n>" on 416)
 
 `Content-Length` is set by the HTTP framework from the response body, not hand-rolled by the sidecar.
 
-`ETag` and `Content-Type` are, as of P2 1.11, genuinely sourced per-request from the download token's
-`etag`/`content_type` claims (see the Claims table above) rather than a control-plane round trip — the sidecar has
-no DB access, so the token is its only source for either. A token minted before P2 1.11 (or, in principle, any
-other producer that leaves either claim empty) falls back to `Content-Type: application/octet-stream` and omits
-`ETag` entirely, rather than sending an empty header.
+`ETag` and `Content-Type` are sourced per-request from the download token's `etag`/`content_type` claims (see the
+Claims table above) rather than a control-plane round trip — the sidecar has no DB access, so the token is its only
+source for either. A token that leaves either claim empty falls back to `Content-Type: application/octet-stream` and
+omits `ETag` entirely, rather than sending an empty header.
 
-**Planned (not implemented) — do not rely on these today:**
+**Planned / not implemented:**
 
 ```text
 Last-Modified: <RFC 7231 date>
@@ -612,11 +613,9 @@ X-FS-Meta-<key>: <value>
 <baked response headers>            # see "the 'baked response headers' claim — NOT implemented" above
 ```
 
-None of the `X-FS-*` headers above are emitted by the sidecar today — they were an earlier design intent (a "baked
-response headers" claim that never shipped, see "Signed URLs" above) and would require the sidecar to either gain DB
-access or carry substantially more per-request state in the token than it does now. `HEAD` and sidecar-side
-`If-None-Match` → `304` are likewise not implemented (see "P1 — Sidecar" above) — this is a pre-existing gap, not
-something P2 1.11 introduced or closes.
+None of the `X-FS-*` headers above are emitted by the sidecar: doing so would require the sidecar to either gain DB
+access or carry substantially more per-request state in the token than it does today. `HEAD` and sidecar-side
+`If-None-Match` → `304` are likewise not implemented (see "P1 — Sidecar" above).
 
 ## Status code summary
 
@@ -637,10 +636,10 @@ something P2 1.11 introduced or closes.
   `scope_target_id` for `user`/`file` scope); the declared file size exceeds
   the effective policy size limit (control plane, `create_file`/`presign_version`/multipart `initiate`); an
   `If-Match`/`If-Match-Metadata` precondition mismatch on control-plane `bind`/`DELETE`/`PATCH`/multipart `complete`
-  (item 3.3; `FailedPrecondition` collapses to `400` on this platform — there is no `412`-mapped canonical-error
-  variant); the finalize callback's
-  read-back size/hash/mime not matching the sidecar's claim, or no blob present at the version's backend path at all
-  (control plane, `POST .../finalize` — see
+  (`FailedPrecondition` collapses to `400` on this platform — there is no `412`-mapped canonical-error variant); a
+  multipart initiate whose target backend does not support native multipart (`MULTIPART_NOT_SUPPORTED`); the
+  finalize callback's read-back size/hash/mime not matching the sidecar's claim, or no blob present at the
+  version's backend path at all (control plane, `POST .../finalize` — see
   [Data-plane callbacks](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated)); or invalid GTS file
   type format (control plane).
 - `401 Unauthorized` — the sidecar's `PUT`/`GET`/multipart-part routes require the signed token via the `fs-token`
@@ -660,15 +659,14 @@ something P2 1.11 introduced or closes.
   - `migrate` (`POST /files/{id}/migrate`): the version is not yet finalized, or a concurrent migration to a
     different target already won the race.
   - multipart `complete`/`abort`: the session is not `in_progress` (e.g. completing an already-aborted upload), one
-    or more planned parts have not been reported yet (item 3.3 — `MultipartPartsMissing`, error detail lists the
-    missing part numbers, checked **before** the size check below), the assembled size does not match
-    `declared_size`, or the pending version row was removed concurrently.
+    or more planned parts have not been reported yet (`MultipartPartsMissing`; the error detail lists the missing
+    part numbers, checked **before** the size check below), the assembled size does not match `declared_size`, or
+    the pending version row was removed concurrently.
   - `create_file` (idempotent retry): the same `idempotency_key` was reused with a materially different request body.
   - `download_url` (`GET /files/{id}/download-url`): the file has no bound content yet (never bound), or the target
-    version's upload has not been finalized. **Not declared** in this route's OpenAPI registration in `routes.rs`
-    (only `401`/`403`/`404`/`500` are) even though the domain code returns it — an undocumented-in-OpenAPI real `409`,
-    found while auditing conflict cases for this doc pass; flagged for the team alongside the `update_metadata`
-    mismatch below.
+    version's upload has not been finalized. This route's OpenAPI registration in `routes.rs` declares only
+    `401`/`403`/`404`/`500`, so this `409` is not represented in the generated OpenAPI schema even though the domain
+    code returns it.
   - **sidecar `PUT` (replay)**: a `PUT` to an `upload_url` whose `backend_path` already holds a published blob (a
     genuine token replay after the version was already finalized, as opposed to a benign retry of the same in-flight
     upload) gets `409 Conflict` from the sidecar itself — `publish_exclusive`'s create-exclusive write refuses to
@@ -676,9 +674,9 @@ something P2 1.11 introduced or closes.
     but finalize had not yet run) instead converges to `200` once finalize succeeds on this attempt.
 
   Note: `update_metadata` (`PATCH /files/{id}`) declares a `409` response in its OpenAPI registration
-  (`routes.rs`), but no domain code path for it was found returning `DomainError::Conflict` as of this doc pass —
-  its only observed failure beyond validation is the `If-Match-Metadata` mismatch, which is `400`
-  (`PreconditionFailed`). Flagged as unverified/possibly-stale route metadata; not asserted as a real `409` case here.
+  (`routes.rs`), but no domain code path returns `DomainError::Conflict` for this handler — its only failure mode
+  beyond request validation is an `If-Match-Metadata` mismatch, which maps to `400` (`PreconditionFailed`). The
+  declared `409` does not correspond to a reachable code path.
 - `412 Precondition Failed` — **not used anywhere in this gear.** This platform's canonical-error taxonomy has no
   `412`-mapped variant; `FailedPrecondition` collapses to `400` on the control plane (see above), and the sidecar
   never performs an `If-Match`/conditional check at all — it only streams bytes and calls finalize, so there is no
@@ -687,12 +685,12 @@ something P2 1.11 introduced or closes.
 - `413 Payload Too Large` — upload exceeds the `max_size` claim, aborted mid-stream (sidecar, `PUT`).
 - `416 Range Not Satisfiable` — a well-formed `Range` that cannot be satisfied against the size (sidecar). An
   unparseable `Range` is **not** a `416` — it is ignored and the full body is served with `200`.
-- `429 Too Many Requests` — **NOT implemented** as a sidecar per-URL `max_conns` cause (that claim does not exist,
-  see "Signed URLs" above); the only live `429` source is the control-plane storage quota check on
-  `create_file`/`presign_version`/multipart `initiate` (`QuotaExceeded`). **Implementation status (P2)**: that
-  `QuotaExceeded` case is itself only reachable when a `QuotaClient` is wired. None is, in any deployment — `gear.rs`
-  always passes `quota_client: None` (Tier 1 item 1.4), so `check_quota`/`check_quota_bytes` are a permissive no-op
-  and this `429` cause cannot currently occur either. See [operations.md](./operations.md#storage-quota-not-enforced).
+- `429 Too Many Requests` — not implemented as a sidecar per-URL `max_conns` cause (that claim does not exist, see
+  "Signed URLs" above); the only live `429` source is the control-plane storage quota check on
+  `create_file`/`presign_version`/multipart `initiate` (`QuotaExceeded`). That check is itself only reachable when a
+  `QuotaClient` is wired, and none is — `gear.rs` always passes `quota_client: None`, so `check_quota`/
+  `check_quota_bytes` are a permissive no-op and this `429` cause cannot currently occur. See
+  [operations.md](./operations.md#storage-quota-not-enforced).
 - `502 Bad Gateway` — the sidecar's own response to the client when its finalize or report-part callback to the
   control plane fails (transport error after retries, or the control plane rejects the callback with a 4xx/5xx). This
   is a **retry signal**: the callback failure does not mean the bytes failed to land — see "Data-plane callbacks"
@@ -700,8 +698,7 @@ something P2 1.11 introduced or closes.
   `upload`/`upload_multipart_part` handlers' own doc comments in `src/bin/sidecar.rs` for the exact decision table
   between `200`, `409`, and `502` on a replayed `PUT`.
 
-Removed from this table (no corresponding code path found — verified by grepping the gear's `src/` for the status
-code and for any `DomainError` variant that could map to it): `422 Unprocessable Entity` (previously claimed for
-`expected_hash` mismatch and invalid GTS type — both are actually `400`) and `415 Unsupported Media Type`
-(previously claimed for magic-bytes mime mismatch — also actually `400`, via `DomainError::MimeMismatch` →
-`invalid_argument`). `507 Insufficient Storage` was already corrected to `429` in a prior doc pass.
+`422 Unprocessable Entity`, `415 Unsupported Media Type`, and `507 Insufficient Storage` are not used anywhere in this
+gear: an `expected_hash` mismatch and an invalid GTS file type both map to `400`; a magic-bytes MIME mismatch
+(`DomainError::MimeMismatch`) also maps to `400` (`invalid_argument`); and the storage-quota-exceeded case maps to
+`429`, not `507`.

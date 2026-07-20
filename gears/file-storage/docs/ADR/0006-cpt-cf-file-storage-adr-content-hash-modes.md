@@ -274,7 +274,11 @@ left untouched** — it is never widened, since both modes use SHA-256 as their 
 move from being unset at pending-insert time to being set at finalize time (the existing `VersionRepo::finalize` never
 touches `hash_algorithm`, a gap independent of this decision); `StorageBackend::upload_part` gains a `part_offset`
 parameter and `complete_multipart`'s contract flips from "re-read and hash the assembled object" to "build the
-manifest and root from the hashes and offsets you were given."
+manifest and root from the hashes and offsets you were given." **Gap, not enforced anywhere:** `part_count` and the
+`version_hash_manifest` row's own entry count are both derived from the same `parts` collection at finalize time, so
+they agree in practice, but nothing — no DB constraint, no runtime assertion — cross-checks that `part_count` actually
+equals the manifest's entry count after the fact; a future bug in a code path that sets one without the other would
+not be caught automatically.
 
 ### Consequences
 
@@ -448,5 +452,7 @@ This decision directly addresses the following requirements or design elements:
   `part_offset` parameter and manifest-building contract this decision requires
 * `cpt-cf-file-storage-fr-metadata-storage` — the version row's `(hash_mode, hash_value)` plus the
   `version_hash_manifest` table remains the system-managed metadata this decision's verification model depends on
-* `cpt-cf-file-storage-fr-get-metadata` — metadata responses continue to surface the resolved hash fields, now
-  including `hash_mode`, `part_count`, and (for multipart versions) the `manifest` text, so consumers can re-verify
+* `cpt-cf-file-storage-fr-get-metadata` — metadata responses (`VersionDto`, `GET /files/{id}/versions`) continue to
+  surface the resolved hash fields, now including `hash_mode` and `part_count`. The `manifest` text itself is
+  **not** part of this surface — it is returned only by the one-shot multipart `complete` response; see the tracked
+  API-exposure gap under [Client and migrate_backend re-verification](#client-and-migrate_backend-re-verification)
