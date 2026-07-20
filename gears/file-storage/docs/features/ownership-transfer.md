@@ -4,12 +4,11 @@ Updated:  2026-07-08 by Constructor Tech
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-featstatus-ownership-transfer-implemented`
 
-> **Status: PARTIAL.** The endpoint, atomic owner swap, audit row, file event,
-> and usage-delta reporting are all shipped and tested. What is **not**
-> implemented is validating that `new_owner_id` names a real principal: the
-> only guard is rejecting the nil UUID. See
-> [§1.2's caveat](#12-purpose) and the acceptance criteria in §6 for the
-> explicit, tracked gap.
+> The endpoint, atomic owner swap, audit row, file event, and usage-delta
+> reporting are fully tested. Target-owner validation is partial: the only
+> guard is rejecting the nil UUID; `new_owner_id` is not verified to name a
+> real principal. See [§1.2's caveat](#12-purpose) and the acceptance
+> criteria in §6.
 
 
 
@@ -56,7 +55,7 @@ references to it. Because the swap, the audit row, and the file event are all
 written in one transaction, a caller can never observe a state where the
 owner changed but no audit trail exists for it, or vice versa.
 
-> **Caveat (P2 2.12 — target-owner validation is PARTIAL).** `transfer_ownership`
+> **Caveat: target-owner validation is partial.** `transfer_ownership`
 > rejects `new_owner_id` only when it is the **nil UUID** — an obviously
 > malformed sentinel value, checked with `Uuid::is_nil()`
 > (`src/domain/service/write.rs::transfer_ownership`). It does **not** verify
@@ -74,8 +73,8 @@ owner changed but no audit trail exists for it, or vice versa.
 > into a different tenant, only to (mis)attribute it to an arbitrary UUID
 > within the caller's own tenant. Whether ownership transfer should also
 > require a distinct privileged-transfer grant (rather than reusing the
-> ordinary file `WRITE` authorization) is a related, separately open decision
-> tied to item 0.7's admin-scope work — not resolved by this feature either.
+> ordinary file `WRITE` authorization) is a related, separately open
+> admin-scope authorization decision — not resolved by this feature either.
 
 **Requirements**: `cpt-cf-file-storage-fr-ownership-transfer`
 
@@ -219,5 +218,5 @@ nil-UUID guard.
 - [x] `new_owner_id == Uuid::nil()` is rejected with a validation error before any DB write (`::transfer_to_malformed_owner_is_rejected`)
 - [x] A well-formed `new_owner_id` under the caller's own tenant succeeds (`::transfer_to_same_tenant_member_succeeds`) — this is also the only kind of transfer the endpoint can perform, since `tenant_id` is never taken from the request
 - [x] Usage deltas are reported: the old owner is debited and the new owner is credited by the file's total available-version bytes, and by one `file_count_delta` each
-- [ ] `new_owner_id` is validated against a real, existing, same-tenant principal — **PARTIAL / NOT IMPLEMENTED**; only the nil-UUID sentinel is rejected today, blocked on an account-management SDK dependency (P2 remediation item 2.12; see the caveat in §1.2 and the DoD in §5)
-- [ ] Ownership transfer requires a distinct privileged-transfer authorization grant rather than reusing the file's ordinary `WRITE` grant — **not decided/not implemented**; tracked alongside item 0.7's admin-scope work, out of this feature's current scope
+- [ ] `new_owner_id` is validated against a real, existing, same-tenant principal — **PARTIAL**; only the nil-UUID sentinel is rejected today, blocked on an account-management SDK dependency (see the caveat in §1.2 and the DoD in §5)
+- [ ] Ownership transfer requires a distinct privileged-transfer authorization grant rather than reusing the file's ordinary `WRITE` grant — **not decided**; a separate, open admin-scope authorization question, out of this feature's current scope

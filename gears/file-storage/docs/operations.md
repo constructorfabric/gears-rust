@@ -2,12 +2,11 @@
 
 This document covers every `FileStorageConfig` field (`gears/file-storage/file-storage/src/config.rs`), the sidecar's
 own `FS_SIDECAR_*` environment variables (`gears/file-storage/file-storage/src/bin/sidecar.rs`), and the background
-`CleanupEngine` sweep those config fields drive. It exists to close a gap flagged in P2 remediation item 3.8: several
-of these knobs (in particular the security-relevant ones) had no operator-facing documentation of their default,
-production recommendation, or failure mode.
+`CleanupEngine` sweep those config fields drive.
 
-Every field below is verified against the current `default_*()` function or `main()` env-var parsing as of this doc
-pass — see the file/line pointers in each entry.
+Every field below is verified against the current `default_*()` function or `main()`'s env-var parsing — each entry
+names the function (or environment variable) that sets its default, rather than a line number, since line numbers
+drift with every edit.
 
 <!-- toc -->
 
@@ -27,13 +26,16 @@ gear started with no `file-storage` config section at all gets every default bel
 actually boot**: `require_signing_key_seed` defaults to `true` with `signing_key_seed` unset, and
 `FileStorageConfig::validate()` fails gear init on exactly that combination (see `require_signing_key_seed` below).
 A genuinely zero-config deployment is dev/test-only (set `require_signing_key_seed: false` there).
-`FileStorageConfig::validate()` (called at gear init, before anything is wired up) currently rejects **seven**
+`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **seven**
 invalid configurations — three missing-secret/zero-interval guards (`sweep_interval_secs == 0` with the sweep
 enabled; `signing_key_seed` absent while required; `finalize_internal_secret` absent while required) and four
 cross-field ordering invariants (`default_url_ttl_secs` vs. `max_url_ttl_secs`; `default_page_size` vs.
 `max_page_size`; `default_url_ttl_secs` vs. `orphan_grace_secs`; `multipart_session_ttl_secs` vs.
 `default_url_ttl_secs`) — noted inline below. Function names (rather than line numbers) are used as source pointers
 throughout this table since line numbers drift with every edit.
+
+Config for this gear (like every gear on this platform) is loaded from its own platform YAML configuration section —
+there is no standalone TOML/JSON file of its own.
 
 | Field | Default | Source |
 |---|---|---|
@@ -59,8 +61,8 @@ throughout this table since line numbers drift with every edit.
 ### `default_url_ttl_secs`
 Default TTL (seconds) baked into every signed URL the control plane mints (`900` = 15 minutes), unless the caller's
 presign request or the code path explicitly asks for something else. Bounds the "stale-permission window" — how long
-a URL remains valid after the authorization decision was made at signing (no per-token revocation exists in P1).
-**Production recommendation**: keep short (minutes, not hours) for anything not explicitly meant to be long-lived or
+a URL remains valid after the authorization decision was made at signing (no per-token revocation exists). **Production
+recommendation**: keep short (minutes, not hours) for anything not explicitly meant to be long-lived or
 shareable; raise only for known bulk/batch workflows. **Misconfiguration risk**: too long → a leaked/logged URL stays
 exploitable for the full window; too short → legitimate slow uploads/downloads may need to be re-presigned mid-flight
 (no such retry-on-expiry logic exists in the SDK/handlers, so a very small value can break large transfers).
@@ -69,9 +71,9 @@ exploitable for the full window; too short → legitimate slow uploads/downloads
 Hard ceiling (seconds) the control plane will mint any signed URL to (`604800` = 7 days); enforced by `Issuer::issue`
 which clamps `exp` down to `now + max_url_ttl_secs` regardless of what was requested. **Production recommendation**:
 leave at the 7-day default or lower for stricter environments; do not raise without a specific long-lived/anonymous-
-sharing use case (P3 FileShare is the intended mechanism for that, not a raised ceiling here). **Misconfiguration
-risk**: raising it widens the window during which a leaked URL is exploitable, with no revocation mechanism to claw
-it back.
+sharing use case (a separate FileShare gear, not yet built, is the intended mechanism for that — not a raised ceiling
+here). **Misconfiguration risk**: raising it widens the window during which a leaked URL is exploitable, with no
+revocation mechanism to claw it back.
 
 ### `sidecar_base_url`
 The externally-reachable base URL of the data-plane sidecar that every signed URL points at (default assumes a
@@ -111,7 +113,7 @@ instead of degrading silently into that failure mode.
 When `true` (the default), `FileStorageConfig::validate()` makes gear init **fail fast** if `signing_key_seed` is
 absent, instead of silently minting an ephemeral per-boot key. **Production recommendation**: leave at `true`
 everywhere except local dev/test harnesses that construct a `FileStorageConfig` directly and intentionally want the
-ephemeral-key behavior — set `false` explicitly there. **Misconfiguration risk**: setting `false` in a real
+ephemeral-key behaviour — set `false` explicitly there. **Misconfiguration risk**: setting `false` in a real
 multi-replica deployment removes the fail-fast guard and re-opens the "different key per replica" failure mode
 described above, deferred from a loud startup error to a confusing runtime symptom.
 
@@ -142,41 +144,49 @@ idempotency keys all accumulate for longer between passes (storage growth, and r
 run wider than the policy nominally states).
 
 ### `enable_background_sweep`
-When `true` (**the default — flipped in Tier 1 item 1.4**; previously defaulted to `false`), the cleanup sweep loop
-starts at gear init. **Production recommendation**: leave at `true` in every real deployment; set `false` only in
-test/dev harnesses that construct a `FileStorageConfig` directly (not via YAML) and need fully deterministic
-behavior (no background task racing test assertions). **Misconfiguration risk**: `false` in production means **no**
-orphan reconciliation, **no** expired-multipart cleanup, **no** retention-policy enforcement, and **no**
-idempotency-key garbage collection ever run — pending versions and abandoned multipart sessions accumulate
-indefinitely, retention rules become inert (a compliance-relevant silent failure, since a configured retention
-policy will appear to exist via `GET /retention-rules` but never actually delete anything), and `idempotency_keys`
-grows without bound.
+When `true` (**the default**), the cleanup sweep loop starts at gear init. **Production recommendation**: leave at
+`true` in every real deployment; set `false` only in test/dev harnesses that construct a `FileStorageConfig` directly
+(not via YAML) and need fully deterministic behavior (no background task racing test assertions). **Misconfiguration
+risk**: `false` in production means **no** orphan reconciliation, **no** expired-multipart cleanup, **no**
+retention-policy enforcement, and **no** idempotency-key garbage collection ever run — pending versions and
+abandoned multipart sessions accumulate indefinitely, retention rules become inert (a compliance-relevant silent
+failure, since a configured retention policy will appear to exist via `GET /retention-rules` but never actually
+delete anything), and `idempotency_keys` grows without bound.
 
 ### `enable_in_memory_backend`
 When `true` (default `false`), an additional non-durable backend registered under the id `memory` (`MEMORY_ID`,
 `gear.rs`) is registered alongside the default `local-fs` backend. **Production recommendation**: leave at `false`
 in any deployment where data loss is unacceptable — the in-memory backend loses all content on restart. Its only
 legitimate use is dev/test scenarios that want a second backend id to exercise multi-backend code paths (e.g.
-`migrate_backend`) without provisioning real durable storage. **Misconfiguration risk**: enabling it in production,
-combined with a file or policy that routes content onto it, is **silent, guaranteed data loss** on the next restart
-— `migrate_backend` additionally requires the caller's `ADMIN_POLICY` authorization scope (not just `WRITE`)
-specifically to make this an explicit, elevated-privilege action rather than an accident.
+`migrate_backend`) without provisioning real durable storage; it is also the simplest way to get a `multipart_native`
+backend for exercising multipart upload without configuring S3 (see `default_backend_id` below). **Misconfiguration
+risk**: enabling it in production, combined with a file or policy that routes content onto it, is **silent, guaranteed
+data loss** on the next restart — `migrate_backend` additionally requires the caller's `ADMIN_POLICY` authorization
+scope (not just `WRITE`) specifically to make this an explicit, elevated-privilege action rather than an accident.
 
 ### `s3_backends`
 Zero or more S3-compatible backends (`S3BackendConfig` entries: `id`, `endpoint`, `region`, `bucket`,
 `access_key_id`, `secret_access_key`, `path_style`) registered alongside `local-fs` (and `memory` if enabled). Empty
 by default — a deployment opts in explicitly. Each entry becomes one `S3Backend` in the registry, keyed by its own
-`id`; ids must be unique across the whole registry (`BackendRegistry::new` rejects a collision at startup).
-**Production recommendation**: omit `access_key_id`/`secret_access_key` and resolve credentials from the process
-environment (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) instead of embedding them in gear YAML.
-**Misconfiguration risk**: a bad endpoint or missing credentials with no env fallback fails gear init (fail-fast,
-not a runtime surprise).
+`id`; ids must be unique across the whole registry (`BackendRegistry::new` rejects a collision at startup). S3
+support is gated by [ADR-0005](./ADR/0005-cpt-cf-file-storage-adr-s3-client-selection.md), whose status is
+`proposed` pending a team security review of its external HTTP-signing/XML-parsing dependencies; the code builds and
+is tested regardless, but merging it to `main` is conditioned on that review. **Production recommendation**: omit
+`access_key_id`/`secret_access_key` and resolve credentials from the process environment
+(`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) instead of embedding them in gear YAML. **Misconfiguration risk**: a bad
+endpoint or missing credentials with no env fallback fails gear init (fail-fast, not a runtime surprise).
 
 ### `default_backend_id`
 Backend id `build_backend_registry` designates as the registry's default — the backend new `create`/
 `initiate_multipart` calls write to. `None` (the default) keeps `local-fs` as the default. Set this to one of
 `s3_backends`' configured ids to make that S3 backend the default instead. **Misconfiguration risk**: an id that
 does not name a registered backend surfaces as a fail-fast gear-init error, never a panic.
+
+`POST /files/{id}/multipart` (initiate) always targets this default backend, and requires it to advertise the
+`multipart_native` capability. `local-fs` does **not** advertise `multipart_native`, so multipart uploads are
+unavailable against the plain default configuration; switch the default to a configured S3 backend, or to the
+dev/test `memory` backend (`enable_in_memory_backend` above), to enable multipart uploads. See `docs/api.md`'s
+"P2 — Multipart upload" section.
 
 ### `finalize_internal_secret`
 Interim gear-local shared secret the s2s finalize/report-part callback routes additionally require, on top of the
@@ -207,7 +217,7 @@ share `FileStorageConfig`. All of these are read once in `main()`.
 | `FS_SIDECAR_CONTROL_URL` | `http://localhost:8080` | Base URL of the control plane, used for the finalize/report-part callbacks. Setting it to the **empty string** explicitly disables the callback (dev/test only) — uploaded versions then stay `pending` forever, since nothing ever calls finalize; production must always set this to a reachable control-plane URL. |
 | `FS_SIDECAR_MAX_BODY_BYTES` | `5368709120` (5 GiB) | Raises axum's blanket request-body floor (default 2 MiB) for the `PUT` route. This is a transport-layer ceiling only — the real per-request limit is the signed token's `max_size`/`exact_size` claim. **Misconfiguration risk**: setting it below the largest policy-permitted single-part upload causes legitimate uploads to be rejected at the transport layer before the token-level check even runs. |
 | `FS_SIDECAR_FINALIZE_TIMEOUT_SECS` | `10` | Total request timeout for the sidecar → control-plane finalize/report-part callbacks. |
-| `FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS` | `5` | Connect timeout for the same callbacks. Together with the timeout above, bounds how long a client's upload request can be held open by an unreachable or hung control plane (P2 remediation 1.5) — before this existed, a hung control plane could block the client indefinitely. **Misconfiguration risk**: too low in a high-latency network path causes spurious `502 Bad Gateway` responses to clients on otherwise-successful uploads; too high re-opens the "held open indefinitely" problem these timeouts exist to close. |
+| `FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS` | `5` | Connect timeout for the same callbacks. Together with the timeout above, bounds how long a client's upload request can be held open by an unreachable or hung control plane — without these timeouts, a hung control plane could block the client indefinitely. **Misconfiguration risk**: too low in a high-latency network path causes spurious `502 Bad Gateway` responses to clients on otherwise-successful uploads; too high re-opens the "held open indefinitely" problem these timeouts exist to close. |
 | `FS_SIDECAR_INTERNAL_TOKEN` | unset (header omitted) | Interim shared secret sent as `x-fs-internal-token` on both the finalize and report-part control-plane callbacks — the sidecar's half of the control plane's `finalize_internal_secret`/`require_finalize_internal_secret` (see above). Unset/empty = the header is not sent, matching a control plane with the check disabled. Must match the control plane's configured secret once it flips `require_finalize_internal_secret` on. |
 | `FS_SIDECAR_S3_BACKENDS` | unset (no S3 backends) | Optional JSON array of `S3BackendConfig` entries (mirrors the control plane's `s3_backends`), folded into the sidecar's own `BackendRegistry` alongside the always-present `local-fs` backend so a control-plane-registered `S3Backend` is reachable by real traffic dispatched per-request via `claims.backend_id`. Credentials embedded in this JSON blob are acceptable for the sidecar (the one component authorized to hold them, per ADR-0003) but should be sourced from a secrets manager / mounted file in production where supported. |
 
@@ -229,16 +239,16 @@ correctly finalized server-side even though the client saw a transient `502` on 
 job the gear schedules on a `sweep_interval_secs` timer when `enable_background_sweep` is `true` (see `gear.rs`).
 Each step is **best-effort**: a failure in one step is logged at `warn` and does not abort the rest of the sweep, and
 every operation is written to be safely idempotent under concurrent sweeps (no cross-instance leader election exists
-in P2 — every replica runs its own sweep independently; P3 is expected to add coordination).
+today — every replica runs its own sweep independently; cross-instance coordination is expected in a future release).
 
 The sweep runs **four** steps, in this order:
 
 1. **Abandoned-pending sweep** (`cpt-cf-file-storage-fr-orphan-reconciliation`) — deletes `file_versions` rows still
    `pending` (pre-registered but never finalized) older than `orphan_grace_secs`, best-effort deletes their backend
-   blobs, and — **P2 remediation 2.8** — additionally deletes the parent `files` row too if reclaiming its last
-   pending version leaves it a permanent zero-version orphan (no versions left **and** `content_id IS NULL`, and no
-   blocking in-progress multipart session for that file). This zero-version file cleanup is not a separate fifth
-   sweep step; it is folded into step 1's per-version cleanup.
+   blobs, and additionally deletes the parent `files` row too if reclaiming its last pending version leaves it a
+   permanent zero-version orphan (no versions left **and** `content_id IS NULL`, and no blocking in-progress
+   multipart session for that file). This zero-version file cleanup is not a separate fifth sweep step; it is
+   folded into step 1's per-version cleanup.
 2. **Expired-multipart sweep** — aborts `multipart_uploads` sessions still `in_progress` whose `expires_at` has
    passed: wins the session's own `in_progress → aborted` CAS first (racing a concurrent `complete`/user-`abort`),
    and only on winning that race does it tell the backend to discard the in-progress upload and delete the
@@ -248,47 +258,50 @@ The sweep runs **four** steps, in this order:
    (tenant/user/file scope; age, inactivity, or custom-metadata-value criteria, OR-combined). A matching file is
    deleted through the same transactional-outbox path a user-initiated `DELETE` uses, so a `file.deleted` event is
    still emitted. Skipped entirely (no file scan at all) when zero retention rules are configured, for cheapness.
-4. **Idempotency-key GC** (**P2 remediation 1.9**) — deletes `idempotency_keys` rows past their `expires_at`
-   (governed by `idempotency_ttl_secs`). Deliberately does **not** touch `audit_outbox`/`events_outbox`: those rows'
-   `published_at` stays `NULL` until the Tier 4 EventBroker relay exists, so an age-based purge there would silently
-   drop undelivered rows.
+4. **Idempotency-key GC** — deletes `idempotency_keys` rows past their `expires_at` (governed by
+   `idempotency_ttl_secs`). Deliberately does **not** touch `audit_outbox`/`events_outbox`: rows in those tables are
+   inserted with `published_at = NULL` and nothing in this gear ever sets it — no relay currently drains either
+   outbox table, so an age-based purge here would silently drop rows that were never delivered. Both tables
+   therefore grow without bound until an `EventBroker` relay exists to drain them.
 
 ## Idempotent-create semantics
 
 `POST /files` accepts an optional `idempotency_key`. A retry with the same key, by the same `(tenant_id, owner_kind,
 owner_id)`, within `idempotency_ttl_secs`, returns the original response instead of creating a second file — guarded
-by two checks (both must pass, added across two separate remediations):
+by two checks, both of which must pass:
 
-- **Subject binding** (P2 remediation 0.10): the stored row's `subject_id` (the authenticated caller who created the
-  key) must match `ctx.subject_id()` on replay; a mismatch is `Forbidden`, not a silent fresh-create fallthrough.
-  Pre-migration rows are backfilled with the nil UUID, which can never match a real subject.
-- **Request-body binding** (P2 remediation 2.1): a SHA-256 `request_hash` over the identity-relevant fields (`name`,
-  `gts_file_type`, `mime_type`, `custom_metadata`) is recomputed on replay and compared; a mismatch is `409 Conflict`
-  ("idempotency key reused with a different request body"), rather than silently replaying the original ticket for a
-  request the caller never actually made.
+- **Subject binding**: the stored row's `subject_id` (the authenticated caller who created the key) must match
+  `ctx.subject_id()` on replay; a mismatch is `Forbidden`, not a silent fresh-create fallthrough. Pre-migration rows
+  are backfilled with the nil UUID, which can never match a real subject.
+- **Request-body binding**: a SHA-256 `request_hash` over the identity-relevant fields (`name`, `gts_file_type`,
+  `mime_type`, `custom_metadata`) is recomputed on replay and compared; a mismatch is `409 Conflict` ("idempotency
+  key reused with a different request body"), rather than silently replaying the original ticket for a request the
+  caller never actually made.
 
 See `docs/migration.sql`'s `idempotency_keys` table and `docs/api.md`'s `409` summary for the wire-level contract.
 
 ## Storage quota (not enforced)
 
-**Implementation status (P2).** `FileService` and `MultipartService` both accept an optional
-`quota_client: Option<Arc<dyn QuotaClient>>` and call `check_quota` / `check_quota_bytes`
-(`src/domain/service/create.rs`, `src/domain/multipart_service.rs`) before every storage-increasing operation
-(`create_file`, `presign_version`, multipart initiate) — see the `QuotaClient` trait in
+`FileService` and `MultipartService` both accept an optional `quota_client: Option<Arc<dyn QuotaClient>>` and call
+`check_quota` / `check_quota_bytes` (`src/domain/service/create.rs`, `src/domain/multipart_service.rs`) before every
+storage-increasing operation (`create_file`, `presign_version`, multipart initiate) — see the `QuotaClient` trait in
 `src/infra/external_clients.rs`. That consumer-side port is designed to fail **closed**: if a wired client's
 `check_storage_quota` call returns an error, the error propagates and the request is denied (see
 `tests/enforce_test.rs`).
 
 There is no config knob for this in the table above because there is nothing to configure yet — `gear.rs`
-unconditionally constructs both services with `quota_client: None` (`TODO(P2)`, Tier 1 item 1.4). When `None`,
-`check_quota`/`check_quota_bytes` short-circuit to `Ok(())`. **This means storage quota is not enforced in any
-deployment**: the effective behavior is permissive / fail-**open**, not the fail-closed behavior the port
-was designed for. No `QuotaClient` implementation exists to wire in — the Quota Enforcement gear
-(`gears/system/quota-enforcement/`) is docs-only (PRD/DESIGN/ADRs, no Rust crate, no SDK). **Operators must not
-assume any storage limit is in effect** until this is wired.
+unconditionally constructs both services with `quota_client: None`. When `None`, `check_quota`/`check_quota_bytes`
+short-circuit to `Ok(())`. **Storage quota is not enforced in any deployment**: the effective behavior is permissive
+/ fail-**open**, not the fail-closed behavior the port was designed for. No `QuotaClient` implementation exists to
+wire in — the Quota Enforcement gear (`gears/system/quota-enforcement/`) is docs-only (PRD/DESIGN/ADRs, no Rust
+crate, no SDK). **Operators must not assume any storage limit is in effect** until this is wired.
+
+Similarly, there is no usage reporter wired: `FileService`, `MultipartService`, and `CleanupEngine` all accept an
+optional usage-reporting sink and `gear.rs` constructs every one of them with `None`, so no usage deltas are ever
+reported anywhere today.
 
 Content-hash modes (whole-object SHA-256 for single-part uploads; a multipart offset-manifest composite SHA-256 for
-multipart uploads) are **shipped** — see [ADR-0006](./ADR/0006-cpt-cf-file-storage-adr-content-hash-modes.md) and
+multipart uploads) are implemented — see [ADR-0006](./ADR/0006-cpt-cf-file-storage-adr-content-hash-modes.md) and
 `docs/features/content-hash-modes.md`. The `hash_mode`/`part_count` columns and the `version_hash_manifest` table
 were added by migration `m20260707_000001_content_hash_modes`.
 
@@ -296,7 +309,7 @@ were added by migration `m20260707_000001_content_hash_modes`.
 
 Signing and verification of the URL-signing token are behind an in-house trait pair
 (`infra::signed_url::SignatureProvider` / `SignatureVerifier`), not called directly against a hard-wired crypto
-library. The shipped P1 implementation is Ed25519 (`Issuer::from_seed`/`Issuer::generate`), codec-equivalent to
+library. The implementation is Ed25519 (`Issuer::from_seed`/`Issuer::generate`), codec-equivalent to
 PASETO `v4.public` (see `docs/api.md`'s "Signed URLs" section). The abstraction exists specifically for **FIPS
 posture**: a FIPS-validated deployment needs the sign/verify primitive to run inside a FIPS-validated module (the
 platform's `rustls-corecrypto-provider`); the trait boundary lets that primitive be swapped (e.g. for ECDSA P-256)

@@ -458,10 +458,8 @@ namespace, and has no JWT-bypass paths — its surface is identical for every co
 platform authentication and the Authorization Service.
 
 **Rationale**: Public/anonymous access is a sharing concern, not a storage concern. Keeping FileStorage purely
-internal in P1 (a) lets sharing semantics evolve independently inside a single gear with the appropriate
-data model, (b) eliminates JWT-bypass surfaces and owner-private-header redaction logic from FileStorage, and
-(c) matches the main-branch design where external sharing was already a separate (P2) FR rather than a P1
-storage concern.
+internal in P1 lets sharing semantics evolve independently inside a single gear with the appropriate data model, and
+eliminates JWT-bypass surfaces and owner-private-header redaction logic from FileStorage.
 
 ### 5.4 Policies (Phase 2)
 
@@ -535,9 +533,9 @@ exhaustion for the platform. Quota checks must cover all storage-consuming opera
 prevent quota bypass through versioned overwrites.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
-**Implementation status (P2)**: not met yet; the requirement remains open. Storage quota is
-**not enforced in any deployment** — the Quota Enforcement service this depends on does not exist yet.
-`file-storage` has built its side and is ready to consume the check once that service ships. Technical detail in
+**Current status**: Storage quota is **not enforced in any deployment** — the Quota Enforcement service this
+requirement depends on does not exist yet. `file-storage`'s consumer side (the `QuotaClient` port and its
+fail-closed call sites) is implemented and ready to enforce the check once that service exists. Technical detail in
 [DESIGN.md](./DESIGN.md) (`quota-adapter`) and [operations.md](./operations.md).
 
 ### 5.5 Metadata
@@ -1196,8 +1194,8 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 (per `cpt-cf-file-storage-fr-storage-quota`)
 **Compatibility**: Contract follows platform quota enforcement protocol; changes require coordinated release.
 
-**Implementation status (P2)**: not satisfied yet — the Quota Enforcement counterparty does not
-exist, so this contract is not exercised in any deployment. `file-storage`'s side is ready. See [DESIGN.md](./DESIGN.md).
+**Current status**: The Quota Enforcement counterparty does not exist, so this contract is not exercised in any
+deployment. `file-storage`'s side is implemented and ready. See [DESIGN.md](./DESIGN.md).
 
 #### EventBroker Contract
 
