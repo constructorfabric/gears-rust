@@ -19,6 +19,7 @@ date: 2026-07-07
   - [(c) Keep client-supplied identity](#c-keep-client-supplied-identity)
 - [More Information](#more-information)
 - [Traceability](#traceability)
+- [Amendment 2026-07-17 — `created_at` folded into the derivation (see ADR-0014)](#amendment-2026-07-17--created_at-folded-into-the-derivation-see-adr-0014)
 
 <!-- /toc -->
 
@@ -123,3 +124,17 @@ Related:
 - Amends: `plugin-spi.md`, `sdk-trait.md`, `domain-model.md`,
   `features/usage-emission.md`, `features/event-deactivation.md`,
   `DECOMPOSITION.md`, PRD, DESIGN, `usage-collector-v1.yaml`.
+
+## Amendment 2026-07-17 — `created_at` folded into the derivation (see ADR-0014)
+
+[`ADR-0014`](./0014-created-at-in-dedup-identity.md) folds `created_at` into the
+derivation:
+`id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_id ⟨0x1F⟩ created_at_micros ⟨0x1F⟩ idempotency_key)`,
+making `id` a projection of the 4-tuple dedup key
+`(tenant_id, gts_id, idempotency_key, created_at)`. The namespace is unchanged.
+The "one key ⇒ one `id`" and "same-key retry ⇒ same `id`" consequences above now
+read "one 4-tuple ⇒ one `id`" and "same-4-tuple retry ⇒ same `id`"; a same-key
+submission with a different `created_at` is a distinct record, not a
+false-conflict source. Offline `corrects_id` pre-computation now also needs the
+target's exact `created_at` (µs). Rationale and full consequences live in
+ADR-0014; this Decision body is otherwise unchanged.

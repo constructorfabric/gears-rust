@@ -79,7 +79,7 @@ from `active` to `inactive`.
 
 | Field               | Required             | Type                     | Description                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | ------------------- | -------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`                | Yes                  | `Uuid`                   | Deterministic UUIDv5 of `(tenant_id, gts_id, idempotency_key)`; not caller-supplied — the create surface takes the identity-free `CreateUsageRecord` (no `id` field), and the service stamps this value; authoritative on return. See ADR 0013 (`./ADR/0013-deterministic-usage-record-id.md`).                                                                                                                                                    |
+| `id`                | Yes                  | `Uuid`                   | Deterministic UUIDv5 of `(tenant_id, gts_id, idempotency_key, created_at)`; not caller-supplied — the create surface takes the identity-free `CreateUsageRecord` (no `id` field), and the service stamps this value; authoritative on return. See ADR 0013 and ADR 0014 (`./ADR/0014-created-at-in-dedup-identity.md`).                                                                                                                                                    |
 | `tenant_id`         | Yes                  | `Uuid`                   | Caller-supplied tenant attribution. PDP authorization decides whether the caller may emit or read this tenant scope.                                                                                                                                                                                                                                                                                                                          |
 | `resource_ref`      | Yes                  | `ResourceRef`            | Caller-supplied resource attribution. Both `resource_id` and `resource_type` are mandatory.                                                                                                                                                                                                                                                                                                                                                   |
 | `subject_ref`       | No                   | `SubjectRef`             | Optional caller-supplied subject attribution. When present, `subject_id` is mandatory and `subject_type` is optional.                                                                                                                                                                                                                                                                                                                         |
@@ -87,7 +87,7 @@ from `active` to `inactive`.
 | `value`             | Yes                  | `Decimal`                | Signed fixed-precision measurement value, carried as [`rust_decimal::Decimal`] on every surface (SDK, REST `UsageValue` schema, plugin SPI), wire-encoded as a JSON **string** (never a float), and persisted as Postgres `NUMERIC`. Floating-point representation is intentionally excluded: `SUM(value)` and counter-compensation netting MUST be bit-exact, which `f64` cannot guarantee at scale. Permitted sign depends jointly on the UsageType's `gts_id` prefix (counter vs gauge) and the presence of `corrects_id` per the four-cell validation matrix in this section. |
 | `corrects_id`       | Optional             | `Uuid`                   | Sole structural discriminator between an ordinary usage row and a counter-compensation row. When `corrects_id IS NULL`, the record is an ordinary usage row. When `corrects_id` is set, the record is a counter-compensation row that references the `UsageRecord.id` of the usage row being offset; the referenced row MUST itself have `corrects_id IS NULL` and share the full identity tuple `(tenant_id, gts_id, resource_ref, subject_ref)` (`subject_ref` presence is part of the identity). See the validation matrix below.    |
 | `created_at`        | Yes                  | UTC timestamp            | Event timestamp supplied by the usage source (event time, not arrival time). Accepted without wall-clock validation; see the `created_at` / late-arrival invariant under §2.1 Invariants.                                                                                                                                                                                                                                                     |
-| `idempotency_key`   | Yes                  | `IdempotencyKey`         | Caller-supplied key used to deduplicate retries within `(tenant_id, gts_id)`. A same-key collision is resolved by exact-equality of the caller-supplied canonical fields: an exact-equality retry is silently deduplicated, while any differing canonical field is a Conflict (rejected, not absorbed).                                                                                                                                       |
+| `idempotency_key`   | Yes                  | `IdempotencyKey`         | Caller-supplied key used to deduplicate retries within `(tenant_id, gts_id)`. `created_at` is part of the dedup identity (ADR 0014): a same-key submission with a different `created_at` is a distinct record, not a Conflict. A same-key-and-`created_at` collision is resolved by exact-equality of the caller-supplied canonical fields: an exact-equality retry is silently deduplicated, while any differing canonical field is a Conflict (rejected, not absorbed).                                                                                                                                       |
 | `status`            | Yes                  | `UsageRecordStatus`      | `active` on acceptance; may transition once to `inactive`. No reactivation exists.                                                                                                                                                                                                                                                                                                                                                            |
 | `metadata`          | No                   | `RecordMetadata`         | Optional opaque JSON object persisted and returned verbatim.                                                                                                                                                                                                                                                                                                                                                                                  |
 
@@ -137,18 +137,26 @@ Invariants:
   database) before the record reaches the plugin; the record's
   `gts_id` value is the same `gts_id` string used as the catalog
   primary key (no UUID derivation; see ADR 0012).
-- Deduplication is unique on `(tenant_id, gts_id, idempotency_key)`.
+- Deduplication is unique on `(tenant_id, gts_id, idempotency_key,
+  created_at)` (ADR 0014, `./ADR/0014-created-at-in-dedup-identity.md`).
   The caller's gear identity is not part of that key; multiple emitting
   gears authorized for the same tenant and UsageType must coordinate key
-  allocation. On a collision the outcome is decided by exact equality of the
-  caller-supplied canonical fields (`value`, `created_at`, `resource_ref`,
-  `subject_ref`, `corrects_id`, `metadata`; the match-key tuple and the
-  server-owned `status` are excluded): an exact-equality retry is silently deduplicated,
+  allocation. A same-key submission with a *different* `created_at` is a
+  distinct record, not a Conflict. On a same-key-and-`created_at` collision
+  the outcome is decided by exact equality of the caller-supplied canonical
+  fields (`value`, `resource_ref`, `subject_ref`, `corrects_id`, `metadata`;
+  the match-key tuple — now including `created_at` — and the server-managed
+  `status` are excluded): an exact-equality retry is silently deduplicated,
   and any differing canonical field — including a metadata-only difference —
-  is a Conflict that is rejected, not absorbed.
+  is a Conflict that is rejected, not absorbed. The server-owned `id` is not a
+  caller-supplied comparison input either, but because it is a deterministic
+  UUIDv5 projection of the dedup key (ADR 0013/0014) it is equal by construction
+  once that key has matched; a plugin MAY therefore defensively verify the stored
+  `id` against the derived value — surfacing a corrupted stored row as a Conflict
+  rather than a silent absorb — without changing the outcome for well-formed data.
 - The idempotency window is unbounded: the key never expires, has no TTL, and
   is never intentionally reusable, so the `(tenant_id, gts_id,
-idempotency_key)` uniqueness is permanent. The active plugin must preserve
+idempotency_key, created_at)` uniqueness is permanent. The active plugin must preserve
   that key tuple permanently even when record bodies are purged or archived by
   retention — a retention purge must not free a dedup key.
 - Accepted records are immutable except for the `status` transition performed
@@ -380,17 +388,26 @@ record.
 Invariants:
 
 - Keyless records are rejected before persistence.
-- A same-key submission with the same `(tenant_id, gts_id,
-idempotency_key)` is resolved by exact equality of the caller-supplied
-  canonical fields (`value`, `created_at`, `resource_ref`, `subject_ref`,
-  `corrects_id`, `metadata`; the match-key tuple and the server-owned `id`
-  and `status` are excluded). An exact-equality retry is silently deduplicated; any
+- The dedup key is the 4-tuple `(tenant_id, gts_id, idempotency_key,
+  created_at)` (ADR 0014, `./ADR/0014-created-at-in-dedup-identity.md`):
+  `created_at` is part of the dedup identity, so a same-key submission with a
+  *different* `created_at` is a distinct record, not a Conflict. A same-key
+  submission with the same `(tenant_id, gts_id, idempotency_key,
+  created_at)` is resolved by exact equality of the caller-supplied
+  canonical fields (`value`, `resource_ref`, `subject_ref`, `corrects_id`,
+  `metadata`; the match-key tuple — now including `created_at` — and the
+  server-managed `status` are excluded). An exact-equality retry is silently deduplicated; any
   differing canonical field — including a metadata-only difference — is a
   Conflict that is rejected fail-closed (surfaced on the wire as the
-  `idempotency_conflict` reason), never silently dropped.
+  `idempotency_conflict` reason), never silently dropped. The server-owned `id`
+  is not a caller-supplied comparison input; as a deterministic UUIDv5 projection
+  of the dedup key (ADR 0013/0014) it is equal by construction once that key has
+  matched, so a plugin MAY defensively verify the stored `id` against the derived
+  value — surfacing a corrupted stored row as a Conflict rather than a silent
+  absorb — without changing the outcome for well-formed data.
 - The idempotency window is unbounded: the key never expires, has no TTL, and
   is never intentionally reusable. The active plugin must preserve the
-  `(tenant_id, gts_id, idempotency_key)` tuple permanently even
+  `(tenant_id, gts_id, idempotency_key, created_at)` tuple permanently even
   when record bodies are purged or archived by retention; a retention purge
   must not free a dedup key.
 - The same key may legitimately appear under a different tenant or UsageType.

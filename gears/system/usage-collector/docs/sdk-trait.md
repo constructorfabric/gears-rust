@@ -305,8 +305,8 @@ existence oracle).
 - **Single-record create output**: the persisted `UsageRecord`. A
   successful fresh insert returns the newly written row; an
   exact-equality idempotency retry (same dedup key tuple
-  `(tenant_id, gts_id, idempotency_key)` AND all caller-supplied
-  canonical fields equal: `value`, `created_at`, `resource_ref`,
+  `(tenant_id, gts_id, idempotency_key, created_at)` AND all
+  caller-supplied canonical fields equal: `value`, `resource_ref`,
   `subject_ref`, `corrects_id`, `metadata`) is
   silently absorbed and returns the previously persisted row as
   `Ok(UsageRecord)`. A same-key resubmission whose canonical fields
@@ -441,11 +441,12 @@ fields a caller cannot own on create: the server-derived `id` and the
 initial `status`. The caller supplies every remaining field, including
 `created_at`. Identity is not caller-supplied and cannot be: `id` is a
 deterministic UUIDv5 of the dedup key
-`(tenant_id, gts_id, idempotency_key)`, stamped — together with the
-initial `status = active` — by `CreateUsageRecord::into_usage_record`
-at the single domain-service choke point every caller (REST and
-in-process SDK) funnels through (see
-`cpt-cf-usage-collector-adr-deterministic-usage-record-id`). The
+`(tenant_id, gts_id, idempotency_key, created_at)`, stamped — together
+with the initial `status = active` — by
+`CreateUsageRecord::into_usage_record` at the single domain-service
+choke point every caller (REST and in-process SDK) funnels through
+(see `cpt-cf-usage-collector-adr-deterministic-usage-record-id` and
+`cpt-cf-usage-collector-adr-created-at-in-dedup-identity`). The
 persisted row is byte-identical to the input, plus the derived `id`
 and `status`, on a successful insert and on an exact-equality
 idempotency replay, so consumers MAY treat the returned value as a
@@ -573,8 +574,9 @@ Plugin SPI (no dedicated `compensate` SPI call).
   server-owned `id` and `status`; named parameters, order-insensitive).
   The create input has NO `id` field: identity is not caller-supplied —
   the returned `UsageRecord.id` is the deterministic UUIDv5 of the dedup
-  key `(tenant_id, gts_id, idempotency_key)` (see
-  `usage_collector_sdk::derive_usage_record_id`), stamped by
+  key `(tenant_id, gts_id, idempotency_key, created_at)` (see
+  `usage_collector_sdk::derive_usage_record_id` and
+  `cpt-cf-usage-collector-adr-created-at-in-dedup-identity`), stamped by
   `CreateUsageRecord::into_usage_record` and authoritative on return:
   - `tenant_id` — `Uuid`; required.
   - `resource_ref` — `ResourceRef`; required.
@@ -677,8 +679,8 @@ Plugin SPI (no dedicated `compensate` SPI call).
      plugin errors lift to the unclassified `Internal` envelope (see
      `plugin-spi.md` for the dispatch-boundary mapping).
   10. A same-key resubmission (same
-      `(tenant_id, gts_id, idempotency_key)`) whose caller-supplied
-      canonical fields (`value`, `created_at`, `resource_ref`,
+      `(tenant_id, gts_id, idempotency_key, created_at)`) whose
+      caller-supplied canonical fields (`value`, `resource_ref`,
       `subject_ref`, `corrects_id`,
       `metadata`) differ from the stored record yields the
       `IdempotencyConflict` error variant and no second record is
@@ -826,7 +828,13 @@ Plugin SPI (no dedicated `compensate` SPI call).
   (TenantId → `Uuid::to_string()`, lowercase hyphenated; all other
   dimensions verbatim). An empty `group_by` produces a single bucket
   with an empty `key`; an empty match within the authorized scope
-  returns an empty `buckets` list and is not an error.
+  returns an empty `buckets` list and is not an error. The result is
+  bounded to `MAX_AGGREGATION_BUCKETS` (100,000) buckets: the plugin
+  caps its own scan at `MAX_AGGREGATION_BUCKETS + 1` (so a
+  high-cardinality `group_by` cannot exhaust memory) and the gateway
+  rejects an over-cap result with `UsageCollectorError::InvalidArgument`
+  carrying `ValidationReason::AggregationResultTooLarge` (REST `400`,
+  `field_violations[0].reason="AGGREGATION_RESULT_TOO_LARGE"`).
 - Latency budget: total p95 500 ms for a 30-day single-tenant
   aggregated query. The
   PRD NFR is authoritative for memory bounds; the SDK trait does not
@@ -922,11 +930,17 @@ Plugin SPI (no dedicated `compensate` SPI call).
      keys resolved from the typed `gts_id` parameter's
      `metadata_fields`), an operator outside the per-field allowance
      (dimension filters accept `eq` / `in` only over `String`-typed
-     values). The `order` is **not** a rejection case: the gateway
-     normalizes any caller `$orderby` to end in the canonical unique
-     `(created_at, id)` keyset suffix (appended in the caller's sort
-     direction) before dispatch, so the plugin always receives a
-     gap-free, uniform-direction keyset.
+     values), or an `$orderby` whose sort direction is mixed across
+     keys or whose leading key is a domain-optional (nullable) field
+     (`subject_id` / `subject_type` / `corrects_id`) — the row-value
+     tuple keyset is only sound over never-null columns, so ordering by
+     a nullable field is rejected rather than silently dropping
+     NULL-keyed rows from the page. An `$orderby` over the mandatory
+     fields is **not** a rejection case: the gateway normalizes it to
+     end in the canonical unique `(created_at, id)` keyset suffix
+     (appended in the caller's sort direction) before dispatch, so the
+     plugin always receives a gap-free, uniform-direction, never-null
+     keyset.
   4. An unregistered `gts_id` parameter yields `NotFound` and is
      rejected before plugin dispatch (D11 — UsageType-existence
      validation inside the trait implementation).
@@ -1302,6 +1316,10 @@ failure — consumers match the category, then the reason.
     type (the value matrix forbids gauge compensation).
   - `MissingTimeWindow` (`MISSING_TIME_WINDOW`) — a raw / aggregated
     query omitted the mandatory bounded `created_at` window.
+  - `AggregationResultTooLarge` (`AGGREGATION_RESULT_TOO_LARGE`) — an
+    aggregated query produced more than `MAX_AGGREGATION_BUCKETS`
+    (100,000) buckets (a high-cardinality `group_by`); narrow the
+    `created_at` window or drop the high-cardinality dimension.
   - `InvalidBaseGtsId` (`INVALID_BASE_GTS_ID`) — `UsageTypeGtsId::new`
     rejected a `gts_id` that does not derive from the reserved abstract
     base `gts.cf.core.uc.usage_record.v1~`. The REST handler lifts the
@@ -1336,8 +1354,9 @@ failure — consumers match the category, then the reason.
     record already `inactive` (the monotonic-deactivation latch,
     `cpt-cf-usage-collector-principle-monotonic-deactivation`).
   - `IdempotencyConflict` (`IDEMPOTENCY_CONFLICT`) — a same-`(tenant_id,
-    gts_id, idempotency_key)` submission whose canonical fields differ
-    from the stored record; `name` carries the existing record UUID. An
+    gts_id, idempotency_key, created_at)` submission whose canonical
+    fields differ from the stored record; `name` carries the existing
+    record UUID. An
     exact-equality retry is NOT this error — it silently returns the
     stored `UsageRecord` on `Ok`.
   - `CorrectsIdTargetsCompensation` / `CorrectsIdWrongScope` /
@@ -1450,7 +1469,7 @@ the SDK trait:
   FK can be enforced natively in a single backend transaction).
 - Cursor token generation and validation.
 - Dedup-on-conflict enforcement on
-  `(tenant_id, gts_id, idempotency_key)`.
+  `(tenant_id, gts_id, idempotency_key, created_at)`.
 - Atomic `Active -> Inactive` transition at the storage boundary.
 - Aggregation pushdown (the plugin executes aggregation server-side;
   the SDK trait emits the query, the plugin produces the result).

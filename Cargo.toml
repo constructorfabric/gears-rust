@@ -99,6 +99,7 @@ members = [
     "gears/system/usage-collector/usage-collector-sdk",
     "gears/system/usage-collector/usage-collector",
     "gears/system/usage-collector/plugins/noop-usage-collector-plugin",
+    "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin",
     "gears/mini-chat/mini-chat-sdk",
     "gears/mini-chat/mini-chat",
     "gears/chat-engine/chat-engine-sdk",

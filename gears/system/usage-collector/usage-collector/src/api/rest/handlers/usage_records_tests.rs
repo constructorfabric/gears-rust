@@ -400,7 +400,12 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
     let tenant_id = Uuid::from_u128(2);
     let gts_id = UsageTypeGtsId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_id");
     let idempotency_key = IdempotencyKey::new("idem-happy").expect("valid idempotency key");
-    let derived_id = derive_usage_record_id(tenant_id, &gts_id, &idempotency_key);
+    let derived_id = derive_usage_record_id(
+        tenant_id,
+        &gts_id,
+        &idempotency_key,
+        OffsetDateTime::UNIX_EPOCH,
+    );
     let persisted_uuid = Uuid::new_v4();
     assert_ne!(derived_id, persisted_uuid, "test premise");
     plugin.set_create_records(vec![Ok(sample_persisted_record(persisted_uuid, tenant_id))]);
@@ -481,7 +486,7 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
 #[tokio::test]
 async fn create_stamps_derived_id() {
     // The gateway MUST derive the dispatched record's id from the dedup key
-    // `(tenant_id, gts_id, idempotency_key)` rather than accept a
+    // `(tenant_id, gts_id, idempotency_key, created_at)` rather than accept a
     // caller-chosen value — pin both that the dispatched id matches
     // `derive_usage_record_id` AND that a same-key resubmit derives the
     // identical id (determinism).
@@ -491,7 +496,12 @@ async fn create_stamps_derived_id() {
     let tenant_id = Uuid::from_u128(2);
     let gts_id = UsageTypeGtsId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_id");
     let idempotency_key = IdempotencyKey::new("idem-derive-1").expect("valid idempotency key");
-    let expected = derive_usage_record_id(tenant_id, &gts_id, &idempotency_key);
+    let expected = derive_usage_record_id(
+        tenant_id,
+        &gts_id,
+        &idempotency_key,
+        OffsetDateTime::UNIX_EPOCH,
+    );
 
     let service = service_with_permit(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
@@ -533,7 +543,7 @@ async fn create_stamps_derived_id() {
     assert_eq!(
         forwarded[0].id, expected,
         "gateway MUST stamp the dispatched record's id with \
-         derive_usage_record_id(tenant_id, gts_id, idempotency_key)",
+         derive_usage_record_id(tenant_id, gts_id, idempotency_key, created_at)",
     );
 
     // Same-key resubmit: the derived id MUST be identical.
@@ -554,6 +564,74 @@ async fn create_stamps_derived_id() {
     assert_eq!(
         forwarded_again[0].id, expected,
         "a same dedup-key resubmit MUST derive the identical id",
+    );
+}
+
+#[tokio::test]
+async fn create_same_key_different_created_at_derives_distinct_ids() {
+    // ADR-0014: `created_at` is part of the identity. Two submissions sharing
+    // `(tenant_id, gts_id, idempotency_key)` but carrying different `created_at`
+    // values MUST be dispatched with DISTINCT ids (previously they collided on
+    // one derived id).
+    let plugin = HappyPathPlugin::new();
+    plugin.set_get_usage_type(happy_usage_type());
+
+    let tenant_id = Uuid::from_u128(2);
+    let service = service_with_permit(
+        Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+        "test.handler.create_records.distinct_created_at.v1",
+    );
+
+    let build_req = |created_at: OffsetDateTime| CreateUsageRecordsRequest {
+        records: vec![CreateUsageRecordRequest {
+            gts_id: HAPPY_RECORD_GTS_ID.to_owned(),
+            tenant_id,
+            resource_ref: ResourceRefDto {
+                resource_id: "rsc-happy".to_owned(),
+                resource_type: "compute.vm".to_owned(),
+            },
+            subject_ref: None,
+            metadata: BTreeMap::new(),
+            value: rust_decimal::Decimal::from(1),
+            idempotency_key: "idem-distinct".to_owned(),
+            corrects_id: None,
+            created_at,
+        }],
+    };
+
+    plugin.set_create_records(vec![Ok(sample_persisted_record(Uuid::new_v4(), tenant_id))]);
+    let response = handle_create_usage_records(
+        Extension(authenticated_ctx()),
+        Extension(Arc::clone(&service)),
+        Json(build_req(OffsetDateTime::UNIX_EPOCH)),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let id_a = plugin
+        .last_create_records_input()
+        .expect("first batch dispatched")[0]
+        .id;
+
+    plugin.set_create_records(vec![Ok(sample_persisted_record(Uuid::new_v4(), tenant_id))]);
+    let response = handle_create_usage_records(
+        Extension(authenticated_ctx()),
+        Extension(service),
+        Json(build_req(
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        )),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let id_b = plugin
+        .last_create_records_input()
+        .expect("second batch dispatched")[0]
+        .id;
+
+    assert_ne!(
+        id_a, id_b,
+        "same dedup key + different created_at MUST derive distinct ids",
     );
 }
 
@@ -645,11 +723,13 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
         tenant_id,
         &gts_id,
         &IdempotencyKey::new("idem-mixed-0").expect("valid idempotency key"),
+        OffsetDateTime::UNIX_EPOCH,
     );
     let derived_id_2 = derive_usage_record_id(
         tenant_id,
         &gts_id,
         &IdempotencyKey::new("idem-mixed-2").expect("valid idempotency key"),
+        OffsetDateTime::UNIX_EPOCH,
     );
     let persisted_uuid_0 = Uuid::new_v4();
     let persisted_uuid_2 = Uuid::new_v4();
@@ -1191,6 +1271,59 @@ mod prepare_list_query_tests {
             extract_first_field_violation_reason(&err).as_deref(),
             Some("VALIDATION"),
         );
+    }
+
+    #[test]
+    fn orderby_on_a_nullable_field_is_rejected_as_invalid_argument() {
+        // The storage plugin's keyset continuation is a row-value tuple
+        // comparison that is only sound over NOT NULL columns. `subject_id`,
+        // `subject_type`, and `corrects_id` are domain-optional (nullable), so
+        // a `$orderby` leading on one of them would silently drop NULL-keyed
+        // rows from the page (and 500 on a page ending at a NULL row). Reject
+        // it up front with a typed 400 that names the real cause instead of
+        // leaking a plugin-internal keyset error — or, worse, an incomplete
+        // page — to the caller.
+        for field in ["subject_id", "subject_type", "corrects_id"] {
+            let mut q = ODataQuery::new();
+            q.order = ODataOrderBy(vec![OrderKey {
+                field: field.into(),
+                dir: SortDir::Asc,
+            }]);
+            let err =
+                prepare_list_query(q).expect_err("$orderby on a nullable field must be rejected");
+            assert!(
+                matches!(err, CanonicalError::InvalidArgument { .. }),
+                "$orderby on nullable `{field}` must surface as InvalidArgument, got {err:?}",
+            );
+            assert_eq!(
+                extract_first_field_violation_reason(&err).as_deref(),
+                Some("VALIDATION"),
+            );
+        }
+    }
+
+    #[test]
+    fn orderby_on_a_mandatory_field_other_than_the_tiebreaker_is_accepted() {
+        // Guard against over-rejection: `tenant_id` / `status` are mandatory
+        // (NOT NULL) columns, so ordering by them is a valid keyset and must
+        // still gain the canonical `(created_at, id)` suffix.
+        for field in ["tenant_id", "status"] {
+            let mut q = ODataQuery::new();
+            q.order = ODataOrderBy(vec![OrderKey {
+                field: field.into(),
+                dir: SortDir::Asc,
+            }]);
+            let out =
+                prepare_list_query(q).expect("ordering by a mandatory field is a valid keyset");
+            assert_order_keys(
+                &out.order,
+                &[
+                    (field, SortDir::Asc),
+                    ("created_at", SortDir::Asc),
+                    ("id", SortDir::Asc),
+                ],
+            );
+        }
     }
 
     #[test]

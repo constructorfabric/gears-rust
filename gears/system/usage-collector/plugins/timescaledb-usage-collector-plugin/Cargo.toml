@@ -1,0 +1,78 @@
+[package]
+name = "cf-gears-timescaledb-usage-collector-plugin"
+description = "TimescaleDB Usage Collector storage backend plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["constructorfabric", "cf-gears"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "timescaledb_usage_collector_plugin"
+
+[lints]
+workspace = true
+
+[features]
+# Gates the TimescaleDB-backed real-DB integration tests (Docker required).
+postgres = []
+
+[dependencies]
+usage-collector-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
+
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-odata = { workspace = true }
+
+tokio-util = { workspace = true }
+
+async-trait = { workspace = true }
+
+sqlx = { workspace = true, features = [
+  "postgres",
+  "uuid",
+  "time",
+  "rust_decimal",
+  "bigdecimal",
+  "json",
+  "migrate",
+  "macros",
+] }
+
+# ODataValue carries these types; converted to time/rust_decimal at the bind layer.
+bigdecimal = { workspace = true }
+chrono = { workspace = true }
+
+rust_decimal = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+
+# Full-jitter on the create_batch transient-error backoff (decorrelates
+# concurrent deadlock-victim retries).
+rand = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+secrecy = { workspace = true }
+
+opentelemetry = { workspace = true }
+tracing = { workspace = true }
+
+anyhow = { workspace = true }
+
+# Required by the toolkit::gear macro
+inventory = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# Unconditional: [dev-dependencies] can't be optional; usage is #![cfg(feature="postgres")]-gated.
+testcontainers = { workspace = true }
+# In-memory metric reader for the metrics-recording unit tests; the `testing`
+# feature gates `InMemoryMetricExporter`.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

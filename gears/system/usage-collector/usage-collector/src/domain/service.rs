@@ -27,8 +27,8 @@ use toolkit_security::SecurityContext;
 use tracing::info;
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient, TypesRegistryError};
 use usage_collector_sdk::{
-    AggregationResult, AggregationSpec, ConflictReason, CreateUsageRecord, MetadataFilter,
-    USAGE_TYPE_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
+    AggregationResult, AggregationSpec, ConflictReason, CreateUsageRecord, MAX_AGGREGATION_BUCKETS,
+    MetadataFilter, USAGE_TYPE_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
     UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
     ValidationReason,
 };
@@ -960,8 +960,9 @@ impl Service {
     ///
     /// Per-record stages mirror [`Self::create_usage_record`] and run
     /// independently for each input; eligible records carry their
-    /// caller-supplied `created_at` through verbatim and are dispatched
-    /// together. Per-record validation /
+    /// caller-supplied `created_at` through to persistence, where
+    /// `into_usage_record` truncates it to microsecond precision (ADR-0014),
+    /// and are dispatched together. Per-record validation /
     /// SPI failures surface in the result vector at their input index —
     /// the outer `Err` is reserved for batch-level failures (plugin
     /// handle resolution, outer SPI dispatch, and the structural batch-size
@@ -1220,7 +1221,8 @@ impl Service {
             // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-metadata-closed-shape
 
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-eligible
-            // (caller-supplied `record.created_at` is materialized verbatim on the persisted record)
+            // (caller-supplied `record.created_at` is carried onto the persisted
+            // record, truncated to microsecond precision by `into_usage_record` per ADR-0014)
             eligible.push((index, record));
             // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-eligible
         }
@@ -1904,6 +1906,21 @@ impl Service {
             // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-plugin-dispatch
         }
         .await;
+        // Enforce the declared aggregate-bucket cap (plugin-spi.md §Method 3).
+        // The plugin bounds its own scan to `MAX_AGGREGATION_BUCKETS + 1` rows
+        // (its memory guard), so an over-cap result surfaces here as strictly
+        // more than the cap — reject it as the client-fixable 400 it is rather
+        // than returning an oversized page. Runs before the result-row telemetry
+        // below so the rejection is classified as a client error, not a page.
+        let result = result.and_then(|aggregation_result| {
+            if aggregation_result.buckets.len() > MAX_AGGREGATION_BUCKETS {
+                Err(UsageCollectorError::aggregation_result_too_large(
+                    MAX_AGGREGATION_BUCKETS,
+                ))
+            } else {
+                Ok(aggregation_result)
+            }
+        });
         let seconds = start.elapsed().as_secs_f64();
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-result-rows-observe
         if let Ok(aggregation_result) = &result {

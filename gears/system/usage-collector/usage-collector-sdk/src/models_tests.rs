@@ -14,6 +14,7 @@ use super::{
     AggregationBucket, AggregationDimension, AggregationOp, AggregationResult, AggregationSpec,
     CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey, ResourceRef, SubjectRef,
     UsageKind, UsageRecord, UsageRecordStatus, UsageType, UsageTypeGtsId,
+    is_keyset_safe_record_field, is_keyset_safe_type_field,
 };
 use crate::error::UsageCollectorError;
 use crate::reason::ValidationReason;
@@ -94,8 +95,12 @@ fn into_usage_record_stamps_derived_id_and_active_status() {
     let corrects = Uuid::parse_str("33333333-3333-3333-3333-333333333333").expect("corrects uuid");
     let input = sample_create_usage_record(Some(subject), Some(corrects));
 
-    let expected_id =
-        crate::id::derive_usage_record_id(input.tenant_id, &input.gts_id, &input.idempotency_key);
+    let expected_id = crate::id::derive_usage_record_id(
+        input.tenant_id,
+        &input.gts_id,
+        &input.idempotency_key,
+        input.created_at,
+    );
 
     let record = input.clone().into_usage_record();
 
@@ -122,8 +127,8 @@ fn into_usage_record_stamps_derived_id_and_active_status() {
 
 // A submission whose dedup key matches an existing `UsageRecord` projects to
 // the SAME `id` that record carries — the derivation is a pure function of
-// `(tenant_id, gts_id, idempotency_key)`, so the create input and the
-// persisted shape agree on identity without the caller ever supplying it.
+// `(tenant_id, gts_id, idempotency_key, created_at)`, so the create input and
+// the persisted shape agree on identity without the caller ever supplying it.
 #[test]
 fn into_usage_record_id_matches_full_record_with_same_dedup_key() {
     let input = sample_create_usage_record(None, None);
@@ -139,8 +144,40 @@ fn into_usage_record_id_matches_full_record_with_same_dedup_key() {
             persisted.tenant_id,
             &persisted.gts_id,
             &persisted.idempotency_key,
+            persisted.created_at,
         ),
         "the create-input identity must equal the derivation of the same dedup key",
+    );
+}
+
+// `into_usage_record` canonicalizes `created_at` to microsecond precision (what
+// Postgres `timestamptz` stores) on the returned record, and derives the id from
+// that same normalized value, so the persisted timestamp / dedup key / id agree.
+#[test]
+fn into_usage_record_truncates_created_at_to_micros() {
+    let sub_us = time::OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_789)
+        .expect("valid instant");
+    let mut input = sample_create_usage_record(None, None);
+    input.created_at = sub_us;
+
+    let record = input.clone().into_usage_record();
+
+    let expected_created_at =
+        time::OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_000)
+            .expect("valid instant");
+    assert_eq!(
+        record.created_at, expected_created_at,
+        "returned created_at must be truncated to microsecond precision",
+    );
+    assert_eq!(
+        record.id,
+        crate::id::derive_usage_record_id(
+            input.tenant_id,
+            &input.gts_id,
+            &input.idempotency_key,
+            sub_us,
+        ),
+        "id must be derived from the (us-normalized) 4-tuple",
     );
 }
 
@@ -1370,4 +1407,60 @@ fn aggregation_op_not_allowed_for_kind_counter_detail_names_op_kind_and_allowed_
         detail.contains("sum, count"),
         "detail must name the counter allowed-op set; got {detail:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Keyset-safe (never-null) order-field classification
+// ---------------------------------------------------------------------------
+
+#[test]
+fn keyset_safe_record_fields_are_exactly_the_mandatory_columns() {
+    // The mandatory (never-null) record attributes are sound leading keys for
+    // the plugin's row-value tuple keyset comparison.
+    for field in [
+        "id",
+        "created_at",
+        "tenant_id",
+        "resource_id",
+        "resource_type",
+        "status",
+    ] {
+        assert!(
+            is_keyset_safe_record_field(field),
+            "`{field}` is a mandatory attribute and must be keyset-safe",
+        );
+    }
+}
+
+#[test]
+fn keyset_unsafe_record_fields_are_the_domain_optional_ones() {
+    // `subject_ref` (→ subject_id, subject_type) and `corrects_id` are
+    // `Option`al on `UsageRecord`, so their columns are nullable. A row-value
+    // tuple comparison with a NULL leading key evaluates to NULL in Postgres,
+    // silently dropping NULL rows from the page — so they are NOT keyset-safe.
+    for field in ["subject_id", "subject_type", "corrects_id"] {
+        assert!(
+            !is_keyset_safe_record_field(field),
+            "`{field}` is a domain-optional attribute and must NOT be keyset-safe",
+        );
+    }
+}
+
+#[test]
+fn keyset_safe_record_field_is_fail_closed_for_unknown_names() {
+    // Fail-closed allowlist: an unknown field (or a future field someone
+    // forgets to classify) is treated as unsafe rather than silently allowed.
+    assert!(!is_keyset_safe_record_field("value"));
+    assert!(!is_keyset_safe_record_field("definitely_not_a_field"));
+    assert!(!is_keyset_safe_record_field(""));
+}
+
+#[test]
+fn keyset_safe_type_fields_are_the_catalog_not_null_columns() {
+    // Both `usage_type_catalog` columns exposed on the filter surface are
+    // `NOT NULL`, so both are keyset-safe; anything else fails closed.
+    assert!(is_keyset_safe_type_field("gts_id"));
+    assert!(is_keyset_safe_type_field("kind"));
+    assert!(!is_keyset_safe_type_field("metadata_fields"));
+    assert!(!is_keyset_safe_type_field("definitely_not_a_field"));
 }

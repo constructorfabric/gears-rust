@@ -1,0 +1,28 @@
+-- Rename usage_records.uuid -> usage_records.id for naming consistency with the
+-- SDK model/API field (`UsageRecord.id`) and the OData `id` filter field. The
+-- column stays uuid-typed; `id` is now a deterministic gateway-derived UUIDv5
+-- of the 4-tuple dedup key (tenant_id, gts_id, idempotency_key, created_at).
+--
+-- RENAME COLUMN is a catalog-only operation (no table/chunk rewrite) and is
+-- supported on TimescaleDB hypertables. Constraints and indexes reference
+-- columns by internal attribute number, not by name, so the rename is
+-- transparent to them and no explicit constraint change is needed: the
+-- composite primary key now spans (id, created_at), while the dedup UNIQUE
+-- (tenant_id, gts_id, idempotency_key, created_at) and the secondary indexes
+-- never referenced this column and so keep their existing column sets.
+--
+-- No value backfill is performed, and none is needed here: the usage-collector
+-- gear is unreleased (see ADR-0013 "deterministic gateway-derived usage-record
+-- id"), so there is no pre-`id`-determinism production data — any rows present
+-- at cutover live on disposable dev databases. This matters because the rename
+-- is catalog-only: a surviving pre-bump row keeps its old *caller-supplied* UUID,
+-- which no longer equals the now gateway-derived
+-- id = UUIDv5(tenant_id, gts_id, idempotency_key, created_at) (ADR-0014). On
+-- such a row an exact retry
+-- would surface a *false* IdempotencyConflict, because the plugin's
+-- canonical-equality compares `id` (stored old-uuid != derived-id;
+-- record_store.rs canonical_equal). A deployment that must preserve live
+-- pre-bump rows across this cutover therefore cannot use a bare rename — it
+-- needs a backfill that recomputes id = derive_usage_record_id(...) for every
+-- row and repoints corrects_id references. That case does not apply here.
+ALTER TABLE usage_records RENAME COLUMN uuid TO id;

@@ -15,7 +15,7 @@ use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
     AggregationSpec, CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey, ResourceRef,
-    SubjectRef, UsageCollectorError, UsageRecord, UsageTypeGtsId,
+    SubjectRef, UsageCollectorError, UsageRecord, UsageTypeGtsId, is_keyset_safe_record_field,
 };
 use uuid::Uuid;
 
@@ -479,6 +479,38 @@ fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalErro
                     )
                     .create());
             }
+        }
+
+        // Reject a caller order on a nullable (domain-optional) field. Every
+        // caller-supplied key is a *leading* key of the effective keyset (the
+        // canonical `(created_at, id)` suffix is appended after this), and the
+        // plugin's keyset continuation is a row-value tuple comparison
+        // `(c1, …) > ($…)` that is only sound when every column is NOT NULL: a
+        // NULL leading key makes the tuple compare as NULL, silently dropping
+        // NULL-keyed rows from the page (and 500-ing on a page that ends at a
+        // NULL row, which cannot encode a cursor). Fields backed by
+        // `subject_ref: Option<_>` / `corrects_id: Option<_>` are the nullable
+        // ones — see [`is_keyset_safe_record_field`]. Surface a typed `400`
+        // here that names the real cause instead of forwarding an unsound
+        // order to the plugin.
+        if let Some(bad) = query
+            .order
+            .0
+            .iter()
+            .find(|key| !is_keyset_safe_record_field(&key.field))
+        {
+            return Err(UsageRecordResource::invalid_argument()
+                .with_field_violation(
+                    "$orderby",
+                    format!(
+                        "$orderby key `{}` is not supported: keyset pagination requires an \
+                         always-present sort key, so ordering by an optional field \
+                         (subject_id, subject_type, corrects_id) is not allowed",
+                        bad.field
+                    ),
+                    "VALIDATION",
+                )
+                .create());
         }
 
         let dir = query
