@@ -41,8 +41,33 @@ use crate::infra::content::hash;
 use crate::infra::content::hash_mode::Manifest;
 
 use super::{
-    BackendCapabilities, MultipartCompletionPart, StorageBackend, build_manifest_and_root,
+    BackendCapabilities, MultipartCompletionPart, PublishOutcome, StorageBackend,
+    build_manifest_and_root,
 };
+
+/// Whether the terminal object-creating write of a streamed upload may
+/// overwrite an existing object or must fail if one already exists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    /// Plain `PutObject` / `CompleteMultipartUpload` — last write wins.
+    Overwrite,
+    /// `If-None-Match: *` conditional write. A `412 Precondition Failed`
+    /// is **not** an error: it means the object already existed and is
+    /// reported as `created: false` (create-exclusive publish, closing the
+    /// PUT-token-replay overwrite race — ADR-0003 immutability). Requires an
+    /// S3 endpoint that honours conditional writes (AWS S3 since 2024-08;
+    /// see this module's `publish_exclusive` note).
+    CreateExclusive,
+}
+
+/// Result of the shared streaming-upload core ([`S3Backend::stream_upload`]).
+struct StreamUploadOutcome {
+    bytes_written: u64,
+    digest: [u8; 32],
+    /// `true` if this call created the object; `false` only in
+    /// [`WriteMode::CreateExclusive`] when the object already existed.
+    created: bool,
+}
 
 /// Expiry for the presigned URLs this backend signs. Requests execute
 /// immediately after signing (there is no user-facing redirect), so this only
@@ -232,6 +257,46 @@ impl S3Backend {
         }
     }
 
+    /// Like [`send_and_check`](Self::send_and_check) but for a create-exclusive
+    /// (`If-None-Match: *`) write: `Ok(true)` means this request created the
+    /// object, `Ok(false)` means a `412 Precondition Failed` — the object
+    /// already existed and was left untouched. Any other non-2xx is still an
+    /// error (with the S3 XML error body parsed as usual).
+    async fn send_and_check_created(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<bool, DomainError> {
+        let resp = req.send().await.map_err(|e| self.transport_err(&e))?;
+        let status = resp.status();
+        let body = resp.bytes().await.map_err(|e| self.transport_err(&e))?;
+        if status.is_success() {
+            Ok(true)
+        } else if status == StatusCode::PRECONDITION_FAILED {
+            Ok(false)
+        } else {
+            Err(self.s3_error(status, &body))
+        }
+    }
+
+    /// `PutObject` for `path` carrying `If-None-Match: *`, so S3 creates the
+    /// object only if it does not already exist. `Ok(true)` = created,
+    /// `Ok(false)` = already existed (`412`). The header is added to the
+    /// action's *signed* header set before signing, so it is covered by the
+    /// `SigV4` signature the presigned URL carries.
+    async fn put_create_exclusive(&self, path: &str, bytes: Bytes) -> Result<bool, DomainError> {
+        let key = Self::path_to_key(path);
+        let mut action = self.bucket.put_object(Some(&self.credentials), key);
+        // Add `If-None-Match` to the action's *signed* header set, then send
+        // the same header on the wire: a SigV4 presigned request lists its
+        // signed headers in `X-Amz-SignedHeaders`, and every one of them MUST
+        // be present on the actual request with the value that was signed, or
+        // S3 rejects it with a signature mismatch.
+        action.headers_mut().insert("if-none-match", "*");
+        let url = action.sign(SIGN_DURATION);
+        self.send_and_check_created(self.http.put(url).header("if-none-match", "*").body(bytes))
+            .await
+    }
+
     fn head_error(&self, path: &str, status: StatusCode) -> DomainError {
         DomainError::backend(&self.id, format!("HEAD {path} failed: {status}"))
     }
@@ -244,101 +309,79 @@ impl S3Backend {
     /// `complete_multipart` builds the ADR-0006 offset-manifest root from the
     /// per-part digests it was handed. Either way a large multipart upload
     /// stays a single pass over the bytes instead of upload-then-re-download.
+    ///
+    /// In [`WriteMode::CreateExclusive`] the `CompleteMultipartUpload` carries
+    /// `If-None-Match: *`, so `Ok(false)` signals the assembled object already
+    /// existed (`412`); in [`WriteMode::Overwrite`] it always returns
+    /// `Ok(true)` on success.
     async fn finalize_multipart(
         &self,
         path: &str,
         upload_handle: &str,
         parts: &[(u32, String)],
-    ) -> Result<(), DomainError> {
+        mode: WriteMode,
+    ) -> Result<bool, DomainError> {
         let mut sorted_parts = parts.to_vec();
         sorted_parts.sort_by_key(|(part_number, _)| *part_number);
         let etags: Vec<&str> = sorted_parts.iter().map(|(_, etag)| etag.as_str()).collect();
 
         let key = Self::path_to_key(path);
-        let action = self.bucket.complete_multipart_upload(
+        let mut action = self.bucket.complete_multipart_upload(
             Some(&self.credentials),
             key,
             upload_handle,
             etags.iter().copied(),
         );
+        let exclusive = mode == WriteMode::CreateExclusive;
+        if exclusive {
+            // Signed + sent on the wire — see `put_create_exclusive`.
+            action.headers_mut().insert("if-none-match", "*");
+        }
         let url = action.sign(SIGN_DURATION);
         let body = action.body();
-        self.send_and_check(self.http.post(url).body(body)).await?;
-        Ok(())
-    }
-}
-
-impl fmt::Debug for S3Backend {
-    /// Manual `Debug`, redacting `credentials` (mirrors
-    /// `FileStorageConfig`'s manual `Debug` impl's secret-redaction pattern).
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("S3Backend")
-            .field("id", &self.id)
-            .field("bucket", &self.bucket.name())
-            .field("region", &self.bucket.region())
-            .field("credentials", &"<redacted>")
-            .field("list_page_size", &self.list_page_size)
-            .field("multipart_threshold_bytes", &self.multipart_threshold_bytes)
-            // `reqwest::Client` has no useful `Debug` output of its own beyond
-            // internal connection-pool state; omit it explicitly.
-            .finish_non_exhaustive()
-    }
-}
-
-#[async_trait]
-impl StorageBackend for S3Backend {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            multipart_native: true,
-            range_native: true,
-            durable: true,
-            ..BackendCapabilities::default()
+        let mut req = self.http.post(url).body(body);
+        if exclusive {
+            req = req.header("if-none-match", "*");
         }
+        self.send_and_check_created(req).await
     }
 
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        let key = Self::path_to_key(path);
-        let url = self
-            .bucket
-            .put_object(Some(&self.credentials), key)
-            .sign(SIGN_DURATION);
-        self.send_and_check(self.http.put(url).body(bytes)).await?;
-        Ok(())
-    }
-
-    /// Streams `stream` into `path` without ever buffering the whole object
-    /// in memory once it crosses `multipart_threshold_bytes`: below the
-    /// threshold, the (small) object is buffered whole and written with one
-    /// `PutObject`; above it, this drives a native multipart upload, holding
-    /// at most one part's worth of bytes beyond the current chunk at a time.
-    /// The SHA-256 digest is computed incrementally as bytes arrive
+    /// Shared streaming-upload core for [`put_stream`](StorageBackend::put_stream)
+    /// (overwrite) and [`publish_exclusive`](StorageBackend::publish_exclusive)
+    /// (create-exclusive). Streams `stream` into `path` without ever buffering
+    /// the whole object once it crosses `multipart_threshold_bytes`: below the
+    /// threshold the (small) object is buffered whole and written with one
+    /// `PutObject`; above it, this drives a native multipart upload, holding at
+    /// most one part's worth of bytes beyond the current chunk at a time. The
+    /// SHA-256 digest is computed incrementally as bytes arrive
     /// (`hash::Hasher`), and `max_size` is enforced the moment the running
     /// total exceeds it — mid-stream, before any extra part is flushed. If a
     /// multipart upload was already initiated when the stream fails (a
-    /// transport error or a `max_size` violation) or when finishing the
-    /// upload fails (uploading the final part / `CompleteMultipartUpload`),
-    /// the multipart session is aborted so no orphaned session or partial
-    /// object is left behind.
-    async fn put_stream(
+    /// transport error or a `max_size` violation) or when finishing the upload
+    /// fails (uploading the final part / `CompleteMultipartUpload`), the
+    /// multipart session is aborted so no orphaned session or partial object is
+    /// left behind. `mode` selects whether the terminal write may overwrite an
+    /// existing object; in [`WriteMode::CreateExclusive`] a `412` on the
+    /// terminal write yields `created: false` (and any multipart session opened
+    /// along the way is aborted, since its `CompleteMultipartUpload` did not
+    /// take effect).
+    async fn stream_upload(
         &self,
         path: &str,
         mut stream: BoxStream<'_, std::io::Result<Bytes>>,
         max_size: Option<u64>,
-    ) -> Result<(u64, [u8; 32]), DomainError> {
+        mode: WriteMode,
+    ) -> Result<StreamUploadOutcome, DomainError> {
         let mut hasher = hash::Hasher::new();
         let mut buf: Vec<u8> = Vec::new();
         let mut upload_handle: Option<String> = None;
         let mut parts: Vec<(u32, String)> = Vec::new();
         let mut next_part_number: u32 = 1;
-        // Byte offset of the next part within the object. `put_stream`
-        // produces a `whole-sha256` version (the digest is computed
-        // incrementally over the whole stream, not from an offset-manifest),
-        // so this is threaded purely to satisfy `upload_part`'s ADR-0006
-        // signature; it is never used to build a manifest on this path.
+        // Byte offset of the next part within the object. This path produces a
+        // `whole-sha256` version (the digest is computed incrementally over the
+        // whole stream, not from an offset-manifest), so this is threaded purely
+        // to satisfy `upload_part`'s ADR-0006 signature; it is never used to
+        // build a manifest here.
         let mut next_part_offset: u64 = 0;
 
         let collect_result: Result<(), DomainError> = async {
@@ -405,8 +448,20 @@ impl StorageBackend for S3Backend {
             None => {
                 // Never crossed the threshold: the whole (small) object is
                 // already buffered — issue one PutObject.
-                self.put(path, Bytes::from(buf)).await?;
-                Ok((bytes_written, digest))
+                let created = match mode {
+                    WriteMode::Overwrite => {
+                        self.put(path, Bytes::from(buf)).await?;
+                        true
+                    }
+                    WriteMode::CreateExclusive => {
+                        self.put_create_exclusive(path, Bytes::from(buf)).await?
+                    }
+                };
+                Ok(StreamUploadOutcome {
+                    bytes_written,
+                    digest,
+                    created,
+                })
             }
             Some(handle) => {
                 if !buf.is_empty() {
@@ -430,8 +485,21 @@ impl StorageBackend for S3Backend {
                 // hashing the stored object would yield (a test asserts the two
                 // actually agree). This keeps a large streaming upload to a
                 // single pass over the bytes instead of upload-then-re-download.
-                match self.finalize_multipart(path, &handle, &parts).await {
-                    Ok(()) => Ok((bytes_written, digest)),
+                match self.finalize_multipart(path, &handle, &parts, mode).await {
+                    Ok(created) => {
+                        // CreateExclusive + `412`: the assembled object already
+                        // existed, so our `CompleteMultipartUpload` did not take
+                        // effect and the multipart session is still open — abort
+                        // it so no orphan session/parts leak.
+                        if !created {
+                            drop(self.abort_multipart(path, &handle).await);
+                        }
+                        Ok(StreamUploadOutcome {
+                            bytes_written,
+                            digest,
+                            created,
+                        })
+                    }
                     Err(e) => {
                         drop(self.abort_multipart(path, &handle).await);
                         Err(e)
@@ -439,6 +507,98 @@ impl StorageBackend for S3Backend {
                 }
             }
         }
+    }
+}
+
+impl fmt::Debug for S3Backend {
+    /// Manual `Debug`, redacting `credentials` (mirrors
+    /// `FileStorageConfig`'s manual `Debug` impl's secret-redaction pattern).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3Backend")
+            .field("id", &self.id)
+            .field("bucket", &self.bucket.name())
+            .field("region", &self.bucket.region())
+            .field("credentials", &"<redacted>")
+            .field("list_page_size", &self.list_page_size)
+            .field("multipart_threshold_bytes", &self.multipart_threshold_bytes)
+            // `reqwest::Client` has no useful `Debug` output of its own beyond
+            // internal connection-pool state; omit it explicitly.
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl StorageBackend for S3Backend {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            multipart_native: true,
+            range_native: true,
+            durable: true,
+            ..BackendCapabilities::default()
+        }
+    }
+
+    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
+        let key = Self::path_to_key(path);
+        let url = self
+            .bucket
+            .put_object(Some(&self.credentials), key)
+            .sign(SIGN_DURATION);
+        self.send_and_check(self.http.put(url).body(bytes)).await?;
+        Ok(())
+    }
+
+    /// Streams `stream` into `path` (overwrite-allowed), returning the total
+    /// bytes written and the incrementally-computed SHA-256 digest. See
+    /// [`stream_upload`](Self::stream_upload) for the streaming/multipart
+    /// mechanics; this is the plain last-write-wins entry point.
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        let o = self
+            .stream_upload(path, stream, max_size, WriteMode::Overwrite)
+            .await?;
+        Ok((o.bytes_written, o.digest))
+    }
+
+    /// Create-exclusive publish: streams `stream` into `path` but fails to
+    /// overwrite an existing object, closing the PUT-token-replay race the
+    /// trait's default (non-atomic `exists`-then-`put`) leaves open for S3.
+    ///
+    /// Atomicity is delegated to S3 conditional writes (`If-None-Match: *` on
+    /// the terminal `PutObject`/`CompleteMultipartUpload`): a `412 Precondition
+    /// Failed` is mapped to `created: false`, matching the outcome
+    /// `LocalFsBackend`/`InMemoryBackend` produce. `bytes_written`/`digest`
+    /// always describe *this* attempt's bytes (the control plane re-derives
+    /// integrity from the stored object at finalize regardless).
+    ///
+    /// **Provider requirement:** the target endpoint MUST honour conditional
+    /// writes — native AWS S3 (since 2024-08-20) and any S3-compatible store
+    /// implementing `If-None-Match: *` on `PutObject`/`CompleteMultipartUpload`
+    /// (e.g. recent `MinIO`). Against an endpoint that silently ignores the
+    /// header this degrades to last-write-wins; validating a specific
+    /// deployment's support is part of the ADR-0005 release gate.
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<PublishOutcome, DomainError> {
+        let o = self
+            .stream_upload(path, stream, max_size, WriteMode::CreateExclusive)
+            .await?;
+        Ok(PublishOutcome {
+            bytes_written: o.bytes_written,
+            digest: o.digest,
+            created: o.created,
+        })
     }
 
     async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
@@ -708,7 +868,7 @@ impl StorageBackend for S3Backend {
             .iter()
             .map(|(part_number, _, _, etag)| (*part_number, etag.clone()))
             .collect();
-        self.finalize_multipart(path, upload_handle, &etag_parts)
+        self.finalize_multipart(path, upload_handle, &etag_parts, WriteMode::Overwrite)
             .await?;
 
         // @cpt-cf-file-storage-algo-content-hash-modes-build-manifest

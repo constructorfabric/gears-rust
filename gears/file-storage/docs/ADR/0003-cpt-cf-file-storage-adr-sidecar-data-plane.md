@@ -204,13 +204,18 @@ platform auth module's token revocation, not the URL layer.
   calls the same `FinalizeAuth::verify`). A durable fix (deriving the part
   hash from a sidecar-side value the control plane can independently trust,
   or re-hashing the assembled object) is future work, out of scope for this
-  remediation. A related, separate gap sits in the same release gate:
-  `StorageBackend::publish_exclusive`'s default implementation
-  (`infra/backend/mod.rs`) is a non-atomic (TOCTOU) `exists`-then-`put`, and
-  `S3Backend` is still left on that default rather than an atomic
-  conditional-PUT override — closing it (e.g. an `If-None-Match: *`
-  conditional write mapped from S3's `412`) is required before S3 leaves its
-  ADR-0005 release gate, same as the part-hash trust gap above.
+  remediation. A related gap in the same release gate is now closed in code
+  but stays provider-conditional: `StorageBackend::publish_exclusive`'s default
+  implementation (`infra/backend/mod.rs`) is a non-atomic (TOCTOU)
+  `exists`-then-`put`, but `S3Backend` **overrides** it with an atomic
+  conditional write (`If-None-Match: *` on the terminal
+  `PutObject`/`CompleteMultipartUpload`, mapping S3's `412 Precondition Failed`
+  to a `created: false` outcome). That guarantee holds only against an endpoint
+  that honours S3 conditional writes (native AWS S3 since 2024-08, and
+  S3-compatible stores that implement it); confirming a specific target
+  deployment actually enforces the precondition — rather than silently ignoring
+  the header and degrading to last-write-wins — is a required check before S3
+  leaves its ADR-0005 release gate, same as the part-hash trust gap above.
 * A new signed-URL contract (`cpt-cf-file-storage-fr-signed-urls`) and the constraint model become
   part of the public surface; the response-header set the sidecar must echo verbatim is baked into
   the signed URL.
