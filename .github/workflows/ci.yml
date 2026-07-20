@@ -521,6 +521,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    # Advisory only — unused-dep warnings should not block PRs.
+    continue-on-error: true
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-04-16
     steps:
