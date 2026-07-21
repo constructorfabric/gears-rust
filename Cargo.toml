@@ -63,6 +63,7 @@ members = [
     "gears/system/cluster/cluster-sdk",
     "gears/system/cluster/cluster-conformance",
     "gears/system/cluster/plugins/standalone-cluster-plugin",
+    "gears/system/cluster/plugins/postgres-cluster-plugin",
     "gears/system/grpc-hub",
     "gears/system/nodes-registry/nodes-registry",
     "gears/system/nodes-registry/nodes-registry-sdk",

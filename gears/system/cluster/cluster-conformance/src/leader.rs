@@ -8,9 +8,12 @@
 //! ```no_run
 //! # use std::sync::Arc;
 //! # use cluster_sdk::LeaderElectionBackend;
-//! # use cluster_conformance::run_leader_conformance;
-//! # async fn run(make_backend: impl Fn() -> Arc<dyn LeaderElectionBackend>) {
-//! run_leader_conformance(make_backend).await;
+//! # use cluster_conformance::{run_leader_conformance, ScenarioBackend, TimeControl};
+//! # async fn run<Fut>(make_backend: impl Fn() -> Fut)
+//! # where Fut: std::future::Future<Output = ScenarioBackend<dyn LeaderElectionBackend>> {
+//! // `TimeControl::Virtual` for in-memory fixtures; `TimeControl::Real` for a
+//! // backend over a real connection pool (see `cluster_conformance::time`).
+//! run_leader_conformance(make_backend, TimeControl::Virtual).await;
 //! # }
 //! ```
 //!
@@ -26,24 +29,41 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cluster_sdk::error::ClusterError;
+use std::future::Future;
+
 use cluster_sdk::leader::{
     ElectionConfig, LeaderElectionBackend, LeaderStatus, LeaderWatch, LeaderWatchEvent,
 };
 
-/// Runs every implemented L2 leader-election scenario against a fresh backend
-/// from `make`. `SC-LEAD-002` is asserted only when the backend declares
-/// `linearizable`; weaker backends skip the single-leader guarantee.
-pub async fn run_leader_conformance<F>(make: F)
+use crate::factory::{ScenarioBackend, run_scenario};
+use crate::time::TimeControl;
+
+/// Runs every implemented L2 leader-election scenario, each against a fresh
+/// backend built by the async factory `make` and torn down afterward (see
+/// [`ScenarioBackend`]). `SC-LEAD-002` is asserted only when the backend
+/// declares `linearizable`; weaker backends skip the single-leader guarantee.
+///
+/// `time` selects the clock model. `SC-LEAD-006` runs **only** under
+/// [`TimeControl::Virtual`]: it asserts a *transient* `Status(Lost)` re-enrols,
+/// which it induces by fast-forwarding virtual time so a lease renewal *misses*.
+/// A healthy real backend never misses a renewal by merely waiting, so under
+/// [`TimeControl::Real`] there would be no `Lost` to observe and the scenario
+/// would hang — inducing a real loss is fault-injection territory (L4). It is
+/// therefore skipped under `Real` rather than run against a real backend.
+pub async fn run_leader_conformance<F, Fut>(make: F, time: TimeControl)
 where
-    F: Fn() -> Arc<dyn LeaderElectionBackend>,
+    F: Fn() -> Fut,
+    Fut: Future<Output = ScenarioBackend<dyn LeaderElectionBackend>>,
 {
-    scenario_lead_001(make()).await;
-    scenario_lead_002(make()).await;
-    scenario_lead_003(make()).await;
-    scenario_lead_004(make()).await;
-    scenario_lead_005(make()).await;
-    scenario_lead_006(make()).await;
-    scenario_lead_007(make()).await;
+    run_scenario(make(), scenario_lead_001).await;
+    run_scenario(make(), scenario_lead_002).await;
+    run_scenario(make(), |b| scenario_lead_003(b, time)).await;
+    run_scenario(make(), scenario_lead_004).await;
+    run_scenario(make(), scenario_lead_005).await;
+    if time == TimeControl::Virtual {
+        run_scenario(make(), scenario_lead_006).await;
+    }
+    run_scenario(make(), scenario_lead_007).await;
 }
 
 /// SC-LEAD-001: a single candidate becomes `Leader`.
@@ -110,8 +130,8 @@ pub async fn scenario_lead_007(_backend: Arc<dyn LeaderElectionBackend>) {
 
 /// SC-LEAD-003: the elected leader's claim auto-renews without any consumer
 /// action; the status stays `Leader` across multiple renewal intervals.
-pub async fn scenario_lead_003(backend: Arc<dyn LeaderElectionBackend>) {
-    tokio::time::pause();
+pub async fn scenario_lead_003(backend: Arc<dyn LeaderElectionBackend>, time: TimeControl) {
+    time.begin();
     // Short TTL so renewals fire quickly under controlled time.
     // max_missed_renewals=2 → renewal_interval = ttl / 3 ≈ 100 ms.
     let config = ElectionConfig::new(Duration::from_millis(300), 2).expect("valid config");
@@ -124,16 +144,16 @@ pub async fn scenario_lead_003(backend: Arc<dyn LeaderElectionBackend>) {
             _ => {}
         }
     }
-    // Advance across 5 renewal intervals; after each yield the renewal task runs.
+    // Elapse across 5 renewal intervals; the renewal task keeps the lease alive,
+    // so a healthy backend (real or fixture) never loses leadership.
     for _ in 0..5 {
-        tokio::time::advance(Duration::from_millis(100)).await;
-        tokio::task::yield_now().await;
+        time.elapse(Duration::from_millis(100)).await;
         assert!(
             watch.is_leader(),
             "SC-LEAD-003: auto-renewal must keep status Leader across renewal intervals"
         );
     }
-    tokio::time::resume();
+    time.end();
 }
 
 /// SC-LEAD-004: graceful `resign()` releases the claim; a waiting follower is

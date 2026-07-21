@@ -22,6 +22,9 @@ workspace = true
 # The contract under test: every suite is generic over the SDK backend traits.
 cluster-sdk = { workspace = true }
 async-trait = { workspace = true }
+# `FutureExt::catch_unwind`, so `run_scenario` can run a scenario behind an async
+# panic boundary and still await teardown when an assertion panics.
+futures = { workspace = true }
 # `Instant`-based TTL + the background sweeper in the in-memory `MemCache`
 # fixture. The suites themselves are runtime-agnostic plain `async fn`s
 # (see §11 open question) so a caller can drive them under `turmoil`/`madsim`.

@@ -9,6 +9,7 @@
 //! instances in an unspecified order.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,23 +18,34 @@ use cluster_sdk::discovery::{
     ServiceWatchEvent, StateFilter, TopologyChange,
 };
 
-/// Runs every implemented L2 discovery scenario against a fresh backend from
-/// `make`.
+use crate::factory::{ScenarioBackend, run_scenario};
+use crate::time::TimeControl;
+
+/// Runs every implemented L2 discovery scenario, each against a fresh backend
+/// built by the async factory `make` and torn down afterward (see
+/// [`ScenarioBackend`]).
 ///
-/// # Panics
-/// Requires a `current_thread` Tokio runtime — `scenario_disc_006` calls
-/// `tokio::time::pause()`, which panics under `multi_thread`.
-pub async fn run_discovery_conformance<F>(make: F)
+/// `time` selects the clock model. `SC-DISC-006` runs **only** under
+/// [`TimeControl::Virtual`]: it asserts a registration disappears purely by
+/// letting its TTL (a fixed 30s in the SDK default backend) lapse, driven by a
+/// virtual-time fast-forward. That is not expressible as a bounded real sleep
+/// against a real backend, so it is skipped under [`TimeControl::Real`] (a real
+/// TTL-lapse belongs to L4). `scenario_disc_006` therefore still uses
+/// `tokio::time::pause()` internally and requires a `current_thread` runtime.
+pub async fn run_discovery_conformance<F, Fut>(make: F, time: TimeControl)
 where
-    F: Fn() -> Arc<dyn ServiceDiscoveryBackend>,
+    F: Fn() -> Fut,
+    Fut: Future<Output = ScenarioBackend<dyn ServiceDiscoveryBackend>>,
 {
-    scenario_disc_001(make()).await;
-    scenario_disc_002(make()).await;
-    scenario_disc_003(make()).await;
-    scenario_disc_004(make()).await;
-    scenario_disc_005(make()).await;
-    scenario_disc_006(make()).await;
-    scenario_disc_007(make()).await;
+    run_scenario(make(), scenario_disc_001).await;
+    run_scenario(make(), scenario_disc_002).await;
+    run_scenario(make(), scenario_disc_003).await;
+    run_scenario(make(), scenario_disc_004).await;
+    run_scenario(make(), scenario_disc_005).await;
+    if time == TimeControl::Virtual {
+        run_scenario(make(), scenario_disc_006).await;
+    }
+    run_scenario(make(), scenario_disc_007).await;
 }
 
 /// SC-DISC-001: a registered, enabled instance is returned by `discover` under

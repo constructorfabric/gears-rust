@@ -277,82 +277,102 @@ async fn revoke_stops_the_store_maintainer() {
 }
 
 #[tokio::test]
-async fn watch_surfaces_unsupported_prefix_watch() {
+async fn watch_works_over_a_cache_without_native_prefix_watch() {
+    // A cache declaring `prefix_watch: false` no longer surfaces `Unsupported`
+    // from `watch`: the backend synthesizes the stream with the
+    // `PollingPrefixWatch` polyfill over `scan_prefix`. A short poll interval
+    // keeps the test fast under real time (the pre-insert path can't help a
+    // `watch`, which genuinely needs a poll tick to observe the registration).
     let backend =
-        CacheBasedServiceDiscoveryBackend::new(MemoryCache::linearizable_without_prefix_watch());
-    assert!(matches!(
-        backend.watch("delivery").await,
-        Err(ClusterError::Unsupported {
-            feature: "prefix_watch"
-        })
-    ));
-    // Registration still succeeds — only the cross-process view degrades.
+        CacheBasedServiceDiscoveryBackend::new(MemoryCache::linearizable_without_prefix_watch())
+            .with_prefix_watch_polling(Duration::from_millis(10));
+    let Ok(mut watch) = backend.watch("delivery").await else {
+        panic!("watch must establish via the polyfill over a prefix_watch:false cache");
+    };
+    let Ok(handle) = backend.register(registration("delivery", &[])).await else {
+        panic!("register");
+    };
+    let joined = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match watch.recv().await {
+                Some(ServiceWatchEvent::Change(TopologyChange::Joined(instance)))
+                    if instance.instance_id == handle.instance_id() =>
+                {
+                    break true;
+                }
+                Some(_) => {}
+                None => break false,
+            }
+        }
+    })
+    .await
+    .expect("a join event must arrive within the timeout");
     assert!(
-        backend
-            .register(registration("delivery", &[]))
-            .await
-            .is_ok()
+        joined,
+        "the polyfill watch must surface the registration as Joined"
     );
+    backend.revoke().await;
 }
 
 #[tokio::test]
-async fn degraded_register_does_not_leak_an_unreapable_local_instance() {
-    // Without native prefix watch no maintainer runs, so nothing would reap a
-    // pre-inserted instance on TTL expiry. `register` must therefore skip the
-    // pre-insert and `discover` must stay best-effort empty — not surface a
-    // local instance that would read as live forever.
+async fn discover_works_over_a_cache_without_native_prefix_watch() {
+    // Previously a degraded, always-empty mode; now the `PollingPrefixWatch`
+    // polyfill backs a real maintainer, so `register`'s local pre-insert is safe
+    // (the polling stream reaps it on TTL expiry / deregistration) and `discover`
+    // finds the instance immediately — no poll wait needed for the local view.
     let backend =
         CacheBasedServiceDiscoveryBackend::new(MemoryCache::linearizable_without_prefix_watch());
-    assert!(
-        backend
-            .register(registration("delivery", &[]))
-            .await
-            .is_ok()
-    );
+    let Ok(handle) = backend.register(registration("delivery", &[])).await else {
+        panic!("register");
+    };
     settle().await;
     let Ok(found) = backend
         .discover("delivery", DiscoveryFilter::default())
         .await
     else {
-        panic!("discover must succeed (best-effort) even in degraded mode");
+        panic!("discover must succeed over a polyfill-backed cache");
     };
-    assert!(
-        found.is_empty(),
-        "degraded discover must be best-effort empty, not a stale unreapable instance"
+    assert_eq!(
+        found.len(),
+        1,
+        "polyfill-backed discover must find the registered instance, not an empty set"
     );
+    assert_eq!(found[0].instance_id, handle.instance_id());
+    backend.revoke().await;
 }
 
 #[tokio::test]
-async fn concurrent_degraded_registers_do_not_leak_an_unreapable_local_instance() {
-    // Regression: `ensure_maintainer` marked a name maintained *before* awaiting
-    // `watch_prefix`. With a degraded cache two concurrent `register`s for the
-    // same name could interleave so the second observed the first's optimistic
-    // mark, pre-inserted an instance, and then the first's `watch_prefix` failed
-    // and rolled the mark back — leaving an instance no maintainer would ever
-    // reap. The slow `watch_prefix` makes that interleaving deterministic.
-    let backend = CacheBasedServiceDiscoveryBackend::new(
-        MemoryCache::linearizable_without_prefix_watch_slow(),
-    );
+async fn concurrent_registers_over_a_polyfill_cache_are_both_discoverable() {
+    // With the polyfill the maintainer always starts, so the historical
+    // rollback-vs-optimistic-mark leak (the reason `ensure_maintainer` marks
+    // `Pending` before confirming the maintainer live) cannot strand an
+    // unreapable instance here. Two concurrent `register`s for the same name
+    // must both end up discoverable: one caller spawns the maintainer and
+    // pre-inserts; the other sees `Pending` and is picked up by the maintainer's
+    // initial `scan_prefix` reconcile.
+    let backend =
+        CacheBasedServiceDiscoveryBackend::new(MemoryCache::linearizable_without_prefix_watch());
     let (first, second) = tokio::join!(
         backend.register(registration("delivery", &[])),
         backend.register(registration("delivery", &[])),
     );
-    assert!(
-        first.is_ok() && second.is_ok(),
-        "both registrations succeed"
-    );
+    let (Ok(h1), Ok(h2)) = (first, second) else {
+        panic!("both registrations must succeed");
+    };
     settle().await;
     let Ok(found) = backend
         .discover("delivery", DiscoveryFilter::default())
         .await
     else {
-        panic!("discover must succeed (best-effort) even in degraded mode");
+        panic!("discover must succeed over a polyfill-backed cache");
     };
+    let ids: std::collections::HashSet<&str> =
+        found.iter().map(|i| i.instance_id.as_str()).collect();
     assert!(
-        found.is_empty(),
-        "no maintainer is running, so degraded discover must stay best-effort \
-         empty even under concurrent registration, not leak an unreapable instance"
+        ids.contains(h1.instance_id()) && ids.contains(h2.instance_id()),
+        "both concurrent registrations must be discoverable via the polyfill maintainer"
     );
+    backend.revoke().await;
 }
 
 #[test]

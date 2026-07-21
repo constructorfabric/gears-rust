@@ -229,6 +229,43 @@ pub fn is_in_toolkit_db_path(source_map: &SourceMap, span: Span) -> bool {
         || check_span_path(source_map, span, "toolkit-db/src/")
 }
 
+/// Check if span is within gears/system/cluster/plugins/postgres-cluster-plugin/ -
+/// the native Postgres backend plugin for the cluster gear's cache/lock primitives.
+///
+/// This path is excluded from sqlx restrictions because it needs Postgres driver
+/// features that have no Sea-ORM/SecureConn equivalent at all, not because it's
+/// exempt from the "go through the ORM" rule as a matter of convenience:
+/// - Session-pinned `pg_advisory_lock`/`pg_advisory_unlock` (cluster DESIGN.md §5) —
+///   the lock must be released on the exact physical connection that acquired it,
+///   held for the lock's full (arbitrary) duration; `sea_orm::DatabaseConnection`
+///   has no "check out and pin one connection outside a transaction" primitive.
+/// - `LISTEN`/`NOTIFY` streaming (cluster DESIGN.md §4.3) — no Sea-ORM equivalent
+///   exists; this is a raw `sqlx::postgres::PgListener` API.
+/// - `PgPoolOptions::after_connect`/`before_acquire` hooks (cluster DESIGN.md §3.4,
+///   enforcing `synchronous_commit = on` per ADR-009) — pool-lifecycle hooks are
+///   configured at `sqlx` pool-construction time, before any Sea-ORM connector
+///   wraps the pool.
+///
+/// See `gears/system/cluster/docs/DESIGN.md` §3.5 (External Dependencies), which
+/// designates `sqlx` as this plugin's dependency at the SDK-design level, and
+/// `gears/system/cluster/plugins/postgres-cluster-plugin/docs/DESIGN.md` for the
+/// per-feature rationale above.
+pub fn is_in_postgres_cluster_plugin_path(source_map: &SourceMap, span: Span) -> bool {
+    // Multiple checks handle different path contexts:
+    // - "/gears/system/cluster/plugins/postgres-cluster-plugin/" - absolute path
+    // - "gears/system/cluster/plugins/postgres-cluster-plugin/" - relative path
+    // - "postgres-cluster-plugin/src/" - simulated_dir paths in tests
+    check_span_path(
+        source_map,
+        span,
+        "/gears/system/cluster/plugins/postgres-cluster-plugin/",
+    ) || check_span_path(
+        source_map,
+        span,
+        "gears/system/cluster/plugins/postgres-cluster-plugin/",
+    ) || check_span_path(source_map, span, "postgres-cluster-plugin/src/")
+}
+
 /// Check if span is within apps/cf-gears-example-server - the main server binary
 /// This path is excluded from sqlx restrictions as it needs driver linkage workaround
 pub fn is_in_cf_gears_server_path(source_map: &SourceMap, span: Span) -> bool {
@@ -525,18 +562,40 @@ pub fn use_tree_to_strings(tree: &UseTree) -> Vec<String> {
 }
 
 fn check_span_path(source_map: &SourceMap, span: Span, pattern: &str) -> bool {
-    let pattern_windows = pattern.replace('/', "\\");
     let Some(path_str) = get_path_str_from_session(source_map, span) else {
         // If we can't get the path (e.g., synthetic/virtual files), assume not matching
         return false;
     };
 
-    // Check for simulated directory in test files first
-    if let Some(simulated) = extract_simulated_dir(&path_str) {
-        return simulated.contains(pattern) || simulated.contains(&pattern_windows);
-    }
+    // A `// simulated_dir=...` comment in a test file overrides the real (temp)
+    // path so lints can be exercised as though the file lived at a workspace
+    // path; otherwise match against the real path.
+    let candidate = extract_simulated_dir(&path_str).unwrap_or(path_str);
+    path_matches(&candidate, pattern)
+}
 
-    path_str.contains(pattern) || path_str.contains(&pattern_windows)
+/// Component-aware path match: reports whether `pattern` occurs in `candidate`
+/// on path-component boundaries, rather than as a bare substring.
+///
+/// Plain `str::contains` let unrelated paths slip through the exemption helpers
+/// (e.g. `not-gears/system/.../postgres-cluster-plugin/` or
+/// `my-postgres-cluster-plugin/src/` matching the relative patterns), which could
+/// bypass `DE0706_NO_DIRECT_SQLX`. A match here is only accepted when its start
+/// sits on a boundary: at the very start of the path, immediately after a `/`, or
+/// when the pattern is itself left-anchored with a leading `/`. Every pattern
+/// used by the callers ends with `/`, which anchors the right-hand boundary.
+///
+/// Windows separators in `candidate` are normalised to `/`, so patterns are
+/// written with `/` only.
+fn path_matches(candidate: &str, pattern: &str) -> bool {
+    let normalised = candidate.replace('\\', "/");
+    let pattern_anchored_left = pattern.starts_with('/');
+    normalised.match_indices(pattern).any(|(idx, _)| {
+        // Left-to-right evaluation guarantees `idx - 1` is only indexed when
+        // `idx > 0`, and it indexes bytes so a UTF-8 continuation byte (>= 0x80)
+        // simply compares unequal to `/` rather than panicking.
+        idx == 0 || pattern_anchored_left || normalised.as_bytes()[idx - 1] == b'/'
+    })
 }
 
 fn get_path_str_from_session(source_map: &SourceMap, span: Span) -> Option<String> {
@@ -702,5 +761,93 @@ pub fn test_comment_annotations_match_stderr(
                 trigger_comment
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_matches;
+
+    // The three pattern forms `is_in_postgres_cluster_plugin_path` feeds to
+    // `check_span_path` (see that function): absolute, relative, and the
+    // `simulated_dir` form used by UI tests.
+    const ABSOLUTE: &str = "/gears/system/cluster/plugins/postgres-cluster-plugin/";
+    const RELATIVE: &str = "gears/system/cluster/plugins/postgres-cluster-plugin/";
+    const SIMULATED: &str = "postgres-cluster-plugin/src/";
+
+    #[test]
+    fn absolute_path_matches() {
+        assert!(path_matches(
+            "/home/user/proj/gears/system/cluster/plugins/postgres-cluster-plugin/src/lib.rs",
+            ABSOLUTE,
+        ));
+        // Also matches when the workspace root *is* the path prefix.
+        assert!(path_matches(
+            "/gears/system/cluster/plugins/postgres-cluster-plugin/src/lib.rs",
+            ABSOLUTE,
+        ));
+    }
+
+    #[test]
+    fn relative_path_matches() {
+        assert!(path_matches(
+            "gears/system/cluster/plugins/postgres-cluster-plugin/src/lib.rs",
+            RELATIVE,
+        ));
+        // Relative pattern preceded by a component boundary also matches.
+        assert!(path_matches(
+            "/abs/gears/system/cluster/plugins/postgres-cluster-plugin/src/lib.rs",
+            RELATIVE,
+        ));
+    }
+
+    #[test]
+    fn simulated_dir_matches() {
+        assert!(path_matches(
+            "postgres-cluster-plugin/src/lib.rs",
+            SIMULATED
+        ));
+        assert!(path_matches(
+            "gears/system/cluster/plugins/postgres-cluster-plugin/src/lib.rs",
+            SIMULATED,
+        ));
+    }
+
+    #[test]
+    fn windows_separators_are_normalised() {
+        assert!(path_matches(
+            r"C:\work\gears\system\cluster\plugins\postgres-cluster-plugin\src\lib.rs",
+            RELATIVE,
+        ));
+    }
+
+    #[test]
+    fn near_miss_prefixed_paths_are_rejected() {
+        // A directory that merely ends with the same suffix must not match.
+        assert!(!path_matches(
+            "not-gears/system/cluster/plugins/postgres-cluster-plugin/src/lib.rs",
+            RELATIVE,
+        ));
+        // A crate whose name merely ends with `postgres-cluster-plugin` must not
+        // match the simulated-dir pattern.
+        assert!(!path_matches(
+            "my-postgres-cluster-plugin/src/lib.rs",
+            SIMULATED,
+        ));
+        // The absolute pattern must not match a non-boundary occurrence either.
+        assert!(!path_matches(
+            "/x/not-gears/system/cluster/plugins/postgres-cluster-plugin/src/lib.rs",
+            ABSOLUTE,
+        ));
+    }
+
+    #[test]
+    fn slash_bounded_patterns_reject_partial_segments() {
+        // Guards the shared helpers that use `/segment/` patterns
+        // (`is_in_domain_path`, `is_in_module_folder`, ...).
+        assert!(path_matches("/x/domain/model.rs", "/domain/"));
+        assert!(!path_matches("/x/subdomain/model.rs", "/domain/"));
+        assert!(path_matches("/x/gears/y.rs", "/gears/"));
+        assert!(!path_matches("/x/not-gears/y.rs", "/gears/"));
     }
 }

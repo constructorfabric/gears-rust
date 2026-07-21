@@ -19,13 +19,20 @@ use std::sync::Arc;
 
 use cluster_conformance::fixture::MemCache;
 use cluster_conformance::{
-    run_cache_conformance, run_restart_conformance, run_watch_lifecycle_conformance,
+    ScenarioBackend, TimeControl, run_cache_conformance, run_restart_conformance,
+    run_watch_lifecycle_conformance,
 };
 use cluster_sdk::ClusterCacheBackend;
 
 #[tokio::test]
 async fn cache_suite_passes_against_memcache() {
-    run_cache_conformance(|| MemCache::linearizable() as Arc<dyn ClusterCacheBackend>).await;
+    run_cache_conformance(
+        || async {
+            ScenarioBackend::bare(MemCache::linearizable() as Arc<dyn ClusterCacheBackend>)
+        },
+        TimeControl::Virtual,
+    )
+    .await;
 }
 
 #[tokio::test]

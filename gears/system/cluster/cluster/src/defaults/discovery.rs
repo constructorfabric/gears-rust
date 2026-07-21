@@ -12,7 +12,9 @@ use tracing::Instrument;
 
 use crate::defaults::{SVC_KEY_PREFIX, ShutdownRevoke, identity};
 use cluster_sdk::cache::types::{PutRequest, Ttl};
-use cluster_sdk::cache::{CacheEvent, CacheWatch, CacheWatchEvent, ClusterCacheBackend};
+use cluster_sdk::cache::{
+    CacheEvent, CacheWatch, CacheWatchEvent, ClusterCacheBackend, PollingPrefixWatch,
+};
 use cluster_sdk::discovery::{
     DiscoveryFilter, InstanceState, ServiceCommandReceiver, ServiceDiscoveryBackend,
     ServiceDiscoveryFeatures, ServiceHandle, ServiceInstance, ServiceRegistration, ServiceRequest,
@@ -58,6 +60,16 @@ const DEFAULT_TTL: Duration = Duration::from_secs(30);
 )]
 const DEFAULT_RENEWAL: Duration = Duration::from_secs(DEFAULT_TTL.as_secs() / 3);
 
+/// Default poll interval for the [`PollingPrefixWatch`] fallback used when the
+/// bound cache lacks a native prefix watch (`features().prefix_watch == false`).
+///
+/// Five seconds mirrors the Postgres plugin's `sd_poll_interval` default (its
+/// DESIGN §6) — the canonical `prefix_watch: false` backend — and trades
+/// topology-change latency for a bounded `scan_prefix` + `N` `get` cost per tick
+/// (`PollingPrefixWatch`'s documented cost). Override with
+/// [`with_prefix_watch_polling`](CacheBasedServiceDiscoveryBackend::with_prefix_watch_polling).
+const DEFAULT_PREFIX_WATCH_POLL: Duration = Duration::from_secs(5);
+
 /// The in-flight command buffer for each [`ServiceHandle`].
 const COMMAND_BUFFER: usize = 4;
 
@@ -92,17 +104,23 @@ const WATCH_CAPACITY: usize = 256;
 ///
 /// # Prefix-watch dependency
 ///
-/// Discovery and watch require the cache's native `watch_prefix`. A cache that
-/// declares no prefix watch returns
-/// [`ClusterError::Unsupported`] from `watch_prefix`, so
-/// [`watch`](ServiceDiscoveryBackend::watch) surfaces that error and
-/// [`discover`](ServiceDiscoveryBackend::discover) is **best-effort**: with no
-/// maintainer to reap entries on TTL expiry, [`register`](ServiceDiscoveryBackend::register)
-/// deliberately skips its local pre-insert (an unreapable pre-insert would read
-/// as live forever), so degraded-mode `discover` returns an empty set rather
-/// than a stale view. This is a known limitation pending the
-/// `PollingPrefixWatch` polyfill (DECOMPOSITION §2.7), which is out of scope
-/// here.
+/// Discovery and watch need a prefix stream. When the bound cache has a native
+/// `watch_prefix` (`features().prefix_watch == true`) it is used directly. When
+/// the cache declares no native prefix watch (`prefix_watch == false`, e.g. the
+/// Postgres plugin's cache), the backend transparently falls back to the
+/// [`PollingPrefixWatch`] polyfill over `scan_prefix`
+/// ([`open_prefix_watch`](Self::open_prefix_watch)) — so a maintainer runs and
+/// `register`'s local pre-insert is safe (it is reaped on TTL expiry /
+/// deregistration through the polling stream) over either kind of cache. The
+/// polyfill path pays the documented poll-interval latency and `N+1`
+/// round-trips per tick; tune it with
+/// [`with_prefix_watch_polling`](Self::with_prefix_watch_polling).
+///
+/// The historical degraded, always-empty mode (skip the pre-insert; return an
+/// empty set) only remains reachable if a maintainer genuinely cannot start —
+/// a transient native-`watch_prefix` failure, or a concurrent caller still
+/// bringing the maintainer up — not merely because the cache lacks native
+/// prefix watch.
 pub struct CacheBasedServiceDiscoveryBackend {
     cache: Arc<dyn ClusterCacheBackend>,
     shared: Arc<Shared>,
@@ -124,6 +142,11 @@ pub struct CacheBasedServiceDiscoveryBackend {
     provider: &'static str,
     /// The metrics sink (default [`NoopMetrics`]).
     metrics: Arc<dyn ClusterMetrics>,
+    /// Poll interval for the [`PollingPrefixWatch`] fallback, used only when the
+    /// bound cache declares `features().prefix_watch == false`. Defaults to
+    /// [`DEFAULT_PREFIX_WATCH_POLL`]; override with
+    /// [`with_prefix_watch_polling`](Self::with_prefix_watch_polling).
+    prefix_watch_poll: Duration,
 }
 
 impl CacheBasedServiceDiscoveryBackend {
@@ -142,6 +165,39 @@ impl CacheBasedServiceDiscoveryBackend {
             tasks: Arc::new(Mutex::new(Vec::new())),
             provider: "unknown",
             metrics: Arc::new(NoopMetrics),
+            prefix_watch_poll: DEFAULT_PREFIX_WATCH_POLL,
+        }
+    }
+
+    /// Sets the poll interval for the [`PollingPrefixWatch`] fallback (used only
+    /// over a cache with no native prefix watch). Mirrors
+    /// [`with_observability`](Self::with_observability); without it the backend
+    /// uses [`DEFAULT_PREFIX_WATCH_POLL`].
+    #[must_use]
+    pub fn with_prefix_watch_polling(mut self, interval: Duration) -> Self {
+        self.prefix_watch_poll = interval;
+        self
+    }
+
+    /// Opens the prefix-watch stream backing discovery for `prefix`.
+    ///
+    /// Uses the cache's **native** `watch_prefix` when it supports prefix
+    /// watches (`features().prefix_watch == true`) — that path is unchanged.
+    /// When the bound cache declares no native prefix watch it would return
+    /// [`ClusterError::Unsupported`]; instead of propagating that (which left
+    /// discovery permanently empty over such a cache — the Postgres plugin's
+    /// gap, DESIGN §6 / DECOMPOSITION §2.7), synthesize the stream with the
+    /// [`PollingPrefixWatch`] polyfill over `scan_prefix`, so discovery actually
+    /// works — at the polyfill's documented poll-latency / `N+1`-round-trip cost.
+    async fn open_prefix_watch(&self, prefix: &str) -> Result<CacheWatch, ClusterError> {
+        if self.cache.features().prefix_watch {
+            self.cache.watch_prefix(prefix).await
+        } else {
+            Ok(PollingPrefixWatch::spawn(
+                Arc::clone(&self.cache),
+                prefix,
+                self.prefix_watch_poll,
+            ))
         }
     }
 
@@ -183,8 +239,9 @@ impl CacheBasedServiceDiscoveryBackend {
     /// view.
     ///
     /// # Errors
-    /// Propagates the cache's [`ClusterError::Unsupported`] when it has no native
-    /// prefix watch.
+    /// Propagates a native `watch_prefix` failure. A cache with no native prefix
+    /// watch does **not** error here — it uses the [`PollingPrefixWatch`]
+    /// polyfill (see [`open_prefix_watch`](Self::open_prefix_watch)).
     async fn ensure_maintainer(&self, name: &str) -> Result<MaintainerStatus, ClusterError> {
         {
             let mut registry = self.shared.lock();
@@ -207,11 +264,14 @@ impl CacheBasedServiceDiscoveryBackend {
             registry.instances.entry(name.to_owned()).or_default();
         }
         let prefix = Self::prefix(name);
-        let watch = match self.cache.watch_prefix(&prefix).await {
+        let watch = match self.open_prefix_watch(&prefix).await {
             Ok(watch) => watch,
             Err(err) => {
-                // Roll back the mark so a later call can retry once the cache
-                // gains prefix-watch support.
+                // Roll back the mark so a later call can retry. A native
+                // `watch_prefix` can fail transiently; the polyfill path over a
+                // prefix-watch-incapable cache does not error here (it defers
+                // any backend failure to its own stream), so this branch is now
+                // reached only for a genuine native-watch failure.
                 self.shared.lock().maintained.remove(name);
                 return Err(err);
             }
@@ -290,6 +350,14 @@ impl ServiceDiscoveryBackend for CacheBasedServiceDiscoveryBackend {
                     .entry(reg.name.clone())
                     .or_default()
                     .insert(instance_id.clone(), instance);
+                // Bump the generation so an in-flight `reconcile_view` sweep that
+                // snapshotted the revision before this pre-insert — and whose
+                // `scan_prefix` ran before the `put` above committed — detects the
+                // race and discards its now-stale rebuilt map rather than
+                // clobbering this local registration (PGR-D2). Without this the
+                // pre-insert's "observe immediately" guarantee could be erased by
+                // an older sweep committing afterward.
+                registry.bump_generation(&reg.name);
             }
             // No confirmed maintainer for this process to pre-insert behind: skip
             // it. Either degraded mode (the maintainer could not start) — with
@@ -336,6 +404,17 @@ impl ServiceDiscoveryBackend for CacheBasedServiceDiscoveryBackend {
         let out = async {
             // Best-effort: ensure the membership view is being maintained.
             let _maintainer = self.ensure_maintainer(name).await;
+            // Over a cache with no native prefix watch, the maintained view is
+            // only as fresh as the last `PollingPrefixWatch` tick — up to a poll
+            // interval stale, and a change made moments ago (e.g. a `set_state`)
+            // is not yet reflected. Refresh from a fresh `scan_prefix` sweep of
+            // backend truth so `discover` is current regardless of poll cadence
+            // (the cost the operator accepted by choosing a polling backend). A
+            // native prefix-watch backend keeps its event-maintained view, which
+            // is already current, so this scan is skipped there.
+            if !self.cache.features().prefix_watch {
+                reconcile_view(&self.cache, &self.shared, name, &Self::prefix(name)).await;
+            }
             let registry = self.shared.lock();
             let instances = registry.instances.get(name).map_or_else(Vec::new, |map| {
                 map.values()
@@ -356,9 +435,11 @@ impl ServiceDiscoveryBackend for CacheBasedServiceDiscoveryBackend {
             tracing::info_span!(spans::DISCOVERY_WATCH, provider = %self.provider, name = %name);
         let out = async {
             let prefix = Self::prefix(name);
-            // Each watch gets its own prefix subscription; the cache's `Unsupported`
-            // surfaces here directly.
-            let cache_watch = self.cache.watch_prefix(&prefix).await?;
+            // Each watch gets its own prefix subscription — native when the
+            // cache supports it, else the `PollingPrefixWatch` polyfill (a
+            // prefix-watch-incapable cache no longer surfaces `Unsupported`
+            // here).
+            let cache_watch = self.open_prefix_watch(&prefix).await?;
             let (sender, mut watch) = ServiceWatch::channel(WATCH_CAPACITY);
             // Stamp the watch so an `auto_restart`ed consumer emits the watch-reset
             // signals (`cluster_watch_resets_total` / `cluster.watch.reset`).
@@ -408,6 +489,28 @@ struct Registry {
     instances: HashMap<String, HashMap<String, ServiceInstance>>,
     /// Service names with a maintainer task being started or running.
     maintained: HashMap<String, MaintainerState>,
+    /// `service name → revision`, bumped on every single-instance mutation the
+    /// maintainer's [`apply`](StoreMaintainer::apply) makes (join / departure /
+    /// state change). A `scan_prefix`+`get` reconcile sweep captures the revision
+    /// before its (unlocked, `await`-ing) scan and commits its rebuilt map only
+    /// if the revision is unchanged — so a newer watch event that landed while
+    /// the sweep was in flight is not clobbered by the older sweep result
+    /// (PGR-D2).
+    generations: HashMap<String, u64>,
+}
+
+impl Registry {
+    /// The current revision for `name` (0 if never mutated).
+    fn generation(&self, name: &str) -> u64 {
+        self.generations.get(name).copied().unwrap_or(0)
+    }
+
+    /// Bumps `name`'s revision; called under the registry lock by every
+    /// maintainer mutation so an in-flight reconcile sweep can detect it raced.
+    fn bump_generation(&mut self, name: &str) {
+        let counter = self.generations.entry(name.to_owned()).or_default();
+        *counter = counter.wrapping_add(1);
+    }
 }
 
 /// Lifecycle of a per-service maintainer slot in [`Registry::maintained`].
@@ -556,6 +659,67 @@ fn take_str(bytes: &[u8], pos: &mut usize) -> Option<String> {
     Some(value)
 }
 
+/// Rebuilds `name`'s slice of the shared view from a `scan_prefix` + `get` sweep
+/// of backend truth, replacing whatever was cached. Best-effort: if the backend
+/// lacks `scan_prefix` the view is left untouched (joins still reconverge from
+/// the maintainer's stream). Never holds the registry lock across an `.await` —
+/// the sweep completes before the single locked insert.
+///
+/// Shared by the [`StoreMaintainer`]'s initial/lagged reconcile and, for a cache
+/// without native prefix watch, by [`discover`](CacheBasedServiceDiscoveryBackend::discover)
+/// on each call, so discovery over a polling backend reflects current backend
+/// truth rather than the poll-interval-stale maintained view.
+async fn reconcile_view(
+    cache: &Arc<dyn ClusterCacheBackend>,
+    shared: &Shared,
+    name: &str,
+    prefix: &str,
+) {
+    // Snapshot the revision before the unlocked scan/get sweep below so we can
+    // tell whether a maintainer `apply` mutated this service's slice while we
+    // were awaiting backend truth (PGR-D2).
+    let start_generation = shared.lock().generation(name);
+
+    let Ok(keys) = cache.scan_prefix(prefix).await else {
+        return;
+    };
+    let mut fresh = HashMap::new();
+    for key in keys {
+        let Some(instance_id) = key.strip_prefix(prefix).map(str::to_owned) else {
+            continue;
+        };
+        match cache.get(&key).await {
+            // A live entry: decode and include it. An entry that fails to decode
+            // is corrupt/foreign, not a backend failure, so it is legitimately
+            // omitted (same as before).
+            Ok(Some(entry)) => {
+                if let Some(record) = InstanceRecord::decode(&entry.value) {
+                    fresh.insert(instance_id.clone(), record.to_instance(instance_id));
+                }
+            }
+            // The key vanished between `scan_prefix` and this `get` (TTL expiry /
+            // deregistration): legitimately absent, so omit it and keep sweeping.
+            Ok(None) => {}
+            // A transient backend read failure (pool exhaustion, DB blip). Do NOT
+            // commit a partial view — silently dropping this key would erase a
+            // healthy instance from discovery until the next successful sweep.
+            // Abort now, leaving the existing view intact; the next
+            // reconcile / `discover` re-sweeps, so this is self-healing (PGR-D2).
+            Err(_) => return,
+        }
+    }
+
+    // Commit the rebuilt map only if no newer watch event landed while the sweep
+    // was in flight; otherwise discard this (now-stale) sweep and leave the
+    // maintainer's fresher single-instance updates in place. The next
+    // reconcile / `discover` re-sweeps, so a discarded sweep is self-healing and
+    // never leaves the view permanently stale (PGR-D2).
+    let mut registry = shared.lock();
+    if registry.generation(name) == start_generation {
+        registry.instances.insert(name.to_owned(), fresh);
+    }
+}
+
 /// The background task that keeps the shared membership view fresh from a
 /// `watch_prefix` stream. Self-terminates when the backend is dropped (its
 /// `Weak<Shared>` no longer upgrades), the cache watch ends, or graceful
@@ -612,27 +776,9 @@ impl StoreMaintainer {
     }
 
     /// Rebuilds this service's slice of the shared view from a `scan_prefix` +
-    /// `get` sweep of backend truth, replacing whatever was cached. Best-effort:
-    /// if the backend lacks `scan_prefix` the view is left untouched (joins still
-    /// reconverge from the heartbeat stream). Never holds the registry lock
-    /// across an `.await` — the sweep completes before the single locked insert.
+    /// `get` sweep of backend truth (delegates to [`reconcile_view`]).
     async fn reconcile(&self, shared: &Shared) {
-        let Ok(keys) = self.cache.scan_prefix(&self.prefix).await else {
-            return;
-        };
-        let mut fresh = HashMap::new();
-        for key in keys {
-            let Some(instance_id) = key.strip_prefix(self.prefix.as_str()).map(str::to_owned)
-            else {
-                continue;
-            };
-            if let Ok(Some(entry)) = self.cache.get(&key).await
-                && let Some(record) = InstanceRecord::decode(&entry.value)
-            {
-                fresh.insert(instance_id.clone(), record.to_instance(instance_id));
-            }
-        }
-        shared.lock().instances.insert(self.name.clone(), fresh);
+        reconcile_view(&self.cache, shared, &self.name, &self.prefix).await;
     }
 
     async fn apply(&self, shared: &Shared, event: &CacheEvent) {
@@ -649,17 +795,33 @@ impl StoreMaintainer {
                 };
                 if let Some(instance) = instance {
                     let mut registry = shared.lock();
-                    registry
-                        .instances
-                        .entry(self.name.clone())
-                        .or_default()
-                        .insert(instance_id, instance);
+                    // Bump the revision only when the effective membership
+                    // actually changes — a genuinely new instance or a changed
+                    // record — not on a heartbeat re-insert of an identical
+                    // instance (PGR-D2). Bumping on every `Changed` (including
+                    // routine TTL refreshes, which are frequent) would needlessly
+                    // discard a concurrent `discover` reconcile sweep and revert
+                    // it to poll-interval-stale departures, defeating the point
+                    // of the discover-time reconcile.
+                    let changed = {
+                        let entry = registry.instances.entry(self.name.clone()).or_default();
+                        entry.insert(instance_id, instance.clone()).as_ref() != Some(&instance)
+                    };
+                    if changed {
+                        registry.bump_generation(&self.name);
+                    }
                 }
             }
             CacheEvent::Deleted { .. } | CacheEvent::Expired { .. } => {
                 let mut registry = shared.lock();
-                if let Some(map) = registry.instances.get_mut(&self.name) {
-                    map.remove(&instance_id);
+                let removed = registry
+                    .instances
+                    .get_mut(&self.name)
+                    .is_some_and(|map| map.remove(&instance_id).is_some());
+                // Only a real removal changes membership, so only then invalidate
+                // a concurrent reconcile sweep (PGR-D2).
+                if removed {
+                    registry.bump_generation(&self.name);
                 }
             }
             _ => {}

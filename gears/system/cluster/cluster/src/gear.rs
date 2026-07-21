@@ -44,11 +44,12 @@ impl Default for ClusterGear {
 
 impl ClusterGear {
     /// Assembles the provider registry from the backend plugins linked into this
-    /// build. Today only the in-process standalone provider; future plugins add a
-    /// `with_cache_provider` line here.
+    /// build; future plugins add a `with_*_provider` line here.
     fn provider_registry() -> ProviderRegistry {
         ProviderRegistry::new()
             .with_cache_provider(Arc::new(standalone_cluster_plugin::StandaloneCacheProvider))
+            .with_cache_provider(Arc::new(postgres_cluster_plugin::PostgresCacheProvider))
+            .with_lock_provider(Arc::new(postgres_cluster_plugin::PostgresLockProvider))
     }
 }
 

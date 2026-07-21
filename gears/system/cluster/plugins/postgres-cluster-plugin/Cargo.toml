@@ -1,0 +1,154 @@
+[package]
+name = "cf-postgres-cluster-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Postgres backend plugin for the cluster gear: a native ClusterCacheBackend over a sqlx::PgPool plus a native DistributedLockBackend over pg_advisory_lock, for multi-instance, no-K8s deployments"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["development-tools"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "postgres_cluster_plugin"
+
+# `testcontainers`/`testcontainers-modules` are declared as *optional* entries
+# under `[dependencies]` (not `[dev-dependencies]`) on purpose: Cargo does not
+# allow optional dev-dependencies, and the `integration` feature must name them
+# via `dep:` (see the `[features]` doc below). cargo-shear's "misplaced optional
+# dependency" heuristic flags that placement; ignore it here since the placement
+# is required, not accidental.
+[package.metadata.cargo-shear]
+ignored = ["testcontainers", "testcontainers-modules"]
+
+[lints]
+workspace = true
+
+[features]
+# Gates the Layer 3 testcontainers integration suite (docs/TESTING.md §4, §7)
+# so a default `cargo test` never requires a Docker daemon. `testcontainers`/
+# `testcontainers-modules` are declared as optional entries under
+# `[dependencies]` below (not `[dev-dependencies]`, which Cargo does not allow
+# to be optional) purely so this feature array can name them directly, per
+# docs/TESTING.md §7; every reference to them lives in `tests/`, so enabling
+# this feature has no effect on the plugin's own compiled artifact. Run with
+# `cargo test -p cf-postgres-cluster-plugin --features integration`.
+integration = ["dep:testcontainers", "dep:testcontainers-modules"]
+
+[dependencies]
+# `otel` pulls in the SDK's OpenTelemetry-backed `ClusterMetrics` adapter
+# (`OtelClusterMetrics`), mirroring `standalone-cluster-plugin` so this plugin
+# emits the cluster cache signal set for free via `InstrumentedCache` (DESIGN
+# §8). The lock signals are emitted natively (§8), not via a decorator.
+cluster-sdk = { workspace = true, features = ["otel"] }
+# The lock/cache TTL reapers emit two plugin-local, non-ADR-004 metrics
+# (`cluster_postgres_lock_active_names` gauge, `cluster_postgres_reaper_sweep_duration_seconds`
+# histogram — DESIGN §8) through a meter this plugin owns directly. The
+# `ClusterMetrics` contract sink has no gauge method, so these go via the OTel
+# API straight (same underlying API `OtelClusterMetrics` uses in cluster-sdk).
+opentelemetry = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+serde = { workspace = true }
+# Per-key watcher registry for the LISTEN fan-out task (cache/watch.rs).
+dashmap = { workspace = true }
+# Reads the provider's flattened operator-config options (e.g.
+# `connection_string`, `pool_max_size`) passed through by the wiring crate as
+# a serde map (DESIGN §7), and deserializes `PostgresClusterConfig` /
+# `PostgresLockConfig` from it.
+serde_json = { workspace = true }
+# `${VAR}` / `${VAR:-default}` env-var expansion for `connection_string`
+# (DESIGN §7), the same mechanism `libs/toolkit-db` uses for DB passwords/DSNs.
+# `toolkit` (not `toolkit-utils` directly) because the `ExpandVars` derive
+# macro expands to `::toolkit::var_expand::ExpandVars`.
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+# Direct sqlx usage is a deliberate, lint-sanctioned exception to the
+# platform's normal Sea-ORM/SecureConn DB-access rule — see DESIGN.md §3.1
+# ("Why sqlx directly, not libs/toolkit-db") and
+# tools/dylint_lints/lint_utils::is_in_postgres_cluster_plugin_path. This
+# plugin needs session-pinned advisory locks, LISTEN/NOTIFY streaming, and
+# PgPoolOptions connect/acquire hooks that have no Sea-ORM equivalent.
+# `expires_at`/`acquired_at` are `TIMESTAMPTZ`; the `chrono` feature maps them
+# through sqlx (which pulls `chrono` transitively) — this plugin never names a
+# `chrono` type directly, so `chrono` is not a direct dependency.
+sqlx = { workspace = true, features = ["postgres", "migrate", "macros", "chrono"] }
+# `lock_key`'s deterministic name -> (key1, key2) hash (DESIGN.md §5.1): xxh3
+# is a well-known, fast, non-cryptographic 64-bit hash, and already a
+# workspace dependency (used by `libs/toolkit-db`) — the specific algorithm is
+# an implementation detail per DESIGN.md §5.1 as long as it stays fixed once
+# shipped.
+xxhash-rust = { workspace = true }
+# Layer 3 testcontainers fixture (`tests/common/mod.rs`, DESIGN.md/TESTING.md
+# §4.1) — optional, only pulled in by `--features integration`. See the
+# `[features]` doc above for why these live here rather than
+# `[dev-dependencies]`.
+testcontainers = { workspace = true, optional = true }
+testcontainers-modules = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# `pg_spec_006` reads the `cluster_postgres_lock_active_names` gauge back through
+# an in-process OTel reader (`InMemoryMetricExporter`, gated by the `testing`
+# feature) over a meter injected into the lock reaper.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# `pg_spec_006` asserts the `cluster.lock.name_cardinality_high` WARN. The WARN
+# is emitted from the reaper's spawned task, so it captures via a process-global
+# subscriber (all threads route to it) rather than `tracing-test`'s thread-local
+# capture, which misses spawned-task events.
+tracing-subscriber = { workspace = true }
+# `FutureExt::now_or_never` in `cache/watch.rs` unit tests, to assert a watch
+# has nothing buffered without risking a hang on a real `.await`.
+futures-util = { workspace = true }
+# Layer 2 conformance suite (TESTING.md §3): the same parametrized suites
+# every other backend runs, wired against this plugin's real Postgres-backed
+# cache/lock/leader/discovery in `tests/conformance.rs`.
+cf-gears-cluster-conformance = { workspace = true }
+# `cluster::defaults::{CasBasedLeaderElectionBackend, CacheBasedServiceDiscoveryBackend}`
+# (TESTING.md §3): leader election and service discovery are always the SDK
+# defaults over this plugin's cache (DESIGN.md §6), so the L2/L3 tests exercise
+# that combination via the `cluster` gear crate itself, not a stand-in. A
+# dev-dependency only — `cf-gears-cluster` does not depend on this plugin (it
+# depends on `cf-gears-standalone-cluster-plugin` for its own default wiring),
+# so this does not introduce a cycle in the normal build graph; a dev-only
+# cycle through test code would be permitted by Cargo either way.
+cluster = { package = "cf-gears-cluster", path = "../../cluster" }
+# `PG-LOCK-011` (docs/TESTING.md §4.3): the "cache on a different provider"
+# half of the end-to-end YAML routing test binds `cache: { provider:
+# standalone }` alongside `lock: { provider: postgres }`.
+cf-gears-standalone-cluster-plugin = { path = "../standalone-cluster-plugin" }
+
+# Layer 2 (conformance) and Layer 3 (testcontainers) test binaries all require
+# a real Docker daemon, so each is gated behind `required-features =
+# ["integration"]` (docs/TESTING.md §7) — `cargo test -p
+# cf-postgres-cluster-plugin` (no flag) skips building these binaries
+# entirely, rather than merely skipping test functions inside them.
+[[test]]
+name = "conformance"
+required-features = ["integration"]
+
+[[test]]
+name = "cache_integration"
+required-features = ["integration"]
+
+[[test]]
+name = "lock_integration"
+required-features = ["integration"]
+
+[[test]]
+name = "watch_integration"
+required-features = ["integration"]
+
+[[test]]
+name = "lifecycle_integration"
+required-features = ["integration"]
+
+[[test]]
+name = "postgres_specific"
+required-features = ["integration"]

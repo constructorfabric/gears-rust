@@ -6,6 +6,7 @@
 //! a plugin may call directly; [`run_cache_conformance`] drives the full L2 set,
 //! building a fresh backend per scenario via `make` so state never leaks.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,29 +16,37 @@ use cluster_sdk::cache::{
 };
 use cluster_sdk::error::ClusterError;
 
-/// Runs every implemented L2 cache scenario against a fresh backend from `make`.
+use crate::factory::{ScenarioBackend, run_scenario};
+use crate::time::TimeControl;
+
+/// Runs every implemented L2 cache scenario, each against a fresh backend built
+/// by the async factory `make` and torn down afterward (see
+/// [`ScenarioBackend`]). `time` selects the clock model
+/// ([`TimeControl::Virtual`] for in-memory fixtures, [`TimeControl::Real`] for a
+/// real-I/O backend — see [`crate::time`]).
 ///
 /// Capability-gated scenarios read `consistency()`/`features()` off the backend
 /// and assert strict guarantees only where the backend claims them.
-pub async fn run_cache_conformance<F>(make: F)
+pub async fn run_cache_conformance<F, Fut>(make: F, time: TimeControl)
 where
-    F: Fn() -> Arc<dyn ClusterCacheBackend>,
+    F: Fn() -> Fut,
+    Fut: Future<Output = ScenarioBackend<dyn ClusterCacheBackend>>,
 {
-    scenario_cache_001(make()).await;
-    scenario_cache_002(make()).await;
-    scenario_cache_003(make()).await;
-    scenario_cache_004(make()).await;
-    scenario_cache_005(make()).await;
-    scenario_cache_006(make()).await;
-    scenario_cache_007(make()).await;
-    scenario_cache_008(make()).await;
-    scenario_cache_009(make()).await;
-    scenario_cache_010(make()).await;
-    scenario_cache_011(make()).await;
-    scenario_cache_012(make()).await;
-    scenario_cache_013(make()).await;
-    scenario_cache_014(make()).await;
-    scenario_cache_015(make()).await;
+    run_scenario(make(), scenario_cache_001).await;
+    run_scenario(make(), scenario_cache_002).await;
+    run_scenario(make(), scenario_cache_003).await;
+    run_scenario(make(), scenario_cache_004).await;
+    run_scenario(make(), scenario_cache_005).await;
+    run_scenario(make(), scenario_cache_006).await;
+    run_scenario(make(), scenario_cache_007).await;
+    run_scenario(make(), scenario_cache_008).await;
+    run_scenario(make(), scenario_cache_009).await;
+    run_scenario(make(), |b| scenario_cache_010(b, time)).await;
+    run_scenario(make(), |b| scenario_cache_011(b, time)).await;
+    run_scenario(make(), scenario_cache_012).await;
+    run_scenario(make(), scenario_cache_013).await;
+    run_scenario(make(), |b| scenario_cache_014(b, time)).await;
+    run_scenario(make(), |b| scenario_cache_015(b, time)).await;
 }
 
 /// SC-CACHE-001: `get` on an absent key returns `Ok(None)`, never an error.
@@ -298,8 +307,8 @@ pub async fn scenario_cache_009(backend: Arc<dyn ClusterCacheBackend>) {
 
 /// SC-CACHE-010: TTL expiry removes the entry and emits `CacheEvent::Expired` to
 /// watchers.
-pub async fn scenario_cache_010(backend: Arc<dyn ClusterCacheBackend>) {
-    tokio::time::pause();
+pub async fn scenario_cache_010(backend: Arc<dyn ClusterCacheBackend>, time: TimeControl) {
+    time.begin();
     let mut watch = backend.watch("k").await.expect("watch");
     backend
         .put(PutRequest {
@@ -309,9 +318,10 @@ pub async fn scenario_cache_010(backend: Arc<dyn ClusterCacheBackend>) {
         })
         .await
         .expect("put with ttl");
-    tokio::time::advance(Duration::from_millis(100)).await;
-    tokio::task::yield_now().await;
-    // Drain the initial Changed, then wait for the Expired emission.
+    time.elapse(Duration::from_millis(100)).await;
+    // Drain the initial Changed, then wait for the Expired emission. `wait_for`
+    // polls the watch, so under `Real` it tolerates the sweeper reclaim landing
+    // a little after the elapse (caller must set a sweep interval < the elapse).
     let expired = wait_for(
         &mut watch,
         |event| matches!(event, CacheEvent::Expired { key } if key == "k"),
@@ -322,7 +332,7 @@ pub async fn scenario_cache_010(backend: Arc<dyn ClusterCacheBackend>) {
         backend.get("k").await.expect("get").is_none(),
         "SC-CACHE-010: expired entry reads as absent"
     );
-    tokio::time::resume();
+    time.end();
 }
 
 /// SC-CACHE-012: exact `watch` yields `Changed`/`Deleted` for the key,
@@ -398,8 +408,8 @@ pub async fn scenario_cache_013(backend: Arc<dyn ClusterCacheBackend>) {
 
 /// SC-CACHE-011: a `Ttl::Indefinite` entry persists well past any default TTL;
 /// it is not removed by the TTL sweeper until explicitly deleted.
-pub async fn scenario_cache_011(backend: Arc<dyn ClusterCacheBackend>) {
-    tokio::time::pause();
+pub async fn scenario_cache_011(backend: Arc<dyn ClusterCacheBackend>, time: TimeControl) {
+    time.begin();
     backend
         .put(PutRequest {
             key: "k",
@@ -408,25 +418,26 @@ pub async fn scenario_cache_011(backend: Arc<dyn ClusterCacheBackend>) {
         })
         .await
         .expect("put");
-    tokio::time::advance(Duration::from_hours(1)).await;
-    // Yield so the sweeper (if any) gets a chance to erroneously remove it.
-    tokio::task::yield_now().await;
+    // A large advance under `Virtual`; under `Real` this is capped to a short
+    // real sleep (several sweep intervals) — enough for a sweeper to run and
+    // (incorrectly) remove the entry if it mishandled the indefinite TTL.
+    time.elapse(Duration::from_hours(1)).await;
     let entry = backend.get("k").await.expect("get");
     assert!(
         entry.is_some(),
         "SC-CACHE-011: an indefinite entry must survive a large time advance"
     );
-    tokio::time::resume();
+    time.end();
 }
 
 /// SC-CACHE-014: `PollingPrefixWatch` synthesizes `Changed`/`Deleted` diffs for
 /// a backend that does not natively support prefix watches.
 /// Capability-gated on `!features().prefix_watch`.
-pub async fn scenario_cache_014(backend: Arc<dyn ClusterCacheBackend>) {
+pub async fn scenario_cache_014(backend: Arc<dyn ClusterCacheBackend>, time: TimeControl) {
     if backend.features().prefix_watch {
         return; // native prefix watch; polyfill is not the subject here
     }
-    tokio::time::pause();
+    time.begin();
     let mut watch = PollingPrefixWatch::spawn(backend.clone(), "p/", Duration::from_millis(25));
 
     // A put under the prefix must be diffed as Changed.
@@ -438,8 +449,7 @@ pub async fn scenario_cache_014(backend: Arc<dyn ClusterCacheBackend>) {
         })
         .await
         .expect("put p/a");
-    tokio::time::advance(Duration::from_millis(50)).await;
-    tokio::task::yield_now().await;
+    time.elapse(Duration::from_millis(50)).await;
     assert!(
         wait_for(
             &mut watch,
@@ -451,8 +461,7 @@ pub async fn scenario_cache_014(backend: Arc<dyn ClusterCacheBackend>) {
 
     // A delete must be diffed as Deleted.
     backend.delete("p/a").await.expect("delete p/a");
-    tokio::time::advance(Duration::from_millis(50)).await;
-    tokio::task::yield_now().await;
+    time.elapse(Duration::from_millis(50)).await;
     assert!(
         wait_for(
             &mut watch,
@@ -461,13 +470,13 @@ pub async fn scenario_cache_014(backend: Arc<dyn ClusterCacheBackend>) {
         .await,
         "SC-CACHE-014: delete under prefix must yield a Deleted event"
     );
-    tokio::time::resume();
+    time.end();
 }
 
 /// SC-CACHE-015: watch delivery is at-most-once per mutation — a single `put`
 /// must not cause more than one `Changed` event for the same key on one watch.
-pub async fn scenario_cache_015(backend: Arc<dyn ClusterCacheBackend>) {
-    tokio::time::pause();
+pub async fn scenario_cache_015(backend: Arc<dyn ClusterCacheBackend>, time: TimeControl) {
+    time.begin();
     let mut watch = backend.watch("k").await.expect("watch");
     backend
         .put(PutRequest {
@@ -478,11 +487,19 @@ pub async fn scenario_cache_015(backend: Arc<dyn ClusterCacheBackend>) {
         .await
         .expect("put");
 
+    // Per-`recv` budget: `Virtual` fixtures deliver synchronously into the
+    // channel during `put().await`, so a zero-timeout drain sees every event
+    // already queued. A `Real` backend delivers the `Changed` asynchronously
+    // (e.g. a Postgres NOTIFY round-trip), so wait a real grace window for the
+    // first event — and keep draining that same window afterward, so a
+    // spurious duplicate (the bug this guards against) is still caught.
+    let recv_budget = match time {
+        TimeControl::Virtual => Duration::from_millis(0),
+        TimeControl::Real => Duration::from_millis(500),
+    };
     let mut changed_count = 0u32;
-    // Drain all immediately queued events without advancing time — any duplicate
-    // that would arrive synchronously will be in the channel already.
     for _ in 0..64 {
-        match tokio::time::timeout(Duration::from_millis(0), watch.recv()).await {
+        match tokio::time::timeout(recv_budget, watch.recv()).await {
             Ok(Some(CacheWatchEvent::Event(CacheEvent::Changed { key }))) if key == "k" => {
                 changed_count += 1;
             }
@@ -494,7 +511,7 @@ pub async fn scenario_cache_015(backend: Arc<dyn ClusterCacheBackend>) {
         changed_count, 1,
         "SC-CACHE-015: a single put must deliver exactly one Changed event (got {changed_count})"
     );
-    tokio::time::resume();
+    time.end();
 }
 
 // TODO(SC-CACHE-016/017) [L4]: slow-subscriber `Lagged` and connection-loss
@@ -502,23 +519,38 @@ pub async fn scenario_cache_015(backend: Arc<dyn ClusterCacheBackend>) {
 //   in-process suite.
 
 /// Polls a watch for up to a bounded number of events, returning `true` once one
-/// satisfies `pred`. Bounded so a missing event fails fast rather than hanging.
+/// satisfies `pred`.
+///
+/// Bounded two ways so a notification/polling regression fails the assertion
+/// instead of hanging the whole suite (PGR-D4): the `0..64` cap limits how many
+/// wrong events it will skip, and [`WAIT_BUDGET`](Self) wraps the entire poll in
+/// a timeout so an event that never arrives (each individual `recv().await` is
+/// otherwise unbounded) resolves to `false` rather than blocking forever. Under
+/// [`TimeControl::Virtual`] a paused clock auto-advances to the timeout when no
+/// event is pending, so it still fails fast; the budget is generous enough for a
+/// real backend's NOTIFY / polling round-trip.
 async fn wait_for<P>(watch: &mut cluster_sdk::cache::CacheWatch, pred: P) -> bool
 where
     P: Fn(&CacheEvent) -> bool,
 {
-    for _ in 0..64 {
-        match watch.recv().await {
-            Some(CacheWatchEvent::Event(event)) => {
-                if pred(&event) {
-                    return true;
+    const WAIT_BUDGET: Duration = Duration::from_secs(3);
+    let poll = async {
+        for _ in 0..64 {
+            match watch.recv().await {
+                Some(CacheWatchEvent::Event(event)) => {
+                    if pred(&event) {
+                        return true;
+                    }
                 }
+                Some(CacheWatchEvent::Closed(_)) | None => return false,
+                Some(_) => {}
             }
-            Some(CacheWatchEvent::Closed(_)) | None => return false,
-            Some(_) => {}
         }
-    }
-    false
+        false
+    };
+    tokio::time::timeout(WAIT_BUDGET, poll)
+        .await
+        .unwrap_or(false)
 }
 
 /// A helper plugins may use to assert a backend's self-declared consistency
