@@ -469,16 +469,17 @@ impl FileService {
         );
 
         // @cpt-cf-file-storage-fr-file-events
-        // `touch_meta` unconditionally bumps `meta_version` by exactly 1 on a
-        // successful CAS, so the post-patch revision is deterministically
-        // `file.meta_version + 1` (the snapshot read at the top of this
-        // method) — no re-read is needed to report it accurately.
+        // The `meta_version` payload is left empty here and stamped with the
+        // authoritative committed revision inside `patch_metadata_atomic`'s
+        // transaction: an unconditional patch (`expected_meta_version = None`)
+        // that races another cannot know its post-bump revision from the
+        // pre-transaction snapshot, so the store fills it from the CAS result.
         let event = Some(Self::make_file_event(
             file.tenant_id,
             file.owner_id,
             file_id,
             "file.metadata_updated",
-            serde_json::json!({ "meta_version": file.meta_version + 1 }),
+            serde_json::json!({}),
         ));
 
         // Apply the meta-version CAS and the patch in ONE transaction. The CAS
