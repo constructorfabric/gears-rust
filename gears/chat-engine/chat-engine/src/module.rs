@@ -108,7 +108,7 @@ const STREAM_BUFFER_SWEEP_PERIOD: Duration = Duration::from_mins(5);
 /// `GearCtx` is available.
 #[toolkit::gear(
     name = "chat-engine",
-    deps = ["authz-resolver"],
+    deps = [authz_resolver],
     capabilities = [db, rest, stateful],
     client = chat_engine_sdk::ChatEngineBackendPlugin,
     ctor = ChatEngineModule::new(),
