@@ -68,7 +68,7 @@
 )]
 
 // Re-export key types for public API
-pub use advisory_locks::{DbLockGuard, LockConfig};
+pub use advisory_locks::{DbLockError, DbLockGuard, LockConfig};
 
 // Re-export sea_orm_migration for gears that implement DatabaseCapability
 pub use sea_orm_migration;
@@ -306,6 +306,7 @@ pub(crate) struct DbHandle {
     engine: DbEngine,
     dsn: String,
     sea: DatabaseConnection,
+    locks: advisory_locks::LockManager,
 }
 
 #[cfg(feature = "sqlite")]
@@ -346,11 +347,14 @@ impl DbHandle {
             DbEngine::Postgres => {
                 let o = PgPoolOptions::new().apply(&opts);
                 let pool = o.connect(dsn).await?;
+                let database_scope = advisory_locks::database_scope_from_dsn(dsn);
+                let locks = advisory_locks::LockManager::postgres(pool.clone(), database_scope);
                 let sea = SqlxPostgresConnector::from_sqlx_postgres_pool(pool);
                 Ok(Self {
                     engine,
                     dsn: dsn.to_owned(),
                     sea,
+                    locks,
                 })
             }
             #[cfg(not(feature = "pg"))]
@@ -359,11 +363,14 @@ impl DbHandle {
             DbEngine::MySql => {
                 let o = MySqlPoolOptions::new().apply(&opts);
                 let pool = o.connect(dsn).await?;
+                let database_scope = advisory_locks::database_scope_from_dsn(dsn);
+                let locks = advisory_locks::LockManager::mysql(pool.clone(), database_scope);
                 let sea = SqlxMySqlConnector::from_sqlx_mysql_pool(pool);
                 Ok(Self {
                     engine,
                     dsn: dsn.to_owned(),
                     sea,
+                    locks,
                 })
             }
             #[cfg(not(feature = "mysql"))]
@@ -437,12 +444,15 @@ impl DbHandle {
                 }
 
                 let pool = o.connect_with(conn_opts).await?;
+                let database_scope = advisory_locks::database_scope_from_dsn(&clean_dsn);
+                let locks = advisory_locks::LockManager::file(database_scope);
                 let sea = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
 
                 Ok(Self {
                     engine,
                     dsn: clean_dsn,
                     sea,
+                    locks,
                 })
             }
             #[cfg(not(feature = "sqlite"))]
@@ -504,8 +514,7 @@ impl DbHandle {
     /// # Errors
     /// Returns an error if the lock cannot be acquired.
     pub async fn lock(&self, gear: &str, key: &str) -> Result<DbLockGuard> {
-        let lock_manager = advisory_locks::LockManager::new(self.dsn.clone());
-        let guard = lock_manager.lock(gear, key).await?;
+        let guard = self.locks.lock(gear, key).await?;
         Ok(guard)
     }
 
@@ -519,8 +528,7 @@ impl DbHandle {
         key: &str,
         config: LockConfig,
     ) -> Result<Option<DbLockGuard>> {
-        let lock_manager = advisory_locks::LockManager::new(self.dsn.clone());
-        let res = lock_manager.try_lock(gear, key, config).await?;
+        let res = self.locks.try_lock(gear, key, config).await?;
         Ok(res)
     }
 
@@ -598,7 +606,7 @@ mod tests {
             .await?;
 
         // Deterministic unlock to avoid races with async Drop cleanup
-        guard1.release().await;
+        guard1.release().await?;
         let _guard4 = db.lock("test_gear", &format!("{test_id}_key1")).await?;
         Ok(())
     }

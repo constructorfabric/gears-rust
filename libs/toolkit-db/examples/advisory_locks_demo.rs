@@ -91,8 +91,8 @@ async fn main() -> anyhow::Result<()> {
     println!("Key features demonstrated:");
     println!("• Gear namespacing prevents conflicts between different gears");
     println!("• try_lock provides configurable retry/backoff policies");
-    println!("• File-based locks for SQLite with automatic cleanup");
-    println!("• All locks are automatically released on guard drop");
+    println!("• Native PG/MySQL session locks pin a pool connection until release()");
+    println!("• Prefer guard.release().await for deterministic unlock");
 
     Ok(())
 }
