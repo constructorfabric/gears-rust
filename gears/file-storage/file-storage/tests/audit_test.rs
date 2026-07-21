@@ -277,6 +277,60 @@ async fn update_metadata_enqueues_metadata_updated_event() {
         meta_events[0].published_at.is_none(),
         "event must not be published yet"
     );
+
+    // The event's `meta_version` payload is the authoritative committed
+    // revision stamped inside the transaction — it must equal the file's
+    // actual current revision, not a pre-read guess.
+    let (file, _) = svc
+        .get_file_with_metadata(&ctx, ticket.file_id)
+        .await
+        .unwrap();
+    let ev_mv = meta_events[0]
+        .payload
+        .get("meta_version")
+        .and_then(serde_json::Value::as_i64);
+    assert_eq!(
+        ev_mv,
+        Some(file.meta_version),
+        "event meta_version must equal the committed revision"
+    );
+
+    // A second unconditional patch stamps the next committed revision, proving
+    // the value tracks the real row rather than a fixed snapshot+1.
+    svc.update_metadata(
+        &ctx,
+        ticket.file_id,
+        CustomMetadataPatch {
+            entries: vec![("k2".to_owned(), Some("v2".to_owned()))],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let (file2, _) = svc
+        .get_file_with_metadata(&ctx, ticket.file_id)
+        .await
+        .unwrap();
+    let events2 = store.list_file_events(ticket.file_id).await.unwrap();
+    let latest_mv = events2
+        .iter()
+        .filter(|e| e.event_type == "file.metadata_updated")
+        .filter_map(|e| {
+            e.payload
+                .get("meta_version")
+                .and_then(serde_json::Value::as_i64)
+        })
+        .max();
+    assert_eq!(
+        latest_mv,
+        Some(file2.meta_version),
+        "the second event must carry the new committed revision"
+    );
+    assert_eq!(
+        file2.meta_version,
+        file.meta_version + 1,
+        "two sequential patches bump the revision by exactly one each"
+    );
 }
 
 // ── 5. delete_file leaves a "delete_file" audit row ──────────────────────────

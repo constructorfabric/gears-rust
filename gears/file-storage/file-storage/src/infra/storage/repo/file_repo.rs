@@ -128,6 +128,16 @@ impl FileRepo {
     /// Bump `meta_version` and `last_modified_at` for a metadata-only write,
     /// optionally guarded by an `If-Match-Metadata` prepredicateition on the current
     /// `meta_version`. Returns `false` if the prepredicateition did not match.
+    /// Bump `meta_version` (and `last_modified_at`) under an optional
+    /// optimistic-concurrency guard. When `expected_meta_version` is `Some(v)`
+    /// the bump only lands if the current revision is exactly `v`; when it is
+    /// `None` the bump is unconditional.
+    ///
+    /// Returns the **committed** post-bump `meta_version` (`Some`), or `None`
+    /// if the guard matched no row (`If-Match-Metadata` conflict). The value is
+    /// read back from the row in the same transaction rather than derived as
+    /// `expected + 1`, because for an unconditional bump the pre-state is not
+    /// known to the caller and a concurrent bump can make `snapshot + 1` wrong.
     pub async fn touch_meta<C: DBRunner>(
         &self,
         conn: &C,
@@ -135,7 +145,7 @@ impl FileRepo {
         file_id: Uuid,
         expected_meta_version: Option<i64>,
         now: OffsetDateTime,
-    ) -> Result<bool, DomainError> {
+    ) -> Result<Option<i64>, DomainError> {
         let mut predicate = Condition::all().add(Column::FileId.eq(file_id));
         if let Some(mv) = expected_meta_version {
             predicate = predicate.add(Column::MetaVersion.eq(mv));
@@ -150,7 +160,19 @@ impl FileRepo {
             .exec(conn)
             .await
             .map_err(db_err)?;
-        Ok(res.rows_affected > 0)
+        if res.rows_affected == 0 {
+            return Ok(None);
+        }
+
+        let row = Entity::find()
+            .filter(Column::FileId.eq(file_id))
+            .secure()
+            .scope_with(scope)
+            .one(conn)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| DomainError::database("file row missing after meta_version bump"))?;
+        Ok(Some(row.meta_version))
     }
 
     /// Delete a file (FK cascade removes its versions and custom metadata).
