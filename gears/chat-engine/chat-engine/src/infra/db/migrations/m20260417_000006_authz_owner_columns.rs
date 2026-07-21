@@ -407,70 +407,19 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let db = manager.get_connection();
-        let backend = manager.get_database_backend();
-
-        // Drop child-table owner indexes in reverse order.
-        let index_specs: [(&str, &str); 5] = [
-            ("idx_link_references_owner", "link_references"),
-            ("idx_link_citations_owner", "link_citations"),
-            ("idx_file_citations_owner", "file_citations"),
-            ("idx_parts_owner", "message_parts"),
-            ("idx_messages_owner", "messages"),
-        ];
-
-        for (index_name, table) in index_specs {
-            manager
-                .drop_index(
-                    Index::drop()
-                        .name(index_name)
-                        .table(Alias::new(table))
-                        .if_exists()
-                        .to_owned(),
-                )
-                .await?;
-        }
-
-        // Drop owner columns from child tables.
-        match backend {
-            sea_orm::DatabaseBackend::Postgres => {
-                // Reverse OWNER_CHILD_TABLES order for safe drop.
-                for table in OWNER_CHILD_TABLES.iter().rev() {
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE {table} DROP COLUMN IF EXISTS owner_tenant_id"
-                    ))
-                    .await?;
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE {table} DROP COLUMN IF EXISTS owner_id"
-                    ))
-                    .await?;
-                }
-            }
-            sea_orm::DatabaseBackend::Sqlite => {
-                // SQLite does not support DROP COLUMN in older versions; no-op.
-                // If running SQLite >= 3.35.0, columns can be dropped but this
-                // migration's down() is not expected in production.
-            }
-            sea_orm::DatabaseBackend::MySql => {}
-        }
-
-        // Drop sessions owner index.
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_sessions_owner")
-                    .table(Alias::new("sessions"))
-                    .if_exists()
-                    .to_owned(),
-            )
-            .await?;
-
-        // The text→UUID cast on sessions.tenant_id / sessions.user_id is NOT
-        // reversed here: converting UUID columns back to TEXT is unsafe because
-        // any downstream code written against the UUID type would break. This
-        // migration's down() is provided for development rollback only.
-
-        Ok(())
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        // This migration is irreversible. up() performs an in-place text→UUID
+        // cast on sessions.tenant_id / sessions.user_id that cannot be safely
+        // undone: converting the UUID columns back to TEXT would break any
+        // downstream code written against the UUID type. Dropping the owner
+        // columns and indexes while leaving that cast in place would report a
+        // successful rollback while leaving the schema in an inconsistent,
+        // half-reverted state. Fail loudly instead of doing partial work.
+        Err(DbErr::Custom(
+            "m20260417_000006_authz_owner_columns is irreversible: the \
+             text→UUID cast on sessions.tenant_id / sessions.user_id cannot be \
+             safely reverted"
+                .to_owned(),
+        ))
     }
 }

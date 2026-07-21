@@ -34,14 +34,8 @@ use rg_tr_plugin as _;
 #[cfg(feature = "static-authn")]
 use static_authn_plugin as _;
 
-#[cfg(feature = "authn-plugin")]
-use authn_resolver_plugin as _;
-
 #[cfg(feature = "static-authz")]
 use static_authz_plugin as _;
-
-#[cfg(feature = "authz-plugin")]
-use authz_resolver_plugin as _;
 
 #[cfg(feature = "tr-authz")]
 use tr_authz_plugin as _;
