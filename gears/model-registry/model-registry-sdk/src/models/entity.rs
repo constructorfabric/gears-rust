@@ -19,7 +19,7 @@ use crate::models::{ApprovalStatus, LifecycleStatus, ModelInfoV1, ProviderStatus
 /// what the public [`crate::api::ModelRegistryClientV1`] trait returns — the
 /// provider settings ride as opaque JSON until the consumer narrows via
 /// [`ModelV1::try_into_typed`], which reads `info.gts_type` for dispatch.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct ModelV1<P: gts::GtsSchema = serde_json::Value> {
     pub id: Uuid,
@@ -60,43 +60,12 @@ impl ModelV1<serde_json::Value> {
         Q: gts::GtsSchema,
         for<'de> Q: gts::GtsDeserialize<'de>,
     {
-        let typed_settings =
-            gts::try_narrow::<Q>(self.info.gts_type.as_ref(), self.info.provider_settings)?;
         Ok(ModelV1 {
             id: self.id,
             canonical_id: self.canonical_id,
             lifecycle_status: self.lifecycle_status,
             approval_status: self.approval_status,
-            info: ModelInfoV1 {
-                gts_type: self.info.gts_type,
-                display_name: self.info.display_name,
-                description: self.info.description,
-                family: self.info.family,
-                vendor: self.info.vendor,
-                managed: self.info.managed,
-                architecture: self.info.architecture,
-                size_bytes: self.info.size_bytes,
-                format: self.info.format,
-                region: self.info.region,
-                hosted_by: self.info.hosted_by,
-                last_release_at: self.info.last_release_at,
-                reasoning_level: self.info.reasoning_level,
-                version: self.info.version,
-                sort_order: self.info.sort_order,
-                icon: self.info.icon,
-                multiplier_display: self.info.multiplier_display,
-                performance: self.info.performance,
-                additional_info: self.info.additional_info,
-                supported_api: self.info.supported_api,
-                provider_model_id: self.info.provider_model_id,
-                capabilities: self.info.capabilities,
-                disabled_capabilities: self.info.disabled_capabilities,
-                context_window: self.info.context_window,
-                default_parameters: self.info.default_parameters,
-                allow_parameter_override: self.info.allow_parameter_override,
-                allow_extra_params: self.info.allow_extra_params,
-                provider_settings: typed_settings,
-            },
+            info: self.info.try_into_typed::<Q>()?,
         })
     }
 }
