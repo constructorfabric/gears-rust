@@ -429,20 +429,18 @@ pub trait ReactionRepo: Send + Sync {
         message_id: Uuid,
     ) -> Result<Vec<MessageReaction>, ChatEngineError>;
 
-    /// Phase 4 (PEP). Enumerate reactions on a message under a PDP-derived
-    /// scope (applied via SecureORM). Default impl fails closed so unrelated
-    /// mocks compile.
-    // @cpt-cf-chat-engine-interface-pep
-    async fn list_by_message_scoped(
+    /// Batch variant of [`Self::list_by_message`]: reactions for many messages
+    /// in a single `message_id IN (…)` query. Used to hydrate a conversation
+    /// page without an N+1 per-message fan-out.
+    ///
+    /// `message_reactions` is an unrestricted table (no owner columns): row
+    /// access is governed by parent-message authorization at the service
+    /// layer, so callers MUST pass only `message_ids` the caller has already
+    /// been authorized to read.
+    async fn list_by_messages(
         &self,
-        scope: &AccessScope,
-        message_id: Uuid,
-    ) -> Result<Vec<MessageReaction>, ChatEngineError> {
-        let _ = (scope, message_id);
-        Err(ChatEngineError::internal(
-            "list_by_message_scoped not implemented for this repository",
-        ))
-    }
+        message_ids: &[Uuid],
+    ) -> Result<Vec<MessageReaction>, ChatEngineError>;
 }
 
 // ===========================================================================
