@@ -7,11 +7,12 @@
 // @cpt-cf-chat-engine-interface-pep
 
 use authz_resolver_sdk::pep::ResourceType;
+use toolkit_gts::gts_id;
 use toolkit_security::pep_properties;
 
 /// Session resource — scoped by `owner_tenant_id`, `owner_id`, and `id`.
 pub const SESSION: ResourceType = ResourceType::from_static(
-    "gts.cf.core.chat_engine.session.v1~",
+    gts_id!("cf.core.chat_engine.session.v1~"),
     &[
         pep_properties::OWNER_TENANT_ID,
         pep_properties::OWNER_ID,
@@ -22,13 +23,13 @@ pub const SESSION: ResourceType = ResourceType::from_static(
 /// Message resource — scoped by `owner_tenant_id` and `owner_id`.
 /// Point-op calls supply `resource_id`; list calls omit it.
 pub const MESSAGE: ResourceType = ResourceType::from_static(
-    "gts.cf.core.chat_engine.message.v1~",
+    gts_id!("cf.core.chat_engine.message.v1~"),
     &[pep_properties::OWNER_TENANT_ID, pep_properties::OWNER_ID],
 );
 
 /// Reaction resource — scoped by `owner_tenant_id` and `owner_id`.
 pub const REACTION: ResourceType = ResourceType::from_static(
-    "gts.cf.core.chat_engine.reaction.v1~",
+    gts_id!("cf.core.chat_engine.reaction.v1~"),
     &[pep_properties::OWNER_TENANT_ID, pep_properties::OWNER_ID],
 );
 
@@ -38,6 +39,6 @@ pub const REACTION: ResourceType = ResourceType::from_static(
 /// governs mutation permission (`create`/`update`/`delete`) via allow/deny
 /// decision only. No `supported_properties` are advertised.
 pub const SESSION_TYPE: ResourceType = ResourceType::from_static(
-    "gts.cf.core.chat_engine.session_type.v1~",
+    gts_id!("cf.core.chat_engine.session_type.v1~"),
     &[],
 );
