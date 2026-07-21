@@ -81,12 +81,12 @@ impl Store {
             .db()
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
-                    let bumped = files
+                    let Some(new_meta_version) = files
                         .touch_meta(tx, &patch_scope, file_id, expected_meta_version, now)
-                        .await?;
-                    if !bumped {
+                        .await?
+                    else {
                         return Ok(false);
-                    }
+                    };
                     for (key, value) in &patch.entries {
                         match value {
                             Some(v) => {
@@ -103,7 +103,18 @@ impl Store {
                     }
                     // @cpt-cf-file-storage-nfr-audit-completeness
                     audit_repo.insert(tx, &audit).await?;
-                    if let Some(ev) = event {
+                    if let Some(mut ev) = event {
+                        // Stamp the authoritative post-bump revision the CAS
+                        // actually committed. The domain builds the event
+                        // before the transaction and cannot know the committed
+                        // value for an unconditional patch that raced another,
+                        // so the `meta_version` payload field is filled here.
+                        if let Some(obj) = ev.payload.as_object_mut() {
+                            obj.insert(
+                                "meta_version".to_owned(),
+                                serde_json::Value::from(new_meta_version),
+                            );
+                        }
                         events_repo.enqueue(tx, &ev).await?;
                     }
                     Ok::<bool, DomainError>(true)

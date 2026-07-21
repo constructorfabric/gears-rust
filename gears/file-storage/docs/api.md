@@ -529,7 +529,8 @@ avoid leaving this unswept sibling behind.
   signed URL serves many ranges, and body integrity is enforced by `max_size`/`expected_hash` during the stream plus a
   control-plane re-verification at `finalize`, which re-reads the stored blob and recomputes its size/hash rather than
   trusting the sidecar's report (single-part); a multipart upload instead derives the composite hash from the
-  reported per-part hashes at `finalize`. `bind` performs no integrity check of its own — it only swaps `content_id`
+  reported per-part hashes during `complete` (no full assembled-object read-back — only a bounded MIME-sniff read).
+  `bind` performs no integrity check of its own — it only swaps `content_id`
   to point at an already-finalized (`Available`) version, guarded by the `If-Match` content-ETag precondition above.
 - **"Baked response headers" claim — NOT implemented.** The token carries only the two specific `content_type`/`etag`
   claims (download-only, above); there is no general response-header-set claim and the sidecar does not echo an
