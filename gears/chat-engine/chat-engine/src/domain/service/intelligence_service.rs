@@ -75,12 +75,16 @@ use crate::domain::message::{
     StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent, StreamingEvent,
     StreamingStartEvent,
 };
+use crate::domain::authz::{actions, bypass, resource_types};
 use crate::domain::ports::MessageRepo;
 use crate::domain::ports::SessionRepo;
 use crate::domain::ports::SessionTypeRepo;
 use crate::domain::retention::RetentionPolicy;
+use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer, ResourceType};
+use toolkit_security::{SecurityContext, pep_properties};
+
 use crate::domain::service::plugin_service::PluginService;
-use crate::domain::service::session_service::Identity;
+use crate::domain::service::session_service::identity_from_ctx;
 use crate::domain::session::{Session, get_retention_policy, set_retention_policy};
 
 /// Default per-call plugin deadline for `on_session_summary`. Mirrors the
@@ -185,6 +189,7 @@ pub struct IntelligenceService {
     /// the round-robin from the beginning (the sweep is idempotent, so this
     /// only delays tail coverage). Shared across `Clone`s via the `Arc`.
     retention_cursor: Arc<Mutex<HashMap<String, Uuid>>>,
+    enforcer: PolicyEnforcer,
 }
 
 /// Default per-tick session cap when the service is constructed
@@ -203,6 +208,7 @@ impl IntelligenceService {
         session_types: Arc<dyn SessionTypeRepo>,
         messages: Arc<dyn MessageRepo>,
         plugins: PluginService,
+        enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             sessions,
@@ -214,6 +220,7 @@ impl IntelligenceService {
             retention_max_sessions_per_tick: DEFAULT_RETENTION_MAX_SESSIONS_PER_TICK,
             retention_max_deletes_per_session: DEFAULT_RETENTION_MAX_DELETES_PER_SESSION,
             retention_cursor: Arc::new(Mutex::new(HashMap::new())),
+            enforcer,
         }
     }
 
@@ -257,13 +264,22 @@ impl IntelligenceService {
     /// schema; the fallback resolves to `None` until ADR-0021 adds the
     /// column. The wiring is in place here so downstream phases can switch
     /// the fallback source without touching the service surface.
-    #[instrument(skip(self), fields(session_id = %session_id))]
+    #[instrument(skip(self, ctx), fields(session_id = %session_id))]
     pub async fn get_effective_retention_policy(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
     ) -> Result<RetentionPolicy> {
-        let session = self.load_session(identity, session_id).await?;
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        let session = self
+            .authorize_session_op(
+                ctx,
+                session_id,
+                &resource_types::SESSION,
+                actions::READ,
+                Some(session_id),
+            )
+            .await?;
         Ok(resolve_effective_policy(&session))
     }
 
@@ -273,18 +289,28 @@ impl IntelligenceService {
     ///
     /// Returns the persisted policy (echoed verbatim — the wire shape
     /// matches the request body).
-    #[instrument(skip(self), fields(session_id = %session_id))]
+    #[instrument(skip(self, ctx), fields(session_id = %session_id))]
     pub async fn update_session_retention_policy(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         policy: RetentionPolicy,
     ) -> Result<RetentionPolicy> {
         let validated = validate_retention_policy(policy)?;
+        // Opaque tenant/user strings for the scoped metadata write below.
+        let identity = identity_from_ctx(ctx)?;
 
-        // Load the session via the ownership-scoped repo so cross-tenant
-        // misses fold to 404 (anti-enumeration, ADR-0021).
-        let mut session = self.load_session(identity, session_id).await?;
+        // PDP gate (owner pair as ABAC input); denied → 403.
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        let mut session = self
+            .authorize_session_op(
+                ctx,
+                session_id,
+                &resource_types::SESSION,
+                actions::UPDATE,
+                Some(session_id),
+            )
+            .await?;
         if matches!(
             session.lifecycle_state,
             LifecycleState::SoftDeleted | LifecycleState::HardDeleted
@@ -334,21 +360,32 @@ impl IntelligenceService {
     /// failures stay on the wire as `StreamingErrorEvent` (the HTTP
     /// response has already started by then).
     #[instrument(
-        skip(self, identity, cancel),
+        skip(self, ctx, cancel),
         fields(
             session_id = %session_id,
-            user_id = %identity.user_id,
+            user_id = %ctx.subject_id(),
             request_id,
             summary_message_id,
         ),
     )]
     pub async fn summarize_session(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         cancel: CancellationToken,
     ) -> Result<SummaryStream> {
-        let session = self.load_session(identity, session_id).await?;
+        // Opaque tenant/user strings for the plugin ctx + summary owner stamp.
+        let identity = identity_from_ctx(ctx)?;
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        let session = self
+            .authorize_session_op(
+                ctx,
+                session_id,
+                &resource_types::SESSION,
+                actions::READ,
+                Some(session_id),
+            )
+            .await?;
         // Lifecycle gate: 409 when not active (active is the only state
         // that admits on-demand work per the feature spec).
         if !matches!(session.lifecycle_state, LifecycleState::Active) {
@@ -525,6 +562,10 @@ impl IntelligenceService {
         &self,
         tenant_id: &str,
     ) -> Result<RetentionCleanupReport> {
+        // TODO(phase-7): bypass registry — system_read_scope()
+        // Scheduled background sweep with no HTTP subject / SecurityContext, so
+        // the PolicyEnforcer MUST NOT be called here. The underlying repo reads
+        // run under the repo's internal allow_all() (converted in Phase 7).
         // Per-tick cap pushed into SQL: fetch only the next `cap` active
         // sessions (ordered by `session_id`) after the previous tick's
         // cursor, rather than materialising the tenant's whole active set and
@@ -658,6 +699,9 @@ impl IntelligenceService {
     /// tenants are live.
     #[instrument(skip(self))]
     pub async fn run_retention_cleanup_all_tenants(&self) -> Result<RetentionCleanupReport> {
+        // TODO(phase-7): bypass registry — system_read_scope()
+        // Scheduled cross-tenant sweep with no HTTP subject; PolicyEnforcer is
+        // not invoked here (see run_retention_cleanup_for_tenant).
         let tenants = self.sessions.list_tenants_with_active_sessions().await?;
         let mut aggregated: Vec<SessionCleanupOutcome> = Vec::new();
         for tenant_id in tenants {
@@ -739,13 +783,49 @@ impl IntelligenceService {
     // Internals
     // ---------------------------------------------------------------------
 
-    async fn load_session(&self, identity: &Identity, session_id: Uuid) -> Result<Session> {
-        let row = self
+    /// Trusted prefetch of a session by id, then the PDP decision for
+    /// (`resource`, `action`). Returns the prefetched session (owner pair fed
+    /// to the PDP as ABAC input; also used downstream for lifecycle gating,
+    /// plugin ctx, and the scoped metadata write). A denied / unreachable /
+    /// uncompilable decision fails closed to `Forbidden` via the `?`-converted
+    /// `EnforcerError` (DESIGN §3.5.5).
+    // @cpt-cf-chat-engine-seq-authz-point-op
+    async fn authorize_session_op(
+        &self,
+        ctx: &SecurityContext,
+        session_id: Uuid,
+        resource: &ResourceType,
+        action: &str,
+        resource_id: Option<Uuid>,
+    ) -> Result<Session> {
+        // AUTHZ-BYPASS: system-internal owner-pair prefetch preceding the PDP
+        // decision that authorizes this op; scoped by session_id.
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let prefetch = self
             .sessions
-            .find_by_id(&identity.tenant_id, &identity.user_id, session_id)
+            .find_by_id_scoped(&bypass::system_read_scope(), session_id)
             .await?
             .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
-        Ok(row)
+
+        // @cpt-cf-chat-engine-interface-pep
+        // @cpt-cf-chat-engine-constraint-fail-closed-authz
+        let _scope = self
+            .enforcer
+            .access_scope_with(
+                ctx,
+                resource,
+                action,
+                resource_id,
+                &AccessRequest::new()
+                    .resource_property(
+                        pep_properties::OWNER_TENANT_ID,
+                        prefetch.tenant_id.as_str(),
+                    )
+                    .resource_property(pep_properties::OWNER_ID, prefetch.user_id.as_str())
+                    .require_constraints(false),
+            )
+            .await?;
+        Ok(prefetch)
     }
 
     /// Spawn the streaming driver that pumps the plugin's summary stream

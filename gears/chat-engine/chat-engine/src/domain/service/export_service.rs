@@ -43,6 +43,7 @@ use toolkit_macros::domain_model;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
+use crate::domain::authz::{actions, bypass, resource_types};
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::export::{
     ExportFormat, ExportSessionMeta, ExportStorage, ExportedSession, MessageView, ShareTokenIssue,
@@ -51,7 +52,10 @@ use crate::domain::export::{
 use crate::domain::message::{Message, MessagePart, MessagePartType, MessageRole};
 use crate::domain::ports::MessageRepo;
 use crate::domain::ports::SessionRepo;
-use crate::domain::service::session_service::Identity;
+use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer, ResourceType};
+use toolkit_security::{SecurityContext, pep_properties};
+
+use crate::domain::service::session_service::identity_from_ctx;
 use crate::domain::session::{
     LifecycleState, Session, get_share_expires_at, public_metadata, set_share_expires_at,
 };
@@ -105,6 +109,7 @@ pub struct ExportService {
     messages: Arc<dyn MessageRepo>,
     storage: Arc<dyn ExportStorage>,
     share_urls: ShareUrlBuilder,
+    enforcer: PolicyEnforcer,
 }
 
 impl ExportService {
@@ -113,12 +118,14 @@ impl ExportService {
         sessions: Arc<dyn SessionRepo>,
         messages: Arc<dyn MessageRepo>,
         storage: Arc<dyn ExportStorage>,
+        enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             sessions,
             messages,
             storage,
             share_urls: ShareUrlBuilder::default(),
+            enforcer,
         }
     }
 
@@ -138,16 +145,27 @@ impl ExportService {
     /// envelope for JSON callers; Markdown callers consume `download_url`
     /// to fetch the rendered file (the envelope is still returned so
     /// every export path emits the same response shape).
-    #[instrument(skip(self, identity), fields(session_id = %session_id, format = %format.as_str()))]
+    #[instrument(skip(self, ctx), fields(session_id = %session_id, format = %format.as_str()))]
     pub async fn export(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         format: ExportFormat,
         include_plugin_metadata: bool,
     ) -> Result<ExportedSession> {
         let started = Instant::now();
-        let session = self.load_owned(identity, session_id).await?;
+        // Opaque tenant string for the storage key.
+        let identity = identity_from_ctx(ctx)?;
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        let session = self
+            .authorize_session_op(
+                ctx,
+                session_id,
+                &resource_types::SESSION,
+                actions::READ,
+                Some(session_id),
+            )
+            .await?;
         ensure_shareable(&session)?;
 
         let messages = self.messages.list_active_path(session_id).await?;
@@ -198,14 +216,25 @@ impl ExportService {
     /// into `session.metadata`. Re-issuing a share on a session that
     /// already has a token effectively revokes the old one (column
     /// approach, ADR-0016 §Consequences).
-    #[instrument(skip(self, identity), fields(session_id = %session_id))]
+    #[instrument(skip(self, ctx), fields(session_id = %session_id))]
     pub async fn create_share(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         expires_in_hours: Option<u32>,
     ) -> Result<ShareTokenIssue> {
-        let row = self.load_owned(identity, session_id).await?;
+        // Opaque tenant/user strings for the scoped share-token write.
+        let identity = identity_from_ctx(ctx)?;
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        let row = self
+            .authorize_session_op(
+                ctx,
+                session_id,
+                &resource_types::SESSION,
+                actions::UPDATE,
+                Some(session_id),
+            )
+            .await?;
         ensure_shareable(&row)?;
 
         let token = generate_share_token();
@@ -247,9 +276,20 @@ impl ExportService {
     /// Clear `share_token` and remove `share_expires_at` from metadata.
     /// Idempotent — revoking an already-cleared token returns `Ok(())`
     /// without touching the database (avoids a needless write).
-    #[instrument(skip(self, identity), fields(session_id = %session_id))]
-    pub async fn revoke_share(&self, identity: &Identity, session_id: Uuid) -> Result<()> {
-        let row = self.load_owned(identity, session_id).await?;
+    #[instrument(skip(self, ctx), fields(session_id = %session_id))]
+    pub async fn revoke_share(&self, ctx: &SecurityContext, session_id: Uuid) -> Result<()> {
+        // Opaque tenant/user strings for the scoped share-token write.
+        let identity = identity_from_ctx(ctx)?;
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        let row = self
+            .authorize_session_op(
+                ctx,
+                session_id,
+                &resource_types::SESSION,
+                actions::UPDATE,
+                Some(session_id),
+            )
+            .await?;
         // Idempotent no-op when nothing to revoke.
         if row.share_token.is_none() {
             info!(
@@ -294,6 +334,11 @@ impl ExportService {
         if token.is_empty() {
             return Err(ChatEngineError::not_found("share_token", "<empty>"));
         }
+        // TODO(phase-7): bypass registry — capability_read_scope()
+        // Unauthenticated `.public()` share-token route: there is no subject to
+        // evaluate, so the PolicyEnforcer MUST NOT be called here. The share
+        // token itself is the capability; `find_by_share_token` reads under the
+        // repo's internal allow_all() (converted in Phase 7).
         let row = self
             .sessions
             .find_by_share_token(token)
@@ -344,11 +389,48 @@ impl ExportService {
     // helpers
     // ---------------------------------------------------------------------
 
-    async fn load_owned(&self, identity: &Identity, session_id: Uuid) -> Result<Session> {
-        self.sessions
-            .find_by_id(&identity.tenant_id, &identity.user_id, session_id)
+    /// Trusted prefetch of a session by id, then the PDP decision for
+    /// (`resource`, `action`). Returns the prefetched session (owner pair fed
+    /// to the PDP as ABAC input; also used downstream for share-token writes).
+    /// A denied / unreachable / uncompilable decision fails closed to
+    /// `Forbidden` via the `?`-converted `EnforcerError` (DESIGN §3.5.5).
+    // @cpt-cf-chat-engine-seq-authz-point-op
+    async fn authorize_session_op(
+        &self,
+        ctx: &SecurityContext,
+        session_id: Uuid,
+        resource: &ResourceType,
+        action: &str,
+        resource_id: Option<Uuid>,
+    ) -> Result<Session> {
+        // AUTHZ-BYPASS: system-internal owner-pair prefetch preceding the PDP
+        // decision that authorizes this op; scoped by session_id.
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let prefetch = self
+            .sessions
+            .find_by_id_scoped(&bypass::system_read_scope(), session_id)
             .await?
-            .ok_or_else(|| ChatEngineError::not_found("session", session_id))
+            .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
+
+        // @cpt-cf-chat-engine-interface-pep
+        // @cpt-cf-chat-engine-constraint-fail-closed-authz
+        let _scope = self
+            .enforcer
+            .access_scope_with(
+                ctx,
+                resource,
+                action,
+                resource_id,
+                &AccessRequest::new()
+                    .resource_property(
+                        pep_properties::OWNER_TENANT_ID,
+                        prefetch.tenant_id.as_str(),
+                    )
+                    .resource_property(pep_properties::OWNER_ID, prefetch.user_id.as_str())
+                    .require_constraints(false),
+            )
+            .await?;
+        Ok(prefetch)
     }
 }
 

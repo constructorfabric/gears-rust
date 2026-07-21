@@ -18,11 +18,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sea_orm::{ActiveValue::Set, EntityTrait, QueryOrder};
-use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
+use toolkit_db::secure::{SecureEntityExt, SecureInsertExt};
 use uuid::Uuid;
 
 use chat_engine_sdk::models::SessionType;
 
+use crate::domain::authz::bypass;
 use crate::domain::error::ChatEngineError;
 use crate::domain::ports::{NewSessionType, SessionTypeRepo};
 use crate::infra::db::entity::session_type::{
@@ -46,7 +47,8 @@ fn to_domain(model: session_type_entity::Model) -> SessionType {
 /// Holds the toolkit-db `DBProvider` so every method runs against the same
 /// connection the migration runner used. `session_types` has no tenant
 /// column (entity is marked `#[secure(unrestricted)]`), so the secure
-/// wrappers run with `AccessScope::allow_all()` — they exist here purely to
+/// wrappers run with a named bypass scope (see `crate::domain::authz::bypass`)
+/// — they exist here purely to
 /// give us a `&impl DBRunner` execution path; a follow-up that introduces
 /// per-tenant session types will replace the noop scope with the real one.
 pub struct SeaSessionTypeRepo {
@@ -71,7 +73,9 @@ impl SessionTypeRepo for SeaSessionTypeRepo {
             updated_at: Set(new.updated_at),
         };
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let inserted = SessionTypeEntity::insert(model)
             .secure()
             .scope_unchecked(&scope)?
@@ -85,7 +89,9 @@ impl SessionTypeRepo for SeaSessionTypeRepo {
         session_type_id: Uuid,
     ) -> Result<Option<SessionType>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let row = SessionTypeEntity::find_by_id(session_type_id)
             .secure()
             .scope_with(&scope)
@@ -96,7 +102,9 @@ impl SessionTypeRepo for SeaSessionTypeRepo {
 
     async fn list(&self) -> Result<Vec<SessionType>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let rows = SessionTypeEntity::find()
             .order_by_desc(session_type_entity::Column::CreatedAt)
             .secure()

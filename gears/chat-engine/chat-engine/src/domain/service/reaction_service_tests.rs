@@ -17,6 +17,7 @@ use crate::domain::ports::SessionRepo;
 use crate::domain::ports::SessionTypeRepo;
 use crate::domain::ports::{FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage};
 use crate::domain::ports::{ReactionDeleteOutcome, ReactionRepo, ReactionUpsertOutcome};
+use crate::domain::service::test_support;
 
 // ----------------------------- Stubs ----------------------------------
 
@@ -111,6 +112,17 @@ impl SessionRepo for StubSessionRepo {
         _i: Uuid,
     ) -> std::result::Result<bool, ChatEngineError> {
         Ok(true)
+    }
+
+    // Scoped (Phase 4) prefetch used by authorize_session under a permissive
+    // enforcer: ignore the scope, return the fixed session if the id matches.
+    async fn find_by_id_scoped(
+        &self,
+        _scope: &AccessScope,
+        session_id: Uuid,
+    ) -> std::result::Result<Option<Session>, ChatEngineError> {
+        let s = self.session.lock().clone();
+        Ok((s.session_id == session_id).then_some(s))
     }
 }
 
@@ -284,6 +296,21 @@ impl ReactionRepo for StubReactionRepo {
     ) -> std::result::Result<Vec<MessageReaction>, ChatEngineError> {
         Ok(self.list_returns.lock().clone())
     }
+
+    // Batch (trust-parent) read used by list_for_messages: return the seeded
+    // reactions whose message_id is in the requested set.
+    async fn list_by_messages(
+        &self,
+        message_ids: &[Uuid],
+    ) -> std::result::Result<Vec<MessageReaction>, ChatEngineError> {
+        Ok(self
+            .list_returns
+            .lock()
+            .iter()
+            .filter(|r| message_ids.contains(&r.message_id))
+            .cloned()
+            .collect())
+    }
 }
 
 struct StubPluginConfigRepo;
@@ -343,17 +370,27 @@ fn make_service(
     messages: Arc<dyn MessageRepo>,
     reactions: Arc<dyn ReactionRepo>,
 ) -> ReactionService {
+    make_service_with_enforcer(sessions, messages, reactions, test_support::enforcer_allow())
+}
+
+fn make_service_with_enforcer(
+    sessions: Arc<dyn SessionRepo>,
+    messages: Arc<dyn MessageRepo>,
+    reactions: Arc<dyn ReactionRepo>,
+    enforcer: PolicyEnforcer,
+) -> ReactionService {
     ReactionService::new(
         sessions,
         Arc::new(StubSessionTypeRepo),
         messages,
         reactions,
         plugin_service(),
+        enforcer,
     )
 }
 
-fn identity() -> Identity {
-    Identity::new("t", "u", None).expect("identity")
+fn make_ctx() -> SecurityContext {
+    test_support::ctx_allow_tenants(&[Uuid::new_v4()])
 }
 
 // --------------------------- Unit tests -------------------------------
@@ -375,7 +412,7 @@ async fn set_reaction_returns_409_when_feedback_capability_missing() {
     );
 
     let err = svc
-        .set_reaction(&identity(), session_id, message_id, ReactionType::Like)
+        .set_reaction(&make_ctx(),session_id, message_id, ReactionType::Like)
         .await
         .expect_err("capability gate must reject");
     match err {
@@ -404,7 +441,7 @@ async fn set_reaction_upserts_when_capability_enabled() {
     );
 
     let (resp, mutation) = svc
-        .set_reaction(&identity(), session_id, message_id, ReactionType::Like)
+        .set_reaction(&make_ctx(),session_id, message_id, ReactionType::Like)
         .await
         .expect("ok");
     assert_eq!(resp.message_id, message_id);
@@ -432,7 +469,7 @@ async fn set_reaction_deletes_on_none_with_applied_true() {
     );
 
     let (resp, mutation) = svc
-        .set_reaction(&identity(), session_id, message_id, ReactionType::None)
+        .set_reaction(&make_ctx(),session_id, message_id, ReactionType::None)
         .await
         .expect("ok");
     assert_eq!(resp.reaction_type, ReactionType::None);
@@ -445,9 +482,8 @@ async fn set_reaction_deletes_on_none_with_applied_true() {
 async fn set_reaction_returns_404_on_unknown_session() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
-    // Session repo holds a *different* tenant — find_by_id returns None.
     let session = make_session(
-        "other-tenant",
+        "t",
         "u",
         session_id,
         Some(serde_json::json!([{ "name": "feedback", "value": true }])),
@@ -458,10 +494,12 @@ async fn set_reaction_returns_404_on_unknown_session() {
         Arc::new(StubReactionRepo::default()),
     );
 
+    // authorize_session prefetches via `find_by_id_scoped`; an id the repo
+    // does not hold resolves to None and collapses to a 404.
     let err = svc
-        .set_reaction(&identity(), session_id, message_id, ReactionType::Like)
+        .set_reaction(&make_ctx(), Uuid::new_v4(), message_id, ReactionType::Like)
         .await
-        .expect_err("cross-tenant collapses to 404");
+        .expect_err("missing session must be 404");
     assert!(matches!(
         err,
         ChatEngineError::NotFound {
@@ -488,7 +526,7 @@ async fn set_reaction_returns_400_on_non_assistant_target() {
     );
 
     let err = svc
-        .set_reaction(&identity(), session_id, message_id, ReactionType::Like)
+        .set_reaction(&make_ctx(),session_id, message_id, ReactionType::Like)
         .await
         .expect_err("user-message target must be rejected");
     assert!(matches!(err, ChatEngineError::BadRequest { .. }));
@@ -512,7 +550,7 @@ async fn list_reactions_bypasses_capability_gate() {
     );
 
     let listing = svc
-        .list_reactions(&identity(), session_id, message_id)
+        .list_reactions(&make_ctx(),session_id, message_id)
         .await
         .expect("ok");
     assert_eq!(listing.message_id, message_id);
@@ -520,7 +558,74 @@ async fn list_reactions_bypasses_capability_gate() {
 }
 
 #[tokio::test]
-async fn list_reactions_404_on_missing_message() {
+async fn list_for_messages_groups_reactions_by_message_id() {
+    let session_id = Uuid::new_v4();
+    let m1 = Uuid::new_v4();
+    let m2 = Uuid::new_v4();
+    let m3 = Uuid::new_v4(); // requested but has no reactions
+    let now = OffsetDateTime::now_utc();
+    let seeded = vec![
+        MessageReaction {
+            message_id: m1,
+            user_id: "u".into(),
+            reaction_type: ReactionType::Like,
+            created_at: now,
+            updated_at: now,
+        },
+        MessageReaction {
+            message_id: m1,
+            user_id: "v".into(),
+            reaction_type: ReactionType::Dislike,
+            created_at: now,
+            updated_at: now,
+        },
+        MessageReaction {
+            message_id: m2,
+            user_id: "u".into(),
+            reaction_type: ReactionType::Like,
+            created_at: now,
+            updated_at: now,
+        },
+    ];
+    let repo = Arc::new(StubReactionRepo {
+        list_returns: Mutex::new(seeded),
+        ..Default::default()
+    });
+    let session = make_session("t", "u", session_id, None);
+    let svc = make_service(
+        StubSessionRepo::new(session),
+        StubMessageRepo::assistant(session_id, m1),
+        repo,
+    );
+
+    let map = svc
+        .list_for_messages(&make_ctx(), &[m1, m2, m3])
+        .await
+        .expect("ok");
+
+    assert_eq!(map.get(&m1).map(Vec::len), Some(2));
+    assert_eq!(map.get(&m2).map(Vec::len), Some(1));
+    assert!(
+        !map.contains_key(&m3),
+        "messages with no reactions are absent"
+    );
+}
+
+#[tokio::test]
+async fn list_for_messages_empty_input_short_circuits() {
+    let session = make_session("t", "u", Uuid::new_v4(), None);
+    let svc = make_service(
+        StubSessionRepo::new(session),
+        StubMessageRepo::assistant(Uuid::new_v4(), Uuid::new_v4()),
+        Arc::new(StubReactionRepo::default()),
+    );
+
+    let map = svc.list_for_messages(&make_ctx(), &[]).await.expect("ok");
+    assert!(map.is_empty());
+}
+
+#[tokio::test]
+async fn list_reactions_unknown_message_returns_empty() {
     let session_id = Uuid::new_v4();
     let session = make_session(
         "t",
@@ -528,25 +633,22 @@ async fn list_reactions_404_on_missing_message() {
         session_id,
         Some(serde_json::json!([{ "name": "feedback", "value": true }])),
     );
-    // Stub returns the session but `find_message_in_session` rejects
-    // any UUID it didn't ingest at construction time.
     let svc = make_service(
         StubSessionRepo::new(session),
         StubMessageRepo::assistant(session_id, Uuid::new_v4()),
         Arc::new(StubReactionRepo::default()),
     );
 
-    let err = svc
-        .list_reactions(&identity(), session_id, Uuid::new_v4())
+    // The scoped read path no longer probes message existence: it lists the
+    // caller's owned reactions and returns an empty set (anti-enumeration)
+    // rather than leaking a 404 for an unknown/foreign message id.
+    let unknown_message = Uuid::new_v4();
+    let listing = svc
+        .list_reactions(&make_ctx(), session_id, unknown_message)
         .await
-        .expect_err("unknown message must be 404");
-    assert!(matches!(
-        err,
-        ChatEngineError::NotFound {
-            resource: "message",
-            ..
-        }
-    ));
+        .expect("unknown message lists empty, not 404");
+    assert_eq!(listing.message_id, unknown_message);
+    assert!(listing.reactions.is_empty());
 }
 
 #[test]
@@ -589,4 +691,78 @@ fn ensure_feedback_capability_rejects_when_array_missing() {
     };
     let err = ensure_feedback_capability(&session).unwrap_err();
     assert!(matches!(err, ChatEngineError::Conflict { .. }));
+}
+
+// --------------------------- Authz (PEP) tests ------------------------
+//
+// The reaction mutation path gates on the parent SESSION (UPDATE). All enforcer
+// failure modes — an explicit PDP deny, an evaluation error, or a policy compile
+// error — fail closed to `Forbidden` (HTTP 403) via `From<EnforcerError>`.
+// The read path is trust-parent (unrestricted table, no PDP call).
+// @cpt-cf-chat-engine-interface-pep
+
+fn authz_fixture(
+    enforcer: PolicyEnforcer,
+) -> (ReactionService, Uuid, Uuid) {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let session = make_session(
+        "t",
+        "u",
+        session_id,
+        Some(serde_json::json!([{ "name": "feedback", "value": true }])),
+    );
+    let svc = make_service_with_enforcer(
+        StubSessionRepo::new(session),
+        StubMessageRepo::assistant(session_id, message_id),
+        Arc::new(StubReactionRepo::default()),
+        enforcer,
+    );
+    (svc, session_id, message_id)
+}
+
+#[tokio::test]
+async fn set_reaction_pdp_denied_returns_forbidden() {
+    let (svc, session_id, message_id) = authz_fixture(test_support::enforcer_deny());
+    let res = svc
+        .set_reaction(&make_ctx(), session_id, message_id, ReactionType::Like)
+        .await;
+    assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
+}
+
+#[tokio::test]
+async fn delete_reaction_pdp_denied_returns_forbidden() {
+    // ReactionType::None routes through the delete branch — still gated on
+    // the parent SESSION UPDATE, so a PDP deny fails closed to 403.
+    let (svc, session_id, message_id) = authz_fixture(test_support::enforcer_deny());
+    let res = svc
+        .set_reaction(&make_ctx(), session_id, message_id, ReactionType::None)
+        .await;
+    assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
+}
+
+// NOTE: `list_reactions` used to gate on REACTION (LIST) via the PDP. Reactions
+// are now an unrestricted, trust-parent table (no owner columns): the read path
+// no longer calls the enforcer — callers authorize the parent message in the
+// same request (set_reaction authorizes before echoing; the batch reader is fed
+// ids from an already-scoped message read). The former
+// `list_reactions_{pdp_denied,evaluation_failed,compile_failed}_returns_forbidden`
+// tests were removed with that gate; the mutation-path PDP tests above stay.
+
+#[tokio::test]
+async fn list_reactions_real_db_read_returns_empty() {
+    // Exercise the real read path (`list_by_message` over in-memory SQLite):
+    // a message with no reactions gets an empty, non-error listing — the
+    // unrestricted query (post owner-column drop) executes end to end.
+    let db = test_support::inmem_db().await;
+    let svc = test_support::build_reaction_service(&db, test_support::enforcer_allow());
+    let ctx = test_support::ctx_allow_tenants(&[Uuid::new_v4()]);
+
+    let message_id = Uuid::new_v4();
+    let listing = svc
+        .list_reactions(&ctx, Uuid::new_v4(), message_id)
+        .await
+        .expect("empty scoped read succeeds");
+    assert_eq!(listing.message_id, message_id);
+    assert!(listing.reactions.is_empty());
 }

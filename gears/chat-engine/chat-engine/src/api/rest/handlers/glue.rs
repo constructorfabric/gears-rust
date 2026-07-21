@@ -28,12 +28,11 @@ use crate::api::rest::dto::{
     RecreateMessageRequestDto, SearchRequestDto, SearchResultsDto, SendMessageRequestDto,
     VariantInfoDto, VariantListDto, parts_into_sdk,
 };
-use crate::api::rest::handlers::sessions::identity_from_ctx;
 use crate::api::rest::sse_delta_stream_response;
 use crate::api::rest::stream_reader::sse_buffer_reader_response;
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::ports::StreamEventBuffer;
-use crate::domain::reaction::ReactionType;
+use crate::domain::reaction::{MessageReaction, ReactionType};
 use crate::domain::search::SearchQuery;
 use crate::domain::service::message_service::SendMessageRequest;
 use crate::domain::service::{
@@ -54,6 +53,18 @@ fn capabilities_into_sdk(
     caps.map(|c| c.into_iter().map(CapabilityValue::from).collect())
 }
 
+/// Project a domain reaction onto the wire DTO. Mirrors the mapping used by
+/// `set_reaction` so the message-embedded and mutation-echo shapes stay in
+/// sync.
+fn reaction_to_dto(r: MessageReaction) -> ReactionDto {
+    ReactionDto {
+        kind: r.reaction_type.as_str().to_string(),
+        value: None,
+        user_id: r.user_id,
+        created_at: r.created_at,
+    }
+}
+
 /// `POST /chat-engine/v1/sessions/{id}/messages` — send a user message and
 /// stream the assistant response as NDJSON.
 #[tracing::instrument(skip(svc, ctx, body), fields(session_id = %session_id))]
@@ -63,7 +74,6 @@ pub async fn send_message_in_session(
     Path(session_id): Path<Uuid>,
     Json(body): Json<SendMessageRequestDto>,
 ) -> Result<Response> {
-    let identity = identity_from_ctx(&ctx)?;
     let req = SendMessageRequest {
         session_id,
         parts: parts_into_sdk(body.parts),
@@ -72,37 +82,59 @@ pub async fn send_message_in_session(
         capabilities: capabilities_into_sdk(body.capabilities),
     };
     let cancel = CancellationToken::new();
-    let stream = svc.send_message(req, identity, cancel).await?;
+    let stream = svc.send_message(req, &ctx, cancel).await?;
     Ok(sse_delta_stream_response(stream))
 }
 
 /// `GET /chat-engine/v1/sessions/{id}/messages` — list the active path.
-#[tracing::instrument(skip(svc, ctx, query), fields(session_id = %session_id))]
+#[tracing::instrument(skip(svc, ctx, reactions, query), fields(session_id = %session_id))]
 pub async fn list_messages(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<MessageService>>,
+    Extension(reactions): Extension<Arc<ReactionService>>,
     Path(session_id): Path<Uuid>,
     Query(query): Query<ListMessagesQuery>,
 ) -> Result<Json<MessageListDto>> {
-    let identity = identity_from_ctx(&ctx)?;
     let messages = svc
-        .list_active_messages(&identity, session_id, query.parent_message_id)
+        .list_active_messages(&ctx, session_id, query.parent_message_id)
         .await?;
+    // Batch-hydrate reactions for the whole page in one query (avoids N+1).
+    let ids: Vec<Uuid> = messages.iter().map(|m| m.message_id).collect();
+    let mut by_message = reactions.list_for_messages(&ctx, &ids).await?;
     Ok(Json(MessageListDto {
-        items: messages.into_iter().map(MessageDto::from).collect(),
+        items: messages
+            .into_iter()
+            .map(|m| {
+                let rx = by_message
+                    .remove(&m.message_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(reaction_to_dto)
+                    .collect();
+                MessageDto::from(m).with_reactions(rx)
+            })
+            .collect(),
     }))
 }
 
 /// `GET /chat-engine/v1/messages/{id}` — fetch a single owned message.
-#[tracing::instrument(skip(svc, ctx), fields(message_id = %message_id))]
+#[tracing::instrument(skip(svc, ctx, reactions), fields(message_id = %message_id))]
 pub async fn get_message(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<MessageService>>,
+    Extension(reactions): Extension<Arc<ReactionService>>,
     Path(message_id): Path<Uuid>,
 ) -> Result<Json<MessageDto>> {
-    let identity = identity_from_ctx(&ctx)?;
-    let message = svc.resolve_owned_message(&identity, message_id).await?;
-    Ok(Json(MessageDto::from(message)))
+    let message = svc.resolve_owned_message(&ctx, message_id).await?;
+    let rx = reactions
+        .list_for_messages(&ctx, &[message.message_id])
+        .await?
+        .remove(&message.message_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(reaction_to_dto)
+        .collect();
+    Ok(Json(MessageDto::from(message).with_reactions(rx)))
 }
 
 /// `GET /chat-engine/v1/messages/{id}/stream` — (re)attach to an assistant
@@ -126,8 +158,7 @@ pub async fn resume_message_stream(
     Path(message_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Response> {
-    let identity = identity_from_ctx(&ctx)?;
-    svc.resolve_owned_message(&identity, message_id).await?;
+    svc.resolve_owned_message(&ctx, message_id).await?;
 
     let from_seq = parse_last_event_id(&headers);
     // Reader-only token: cancelling it stops polling on disconnect; the driver
@@ -158,15 +189,14 @@ pub async fn recreate_message(
     Path(message_id): Path<Uuid>,
     Json(body): Json<RecreateMessageRequestDto>,
 ) -> Result<Response> {
-    let identity = identity_from_ctx(&ctx)?;
     let session_id = messages
-        .resolve_owned_message(&identity, message_id)
+        .resolve_owned_message(&ctx, message_id)
         .await?
         .session_id;
     let cancel = CancellationToken::new();
     let stream = variants
         .recreate_variant(
-            &identity,
+            &ctx,
             session_id,
             message_id,
             capabilities_into_sdk(body.enabled_capabilities),
@@ -184,13 +214,12 @@ pub async fn list_variants(
     Extension(variants): Extension<Arc<VariantService>>,
     Path(message_id): Path<Uuid>,
 ) -> Result<Json<VariantListDto>> {
-    let identity = identity_from_ctx(&ctx)?;
     let session_id = messages
-        .resolve_owned_message(&identity, message_id)
+        .resolve_owned_message(&ctx, message_id)
         .await?
         .session_id;
     let listing = variants
-        .list_variants(&identity, session_id, message_id)
+        .list_variants(&ctx, session_id, message_id)
         .await?;
     Ok(Json(VariantListDto {
         current_index: listing.current_index,
@@ -211,24 +240,23 @@ pub async fn set_reaction(
     Path(message_id): Path<Uuid>,
     Json(body): Json<ReactionRequestDto>,
 ) -> Result<Json<ReactionListDto>> {
-    let identity = identity_from_ctx(&ctx)?;
     let reaction_type = ReactionType::from_str_value(&body.kind).ok_or_else(|| {
         ChatEngineError::bad_request(format!("unknown reaction kind: {}", body.kind))
     })?;
     let session_id = messages
-        .resolve_owned_message(&identity, message_id)
+        .resolve_owned_message(&ctx, message_id)
         .await?
         .session_id;
 
     let (_response, mutation) = reactions
-        .set_reaction(&identity, session_id, message_id, reaction_type)
+        .set_reaction(&ctx, session_id, message_id, reaction_type)
         .await?;
     // Notify the backend plugin out-of-band; the detached task logs failures
     // and never blocks the HTTP response (see `spawn_plugin_notification`).
     drop(reactions.spawn_plugin_notification(mutation));
 
     let listing = reactions
-        .list_reactions(&identity, session_id, message_id)
+        .list_reactions(&ctx, session_id, message_id)
         .await?;
     Ok(Json(ReactionListDto {
         reactions: listing
@@ -252,9 +280,8 @@ pub async fn summarize_session(
     Extension(svc): Extension<Arc<IntelligenceService>>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Response> {
-    let identity = identity_from_ctx(&ctx)?;
     let cancel = CancellationToken::new();
-    let stream = svc.summarize_session(&identity, session_id, cancel).await?;
+    let stream = svc.summarize_session(&ctx, session_id, cancel).await?;
     Ok(sse_delta_stream_response(stream))
 }
 
@@ -267,14 +294,13 @@ pub async fn search_in_session(
     Path(session_id): Path<Uuid>,
     Json(body): Json<SearchRequestDto>,
 ) -> Result<Json<SearchResultsDto>> {
-    let identity = identity_from_ctx(&ctx)?;
     let query = SearchQuery {
         q: Some(body.query),
         top: body.limit,
         skip: body.offset,
         ..Default::default()
     };
-    let page = svc.search_in_session(&identity, session_id, &query).await?;
+    let page = svc.search_in_session(&ctx, session_id, &query).await?;
     let results: Vec<serde_json::Value> = page
         .items
         .into_iter()
@@ -290,14 +316,13 @@ pub async fn search_across_sessions(
     Extension(svc): Extension<Arc<SearchService>>,
     Json(body): Json<SearchRequestDto>,
 ) -> Result<Json<SearchResultsDto>> {
-    let identity = identity_from_ctx(&ctx)?;
     let query = SearchQuery {
         q: Some(body.query),
         top: body.limit,
         skip: body.offset,
         ..Default::default()
     };
-    let page = svc.search_across_sessions(&identity, &query).await?;
+    let page = svc.search_across_sessions(&ctx, &query).await?;
     let results: Vec<serde_json::Value> = page
         .items
         .into_iter()

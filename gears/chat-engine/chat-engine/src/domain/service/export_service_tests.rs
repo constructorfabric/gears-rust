@@ -6,8 +6,9 @@ use crate::domain::message::MessageRole;
 use crate::domain::ports::NewSession;
 use crate::domain::ports::SessionRepo;
 use crate::domain::ports::{FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage};
-use crate::domain::service::session_service::Identity;
+use crate::domain::service::test_support;
 use crate::domain::session::LifecycleState;
+use toolkit_security::AccessScope;
 use crate::domain::session::METADATA_KEY_SHARE_EXPIRES_AT;
 use crate::domain::session::Session;
 use async_trait::async_trait;
@@ -120,6 +121,21 @@ impl SessionRepo for MockSessionRepo {
             .cloned())
     }
 
+    // Scoped (Phase 4) prefetch used by authorize_session_op under a
+    // permissive enforcer: ignore the scope, match on session_id.
+    async fn find_by_id_scoped(
+        &self,
+        _scope: &AccessScope,
+        session_id: Uuid,
+    ) -> Result<Option<Session>> {
+        Ok(self
+            .rows
+            .lock()
+            .iter()
+            .find(|m| m.session_id == session_id)
+            .cloned())
+    }
+
     async fn update_share_token(
         &self,
         tenant_id: &str,
@@ -222,7 +238,23 @@ fn sample_message(role: MessageRole, text: &str) -> Message {
     }
 }
 
-fn build_service() -> (ExportService, Arc<MockSessionRepo>, Arc<MockMessageRepo>) {
+// Fixed owner ids so the mock PDP's owner constraints (subject tenant / id)
+// line up with the seeded session rows and the scoped share-token writes,
+// which key on the ctx-derived tenant/user strings (now UUIDs).
+const TENANT: Uuid = Uuid::from_u128(0xA1);
+const USER: Uuid = Uuid::from_u128(0xA2);
+
+fn ctx() -> SecurityContext {
+    test_support::ctx_for_subject(USER, TENANT)
+}
+
+fn owned_session(session_id: Uuid) -> Session {
+    sample_session(&TENANT.to_string(), &USER.to_string(), session_id)
+}
+
+fn build_service_with_enforcer(
+    enforcer: PolicyEnforcer,
+) -> (ExportService, Arc<MockSessionRepo>, Arc<MockMessageRepo>) {
     let sessions = Arc::new(MockSessionRepo::default());
     let messages = Arc::new(MockMessageRepo::default());
     let storage = Arc::new(crate::domain::export::StubExportStorage);
@@ -230,6 +262,7 @@ fn build_service() -> (ExportService, Arc<MockSessionRepo>, Arc<MockMessageRepo>
         sessions.clone() as Arc<dyn SessionRepo>,
         messages.clone() as Arc<dyn MessageRepo>,
         storage as Arc<dyn ExportStorage>,
+        enforcer,
     )
     .with_share_urls(ShareUrlBuilder {
         base_url: "https://example.test".into(),
@@ -237,22 +270,22 @@ fn build_service() -> (ExportService, Arc<MockSessionRepo>, Arc<MockMessageRepo>
     (service, sessions, messages)
 }
 
-fn identity() -> Identity {
-    Identity::new("tenant-a", "user-a", None).unwrap()
+fn build_service() -> (ExportService, Arc<MockSessionRepo>, Arc<MockMessageRepo>) {
+    build_service_with_enforcer(test_support::enforcer_allow())
 }
 
 #[tokio::test]
 async fn export_json_returns_envelope_with_active_path() {
     let (svc, sessions, messages) = build_service();
     let session_id = Uuid::new_v4();
-    sessions.seed(sample_session("tenant-a", "user-a", session_id));
+    sessions.seed(owned_session(session_id));
     messages.messages.lock().extend(vec![
         sample_message(MessageRole::User, "hi"),
         sample_message(MessageRole::Assistant, "hello"),
     ]);
 
     let exported = svc
-        .export(&identity(), session_id, ExportFormat::Json, false)
+        .export(&ctx(), session_id, ExportFormat::Json, false)
         .await
         .expect("export ok");
     assert_eq!(exported.format, ExportFormat::Json);
@@ -272,14 +305,14 @@ async fn export_json_returns_envelope_with_active_path() {
 async fn export_markdown_renders_role_headers() {
     let (svc, sessions, messages) = build_service();
     let session_id = Uuid::new_v4();
-    sessions.seed(sample_session("tenant-a", "user-a", session_id));
+    sessions.seed(owned_session(session_id));
     messages.messages.lock().extend(vec![
         sample_message(MessageRole::User, "hi"),
         sample_message(MessageRole::Assistant, "hello"),
     ]);
 
     let exported = svc
-        .export(&identity(), session_id, ExportFormat::Markdown, false)
+        .export(&ctx(), session_id, ExportFormat::Markdown, false)
         .await
         .expect("export ok");
     assert_eq!(exported.format, ExportFormat::Markdown);
@@ -290,10 +323,10 @@ async fn export_markdown_renders_role_headers() {
 async fn export_empty_session_still_succeeds() {
     let (svc, sessions, _messages) = build_service();
     let session_id = Uuid::new_v4();
-    sessions.seed(sample_session("tenant-a", "user-a", session_id));
+    sessions.seed(owned_session(session_id));
 
     let exported = svc
-        .export(&identity(), session_id, ExportFormat::Json, true)
+        .export(&ctx(), session_id, ExportFormat::Json, true)
         .await
         .expect("empty export ok");
     assert_eq!(exported.message_count, 0);
@@ -303,12 +336,12 @@ async fn export_empty_session_still_succeeds() {
 async fn export_rejects_soft_deleted_session() {
     let (svc, sessions, _messages) = build_service();
     let session_id = Uuid::new_v4();
-    let mut row = sample_session("tenant-a", "user-a", session_id);
+    let mut row = owned_session(session_id);
     row.lifecycle_state = LifecycleState::SoftDeleted;
     sessions.seed(row);
 
     let err = svc
-        .export(&identity(), session_id, ExportFormat::Json, false)
+        .export(&ctx(), session_id, ExportFormat::Json, false)
         .await
         .unwrap_err();
     assert!(matches!(err, ChatEngineError::Conflict { .. }));
@@ -318,7 +351,7 @@ async fn export_rejects_soft_deleted_session() {
 async fn export_not_found_when_session_missing() {
     let (svc, _sessions, _messages) = build_service();
     let err = svc
-        .export(&identity(), Uuid::new_v4(), ExportFormat::Json, false)
+        .export(&ctx(), Uuid::new_v4(), ExportFormat::Json, false)
         .await
         .unwrap_err();
     assert!(matches!(err, ChatEngineError::NotFound { .. }));
@@ -328,10 +361,10 @@ async fn export_not_found_when_session_missing() {
 async fn create_share_persists_token_and_returns_url() {
     let (svc, sessions, _messages) = build_service();
     let session_id = Uuid::new_v4();
-    sessions.seed(sample_session("tenant-a", "user-a", session_id));
+    sessions.seed(owned_session(session_id));
 
     let issue = svc
-        .create_share(&identity(), session_id, Some(24))
+        .create_share(&ctx(), session_id, Some(24))
         .await
         .expect("share created");
     assert!(!issue.share_token.is_empty());
@@ -341,7 +374,7 @@ async fn create_share_persists_token_and_returns_url() {
 
     // Persistence side effect.
     let stored = sessions
-        .find_by_id("tenant-a", "user-a", session_id)
+        .find_by_id(&TENANT.to_string(), &USER.to_string(), session_id)
         .await
         .unwrap()
         .unwrap();
@@ -361,12 +394,12 @@ async fn create_share_persists_token_and_returns_url() {
 async fn create_share_rejects_soft_deleted_session() {
     let (svc, sessions, _messages) = build_service();
     let session_id = Uuid::new_v4();
-    let mut row = sample_session("tenant-a", "user-a", session_id);
+    let mut row = owned_session(session_id);
     row.lifecycle_state = LifecycleState::SoftDeleted;
     sessions.seed(row);
 
     let err = svc
-        .create_share(&identity(), session_id, None)
+        .create_share(&ctx(), session_id, None)
         .await
         .unwrap_err();
     assert!(matches!(err, ChatEngineError::Conflict { .. }));
@@ -376,14 +409,14 @@ async fn create_share_rejects_soft_deleted_session() {
 async fn access_shared_returns_view_without_user_or_tenant() {
     let (svc, sessions, messages) = build_service();
     let session_id = Uuid::new_v4();
-    sessions.seed(sample_session("tenant-a", "user-a", session_id));
+    sessions.seed(owned_session(session_id));
     messages
         .messages
         .lock()
         .push(sample_message(MessageRole::Assistant, "hi there"));
 
     let issue = svc
-        .create_share(&identity(), session_id, None)
+        .create_share(&ctx(), session_id, None)
         .await
         .unwrap();
 
@@ -408,7 +441,7 @@ async fn access_shared_returns_404_for_unknown_token() {
 async fn access_shared_returns_expired_for_past_expiry() {
     let (svc, sessions, _messages) = build_service();
     let session_id = Uuid::new_v4();
-    let mut row = sample_session("tenant-a", "user-a", session_id);
+    let mut row = owned_session(session_id);
     row.share_token = Some("abcd-token".into());
     // Build expired metadata manually.
     let past = (OffsetDateTime::now_utc() - time::Duration::hours(1))
@@ -428,7 +461,7 @@ async fn access_shared_returns_expired_for_past_expiry() {
 async fn access_shared_returns_expired_for_soft_deleted_session() {
     let (svc, sessions, _messages) = build_service();
     let session_id = Uuid::new_v4();
-    let mut row = sample_session("tenant-a", "user-a", session_id);
+    let mut row = owned_session(session_id);
     row.share_token = Some("soft-tok".into());
     row.lifecycle_state = LifecycleState::SoftDeleted;
     sessions.seed(row);
@@ -441,18 +474,18 @@ async fn access_shared_returns_expired_for_soft_deleted_session() {
 async fn revoke_share_clears_token_and_expires() {
     let (svc, sessions, _messages) = build_service();
     let session_id = Uuid::new_v4();
-    sessions.seed(sample_session("tenant-a", "user-a", session_id));
+    sessions.seed(owned_session(session_id));
 
     let issue = svc
-        .create_share(&identity(), session_id, Some(1))
+        .create_share(&ctx(), session_id, Some(1))
         .await
         .unwrap();
     assert!(!issue.share_token.is_empty());
 
-    svc.revoke_share(&identity(), session_id).await.unwrap();
+    svc.revoke_share(&ctx(), session_id).await.unwrap();
 
     let stored = sessions
-        .find_by_id("tenant-a", "user-a", session_id)
+        .find_by_id(&TENANT.to_string(), &USER.to_string(), session_id)
         .await
         .unwrap()
         .unwrap();
@@ -468,11 +501,64 @@ async fn revoke_share_clears_token_and_expires() {
 async fn revoke_share_is_idempotent_when_already_cleared() {
     let (svc, sessions, _messages) = build_service();
     let session_id = Uuid::new_v4();
-    sessions.seed(sample_session("tenant-a", "user-a", session_id));
+    sessions.seed(owned_session(session_id));
 
-    svc.revoke_share(&identity(), session_id)
+    svc.revoke_share(&ctx(), session_id)
         .await
         .expect("idempotent no-op");
+}
+
+// --------------------------- Authz (PEP) tests ------------------------
+//
+// export / create_share / revoke_share are SESSION point-ops (READ / UPDATE)
+// gated by authorize_session_op. An explicit PDP deny or an evaluation error
+// fails closed to `Forbidden` (403) via `From<EnforcerError>`. The point-op
+// uses `require_constraints(false)`, so a compile error is NOT a failure mode
+// here (mirrors the session-service point-op semantics).
+// @cpt-cf-chat-engine-interface-pep
+
+#[tokio::test]
+async fn export_pdp_denied_returns_forbidden() {
+    let (svc, sessions, _messages) = build_service_with_enforcer(test_support::enforcer_deny());
+    let session_id = Uuid::new_v4();
+    sessions.seed(owned_session(session_id));
+
+    let res = svc
+        .export(&ctx(), session_id, ExportFormat::Json, false)
+        .await;
+    assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
+}
+
+#[tokio::test]
+async fn export_evaluation_failed_returns_forbidden() {
+    let (svc, sessions, _messages) = build_service_with_enforcer(test_support::enforcer_failing());
+    let session_id = Uuid::new_v4();
+    sessions.seed(owned_session(session_id));
+
+    let res = svc
+        .export(&ctx(), session_id, ExportFormat::Json, false)
+        .await;
+    assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
+}
+
+#[tokio::test]
+async fn create_share_pdp_denied_returns_forbidden() {
+    let (svc, sessions, _messages) = build_service_with_enforcer(test_support::enforcer_deny());
+    let session_id = Uuid::new_v4();
+    sessions.seed(owned_session(session_id));
+
+    let res = svc.create_share(&ctx(), session_id, Some(1)).await;
+    assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
+}
+
+#[tokio::test]
+async fn revoke_share_pdp_denied_returns_forbidden() {
+    let (svc, sessions, _messages) = build_service_with_enforcer(test_support::enforcer_deny());
+    let session_id = Uuid::new_v4();
+    sessions.seed(owned_session(session_id));
+
+    let res = svc.revoke_share(&ctx(), session_id).await;
+    assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
 }
 
 #[test]

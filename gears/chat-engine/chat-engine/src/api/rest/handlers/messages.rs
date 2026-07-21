@@ -32,7 +32,7 @@ use uuid::Uuid;
 use chat_engine_sdk::models::{CapabilityValue, MessagePartInput};
 use toolkit_security::SecurityContext;
 
-use crate::api::rest::handlers::sessions::{identity_from_ctx, reject_body_identity};
+use crate::api::rest::handlers::sessions::reject_body_identity;
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::service::message_service::{DeleteOutcome, MessageService, SendMessageRequest};
 
@@ -85,7 +85,6 @@ pub async fn send_message(
     Json(body): Json<SendMessageBody>,
 ) -> Result<Response> {
     reject_body_identity(&body.tenant_id, &body.user_id)?;
-    let identity = identity_from_ctx(&ctx)?;
 
     tracing::Span::current().record("session_id", tracing::field::display(body.session_id));
 
@@ -103,7 +102,7 @@ pub async fn send_message(
         capabilities: body.capabilities,
     };
 
-    let event_stream = svc.send_message(req, identity, cancel).await?;
+    let event_stream = svc.send_message(req, &ctx, cancel).await?;
 
     // Project the plugin event stream into the client-facing SSE delta
     // protocol (FR-024). Per true live-tail, a client disconnect no longer
@@ -171,16 +170,15 @@ pub async fn delete_message(
     Extension(svc): Extension<Arc<MessageService>>,
     Path(message_id): Path<Uuid>,
 ) -> Result<Json<DeleteMessageResponse>> {
-    let identity = identity_from_ctx(&ctx)?;
     // The spec keys this route on `message_id` only; resolve the owning
-    // session (ownership-checked, cross-tenant → 404) before the cascade.
+    // session (PDP-authorized, out-of-scope → 404) before the cascade.
     let session_id = svc
-        .resolve_owned_message(&identity, message_id)
+        .resolve_owned_message(&ctx, message_id)
         .await?
         .session_id;
     tracing::Span::current().record("session_id", tracing::field::display(session_id));
     let outcome = svc
-        .delete_message_cascade(&identity, session_id, message_id)
+        .delete_message_cascade(&ctx, session_id, message_id)
         .await?;
     Ok(Json(DeleteMessageResponse::from_outcome(outcome)?))
 }

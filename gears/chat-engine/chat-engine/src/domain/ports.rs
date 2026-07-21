@@ -14,6 +14,7 @@ use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use chat_engine_sdk::models::{
@@ -294,6 +295,64 @@ pub trait MessageRepo: Send + Sync {
             "delete_message_subtree not implemented for this repository",
         ))
     }
+
+    // ---------------------------------------------------------------------
+    // Phase 4 (PEP) — PDP-scoped surface. Owner filtering is carried by the
+    // PDP-derived `AccessScope` (applied via SecureORM); `MessageService`
+    // calls these. Default impls fail closed so unrelated mocks compile.
+    // @cpt-cf-chat-engine-interface-pep
+    // ---------------------------------------------------------------------
+
+    /// Active visible history for a session under a PDP-derived scope.
+    async fn fetch_active_history_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        depth: Option<u32>,
+    ) -> Result<Vec<Message>, ChatEngineError> {
+        let _ = (scope, session_id, depth);
+        Err(ChatEngineError::internal(
+            "fetch_active_history_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Look up a single message by id under a PDP-derived scope.
+    async fn find_message_by_id_scoped(
+        &self,
+        scope: &AccessScope,
+        message_id: Uuid,
+    ) -> Result<Option<Message>, ChatEngineError> {
+        let _ = (scope, message_id);
+        Err(ChatEngineError::internal(
+            "find_message_by_id_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Look up a single message scoped to a session under a PDP-derived scope.
+    async fn find_message_in_session_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        message_id: Uuid,
+    ) -> Result<Option<Message>, ChatEngineError> {
+        let _ = (scope, session_id, message_id);
+        Err(ChatEngineError::internal(
+            "find_message_in_session_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Cascade-delete a message subtree under a PDP-derived scope.
+    async fn delete_message_subtree_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        root_id: Uuid,
+    ) -> Result<u64, ChatEngineError> {
+        let _ = (scope, session_id, root_id);
+        Err(ChatEngineError::internal(
+            "delete_message_subtree_scoped not implemented for this repository",
+        ))
+    }
 }
 
 // ===========================================================================
@@ -368,6 +427,19 @@ pub trait ReactionRepo: Send + Sync {
     async fn list_by_message(
         &self,
         message_id: Uuid,
+    ) -> Result<Vec<MessageReaction>, ChatEngineError>;
+
+    /// Batch variant of [`Self::list_by_message`]: reactions for many messages
+    /// in a single `message_id IN (…)` query. Used to hydrate a conversation
+    /// page without an N+1 per-message fan-out.
+    ///
+    /// `message_reactions` is an unrestricted table (no owner columns): row
+    /// access is governed by parent-message authorization at the service
+    /// layer, so callers MUST pass only `message_ids` the caller has already
+    /// been authorized to read.
+    async fn list_by_messages(
+        &self,
+        message_ids: &[Uuid],
     ) -> Result<Vec<MessageReaction>, ChatEngineError>;
 }
 
@@ -610,6 +682,126 @@ pub trait SessionRepo: Send + Sync {
         let _ = (tenant_id, user_id, session_id, share_token, metadata);
         Err(ChatEngineError::internal(
             "update_share_token not implemented for this repository",
+        ))
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 4 (PEP) — PDP-scoped surface.
+    //
+    // These accept a PDP-derived [`AccessScope`] instead of a manual
+    // `(tenant_id, user_id)` owner filter; the scope carries the tenant /
+    // owner constraints and the concrete impl applies them via SecureORM.
+    // `SessionService` calls these; the legacy `(tenant_id, user_id)` methods
+    // above stay until the secondary services migrate in their own phases.
+    // Default impls fail closed so unrelated mocks compile without change.
+    // ---------------------------------------------------------------------
+
+    /// Insert a new session under a PDP-derived scope (CREATE).
+    // @cpt-cf-chat-engine-interface-pep
+    async fn insert_scoped(
+        &self,
+        scope: &AccessScope,
+        new: NewSession,
+    ) -> Result<Session, ChatEngineError> {
+        let _ = (scope, new);
+        Err(ChatEngineError::internal(
+            "insert_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Scoped read by `session_id` under a PDP-derived scope. `HardDeleted`
+    /// rows are treated as absent.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn find_by_id_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+    ) -> Result<Option<Session>, ChatEngineError> {
+        let _ = (scope, session_id);
+        Err(ChatEngineError::internal(
+            "find_by_id_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Cursor/OData-paginated list under a PDP-derived scope.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn list_scoped(
+        &self,
+        _scope: &AccessScope,
+        _query: &ODataQuery,
+    ) -> Result<Page<Session>, ChatEngineError> {
+        Err(ChatEngineError::internal(
+            "list_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Replace the session metadata JSONB under a PDP-derived scope.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn update_metadata_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        metadata: Option<JsonValue>,
+    ) -> Result<Session, ChatEngineError> {
+        let _ = (scope, session_id, metadata);
+        Err(ChatEngineError::internal(
+            "update_metadata_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Replace the enabled-capabilities JSONB under a PDP-derived scope.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn update_capabilities_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        capabilities: Option<JsonValue>,
+    ) -> Result<Session, ChatEngineError> {
+        let _ = (scope, session_id, capabilities);
+        Err(ChatEngineError::internal(
+            "update_capabilities_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Transition the lifecycle state under a PDP-derived scope. Restoring to
+    /// `Active` clears the soft-delete bookkeeping columns.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn update_lifecycle_state_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        new_state: LifecycleState,
+    ) -> Result<Session, ChatEngineError> {
+        let _ = (scope, session_id, new_state);
+        Err(ChatEngineError::internal(
+            "update_lifecycle_state_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Soft-delete under a PDP-derived scope.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn soft_delete_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        retention_days: i64,
+    ) -> Result<Session, ChatEngineError> {
+        let _ = (scope, session_id, retention_days);
+        Err(ChatEngineError::internal(
+            "soft_delete_scoped not implemented for this repository",
+        ))
+    }
+
+    /// Return the `scheduled_hard_delete_at` timestamp for a scoped session.
+    // @cpt-cf-chat-engine-interface-pep
+    async fn scheduled_hard_delete_at_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+    ) -> Result<Option<OffsetDateTime>, ChatEngineError> {
+        let _ = (scope, session_id);
+        Err(ChatEngineError::internal(
+            "scheduled_hard_delete_at_scoped not implemented for this repository",
         ))
     }
 }

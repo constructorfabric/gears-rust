@@ -50,11 +50,13 @@ use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::message::{Message, MessagePart, MessageRole, message_text};
 use crate::domain::ports::MessageRepo;
 use crate::domain::ports::SessionRepo;
+use crate::domain::authz::{actions, resource_types};
 use crate::domain::search::{
     Cursor, MAX_QUERY_LENGTH, MessageRef, SearchError, SearchPage, SearchQuery, SearchResult,
     SessionMeta, make_snippet, sanitize_for_tsquery,
 };
-use crate::domain::service::session_service::Identity;
+use authz_resolver_sdk::pep::PolicyEnforcer;
+use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 
 /// Scope label used by the `search_duration_seconds` metric / structured log.
 #[domain_model]
@@ -248,6 +250,41 @@ impl SearchBackend for InMemorySearchBackend {
     }
 }
 
+/// Build the backend [`SearchScopeFilter`] from a PDP-compiled
+/// [`AccessScope`]. Owner tenant/user are taken from the scope's compiled
+/// `owner_tenant_id` / `owner_id` constraints so the backend filters exactly
+/// the rows the PDP authorized. An unconstrained scope (allow-all — the
+/// static-authz plugin only returns this in tests) falls back to the
+/// authenticated subject's ids.
+fn scope_filter_from_access(
+    scope: &AccessScope,
+    ctx: &SecurityContext,
+    session_id: Option<Uuid>,
+) -> SearchScopeFilter {
+    if scope.is_unconstrained() {
+        return SearchScopeFilter {
+            tenant_id: ctx.subject_tenant_id().to_string(),
+            user_id: ctx.subject_id().to_string(),
+            session_id,
+        };
+    }
+    let tenant_id = scope
+        .all_uuid_values_for(pep_properties::OWNER_TENANT_ID)
+        .first()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| ctx.subject_tenant_id().to_string());
+    let user_id = scope
+        .all_uuid_values_for(pep_properties::OWNER_ID)
+        .first()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| ctx.subject_id().to_string());
+    SearchScopeFilter {
+        tenant_id,
+        user_id,
+        session_id,
+    }
+}
+
 /// Drop every hit ordered at-or-before `cursor` under the
 /// `(created_at DESC, message_id DESC)` sort key — the sole keyset
 /// pagination primitive used by [`InMemorySearchBackend`].
@@ -292,6 +329,7 @@ pub struct SearchService {
     sessions: Arc<dyn SessionRepo>,
     messages: Arc<dyn MessageRepo>,
     backend: Arc<dyn SearchBackend>,
+    enforcer: PolicyEnforcer,
 }
 
 impl SearchService {
@@ -300,20 +338,22 @@ impl SearchService {
         sessions: Arc<dyn SessionRepo>,
         messages: Arc<dyn MessageRepo>,
         backend: Arc<dyn SearchBackend>,
+        enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             sessions,
             messages,
             backend,
+            enforcer,
         }
     }
 
     /// Session-scoped search. Validates session ownership BEFORE running the
     /// search (per Phase 11 Rules §Scoping and Security).
-    #[instrument(skip(self, identity, query), fields(session_id = %session_id))]
+    #[instrument(skip(self, ctx, query), fields(session_id = %session_id))]
     pub async fn search_in_session(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         query: &SearchQuery,
     ) -> Result<SearchPage> {
@@ -321,18 +361,16 @@ impl SearchService {
         let parsed =
             parse_search_query(query.q.as_deref().unwrap_or("")).map_err(ChatEngineError::from)?;
 
-        // Ownership validation: missing or cross-tenant session → 404.
-        let owned = self
-            .sessions
-            .find_by_id(&identity.tenant_id, &identity.user_id, session_id)
-            .await?
-            .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
-
-        let scope = SearchScopeFilter {
-            tenant_id: identity.tenant_id.clone(),
-            user_id: identity.user_id.clone(),
-            session_id: Some(owned.session_id),
-        };
+        // Within-session search is a MESSAGE list; the PDP returns owner
+        // constraints and the backend applies them (plus the session_id filter).
+        // @cpt-cf-chat-engine-seq-authz-list
+        // @cpt-cf-chat-engine-interface-pep
+        // @cpt-cf-chat-engine-constraint-fail-closed-authz
+        let access = self
+            .enforcer
+            .access_scope(ctx, &resource_types::MESSAGE, actions::LIST, None)
+            .await?;
+        let scope = scope_filter_from_access(&access, ctx, Some(session_id));
         let page = self
             .run(&scope, &parsed, query, SearchScope::Session)
             .await?;
@@ -352,21 +390,26 @@ impl SearchService {
     /// Cross-session search across every session owned by the caller.
     /// Hard-deleted sessions are excluded by the underlying backend
     /// implementation.
-    #[instrument(skip(self, identity, query))]
+    #[instrument(skip(self, ctx, query))]
     pub async fn search_across_sessions(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         query: &SearchQuery,
     ) -> Result<SearchPage> {
         let started = Instant::now();
         let parsed =
             parse_search_query(query.q.as_deref().unwrap_or("")).map_err(ChatEngineError::from)?;
 
-        let scope = SearchScopeFilter {
-            tenant_id: identity.tenant_id.clone(),
-            user_id: identity.user_id.clone(),
-            session_id: None,
-        };
+        // Cross-session search is a SESSION list; the PDP returns owner
+        // constraints applied by the backend's sessions join.
+        // @cpt-cf-chat-engine-seq-authz-list
+        // @cpt-cf-chat-engine-interface-pep
+        // @cpt-cf-chat-engine-constraint-fail-closed-authz
+        let access = self
+            .enforcer
+            .access_scope(ctx, &resource_types::SESSION, actions::LIST, None)
+            .await?;
+        let scope = scope_filter_from_access(&access, ctx, None);
         // For cross-session results we need session titles → look them up
         // in batch after the backend returns the hits. Index by session id.
         let page = self

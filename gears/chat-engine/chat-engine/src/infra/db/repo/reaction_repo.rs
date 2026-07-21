@@ -29,13 +29,12 @@ use async_trait::async_trait;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use time::OffsetDateTime;
-use toolkit_db::secure::{
-    AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt, TxConfig,
-};
+use toolkit_db::secure::{SecureDeleteExt, SecureEntityExt, SecureInsertExt, TxConfig};
 use uuid::Uuid;
 
 use crate::domain::error::ChatEngineError;
 use crate::domain::ports::{ReactionDeleteOutcome, ReactionRepo, ReactionUpsertOutcome};
+use crate::domain::authz::bypass;
 use crate::domain::reaction::{MessageReaction, ReactionType};
 use crate::infra::db::entity::message_reaction::{
     self as reaction_entity, Column as ReactionColumn, Entity as ReactionEntity,
@@ -47,8 +46,8 @@ use crate::infra::db::repo::ChatEngineDb;
 /// Holds the toolkit-db `DBProvider` so every query runs against the same
 /// connection the migration runner used. `message_reactions` has no
 /// tenant column (entity is marked `#[secure(unrestricted)]`); the
-/// secure wrappers run with `AccessScope::allow_all()` and exist to
-/// expose a `&impl DBRunner` execution path.
+/// secure wrappers run with a named bypass scope (`crate::domain::authz::bypass`)
+/// and exist to expose a `&impl DBRunner` execution path.
 pub struct SeaReactionRepo {
     db: Arc<ChatEngineDb>,
 }
@@ -68,8 +67,13 @@ impl ReactionRepo for SeaReactionRepo {
         user_id: &str,
     ) -> Result<Option<MessageReaction>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
-        let row = ReactionEntity::find_by_id((message_id, user_id.to_owned()))
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
+        let user_uuid = user_id
+            .parse::<Uuid>()
+            .map_err(|_| ChatEngineError::internal("reaction user_id is not a valid UUID"))?;
+        let row = ReactionEntity::find_by_id((message_id, user_uuid))
             .secure()
             .scope_with(&scope)
             .one(&conn)
@@ -88,7 +92,10 @@ impl ReactionRepo for SeaReactionRepo {
             "upsert called with ReactionType::None \u{2014} caller must route to delete"
         );
 
-        let user_id_owned = user_id.to_owned();
+        let user_uuid = user_id
+            .parse::<Uuid>()
+            .map_err(|_| ChatEngineError::internal("reaction user_id is not a valid UUID"))?;
+        let user_id_owned = user_uuid;
         let stored_value = reaction_type.as_str().to_owned();
         let now = OffsetDateTime::now_utc();
 
@@ -102,10 +109,12 @@ impl ReactionRepo for SeaReactionRepo {
                 TxConfig::serializable(),
                 move |tx| {
                     Box::pin(async move {
-                        let scope = AccessScope::allow_all();
+                        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+                        // @cpt-cf-chat-engine-design-authz-bypass-registry
+                        let scope = bypass::unrestricted_table_scope();
 
                         let previous =
-                            ReactionEntity::find_by_id((message_id, user_id_owned.clone()))
+                            ReactionEntity::find_by_id((message_id, user_id_owned))
                                 .secure()
                                 .scope_with(&scope)
                                 .one(tx)
@@ -113,7 +122,7 @@ impl ReactionRepo for SeaReactionRepo {
 
                         let am = reaction_entity::ActiveModel {
                             message_id: Set(message_id),
-                            user_id: Set(user_id_owned.clone()),
+                            user_id: Set(user_id_owned),
                             reaction_type: Set(stored_value),
                             // For new rows `created_at` lands; for the
                             // updated path Postgres ignores it because the
@@ -171,11 +180,16 @@ impl ReactionRepo for SeaReactionRepo {
         user_id: &str,
     ) -> Result<ReactionDeleteOutcome, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
 
         // Capture the prior value so the service can populate
         // `previous_reaction_type` on the fire-and-forget plugin event.
-        let prior = ReactionEntity::find_by_id((message_id, user_id.to_owned()))
+        let user_uuid = user_id
+            .parse::<Uuid>()
+            .map_err(|_| ChatEngineError::internal("reaction user_id is not a valid UUID"))?;
+        let prior = ReactionEntity::find_by_id((message_id, user_uuid))
             .secure()
             .scope_with(&scope)
             .one(&conn)
@@ -191,7 +205,7 @@ impl ReactionRepo for SeaReactionRepo {
             .filter(
                 Condition::all()
                     .add(ReactionColumn::MessageId.eq(message_id))
-                    .add(ReactionColumn::UserId.eq(user_id.to_owned())),
+                    .add(ReactionColumn::UserId.eq(user_uuid)),
             )
             .exec(&conn)
             .await?;
@@ -207,11 +221,36 @@ impl ReactionRepo for SeaReactionRepo {
         message_id: Uuid,
     ) -> Result<Vec<MessageReaction>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let rows = ReactionEntity::find()
             .secure()
             .scope_with(&scope)
             .filter(Condition::all().add(ReactionColumn::MessageId.eq(message_id)))
+            .all(&conn)
+            .await?;
+        Ok(rows.into_iter().map(MessageReaction::from).collect())
+    }
+
+    async fn list_by_messages(
+        &self,
+        message_ids: &[Uuid],
+    ) -> Result<Vec<MessageReaction>, ChatEngineError> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.db.conn()?;
+        // AUTHZ-BYPASS: unrestricted table; reactions are read only for parent
+        // messages the caller was already authorized against (trust-parent).
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
+        let rows = ReactionEntity::find()
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all().add(ReactionColumn::MessageId.is_in(message_ids.iter().copied())),
+            )
             .all(&conn)
             .await?;
         Ok(rows.into_iter().map(MessageReaction::from).collect())

@@ -37,6 +37,7 @@ use toolkit_db::secure::{
 use toolkit_odata::{ODataQuery, Page, SortDir};
 use uuid::Uuid;
 
+use crate::domain::authz::bypass;
 use crate::domain::error::ChatEngineError;
 use crate::domain::ports::{NewSession, SessionRepo};
 use crate::domain::session::{LifecycleState, Session};
@@ -47,6 +48,16 @@ use crate::infra::db::entity::message_reaction::{
 use crate::infra::db::entity::session::{self as session_entity, Entity as SessionEntity};
 use crate::infra::db::odata_mapper::{SessionODataMapper, SessionQueryFilterField};
 use crate::infra::db::repo::ChatEngineDb;
+
+/// Parse a `sessions` owner identifier (tenant/user) into its `Uuid` column
+/// value. The strings always originate from a `SecurityContext` UUID, so a
+/// parse failure is an internal invariant break rather than a client error —
+/// surfaced as a fail-closed internal error instead of a panic.
+fn parse_owner_uuid(value: &str, field: &str) -> Result<Uuid, ChatEngineError> {
+    value.parse::<Uuid>().map_err(|err| {
+        ChatEngineError::internal(format!("session {field} is not a valid UUID: {err}"))
+    })
+}
 
 /// Maximum results returned per page.
 pub const MAX_PAGE_SIZE: u32 = 100;
@@ -93,11 +104,36 @@ impl SeaSessionRepo {
         user_id: &str,
         session_id: Uuid,
     ) -> Result<Session, ChatEngineError> {
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let row = SessionEntity::find()
             .secure()
             .scope_with(&scope)
             .filter(Self::owned_filter(session_id, tenant_id, user_id))
+            .one(runner)
+            .await?;
+        let row = row.ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
+        if row.lifecycle_state == LifecycleState::HardDeleted.as_str() {
+            return Err(ChatEngineError::not_found("session", session_id));
+        }
+        Ok(row.into())
+    }
+
+    /// Re-read a session by `session_id` under a PDP-derived scope after a
+    /// scoped write. Owner/tenant filtering is carried by `scope` (applied by
+    /// SecureORM); a row that falls outside the scope, is absent, or is
+    /// `HardDeleted` surfaces as `NotFound` (TOCTOU-safe: the owner pair is
+    /// immutable). Phase 4 counterpart of [`Self::read_owned`].
+    async fn read_scoped<R: DBRunner>(
+        runner: &R,
+        scope: &AccessScope,
+        session_id: Uuid,
+    ) -> Result<Session, ChatEngineError> {
+        let row = SessionEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
             .one(runner)
             .await?;
         let row = row.ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
@@ -112,10 +148,12 @@ impl SeaSessionRepo {
 impl SessionRepo for SeaSessionRepo {
     async fn insert(&self, new: NewSession) -> Result<Session, ChatEngineError> {
         use sea_orm::ActiveValue::{NotSet, Set};
+        let tenant_uuid = parse_owner_uuid(&new.tenant_id, "tenant_id")?;
+        let user_uuid = parse_owner_uuid(&new.user_id, "user_id")?;
         let model = session_entity::ActiveModel {
             session_id: Set(new.session_id),
-            tenant_id: Set(new.tenant_id),
-            user_id: Set(new.user_id),
+            tenant_id: Set(tenant_uuid),
+            user_id: Set(user_uuid),
             client_id: Set(new.client_id),
             session_type_id: Set(new.session_type_id),
             enabled_capabilities: Set(None),
@@ -128,7 +166,9 @@ impl SessionRepo for SeaSessionRepo {
             updated_at: Set(new.updated_at),
         };
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let inserted = SessionEntity::insert(model)
             .secure()
             .scope_unchecked(&scope)?
@@ -144,7 +184,9 @@ impl SessionRepo for SeaSessionRepo {
         session_id: Uuid,
     ) -> Result<Option<OffsetDateTime>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let row = SessionEntity::find()
             .secure()
             .scope_with(&scope)
@@ -161,7 +203,9 @@ impl SessionRepo for SeaSessionRepo {
         session_id: Uuid,
     ) -> Result<Option<Session>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let row = SessionEntity::find()
             .secure()
             .scope_with(&scope)
@@ -181,7 +225,9 @@ impl SessionRepo for SeaSessionRepo {
         query: &ODataQuery,
     ) -> Result<Page<Session>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
 
         // Tenant / user scoping and the hard-delete exclusion come from the
         // caller's identity, never from the OData `$filter`, so they live in
@@ -244,7 +290,9 @@ impl SessionRepo for SeaSessionRepo {
                 Box::pin(async move {
                     let _existing = Self::read_owned(tx, &tenant_id, &user_id, session_id).await?;
                     let now = OffsetDateTime::now_utc();
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
@@ -276,7 +324,9 @@ impl SessionRepo for SeaSessionRepo {
                 Box::pin(async move {
                     let _existing = Self::read_owned(tx, &tenant_id, &user_id, session_id).await?;
                     let now = OffsetDateTime::now_utc();
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
@@ -310,7 +360,9 @@ impl SessionRepo for SeaSessionRepo {
                 Box::pin(async move {
                     let _existing = Self::read_owned(tx, &tenant_id, &user_id, session_id).await?;
                     let now = OffsetDateTime::now_utc();
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     let mut update = SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
@@ -356,7 +408,9 @@ impl SessionRepo for SeaSessionRepo {
                     let now = OffsetDateTime::now_utc();
                     let grace = retention_days.max(0);
                     let scheduled = now + Duration::from_secs((grace as u64) * 86_400);
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
@@ -394,7 +448,9 @@ impl SessionRepo for SeaSessionRepo {
         self.db
             .transaction_with_config(TxConfig::serializable(), move |tx| {
                 Box::pin(async move {
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     // Re-load inside the transaction to make sure the
                     // ownership/lifecycle check sees the same snapshot as
                     // the cascade deletes.
@@ -499,7 +555,9 @@ impl SessionRepo for SeaSessionRepo {
         limit: u32,
     ) -> Result<Vec<Session>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: system op; not HTTP-exposed
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::system_read_scope();
         let mut filter = Condition::all()
             .add(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
             .add(
@@ -534,7 +592,9 @@ impl SessionRepo for SeaSessionRepo {
         // already polls regularly. Once `SecureSelect::into_tuple` exists
         // this collapses back to a one-shot `DISTINCT` scan.
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: system op; not HTTP-exposed
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::system_read_scope();
         let rows = SessionEntity::find()
             .secure()
             .scope_with(&scope)
@@ -547,7 +607,7 @@ impl SessionRepo for SeaSessionRepo {
             .all(&conn)
             .await?;
 
-        let mut tenants: Vec<String> = rows.into_iter().map(|m| m.tenant_id).collect();
+        let mut tenants: Vec<String> = rows.into_iter().map(|m| m.tenant_id.to_string()).collect();
         tenants.sort_unstable();
         tenants.dedup();
         Ok(tenants)
@@ -558,7 +618,9 @@ impl SessionRepo for SeaSessionRepo {
         session_id: Uuid,
     ) -> Result<Option<Session>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: system op; not HTTP-exposed
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::system_read_scope();
         let row = SessionEntity::find()
             .secure()
             .scope_with(&scope)
@@ -578,7 +640,9 @@ impl SessionRepo for SeaSessionRepo {
         // single equality lookup — keep the query verbatim so EXPLAIN
         // selects the index per ADR-0016.
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: capability-URL read; token is the grant; 404 on miss/revoked
+        // @cpt-cf-chat-engine-seq-authz-shared-read
+        let scope = bypass::capability_read_scope();
         let row = SessionEntity::find()
             .secure()
             .scope_with(&scope)
@@ -607,7 +671,9 @@ impl SessionRepo for SeaSessionRepo {
                 Box::pin(async move {
                     let _existing = Self::read_owned(tx, &tenant_id, &user_id, session_id).await?;
                     let now = OffsetDateTime::now_utc();
-                    let scope = AccessScope::allow_all();
+                    // AUTHZ-BYPASS: legacy owner-filtered / unrestricted path; row scoping via explicit WHERE
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
@@ -627,6 +693,254 @@ impl SessionRepo for SeaSessionRepo {
                 })
             })
             .await
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 4 (PEP) — PDP-scoped surface. Owner/tenant filtering is carried by
+    // the PDP-derived `AccessScope` (applied via SecureORM `.scope_with`),
+    // so the residual predicate is just `session_id`.
+    // @cpt-cf-chat-engine-interface-pep
+    // ---------------------------------------------------------------------
+
+    async fn insert_scoped(
+        &self,
+        scope: &AccessScope,
+        new: NewSession,
+    ) -> Result<Session, ChatEngineError> {
+        use sea_orm::ActiveValue::{NotSet, Set};
+        let tenant_uuid = parse_owner_uuid(&new.tenant_id, "tenant_id")?;
+        let user_uuid = parse_owner_uuid(&new.user_id, "user_id")?;
+        let model = session_entity::ActiveModel {
+            session_id: Set(new.session_id),
+            tenant_id: Set(tenant_uuid),
+            user_id: Set(user_uuid),
+            client_id: Set(new.client_id),
+            session_type_id: Set(new.session_type_id),
+            enabled_capabilities: Set(None),
+            metadata: Set(new.metadata),
+            lifecycle_state: Set(LifecycleState::Active.as_str().to_string()),
+            share_token: Set(None),
+            deleted_at: NotSet,
+            scheduled_hard_delete_at: NotSet,
+            created_at: Set(new.created_at),
+            updated_at: Set(new.updated_at),
+        };
+        let conn = self.db.conn()?;
+        let inserted = SessionEntity::insert(model)
+            .secure()
+            .scope_unchecked(scope)?
+            .exec_with_returning(&conn)
+            .await?;
+        Ok(inserted.into())
+    }
+
+    async fn find_by_id_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+    ) -> Result<Option<Session>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let row = SessionEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+            .one(&conn)
+            .await?;
+        Ok(row
+            .filter(|m| m.lifecycle_state != LifecycleState::HardDeleted.as_str())
+            .map(Into::into))
+    }
+
+    async fn list_scoped(
+        &self,
+        scope: &AccessScope,
+        query: &ODataQuery,
+    ) -> Result<Page<Session>, ChatEngineError> {
+        let conn = self.db.conn()?;
+
+        // Owner/tenant scoping now comes from the PDP-derived scope (applied by
+        // SecureORM). Only the hard-delete exclusion — an engine invariant, not
+        // a caller-controlled `$filter` — lives in the base query.
+        let base_query = SessionEntity::find().secure().scope_with(scope).filter(
+            Condition::all().add(
+                session_entity::Column::LifecycleState
+                    .ne(LifecycleState::HardDeleted.as_str().to_string()),
+            ),
+        );
+
+        let query = if query.cursor.is_none() && query.order.is_empty() {
+            let mut adjusted = query.clone();
+            adjusted.order = adjusted
+                .order
+                .ensure_tiebreaker("created_at", SortDir::Desc);
+            Cow::Owned(adjusted)
+        } else {
+            Cow::Borrowed(query)
+        };
+
+        let limit_cfg = LimitCfg {
+            default: u64::from(DEFAULT_PAGE_SIZE),
+            max: u64::from(MAX_PAGE_SIZE),
+        };
+
+        paginate_odata::<SessionQueryFilterField, SessionODataMapper, _, _, _, _>(
+            base_query,
+            &conn,
+            query.as_ref(),
+            ("session_id", SortDir::Desc),
+            limit_cfg,
+            |m: session_entity::Model| Session::from(m),
+        )
+        .await
+        .map_err(map_odata_err)
+    }
+
+    async fn update_metadata_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        metadata: Option<JsonValue>,
+    ) -> Result<Session, ChatEngineError> {
+        let scope = scope.clone();
+        self.db
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    let _existing = Self::read_scoped(tx, &scope, session_id).await?;
+                    let now = OffsetDateTime::now_utc();
+                    SessionEntity::update_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+                        .col_expr(
+                            session_entity::Column::Metadata,
+                            Expr::value(metadata.clone()),
+                        )
+                        .col_expr(session_entity::Column::UpdatedAt, Expr::value(now))
+                        .exec(tx)
+                        .await?;
+                    Self::read_scoped(tx, &scope, session_id).await
+                })
+            })
+            .await
+    }
+
+    async fn update_capabilities_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        capabilities: Option<JsonValue>,
+    ) -> Result<Session, ChatEngineError> {
+        let scope = scope.clone();
+        self.db
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    let _existing = Self::read_scoped(tx, &scope, session_id).await?;
+                    let now = OffsetDateTime::now_utc();
+                    SessionEntity::update_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+                        .col_expr(
+                            session_entity::Column::EnabledCapabilities,
+                            Expr::value(capabilities.clone()),
+                        )
+                        .col_expr(session_entity::Column::UpdatedAt, Expr::value(now))
+                        .exec(tx)
+                        .await?;
+                    Self::read_scoped(tx, &scope, session_id).await
+                })
+            })
+            .await
+    }
+
+    async fn update_lifecycle_state_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        new_state: LifecycleState,
+    ) -> Result<Session, ChatEngineError> {
+        let scope = scope.clone();
+        let state_str = new_state.as_str().to_string();
+        let clear_deletion = matches!(new_state, LifecycleState::Active);
+        self.db
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    let _existing = Self::read_scoped(tx, &scope, session_id).await?;
+                    let now = OffsetDateTime::now_utc();
+                    let mut update = SessionEntity::update_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+                        .col_expr(
+                            session_entity::Column::LifecycleState,
+                            Expr::value(state_str.clone()),
+                        )
+                        .col_expr(session_entity::Column::UpdatedAt, Expr::value(now));
+                    if clear_deletion {
+                        let null_dt: Option<OffsetDateTime> = None;
+                        update = update
+                            .col_expr(session_entity::Column::DeletedAt, Expr::value(null_dt))
+                            .col_expr(
+                                session_entity::Column::ScheduledHardDeleteAt,
+                                Expr::value(null_dt),
+                            );
+                    }
+                    update.exec(tx).await?;
+                    Self::read_scoped(tx, &scope, session_id).await
+                })
+            })
+            .await
+    }
+
+    async fn soft_delete_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        retention_days: i64,
+    ) -> Result<Session, ChatEngineError> {
+        let scope = scope.clone();
+        self.db
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    let _existing = Self::read_scoped(tx, &scope, session_id).await?;
+                    let now = OffsetDateTime::now_utc();
+                    let grace = retention_days.max(0);
+                    let scheduled = now + Duration::from_secs((grace as u64) * 86_400);
+                    SessionEntity::update_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+                        .col_expr(
+                            session_entity::Column::LifecycleState,
+                            Expr::value(LifecycleState::SoftDeleted.as_str().to_string()),
+                        )
+                        .col_expr(session_entity::Column::DeletedAt, Expr::value(Some(now)))
+                        .col_expr(
+                            session_entity::Column::ScheduledHardDeleteAt,
+                            Expr::value(Some(scheduled)),
+                        )
+                        .col_expr(session_entity::Column::UpdatedAt, Expr::value(now))
+                        .exec(tx)
+                        .await?;
+                    Self::read_scoped(tx, &scope, session_id).await
+                })
+            })
+            .await
+    }
+
+    async fn scheduled_hard_delete_at_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+    ) -> Result<Option<OffsetDateTime>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let row = SessionEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+            .one(&conn)
+            .await?;
+        Ok(row.and_then(|m| m.scheduled_hard_delete_at))
     }
 }
 

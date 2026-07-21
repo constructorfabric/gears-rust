@@ -16,11 +16,10 @@ use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryOrder};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
-use toolkit_db::secure::{
-    AccessScope, SecureEntityExt, SecureInsertExt, SecureUpdateExt, TxConfig,
-};
+use toolkit_db::secure::{SecureEntityExt, SecureInsertExt, SecureUpdateExt, TxConfig};
 use uuid::Uuid;
 
+use crate::domain::authz::bypass;
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::message::Message;
 use crate::domain::service::variant_service::VariantRepo;
@@ -30,9 +29,9 @@ use crate::infra::db::repo::ChatEngineDb;
 ///
 /// Holds the toolkit-db `DBProvider` so every query runs against the same
 /// connection the migration runner used. `messages` and `sessions` are both
-/// marked `#[secure(unrestricted)]`; the secure wrappers run with
-/// `AccessScope::allow_all()` and exist only to expose a `&impl DBRunner`
-/// execution path.
+/// marked `#[secure(unrestricted)]`; the secure wrappers run with a named
+/// bypass scope (see `crate::domain::authz::bypass`) and exist only to expose
+/// a `&impl DBRunner` execution path.
 pub struct SeaVariantRepo {
     db: Arc<ChatEngineDb>,
 }
@@ -54,7 +53,10 @@ impl VariantRepo for SeaVariantRepo {
         use crate::infra::db::entity::message::{self as message_entity, Entity as MessageEntity};
 
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // TODO(phase-7): bypass registry — unrestricted_table_scope()
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let parent_cond = match parent_message_id {
             Some(p) => Condition::all().add(message_entity::Column::ParentMessageId.eq(p)),
             None => Condition::all().add(message_entity::Column::ParentMessageId.is_null()),
@@ -80,7 +82,7 @@ impl VariantRepo for SeaVariantRepo {
         user_id: Option<String>,
     ) -> Result<(Uuid, i32, Uuid)> {
         use crate::infra::db::entity::message as message_entity;
-        use crate::infra::db::repo::message_repo::insert_message_parts;
+        use crate::infra::db::repo::message_repo::{insert_message_parts, message_owner_pair};
         use crate::infra::db::{
             VARIANT_INDEX_MAX_RETRIES, compute_next_variant_index, is_variant_unique_violation,
         };
@@ -117,10 +119,20 @@ impl VariantRepo for SeaVariantRepo {
                         let user_variant_index =
                             compute_next_variant_index(tx, session_id, Some(parent_message_id))
                                 .await?;
-                        let scope = AccessScope::allow_all();
+                        // TODO(phase-7): bypass registry — unrestricted_table_scope()
+                        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+                        // @cpt-cf-chat-engine-design-authz-bypass-registry
+                        let scope = bypass::unrestricted_table_scope();
+                        // Branch rows inherit the parent message's owner pair
+                        // (the `messages` secure scope columns), derived
+                        // in-transaction. @cpt-cf-chat-engine-interface-pep
+                        let (owner_tenant_id, owner_id) =
+                            message_owner_pair(tx, parent_message_id).await?;
                         let user_active = message_entity::ActiveModel {
                             message_id: Set(user_message_id),
                             session_id: Set(session_id),
+                            owner_tenant_id: Set(owner_tenant_id),
+                            owner_id: Set(owner_id),
                             // Owning tenant (denormalized) + branching author,
                             // both from the JWT identity at the service layer.
                             tenant_id: Set(user_tenant),
@@ -139,6 +151,8 @@ impl VariantRepo for SeaVariantRepo {
                         let assistant_active = message_entity::ActiveModel {
                             message_id: Set(assistant_message_id),
                             session_id: Set(session_id),
+                            owner_tenant_id: Set(owner_tenant_id),
+                            owner_id: Set(owner_id),
                             // Inherits the owning tenant; no human author.
                             tenant_id: Set(assistant_tenant),
                             user_id: Set(None),
@@ -159,7 +173,15 @@ impl VariantRepo for SeaVariantRepo {
                             .exec(tx)
                             .await?;
                         // Persist the branch user message body as ordered parts.
-                        insert_message_parts(tx, &scope, user_message_id, &parts_attempt).await?;
+                        insert_message_parts(
+                            tx,
+                            &scope,
+                            user_message_id,
+                            &parts_attempt,
+                            owner_tenant_id,
+                            owner_id,
+                        )
+                        .await?;
                         message_entity::Entity::insert(assistant_active)
                             .secure()
                             .scope_unchecked(&scope)?
@@ -203,7 +225,10 @@ impl VariantRepo for SeaVariantRepo {
         use crate::infra::db::entity::message::{self as message_entity, Entity as MessageEntity};
 
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // TODO(phase-7): bypass registry — unrestricted_table_scope()
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let mut chain = Vec::new();
         let mut cursor: Option<Uuid> = Some(message_id);
         let mut guard = 0_usize;
@@ -233,7 +258,10 @@ impl VariantRepo for SeaVariantRepo {
         use crate::infra::db::entity::message::{self as message_entity, Entity as MessageEntity};
 
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // TODO(phase-7): bypass registry — unrestricted_table_scope()
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let mut out: Vec<Uuid> = Vec::new();
         let mut frontier: Vec<Uuid> = vec![message_id];
         while !frontier.is_empty() {
@@ -280,7 +308,10 @@ impl VariantRepo for SeaVariantRepo {
         self.db
             .transaction_with_config(TxConfig::serializable(), move |tx| {
                 Box::pin(async move {
-                    let scope = AccessScope::allow_all();
+                    // TODO(phase-7): bypass registry — unrestricted_table_scope()
+                    // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     if !activate_ids.is_empty() {
                         MessageEntity::update_many()
                             .secure()
@@ -334,7 +365,10 @@ impl VariantRepo for SeaVariantRepo {
         self.db
             .transaction(move |tx| {
                 Box::pin(async move {
-                    let scope = AccessScope::allow_all();
+                    // TODO(phase-7): bypass registry — unrestricted_table_scope()
+                    // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+                    // @cpt-cf-chat-engine-design-authz-bypass-registry
+                    let scope = bypass::unrestricted_table_scope();
                     let owned_cond = Condition::all()
                         .add(session_entity::Column::SessionId.eq(session_id))
                         .add(session_entity::Column::TenantId.eq(tenant_id.clone()))
@@ -393,7 +427,7 @@ fn chat_engine_db_err(err: &ChatEngineError) -> Option<&sea_orm::DbErr> {
         // already covers that path. `DbError::Other(anyhow)` errors
         // (used by the transaction helpers when a domain error
         // bubbles through) appear as `toolkit_db::DbError`, not as a
-        // bare `DbErr` — so peek through that wrapper too.
+        // bare `DbErr` â so peek through that wrapper too.
         source
             .downcast_ref::<toolkit_db::DbError>()
             .and_then(|dbe| match dbe {

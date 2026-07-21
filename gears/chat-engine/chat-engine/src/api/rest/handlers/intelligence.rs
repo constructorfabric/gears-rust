@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use toolkit_security::SecurityContext;
 
-use crate::api::rest::handlers::sessions::{identity_from_ctx, reject_body_identity};
+use crate::api::rest::handlers::sessions::reject_body_identity;
 use crate::domain::error::Result;
 use crate::domain::retention::RetentionPolicy;
 use crate::domain::service::intelligence_service::IntelligenceService;
@@ -73,15 +73,13 @@ pub async fn summarize_session(
     Extension(svc): Extension<Arc<IntelligenceService>>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Response> {
-    let identity = identity_from_ctx(&ctx)?;
-
     // Cancellation token threaded into the summary driver. The summary stream
     // is not part of the resumable message buffer, but it shares the SSE delta
     // builder; a client disconnect no longer force-cancels here, so an
     // on-demand summary still completes and persists.
     let cancel = CancellationToken::new();
 
-    let event_stream = svc.summarize_session(&identity, session_id, cancel).await?;
+    let event_stream = svc.summarize_session(&ctx, session_id, cancel).await?;
 
     // Project the summary stream into the shared SSE delta protocol (FR-024).
     Ok(crate::api::rest::sse_delta_stream_response(event_stream))
@@ -96,9 +94,8 @@ pub async fn get_retention_policy(
     Extension(svc): Extension<Arc<IntelligenceService>>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Json<RetentionPolicy>> {
-    let identity = identity_from_ctx(&ctx)?;
     let policy = svc
-        .get_effective_retention_policy(&identity, session_id)
+        .get_effective_retention_policy(&ctx, session_id)
         .await?;
     Ok(Json(policy))
 }
@@ -114,9 +111,8 @@ pub async fn patch_retention_policy(
     Json(body): Json<PatchRetentionPolicyBody>,
 ) -> Result<Json<RetentionPolicy>> {
     reject_body_identity(&body.tenant_id, &body.user_id)?;
-    let identity = identity_from_ctx(&ctx)?;
     let updated = svc
-        .update_session_retention_policy(&identity, session_id, body.policy)
+        .update_session_retention_policy(&ctx, session_id, body.policy)
         .await?;
     Ok(Json(updated))
 }

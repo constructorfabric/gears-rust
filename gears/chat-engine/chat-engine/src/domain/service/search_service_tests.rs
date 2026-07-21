@@ -1,6 +1,7 @@
 use super::*;
 use crate::domain::ports::NewSession;
 use crate::domain::ports::SessionRepo;
+use crate::domain::service::test_support;
 use crate::domain::session::LifecycleState;
 use crate::domain::session::Session;
 use async_trait::async_trait;
@@ -213,8 +214,19 @@ fn fixture_message(
     }
 }
 
-fn identity() -> Identity {
-    Identity::new("tenant-a", "user-1", None).unwrap()
+// Fixed owner ids so the mock PDP's owner constraints (subject tenant / id)
+// line up with the session + backend rows the fixtures create. The scoped
+// search filter is derived from those constraints, so tenants/users must be
+// UUIDs (not the old free-form "tenant-a" strings).
+const TENANT: Uuid = Uuid::from_u128(0xA1);
+const USER: Uuid = Uuid::from_u128(0xB0);
+
+fn ctx() -> SecurityContext {
+    test_support::ctx_for_subject(USER, TENANT)
+}
+
+fn owner_session(id: Uuid) -> Session {
+    fixture_session(&TENANT.to_string(), &USER.to_string(), id)
 }
 
 fn make_service(session: Session, messages: Vec<Message>) -> SearchService {
@@ -233,7 +245,12 @@ fn make_service(session: Session, messages: Vec<Message>) -> SearchService {
         );
     }
     let backend = Arc::new(backend);
-    SearchService::new(sessions, message_repo, backend)
+    SearchService::new(
+        sessions,
+        message_repo,
+        backend,
+        test_support::enforcer_allow(),
+    )
 }
 
 // ---------- Tests ----------
@@ -269,11 +286,11 @@ fn parse_query_accepts_normal_input() {
 #[tokio::test]
 async fn empty_query_returns_400_via_chat_engine_error() {
     let session_id = Uuid::new_v4();
-    let session = fixture_session("tenant-a", "user-1", session_id);
+    let session = owner_session(session_id);
     let svc = make_service(session, vec![]);
     let result = svc
         .search_in_session(
-            &identity(),
+            &ctx(),
             session_id,
             &SearchQuery {
                 q: Some(String::new()),
@@ -288,12 +305,12 @@ async fn empty_query_returns_400_via_chat_engine_error() {
 #[tokio::test]
 async fn over_length_query_returns_400() {
     let session_id = Uuid::new_v4();
-    let session = fixture_session("tenant-a", "user-1", session_id);
+    let session = owner_session(session_id);
     let svc = make_service(session, vec![]);
     let q = "a".repeat(MAX_QUERY_LENGTH + 1);
     let result = svc
         .search_in_session(
-            &identity(),
+            &ctx(),
             session_id,
             &SearchQuery {
                 q: Some(q),
@@ -311,29 +328,50 @@ async fn over_length_query_returns_400() {
 }
 
 #[tokio::test]
-async fn unowned_session_returns_404() {
+async fn unowned_session_returns_empty() {
+    // A session owned by a different user: the scoped MESSAGE-list filter is
+    // the caller's owner pair, so a foreign session's rows are filtered out
+    // and the search returns an empty page (anti-enumeration) rather than a
+    // 404 that would confirm the session exists.
     let session_id = Uuid::new_v4();
-    // Session is owned by a different user.
-    let session = fixture_session("tenant-a", "someone-else", session_id);
-    let svc = make_service(session, vec![]);
-    let result = svc
+    let foreign_user = Uuid::from_u128(0xB1);
+    let foreign_session =
+        fixture_session(&TENANT.to_string(), &foreign_user.to_string(), session_id);
+    let foreign_msg = fixture_message(session_id, MessageRole::User, "find me secret", 0, false);
+
+    let sessions = Arc::new(MockSessionRepo::with(foreign_session.clone()));
+    let mr = Arc::new(MockMessageRepo::with(vec![foreign_msg.clone()]));
+    let mut backend = InMemorySearchBackend::new();
+    backend.push(
+        SearchScopeFilter::new(
+            foreign_session.tenant_id.as_str().to_owned(),
+            foreign_session.user_id.as_str().to_owned(),
+            Some(session_id),
+        ),
+        foreign_msg,
+    );
+    let backend = Arc::new(backend);
+    let svc = SearchService::new(sessions, mr, backend, test_support::enforcer_allow());
+
+    let page = svc
         .search_in_session(
-            &identity(),
+            &ctx(),
             session_id,
             &SearchQuery {
-                q: Some("hello".into()),
+                q: Some("find me".into()),
                 ..Default::default()
             },
         )
         .await
-        .unwrap_err();
-    assert!(matches!(result, ChatEngineError::NotFound { .. }));
+        .unwrap();
+    assert_eq!(page.items.len(), 0);
+    assert_eq!(page.total_count, 0);
 }
 
 #[tokio::test]
 async fn hidden_messages_excluded_from_results() {
     let session_id = Uuid::new_v4();
-    let session = fixture_session("tenant-a", "user-1", session_id);
+    let session = owner_session(session_id);
     let messages = vec![
         fixture_message(
             session_id,
@@ -347,7 +385,7 @@ async fn hidden_messages_excluded_from_results() {
     let svc = make_service(session, messages);
     let page = svc
         .search_in_session(
-            &identity(),
+            &ctx(),
             session_id,
             &SearchQuery {
                 q: Some("find me".into()),
@@ -364,7 +402,7 @@ async fn hidden_messages_excluded_from_results() {
 async fn tenant_scoping_blocks_cross_tenant_results() {
     // Backend stores a message for tenant-b — caller is tenant-a.
     let session_id = Uuid::new_v4();
-    let session = fixture_session("tenant-a", "user-1", session_id);
+    let session = owner_session(session_id);
     // Mock storage to inject a cross-tenant row.
     let foreign_session = Uuid::new_v4();
     let foreign_msg = fixture_message(
@@ -383,11 +421,11 @@ async fn tenant_scoping_blocks_cross_tenant_results() {
         foreign_msg,
     );
     let backend = Arc::new(backend);
-    let svc = SearchService::new(sessions, mr, backend);
+    let svc = SearchService::new(sessions, mr, backend, test_support::enforcer_allow());
 
     let page = svc
         .search_across_sessions(
-            &identity(),
+            &ctx(),
             &SearchQuery {
                 q: Some("find me".into()),
                 ..Default::default()
@@ -402,7 +440,7 @@ async fn tenant_scoping_blocks_cross_tenant_results() {
 #[tokio::test]
 async fn pagination_caps_per_page_at_max() {
     let session_id = Uuid::new_v4();
-    let session = fixture_session("tenant-a", "user-1", session_id);
+    let session = owner_session(session_id);
     let mut messages = Vec::new();
     for i in 0..80 {
         messages.push(fixture_message(
@@ -416,7 +454,7 @@ async fn pagination_caps_per_page_at_max() {
     let svc = make_service(session, messages);
     let page = svc
         .search_in_session(
-            &identity(),
+            &ctx(),
             session_id,
             &SearchQuery {
                 q: Some("needle".into()),
@@ -437,7 +475,7 @@ async fn pagination_caps_per_page_at_max() {
 #[tokio::test]
 async fn context_window_populated() {
     let session_id = Uuid::new_v4();
-    let session = fixture_session("tenant-a", "user-1", session_id);
+    let session = owner_session(session_id);
     let messages = vec![
         fixture_message(session_id, MessageRole::User, "before-1", 0, false),
         fixture_message(session_id, MessageRole::Assistant, "needle here", 1, false),
@@ -446,7 +484,7 @@ async fn context_window_populated() {
     let svc = make_service(session, messages);
     let page = svc
         .search_in_session(
-            &identity(),
+            &ctx(),
             session_id,
             &SearchQuery {
                 q: Some("needle".into()),
@@ -467,7 +505,7 @@ async fn context_window_populated() {
 #[tokio::test]
 async fn cross_session_results_attach_session_metadata() {
     let session_id = Uuid::new_v4();
-    let session = fixture_session("tenant-a", "user-1", session_id);
+    let session = owner_session(session_id);
     let messages = vec![fixture_message(
         session_id,
         MessageRole::User,
@@ -478,7 +516,7 @@ async fn cross_session_results_attach_session_metadata() {
     let svc = make_service(session, messages);
     let page = svc
         .search_across_sessions(
-            &identity(),
+            &ctx(),
             &SearchQuery {
                 q: Some("needle".into()),
                 ..Default::default()
@@ -498,11 +536,11 @@ async fn cross_session_results_attach_session_metadata() {
 #[tokio::test]
 async fn malformed_cursor_returns_400() {
     let session_id = Uuid::new_v4();
-    let session = fixture_session("tenant-a", "user-1", session_id);
+    let session = owner_session(session_id);
     let svc = make_service(session, vec![]);
     let err = svc
         .search_in_session(
-            &identity(),
+            &ctx(),
             session_id,
             &SearchQuery {
                 q: Some("needle".into()),
@@ -524,7 +562,7 @@ async fn cursor_pages_advance_strictly_past_prior_page() {
     // page 1's last row under the `(created_at DESC, message_id
     // DESC)` ordering.
     let session_id = Uuid::new_v4();
-    let session = fixture_session("tenant-a", "user-1", session_id);
+    let session = owner_session(session_id);
     // 5 distinct matches with monotonically increasing created_at.
     let messages: Vec<Message> = (0..5)
         .map(|i| {
@@ -542,7 +580,7 @@ async fn cursor_pages_advance_strictly_past_prior_page() {
     // Page size 2 → expect three pages: 2 + 2 + 1.
     let page1 = svc
         .search_in_session(
-            &identity(),
+            &ctx(),
             session_id,
             &SearchQuery {
                 q: Some("needle".into()),
@@ -560,7 +598,7 @@ async fn cursor_pages_advance_strictly_past_prior_page() {
 
     let page2 = svc
         .search_in_session(
-            &identity(),
+            &ctx(),
             session_id,
             &SearchQuery {
                 q: Some("needle".into()),
@@ -619,7 +657,7 @@ async fn cursor_pages_advance_strictly_past_prior_page() {
         .expect("page 2 must surface a cursor when more rows exist");
     let page3 = svc
         .search_in_session(
-            &identity(),
+            &ctx(),
             session_id,
             &SearchQuery {
                 q: Some("needle".into()),
@@ -652,7 +690,7 @@ async fn legacy_cursor_without_created_at_still_advances() {
     // clients holding an in-flight legacy cursor at the cutover are
     // still able to advance instead of looping.
     let session_id = Uuid::new_v4();
-    let session = fixture_session("tenant-a", "user-1", session_id);
+    let session = owner_session(session_id);
     let messages: Vec<Message> = (0..4)
         .map(|i| {
             fixture_message(
@@ -680,7 +718,7 @@ async fn legacy_cursor_without_created_at_still_advances() {
 
     let page = svc
         .search_in_session(
-            &identity(),
+            &ctx(),
             session_id,
             &SearchQuery {
                 q: Some("needle".into()),
@@ -700,7 +738,7 @@ async fn legacy_cursor_without_created_at_still_advances() {
 #[tokio::test]
 async fn session_scoped_results_omit_session_metadata() {
     let session_id = Uuid::new_v4();
-    let session = fixture_session("tenant-a", "user-1", session_id);
+    let session = owner_session(session_id);
     let messages = vec![fixture_message(
         session_id,
         MessageRole::User,
@@ -711,7 +749,7 @@ async fn session_scoped_results_omit_session_metadata() {
     let svc = make_service(session, messages);
     let page = svc
         .search_in_session(
-            &identity(),
+            &ctx(),
             session_id,
             &SearchQuery {
                 q: Some("needle".into()),

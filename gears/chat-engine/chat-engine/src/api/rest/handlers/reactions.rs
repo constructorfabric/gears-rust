@@ -53,7 +53,7 @@ use uuid::Uuid;
 
 use toolkit_security::SecurityContext;
 
-use crate::api::rest::handlers::sessions::{identity_from_ctx, reject_body_identity};
+use crate::api::rest::handlers::sessions::reject_body_identity;
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::reaction::{MessageReaction, ReactionType};
 use crate::domain::service::reaction_service::{
@@ -166,13 +166,8 @@ pub async fn set_reaction(
         return err.into_response();
     }
 
-    let identity = match identity_from_ctx(&ctx) {
-        Ok(id) => id,
-        Err(err) => return err.into_response(),
-    };
-
     let service_outcome = svc
-        .set_reaction(&identity, session_id, message_id, body.reaction_type)
+        .set_reaction(&ctx, session_id, message_id, body.reaction_type)
         .await;
 
     match service_outcome {
@@ -207,9 +202,8 @@ pub async fn list_reactions(
     Extension(svc): Extension<Arc<ReactionService>>,
     Path((session_id, message_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<ListReactionsResponseDto>> {
-    let identity = identity_from_ctx(&ctx)?;
     let listing = svc
-        .list_reactions(&identity, session_id, message_id)
+        .list_reactions(&ctx, session_id, message_id)
         .await?;
     Ok(Json(ListReactionsResponseDto::from(listing)))
 }

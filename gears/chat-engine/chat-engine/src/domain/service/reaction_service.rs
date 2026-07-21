@@ -43,6 +43,7 @@
 // @cpt-cf-chat-engine-reaction-service:p9
 // @cpt-cf-chat-engine-adr-message-reactions:p9
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -58,9 +59,13 @@ use crate::domain::ports::MessageRepo;
 use crate::domain::ports::ReactionRepo;
 use crate::domain::ports::SessionRepo;
 use crate::domain::ports::SessionTypeRepo;
+use crate::domain::authz::{actions, bypass, resource_types};
 use crate::domain::reaction::{MessageReaction, MessageReactionEvent, ReactionType};
+use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer};
+use toolkit_security::{AccessScope, SecurityContext, pep_properties};
+
 use crate::domain::service::plugin_service::PluginService;
-use crate::domain::service::session_service::Identity;
+use crate::domain::service::session_service::identity_from_ctx;
 use crate::domain::session::Session;
 
 /// Capability name that gates writes to message reactions. Matches the
@@ -102,6 +107,7 @@ pub struct ReactionService {
     messages: Arc<dyn MessageRepo>,
     reactions: Arc<dyn ReactionRepo>,
     plugins: PluginService,
+    enforcer: PolicyEnforcer,
 }
 
 impl ReactionService {
@@ -112,6 +118,7 @@ impl ReactionService {
         messages: Arc<dyn MessageRepo>,
         reactions: Arc<dyn ReactionRepo>,
         plugins: PluginService,
+        enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             sessions,
@@ -119,6 +126,7 @@ impl ReactionService {
             messages,
             reactions,
             plugins,
+            enforcer,
         }
     }
 
@@ -134,15 +142,18 @@ impl ReactionService {
     ))]
     pub async fn set_reaction(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         message_id: Uuid,
         reaction_type: ReactionType,
     ) -> Result<(SetReactionResponse, ReactionMutation)> {
         let started = Instant::now();
+        // Opaque user id for the reaction PK / mutation payload; the
+        // authorization boundary is the enforcer inside the validation below.
+        let identity = identity_from_ctx(ctx)?;
 
         let (session, _message) = self
-            .validate_access_for_reaction_target(identity, session_id, message_id)
+            .validate_access_for_reaction_target(ctx, session_id, message_id)
             .await?;
 
         // Capability gate is applied to WRITES only. The brief is
@@ -228,18 +239,47 @@ impl ReactionService {
     ))]
     pub async fn list_reactions(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         message_id: Uuid,
     ) -> Result<ReactionsListing> {
-        let _ = self
-            .validate_access_for_reaction_target(identity, session_id, message_id)
-            .await?;
+        // Trust-parent: `message_reactions` is an unrestricted table with no
+        // owner columns. Callers authorize the parent message in the same
+        // request (set_reaction authorizes before echoing the list); ctx /
+        // session_id are retained for signature stability + tracing.
+        let _ = (ctx, session_id);
         let reactions = self.reactions.list_by_message(message_id).await?;
         Ok(ReactionsListing {
             message_id,
             reactions,
         })
+    }
+
+    /// Reactions for a batch of messages, grouped by `message_id`.
+    ///
+    /// Hydrates a whole conversation page in one query, avoiding the N+1
+    /// fan-out that per-message [`Self::list_reactions`] would incur.
+    ///
+    /// Trust-parent: `message_reactions` is an unrestricted table (no owner
+    /// columns). Callers MUST pass only `message_ids` the caller has already
+    /// been authorized to read (the read handlers pass ids returned by an
+    /// already-scoped message read). `ctx` is retained for signature
+    /// stability + tracing. Messages with no reactions are absent from the map.
+    pub async fn list_for_messages(
+        &self,
+        ctx: &SecurityContext,
+        message_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<MessageReaction>>> {
+        let _ = ctx;
+        if message_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = self.reactions.list_by_messages(message_ids).await?;
+        let mut grouped: HashMap<Uuid, Vec<MessageReaction>> = HashMap::new();
+        for r in rows {
+            grouped.entry(r.message_id).or_default().push(r);
+        }
+        Ok(grouped)
     }
 
     /// Fire the `message.reaction` event to the backend plugin.
@@ -347,17 +387,20 @@ impl ReactionService {
     /// 404-on-cross-tenant rule mirrors ADR-0021 anti-enumeration.
     async fn validate_access_for_reaction_target(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         message_id: Uuid,
     ) -> Result<(Session, crate::domain::message::Message)> {
-        let session_row = self
-            .sessions
-            .find_by_id(&identity.tenant_id, &identity.user_id, session_id)
-            .await?
-            .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
-        let session = session_row;
+        // Reacting mutates the conversation, so it is gated as a SESSION update
+        // at parent granularity; the reaction row inherits the message's owner
+        // pair (stamped in the repo).
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        let (session, _scope) = self
+            .authorize_session(ctx, session_id, actions::UPDATE)
+            .await?;
 
+        // Trusted resolve of the target within the already-authorized session
+        // (existence + assistant-only check).
         let message = self
             .messages
             .find_message_in_session(session_id, message_id)
@@ -371,6 +414,47 @@ impl ReactionService {
         }
 
         Ok((session, message))
+    }
+
+    /// Trusted prefetch of a session by id, then the PDP decision for `action`.
+    /// Mirrors `SessionService::authorize_session_op`: the prefetched row is the
+    /// source of the owner pair passed to the PDP as ABAC input. A denied /
+    /// unreachable / uncompilable decision fails closed to `Forbidden` via the
+    /// `?`-converted `EnforcerError` (DESIGN §3.5.5).
+    // @cpt-cf-chat-engine-seq-authz-point-op
+    async fn authorize_session(
+        &self,
+        ctx: &SecurityContext,
+        session_id: Uuid,
+        action: &str,
+    ) -> Result<(Session, AccessScope)> {
+        // AUTHZ-BYPASS: system-internal owner-pair prefetch preceding the PDP
+        // decision that authorizes this op; scoped by session_id.
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let prefetch = self
+            .sessions
+            .find_by_id_scoped(&bypass::system_read_scope(), session_id)
+            .await?
+            .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
+
+        // @cpt-cf-chat-engine-interface-pep
+        let scope = self
+            .enforcer
+            .access_scope_with(
+                ctx,
+                &resource_types::SESSION,
+                action,
+                Some(session_id),
+                &AccessRequest::new()
+                    .resource_property(
+                        pep_properties::OWNER_TENANT_ID,
+                        prefetch.tenant_id.as_str(),
+                    )
+                    .resource_property(pep_properties::OWNER_ID, prefetch.user_id.as_str())
+                    .require_constraints(false),
+            )
+            .await?;
+        Ok((prefetch, scope))
     }
 }
 

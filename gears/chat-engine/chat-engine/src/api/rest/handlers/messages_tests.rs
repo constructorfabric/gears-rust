@@ -296,6 +296,7 @@ fn make_service() -> Arc<MessageService> {
         session_types as Arc<dyn SessionTypeRepo>,
         messages as Arc<dyn MessageRepo>,
         plugin_service,
+        crate::domain::service::test_support::enforcer_allow(),
     ))
 }
 

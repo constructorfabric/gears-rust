@@ -10,23 +10,22 @@
 
 use sea_orm::entity::prelude::*;
 use sea_orm::{Condition, QueryOrder, QuerySelect};
-use toolkit_db::secure::{AccessScope, DBRunner, SecureEntityExt};
+use toolkit_db::secure::{DBRunner, SecureEntityExt};
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
+use crate::domain::authz::bypass;
 use crate::domain::error::ChatEngineError;
 
-// Tenant / user scoping for parts is enforced via the owning `messages` row
-// (and in turn its `sessions` row); parts carry no scoping columns of their
-// own, so the entity is marked unrestricted and the repo always reaches them
-// through a message the caller has already authorized.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "message_parts")]
-#[secure(unrestricted)]
+#[secure(tenant_col = "owner_tenant_id", owner_col = "owner_id", resource_col = "id", no_type)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
     pub message_id: Uuid,
+    pub owner_tenant_id: Uuid,
+    pub owner_id: Uuid,
     pub r#type: MessagePartType,
     #[sea_orm(column_type = "JsonBinary")]
     pub content: serde_json::Value,
@@ -86,7 +85,9 @@ pub async fn compute_next_part_number<R>(
 where
     R: DBRunner,
 {
-    let scope = AccessScope::allow_all();
+    // AUTHZ-BYPASS: globally non-tenant compute helper (MAX(number)+1); scoped by explicit WHERE
+    // @cpt-cf-chat-engine-design-authz-bypass-registry
+    let scope = bypass::unrestricted_table_scope();
     let row = Entity::find()
         .order_by_desc(Column::Number)
         .limit(1)

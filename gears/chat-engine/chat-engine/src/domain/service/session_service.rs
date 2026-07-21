@@ -37,11 +37,15 @@ use uuid::Uuid;
 use chat_engine_sdk::models::{Capability, CapabilityValue, LifecycleState, TenantId, UserId};
 use chat_engine_sdk::plugin::{PluginCallContext, SessionPluginCtx};
 
+use crate::domain::authz::{actions, bypass, resource_types};
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::ports::{DEFAULT_SOFT_DELETE_RETENTION_DAYS, NewSession, SessionRepo};
 use crate::domain::ports::{NewSessionType, SessionTypeRepo};
 use crate::domain::service::plugin_service::PluginService;
 use crate::domain::service::webhook::{WebhookEmitter, WebhookEvent};
+use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer};
+use toolkit_security::{AccessScope, SecurityContext, pep_properties};
+
 use crate::domain::session::{
     RESERVED_METADATA_KEYS, Session, SessionType, ensure_can_transition, public_metadata,
 };
@@ -148,6 +152,7 @@ pub struct SessionService {
     /// Default per-plugin-call deadline; can be overridden per call site via
     /// [`SessionService::with_plugin_timeout`].
     plugin_timeout: Duration,
+    enforcer: PolicyEnforcer,
 }
 
 impl SessionService {
@@ -157,6 +162,7 @@ impl SessionService {
         session_types: Arc<dyn SessionTypeRepo>,
         plugins: PluginService,
         webhooks: Arc<dyn WebhookEmitter>,
+        enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             sessions,
@@ -164,6 +170,7 @@ impl SessionService {
             plugins,
             webhooks,
             plugin_timeout: DEFAULT_PLUGIN_CALL_TIMEOUT,
+            enforcer,
         }
     }
 
@@ -181,9 +188,27 @@ impl SessionService {
 
     pub async fn register_session_type(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         req: RegisterSessionTypeRequest,
     ) -> Result<SessionType> {
+        // @cpt-cf-chat-engine-design-auth-model
+        // session_type mutation is a PDP permission decision, not a SQL scope:
+        // `session_types` is a global unrestricted table (DESIGN §3.5.6). The
+        // returned scope is discarded — this is a pure allow/deny gate.
+        // Denied / unreachable / uncompilable PDP → 403 (fail-closed).
+        self.enforcer
+            .access_scope_with(
+                ctx,
+                &resource_types::SESSION_TYPE,
+                actions::CREATE,
+                None,
+                &AccessRequest::new().require_constraints(false),
+            )
+            .await?;
+
+        // Opaque tenant/user strings for the plugin call context below.
+        let identity = identity_from_ctx(ctx)?;
+
         if req.name.trim().is_empty() {
             return Err(ChatEngineError::bad_request(
                 "session-type name must not be empty",
@@ -285,13 +310,15 @@ impl SessionService {
         Ok(inserted)
     }
 
-    pub async fn list_session_types(&self, _identity: &Identity) -> Result<Vec<SessionType>> {
+    // session_type reads are `.authenticated()`-only — no PDP call (DESIGN §3.5.6).
+    pub async fn list_session_types(&self, _ctx: &SecurityContext) -> Result<Vec<SessionType>> {
         self.session_types.list().await
     }
 
+    // session_type reads are `.authenticated()`-only — no PDP call (DESIGN §3.5.6).
     pub async fn get_session_type(
         &self,
-        _identity: &Identity,
+        _ctx: &SecurityContext,
         session_type_id: Uuid,
     ) -> Result<SessionType> {
         let row = self
@@ -308,10 +335,13 @@ impl SessionService {
 
     pub async fn create_session(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         req: CreateSessionRequest,
     ) -> Result<Session> {
         reject_reserved_metadata(req.metadata.as_ref())?;
+        // Opaque tenant/user strings for plugin-call construction only; the
+        // authorization boundary is the enforcer / `SecurityContext` below.
+        let identity = identity_from_ctx(ctx)?;
 
         // Resolve session-type (if requested) before any write so we can
         // surface 404 cleanly.
@@ -328,18 +358,39 @@ impl SessionService {
         let session_id = Uuid::new_v4();
         let now = OffsetDateTime::now_utc();
 
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        // @cpt-cf-chat-engine-interface-pep
+        // CREATE stamps the owner pair (subject tenant/user) as ABAC input so
+        // the PDP can bind the row to its creator; the compiled scope is passed
+        // to the insert instead of a manual owner filter.
+        let scope = self
+            .enforcer
+            .access_scope_with(
+                ctx,
+                &resource_types::SESSION,
+                actions::CREATE,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id())
+                    .resource_property(pep_properties::OWNER_ID, ctx.subject_id()),
+            )
+            .await?;
+
         let inserted = self
             .sessions
-            .insert(NewSession {
-                session_id,
-                tenant_id: identity.tenant_id.clone(),
-                user_id: identity.user_id.clone(),
-                client_id: identity.client_id.clone(),
-                session_type_id: req.session_type_id,
-                metadata: req.metadata,
-                created_at: now,
-                updated_at: now,
-            })
+            .insert_scoped(
+                &scope,
+                NewSession {
+                    session_id,
+                    tenant_id: identity.tenant_id.clone(),
+                    user_id: identity.user_id.clone(),
+                    client_id: identity.client_id.clone(),
+                    session_type_id: req.session_type_id,
+                    metadata: req.metadata,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
             .await?;
         let inserted_id = inserted.session_id;
 
@@ -413,12 +464,7 @@ impl SessionService {
 
         let mut persisted = if let Some(caps) = enabled_capabilities {
             self.sessions
-                .update_capabilities(
-                    &identity.tenant_id,
-                    &identity.user_id,
-                    inserted_id,
-                    Some(caps),
-                )
+                .update_capabilities_scoped(&scope, inserted_id, Some(caps))
                 .await?
         } else {
             inserted
@@ -430,12 +476,7 @@ impl SessionService {
             let merged = merge_plugin_metadata(persisted.metadata.clone(), plugin_meta);
             persisted = self
                 .sessions
-                .update_metadata(
-                    &identity.tenant_id,
-                    &identity.user_id,
-                    inserted_id,
-                    Some(merged),
-                )
+                .update_metadata_scoped(&scope, inserted_id, Some(merged))
                 .await?;
         }
 
@@ -457,36 +498,50 @@ impl SessionService {
         Ok(redact_session(session))
     }
 
-    pub async fn get_session(&self, identity: &Identity, session_id: Uuid) -> Result<Session> {
-        let row = self
-            .sessions
-            .find_by_id(&identity.tenant_id, &identity.user_id, session_id)
-            .await?
-            .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
+    pub async fn get_session(&self, ctx: &SecurityContext, session_id: Uuid) -> Result<Session> {
+        let (prefetch, scope) = self
+            .authorize_session_op(ctx, session_id, actions::READ)
+            .await?;
+        // Unconstrained → PDP allowed with no row-level filter; return prefetch.
+        // Constrained → scoped re-read validates against the PDP constraints;
+        // 0 rows hides the row's existence from out-of-scope callers (NotFound).
+        let row = if scope.is_unconstrained() {
+            prefetch
+        } else {
+            self.sessions
+                .find_by_id_scoped(&scope, session_id)
+                .await?
+                .ok_or_else(|| ChatEngineError::not_found("session", session_id))?
+        };
         Ok(redact_session(row))
     }
 
     pub async fn list_sessions(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         query: &ODataQuery,
     ) -> Result<Page<Session>> {
-        let page = self
-            .sessions
-            .list_paginated(&identity.tenant_id, &identity.user_id, query)
+        // @cpt-cf-chat-engine-seq-authz-list
+        // @cpt-cf-chat-engine-interface-pep
+        let scope = self
+            .enforcer
+            .access_scope(ctx, &resource_types::SESSION, actions::LIST, None)
             .await?;
+        let page = self.sessions.list_scoped(&scope, query).await?;
         Ok(page.map_items(redact_session))
     }
 
     pub async fn update_metadata(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         metadata: JsonValue,
     ) -> Result<Session> {
         reject_reserved_metadata(Some(&metadata))?;
 
-        let row = self.load_modifiable(identity, session_id).await?;
+        let (row, scope) = self
+            .authorize_session_op(ctx, session_id, actions::UPDATE)
+            .await?;
         // Soft-deleted sessions cannot receive metadata writes per the spec.
         let state = row.lifecycle_state;
         if matches!(
@@ -500,23 +555,22 @@ impl SessionService {
 
         let updated = self
             .sessions
-            .update_metadata(
-                &identity.tenant_id,
-                &identity.user_id,
-                session_id,
-                Some(metadata),
-            )
+            .update_metadata_scoped(&scope, session_id, Some(metadata))
             .await?;
         Ok(redact_session(updated))
     }
 
     pub async fn update_capabilities(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         caps: Vec<CapabilityValue>,
     ) -> Result<Session> {
-        let row = self.load_modifiable(identity, session_id).await?;
+        // Opaque tenant/user strings for plugin-call construction only.
+        let identity = identity_from_ctx(ctx)?;
+        let (row, scope) = self
+            .authorize_session_op(ctx, session_id, actions::UPDATE)
+            .await?;
         let state = row.lifecycle_state;
         if matches!(
             state,
@@ -574,12 +628,7 @@ impl SessionService {
 
         let mut updated = self
             .sessions
-            .update_capabilities(
-                &identity.tenant_id,
-                &identity.user_id,
-                session_id,
-                Some(new_caps_json),
-            )
+            .update_capabilities_scoped(&scope, session_id, Some(new_caps_json))
             .await?;
 
         // Merge plugin-supplied metadata into the session metadata.
@@ -587,30 +636,27 @@ impl SessionService {
             let merged = merge_plugin_metadata(updated.metadata.clone(), plugin_meta);
             updated = self
                 .sessions
-                .update_metadata(
-                    &identity.tenant_id,
-                    &identity.user_id,
-                    session_id,
-                    Some(merged),
-                )
+                .update_metadata_scoped(&scope, session_id, Some(merged))
                 .await?;
         }
         Ok(redact_session(updated))
     }
 
-    pub async fn archive_session(&self, identity: &Identity, session_id: Uuid) -> Result<Session> {
-        let row = self.load_modifiable(identity, session_id).await?;
+    pub async fn archive_session(
+        &self,
+        ctx: &SecurityContext,
+        session_id: Uuid,
+    ) -> Result<Session> {
+        let identity = identity_from_ctx(ctx)?;
+        let (row, scope) = self
+            .authorize_session_op(ctx, session_id, actions::UPDATE)
+            .await?;
         let from = row.lifecycle_state;
         ensure_can_transition(from, LifecycleState::Archived)?;
 
         let updated = self
             .sessions
-            .update_lifecycle_state(
-                &identity.tenant_id,
-                &identity.user_id,
-                session_id,
-                LifecycleState::Archived,
-            )
+            .update_lifecycle_state_scoped(&scope, session_id, LifecycleState::Archived)
             .await?;
         self.webhooks
             .emit(WebhookEvent::SessionArchived {
@@ -623,8 +669,15 @@ impl SessionService {
         Ok(redact_session(updated))
     }
 
-    pub async fn restore_session(&self, identity: &Identity, session_id: Uuid) -> Result<Session> {
-        let row = self.load_modifiable(identity, session_id).await?;
+    pub async fn restore_session(
+        &self,
+        ctx: &SecurityContext,
+        session_id: Uuid,
+    ) -> Result<Session> {
+        let identity = identity_from_ctx(ctx)?;
+        let (row, scope) = self
+            .authorize_session_op(ctx, session_id, actions::UPDATE)
+            .await?;
         let from = row.lifecycle_state;
         ensure_can_transition(from, LifecycleState::Active)?;
 
@@ -636,7 +689,7 @@ impl SessionService {
         // query rather than the domain `Session`.
         let scheduled_hard_delete_at = self
             .sessions
-            .scheduled_hard_delete_at(&identity.tenant_id, &identity.user_id, session_id)
+            .scheduled_hard_delete_at_scoped(&scope, session_id)
             .await?;
         if let Some(scheduled) = scheduled_hard_delete_at
             && scheduled < OffsetDateTime::now_utc()
@@ -648,12 +701,7 @@ impl SessionService {
 
         let updated = self
             .sessions
-            .update_lifecycle_state(
-                &identity.tenant_id,
-                &identity.user_id,
-                session_id,
-                LifecycleState::Active,
-            )
+            .update_lifecycle_state_scoped(&scope, session_id, LifecycleState::Active)
             .await?;
         self.webhooks
             .emit(WebhookEvent::SessionRestored {
@@ -668,11 +716,14 @@ impl SessionService {
 
     pub async fn delete_session(
         &self,
-        identity: &Identity,
+        ctx: &SecurityContext,
         session_id: Uuid,
         hard: bool,
     ) -> Result<SessionDeleteOutcome> {
-        let row = self.load_modifiable(identity, session_id).await?;
+        let identity = identity_from_ctx(ctx)?;
+        let (row, scope) = self
+            .authorize_session_op(ctx, session_id, actions::DELETE)
+            .await?;
         let from = row.lifecycle_state;
         let target = if hard {
             LifecycleState::HardDeleted
@@ -682,6 +733,9 @@ impl SessionService {
         ensure_can_transition(from, target)?;
 
         if hard {
+            // `hard_delete` performs the message/reaction cascade and stays on
+            // the trusted (tenant, user) scope until Phase 7 (bypass registry);
+            // access is already gated by the PDP DELETE decision above.
             let removed = self
                 .sessions
                 .hard_delete(&identity.tenant_id, &identity.user_id, session_id)
@@ -704,12 +758,7 @@ impl SessionService {
             let retention_days = DEFAULT_SOFT_DELETE_RETENTION_DAYS;
             let updated = self
                 .sessions
-                .soft_delete(
-                    &identity.tenant_id,
-                    &identity.user_id,
-                    session_id,
-                    retention_days,
-                )
+                .soft_delete_scoped(&scope, session_id, retention_days)
                 .await?;
             // Plugin notification for soft-delete is best-effort — the
             // current SDK trait (`ChatEngineBackendPlugin`) does NOT expose
@@ -736,11 +785,51 @@ impl SessionService {
     // Internals
     // ---------------------------------------------------------------------
 
-    async fn load_modifiable(&self, identity: &Identity, session_id: Uuid) -> Result<Session> {
-        self.sessions
-            .find_by_id(&identity.tenant_id, &identity.user_id, session_id)
+    /// Trusted prefetch of a session by id, followed by the PDP decision for
+    /// `action`. Returns the prefetched row (source of the owner pair passed to
+    /// the PDP as ABAC input) plus the compiled [`AccessScope`]. A denied,
+    /// unreachable, or uncompilable PDP decision fails closed to `Forbidden`
+    /// via the `?`-converted `EnforcerError` (DESIGN §3.5.5).
+    ///
+    /// `require_constraints(false)` lets the PDP answer allow/deny without
+    /// mandating row-level constraints: an unconstrained scope means "allowed,
+    /// no filter" (caller may use the prefetch); a constrained scope drives a
+    /// scoped re-read / mutation whose 0-row outcome maps to `NotFound`.
+    // @cpt-cf-chat-engine-seq-authz-point-op
+    async fn authorize_session_op(
+        &self,
+        ctx: &SecurityContext,
+        session_id: Uuid,
+        action: &str,
+    ) -> Result<(Session, AccessScope)> {
+        // AUTHZ-BYPASS: system-internal owner-pair prefetch preceding the PDP
+        // decision that authorizes this op; scoped by session_id.
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let prefetch = self
+            .sessions
+            .find_by_id_scoped(&bypass::system_read_scope(), session_id)
             .await?
-            .ok_or_else(|| ChatEngineError::not_found("session", session_id))
+            .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
+
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        // @cpt-cf-chat-engine-interface-pep
+        let scope = self
+            .enforcer
+            .access_scope_with(
+                ctx,
+                &resource_types::SESSION,
+                action,
+                Some(session_id),
+                &AccessRequest::new()
+                    .resource_property(
+                        pep_properties::OWNER_TENANT_ID,
+                        prefetch.tenant_id.as_str(),
+                    )
+                    .resource_property(pep_properties::OWNER_ID, prefetch.user_id.as_str())
+                    .require_constraints(false),
+            )
+            .await?;
+        Ok((prefetch, scope))
     }
 
     /// Run a plugin call future against the cancellation token + deadline
@@ -766,6 +855,22 @@ impl SessionService {
 }
 
 // ---------------- Free helpers used by tests + handlers ----------------
+
+/// Build a service [`Identity`] from the JWT-derived [`SecurityContext`] for
+/// plugin-call construction only. The authorization boundary is the enforcer /
+/// `SecurityContext`; this helper just carries the opaque tenant/user strings
+/// plugins expect. Anonymous contexts (nil subject/tenant) are rejected with
+/// `Forbidden`.
+pub(crate) fn identity_from_ctx(ctx: &SecurityContext) -> Result<Identity> {
+    let tenant = ctx.subject_tenant_id();
+    let user = ctx.subject_id();
+    if tenant.is_nil() || user.is_nil() {
+        return Err(ChatEngineError::forbidden(
+            "authenticated identity required (tenant_id and user_id must be present in the bearer token)",
+        ));
+    }
+    Identity::new(tenant.to_string(), user.to_string(), None)
+}
 
 /// Reject metadata payloads that try to write a reserved key. Centralised so
 /// every handler/service entry point applies the same rule (per ADR-0017).
