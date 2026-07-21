@@ -43,6 +43,13 @@ fn trait_is_object_safe() {
         ) -> Result<Vec<MessageReaction>, ChatEngineError> {
             Ok(Vec::new())
         }
+
+        async fn list_by_messages(
+            &self,
+            _message_ids: &[Uuid],
+        ) -> Result<Vec<MessageReaction>, ChatEngineError> {
+            Ok(Vec::new())
+        }
     }
 
     let _: std::sync::Arc<dyn ReactionRepo> = std::sync::Arc::new(Stub);

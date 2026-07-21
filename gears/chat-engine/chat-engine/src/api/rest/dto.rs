@@ -286,6 +286,11 @@ pub struct MessageDto {
     pub is_complete: bool,
     pub is_hidden_from_user: bool,
     pub is_hidden_from_backend: bool,
+    /// Reactions on this message, hydrated by the read handlers in one batch
+    /// query. Omitted from the wire when empty so the field is additive and
+    /// backward-compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<ReactionDto>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -307,9 +312,21 @@ impl From<SdkMessage> for MessageDto {
             is_complete: m.is_complete,
             is_hidden_from_user: m.is_hidden_from_user,
             is_hidden_from_backend: m.is_hidden_from_backend,
+            reactions: Vec::new(),
             created_at: m.created_at,
             updated_at: m.updated_at,
         }
+    }
+}
+
+impl MessageDto {
+    /// Attach a pre-hydrated reaction list to this message DTO. The read
+    /// handlers batch-load reactions for the whole page and zip them in via
+    /// this builder (the `From<SdkMessage>` conversion starts them empty).
+    #[must_use]
+    pub fn with_reactions(mut self, reactions: Vec<ReactionDto>) -> Self {
+        self.reactions = reactions;
+        self
     }
 }
 
@@ -454,7 +471,10 @@ pub struct ReactionRequestDto {
 }
 
 /// Single reaction record.
-#[api_dto(response)]
+///
+/// `request, response`: response-shaped, but embedded in `MessageDto`
+/// (`request, response`), so it must also derive `Deserialize`.
+#[api_dto(request, response)]
 #[derive(Debug, Clone)]
 pub struct ReactionDto {
     pub kind: String,

@@ -43,6 +43,7 @@
 // @cpt-cf-chat-engine-reaction-service:p9
 // @cpt-cf-chat-engine-adr-message-reactions:p9
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -242,25 +243,43 @@ impl ReactionService {
         session_id: Uuid,
         message_id: Uuid,
     ) -> Result<ReactionsListing> {
-        let _ = session_id;
-        // @cpt-cf-chat-engine-seq-authz-list
-        // @cpt-cf-chat-engine-interface-pep
-        // REACTION list: the PDP returns owner constraints; the scoped query
-        // filters to the caller's owned reactions. A non-owned message simply
-        // yields an empty list (anti-enumeration) — the capability gate stays
-        // read-bypassed so historical reactions remain visible.
-        let scope = self
-            .enforcer
-            .access_scope(ctx, &resource_types::REACTION, actions::LIST, None)
-            .await?;
-        let reactions = self
-            .reactions
-            .list_by_message_scoped(&scope, message_id)
-            .await?;
+        // Trust-parent: `message_reactions` is an unrestricted table with no
+        // owner columns. Callers authorize the parent message in the same
+        // request (set_reaction authorizes before echoing the list); ctx /
+        // session_id are retained for signature stability + tracing.
+        let _ = (ctx, session_id);
+        let reactions = self.reactions.list_by_message(message_id).await?;
         Ok(ReactionsListing {
             message_id,
             reactions,
         })
+    }
+
+    /// Reactions for a batch of messages, grouped by `message_id`.
+    ///
+    /// Hydrates a whole conversation page in one query, avoiding the N+1
+    /// fan-out that per-message [`Self::list_reactions`] would incur.
+    ///
+    /// Trust-parent: `message_reactions` is an unrestricted table (no owner
+    /// columns). Callers MUST pass only `message_ids` the caller has already
+    /// been authorized to read (the read handlers pass ids returned by an
+    /// already-scoped message read). `ctx` is retained for signature
+    /// stability + tracing. Messages with no reactions are absent from the map.
+    pub async fn list_for_messages(
+        &self,
+        ctx: &SecurityContext,
+        message_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<MessageReaction>>> {
+        let _ = ctx;
+        if message_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = self.reactions.list_by_messages(message_ids).await?;
+        let mut grouped: HashMap<Uuid, Vec<MessageReaction>> = HashMap::new();
+        for r in rows {
+            grouped.entry(r.message_id).or_default().push(r);
+        }
+        Ok(grouped)
     }
 
     /// Fire the `message.reaction` event to the backend plugin.

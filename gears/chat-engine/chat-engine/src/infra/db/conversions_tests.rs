@@ -122,8 +122,6 @@ fn reaction_model_to_domain_unknown_value_collapses_to_none() {
     let model = reaction_entity::Model {
         message_id: Uuid::nil(),
         user_id: Uuid::nil(),
-        owner_tenant_id: Uuid::nil(),
-        owner_id: Uuid::nil(),
         reaction_type: "purple_heart".into(),
         created_at: now,
         updated_at: now,

@@ -297,14 +297,19 @@ impl ReactionRepo for StubReactionRepo {
         Ok(self.list_returns.lock().clone())
     }
 
-    // Scoped (Phase 4) read used by list_reactions under a permissive
-    // enforcer: ignore the scope, return the seeded reactions.
-    async fn list_by_message_scoped(
+    // Batch (trust-parent) read used by list_for_messages: return the seeded
+    // reactions whose message_id is in the requested set.
+    async fn list_by_messages(
         &self,
-        _scope: &AccessScope,
-        _message_id: Uuid,
+        message_ids: &[Uuid],
     ) -> std::result::Result<Vec<MessageReaction>, ChatEngineError> {
-        Ok(self.list_returns.lock().clone())
+        Ok(self
+            .list_returns
+            .lock()
+            .iter()
+            .filter(|r| message_ids.contains(&r.message_id))
+            .cloned()
+            .collect())
     }
 }
 
@@ -553,6 +558,73 @@ async fn list_reactions_bypasses_capability_gate() {
 }
 
 #[tokio::test]
+async fn list_for_messages_groups_reactions_by_message_id() {
+    let session_id = Uuid::new_v4();
+    let m1 = Uuid::new_v4();
+    let m2 = Uuid::new_v4();
+    let m3 = Uuid::new_v4(); // requested but has no reactions
+    let now = OffsetDateTime::now_utc();
+    let seeded = vec![
+        MessageReaction {
+            message_id: m1,
+            user_id: "u".into(),
+            reaction_type: ReactionType::Like,
+            created_at: now,
+            updated_at: now,
+        },
+        MessageReaction {
+            message_id: m1,
+            user_id: "v".into(),
+            reaction_type: ReactionType::Dislike,
+            created_at: now,
+            updated_at: now,
+        },
+        MessageReaction {
+            message_id: m2,
+            user_id: "u".into(),
+            reaction_type: ReactionType::Like,
+            created_at: now,
+            updated_at: now,
+        },
+    ];
+    let repo = Arc::new(StubReactionRepo {
+        list_returns: Mutex::new(seeded),
+        ..Default::default()
+    });
+    let session = make_session("t", "u", session_id, None);
+    let svc = make_service(
+        StubSessionRepo::new(session),
+        StubMessageRepo::assistant(session_id, m1),
+        repo,
+    );
+
+    let map = svc
+        .list_for_messages(&make_ctx(), &[m1, m2, m3])
+        .await
+        .expect("ok");
+
+    assert_eq!(map.get(&m1).map(Vec::len), Some(2));
+    assert_eq!(map.get(&m2).map(Vec::len), Some(1));
+    assert!(
+        !map.contains_key(&m3),
+        "messages with no reactions are absent"
+    );
+}
+
+#[tokio::test]
+async fn list_for_messages_empty_input_short_circuits() {
+    let session = make_session("t", "u", Uuid::new_v4(), None);
+    let svc = make_service(
+        StubSessionRepo::new(session),
+        StubMessageRepo::assistant(Uuid::new_v4(), Uuid::new_v4()),
+        Arc::new(StubReactionRepo::default()),
+    );
+
+    let map = svc.list_for_messages(&make_ctx(), &[]).await.expect("ok");
+    assert!(map.is_empty());
+}
+
+#[tokio::test]
 async fn list_reactions_unknown_message_returns_empty() {
     let session_id = Uuid::new_v4();
     let session = make_session(
@@ -623,10 +695,10 @@ fn ensure_feedback_capability_rejects_when_array_missing() {
 
 // --------------------------- Authz (PEP) tests ------------------------
 //
-// The reaction mutation path gates on the parent SESSION (UPDATE); the read
-// path gates on REACTION (LIST). All enforcer failure modes — an explicit
-// PDP deny, an evaluation error, or a policy compile error — fail closed to
-// `Forbidden` (HTTP 403) via `From<EnforcerError>`.
+// The reaction mutation path gates on the parent SESSION (UPDATE). All enforcer
+// failure modes — an explicit PDP deny, an evaluation error, or a policy compile
+// error — fail closed to `Forbidden` (HTTP 403) via `From<EnforcerError>`.
+// The read path is trust-parent (unrestricted table, no PDP call).
 // @cpt-cf-chat-engine-interface-pep
 
 fn authz_fixture(
@@ -669,33 +741,19 @@ async fn delete_reaction_pdp_denied_returns_forbidden() {
     assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
 }
 
-#[tokio::test]
-async fn list_reactions_pdp_denied_returns_forbidden() {
-    let (svc, session_id, message_id) = authz_fixture(test_support::enforcer_deny());
-    let res = svc.list_reactions(&make_ctx(), session_id, message_id).await;
-    assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
-}
+// NOTE: `list_reactions` used to gate on REACTION (LIST) via the PDP. Reactions
+// are now an unrestricted, trust-parent table (no owner columns): the read path
+// no longer calls the enforcer — callers authorize the parent message in the
+// same request (set_reaction authorizes before echoing; the batch reader is fed
+// ids from an already-scoped message read). The former
+// `list_reactions_{pdp_denied,evaluation_failed,compile_failed}_returns_forbidden`
+// tests were removed with that gate; the mutation-path PDP tests above stay.
 
 #[tokio::test]
-async fn list_reactions_evaluation_failed_returns_forbidden() {
-    let (svc, session_id, message_id) = authz_fixture(test_support::enforcer_failing());
-    let res = svc.list_reactions(&make_ctx(), session_id, message_id).await;
-    assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
-}
-
-#[tokio::test]
-async fn list_reactions_compile_failed_returns_forbidden() {
-    let (svc, session_id, message_id) = authz_fixture(test_support::enforcer_compile_fail());
-    let res = svc.list_reactions(&make_ctx(), session_id, message_id).await;
-    assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
-}
-
-#[tokio::test]
-async fn list_reactions_real_db_scoped_read_returns_empty() {
-    // Exercise the real secure-ORM read path (`list_by_message_scoped` over
-    // in-memory SQLite): a tenant with no reactions gets an empty, non-error
-    // listing — the PDP owner constraints compile into a live query that
-    // executes end to end.
+async fn list_reactions_real_db_read_returns_empty() {
+    // Exercise the real read path (`list_by_message` over in-memory SQLite):
+    // a message with no reactions gets an empty, non-error listing — the
+    // unrestricted query (post owner-column drop) executes end to end.
     let db = test_support::inmem_db().await;
     let svc = test_support::build_reaction_service(&db, test_support::enforcer_allow());
     let ctx = test_support::ctx_allow_tenants(&[Uuid::new_v4()]);

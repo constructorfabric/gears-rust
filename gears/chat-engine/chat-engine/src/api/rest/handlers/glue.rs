@@ -32,7 +32,7 @@ use crate::api::rest::sse_delta_stream_response;
 use crate::api::rest::stream_reader::sse_buffer_reader_response;
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::ports::StreamEventBuffer;
-use crate::domain::reaction::ReactionType;
+use crate::domain::reaction::{MessageReaction, ReactionType};
 use crate::domain::search::SearchQuery;
 use crate::domain::service::message_service::SendMessageRequest;
 use crate::domain::service::{
@@ -51,6 +51,18 @@ fn capabilities_into_sdk(
     caps: Option<Vec<crate::api::rest::dto::CapabilityValueDto>>,
 ) -> Option<Vec<CapabilityValue>> {
     caps.map(|c| c.into_iter().map(CapabilityValue::from).collect())
+}
+
+/// Project a domain reaction onto the wire DTO. Mirrors the mapping used by
+/// `set_reaction` so the message-embedded and mutation-echo shapes stay in
+/// sync.
+fn reaction_to_dto(r: MessageReaction) -> ReactionDto {
+    ReactionDto {
+        kind: r.reaction_type.as_str().to_string(),
+        value: None,
+        user_id: r.user_id,
+        created_at: r.created_at,
+    }
 }
 
 /// `POST /chat-engine/v1/sessions/{id}/messages` — send a user message and
@@ -75,30 +87,54 @@ pub async fn send_message_in_session(
 }
 
 /// `GET /chat-engine/v1/sessions/{id}/messages` — list the active path.
-#[tracing::instrument(skip(svc, ctx, query), fields(session_id = %session_id))]
+#[tracing::instrument(skip(svc, ctx, reactions, query), fields(session_id = %session_id))]
 pub async fn list_messages(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<MessageService>>,
+    Extension(reactions): Extension<Arc<ReactionService>>,
     Path(session_id): Path<Uuid>,
     Query(query): Query<ListMessagesQuery>,
 ) -> Result<Json<MessageListDto>> {
     let messages = svc
         .list_active_messages(&ctx, session_id, query.parent_message_id)
         .await?;
+    // Batch-hydrate reactions for the whole page in one query (avoids N+1).
+    let ids: Vec<Uuid> = messages.iter().map(|m| m.message_id).collect();
+    let mut by_message = reactions.list_for_messages(&ctx, &ids).await?;
     Ok(Json(MessageListDto {
-        items: messages.into_iter().map(MessageDto::from).collect(),
+        items: messages
+            .into_iter()
+            .map(|m| {
+                let rx = by_message
+                    .remove(&m.message_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(reaction_to_dto)
+                    .collect();
+                MessageDto::from(m).with_reactions(rx)
+            })
+            .collect(),
     }))
 }
 
 /// `GET /chat-engine/v1/messages/{id}` — fetch a single owned message.
-#[tracing::instrument(skip(svc, ctx), fields(message_id = %message_id))]
+#[tracing::instrument(skip(svc, ctx, reactions), fields(message_id = %message_id))]
 pub async fn get_message(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<MessageService>>,
+    Extension(reactions): Extension<Arc<ReactionService>>,
     Path(message_id): Path<Uuid>,
 ) -> Result<Json<MessageDto>> {
     let message = svc.resolve_owned_message(&ctx, message_id).await?;
-    Ok(Json(MessageDto::from(message)))
+    let rx = reactions
+        .list_for_messages(&ctx, &[message.message_id])
+        .await?
+        .remove(&message.message_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(reaction_to_dto)
+        .collect();
+    Ok(Json(MessageDto::from(message).with_reactions(rx)))
 }
 
 /// `GET /chat-engine/v1/messages/{id}/stream` — (re)attach to an assistant

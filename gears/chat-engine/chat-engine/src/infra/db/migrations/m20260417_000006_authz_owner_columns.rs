@@ -16,10 +16,14 @@ use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;
 
 /// Child tables that receive owner_tenant_id / owner_id columns.
-const OWNER_CHILD_TABLES: [&str; 6] = [
+///
+/// `message_reactions` is intentionally excluded: it is an unrestricted,
+/// trust-parent table (row access governed by parent-message authorization),
+/// so it carries no owner columns. Its `user_id` cast to UUID below is a
+/// separate concern (reactor identity / storage consistency), not scoping.
+const OWNER_CHILD_TABLES: [&str; 5] = [
     "messages",
     "message_parts",
-    "message_reactions",
     "file_citations",
     "link_citations",
     "link_references",
@@ -271,30 +275,6 @@ impl MigrationTrait for Migration {
                     }
                 }
 
-                // message_reactions ← messages
-                db.execute_unprepared(
-                    "UPDATE message_reactions mr \
-                     SET owner_tenant_id = m.owner_tenant_id, \
-                         owner_id        = m.owner_id \
-                     FROM messages m \
-                     WHERE mr.message_id = m.message_id",
-                )
-                .await?;
-
-                let orphans: i64 = db
-                    .query_one(sea_orm_migration::sea_orm::Statement::from_string(
-                        backend,
-                        "SELECT COUNT(*) AS cnt FROM message_reactions \
-                         WHERE owner_tenant_id IS NULL",
-                    ))
-                    .await?
-                    .map(|r| r.try_get::<i64>("", "cnt").unwrap_or(0))
-                    .unwrap_or(0);
-                if orphans > 0 {
-                    return Err(DbErr::Custom(format!(
-                        "Migration aborted: {orphans} orphan row(s) in `message_reactions`."
-                    )));
-                }
             }
             sea_orm::DatabaseBackend::Sqlite => {
                 // SQLite does not support UPDATE ... FROM; use correlated subquery.
@@ -369,27 +349,6 @@ impl MigrationTrait for Migration {
                     }
                 }
 
-                // message_reactions ← messages
-                db.execute_unprepared(
-                    "UPDATE message_reactions SET \
-                     owner_tenant_id = (SELECT owner_tenant_id FROM messages WHERE messages.message_id = message_reactions.message_id), \
-                     owner_id        = (SELECT owner_id        FROM messages WHERE messages.message_id = message_reactions.message_id)",
-                )
-                .await?;
-
-                let orphans: i64 = db
-                    .query_one(sea_orm_migration::sea_orm::Statement::from_string(
-                        backend,
-                        "SELECT COUNT(*) AS cnt FROM message_reactions WHERE owner_tenant_id IS NULL",
-                    ))
-                    .await?
-                    .map(|r| r.try_get::<i64>("", "cnt").unwrap_or(0))
-                    .unwrap_or(0);
-                if orphans > 0 {
-                    return Err(DbErr::Custom(format!(
-                        "Migration aborted: {orphans} orphan row(s) in `message_reactions`."
-                    )));
-                }
             }
             sea_orm::DatabaseBackend::MySql => {
                 return Err(DbErr::Custom(
@@ -424,9 +383,8 @@ impl MigrationTrait for Migration {
         }
 
         // Named composite indexes on owner pair for each child table.
-        let index_specs: [(&str, &str); 6] = [
+        let index_specs: [(&str, &str); 5] = [
             ("idx_messages_owner", "messages"),
-            ("idx_reactions_owner", "message_reactions"),
             ("idx_parts_owner", "message_parts"),
             ("idx_file_citations_owner", "file_citations"),
             ("idx_link_citations_owner", "link_citations"),
@@ -454,12 +412,11 @@ impl MigrationTrait for Migration {
         let backend = manager.get_database_backend();
 
         // Drop child-table owner indexes in reverse order.
-        let index_specs: [(&str, &str); 6] = [
+        let index_specs: [(&str, &str); 5] = [
             ("idx_link_references_owner", "link_references"),
             ("idx_link_citations_owner", "link_citations"),
             ("idx_file_citations_owner", "file_citations"),
             ("idx_parts_owner", "message_parts"),
-            ("idx_reactions_owner", "message_reactions"),
             ("idx_messages_owner", "messages"),
         ];
 
