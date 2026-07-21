@@ -47,7 +47,6 @@ gears/llm-gateway/
 │   ├── DESIGN.md
 │   └── ADR/
 ├── llm-gateway-sdk/         # Public API traits, models, errors
-│   └── schemas/             # GTS domain model schemas
 ├── llm-gateway/             # Core gear implementation (planned)
 └── plugins/                 # (planned)
     ├── providers/
@@ -69,7 +68,7 @@ gears/llm-gateway/
 
 - [PRD.md](docs/PRD.md) — Product requirements, use cases, acceptance criteria
 - [DESIGN.md](docs/DESIGN.md) — Technical architecture, components, sequence diagrams
-- API.md — SDK traits, request/response models, errors `TODO`
+- API.md — SDK traits, request/response models, errors (see [`llm-gateway-sdk/src/lib.rs`](llm-gateway-sdk/src/lib.rs) for rustdoc)
 - PROVIDERS.md — Provider abstraction, capability matrix `TODO`
 - CONFIGURATION.md — Gateway and plugin configuration `TODO`
 
