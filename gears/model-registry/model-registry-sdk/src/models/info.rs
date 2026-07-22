@@ -208,6 +208,7 @@ mod tests {
     use std::collections::HashSet;
 
     use gts::GtsSchema;
+    use toolkit_gts::gts_id;
 
     use crate::models::{
         ContextWindow, DefaultInferenceParametersV1, DisabledCapabilities, MediaCapability,
@@ -333,7 +334,7 @@ mod tests {
     #[test]
     fn try_into_typed_fails_on_schema_id_mismatch() {
         let info = raw_info(
-            "gts.cf.genai.model.info.v1~cf.genai._.anthropic.v1~",
+            gts_id!("cf.genai.model.info.v1~cf.genai._.anthropic.v1~"),
             serde_json::json!({ "oagw_alias": "openai-prod" }),
         );
         let err = info
