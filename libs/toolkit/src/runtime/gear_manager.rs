@@ -93,6 +93,8 @@ pub struct GearInstance {
     pub control: Option<Endpoint>,
     pub grpc_services: HashMap<String, Endpoint>,
     pub version: Option<String>,
+    pub rest_endpoint: Option<Endpoint>,
+    pub openapi_spec: Option<String>,
     inner: Arc<parking_lot::RwLock<InstanceRuntimeState>>,
 }
 
@@ -104,6 +106,8 @@ impl Clone for GearInstance {
             control: self.control.clone(),
             grpc_services: self.grpc_services.clone(),
             version: self.version.clone(),
+            rest_endpoint: self.rest_endpoint.clone(),
+            openapi_spec: self.openapi_spec.clone(),
             inner: Arc::clone(&self.inner),
         }
     }
@@ -117,6 +121,8 @@ impl GearInstance {
             control: None,
             grpc_services: HashMap::new(),
             version: None,
+            rest_endpoint: None,
+            openapi_spec: None,
             inner: Arc::new(parking_lot::RwLock::new(InstanceRuntimeState {
                 last_heartbeat: Instant::now(),
                 state: InstanceState::Registered,
@@ -136,6 +142,16 @@ impl GearInstance {
 
     pub fn with_grpc_service(mut self, name: impl Into<String>, ep: Endpoint) -> Self {
         self.grpc_services.insert(name.into(), ep);
+        self
+    }
+
+    pub fn with_rest_endpoint(mut self, ep: Endpoint) -> Self {
+        self.rest_endpoint = Some(ep);
+        self
+    }
+
+    pub fn with_openapi_spec(mut self, spec: impl Into<String>) -> Self {
+        self.openapi_spec = Some(spec.into());
         self
     }
 
@@ -264,6 +280,7 @@ impl GearManager {
         if remove_gear {
             self.inner.remove(gear);
             self.rr_counters.remove(gear);
+            self.rr_counters.remove(&format!("rest:{gear}"));
         }
     }
 
@@ -317,6 +334,7 @@ impl GearManager {
         for gear in empty_gears {
             self.inner.remove(&gear);
             self.rr_counters.remove(&gear);
+            self.rr_counters.remove(&format!("rest:{gear}"));
         }
     }
 
@@ -388,6 +406,59 @@ impl GearManager {
         *counter = (*counter + 1) % len;
 
         candidates.get(idx).cloned()
+    }
+
+    /// Resolve a REST endpoint for a gear using round-robin over instances that
+    /// expose one, preferring healthy/ready instances.
+    #[must_use]
+    pub fn pick_rest_endpoint_round_robin(&self, gear: &str) -> Option<Endpoint> {
+        let instances_entry = self.inner.get(gear)?;
+        let instances = instances_entry.value();
+
+        // Only instances that actually expose a REST endpoint are candidates.
+        let with_rest: Vec<_> = instances
+            .iter()
+            .filter(|inst| inst.rest_endpoint.is_some())
+            .cloned()
+            .collect();
+
+        if with_rest.is_empty() {
+            return None;
+        }
+
+        // Prefer healthy/ready instances, otherwise fall back to any with REST.
+        let healthy: Vec<_> = with_rest
+            .iter()
+            .filter(|inst| matches!(inst.state(), InstanceState::Healthy | InstanceState::Ready))
+            .cloned()
+            .collect();
+
+        let candidates = if healthy.is_empty() {
+            with_rest
+        } else {
+            healthy
+        };
+
+        let len = candidates.len();
+        let rr_key = format!("rest:{gear}");
+        let mut counter = self.rr_counters.entry(rr_key).or_insert(0);
+        let idx = *counter % len;
+        *counter = (*counter + 1) % len;
+
+        candidates
+            .get(idx)
+            .and_then(|inst| inst.rest_endpoint.clone())
+    }
+
+    /// Retrieve the `OpenAPI` spec of a gear, taken from the first registered
+    /// instance that published one.
+    #[must_use]
+    pub fn openapi_spec_of(&self, gear: &str) -> Option<String> {
+        let instances_entry = self.inner.get(gear)?;
+        instances_entry
+            .value()
+            .iter()
+            .find_map(|inst| inst.openapi_spec.clone())
     }
 }
 
@@ -686,6 +757,64 @@ mod tests {
     }
 
     #[test]
+    fn test_pick_rest_endpoint_and_openapi() {
+        let dir = GearManager::new();
+        let id = Uuid::new_v4();
+        let instance = Arc::new(
+            GearInstance::new("billing", id)
+                .with_rest_endpoint(Endpoint::http("billing", 8080))
+                .with_openapi_spec("{\"openapi\":\"3.1.0\"}"),
+        );
+        dir.register_instance(instance);
+
+        let rest = dir.pick_rest_endpoint_round_robin("billing").unwrap();
+        assert_eq!(rest.uri, "http://billing:8080");
+
+        let spec = dir.openapi_spec_of("billing").unwrap();
+        assert!(spec.contains("openapi"));
+    }
+
+    #[test]
+    fn test_pick_rest_endpoint_none_when_absent() {
+        let dir = GearManager::new();
+        let id = Uuid::new_v4();
+        // Instance exposes only a gRPC service, no REST endpoint.
+        let instance = Arc::new(
+            GearInstance::new("grpc_only", id)
+                .with_grpc_service("some.Service", Endpoint::http("127.0.0.1", 9000)),
+        );
+        dir.register_instance(instance);
+
+        assert!(dir.pick_rest_endpoint_round_robin("grpc_only").is_none());
+        assert!(dir.openapi_spec_of("grpc_only").is_none());
+        assert!(dir.pick_rest_endpoint_round_robin("missing").is_none());
+    }
+
+    #[test]
+    fn test_pick_rest_endpoint_round_robin_rotates() {
+        let dir = GearManager::new();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let inst1 = Arc::new(
+            GearInstance::new("web", id1).with_rest_endpoint(Endpoint::http("127.0.0.1", 8001)),
+        );
+        let inst2 = Arc::new(
+            GearInstance::new("web", id2).with_rest_endpoint(Endpoint::http("127.0.0.1", 8002)),
+        );
+        dir.register_instance(inst1);
+        dir.register_instance(inst2);
+        dir.update_heartbeat("web", id1, Instant::now());
+        dir.update_heartbeat("web", id2, Instant::now());
+
+        let ep1 = dir.pick_rest_endpoint_round_robin("web").unwrap();
+        let ep2 = dir.pick_rest_endpoint_round_robin("web").unwrap();
+        let ep3 = dir.pick_rest_endpoint_round_robin("web").unwrap();
+
+        assert_ne!(ep1, ep2);
+        assert_eq!(ep1, ep3);
+    }
+
+    #[test]
     fn test_pick_service_round_robin() {
         let dir = GearManager::new();
 
@@ -727,5 +856,65 @@ mod tests {
         assert_ne!(inst1.instance_id, inst2.instance_id);
         // Endpoints should differ
         assert_ne!(ep1, ep2);
+    }
+
+    #[test]
+    fn test_deregister_clears_rr_counters() {
+        let dir = GearManager::new();
+        let id = Uuid::new_v4();
+        let instance = Arc::new(
+            GearInstance::new("web", id).with_rest_endpoint(Endpoint::http("127.0.0.1", 8001)),
+        );
+        dir.register_instance(instance);
+        dir.update_heartbeat("web", id, Instant::now());
+
+        // Exercise both round-robin counters so the keys are created.
+        assert!(dir.pick_instance_round_robin("web").is_some());
+        assert!(dir.pick_rest_endpoint_round_robin("web").is_some());
+
+        assert!(dir.rr_counters.contains_key("web"));
+        assert!(dir.rr_counters.contains_key("rest:web"));
+
+        dir.deregister("web", id);
+
+        assert!(!dir.rr_counters.contains_key("web"));
+        assert!(!dir.rr_counters.contains_key("rest:web"));
+    }
+
+    #[test]
+    fn test_evict_stale_clears_rr_counters() {
+        let ttl = Duration::from_millis(50);
+        let grace = Duration::from_millis(50);
+        let dir = GearManager::new().with_heartbeat_policy(ttl, grace);
+
+        let now = Instant::now();
+        let id = Uuid::new_v4();
+        let instance = Arc::new(
+            GearInstance::new("web", id).with_rest_endpoint(Endpoint::http("127.0.0.1", 8001)),
+        );
+        // Set the last heartbeat to be stale so the instance is quarantined then evicted.
+        instance.inner.write().last_heartbeat = now
+            .checked_sub(ttl)
+            .and_then(|t| t.checked_sub(Duration::from_millis(10)))
+            .expect("test duration subtraction should not underflow");
+
+        dir.register_instance(instance);
+        assert!(dir.pick_rest_endpoint_round_robin("web").is_some());
+
+        assert!(dir.rr_counters.contains_key("rest:web"));
+
+        // First eviction pass quarantines the stale instance.
+        dir.evict_stale(now);
+        let instances = dir.instances_of("web");
+        assert_eq!(instances.len(), 1);
+        assert!(matches!(instances[0].state(), InstanceState::Quarantined));
+
+        // Second pass evicts quarantined instances that exceeded the grace period.
+        let later = now + grace + Duration::from_millis(10);
+        dir.evict_stale(later);
+
+        assert!(dir.instances_of("web").is_empty());
+        assert!(!dir.rr_counters.contains_key("web"));
+        assert!(!dir.rr_counters.contains_key("rest:web"));
     }
 }

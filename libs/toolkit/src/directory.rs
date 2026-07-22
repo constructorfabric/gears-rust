@@ -37,6 +37,20 @@ impl DirectoryClient for LocalDirectoryClient {
         anyhow::bail!("Service not found or no healthy instances: {service_name}")
     }
 
+    async fn resolve_rest_service(&self, gear_name: &str) -> Result<ServiceEndpoint> {
+        if let Some(ep) = self.mgr.pick_rest_endpoint_round_robin(gear_name) {
+            return Ok(ServiceEndpoint::new(ep.uri));
+        }
+
+        anyhow::bail!("No REST endpoint registered for gear: {gear_name}")
+    }
+
+    async fn get_openapi_spec(&self, gear_name: &str) -> Result<String> {
+        self.mgr
+            .openapi_spec_of(gear_name)
+            .ok_or_else(|| anyhow::anyhow!("No OpenAPI spec registered for gear: {gear_name}"))
+    }
+
     async fn list_instances(&self, gear: &str) -> Result<Vec<ServiceInstanceInfo>> {
         let mut result = Vec::new();
 
@@ -47,6 +61,10 @@ impl DirectoryClient for LocalDirectoryClient {
                     instance_id: inst.instance_id.to_string(),
                     endpoint: ServiceEndpoint::new(ep.uri.clone()),
                     version: inst.version.clone(),
+                    rest_endpoint: inst
+                        .rest_endpoint
+                        .as_ref()
+                        .map(|ep| ServiceEndpoint::new(ep.uri.clone())),
                 });
             }
         }
@@ -70,6 +88,16 @@ impl DirectoryClient for LocalDirectoryClient {
         // Add all gRPC services
         for (service_name, endpoint) in info.grpc_services {
             instance = instance.with_grpc_service(service_name, Endpoint::from_uri(endpoint.uri));
+        }
+
+        // Apply REST endpoint if provided
+        if let Some(rest) = info.rest_endpoint {
+            instance = instance.with_rest_endpoint(Endpoint::from_uri(rest.uri));
+        }
+
+        // Apply OpenAPI spec if provided
+        if let Some(spec) = info.openapi_spec {
+            instance = instance.with_openapi_spec(spec);
         }
 
         // Register the instance with the manager
@@ -123,6 +151,8 @@ mod tests {
                 ServiceEndpoint::http("127.0.0.1", 8001),
             )],
             version: Some("1.0.0".to_owned()),
+            rest_endpoint: None,
+            openapi_spec: None,
         };
 
         api.register_instance(register_info).await.unwrap();
@@ -133,6 +163,41 @@ mod tests {
         assert_eq!(instances[0].instance_id, instance_id);
         assert_eq!(instances[0].version, Some("1.0.0".to_owned()));
         assert!(instances[0].grpc_services.contains_key("test.Service"));
+    }
+
+    #[tokio::test]
+    async fn test_register_and_resolve_rest_and_openapi() {
+        let dir = Arc::new(GearManager::new());
+        let api = LocalDirectoryClient::new(dir.clone());
+
+        let instance_id = Uuid::new_v4();
+        let register_info = RegisterInstanceInfo {
+            gear: "billing".to_owned(),
+            instance_id: instance_id.to_string(),
+            grpc_services: vec![],
+            version: Some("1.0.0".to_owned()),
+            rest_endpoint: Some(ServiceEndpoint::http("billing", 8080)),
+            openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
+        };
+
+        api.register_instance(register_info).await.unwrap();
+
+        // REST endpoint resolves to the registered base URL.
+        let resolved = api.resolve_rest_service("billing").await.unwrap();
+        assert_eq!(resolved.uri, concat!("http", "://billing:8080"));
+
+        // OpenAPI spec can be retrieved.
+        let spec = api.get_openapi_spec("billing").await.unwrap();
+        assert!(spec.contains("openapi"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_rest_and_openapi_not_found() {
+        let dir = Arc::new(GearManager::new());
+        let api = LocalDirectoryClient::new(dir);
+
+        assert!(api.resolve_rest_service("missing").await.is_err());
+        assert!(api.get_openapi_spec("missing").await.is_err());
     }
 
     #[tokio::test]

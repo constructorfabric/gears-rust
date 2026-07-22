@@ -48,6 +48,9 @@ pub struct ServiceInstanceInfo {
     pub endpoint: ServiceEndpoint,
     /// Optional version string
     pub version: Option<String>,
+    /// Optional REST endpoint (HTTP base URL) for this instance.
+    /// Not all gears expose a REST API.
+    pub rest_endpoint: Option<ServiceEndpoint>,
 }
 
 /// Information for registering a new gear instance
@@ -61,6 +64,10 @@ pub struct RegisterInstanceInfo {
     pub grpc_services: Vec<(String, ServiceEndpoint)>,
     /// Optional version string
     pub version: Option<String>,
+    /// Optional REST endpoint (HTTP base URL) exposed by the gear.
+    pub rest_endpoint: Option<ServiceEndpoint>,
+    /// Optional `OpenAPI` spec (JSON) published by the gear.
+    pub openapi_spec: Option<String>,
 }
 
 /// Directory API trait for service discovery and instance management
@@ -73,6 +80,15 @@ pub struct RegisterInstanceInfo {
 pub trait DirectoryClient: Send + Sync {
     /// Resolve a gRPC service by its logical name to an endpoint
     async fn resolve_grpc_service(&self, service_name: &str) -> Result<ServiceEndpoint>;
+
+    /// Resolve a REST endpoint (HTTP base URL) for a gear by its name.
+    ///
+    /// Returns the base URL (e.g. `http://billing:8080`) that callers use to
+    /// make REST requests to the resolved gear.
+    async fn resolve_rest_service(&self, gear_name: &str) -> Result<ServiceEndpoint>;
+
+    /// Retrieve the `OpenAPI` spec (JSON) published by a gear.
+    async fn get_openapi_spec(&self, gear_name: &str) -> Result<String>;
 
     /// List all service instances for a given gear
     async fn list_instances(&self, gear: &str) -> Result<Vec<ServiceInstanceInfo>>;
@@ -118,10 +134,33 @@ mod tests {
                 ServiceEndpoint::http("127.0.0.1", 8001),
             )],
             version: Some("1.0.0".to_owned()),
+            rest_endpoint: None,
+            openapi_spec: None,
         };
 
         assert_eq!(info.gear, "test_gear");
         assert_eq!(info.instance_id, "instance1");
         assert_eq!(info.grpc_services.len(), 1);
+        assert!(info.rest_endpoint.is_none());
+        assert!(info.openapi_spec.is_none());
+    }
+
+    #[test]
+    fn test_register_instance_info_with_rest() {
+        let info = RegisterInstanceInfo {
+            gear: "billing".to_owned(),
+            instance_id: "instance1".to_owned(),
+            grpc_services: vec![],
+            version: Some("2.0.0".to_owned()),
+            rest_endpoint: Some(ServiceEndpoint::http("billing", 8080)),
+            openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
+        };
+
+        assert_eq!(info.gear, "billing");
+        assert_eq!(
+            info.rest_endpoint.as_ref().unwrap().uri,
+            concat!("http", "://billing:8080")
+        );
+        assert!(info.openapi_spec.is_some());
     }
 }

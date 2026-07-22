@@ -4,11 +4,17 @@ package gear_orchestrator.v1.directory;
 
 import "google/protobuf/empty.proto";
 
-// DirectoryService provides service discovery for gRPC services.
+// DirectoryService provides service discovery for gRPC and REST services.
 // OoP gears use this to register themselves and discover other services.
 service DirectoryService {
   // Resolve a gRPC service name to an endpoint URI
   rpc ResolveGrpcService(ResolveGrpcServiceRequest) returns (ResolveGrpcServiceResponse);
+
+  // Resolve a REST endpoint (HTTP base URL) for a gear by its name
+  rpc ResolveRestService(ResolveRestServiceRequest) returns (ResolveRestServiceResponse);
+
+  // Retrieve the OpenAPI spec (JSON) published by a gear
+  rpc GetOpenApiSpec(GetOpenApiSpecRequest) returns (GetOpenApiSpecResponse);
 
   // List all instances of a specific gear
   rpc ListInstances(ListInstancesRequest) returns (ListInstancesResponse);
@@ -31,6 +37,22 @@ message ResolveGrpcServiceResponse {
   string endpoint_uri = 1;
 }
 
+message ResolveRestServiceRequest {
+  string gear_name = 1;
+}
+
+message ResolveRestServiceResponse {
+  string endpoint_uri = 1;
+}
+
+message GetOpenApiSpecRequest {
+  string gear_name = 1;
+}
+
+message GetOpenApiSpecResponse {
+  string openapi_spec = 1;
+}
+
 message ListInstancesRequest {
   string gear_name = 1;
 }
@@ -40,6 +62,7 @@ message InstanceInfo {
   string instance_id = 2;
   string endpoint_uri = 3;
   string version = 4;
+  optional string rest_endpoint_uri = 5;
 }
 
 message ListInstancesResponse {
@@ -57,6 +80,8 @@ message RegisterInstanceRequest {
   string instance_id = 2;
   repeated GrpcServiceEndpoint grpc_services = 3;
   string version = 4;
+  optional string rest_endpoint_uri = 5;
+  optional string openapi_spec = 6;
 }
 
 message DeregisterInstanceRequest {
