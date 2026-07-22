@@ -179,8 +179,8 @@ pub struct ResponseResource {
     pub presence_penalty: f64,
     /// Frequency penalty.
     pub frequency_penalty: f64,
-    /// Number of top log-probabilities returned per token.
-    pub top_logprobs: u32,
+    /// Number of top log-probabilities returned per token (schema range 0..=20).
+    pub top_logprobs: u8,
     /// Sampling temperature.
     pub temperature: f64,
     /// Reasoning configuration.
@@ -347,22 +347,6 @@ pub struct ResponseError {
 }
 
 // ---------------------------------------------------------------------------
-// Role
-// ---------------------------------------------------------------------------
-
-/// Message author role.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    User,
-    Assistant,
-    System,
-    Developer,
-}
-
-// ---------------------------------------------------------------------------
 // TextFormat
 // ---------------------------------------------------------------------------
 
@@ -401,8 +385,10 @@ pub enum TextFormatKind {
         /// Schema name.
         name: String,
         /// Schema description.
+        #[serde(skip_serializing_if = "Option::is_none")]
         description: Option<String>,
         /// JSON Schema definition.
+        #[serde(skip_serializing_if = "Option::is_none")]
         schema: Option<serde_json::Value>,
         /// Strict schema enforcement.
         strict: bool,

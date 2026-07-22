@@ -146,7 +146,7 @@ pub struct OutputItemEvent {
     /// Index of the output item.
     pub output_index: u32,
     /// The output item that was added or completed (absent for no-op done).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item: Option<OutputItem>,
 }
 
@@ -295,8 +295,8 @@ pub struct DataEvent {
 mod tests {
     use super::*;
     use crate::models::content::OutputText;
-    use crate::models::core::Role;
     use crate::models::items::{ItemStatus, MessageOutput};
+    use crate::models::role::Role;
 
     #[test]
     fn output_item_added_roundtrips() {

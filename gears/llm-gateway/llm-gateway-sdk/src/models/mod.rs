@@ -15,6 +15,7 @@ pub mod content;
 pub mod core;
 pub mod extension;
 pub mod items;
+pub mod role;
 pub mod plugin;
 pub mod streaming;
 pub mod tools;

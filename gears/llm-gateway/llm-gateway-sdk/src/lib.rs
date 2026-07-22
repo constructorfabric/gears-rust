@@ -31,7 +31,7 @@ pub use models::core::{
     EmbeddingVector, EncodingFormat, FallbackConfig, FallbackStrategy, IncludeField,
     IncompleteDetails, InputTokensDetails, NamedToolChoice, OutputTokensDetails, ReasoningConfig,
     ReasoningEffort, ReasoningSummary, ResponseError, ResponseInput, ResponseResource,
-    ResponseStatus, Role, ServiceTier, StreamOptions, TextFormat, TextFormatKind, TextVerbosity,
+    ResponseStatus, ServiceTier, StreamOptions, TextFormat, TextFormatKind, TextVerbosity,
     ToolChoice, ToolChoiceMode, TruncationStrategy, Usage,
 };
 pub use models::extension::Extension;
@@ -40,6 +40,7 @@ pub use models::items::{
     ItemStatus, MessageItem, MessageOutput, OutputItem, ReasoningContentPart, ReasoningItem,
     ReasoningOutput, ReasoningSummaryPart,
 };
+pub use models::role::Role;
 pub use models::plugin::{MediaInputMode, ProviderCallCtx, ProviderPluginCapabilities};
 pub use models::streaming::{
     ContentDeltaEvent, ContentPartEvent, DataEvent, ErrorEvent, FunctionCallArgumentsEvent,

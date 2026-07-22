@@ -9,8 +9,8 @@
 //! as input by re-serializing them into the matching [`InputItem`] variant.
 
 use crate::models::content::{InputContentPart, OutputContentPart};
-use crate::models::core::Role;
 use crate::models::extension::Extension;
+use crate::models::role::Role;
 
 // ---------------------------------------------------------------------------
 // InputItem
