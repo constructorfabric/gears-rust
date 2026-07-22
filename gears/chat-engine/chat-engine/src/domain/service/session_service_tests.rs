@@ -50,6 +50,7 @@ fn reject_reserved_metadata_allows_client_keys() {
 }
 
 #[test]
+#[allow(clippy::use_debug)]
 fn redact_session_clears_share_token_and_reserved_metadata() {
     let s = Session {
         session_id: Uuid::nil(),
@@ -63,10 +64,15 @@ fn redact_session_clears_share_token_and_reserved_metadata() {
             "client_field": "ok",
         })),
         lifecycle_state: LifecycleState::Active,
-        share_token: Some("super-secret".into()),
+        share_token: Some(toolkit_utils::SecretString::new("super-secret")),
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::UNIX_EPOCH,
     };
+
+    // Redaction proof: Debug must not leak the share token.
+    let s_debug = format!("{s:?}");
+    assert!(!s_debug.contains("super-secret"));
+
     let redacted = redact_session(s);
     assert!(redacted.share_token.is_none());
     assert_eq!(

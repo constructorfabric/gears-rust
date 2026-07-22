@@ -116,7 +116,12 @@ impl SessionRepo for MockSessionRepo {
             .rows
             .lock()
             .iter()
-            .find(|m| m.share_token.as_deref() == Some(share_token))
+            .find(|m| {
+                m.share_token
+                    .as_ref()
+                    .map(toolkit_utils::SecretString::expose)
+                    == Some(share_token)
+            })
             .cloned())
     }
 
@@ -137,7 +142,7 @@ impl SessionRepo for MockSessionRepo {
                     && m.user_id.as_str() == user_id
             })
             .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
-        row.share_token = share_token;
+        row.share_token = share_token.map(toolkit_utils::SecretString::new);
         row.metadata = metadata;
         row.updated_at = OffsetDateTime::now_utc();
         Ok(row.clone())
@@ -346,7 +351,10 @@ async fn create_share_persists_token_and_returns_url() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        stored.share_token.as_deref(),
+        stored
+            .share_token
+            .as_ref()
+            .map(toolkit_utils::SecretString::expose),
         Some(issue.share_token.as_str())
     );
     let metadata_expires = stored
@@ -409,7 +417,7 @@ async fn access_shared_returns_expired_for_past_expiry() {
     let (svc, sessions, _messages) = build_service();
     let session_id = Uuid::new_v4();
     let mut row = sample_session("tenant-a", "user-a", session_id);
-    row.share_token = Some("abcd-token".into());
+    row.share_token = Some(toolkit_utils::SecretString::new("abcd-token"));
     // Build expired metadata manually.
     let past = (OffsetDateTime::now_utc() - time::Duration::hours(1))
         .format(&Rfc3339)
@@ -429,7 +437,7 @@ async fn access_shared_returns_expired_for_soft_deleted_session() {
     let (svc, sessions, _messages) = build_service();
     let session_id = Uuid::new_v4();
     let mut row = sample_session("tenant-a", "user-a", session_id);
-    row.share_token = Some("soft-tok".into());
+    row.share_token = Some(toolkit_utils::SecretString::new("soft-tok"));
     row.lifecycle_state = LifecycleState::SoftDeleted;
     sessions.seed(row);
 

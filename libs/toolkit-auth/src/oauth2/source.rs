@@ -248,7 +248,7 @@ mod tests {
         let mut source = OAuthTokenSource::new(&test_config(&server)).unwrap();
         let token = source.request_token().await.unwrap();
 
-        assert_eq!(token.access_token, "tok-123");
+        assert_eq!(token.access_token.expose(), "tok-123");
         assert_eq!(token.lifetime_secs, 3600);
         mock.assert();
     }
@@ -504,7 +504,7 @@ mod tests {
         let mut source = OAuthTokenSource::new(&test_config(&server)).unwrap();
         let token = source.request_token().await.unwrap();
 
-        assert_eq!(token.access_token, "tok");
+        assert_eq!(token.access_token.expose(), "tok");
         mock.assert();
     }
 

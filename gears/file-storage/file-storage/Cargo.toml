@@ -41,6 +41,9 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }
+# SecretString for config credentials (redacted Debug + zeroize); `serde` enables
+# its Deserialize impl so config fields can be typed SecretString directly.
+toolkit-utils = { workspace = true, features = ["serde"] }
 
 # Serde and JSON schema
 serde = { workspace = true }

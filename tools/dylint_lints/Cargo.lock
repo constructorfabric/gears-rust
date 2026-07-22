@@ -656,7 +656,6 @@ name = "cf-gears-toolkit-db-macros"
 version = "0.6.3"
 dependencies = [
  "heck 0.5.0",
- "proc-macro-error2",
  "proc-macro2",
  "quote",
  "syn 2.0.117",

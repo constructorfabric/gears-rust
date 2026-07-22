@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use toolkit_utils::SecretString;
 use uuid::Uuid;
 
 /// Tenant identifier. Opaque string from the auth token, used to scope all
@@ -152,7 +153,11 @@ pub struct Session {
     pub lifecycle_state: LifecycleState,
     /// Cryptographically-random token granting read-only access to a shared
     /// view of this session. Present only while sharing is active.
-    pub share_token: Option<String>,
+    #[serde(
+        default,
+        serialize_with = "toolkit_utils::secret_string::serialize_option_exposed"
+    )]
+    pub share_token: Option<SecretString>,
     /// Creation timestamp (UTC, RFC3339 on the wire).
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,

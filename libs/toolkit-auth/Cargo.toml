@@ -43,7 +43,7 @@ rand = { workspace = true }
 base64 = { workspace = true }
 
 # Shared utilities
-toolkit-utils = { workspace = true }
+toolkit-utils = { workspace = true, features = ["serde"] }
 zeroize = { workspace = true }
 
 [dev-dependencies]

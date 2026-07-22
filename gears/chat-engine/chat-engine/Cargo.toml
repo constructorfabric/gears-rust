@@ -36,6 +36,8 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
+# SecretString conversions for Session.share_token (see chat-engine-sdk).
+toolkit-utils = { workspace = true, features = ["serde"] }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

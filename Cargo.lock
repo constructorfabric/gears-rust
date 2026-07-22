@@ -1398,6 +1398,7 @@ dependencies = [
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-odata-macros",
  "cf-gears-toolkit-security",
+ "cf-gears-toolkit-utils",
  "futures",
  "http",
  "k8s-openapi",
@@ -1423,6 +1424,7 @@ name = "cf-chat-engine-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cf-gears-toolkit-utils",
  "futures",
  "serde",
  "serde_json",
@@ -1813,6 +1815,7 @@ dependencies = [
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
+ "cf-gears-toolkit-utils",
  "futures",
  "gts",
  "hex",

@@ -2,7 +2,9 @@
 
 ## What it does
 
-Checks that all struct and enum types in domain modules have the `#[domain_model]` attribute.
+Checks that struct and enum types in domain modules that are visible beyond their own
+module (`pub`, `pub(crate)`, `pub(super)`, `pub(in ...)`) have the `#[domain_model]`
+attribute. Strictly module-private types (no `pub` keyword) are exempt.
 
 ## Why is this important?
 
@@ -13,7 +15,7 @@ The `#[domain_model]` macro provides **compile-time validation** of Domain-Drive
 - File system types (`std::fs::*`, `tokio::fs::*`)
 - External service clients (`reqwest::*`, `tonic::*`)
 
-By requiring this attribute on all domain types, we guarantee that infrastructure concerns cannot leak into the domain layer.
+By requiring this attribute on all externally-visible domain types, we guarantee that infrastructure concerns cannot leak into the domain layer. (Strictly module-private types are exempt from this lint — their fields are still guarded by `DE0301`/`DE0308`.)
 
 ## Example
 
@@ -45,15 +47,21 @@ pub struct User {
 
 This lint is configured to **deny** by default.
 
-It checks all `struct` and `enum` definitions in files whose path contains `/domain/`.
+It checks `struct` and `enum` definitions in files whose path contains `/domain/`,
+**except** strictly module-private ones (no `pub` keyword). Private types are pure
+implementation details that never cross a layer boundary, and their fields are still
+guarded against infrastructure leakage by `DE0301_NO_INFRA_IN_DOMAIN` and
+`DE0308_NO_HTTP_IN_DOMAIN`, which check every domain `struct`/`enum` regardless of this
+attribute. This keeps small technical helpers (e.g. a `HashMap`-key newtype) from
+needing either a spurious `#[domain_model]` or an `#[allow(...)]`.
 
 ## TDD Approach
 
 This lint is designed for Test-Driven Development:
 
-1. **Add the lint** - CI will fail for all domain types without the attribute
-2. **Fix each violation** - Add `#[domain_model]` to all domain types
-3. **CI passes** - All domain types are now validated at compile time
+1. **Add the lint** - CI will fail for all externally-visible domain types without the attribute
+2. **Fix each violation** - Add `#[domain_model]` to all externally-visible domain types
+3. **CI passes** - All externally-visible domain types are now validated at compile time
 
 ## See Also
 

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use rand::RngExt as _;
+use toolkit_utils::SecretString;
 
 /// Freshness status of a cached token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +30,7 @@ pub enum TokenStatus {
 /// A cached bearer token with computed refresh / expiry deadlines.
 #[derive(Clone)]
 pub struct CachedToken {
-    access_token: String,
+    access_token: SecretString,
     /// Wall-clock instant the token was received.
     received_at: Instant,
     /// Duration after `received_at` at which the token transitions to `Stale`.
@@ -55,7 +56,7 @@ impl CachedToken {
     /// Returns [`TokenError::InvalidTokenLifetime`] if `lifetime_secs` is zero
     /// or `freshness_ratio` is not in `(0.0, 1.0]`.
     pub(crate) fn new(
-        access_token: String,
+        access_token: SecretString,
         lifetime_secs: u64,
         freshness_ratio: f64,
     ) -> Result<Self, super::error::TokenError> {
@@ -86,7 +87,7 @@ impl CachedToken {
     }
 
     pub(crate) fn access_token(&self) -> &str {
-        &self.access_token
+        self.access_token.expose()
     }
 
     pub(crate) fn token_status(&self) -> TokenStatus {
@@ -160,7 +161,7 @@ impl WatcherConfig {
 /// Result of a single token fetch — the source returns this.
 #[derive(Debug)]
 pub struct FetchedToken {
-    pub access_token: String,
+    pub access_token: SecretString,
     pub lifetime_secs: u64,
     /// Freshness ratio (0.0–1.0): fraction of lifetime during which the token
     /// is considered "fresh". After this fraction, it becomes "stale" and the
@@ -350,14 +351,14 @@ mod tests {
 
     #[test]
     fn cached_token_fresh_immediately() {
-        let ct = CachedToken::new("tok".into(), 3600, 0.8).unwrap();
+        let ct = CachedToken::new(SecretString::new("tok"), 3600, 0.8).unwrap();
         assert_eq!(ct.access_token(), "tok");
         assert_eq!(ct.token_status(), TokenStatus::Fresh);
     }
 
     #[test]
     fn cached_token_zero_lifetime_rejected() {
-        let err = CachedToken::new("tok".into(), 0, 0.8).unwrap_err();
+        let err = CachedToken::new(SecretString::new("tok"), 0, 0.8).unwrap_err();
         assert!(
             err.to_string().contains("lifetime_secs"),
             "expected lifetime error, got: {err}"
@@ -366,7 +367,7 @@ mod tests {
 
     #[test]
     fn cached_token_zero_freshness_rejected() {
-        let err = CachedToken::new("tok".into(), 3600, 0.0).unwrap_err();
+        let err = CachedToken::new(SecretString::new("tok"), 3600, 0.0).unwrap_err();
         assert!(
             err.to_string().contains("freshness_ratio"),
             "expected freshness error, got: {err}"
@@ -375,7 +376,7 @@ mod tests {
 
     #[test]
     fn cached_token_negative_freshness_rejected() {
-        let err = CachedToken::new("tok".into(), 3600, -0.1).unwrap_err();
+        let err = CachedToken::new(SecretString::new("tok"), 3600, -0.1).unwrap_err();
         assert!(
             err.to_string().contains("freshness_ratio"),
             "expected freshness error, got: {err}"
@@ -384,7 +385,7 @@ mod tests {
 
     #[test]
     fn cached_token_freshness_above_one_rejected() {
-        let err = CachedToken::new("tok".into(), 3600, 1.1).unwrap_err();
+        let err = CachedToken::new(SecretString::new("tok"), 3600, 1.1).unwrap_err();
         assert!(
             err.to_string().contains("freshness_ratio"),
             "expected freshness error, got: {err}"
@@ -393,7 +394,7 @@ mod tests {
 
     #[test]
     fn cached_token_nan_freshness_rejected() {
-        let err = CachedToken::new("tok".into(), 3600, f64::NAN).unwrap_err();
+        let err = CachedToken::new(SecretString::new("tok"), 3600, f64::NAN).unwrap_err();
         assert!(
             err.to_string().contains("freshness_ratio"),
             "expected freshness error, got: {err}"
@@ -402,7 +403,7 @@ mod tests {
 
     #[test]
     fn cached_token_inf_freshness_rejected() {
-        let err = CachedToken::new("tok".into(), 3600, f64::INFINITY).unwrap_err();
+        let err = CachedToken::new(SecretString::new("tok"), 3600, f64::INFINITY).unwrap_err();
         assert!(
             err.to_string().contains("freshness_ratio"),
             "expected freshness error, got: {err}"
@@ -411,7 +412,7 @@ mod tests {
 
     #[test]
     fn cached_token_tiny_freshness_zero_window_rejected() {
-        let err = CachedToken::new("tok".into(), 1, 0.000_000_000_01).unwrap_err();
+        let err = CachedToken::new(SecretString::new("tok"), 1, 0.000_000_000_01).unwrap_err();
         assert!(
             err.to_string().contains("freshness window rounds to zero"),
             "expected zero-window error, got: {err}"
@@ -421,19 +422,19 @@ mod tests {
     #[test]
     fn cached_token_full_freshness() {
         // freshness_ratio=1.0 → fresh_until=lifetime → only stale at expiry
-        let ct = CachedToken::new("tok".into(), 3600, 1.0).unwrap();
+        let ct = CachedToken::new(SecretString::new("tok"), 3600, 1.0).unwrap();
         assert_eq!(ct.token_status(), TokenStatus::Fresh);
     }
 
     #[test]
     fn time_until_stale_positive_when_fresh() {
-        let ct = CachedToken::new("tok".into(), 3600, 0.8).unwrap();
+        let ct = CachedToken::new(SecretString::new("tok"), 3600, 0.8).unwrap();
         assert!(ct.time_until_stale() > Duration::ZERO);
     }
 
     #[test]
     fn time_until_expired_positive_when_fresh() {
-        let ct = CachedToken::new("tok".into(), 3600, 0.8).unwrap();
+        let ct = CachedToken::new(SecretString::new("tok"), 3600, 0.8).unwrap();
         assert!(ct.time_until_expired() > Duration::ZERO);
     }
 

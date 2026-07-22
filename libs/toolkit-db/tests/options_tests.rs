@@ -12,7 +12,7 @@ async fn test_build_db_handle_postgres_missing_dbname() {
         host: Some("localhost".to_owned()),
         port: Some(5432),
         user: Some("testuser".to_owned()),
-        password: Some("testpass".to_owned()),
+        password: Some(toolkit_utils::SecretString::new("testpass")),
         // Missing dbname
         ..Default::default()
     };

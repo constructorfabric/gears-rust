@@ -2,6 +2,7 @@
 //! Service implementation for the static `AuthN` resolver plugin.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use secrecy::{ExposeSecret, SecretString};
 use toolkit_macros::domain_model;
@@ -9,6 +10,40 @@ use toolkit_security::SecurityContext;
 
 use crate::config::{AuthNMode, IdentityConfig, StaticAuthNPluginConfig};
 use authn_resolver_sdk::{AuthenticationResult, ClientCredentialsRequest};
+
+/// Wraps a `SecretString` bearer token so it can be a `HashMap` key.
+///
+/// `secrecy::SecretString` deliberately has no `Hash`/`Eq` — and being a
+/// foreign type, we can't add them directly here either (orphan rule). This
+/// newtype supplies both by delegating to the exposed value, and delegates
+/// `Debug` to `SecretString`'s own redacting impl so a Debug dump of the map
+/// never prints the raw token.
+struct TokenKey(SecretString);
+
+impl PartialEq for TokenKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.expose_secret() == other.0.expose_secret()
+    }
+}
+impl Eq for TokenKey {}
+
+impl std::hash::Hash for TokenKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.expose_secret().hash(state);
+    }
+}
+
+impl std::borrow::Borrow<str> for TokenKey {
+    fn borrow(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl fmt::Debug for TokenKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
 
 /// Static `AuthN` resolver service.
 ///
@@ -19,7 +54,7 @@ use authn_resolver_sdk::{AuthenticationResult, ClientCredentialsRequest};
 pub struct Service {
     mode: AuthNMode,
     default_identity: IdentityConfig,
-    token_map: HashMap<String, IdentityConfig>,
+    token_map: HashMap<TokenKey, IdentityConfig>,
     s2s_credentials: HashMap<String, S2sEntry>,
 }
 
@@ -35,10 +70,10 @@ impl Service {
     /// Create a service from plugin configuration.
     #[must_use]
     pub fn from_config(cfg: &StaticAuthNPluginConfig) -> Self {
-        let token_map: HashMap<String, IdentityConfig> = cfg
+        let token_map = cfg
             .tokens
             .iter()
-            .map(|m| (m.token.clone(), m.identity.clone()))
+            .map(|m| (TokenKey(m.token.clone()), m.identity.clone()))
             .collect();
 
         let s2s_credentials: HashMap<String, S2sEntry> = cfg

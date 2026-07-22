@@ -120,7 +120,7 @@ Follow the DDD-light layer rules:
 
 - **Contract**: NO serde, NO utoipa, NO HTTP types
 - **API/REST DTOs**: MUST have `Serialize`, `Deserialize`, `ToSchema`; MUST be in `api/rest/`
-- **Domain**: All structs/enums MUST have `#[domain_model]`
+- **Domain**: All non-module-private structs/enums (`pub`/`pub(crate)`/`pub(super)`) MUST have `#[domain_model]` (strictly module-private helpers are exempt)
 - **Entities**: Use `#[derive(Scopable)]` with `#[secure(tenant_col = "...")]`
 - **Endpoints**: MUST follow `/{service-name}/v{N}/{resource}` pattern
 - **Errors**: Use `Problem` (RFC-9457), implement `From<DomainError> for Problem`
@@ -136,6 +136,6 @@ These rules apply to ALL gear work. Violating them will fail CI:
 - SDK pattern is the public API — use `<gear>-sdk` crate
 - `SecureConn` + `AccessScope` for all DB access — no raw connections
 - `OperationBuilder` for all REST routes — with `.authenticated()` and `.standard_errors()`
-- `#[domain_model]` on all domain structs/enums (DE0309 lint)
+- `#[domain_model]` on all non-module-private domain structs/enums (DE0309 lint; strictly private helpers exempt)
 - No `unwrap()` / `expect()` — use proper Result types
 - AuthZ via `PolicyEnforcer` PEP pattern — never construct `AccessScope` manually

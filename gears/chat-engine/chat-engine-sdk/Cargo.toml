@@ -29,3 +29,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }
+# SecretString for the `share_token` bearer secret (redacted Debug + zeroize);
+# `serde` enables its Deserialize so the field can be typed SecretString directly.
+toolkit-utils = { workspace = true, features = ["serde"] }

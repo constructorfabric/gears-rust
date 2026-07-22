@@ -75,7 +75,7 @@ pub async fn fetch_token(mut config: OAuthClientConfig) -> Result<FetchedToken, 
     let token = source.request_token().await?;
 
     Ok(FetchedToken {
-        bearer: SecretString::new(token.access_token),
+        bearer: token.access_token,
         expires_in: Duration::from_secs(token.lifetime_secs),
     })
 }

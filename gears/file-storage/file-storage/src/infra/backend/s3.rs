@@ -170,7 +170,8 @@ impl S3Backend {
             })?;
         let secret_access_key = cfg
             .secret_access_key
-            .clone()
+            .as_ref()
+            .map(|s| s.expose().to_owned())
             .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
             .ok_or_else(|| {
                 DomainError::backend(

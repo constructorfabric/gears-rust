@@ -25,6 +25,15 @@ impl SecretString {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    /// Consume `self` and return the underlying secret, e.g. to move it into
+    /// another owned value without an extra clone.
+    ///
+    /// Callers must not log, store, or otherwise persist the returned value.
+    #[must_use]
+    pub fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -34,6 +43,44 @@ impl<'de> serde::Deserialize<'de> for SecretString {
         D: serde::Deserializer<'de>,
     {
         <String as serde::Deserialize>::deserialize(deserializer).map(SecretString::new)
+    }
+}
+
+/// `serialize_with` helper for an `Option<SecretString>` field that must
+/// round-trip (e.g. persisted config).
+///
+/// `SecretString` deliberately has no `Serialize` impl of its own — that would
+/// make *every* field serialize its secret and defeat the type. This opt-in
+/// helper exposes the value for one explicitly-annotated field only:
+///
+/// ```ignore
+/// #[serde(default, serialize_with = "toolkit_utils::secret_string::serialize_option_exposed")]
+/// pub password: Option<SecretString>,
+/// ```
+///
+/// `Debug`/`Display` stay redacted and the field is still zeroized on drop;
+/// deserialization uses `SecretString`'s own `Deserialize` (no annotation needed).
+///
+/// # Security
+///
+/// Annotating a field with this helper re-enables plaintext serialization for
+/// that field — only use it for config fields that must round-trip on disk.
+///
+/// # Errors
+///
+/// Returns the underlying `serde::Serializer`'s error if it fails to write
+/// the value.
+#[cfg(feature = "serde")]
+pub fn serialize_option_exposed<S>(
+    value: &Option<SecretString>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(secret) => serializer.serialize_some(secret.expose()),
+        None => serializer.serialize_none(),
     }
 }
 

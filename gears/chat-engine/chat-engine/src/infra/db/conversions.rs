@@ -40,7 +40,7 @@ impl From<session_entity::Model> for Session {
             enabled_capabilities: model.enabled_capabilities,
             metadata: model.metadata,
             lifecycle_state,
-            share_token: model.share_token,
+            share_token: model.share_token.map(toolkit_utils::SecretString::new),
             created_at: model.created_at,
             updated_at: model.updated_at,
         }
@@ -58,7 +58,7 @@ impl From<Session> for session_entity::ActiveModel {
             enabled_capabilities: Set(s.enabled_capabilities),
             metadata: Set(s.metadata),
             lifecycle_state: Set(s.lifecycle_state.as_str().to_string()),
-            share_token: Set(s.share_token),
+            share_token: Set(s.share_token.map(toolkit_utils::SecretString::into_inner)),
             // `deleted_at` / `scheduled_hard_delete_at` are owned by the
             // soft-delete service (Phase 12) — leave untouched here so an
             // accidental `From` round-trip from a non-deleted session does

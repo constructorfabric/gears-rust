@@ -74,6 +74,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures::StreamExt;
 use serde::Deserialize;
 use time::OffsetDateTime;
+use toolkit_utils::SecretString;
 use uuid::Uuid;
 
 use file_storage::domain::error::DomainError;
@@ -118,7 +119,7 @@ struct SidecarState {
 #[derive(Debug, Deserialize)]
 struct TokenQuery {
     #[serde(rename = "fs-token")]
-    fs_token: Option<String>,
+    fs_token: Option<SecretString>,
 }
 
 /// Default value for `FS_SIDECAR_MAX_BODY_BYTES` (5 GiB) — comfortably above any
@@ -381,12 +382,15 @@ async fn readyz(State(state): State<SidecarState>) -> Response {
 
 /// Extract the token from the `fs-token` query param or the `X-FS-Token` header.
 fn extract_token(q: &TokenQuery, headers: &HeaderMap) -> Option<String> {
-    q.fs_token.clone().or_else(|| {
-        headers
-            .get("x-fs-token")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-    })
+    q.fs_token
+        .as_ref()
+        .map(|s| s.expose().to_owned())
+        .or_else(|| {
+            headers
+                .get("x-fs-token")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        })
 }
 
 /// `PUT` upload: verify token (op=PUT), stream bytes straight to the backend.

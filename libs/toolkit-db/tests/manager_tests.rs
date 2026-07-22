@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tempfile::TempDir;
 use toolkit_db::{DbConnConfig, DbManager, GlobalDatabaseConfig, PoolCfg};
+use toolkit_utils::SecretString;
 
 #[tokio::test]
 async fn test_dbmanager_no_global_config() {
@@ -54,7 +55,7 @@ async fn test_dbmanager_server_merge() {
             host: Some("localhost".to_owned()),
             port: Some(5432),
             user: Some("serveruser".to_owned()),
-            password: Some("serverpass".to_owned()),
+            password: Some(SecretString::new("serverpass")),
             dbname: Some("serverdb".to_owned()),
             params: Some({
                 let mut params = HashMap::new();

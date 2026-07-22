@@ -49,7 +49,7 @@ fn static_tokens_mode_returns_mapped_identity() {
     let cfg = StaticAuthNPluginConfig {
         mode: AuthNMode::StaticTokens,
         tokens: vec![TokenMapping {
-            token: "token-user-a".to_owned(),
+            token: SecretString::from("token-user-a"),
             identity: IdentityConfig {
                 subject_id: user_a_id,
                 subject_tenant_id: tenant_a,
@@ -59,6 +59,10 @@ fn static_tokens_mode_returns_mapped_identity() {
         }],
         ..default_config()
     };
+
+    // Redaction proof: the raw token must not appear in Debug output.
+    let mapping_debug = format!("{:?}", cfg.tokens[0]);
+    assert!(!mapping_debug.contains("token-user-a"));
 
     let service = Service::from_config(&cfg);
 
@@ -81,7 +85,7 @@ fn static_tokens_mode_rejects_unknown_token() {
     let cfg = StaticAuthNPluginConfig {
         mode: AuthNMode::StaticTokens,
         tokens: vec![TokenMapping {
-            token: "known-token".to_owned(),
+            token: SecretString::from("known-token"),
             identity: IdentityConfig::default(),
         }],
         ..default_config()

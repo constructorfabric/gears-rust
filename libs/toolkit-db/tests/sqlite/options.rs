@@ -13,7 +13,7 @@ fn test_build_db_handle_env_expansion() {
         rt.block_on(async {
             let config = DbConnConfig {
                 engine: Some(toolkit_db::config::DbEngineCfg::Sqlite),
-                dsn: Some("sqlite::memory:".to_owned()),
+                dsn: Some(toolkit_utils::SecretString::new("sqlite::memory:")),
                 params: Some({
                     let mut params = HashMap::new();
                     // Exercise env expansion in params
@@ -35,7 +35,7 @@ fn test_build_db_handle_env_expansion() {
 async fn test_build_db_handle_sqlite_memory() {
     let config = DbConnConfig {
         engine: Some(toolkit_db::config::DbEngineCfg::Sqlite),
-        dsn: Some("sqlite::memory:".to_owned()),
+        dsn: Some(toolkit_utils::SecretString::new("sqlite::memory:")),
         params: Some({
             let mut params = HashMap::new();
             params.insert("journal_mode".to_owned(), "WAL".to_owned());
@@ -80,8 +80,8 @@ async fn test_build_db_handle_sqlite_file() {
 async fn test_build_db_handle_invalid_env_var() {
     let config = DbConnConfig {
         engine: Some(toolkit_db::config::DbEngineCfg::Sqlite),
-        dsn: Some("sqlite::memory:".to_owned()),
-        password: Some("${NONEXISTENT_VAR}".to_owned()),
+        dsn: Some(toolkit_utils::SecretString::new("sqlite::memory:")),
+        password: Some(toolkit_utils::SecretString::new("${NONEXISTENT_VAR}")),
         ..Default::default()
     };
 
@@ -97,7 +97,7 @@ async fn test_build_db_handle_invalid_env_var() {
 async fn test_build_db_handle_invalid_sqlite_pragma() {
     let config = DbConnConfig {
         engine: Some(toolkit_db::config::DbEngineCfg::Sqlite),
-        dsn: Some("sqlite::memory:".to_owned()),
+        dsn: Some(toolkit_utils::SecretString::new("sqlite::memory:")),
         params: Some({
             let mut params = HashMap::new();
             params.insert("invalid_pragma".to_owned(), "some_value".to_owned());
@@ -118,7 +118,7 @@ async fn test_build_db_handle_invalid_sqlite_pragma() {
 async fn test_build_db_handle_invalid_journal_mode() {
     let config = DbConnConfig {
         engine: Some(toolkit_db::config::DbEngineCfg::Sqlite),
-        dsn: Some("sqlite::memory:".to_owned()),
+        dsn: Some(toolkit_utils::SecretString::new("sqlite::memory:")),
         params: Some({
             let mut params = HashMap::new();
             params.insert("journal_mode".to_owned(), "INVALID_MODE".to_owned());
@@ -144,7 +144,7 @@ async fn test_build_db_handle_invalid_journal_mode() {
 async fn test_build_db_handle_pool_config() {
     let config = DbConnConfig {
         engine: Some(toolkit_db::config::DbEngineCfg::Sqlite),
-        dsn: Some("sqlite::memory:".to_owned()),
+        dsn: Some(toolkit_utils::SecretString::new("sqlite::memory:")),
         pool: Some(PoolCfg {
             max_conns: Some(5),
             acquire_timeout: Some(Duration::from_secs(10)),

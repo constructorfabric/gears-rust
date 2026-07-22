@@ -541,7 +541,7 @@ mod database_merge {
             DbConnConfig {
                 engine: Some(toolkit_db::config::DbEngineCfg::Sqlite),
                 server: None,
-                dsn: Some("sqlite://new.db".to_owned()),
+                dsn: Some(toolkit_utils::SecretString::new("sqlite://new.db")),
                 host: None,
                 port: None,
                 user: None,

@@ -270,7 +270,7 @@ Clients must be registered explicitly in `init()`: `ctx.client_hub().register::<
 
 ### Domain types and `#[domain_model]` macro
 
-All `struct` and `enum` types in `domain/` **must** have the `#[domain_model]` attribute from `toolkit_macros`.
+All `struct` and `enum` types in `domain/` that are visible beyond their own module (`pub`, `pub(crate)`, `pub(super)`, `pub(in ...)`) **must** have the `#[domain_model]` attribute from `toolkit_macros`. Strictly module-private types (no `pub` keyword) are exempt — they never cross a layer boundary, and their fields are still checked for infrastructure leakage by the `DE0301`/`DE0308` domain-layer lints.
 
 #### What it does
 
@@ -343,7 +343,7 @@ error: field 'pool' has type 'sqlx::PgPool' which is forbidden (crate 'sqlx').
 
 #### CI enforcement
 
-The [DE0309 lint](../../tools/dylint_lints/de03_domain_layer/de0309_must_have_domain_model/README.md) runs in CI and **denies** any `struct` or `enum` in `domain/` that is missing the `#[domain_model]` attribute. This ensures the macro cannot be accidentally omitted.
+The [DE0309 lint](../../tools/dylint_lints/de03_domain_layer/de0309_must_have_domain_model/README.md) runs in CI and **denies** any non-module-private `struct` or `enum` in `domain/` that is missing the `#[domain_model]` attribute. This ensures the macro cannot be accidentally omitted. Strictly module-private types are exempt (see above).
 
 ### Gear `src/api/rest/dto.rs` (REST DTOs, OData)
 
@@ -521,7 +521,7 @@ For additional endpoints, see <http://127.0.0.1:8087/cf/docs>.
 - [ ] Create `<gear>-sdk` crate with `api.rs`, `models.rs`, `errors.rs`, `lib.rs`.
 - [ ] Create `<gear>` crate with `gear.rs`, `api/rest/`, `domain/`, `infra/storage/`.
 - [ ] Implement SDK trait with `async_trait` and `SecurityContext` first param.
-- [ ] Add `#[domain_model]` on all `struct`/`enum` types in `domain/` (import `toolkit_macros::domain_model`).
+- [ ] Add `#[domain_model]` on all non-module-private `struct`/`enum` types in `domain/` (import `toolkit_macros::domain_model`; strictly module-private helpers are exempt).
 - [ ] Add `#[derive(ODataFilterable)]` on REST DTOs (import `toolkit_odata_macros::ODataFilterable`).
 - [ ] Add `#[derive(Scopable)]` on SeaORM entities (import `toolkit_db_macros::Scopable`).
 - [ ] Use `SecureConn` + `SecurityContext` for all DB operations.

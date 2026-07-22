@@ -7,6 +7,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use toolkit_utils::SecretString;
 
 /// Configuration for the `file-storage` gear.
 ///
@@ -50,8 +51,11 @@ pub struct FileStorageConfig {
     /// **stable across restarts**. When absent, an ephemeral key is generated at
     /// boot — fine for local dev, but signed URLs do not survive a restart and
     /// the sidecar must be reconfigured. Configure this in any real deployment.
-    #[serde(default)]
-    pub signing_key_seed: Option<String>,
+    #[serde(
+        default,
+        serialize_with = "toolkit_utils::secret_string::serialize_option_exposed"
+    )]
+    pub signing_key_seed: Option<SecretString>,
 
     /// When `true` (the default), gear init fails fast if `signing_key_seed`
     /// is absent instead of silently minting an ephemeral per-boot key. A
@@ -141,8 +145,11 @@ pub struct FileStorageConfig {
     /// gear — see `docs/ADR/0003-…-sidecar-data-plane.md`'s trust-model
     /// section — at which point the comparator should be swapped for
     /// `InternalAuthenticator`. Never printed by `Debug`.
-    #[serde(default)]
-    pub finalize_internal_secret: Option<String>,
+    #[serde(
+        default,
+        serialize_with = "toolkit_utils::secret_string::serialize_option_exposed"
+    )]
+    pub finalize_internal_secret: Option<SecretString>,
 
     /// When `true`, gear init fails fast if `finalize_internal_secret` is
     /// absent instead of silently accepting the token-only trust model for
@@ -190,8 +197,11 @@ pub struct S3BackendConfig {
     /// Secret access key. `None` resolves `AWS_SECRET_ACCESS_KEY` from the
     /// process environment at construction time instead of a static config
     /// value. Never printed by `Debug` — see the struct-level doc comment.
-    #[serde(default)]
-    pub secret_access_key: Option<String>,
+    #[serde(
+        default,
+        serialize_with = "toolkit_utils::secret_string::serialize_option_exposed"
+    )]
+    pub secret_access_key: Option<SecretString>,
 
     /// `true` for path-style addressing (`MinIO`/`s3s-fs`-style endpoints),
     /// `false` for virtual-hosted-style real S3. Defaults to `true` since

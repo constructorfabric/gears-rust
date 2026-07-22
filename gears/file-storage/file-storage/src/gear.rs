@@ -99,7 +99,9 @@ impl Gear for FileStorageGear {
         // rejected an absent secret when `require_finalize_internal_secret`
         // is set, so this is a plain construction.
         let finalize_auth = Arc::new(crate::api::rest::handlers::FinalizeAuth::new(
-            cfg.finalize_internal_secret.clone(),
+            cfg.finalize_internal_secret
+                .as_ref()
+                .map(|s| s.expose().to_owned()),
         ));
         self.finalize_auth
             .set(Arc::clone(&finalize_auth))
@@ -122,7 +124,7 @@ impl Gear for FileStorageGear {
         let max_ttl = i64::try_from(cfg.max_url_ttl_secs).unwrap_or(i64::MAX);
         let issuer = Arc::new(if let Some(seed_b64) = &cfg.signing_key_seed {
             let seed = URL_SAFE_NO_PAD
-                .decode(seed_b64.trim())
+                .decode(seed_b64.expose().trim())
                 .map_err(|e| anyhow::anyhow!("invalid file-storage signing_key_seed: {e}"))?;
             Issuer::from_seed(&seed, max_ttl).map_err(|e| anyhow::anyhow!("signing key: {e}"))?
         } else {

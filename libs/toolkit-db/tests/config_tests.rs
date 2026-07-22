@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::use_debug)]
 
 //! Tests for configuration types and serialization.
 
@@ -6,16 +6,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use toolkit_db::{DbConnConfig, GlobalDatabaseConfig, PoolCfg};
+use toolkit_utils::SecretString;
 
 #[test]
 fn test_dbconnconfig_serialization() {
     let config = DbConnConfig {
         engine: None,
-        dsn: Some("postgresql://user:pass@localhost/db".to_owned()),
+        dsn: Some(SecretString::new("postgresql://user:pass@localhost/db")),
         host: Some("localhost".to_owned()),
         port: Some(5432),
         user: Some("testuser".to_owned()),
-        password: Some("testpass".to_owned()),
+        password: Some(SecretString::new("testpass")),
         dbname: Some("testdb".to_owned()),
         params: Some({
             let mut params = HashMap::new();
@@ -32,6 +33,11 @@ fn test_dbconnconfig_serialization() {
         server: Some("test_server".to_owned()),
     };
 
+    // Redaction proof: Debug must not leak the password or the DSN's embedded credential.
+    let config_debug = format!("{config:?}");
+    assert!(!config_debug.contains("testpass"));
+    assert!(!config_debug.contains("postgresql://user:pass@localhost/db"));
+
     // Test serialization to JSON
     let json = serde_json::to_string_pretty(&config).expect("Failed to serialize to JSON");
     assert!(json.contains("postgresql://user:pass@localhost/db"));
@@ -40,7 +46,10 @@ fn test_dbconnconfig_serialization() {
     // Test deserialization from JSON
     let deserialized: DbConnConfig =
         serde_json::from_str(&json).expect("Failed to deserialize from JSON");
-    assert_eq!(deserialized.dsn, config.dsn);
+    assert_eq!(
+        deserialized.dsn.as_ref().map(SecretString::expose),
+        config.dsn.as_ref().map(SecretString::expose)
+    );
     assert_eq!(deserialized.server, config.server);
     assert_eq!(deserialized.host, config.host);
     assert_eq!(deserialized.port, config.port);
@@ -72,7 +81,7 @@ fn test_globaldatabaseconfig_serialization() {
             host: Some("db.example.com".to_owned()),
             port: Some(5432),
             user: Some("appuser".to_owned()),
-            password: Some("${DB_PASSWORD}".to_owned()),
+            password: Some(SecretString::new("${DB_PASSWORD}")),
             dbname: Some("maindb".to_owned()),
             params: Some({
                 let mut params = HashMap::new();

@@ -25,7 +25,7 @@ pub enum ClientAuthMethod {
 #[derive(Deserialize)]
 pub(crate) struct TokenResponse {
     /// The access token issued by the authorization server.
-    pub access_token: String,
+    pub access_token: SecretString,
     /// The lifetime in seconds of the access token (optional per RFC 6749).
     #[serde(default)]
     pub expires_in: Option<u64>,
@@ -48,16 +48,19 @@ mod tests {
     fn deserialize_full_response() {
         let json = r#"{"access_token":"tok","expires_in":3600,"token_type":"Bearer"}"#;
         let r: TokenResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(r.access_token, "tok");
+        assert_eq!(r.access_token.expose(), "tok");
         assert_eq!(r.expires_in, Some(3600));
         assert_eq!(r.token_type.as_deref(), Some("Bearer"));
+
+        // Redaction proof: the raw token must not appear in Debug output.
+        assert!(!format!("{:?}", r.access_token).contains("tok"));
     }
 
     #[test]
     fn deserialize_minimal_response() {
         let json = r#"{"access_token":"tok"}"#;
         let r: TokenResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(r.access_token, "tok");
+        assert_eq!(r.access_token.expose(), "tok");
         assert!(r.expires_in.is_none());
         assert!(r.token_type.is_none());
     }
@@ -66,6 +69,6 @@ mod tests {
     fn deserialize_ignores_unknown_fields() {
         let json = r#"{"access_token":"tok","scope":"read","refresh_token":"rt"}"#;
         let r: TokenResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(r.access_token, "tok");
+        assert_eq!(r.access_token.expose(), "tok");
     }
 }

@@ -5,14 +5,22 @@ extern crate rustc_ast;
 
 use clippy_utils::diagnostics::span_lint_and_then;
 use lint_utils::is_in_domain_path;
-use rustc_ast::{Item, ItemKind};
+use rustc_ast::{Item, ItemKind, VisibilityKind};
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
 
 dylint_linting::declare_pre_expansion_lint! {
     /// DE0309: Domain Structs Must Have `#[domain_model]` Attribute
     ///
-    /// All struct and enum types in the domain layer MUST have the `#[domain_model]`
-    /// attribute to ensure compile-time validation of DDD boundaries.
+    /// Struct and enum types in the domain layer that are visible beyond their own
+    /// module (`pub`, `pub(crate)`, `pub(super)`, `pub(in ...)`) MUST have the
+    /// `#[domain_model]` attribute to ensure compile-time validation of DDD boundaries.
+    ///
+    /// Strictly module-private types (no `pub` keyword) are exempt: they are pure
+    /// implementation details that never cross a layer boundary, and their fields
+    /// are still guarded against infrastructure leakage by `DE0301_NO_INFRA_IN_DOMAIN`
+    /// and `DE0308_NO_HTTP_IN_DOMAIN`, which check every domain struct/enum regardless
+    /// of this attribute. This keeps small technical helpers (e.g. a `HashMap`-key
+    /// newtype) from needing either a spurious `#[domain_model]` or an `#[allow(...)]`.
     ///
     /// ### Why is this important?
     ///
@@ -62,6 +70,14 @@ fn check_domain_model_attribute(cx: &EarlyContext<'_>, item: &Item) {
 
     // Only check items in domain path
     if !is_in_domain_path(cx.sess().source_map(), item.span) {
+        return;
+    }
+
+    // Exempt strictly module-private types (no `pub` keyword). They never cross a
+    // layer boundary, and their fields are still checked for infra leakage by
+    // DE0301/DE0308 regardless of this attribute. `pub`/`pub(crate)`/`pub(super)`/
+    // `pub(in ...)` remain subject to the requirement.
+    if matches!(item.vis.kind, VisibilityKind::Inherited) {
         return;
     }
 

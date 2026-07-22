@@ -74,7 +74,7 @@ See: [GEARS.md](GEARS.md)
 
 Constructor Fabric Gears follows a DDD-light structure in which domain logic is kept free from transport and infrastructure details, while REST/gRPC adapters and infra layers handle boundary-specific concerns.
 
-**How.** The standard gear layout separates SDK contracts, gear bootstrap, domain logic, API adapters, and infrastructure. Domain types and services live under `domain/`, REST DTOs and route wiring stay in API-facing layers, and persistence/integration logic stays in infra. This boundary is reinforced not only by structure but also by custom Dylints and the `#[domain_model]` macro requirement for domain-layer types.
+**How.** The standard gear layout separates SDK contracts, gear bootstrap, domain logic, API adapters, and infrastructure. Domain types and services live under `domain/`, REST DTOs and route wiring stay in API-facing layers, and persistence/integration logic stays in infra. This boundary is reinforced not only by structure but also by custom Dylints and the `#[domain_model]` macro requirement for domain-layer types that are visible beyond their module (strictly module-private helper types are exempt; their fields are still checked for infrastructure leakage by the domain-layer Dylints).
 
 **Why.** Business logic stays easier to test, reuse, and evolve because it is not entangled with HTTP, database, or framework details. At the same time, adapter code remains explicit about where transport translation and persistence concerns begin.
 

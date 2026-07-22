@@ -158,7 +158,7 @@ async fn pg_params_smoke() -> Result<()> {
     params.insert("application_name".to_owned(), "test_app_toolkit".to_owned());
 
     let config = DbConnConfig {
-        dsn: Some(dut.url),
+        dsn: Some(toolkit_utils::SecretString::new(dut.url)),
         params: Some(params),
         ..Default::default()
     };
@@ -175,7 +175,7 @@ async fn mysql_params_smoke() -> Result<()> {
     params.insert("connect_timeout".to_owned(), "10".to_owned());
 
     let config = DbConnConfig {
-        dsn: Some(dut.url),
+        dsn: Some(toolkit_utils::SecretString::new(dut.url)),
         params: Some(params),
         ..Default::default()
     };
@@ -191,7 +191,7 @@ async fn sqlite_params_smoke() -> Result<()> {
     params.insert("busy_timeout".to_owned(), "5000".to_owned());
 
     let config = DbConnConfig {
-        dsn: Some("sqlite::memory:".to_owned()),
+        dsn: Some(toolkit_utils::SecretString::new("sqlite::memory:")),
         params: Some(params),
         ..Default::default()
     };

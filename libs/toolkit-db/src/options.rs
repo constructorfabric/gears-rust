@@ -1,5 +1,6 @@
 //! Database connection options and configuration types.
 
+use toolkit_utils::SecretString;
 use toolkit_utils::var_expand::expand_env_vars;
 
 use crate::config::{DbConnConfig, DbEngineCfg, GlobalDatabaseConfig, PoolCfg};
@@ -260,10 +261,10 @@ pub(crate) async fn build_db_handle(
 ) -> Result<DbHandle> {
     // Expand environment variables in DSN and password
     if let Some(dsn) = &cfg.dsn {
-        cfg.dsn = Some(expand_env_vars(dsn)?);
+        cfg.dsn = Some(SecretString::new(expand_env_vars(dsn.expose())?));
     }
     if let Some(password) = &cfg.password {
-        cfg.password = Some(resolve_password(password)?);
+        cfg.password = Some(SecretString::new(resolve_password(password.expose())?));
     }
 
     // Expand environment variables in params
@@ -289,7 +290,7 @@ pub(crate) async fn build_db_handle(
     let pool_cfg = cfg.pool.unwrap_or_default();
 
     // Log connection attempt (without credentials)
-    let log_dsn = redact_credentials_in_dsn(cfg.dsn.as_deref());
+    let log_dsn = redact_credentials_in_dsn(cfg.dsn.as_ref().map(SecretString::expose));
     tracing::debug!(dsn = log_dsn, engine = ?engine, "Building database connection");
 
     // Connect to database
@@ -303,7 +304,7 @@ fn determine_engine(cfg: &DbConnConfig) -> Result<DbEngineCfg> {
     // (We do the same check in validate_config_consistency, but keep this here to ensure
     // determine_engine() never returns a misleading value.)
     if let Some(engine) = cfg.engine {
-        if let Some(dsn) = cfg.dsn.as_deref() {
+        if let Some(dsn) = cfg.dsn.as_ref().map(SecretString::expose) {
             let inferred = engine_from_dsn(dsn)?;
             if inferred != engine {
                 return Err(DbError::ConfigConflict(format!(
@@ -326,7 +327,7 @@ fn determine_engine(cfg: &DbConnConfig) -> Result<DbEngineCfg> {
     }
 
     // Infer from DSN scheme when present.
-    let Some(dsn) = cfg.dsn.as_deref() else {
+    let Some(dsn) = cfg.dsn.as_ref().map(SecretString::expose) else {
         // SAFETY: guarded above by `cfg.dsn.is_none()`.
         return Err(DbError::InvalidParameter(
             "Missing 'dsn': required to infer database engine".to_owned(),
@@ -352,7 +353,7 @@ fn engine_from_dsn(dsn: &str) -> Result<DbEngineCfg> {
 #[cfg(feature = "sqlite")]
 fn build_sqlite_options(cfg: &DbConnConfig) -> Result<DbConnectOptions> {
     let db_path = if let Some(dsn) = &cfg.dsn {
-        parse_sqlite_path_from_dsn(dsn)?
+        parse_sqlite_path_from_dsn(dsn.expose())?
     } else if let Some(path) = &cfg.path {
         path.clone()
     } else if let Some(_file) = &cfg.file {
@@ -571,7 +572,8 @@ fn build_server_options(cfg: &DbConnConfig, engine: DbEngineCfg) -> Result<DbCon
             #[cfg(feature = "pg")]
             {
                 let mut opts = if let Some(dsn) = &cfg.dsn {
-                    dsn.parse::<sqlx::postgres::PgConnectOptions>()
+                    dsn.expose()
+                        .parse::<sqlx::postgres::PgConnectOptions>()
                         .map_err(|e| DbError::InvalidParameter(e.to_string()))?
                 } else {
                     sqlx::postgres::PgConnectOptions::new()
@@ -588,7 +590,7 @@ fn build_server_options(cfg: &DbConnConfig, engine: DbEngineCfg) -> Result<DbCon
                     opts = opts.username(user);
                 }
                 if let Some(password) = &cfg.password {
-                    opts = opts.password(password);
+                    opts = opts.password(password.expose());
                 }
                 if let Some(dbname) = &cfg.dbname {
                     opts = opts.database(dbname);
@@ -614,7 +616,8 @@ fn build_server_options(cfg: &DbConnConfig, engine: DbEngineCfg) -> Result<DbCon
             #[cfg(feature = "mysql")]
             {
                 let mut opts = if let Some(dsn) = &cfg.dsn {
-                    dsn.parse::<sqlx::mysql::MySqlConnectOptions>()
+                    dsn.expose()
+                        .parse::<sqlx::mysql::MySqlConnectOptions>()
                         .map_err(|e| DbError::InvalidParameter(e.to_string()))?
                 } else {
                     sqlx::mysql::MySqlConnectOptions::new()
@@ -631,7 +634,7 @@ fn build_server_options(cfg: &DbConnConfig, engine: DbEngineCfg) -> Result<DbCon
                     opts = opts.username(user);
                 }
                 if let Some(password) = &cfg.password {
-                    opts = opts.password(password);
+                    opts = opts.password(password.expose());
                 }
                 if let Some(dbname) = &cfg.dbname {
                     opts = opts.database(dbname);
@@ -705,7 +708,7 @@ fn resolve_password(password: &str) -> Result<String> {
 /// Validate configuration for consistency and detect conflicts.
 fn validate_config_consistency(cfg: &DbConnConfig) -> Result<()> {
     // Validate engine against DSN if both are present
-    if let (Some(engine), Some(dsn)) = (cfg.engine, cfg.dsn.as_deref()) {
+    if let (Some(engine), Some(dsn)) = (cfg.engine, cfg.dsn.as_ref().map(SecretString::expose)) {
         let inferred = engine_from_dsn(dsn)?;
         if inferred != engine {
             return Err(DbError::ConfigConflict(format!(
@@ -716,7 +719,7 @@ fn validate_config_consistency(cfg: &DbConnConfig) -> Result<()> {
 
     // Check for SQLite vs server engine conflicts
     if let Some(dsn) = &cfg.dsn {
-        let is_sqlite_dsn = dsn.starts_with("sqlite");
+        let is_sqlite_dsn = dsn.expose().starts_with("sqlite");
         let has_sqlite_fields = cfg.file.is_some() || cfg.path.is_some();
         let has_server_fields = cfg.host.is_some() || cfg.port.is_some();
 
@@ -824,7 +827,7 @@ mod tests {
     fn determine_engine_infers_from_dsn_when_engine_missing() {
         let cfg = DbConnConfig {
             engine: None,
-            dsn: Some("sqlite::memory:".to_owned()),
+            dsn: Some(SecretString::new("sqlite::memory:")),
             ..Default::default()
         };
 
@@ -845,7 +848,7 @@ mod tests {
         for (engine, dsn) in cases {
             let cfg = DbConnConfig {
                 engine: Some(engine),
-                dsn: Some(dsn.to_owned()),
+                dsn: Some(SecretString::new(dsn)),
                 ..Default::default()
             };
             validate_config_consistency(&cfg).unwrap();
@@ -864,7 +867,7 @@ mod tests {
         for (engine, dsn) in cases {
             let cfg = DbConnConfig {
                 engine: Some(engine),
-                dsn: Some(dsn.to_owned()),
+                dsn: Some(SecretString::new(dsn)),
                 ..Default::default()
             };
 
@@ -877,7 +880,7 @@ mod tests {
     fn unknown_dsn_is_error() {
         let cfg = DbConnConfig {
             engine: None,
-            dsn: Some("unknown://localhost/db".to_owned()),
+            dsn: Some(SecretString::new("unknown://localhost/db")),
             ..Default::default()
         };
 

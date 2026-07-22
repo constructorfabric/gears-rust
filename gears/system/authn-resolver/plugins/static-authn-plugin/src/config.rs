@@ -88,7 +88,7 @@ impl Default for IdentityConfig {
 #[serde(deny_unknown_fields)]
 pub struct TokenMapping {
     /// The bearer token value to match.
-    pub token: String,
+    pub token: SecretString,
     /// The identity to return when this token is presented.
     pub identity: IdentityConfig,
 }

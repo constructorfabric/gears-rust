@@ -860,7 +860,7 @@ impl DbConfigBuilder {
     ) -> Result<()> {
         // Apply global server DSN
         if let Some(global_dsn) = &global_server.dsn {
-            let expanded_dsn = expand_env_in_dsn(global_dsn)?;
+            let expanded_dsn = expand_env_in_dsn(global_dsn.expose())?;
             // For SQLite, resolve @file() syntax before validation
             let resolved_dsn = if expanded_dsn.starts_with("sqlite") {
                 resolve_sqlite_dsn(&expanded_dsn, home_dir, gear_name, dry_run)?
@@ -881,7 +881,12 @@ impl DbConfigBuilder {
         if let Some(user) = &global_server.user {
             self.user = Some(user.clone());
         }
-        if let Some(password) = resolve_password(global_server.password.as_deref())? {
+        if let Some(password) = resolve_password(
+            global_server
+                .password
+                .as_ref()
+                .map(toolkit_utils::SecretString::expose),
+        )? {
             self.password = Some(password);
         }
         if let Some(dbname) = &global_server.dbname {
@@ -927,7 +932,12 @@ impl DbConfigBuilder {
         if let Some(user) = &gear_db_config.user {
             self.user = Some(user.clone());
         }
-        if let Some(password) = resolve_password(gear_db_config.password.as_deref())? {
+        if let Some(password) = resolve_password(
+            gear_db_config
+                .password
+                .as_ref()
+                .map(toolkit_utils::SecretString::expose),
+        )? {
             self.password = Some(password);
         }
         if let Some(dbname) = &gear_db_config.dbname {
@@ -1281,7 +1291,7 @@ pub fn build_final_db_for_gear(
 
     // Step 2: Apply gear DSN (override global)
     if let Some(gear_dsn) = &gear_db_config.dsn {
-        builder.apply_gear_dsn(gear_dsn, home_dir, gear_name, dry_run)?;
+        builder.apply_gear_dsn(gear_dsn.expose(), home_dir, gear_name, dry_run)?;
     }
 
     // Step 3: Apply gear fields (override everything)
@@ -1670,9 +1680,9 @@ logging:
         let mut app = create_app_with_server(
             "test_server",
             DbConnConfig {
-                dsn: Some(
-                    "postgresql://global_user:global_pass@global_host:5432/global_db".to_owned(),
-                ),
+                dsn: Some(toolkit_utils::SecretString::new(
+                    "postgresql://global_user:global_pass@global_host:5432/global_db",
+                )),
                 ..Default::default()
             },
         );
@@ -1802,7 +1812,9 @@ logging:
         let mut app = create_app_with_server(
             "test_server",
             DbConnConfig {
-                dsn: Some("postgresql://old_user:old_pass@old_host:5432/old_db".to_owned()),
+                dsn: Some(toolkit_utils::SecretString::new(
+                    "postgresql://old_user:old_pass@old_host:5432/old_db",
+                )),
                 host: Some("new_host".to_owned()), // This should override DSN host
                 port: Some(5433),                  // This should override DSN port
                 user: Some("new_user".to_owned()), // This should override DSN user
@@ -1849,7 +1861,7 @@ logging:
                     host: Some("localhost".to_owned()),
                     port: Some(5432),
                     user: Some("testuser".to_owned()),
-                    password: Some("${TEST_DB_PASSWORD}".to_owned()), // Should expand to "secret123"
+                    password: Some(toolkit_utils::SecretString::new("${TEST_DB_PASSWORD}")), // Should expand to "secret123"
                     dbname: Some("testdb".to_owned()),
                     ..Default::default()
                 },
@@ -1885,9 +1897,9 @@ logging:
                 let mut app = create_app_with_server(
                     "test_server",
                     DbConnConfig {
-                        dsn: Some(
-                            "postgresql://user:${DB_PASSWORD}@${DB_HOST}:5432/mydb".to_owned(),
-                        ),
+                        dsn: Some(toolkit_utils::SecretString::new(
+                            "postgresql://user:${DB_PASSWORD}@${DB_HOST}:5432/mydb",
+                        )),
                         ..Default::default()
                     },
                 );
@@ -2033,10 +2045,9 @@ logging:
             "sqlite_users".to_owned(),
             DbConnConfig {
                 engine: None,
-                dsn: Some(
-                    "sqlite://users_info.db?WAL=true&synchronous=NORMAL&busy_timeout=5000"
-                        .to_owned(),
-                ),
+                dsn: Some(toolkit_utils::SecretString::new(
+                    "sqlite://users_info.db?WAL=true&synchronous=NORMAL&busy_timeout=5000",
+                )),
                 host: None,
                 port: None,
                 user: None,
@@ -2268,7 +2279,7 @@ logging:
                 "test_server",
                 DbConnConfig {
                     host: Some("localhost".to_owned()),
-                    password: Some("${NONEXISTENT_PASSWORD}".to_owned()),
+                    password: Some(toolkit_utils::SecretString::new("${NONEXISTENT_PASSWORD}")),
                     dbname: Some("testdb".to_owned()),
                     ..Default::default()
                 },
@@ -2434,7 +2445,9 @@ logging:
                 host: Some("localhost".to_owned()),
                 port: Some(5432),
                 user: Some("user@domain".to_owned()),
-                password: Some("pa@ss:w0rd/with%special&chars".to_owned()),
+                password: Some(toolkit_utils::SecretString::new(
+                    "pa@ss:w0rd/with%special&chars",
+                )),
                 dbname: Some("test/db".to_owned()),
                 ..Default::default()
             },
@@ -2734,7 +2747,7 @@ logging:
                 host: Some("localhost".to_owned()),
                 port: Some(5432),
                 user: Some("user".to_owned()),
-                password: Some("pass".to_owned()),
+                password: Some(toolkit_utils::SecretString::new("pass")),
                 dbname: Some("db".to_owned()),
                 ..Default::default()
             },

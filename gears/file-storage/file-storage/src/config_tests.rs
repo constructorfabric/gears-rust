@@ -119,14 +119,22 @@ fn validate_allows_missing_signing_key_seed_when_required_flag_unset() {
 
 #[test]
 fn validate_allows_present_signing_key_seed_when_required_flag_set() {
+    const SEED: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let cfg = FileStorageConfig {
-        signing_key_seed: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()),
+        signing_key_seed: Some(SecretString::new(SEED)),
         require_signing_key_seed: true,
         ..FileStorageConfig::default()
     };
     assert!(
         cfg.validate().is_ok(),
         "a present signing_key_seed must pass validation even when required"
+    );
+
+    // Redaction proof: the raw seed must not appear in Debug output.
+    let cfg_debug = format!("{cfg:?}");
+    assert!(
+        !cfg_debug.contains(SEED),
+        "FileStorageConfig's Debug output must never contain the raw signing_key_seed: {cfg_debug}"
     );
 }
 
@@ -159,15 +167,23 @@ fn require_finalize_internal_secret_without_secret_fails_validate() {
 
 #[test]
 fn require_finalize_internal_secret_with_secret_passes_validate() {
+    const SECRET: &str = "interim-shared-secret";
     let cfg = FileStorageConfig {
         require_signing_key_seed: false,
-        finalize_internal_secret: Some("interim-shared-secret".to_owned()),
+        finalize_internal_secret: Some(SecretString::new(SECRET)),
         require_finalize_internal_secret: true,
         ..FileStorageConfig::default()
     };
     assert!(
         cfg.validate().is_ok(),
         "a present finalize_internal_secret must pass validation even when required"
+    );
+
+    // Redaction proof: the raw secret must not appear in Debug output.
+    let cfg_debug = format!("{cfg:?}");
+    assert!(
+        !cfg_debug.contains(SECRET),
+        "FileStorageConfig's Debug output must never contain the raw finalize_internal_secret: {cfg_debug}"
     );
 }
 
@@ -214,7 +230,7 @@ fn config_s3_backends_serde_round_trip() {
             region: "us-east-1".to_owned(),
             bucket: "my-bucket".to_owned(),
             access_key_id: Some("AKIAEXAMPLE".to_owned()),
-            secret_access_key: Some(SECRET.to_owned()),
+            secret_access_key: Some(SecretString::new(SECRET)),
             path_style: true,
         }],
         ..FileStorageConfig::default()
@@ -230,7 +246,13 @@ fn config_s3_backends_serde_round_trip() {
     assert_eq!(entry.region, "us-east-1");
     assert_eq!(entry.bucket, "my-bucket");
     assert_eq!(entry.access_key_id.as_deref(), Some("AKIAEXAMPLE"));
-    assert_eq!(entry.secret_access_key.as_deref(), Some(SECRET));
+    assert_eq!(
+        entry
+            .secret_access_key
+            .as_ref()
+            .map(toolkit_utils::SecretString::expose),
+        Some(SECRET)
+    );
     assert!(entry.path_style);
 
     // Redaction proof: the raw secret must not appear anywhere in either

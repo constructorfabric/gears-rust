@@ -90,7 +90,10 @@ async fn test_precedence_gear_dsn_override_server() {
                 "sqlite_server".to_owned(),
                 DbConnConfig {
                     engine: Some(DbEngineCfg::Sqlite),
-                    dsn: Some(format!("sqlite://{}?synchronous=FULL", server_db.display())),
+                    dsn: Some(toolkit_utils::SecretString::new(format!(
+                        "sqlite://{}?synchronous=FULL",
+                        server_db.display()
+                    ))),
                     ..Default::default()
                 },
             );

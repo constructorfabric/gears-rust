@@ -1,4 +1,5 @@
 use toolkit::DatabaseCapability;
+use toolkit_utils::SecretString;
 
 use super::*;
 
@@ -76,7 +77,7 @@ fn gear_registry_includes_configured_s3_backends() {
             region: "us-east-1".to_owned(),
             bucket: "test-bucket".to_owned(),
             access_key_id: Some("test-access-key".to_owned()),
-            secret_access_key: Some("test-secret-key".to_owned()),
+            secret_access_key: Some(SecretString::new("test-secret-key")),
             path_style: true,
         }],
         ..FileStorageConfig::default()
@@ -107,7 +108,7 @@ fn gear_default_backend_id_falls_back_to_local_fs_when_unset() {
             region: "us-east-1".to_owned(),
             bucket: "test-bucket".to_owned(),
             access_key_id: Some("test-access-key".to_owned()),
-            secret_access_key: Some("test-secret-key".to_owned()),
+            secret_access_key: Some(SecretString::new("test-secret-key")),
             path_style: true,
         }],
         ..FileStorageConfig::default()
@@ -130,7 +131,7 @@ fn gear_default_backend_id_override_selects_configured_backend() {
             region: "us-east-1".to_owned(),
             bucket: "test-bucket".to_owned(),
             access_key_id: Some("test-access-key".to_owned()),
-            secret_access_key: Some("test-secret-key".to_owned()),
+            secret_access_key: Some(SecretString::new("test-secret-key")),
             path_style: true,
         }],
         default_backend_id: Some("s3-primary".to_owned()),

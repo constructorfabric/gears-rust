@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
+use toolkit_utils::SecretString;
 
 /// Global database configuration with server-based DBs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -69,14 +70,22 @@ pub struct DbConnConfig {
     pub engine: Option<DbEngineCfg>,
 
     // DSN-style (full, valid). Optional: can be absent and rely on fields.
-    pub dsn: Option<String>,
+    #[serde(
+        default,
+        serialize_with = "toolkit_utils::secret_string::serialize_option_exposed"
+    )]
+    pub dsn: Option<SecretString>,
 
     // Field-based style; any of these override DSN parts when present:
     pub host: Option<String>,
     pub port: Option<u16>,
     pub user: Option<String>,
-    pub password: Option<String>, // literal password or ${VAR} for env expansion
-    pub dbname: Option<String>,   // MUST be present in final for server-based DBs
+    #[serde(
+        default,
+        serialize_with = "toolkit_utils::secret_string::serialize_option_exposed"
+    )]
+    pub password: Option<SecretString>, // literal password or ${VAR} for env expansion
+    pub dbname: Option<String>, // MUST be present in final for server-based DBs
     #[serde(default)]
     pub params: Option<HashMap<String, String>>,
 
