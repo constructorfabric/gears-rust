@@ -165,8 +165,8 @@ pub struct CreateUsageRecordRequest {
     /// Mandatory caller-supplied idempotency key per
     /// `cpt-cf-usage-collector-dod-usage-emission-fr-idempotency`. The
     /// plugin SPI dedups every persisted record on
-    /// `(tenant_id, usage_type_gts_id, idempotency_key)`; a missing key
-    /// surfaces as a request-deserialization failure.
+    /// `(tenant_id, gts_id, idempotency_key, created_at)` (ADR-0014); a
+    /// missing key surfaces as a request-deserialization failure.
     pub idempotency_key: String,
     /// When set, marks this submission as a counter compensation
     /// referencing a previously emitted ordinary usage row. Absent on

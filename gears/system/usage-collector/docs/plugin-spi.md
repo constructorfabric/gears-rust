@@ -115,7 +115,7 @@ capabilities at the persistence boundary:
 
 - Durable persistence of single and batched `UsageRecord` submissions
   with caller-supplied idempotency keys, including dedup-on-conflict
-  enforcement on the composite `(tenant_id, gts_id, idempotency_key)`
+  enforcement on the composite `(tenant_id, gts_id, idempotency_key, created_at)`
   (`cpt-cf-usage-collector-fr-pluggable-storage`,
   `cpt-cf-usage-collector-fr-ingestion`,
   `cpt-cf-usage-collector-fr-idempotency`,
@@ -432,10 +432,12 @@ upstream.
 SPI-specific aspects of the canonical types:
 
 - `UsageRecord.id` is **gateway-derived** (deterministic UUIDv5 of the dedup key
-  `(tenant_id, gts_id, idempotency_key)`), persisted verbatim, and returned on
+  `(tenant_id, gts_id, idempotency_key, created_at)`), persisted verbatim, and returned on
   every subsequent read; the plugin MUST NOT mint or rewrite it.
   The gateway derives it as
-  `id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_id ⟨0x1F⟩ idempotency_key)` where `NS`
+  `id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_id ⟨0x1F⟩ created_at_micros ⟨0x1F⟩ idempotency_key)`
+  (`created_at_micros` = the event timestamp as integer microseconds-since-epoch;
+  see [ADR-0014](./ADR/0014-created-at-in-dedup-identity.md)) where `NS`
   is the fixed namespace `56313026-863b-4de8-b32b-1f96b67306ed`, `tenant_id` is
   its canonical lowercase-hyphenated form, the fields are joined by a single
   `0x1F` byte, and `idempotency_key` is the final field (so the encoding is
@@ -507,12 +509,17 @@ dedicated outcome enums; failures use error variants instead.
   plugin returns either the newly written row (fresh insert) or the
   previously stored row when an exact-equality idempotency retry is
   silently absorbed. The dedup-key tuple is
-  `(tenant_id, gts_id, idempotency_key)`; on a key collision the plugin
+  `(tenant_id, gts_id, idempotency_key, created_at)`; on a key collision the plugin
   compares the incoming record's canonical fields — `value`,
-  `created_at`, `resource_ref`, `subject_ref`,
+  `resource_ref`, `subject_ref`,
   `corrects_id`, and `metadata` — against the stored record. The
   dedup-key tuple itself is excluded (it is the match key) and the
-  server-owned fields (`id`, `status`) are excluded. ALL compared
+  server-managed `status` is excluded; the server-owned `id`, though not a
+  caller-supplied comparison input, is a deterministic UUIDv5 projection of the
+  dedup key (ADR-0013/0014) and thus equal by construction once the key has
+  matched, so a plugin MAY defensively verify the stored `id` against the derived
+  value (surfacing a corrupted stored row as `IdempotencyConflict` rather than a
+  silent absorb) without changing the outcome for well-formed data. ALL compared
   fields equal → silent absorb (return the stored record on `Ok`);
   ANY compared field differs — including a metadata-only difference —
   → `IdempotencyConflict` error variant (the Plugin Host lifts this to
@@ -520,7 +527,11 @@ dedicated outcome enums; failures use error variants instead.
   fail-closed `idempotency_conflict` rejection, AIP-193 AlreadyExists /
   `409`, DESIGN §3.3; the second write
   is never silently dropped). Duplicates MUST NOT accumulate the
-  counter total.
+  counter total. Per [ADR-0014](./ADR/0014-created-at-in-dedup-identity.md),
+  `created_at` is part of the dedup key rather than a compared canonical
+  field: a same-key submission with a different `created_at` is a
+  distinct record (a distinct dedup-key tuple, hence a distinct derived
+  `id`), not an `IdempotencyConflict`.
 - **Create batch output**: a list of per-record `Result<UsageRecord,
 UsageCollectorPluginError>` in the same length and order as the input
   batch. Per-record errors do not cause the batch call as a whole to
@@ -600,7 +611,7 @@ UsageCollectorPluginError>` in the same length and order as the input
 ### Cross-entity invariants honored by the Plugin SPI
 
 - Records persisted through the SPI honour the
-  `(tenant_id, gts_id, idempotency_key)` UNIQUE constraint (the reference
+  `(tenant_id, gts_id, idempotency_key, created_at)` UNIQUE constraint (the reference
   column carries the GTS identifier string `gts_id`;
   the in-plugin column type and index choice are the plugin author's
   choice and out of SPI scope). On a key
@@ -612,20 +623,24 @@ UsageCollectorPluginError>` in the same length and order as the input
   `IdempotencyConflict` error variant, which the Plugin Host lifts to
   the SDK-side `IdempotencyConflict` and the core then surfaces as a
   fail-closed `idempotency_conflict` rejection (AlreadyExists / `409`)
-  rather than a silent absorb.
+  rather than a silent absorb. Per [ADR-0014](./ADR/0014-created-at-in-dedup-identity.md),
+  `created_at` is part of the dedup key rather than a compared canonical
+  field: a same-key submission with a different `created_at` is a
+  distinct record (a distinct dedup-key tuple, hence a distinct derived
+  `id`), not an `IdempotencyConflict`.
 - **Strict dedup-key preservation (normative).** The idempotency window
   is unbounded: the
-  `(tenant_id, gts_id, idempotency_key)` dedup key never
+  `(tenant_id, gts_id, idempotency_key, created_at)` dedup key never
   expires, has no TTL, and is never intentionally reusable, so the
   UNIQUE constraint is permanent. A storage plugin MUST preserve the
-  `(tenant_id, gts_id, idempotency_key)` tuple permanently —
+  `(tenant_id, gts_id, idempotency_key, created_at)` tuple permanently —
   even when the corresponding record bodies are purged or archived by
   the plugin's own retention policy. Retention, purge, and archival
   remain plugin-owned (`cpt-cf-usage-collector-adr-pluggable-storage`;
   see also §"Exclusions/Non-goals"), and this obligation refines, not
   contradicts, that ownership: the plugin still owns retention but
   MUST NOT free a dedup key. Retention / purge / archival MUST NOT
-  release a `(tenant_id, gts_id, idempotency_key)` tuple, so
+  release a `(tenant_id, gts_id, idempotency_key, created_at)` tuple, so
   a replayed key always resolves to a silently-absorbed exact-equality
   retry (the previously persisted `UsageRecord` is returned on the `Ok`
   arm) or an `IdempotencyConflict` error (canonical-field mismatch),
@@ -688,7 +703,7 @@ UsageCollectorPluginError>` in the same length and order as the input
   per `cpt-cf-usage-collector-adr-usage-compensation`.
 - The plugin does NOT allocate `id`: it is gateway-derived (a
   deterministic UUIDv5 of the dedup key
-  `(tenant_id, gts_id, idempotency_key)`) and the plugin persists it
+  `(tenant_id, gts_id, idempotency_key, created_at)`) and the plugin persists it
   verbatim. Cursor decode and structural validation
   (`toolkit_odata::CursorV1::decode` plus `validate_cursor_against`)
   are gateway-owned; the plugin receives an already-decoded
@@ -786,11 +801,11 @@ Taxonomy".
 
   The plugin records the caller-supplied signed delta; it does NOT compute the delta.
 - Plugin invariants:
-  1. UNIQUE `(tenant_id, gts_id, idempotency_key)`. On collision, compare the incoming record's caller-supplied canonical fields (`value`, `created_at`, `resource_ref`, `subject_ref`, `metadata`, `corrects_id`) against the stored row (the dedup tuple itself and server-owned `id`/`status` are excluded). ALL-equal → silently absorb and return the stored row on `Ok`; ANY-differ — including metadata-only or divergent `corrects_id` — → `IdempotencyConflict`.
+  1. UNIQUE `(tenant_id, gts_id, idempotency_key, created_at)`. On collision, compare the incoming record's caller-supplied canonical fields (`value`, `resource_ref`, `subject_ref`, `metadata`, `corrects_id`) against the stored row (the dedup tuple itself — including `created_at` — and the server-managed `status` are excluded; the server-owned `id` is a deterministic UUIDv5 projection of the dedup key per ADR-0013/0014, hence equal by construction once the key has matched, so a plugin MAY defensively verify it against the derived value — surfacing a corrupted stored row as `IdempotencyConflict` rather than a silent absorb — without changing the outcome for well-formed data). ALL-equal → silently absorb and return the stored row on `Ok`; ANY-differ — including metadata-only or divergent `corrects_id` — → `IdempotencyConflict`. Per [ADR-0014](./ADR/0014-created-at-in-dedup-identity.md), `created_at` is part of the dedup key, not a compared canonical field: a same-key submission with a different `created_at` is a distinct record, not an `IdempotencyConflict`.
   2. Persist `metadata` byte-for-byte; the size cap is enforced upstream and the SPI MUST NOT silently truncate.
   3. Persist `status = Active` on first acceptance.
   4. Persist `corrects_id` exactly as supplied; the value-sign matrix above is a structural precondition (no row inserted on rejection).
-  5. **Permanent dedup-key preservation.** The `(tenant_id, gts_id, idempotency_key)` UNIQUE constraint is unbounded: the key never expires, has no TTL, and is never intentionally reusable. Even after a record body is purged or archived, a replayed key MUST still resolve to a silently-absorbed exact-equality retry or `IdempotencyConflict` — never a fresh insertion. See §"Cross-entity invariants honored by the Plugin SPI".
+  5. **Permanent dedup-key preservation.** The `(tenant_id, gts_id, idempotency_key, created_at)` UNIQUE constraint is unbounded: the key never expires, has no TTL, and is never intentionally reusable. Even after a record body is purged or archived, a replayed key MUST still resolve to a silently-absorbed exact-equality retry or `IdempotencyConflict` — never a fresh insertion. See §"Cross-entity invariants honored by the Plugin SPI".
 - **Single ingestion path (no dedicated `compensate` SPI call).** Per `cpt-cf-usage-collector-adr-usage-compensation`, this same persist accepts both ordinary usage payloads (`corrects_id IS NULL`) and counter-compensation payloads (`corrects_id` set).
 - Error variants the plugin may surface: `Transient`, `Internal`, `IdempotencyConflict`. Host-contract breaches the plugin happens to detect (value-sign matrix violation, …) lift through `Internal(detail)` (non-retryable). Upstream-enforced categories (typed validation variants, `UsageTypeNotFound`, `UnknownMetadataKey`, `Authorization`, `GaugeCompensationRejected`, `CorrectsId*`) are not raised by the SPI. "Not ready" is detected structurally by the Plugin Host before dispatch (no scoped client under `ClientScope::gts_id(instance_id)`); the SPI has no `Unready` variant.
 - Latency budget: 75 ms p95 of the 200 ms total ingestion p95 per DESIGN §3.11.2.
@@ -848,8 +863,8 @@ Taxonomy".
   - Inactive rows (any `corrects_id`) are excluded from all aggregations BEFORE the `corrects_id` partition. The status filter and the `corrects_id` partition are orthogonal.
   - A negative `SUM(value)` is an ordinary outcome — the plugin MUST NOT validate non-negative net per the un-policed-net stance (`cpt-cf-usage-collector-adr-usage-compensation`).
   - The plugin MAY implement this universal rule ("`SUM` nets; every other op filters `corrects_id IS NULL`") uniformly as defence-in-depth; under the restricted contract it is only ever dispatched allowed `(op, kind)` pairs.
-- Success output: `AggregationResult` bounded at the wire boundary by the caps declared in `usage-collector-v1.yaml` (≤ 100,000 rows over a 90-day single-tenant window with ≤ 2 groupings). An empty result returns empty `buckets`, not an error.
-- Error variants: `Transient`, `Internal` (host-contract breaches lift through `Internal(detail)`).
+- Success output: `AggregationResult`. The gateway-enforced bounded `created_at` window caps the rows scanned but **not** the distinct groups a `group_by` produces, so a high-cardinality dimension (e.g. an `AggregationDimension::Metadata` key with near-unique values) could otherwise materialize an unbounded bucket set into memory. The plugin therefore MUST bound its own result to `MAX_AGGREGATION_BUCKETS + 1` buckets (≤ 100,001 — e.g. a `LIMIT` on the grouped query); the `+ 1` lets the gateway distinguish a result exactly at the cap from one over it. The gateway rejects a result exceeding `MAX_AGGREGATION_BUCKETS` (100,000) with a `400` (`field_violations[0].reason="AGGREGATION_RESULT_TOO_LARGE"`) before returning it. An empty result returns empty `buckets`, not an error. Wire caps (≤ 100,000 rows over a 90-day single-tenant window with ≤ 2 groupings) are declared in `usage-collector-v1.yaml`.
+- Error variants: `Transient`, `Internal` (host-contract breaches lift through `Internal(detail)`). The over-cap rejection is gateway-side (a `400`), not a plugin error.
 - Latency budget: 425 ms p95 of the 500 ms total query p95 per DESIGN §3.11.2.
 
 ### Method 4 — Raw keyset-paginated query
@@ -872,7 +887,7 @@ Taxonomy".
 - Structural inputs reaching the SPI:
   - `gts_id: UsageTypeGtsId` — the typed usage-type key. The gateway has already validated usage-type existence and resolved the declared `metadata_fields`; the plugin lowers this to its `gts_id` column filter (`WHERE gts_id = $1`). The `gts_id` field on the OData filter surface is reserved and is guaranteed by the gateway to be absent from `query`.
   - The mandatory bounded `[from, to)` time window rides `query` as `created_at ge … and created_at lt …` conjuncts — `created_at` is a first-class `UsageRecordFilterField`. The gateway rejects an unbounded window (missing lower or upper `created_at` bound) before dispatch, so the plugin always receives a bounded scan.
-  - `query: &ODataQuery` carrying the parsed PDP-constrained `filter` over `UsageRecordFilterField` minus the reserved `gts_id` field (operator allowances per `domain-model.md` §2.9–§2.10), the parsed `order` (the gateway normalizes it upstream so it always ends in the canonical unique `(created_at, id)` suffix — appended in the caller's sort direction — giving the plugin a gap-free, uniform-direction keyset for any caller `$orderby`), `cursor: Option<CursorV1>` (decoded by the gateway and validated against order/filter via `toolkit_odata::validate_cursor_against` — plugins MAY treat it as a structural assertion), and gateway-clamped `limit: Option<u64>` bounded by the wire-level cap declared in `usage-collector-v1.yaml` (≤ 1,000 records over a 24-hour window).
+  - `query: &ODataQuery` carrying the parsed PDP-constrained `filter` over `UsageRecordFilterField` minus the reserved `gts_id` field (operator allowances per `domain-model.md` §2.9–§2.10), the parsed `order` (the gateway normalizes it upstream so it always ends in the canonical unique `(created_at, id)` suffix — appended in the caller's sort direction — giving the plugin a gap-free, uniform-direction keyset for any caller `$orderby`; every ordering key is guaranteed non-nullable — the gateway rejects a caller `$orderby` on a domain-optional field, `subject_id` / `subject_type` / `corrects_id`, with `400 InvalidArgument` so the row-value tuple keyset never compares a NULL leading key), `cursor: Option<CursorV1>` (decoded by the gateway and validated against order/filter via `toolkit_odata::validate_cursor_against` — plugins MAY treat it as a structural assertion), and gateway-clamped `limit: Option<u64>` bounded by the wire-level cap declared in `usage-collector-v1.yaml` (≤ 1,000 records over a 24-hour window).
   - `metadata_filter: &[MetadataFilter]` carrying validated `(key, values)` entries for filtering on the dynamic `UsageRecord.metadata` JSON map. Semantics: AND across distinct entries, OR within `MetadataFilter::values`; an empty slice imposes no metadata filter. Plugins lower this to their JSON-path facility (e.g. `metadata->>'key' = ANY($values)` on Postgres) and MUST AND the result with the `ODataQuery`-derived `WHERE`.
 
   The plugin MUST treat every filter as authoritative and MUST NOT widen the result set.
@@ -1375,6 +1390,10 @@ Behavioural notes:
   SDK-side `IdempotencyConflict`, which the core surfaces to the
   caller as a `UsageCollectorError` (the `idempotency_conflict`
   rejection, AlreadyExists / `409`, DESIGN §3.3) — NOT an `Ok` ack.
+  Per [ADR-0014](./ADR/0014-created-at-in-dedup-identity.md), `created_at`
+  is part of the dedup key rather than a compared canonical field, so a
+  same-key submission with a different `created_at` is a distinct record
+  (a distinct `id`), not a trigger for `IdempotencyConflict`.
   Repeat deactivation against an already-inactive record is reported
   as the `UsageRecordAlreadyInactive` error variant; a missing target
   row is reported as the `UsageRecordNotFound` error variant — neither
@@ -1428,7 +1447,7 @@ relaxes or strengthens it.
   `create_usage_records` return the persisted `UsageRecord` on the
   `Ok` arm (whether on first acceptance or on a silently-absorbed
   exact-equality retry), the record is durable; the
-  `(tenant_id, gts_id, idempotency_key)` dedup tuple is
+  `(tenant_id, gts_id, idempotency_key, created_at)` dedup tuple is
   permanently visible to subsequent persistence attempts on the
   ingestion path per §"Cross-entity invariants honored by the Plugin
   SPI" (strict dedup-key preservation, refining plugin-owned
@@ -1637,7 +1656,7 @@ The Plugin SPI does not expose REST-handling concerns:
   contradicted, by the strict dedup-key-preservation obligation in
   §"Cross-entity invariants honored by the Plugin SPI": the plugin
   still owns retention but MUST NOT free a
-  `(tenant_id, gts_id, idempotency_key)` dedup key when it purges
+  `(tenant_id, gts_id, idempotency_key, created_at)` dedup key when it purges
   or archives the corresponding record bodies.
 - Dead-letter queue, poison-message handling, and compensation-saga
   patterns are out of scope for the SPI; persistence is a single
@@ -1768,7 +1787,7 @@ plugin-internal and live in each plugin's own DESIGN document.
 
 - **Usage records store** — durable rows emitted by Methods 1 / 2
   and read by Methods 3 / 4; status updated by Method 5. The plugin
-  enforces the dedup composite `(tenant_id, gts_id, idempotency_key)`
+  enforces the dedup composite `(tenant_id, gts_id, idempotency_key, created_at)`
   permanently (see §"Cross-entity invariants honored by the Plugin
   SPI") and the `ON DELETE RESTRICT` reference to the usage-type
   catalog.
@@ -1909,6 +1928,14 @@ the conservative default this reference adopts.
 
 ## Document Changelog
 
+- **2026-07-17 (amendment)** — Aligned with ADR-0014
+  ([`./ADR/0014-created-at-in-dedup-identity.md`](./ADR/0014-created-at-in-dedup-identity.md)).
+  `created_at` is now part of the dedup identity: the dedup key is the 4-tuple
+  `(tenant_id, gts_id, idempotency_key, created_at)`, the derived `id` folds it
+  in (`id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_id ⟨0x1F⟩ created_at_micros ⟨0x1F⟩ idempotency_key)`),
+  and `created_at` is removed from the canonical-field conflict comparison. A
+  same-key submission with a different `created_at` is a distinct record, not an
+  `IdempotencyConflict`. Does not change the SPI method set or plugin logic.
 - **2026-07-07 (amendment)** — Aligned with ADR-0013
   ([`./ADR/0013-deterministic-usage-record-id.md`](./ADR/0013-deterministic-usage-record-id.md)).
   The usage-record identity is now gateway-derived rather

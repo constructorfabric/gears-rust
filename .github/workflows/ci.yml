@@ -318,6 +318,9 @@ jobs:
       - name: Test users_info with Postgres (integration)
         run: make test-users-info-pg
 
+      - name: Test timescaledb usage-collector plugin (pg integration)
+        run: make test-usage-collector-pg
+
       - name: Test toolkit-db (sqlite integration)
         run: make test-sqlite
 

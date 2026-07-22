@@ -19,6 +19,7 @@ date: 2026-05-24
   - [Server-generated idempotency key](#server-generated-idempotency-key)
 - [More Information](#more-information)
 - [Traceability](#traceability)
+- [Amendment 2026-07-17 — `created_at` moves to the dedup identity (see ADR-0014)](#amendment-2026-07-17--created_at-moves-to-the-dedup-identity-see-adr-0014)
 
 <!-- /toc -->
 
@@ -107,3 +108,18 @@ This decision directly addresses the following requirements or design elements:
 - `cpt-cf-usage-collector-nfr-ingestion-latency` — keeps idempotency enforcement on the synchronous hot path within the 200 ms p95 budget.
 - `cpt-cf-usage-collector-principle-idempotency-by-key` — codifies the principle in §2.1.
 - `IdempotencyKey` and `cpt-cf-usage-collector-interface-plugin` — the entity and SPI surface participating in the `UNIQUE (tenant_id, gts_id, idempotency_key)` composite that enforces deduplication.
+
+## Amendment 2026-07-17 — `created_at` moves to the dedup identity (see ADR-0014)
+
+[`ADR-0014`](./0014-created-at-in-dedup-identity.md) makes `created_at` part of
+the dedup identity: the dedup key becomes the 4-tuple
+`(tenant_id, gts_id, idempotency_key, created_at)` and `created_at` is removed
+from the canonical-field comparison set. Consequently a same-key submission with
+a *different* `created_at` is two distinct records rather than an
+`IdempotencyConflict` — narrowing, for the timestamp field only, the "same key +
+different canonical field ⇒ Conflict" rule in the Decision above. Same key +
+same `created_at` + any other canonical field differing (`value`,
+`resource_ref`, `subject_ref`, `corrects_id`, `metadata`) remains an
+`IdempotencyConflict`. The permanent-dedup-key-preservation obligation is
+unchanged. Rationale and full consequences live in ADR-0014; this Decision body
+is otherwise unchanged.

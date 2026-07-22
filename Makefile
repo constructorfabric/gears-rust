@@ -439,7 +439,7 @@ dev: dev-fmt dev-clippy dev-test
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-fips
 
 # Run all tests
 test: install-tools
@@ -471,6 +471,11 @@ test-db: test-sqlite test-pg test-mysql
 ## Run users-info gear integration tests
 test-users-info-pg: install-tools
 	cargo nextest run -p users-info --features "integration"
+
+## Run TimescaleDB usage-collector plugin integration tests (Docker required;
+## the suite spins up its own timescale/timescaledb container via testcontainers)
+test-usage-collector-pg: install-tools
+	cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres
 
 ## Run FIPS-mode integration tests (requires Go for aws-lc-fips-sys).
 ## Covers:
@@ -832,7 +837,7 @@ ci_test: fmt clippy
 ci_docs: lychee gts-docs
 
 # Run CI pipeline locally, requires docker
-ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg lychee gts-docs dylint dylint-test
+ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-usage-collector-pg lychee gts-docs dylint dylint-test
 
 ## Build the cf-gears-example-server release binary using a toolchain from the rust-toolchain.toml
 .cargo-build:

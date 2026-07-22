@@ -31,6 +31,10 @@ fn validation_reason_round_trips_each_constant() {
             INVALID_METADATA_FIELDS_DUPLICATE,
             ValidationReason::MetadataFieldDuplicate,
         ),
+        (
+            AGGREGATION_RESULT_TOO_LARGE,
+            ValidationReason::AggregationResultTooLarge,
+        ),
     ] {
         assert_eq!(ValidationReason::from_wire(wire), expected);
         assert_eq!(expected.as_wire(), wire);

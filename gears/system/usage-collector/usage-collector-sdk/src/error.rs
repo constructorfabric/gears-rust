@@ -234,6 +234,25 @@ impl UsageCollectorError {
         }
     }
 
+    /// An aggregated query produced more than `cap`
+    /// ([`crate::MAX_AGGREGATION_BUCKETS`]) buckets — a high-cardinality
+    /// `group_by` (e.g. a per-record metadata key) over a wide window. The
+    /// plugin bounds its own scan to `cap + 1` rows (memory guard); the gateway
+    /// rejects the over-cap result as this client-fixable `400`.
+    #[must_use]
+    pub fn aggregation_result_too_large(cap: usize) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "group_by".to_owned(),
+            reason: ValidationReason::AggregationResultTooLarge,
+            detail: format!(
+                "aggregated query produced more than {cap} groups; narrow the \
+                 created_at window or drop a high-cardinality group_by dimension"
+            ),
+        }
+    }
+
     /// `UsageTypeGtsId::new` rejected `raw` — malformed / wrong-base `gts_id`.
     #[must_use]
     pub fn invalid_usage_type_gts_id(raw: &str, reason: &str) -> Self {

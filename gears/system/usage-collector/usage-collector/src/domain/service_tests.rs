@@ -3857,8 +3857,9 @@ mod derived_id_stamp_tests {
     }
 
     /// Build a create submission with a known dedup key
-    /// (`tenant_id` / `gts_id` / `idempotency_key`), so a passing assertion can
-    /// only mean the service derived the dispatched record's id from it.
+    /// (`tenant_id` / `gts_id` / `idempotency_key` / `created_at`), so a
+    /// passing assertion can only mean the service derived the dispatched
+    /// record's id from it.
     fn input_record(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
             gts_id: UsageTypeGtsId::new(GTS_ID).expect("valid gts_id"),
@@ -3884,9 +3885,10 @@ mod derived_id_stamp_tests {
         let idem = "idem-derive-singular";
         let input = input_record(tenant_id, idem);
         let expected = derive_usage_record_id(
-            tenant_id,
-            &UsageTypeGtsId::new(GTS_ID).expect("valid gts_id"),
-            &IdempotencyKey::new(idem).expect("valid idempotency key"),
+            input.tenant_id,
+            &input.gts_id,
+            &input.idempotency_key,
+            input.created_at,
         );
 
         // The plugin echoes back the record it was dispatched, so the persist
@@ -3909,7 +3911,7 @@ mod derived_id_stamp_tests {
         assert_eq!(
             dispatched.id, expected,
             "the SERVICE MUST stamp the dispatched record's id with \
-             derive_usage_record_id(tenant_id, gts_id, idempotency_key) - this \
+             derive_usage_record_id(tenant_id, gts_id, idempotency_key, created_at) - this \
              guards the in-process (non-REST) caller path independently of the \
              handler",
         );
@@ -3928,14 +3930,10 @@ mod derived_id_stamp_tests {
             .iter()
             .map(|idem| input_record(tenant_id, idem))
             .collect();
-        let expected: Vec<Uuid> = idems
+        let expected: Vec<Uuid> = input
             .iter()
-            .map(|idem| {
-                derive_usage_record_id(
-                    tenant_id,
-                    &UsageTypeGtsId::new(GTS_ID).expect("valid gts_id"),
-                    &IdempotencyKey::new(*idem).expect("valid idempotency key"),
-                )
+            .map(|r| {
+                derive_usage_record_id(r.tenant_id, &r.gts_id, &r.idempotency_key, r.created_at)
             })
             .collect();
 
@@ -3965,7 +3963,7 @@ mod derived_id_stamp_tests {
         assert_eq!(
             dispatched_ids, expected,
             "the SERVICE MUST stamp each dispatched record's id with its own \
-             derive_usage_record_id(tenant_id, gts_id, idempotency_key), \
+             derive_usage_record_id(tenant_id, gts_id, idempotency_key, created_at), \
              overwriting the caller-supplied ids - this guards the in-process \
              (non-REST) batch caller path independently of the handler",
         );
@@ -3979,8 +3977,9 @@ mod aggregate_op_kind_enforcement_tests {
     use toolkit_gts::gts_id;
     use toolkit_security::pep_properties;
     use usage_collector_sdk::{
-        AggregationOp, AggregationResult, AggregationSpec, UsageCollectorError,
-        UsageCollectorPluginV1, UsageKind, UsageType, UsageTypeGtsId, ValidationReason,
+        AggregationBucket, AggregationOp, AggregationResult, AggregationSpec,
+        MAX_AGGREGATION_BUCKETS, UsageCollectorError, UsageCollectorPluginV1, UsageKind, UsageType,
+        UsageTypeGtsId, ValidationReason,
     };
     use uuid::Uuid;
 
@@ -4092,6 +4091,65 @@ mod aggregate_op_kind_enforcement_tests {
                 .await
                 .unwrap_or_else(|e| panic!("({kind:?}, {op:?}) MUST dispatch, got {e:?}"));
         }
+    }
+
+    // Build an `AggregationResult` with exactly `n` empty-key buckets. Mirrors
+    // what the plugin's `LIMIT MAX_AGGREGATION_BUCKETS + 1` produces on an
+    // over-cardinality `group_by`.
+    fn result_with_buckets(n: usize) -> AggregationResult {
+        AggregationResult {
+            buckets: (0..n)
+                .map(|_| AggregationBucket {
+                    key: Vec::new(),
+                    value: None,
+                })
+                .collect(),
+        }
+    }
+
+    async fn run_with_buckets(
+        n: usize,
+        suffix: &str,
+    ) -> Result<AggregationResult, UsageCollectorError> {
+        let plugin = HappyPathPlugin::new();
+        plugin.set_get_usage_type(usage_type(UsageKind::Counter));
+        plugin.set_query_aggregated_usage_records_response(result_with_buckets(n));
+        let service = service_with_plugin(&plugin, suffix);
+        service
+            .query_aggregated_usage_records(
+                &authenticated_ctx(),
+                gts_id(),
+                &bounded_window(),
+                &[],
+                spec(AggregationOp::Count),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn over_cap_bucket_count_is_rejected() {
+        // One bucket over the cap — exactly what the plugin's `LIMIT cap + 1`
+        // yields on overflow — must lift to a client-fixable 400, not a page.
+        match run_with_buckets(
+            MAX_AGGREGATION_BUCKETS + 1,
+            "test.aggregate.overcap.guard.v1",
+        )
+        .await
+        {
+            Err(UsageCollectorError::InvalidArgument { reason, .. }) => {
+                assert_eq!(reason, ValidationReason::AggregationResultTooLarge);
+            }
+            other => panic!("expected AGGREGATION_RESULT_TOO_LARGE 400, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn at_cap_bucket_count_is_allowed() {
+        // Exactly at the cap is the boundary — `>` must not reject it.
+        let result = run_with_buckets(MAX_AGGREGATION_BUCKETS, "test.aggregate.atcap.guard.v1")
+            .await
+            .expect("a result exactly at the cap must be returned");
+        assert_eq!(result.buckets.len(), MAX_AGGREGATION_BUCKETS);
     }
 
     #[tokio::test]

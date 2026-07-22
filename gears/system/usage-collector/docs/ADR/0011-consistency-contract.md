@@ -37,8 +37,8 @@ and queryability into one "ingestion-latency-bounded freshness" phrase, which
 hides that the two are governed by different mechanisms with different bounds.
 
 Two intra-plugin invariants ARE pinned down in DESIGN and `plugin-spi.md` and
-remain in force: the `(tenant_id, gts_id, idempotency_key)` dedup tuple
-is permanently visible to subsequent ingestion attempts after `Acknowledged` —
+remain in force: the `(tenant_id, gts_id, idempotency_key, created_at)` dedup
+tuple is permanently visible to subsequent ingestion attempts after `Acknowledged` —
 the dedup-key tuple is preserved permanently and independently of the plugin's
 record-body retention policy —, and a `deactivate` of
 an accepted row commits atomically with its depth-1 compensation cascade in a

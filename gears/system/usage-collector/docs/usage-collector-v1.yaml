@@ -38,7 +38,7 @@ paths:
       description: |
         Submit up to 100 usage records for persistence. Every record
         carries an `idempotency_key` and is deduplicated per
-        `(tenant_id, gts_id, idempotency_key)`. A record with
+        `(tenant_id, gts_id, idempotency_key, created_at)`. A record with
         `corrects_id` set is a counter compensation row; otherwise it is
         an ordinary usage row. Returns `200` if every record was accepted
         or deduplicated, `207 Multi-Status` if at least one record was
@@ -128,7 +128,15 @@ paths:
           in: query
           required: false
           description: |
-            OData $orderby. MUST be a prefix of `(created_at, id)`.
+            OData $orderby. All keys MUST share one sort direction, and
+            each key MUST name a mandatory (never-null) record field
+            (`id`, `created_at`, `tenant_id`, `resource_id`,
+            `resource_type`, `status`). The server appends the canonical
+            unique `(created_at, id)` tiebreaker in the caller's
+            direction. Ordering by an optional field (`subject_id`,
+            `subject_type`, `corrects_id`) or mixing `asc`/`desc` across
+            keys is rejected `400` (`VALIDATION`), because keyset
+            pagination requires a uniform-direction, never-null keyset.
           schema:
             type: string
         - name: $top
@@ -163,7 +171,8 @@ paths:
       description: |
         Compute a server-side aggregation (`sum`, `count`, `min`, `max`,
         `avg`) for a single usage type. Group-by is capped at 2
-        dimensions; result rows bounded to 100,000. Mirrors the SDK's
+        dimensions; result rows bounded to 100,000 (a result exceeding
+        that is a `400`, `AGGREGATION_RESULT_TOO_LARGE`). Mirrors the SDK's
         `UsageCollectorClientV1::query_aggregated_usage_records`
         signature.
 
@@ -186,9 +195,11 @@ paths:
           description: |
             Canonical `InvalidArgument` envelope. Discrimination via
             `field_violations[0].reason`: `MISSING_TIME_WINDOW` (no bounded
-            `created_at` window) or `OP_NOT_ALLOWED_FOR_KIND` (the `op` is not
+            `created_at` window), `OP_NOT_ALLOWED_FOR_KIND` (the `op` is not
             valid for the usage type's `kind` — `sum` on a gauge, or
-            `min`/`max`/`avg` on a counter).
+            `min`/`max`/`avg` on a counter), or `AGGREGATION_RESULT_TOO_LARGE`
+            (the grouping produced more than 100,000 buckets — narrow the
+            window or drop a high-cardinality `group_by` dimension).
           content:
             application/problem+json:
               schema:
@@ -522,7 +533,7 @@ components:
       maxLength: 256
       description: |
         Caller-supplied dedup key. Dedup unique is
-        `(tenant_id, gts_id, idempotency_key)`.
+        `(tenant_id, gts_id, idempotency_key, created_at)`.
 
     RecordMetadata:
       type: object
@@ -588,7 +599,7 @@ components:
         id:
           type: string
           format: uuid
-          description: Deterministic gateway-derived UUIDv5 of (tenant_id, gts_id, idempotency_key).
+          description: Deterministic gateway-derived UUIDv5 of (tenant_id, gts_id, idempotency_key, created_at).
         tenant_id:
           type: string
           format: uuid
@@ -640,10 +651,12 @@ components:
         identity: `id` is gateway-derived, never caller-supplied, and
         is rejected as an unknown field if present. The gateway
         computes it as a deterministic UUIDv5 of the dedup key:
-        `id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_id ⟨0x1F⟩ idempotency_key)`,
+        `id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_id ⟨0x1F⟩ created_at_micros ⟨0x1F⟩ idempotency_key)`,
         where `NS` is the fixed namespace
-        `56313026-863b-4de8-b32b-1f96b67306ed`. The caller supplies
-        `created_at` on every submission. The same schema carries both
+        `56313026-863b-4de8-b32b-1f96b67306ed` and `created_at_micros` is
+        the event timestamp as integer microseconds-since-epoch
+        (ADR-0014). The caller supplies `created_at` on every
+        submission. The same schema carries both
         ordinary usage and counter compensations; the server enforces
         the `(kind × corrects_id presence)` value matrix and
         `corrects_id` referential integrity at ingestion.

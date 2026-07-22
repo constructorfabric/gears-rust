@@ -43,6 +43,11 @@ pub const INVALID_METADATA_FIELDS_EMPTY_STRING: &str = "INVALID_METADATA_FIELDS_
 pub const INVALID_METADATA_FIELDS_INVALID_KEY: &str = "INVALID_METADATA_FIELDS_INVALID_KEY";
 /// Duplicate `metadata_fields[i]` entry.
 pub const INVALID_METADATA_FIELDS_DUPLICATE: &str = "INVALID_METADATA_FIELDS_DUPLICATE";
+/// An aggregated query produced more distinct groups than
+/// [`crate::MAX_AGGREGATION_BUCKETS`] — typically a high-cardinality `group_by`
+/// (e.g. a per-record metadata key) over a wide window. Narrow the `created_at`
+/// window or drop the high-cardinality dimension.
+pub const AGGREGATION_RESULT_TOO_LARGE: &str = "AGGREGATION_RESULT_TOO_LARGE";
 
 /// Typed view of the `field_violations[].reason` codes carried by
 /// [`crate::UsageCollectorError::InvalidArgument`].
@@ -71,6 +76,8 @@ pub enum ValidationReason {
     MetadataFieldInvalidKey,
     /// See [`INVALID_METADATA_FIELDS_DUPLICATE`].
     MetadataFieldDuplicate,
+    /// See [`AGGREGATION_RESULT_TOO_LARGE`].
+    AggregationResultTooLarge,
     /// Unmodeled / future reason — preserves the raw wire string.
     Unknown(String),
 }
@@ -92,6 +99,7 @@ impl ValidationReason {
             INVALID_METADATA_FIELDS_EMPTY_STRING => Self::MetadataFieldEmptyString,
             INVALID_METADATA_FIELDS_INVALID_KEY => Self::MetadataFieldInvalidKey,
             INVALID_METADATA_FIELDS_DUPLICATE => Self::MetadataFieldDuplicate,
+            AGGREGATION_RESULT_TOO_LARGE => Self::AggregationResultTooLarge,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -112,6 +120,7 @@ impl ValidationReason {
             Self::MetadataFieldEmptyString => INVALID_METADATA_FIELDS_EMPTY_STRING,
             Self::MetadataFieldInvalidKey => INVALID_METADATA_FIELDS_INVALID_KEY,
             Self::MetadataFieldDuplicate => INVALID_METADATA_FIELDS_DUPLICATE,
+            Self::AggregationResultTooLarge => AGGREGATION_RESULT_TOO_LARGE,
             Self::Unknown(s) => s.as_str(),
         }
     }
