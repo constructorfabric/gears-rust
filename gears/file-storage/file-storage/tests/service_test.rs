@@ -482,6 +482,15 @@ async fn list_files_filters_by_owner() {
     assert!(empty.is_empty());
 }
 
+// NOTE: `list_files_returns_each_files_custom_metadata` (exercising
+// `FileService::list_metadata_for_files` batching) moved to the in-crate
+// `domain::service::read_ops_tests` module (P2 remediation, item 13):
+// `list_metadata_for_files` takes raw file ids with no `SecurityContext` of
+// its own and trusts the caller to have already authorized them, so it was
+// tightened from `pub` to `pub(crate)` -- which this external `tests/`
+// integration binary, compiled against the crate's public API only, can no
+// longer reach directly.
+
 /// `GET /files/{id}/versions` must cap at `ServiceConfig::max_page_size` even
 /// when a file has more versions than that — both with no explicit `limit`
 /// (clamped to `max_page_size`) and with an explicit `limit` above

@@ -314,6 +314,74 @@ async fn set_policy_tenant_admin_scope_allows_foreign_owner() {
     assert_eq!(row.scope_owner_id, Some(user_b));
 }
 
+// ── get_own_policy ───────────────────────────────────────────────────────────
+
+/// `GET /policy?scope=user` with no `scope_owner_id` must be a `400
+/// Validation` error, not a silently-empty (`204 No Content`) read: the
+/// `(policy_scope, scope_owner_id)` pair `get_own_policy` is asked to look up
+/// can never resolve a row (a `None`-owner user-scope row can never be
+/// written either, per `validate_policy_body`'s identical guard on the write
+/// path), so treating it as "no policy configured" instead of "malformed
+/// request" would hide the caller's mistake.
+#[tokio::test]
+async fn get_own_policy_user_scope_without_owner_is_rejected() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let ctx_a = ctx(tenant, owner);
+
+    let result = h
+        .policy_svc
+        .get_own_policy(&ctx_a, PolicyScope::User, None)
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::Validation { .. })),
+        "expected Validation, got {result:?}"
+    );
+}
+
+/// Positive control: `scope=tenant` with no `scope_owner_id` is the normal
+/// (and only valid) shape for a tenant-scope read, and must not be rejected.
+#[tokio::test]
+async fn get_own_policy_tenant_scope_without_owner_is_allowed() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let ctx_a = ctx(tenant, owner);
+
+    let result = h
+        .policy_svc
+        .get_own_policy(&ctx_a, PolicyScope::Tenant, None)
+        .await;
+    assert!(
+        result.is_ok(),
+        "tenant-scope read with no owner must be allowed, got {result:?}"
+    );
+}
+
+/// `scope=tenant` with a `scope_owner_id` is the mirror-image malformed
+/// shape: tenant policy rows never have an owner (`get_policy`/`upsert_policy`
+/// key tenant rows on `(tenant_id, scope)` alone), so this pair can never
+/// resolve a real row either. Must be rejected with `Validation`, the same
+/// class of error as the `User`-scope-without-owner case above, not silently
+/// queried as if the owner were ignored.
+#[tokio::test]
+async fn get_own_policy_tenant_scope_with_owner_is_rejected() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let ctx_a = ctx(tenant, owner);
+
+    let result = h
+        .policy_svc
+        .get_own_policy(&ctx_a, PolicyScope::Tenant, Some(owner))
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::Validation { .. })),
+        "expected Validation, got {result:?}"
+    );
+}
+
 // ── create_retention_rule (file scope) ──────────────────────────────────────
 
 /// A `scope=file` retention rule staged against a file the caller cannot
@@ -407,6 +475,61 @@ async fn create_retention_rule_file_scope_target_writable_is_allowed() {
     assert_eq!(rules.len(), 1, "only the writable-file rule should exist");
 }
 
+/// Cross-tenant existence oracle (verifier finding, medium): a `scope=file`
+/// retention rule targeting a file that genuinely exists, but in a
+/// *different* tenant, must surface the exact same `FileNotFound` a truly
+/// nonexistent `scope_target_id` would — not resolve the file first (leaking
+/// "this UUID exists somewhere") and only then fail authorization. Before the
+/// fix, `authorize_retention_scope`'s `File` arm resolved the target via
+/// `require_file(&AccessScope::allow_all(), ...)`, which finds a foreign
+/// tenant's file unconditionally; `ScopedTestAuthorizer` grants `WRITE`
+/// unconditionally too (unless a specific `file_id` is explicitly denied), so
+/// with the old code this call would have *succeeded* — silently creating a
+/// tenant-B-owned rule pointing at a tenant-A file. The fix scopes the
+/// prefetch to the caller's own tenant, so the foreign file is
+/// indistinguishable from a missing one.
+#[tokio::test]
+async fn create_retention_rule_file_scope_target_foreign_tenant_is_not_found() {
+    let h = build_harness().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let owner_a = Uuid::now_v7();
+    let owner_b = Uuid::now_v7();
+    let ctx_a = ctx(tenant_a, owner_a);
+    let ctx_b = ctx(tenant_b, owner_b);
+
+    let ticket = h
+        .file_svc
+        .create_file(&ctx_a, new_file(owner_a), None)
+        .await
+        .expect("tenant A creates a file");
+
+    let result = h
+        .policy_svc
+        .create_retention_rule(
+            &ctx_b,
+            RetentionScope::File,
+            Some(ticket.file_id),
+            valid_rule_body(),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::FileNotFound { id }) if id == ticket.file_id),
+        "expected FileNotFound (foreign-tenant file must not resolve), got {result:?}"
+    );
+
+    let rules = h
+        .policy_store
+        .list_retention_rules(&AccessScope::allow_all(), tenant_b)
+        .await
+        .expect("list_retention_rules");
+    assert_eq!(
+        rules.len(),
+        0,
+        "no rule should be created under tenant B pointing at tenant A's file"
+    );
+}
+
 // ── delete_retention_rule ────────────────────────────────────────────────────
 
 /// A `User`-scope retention rule created by user A must not be deletable by
@@ -447,6 +570,186 @@ async fn delete_retention_rule_foreign_owner_is_denied() {
         .expect("get_retention_rule")
         .expect("rule must still exist");
     assert_eq!(still_there.rule_id, rule.rule_id);
+}
+
+/// A `scope=file` rule whose target file has since been deleted (no FK/
+/// cascade ties `retention_rules.scope_target_id` to `files.file_id`) must
+/// remain deletable by the rule owner. Before the fix, `authorize_retention_scope`'s
+/// `File` arm always re-resolved the (now-gone) target via `require_file`,
+/// which 404s — permanently stuck rule, re-scanned by every sweep.
+#[tokio::test]
+async fn delete_retention_rule_file_scope_target_deleted_still_deletable() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let ctx_a = ctx(tenant, owner);
+
+    let ticket = h
+        .file_svc
+        .create_file(&ctx_a, new_file(owner), None)
+        .await
+        .expect("create file");
+
+    let rule = h
+        .policy_svc
+        .create_retention_rule(
+            &ctx_a,
+            RetentionScope::File,
+            Some(ticket.file_id),
+            valid_rule_body(),
+        )
+        .await
+        .expect("create file-scope rule");
+
+    // Delete the target file out from under the rule (unconditional delete).
+    h.file_svc
+        .delete_file(&ctx_a, ticket.file_id, Some("*"))
+        .await
+        .expect("delete target file");
+
+    // The rule must still be deletable: authorization falls back to a plain
+    // tenant-wide WRITE gate instead of re-resolving the gone file.
+    let removed = h
+        .policy_svc
+        .delete_retention_rule(&ctx_a, rule.rule_id)
+        .await
+        .expect("delete_retention_rule must not fail once the file is gone");
+    assert!(removed, "the orphaned rule must actually be removed");
+
+    let gone = h
+        .policy_store
+        .get_retention_rule(&AccessScope::allow_all(), rule.rule_id)
+        .await
+        .expect("get_retention_rule");
+    assert!(gone.is_none(), "rule row must be gone after delete");
+}
+
+/// The tenant-wide fallback used for an orphaned `scope=file` rule must not
+/// widen who can delete it: a caller in a *different* tenant than the rule
+/// must still fail — and, per the cross-tenant rule-ID oracle fix (P2
+/// remediation), as the exact same `RetentionRuleNotFound` a nonexistent
+/// `rule_id` produces (`delete_missing_retention_rule_returns_retention_not_found`
+/// below), never a `Forbidden` (which would leak "yes, a rule with this id
+/// exists") and never reaching the tenant-wide `WRITE` fallback at all: the
+/// rule is now fetched under the caller's *own* tenant scope, so a foreign
+/// tenant's rule_id simply does not resolve.
+#[tokio::test]
+async fn delete_retention_rule_file_scope_deleted_target_foreign_tenant_cannot_delete() {
+    let h = build_harness().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let owner_a = Uuid::now_v7();
+    let owner_b = Uuid::now_v7();
+    let ctx_a = ctx(tenant_a, owner_a);
+    let ctx_b = ctx(tenant_b, owner_b);
+
+    let ticket = h
+        .file_svc
+        .create_file(&ctx_a, new_file(owner_a), None)
+        .await
+        .expect("tenant A creates a file");
+
+    let rule = h
+        .policy_svc
+        .create_retention_rule(
+            &ctx_a,
+            RetentionScope::File,
+            Some(ticket.file_id),
+            valid_rule_body(),
+        )
+        .await
+        .expect("tenant A creates a file-scope rule");
+
+    h.file_svc
+        .delete_file(&ctx_a, ticket.file_id, Some("*"))
+        .await
+        .expect("tenant A deletes the target file");
+
+    let result = h
+        .policy_svc
+        .delete_retention_rule(&ctx_b, rule.rule_id)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(DomainError::RetentionRuleNotFound { rule_id }) if rule_id == rule.rule_id
+        ),
+        "tenant B must not be able to delete tenant A's orphaned rule, and must see \
+         RetentionRuleNotFound rather than Forbidden or a silent no-op; got {result:?}"
+    );
+
+    let still_there = h
+        .policy_store
+        .get_retention_rule(&AccessScope::allow_all(), rule.rule_id)
+        .await
+        .expect("get_retention_rule")
+        .expect("rule must still exist, owned by tenant A");
+    assert_eq!(still_there.tenant_id, tenant_a);
+}
+
+/// The cross-tenant rule-ID oracle, closed directly: deleting an existing
+/// rule that belongs to a *different* tenant (`Tenant`-scope this time, not
+/// the orphaned-file-scope special case above) must produce the exact same
+/// `RetentionRuleNotFound` error — same variant, same `rule_id` field — as
+/// deleting a `rule_id` that was never created at all. Before the fix, the
+/// rule row was prefetched with `AccessScope::allow_all()` (crossing tenant
+/// boundaries), so a foreign tenant's real rule_id could reach the
+/// authorization decision and be distinguished (via `Forbidden` vs `404`)
+/// from a merely-nonexistent id -- a cross-tenant rule-ID existence oracle.
+#[tokio::test]
+async fn delete_retention_rule_foreign_tenant_gets_same_error_as_nonexistent_id() {
+    let h = build_harness().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let owner_a = Uuid::now_v7();
+    let owner_b = Uuid::now_v7();
+    let ctx_a = ctx(tenant_a, owner_a);
+    let ctx_b = ctx(tenant_b, owner_b);
+
+    let rule = h
+        .policy_svc
+        .create_retention_rule(&ctx_a, RetentionScope::Tenant, None, valid_rule_body())
+        .await
+        .expect("tenant A creates a tenant-scope rule");
+
+    let foreign_result = h
+        .policy_svc
+        .delete_retention_rule(&ctx_b, rule.rule_id)
+        .await;
+
+    let missing_rule_id = Uuid::now_v7();
+    let missing_result = h
+        .policy_svc
+        .delete_retention_rule(&ctx_b, missing_rule_id)
+        .await;
+
+    match (&foreign_result, &missing_result) {
+        (
+            Err(DomainError::RetentionRuleNotFound {
+                rule_id: foreign_id,
+            }),
+            Err(DomainError::RetentionRuleNotFound {
+                rule_id: missing_id,
+            }),
+        ) => {
+            assert_eq!(*foreign_id, rule.rule_id);
+            assert_eq!(*missing_id, missing_rule_id);
+        }
+        other => panic!(
+            "both a foreign-tenant existing rule_id and a nonexistent rule_id must produce \
+             RetentionRuleNotFound identically, got {other:?}"
+        ),
+    }
+
+    // Sanity: the rule must genuinely still exist (owned by tenant A) — the
+    // 404 tenant B sees is a scoping artifact, not an actual deletion.
+    let still_there = h
+        .policy_store
+        .get_retention_rule(&AccessScope::allow_all(), rule.rule_id)
+        .await
+        .expect("get_retention_rule")
+        .expect("rule must still exist, owned by tenant A");
+    assert_eq!(still_there.tenant_id, tenant_a);
 }
 
 /// `DELETE /retention-rules/{id}` for a `rule_id` that does not exist must
@@ -609,6 +912,34 @@ async fn set_policy_user_scope_without_owner_is_rejected() {
     let result = h
         .policy_svc
         .set_policy(&ctx_a, PolicyScope::User, None, PolicyBody::default())
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::Validation { .. })),
+        "expected Validation, got {result:?}"
+    );
+}
+
+/// A `scope = Tenant` policy with `scope_owner_id = Some(_)` is the
+/// mirror-image invalid shape: tenant policy rows never have an owner, so
+/// this write would either be silently ignored or write/query an impossible
+/// row. `set_policy` must reject it, same as the `User`-without-owner case.
+/// Uses the caller's own id as the (invalid) owner so authorization itself
+/// passes and the rejection is attributable to the scope/owner shape check.
+#[tokio::test]
+async fn set_policy_tenant_scope_with_owner_is_rejected() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let ctx_a = ctx(tenant, owner);
+
+    let result = h
+        .policy_svc
+        .set_policy(
+            &ctx_a,
+            PolicyScope::Tenant,
+            Some(owner),
+            PolicyBody::default(),
+        )
         .await;
     assert!(
         matches!(result, Err(DomainError::Validation { .. })),

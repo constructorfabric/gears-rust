@@ -141,7 +141,9 @@ platform auth module's token revocation, not the URL layer.
   content is written to an immutable backend object `/{file_id}/{version_id}`; the file's current
   content is a DB pointer (`content_id`) swapped under optimistic CAS — see DESIGN §4.x and
   `cpt-cf-file-storage-fr-upload-file`. A new version is a new object plus a pointer swap; backend
-  content is never mutated in place.
+  content is never mutated in place (enforced, not just conventional: the sidecar's single-shot
+  publish is create-exclusive — see DESIGN.md's `PUT`-token-replay consequence note — so a second
+  `PUT` to an already-published path is rejected rather than silently replacing it).
 * `cpt-cf-file-storage-fr-content-type-validation`, `cpt-cf-file-storage-fr-usage-reporting`, and
   `cpt-cf-file-storage-fr-read-audit` are reallocated from the monolith to the sidecar; coverage
   stays 100%.
@@ -180,6 +182,35 @@ platform auth module's token revocation, not the URL layer.
   not-yet-redeployed sidecar. This is explicitly a stop-gap: once the platform's `internal_auth`
   profiles are deployable here, `handlers::FinalizeAuth`'s comparator should be swapped for
   `InternalAuthenticator` and this shared secret retired.
+* **Known gap: multipart part-hash trust.** The data-integrity claim above
+  ("a forged claim cannot corrupt stored metadata") only holds for the
+  **single-shot** `PUT`/finalize path, where `read_back_and_hash_streaming`
+  re-derives `size`/`hash`/`mime_type` from the real backend bytes. For
+  **multipart** uploads there is no equivalent re-read: `report_part`
+  persists the caller-supplied part hash after only a length/size check (not
+  a re-hash of the bytes actually written), and `complete_multipart_upload`
+  builds the composite `hash_value`/manifest exclusively from those stored
+  per-part hashes (ADR-0006) — the assembled object itself is never re-hashed
+  end to end. Since the `fs-token` authorizing a part write is client-visible
+  (the same exposure this bullet's trust-model update addresses) and the
+  `x-fs-internal-token` gate is not required by default
+  (`require_finalize_internal_secret: false`), a caller holding a valid part
+  token could in principle report a hash that does not match the bytes it
+  streamed, corrupting the composite hash without being caught by any
+  read-back. Mitigations available today: enable `finalize_internal_secret` +
+  `require_finalize_internal_secret` so only the sidecar (not an arbitrary
+  token holder) can reach `report_part`/`finalize` at all — this gate already
+  covers `report_part`, not just `finalize` (`handlers::report_multipart_part`
+  calls the same `FinalizeAuth::verify`). A durable fix (deriving the part
+  hash from a sidecar-side value the control plane can independently trust,
+  or re-hashing the assembled object) is future work, out of scope for this
+  remediation. A related, separate gap sits in the same release gate:
+  `StorageBackend::publish_exclusive`'s default implementation
+  (`infra/backend/mod.rs`) is a non-atomic (TOCTOU) `exists`-then-`put`, and
+  `S3Backend` is still left on that default rather than an atomic
+  conditional-PUT override — closing it (e.g. an `If-None-Match: *`
+  conditional write mapped from S3's `412`) is required before S3 leaves its
+  ADR-0005 release gate, same as the part-hash trust gap above.
 * A new signed-URL contract (`cpt-cf-file-storage-fr-signed-urls`) and the constraint model become
   part of the public surface; the response-header set the sidecar must echo verbatim is baked into
   the signed URL.
