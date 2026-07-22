@@ -128,8 +128,12 @@ documented as a process in §3 instead.
 - `age.max_age_days == 0` or `inactivity.inactivity_days == 0` — `400` (would match *every* file in the tenant on
   the very next sweep tick, permanently deleting rows and blobs with no dry-run and no undo)
 - `scope ∈ {user, file}` with no `scope_target_id` — `400` (a dead rule that can never resolve to a target)
-- `scope = file` and the target file does not exist, or the caller lacks `WRITE` on it — `404`/`403`
-  (`authorize_retention_scope`'s `File` arm resolves the target via `require_file` before authorizing)
+- `scope = file` and the target file does not exist, or belongs to a different
+  tenant, or the caller lacks `WRITE` on it — `404`/`403` (`authorize_retention_scope`'s
+  `File` arm resolves the target via `require_file` scoped to the caller's own
+  tenant — the same prefetch pattern `read_ops.rs`/`write.rs` use — before
+  authorizing, so a foreign tenant's file UUID cannot be distinguished from a
+  nonexistent one; both surface identically as `FileNotFound`)
 - `scope = user` and the target is a different user, without `ADMIN_POLICY` — `403`
 - Caller lacks `WRITE` (tenant scope) — `403`
 
@@ -148,16 +152,26 @@ documented as a process in §3 instead.
 
 **Success Scenarios**:
 - Rule is deleted
+- A `scope = file` rule whose target file has since been deleted (there is no
+  FK/cascade between `retention_rules.scope_target_id` and `files.file_id`) is
+  still deletable: the caller is re-authorized against a plain tenant-wide
+  `WRITE` grant instead of a per-file check that can no longer resolve a
+  target, so the orphaned rule does not become permanently stuck and does not
+  keep being re-scanned by every sweep
 
 **Error Scenarios**:
 - `rule_id` does not exist — `404`
 - Caller does not own the rule's scope/target (same rules as create) — `403`
+- A foreign-tenant caller's `rule_id` (the rule is not visible to them) — `404`,
+  not `403`: the fetch-then-reauthorize prefetch always finds the row (see
+  step 2), but the scoped `DELETE` in step 4 matches zero rows for a tenant
+  that does not own it, same as any other foreign-tenant `rule_id`
 
 **Steps**:
 1. [x] - `p1` - Client: DELETE /api/file-storage/v1/retention-rules/{rule_id} - `inst-retention-delete-request`
 2. [x] - `p1` - DB (fetch-then-reauthorize): SELECT the rule via an `allow_all` scope purely to learn its `(scope, scope_target_id)` — a bare `rule_id` carries no ownership information, so the coarse tenant-wide `DELETE` check alone would let any tenant member delete any other member's rule; `404` if it does not exist - `inst-retention-delete-load`
-3. [x] - `p1` - Re-run the same scope-based authorization [Create Retention Rule](#create-retention-rule) uses, against the rule's actual `(scope, scope_target_id)` - `inst-retention-delete-authz`
-4. [x] - `p1` - DB: DELETE the rule row - `inst-retention-delete-remove`
+3. [x] - `p1` - Re-run the same scope-based authorization [Create Retention Rule](#create-retention-rule) uses, against the rule's actual `(scope, scope_target_id)`; for `scope = file`, if the target file no longer exists (`FileNotFound`), fall back to the same plain tenant-wide `WRITE` gate the `Tenant` arm uses rather than propagating the 404 — an orphaned file-scope rule must remain deletable - `inst-retention-delete-authz`
+4. [x] - `p1` - DB: DELETE the rule row, scoped to the authorized `AccessScope` (a foreign tenant's scope matches zero rows here, surfacing as `404`, never `403`) - `inst-retention-delete-remove`
 5. [x] - `p1` - RETURN 204 - `inst-retention-delete-return`
 
 ## 3. Processes / Business Logic (CDSL)
@@ -198,7 +212,7 @@ retention_expired_deleted, idempotency_keys_deleted }`
 
 **Steps**:
 1. [x] - `p1` - DB: list `pending` version rows with `created_at < grace_cutoff`, **excluding** any version that is still the backing version of a live `in_progress` multipart session (`multipart_uploads.expires_at > now`) — see [Live-Multipart-Session Guard](#live-multipart-session-guard-p2-remediation-28) - `inst-sweep-pending-list`
-2. [x] - `p1` - FOR EACH candidate: write an `orphan_reconcile` audit row, then delete the version row - `inst-sweep-pending-audit-delete`
+2. [x] - `p1` - FOR EACH candidate: write an `orphan_reconcile` audit row, then delete the version row **status-guarded** (`status = pending` only) -- the same CAS pattern step 2 below uses, so a version a racing `finalize_upload` already flipped to `available` between the list query and this delete is left completely untouched (row, blob, and debit alike) - `inst-sweep-pending-audit-delete`
 3. [x] - `p1` - **IF** deleted: debit the reclaimed bytes via the usage reporter (fire-and-forget; `bytes_delta = -size`, `file_count_delta = 0` — `size` is structurally `0` in practice since a version is only ever assigned a nonzero size by `finalize_version`, which a reclaimed-here version never reached) - `inst-sweep-pending-usage`
 4. [x] - `p1` - Best-effort: delete the backend blob at the version's `(backend_id, backend_path)` — a failure leaves an unreachable orphan blob, acceptable in P2 - `inst-sweep-pending-blob`
 5. [x] - `p1` - **IF** the parent file now has zero versions **AND** `content_id IS NULL` **AND** no `in_progress`, unexpired multipart session still references it (the same guard as step 1, re-checked because a session that has not yet expired could still legitimately have its backing version reclaimed by an unrelated grace-window aging in the *same* sweep pass): delete the `files` row too, transactionally re-verifying both conditions inside the delete so a version inserted in the gap is never lost — write a `file.deleted` event and debit `file_count_delta = -1`, `bytes_delta = 0` (P2 remediation 2.8) - `inst-sweep-pending-orphan-file`

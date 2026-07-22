@@ -236,6 +236,103 @@ async fn update_metadata_leaves_audit_row() {
     assert_eq!(meta_rows[0].outcome, "success");
 }
 
+// ── 4b. update_metadata enqueues a "file.metadata_updated" event ────────────
+
+/// Regression test: `patch_metadata_atomic` previously wrote only the audit
+/// row, silently skipping the `file.metadata_updated` event required by
+/// `cpt-cf-file-storage-fr-file-events` (docs/migration.sql's `events_outbox`
+/// catalog lists the event type, but nothing ever enqueued it). This proves
+/// the event is now enqueued exactly once, in the same transaction as the
+/// audit row and the metadata mutation.
+///
+/// @cpt-cf-file-storage-fr-file-events
+/// @cpt-cf-file-storage-fr-audit-trail
+#[tokio::test]
+async fn update_metadata_enqueues_metadata_updated_event() {
+    let (svc, _msvc, _dp, store) = build_service().await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let patch = CustomMetadataPatch {
+        entries: vec![("k".to_owned(), Some("v".to_owned()))],
+    };
+    svc.update_metadata(&ctx, ticket.file_id, patch, None)
+        .await
+        .unwrap();
+
+    let events = store.list_file_events(ticket.file_id).await.unwrap();
+    let meta_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "file.metadata_updated")
+        .collect();
+    assert_eq!(
+        meta_events.len(),
+        1,
+        "expected exactly 1 file.metadata_updated event"
+    );
+    assert_eq!(meta_events[0].file_id, ticket.file_id);
+    assert_eq!(meta_events[0].tenant_id, tenant);
+    assert!(
+        meta_events[0].published_at.is_none(),
+        "event must not be published yet"
+    );
+
+    // The event's `meta_version` payload is the authoritative committed
+    // revision stamped inside the transaction — it must equal the file's
+    // actual current revision, not a pre-read guess.
+    let (file, _) = svc
+        .get_file_with_metadata(&ctx, ticket.file_id)
+        .await
+        .unwrap();
+    let ev_mv = meta_events[0]
+        .payload
+        .get("meta_version")
+        .and_then(serde_json::Value::as_i64);
+    assert_eq!(
+        ev_mv,
+        Some(file.meta_version),
+        "event meta_version must equal the committed revision"
+    );
+
+    // A second unconditional patch stamps the next committed revision, proving
+    // the value tracks the real row rather than a fixed snapshot+1.
+    svc.update_metadata(
+        &ctx,
+        ticket.file_id,
+        CustomMetadataPatch {
+            entries: vec![("k2".to_owned(), Some("v2".to_owned()))],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let (file2, _) = svc
+        .get_file_with_metadata(&ctx, ticket.file_id)
+        .await
+        .unwrap();
+    let events2 = store.list_file_events(ticket.file_id).await.unwrap();
+    let latest_mv = events2
+        .iter()
+        .filter(|e| e.event_type == "file.metadata_updated")
+        .filter_map(|e| {
+            e.payload
+                .get("meta_version")
+                .and_then(serde_json::Value::as_i64)
+        })
+        .max();
+    assert_eq!(
+        latest_mv,
+        Some(file2.meta_version),
+        "the second event must carry the new committed revision"
+    );
+    assert_eq!(
+        file2.meta_version,
+        file.meta_version + 1,
+        "two sequential patches bump the revision by exactly one each"
+    );
+}
+
 // ── 5. delete_file leaves a "delete_file" audit row ──────────────────────────
 
 /// @cpt-cf-file-storage-fr-audit-trail

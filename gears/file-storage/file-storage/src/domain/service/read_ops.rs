@@ -42,6 +42,28 @@ impl FileService {
         Ok((file, meta))
     }
 
+    /// Batched custom-metadata lookup for `list_files`'s page of results:
+    /// one `IN (...)` query for every file id in `file_ids` instead of one
+    /// `list_metadata` call per file (`GET /files` was previously built with
+    /// an empty `custom_metadata` on every item -- see `handlers::list_files`).
+    ///
+    /// Takes raw file ids with **no `SecurityContext`/authorization check of
+    /// its own** -- it trusts the caller to have already authorized every id
+    /// in `file_ids` (e.g. via a preceding `list_files` call, which
+    /// tenant-scopes and owner-gates its results before returning them). It
+    /// is `pub(crate)`, not `pub`, precisely to keep its only intended caller
+    /// (`handlers::list_files`, same crate) from becoming a foot-gun for a
+    /// future caller reachable from outside this crate that might pass
+    /// unauthorized ids straight through to an unscoped batched DB read.
+    /// Do **not** call this with file ids that have not already come out of
+    /// an authorized listing for the current `SecurityContext`.
+    pub(crate) async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        self.store.list_metadata_for_files(file_ids).await
+    }
+
     /// List files for a mandatory owner filter, offset-paginated.
     pub async fn list_files(
         &self,
@@ -376,3 +398,7 @@ impl FileService {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "read_ops_tests.rs"]
+mod read_ops_tests;

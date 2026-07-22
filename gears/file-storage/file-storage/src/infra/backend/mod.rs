@@ -71,6 +71,23 @@ pub(crate) fn build_manifest_and_root(
     // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-return
 }
 
+/// Result of [`StorageBackend::publish_exclusive`]: the measured size/digest
+/// of the stream that was just read, plus whether the write actually landed.
+///
+/// `created: true` means `path` held nothing before this call and now holds
+/// exactly the streamed bytes. `created: false` means `path` already held a
+/// blob and this call left it untouched — the destination was **never**
+/// overwritten. `bytes_written`/`digest` are always populated (describing
+/// *this* attempt's bytes) even when `created` is `false`, so a caller can
+/// still run a server-side idempotency check (e.g. the sidecar's finalize
+/// callback) without a second read of the backend.
+#[derive(Debug, Clone, Copy)]
+pub struct PublishOutcome {
+    pub bytes_written: u64,
+    pub digest: [u8; 32],
+    pub created: bool,
+}
+
 /// Optional features a backend may declare
 /// (`cpt-cf-file-storage-fr-backend-capabilities`). Versioning is **not** here —
 /// it is implemented at the `FileStorage` level on every backend.
@@ -142,6 +159,102 @@ pub trait StorageBackend: Send + Sync {
             crate::infra::content::hash::digest_to_array(crate::infra::content::hash::sha256(&buf));
         self.put(path, Bytes::from(buf)).await?;
         Ok((bytes_written, digest))
+    }
+
+    /// Publish a blob at `path`, but **only if nothing is stored there yet**
+    /// (create-exclusive semantics) — unlike [`Self::put_stream`], which is
+    /// documented as overwrite-allowed and stays that way for its existing
+    /// callers (per-part multipart writes, which are deliberately
+    /// overwrite-safe for resume; `migrate_backend`'s write to a fresh
+    /// backend). This method exists for exactly one call site: the sidecar's
+    /// single-shot upload handler, publishing a version's *final*, canonical
+    /// object at `/{file_id}/{version_id}`.
+    ///
+    /// # Why this must not just overwrite (P2 remediation — replay-`PUT` fix)
+    /// A `PUT` token's signature covers `op`/`file_id`/`version_id`/size/hash
+    /// *constraints*, never the body bytes (DESIGN.md, ADR-0003), and stays
+    /// valid until `exp`. Once a version has been finalized and bound as a
+    /// file's live content, a holder of that same still-unexpired token could
+    /// otherwise re-`PUT` different bytes to the same backend path and
+    /// silently replace the live, already-served content out from under the
+    /// recorded size/hash/`ETag`/MIME — a HIGH-severity immutability break,
+    /// not the merely-orphans-a-version consequence the design previously
+    /// assumed. Making this call create-exclusive closes that: only the
+    /// *first* write to a given path ever lands; every subsequent attempt
+    /// observes `created: false` and the existing bytes are provably
+    /// untouched.
+    ///
+    /// # This default implementation is explicitly non-atomic (TOCTOU) — read before relying on it
+    /// It is an `exists` check followed by a separate `put`, with a real race
+    /// window in between: two concurrent callers can both observe "nothing
+    /// there yet" and both proceed to `put`, so two racing publishes to the
+    /// same `path` can each report `created: true` and the second `put`'s
+    /// bytes silently win, defeating the create-exclusive guarantee this
+    /// method exists to provide. It is only "good enough" as a
+    /// backend-agnostic fallback for a backend that cannot yet do better —
+    /// not a substitute for a real atomic primitive.
+    ///
+    /// [`LocalFsBackend`](super::LocalFsBackend) (`std::fs::hard_link`, which
+    /// atomically fails with `AlreadyExists` if the target already has a
+    /// directory entry) and [`InMemoryBackend`](super::InMemoryBackend) (a
+    /// single mutex guards both the check and the insert) both override this
+    /// with a truly atomic implementation, closing the race for those two
+    /// backends completely.
+    ///
+    /// [`S3Backend`](super::backend::S3Backend) **overrides** this default with
+    /// an atomic conditional-write implementation (`If-None-Match: *` on the
+    /// terminal `PutObject`/`CompleteMultipartUpload`, mapping the resulting
+    /// `412 Precondition Failed` to `created: false` — the same outcome
+    /// `LocalFsBackend`/`InMemoryBackend` produce), so no shipping backend is
+    /// left on this racy default. That override's guarantee is
+    /// provider-dependent: it requires an endpoint that honours S3 conditional
+    /// writes (native AWS S3 since 2024-08, and S3-compatible stores that
+    /// implement it). S3 support is opt-in (`s3_backends` config) and
+    /// release-gated by [ADR-0005](../../../docs/ADR/0005-cpt-cf-file-storage-adr-s3-client-selection.md)
+    /// (also see [ADR-0003](../../../docs/ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)'s
+    /// "Known gap" paragraph); validating a specific target deployment's
+    /// conditional-write support is part of that gate.
+    ///
+    /// This default therefore remains only as a backend-agnostic fallback for a
+    /// hypothetical future backend that cannot do better — every backend wired
+    /// today (`local-fs`, `in-memory`, `s3`) provides an atomic override.
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<PublishOutcome, DomainError> {
+        use futures::StreamExt;
+
+        let mut buf = Vec::new();
+        let mut stream = stream;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| DomainError::backend(self.id(), e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+            if max_size.is_some_and(|m| buf.len() as u64 > m) {
+                return Err(DomainError::validation("size", "exceeds max_size"));
+            }
+        }
+        let bytes_written = buf.len() as u64;
+        let digest =
+            crate::infra::content::hash::digest_to_array(crate::infra::content::hash::sha256(&buf));
+
+        // Non-atomic check-then-act: see this method's doc comment for the
+        // race this fallback accepts as the price of a backend-agnostic
+        // default.
+        if self.exists(path).await? {
+            return Ok(PublishOutcome {
+                bytes_written,
+                digest,
+                created: false,
+            });
+        }
+        self.put(path, Bytes::from(buf)).await?;
+        Ok(PublishOutcome {
+            bytes_written,
+            digest,
+            created: true,
+        })
     }
 
     /// Read the whole blob at `path`.

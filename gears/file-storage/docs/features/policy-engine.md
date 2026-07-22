@@ -252,6 +252,14 @@ transitions to model.
 `src/domain/policy_tests.rs` (resolver merge behavior) and `src/domain/service/service_tests.rs` (the enforcement
 helpers, DB-free).
 
+**Known gap**: `enabled_event_types` is stored and round-tripped through `GET`/`PUT /policy` like every other
+`PolicyBody` field, but `PolicyResolver` has no method that consults it, and no file-event enqueue path
+(`FileService::make_file_event` call sites, or the cleanup engine's own `FileEvent` construction) checks it before
+enqueuing. Every event type is enqueued unconditionally regardless of what a policy's `enabled_event_types` says —
+the field is currently inert configuration, not enforced gating. See
+[docs/migration.sql](../migration.sql)'s `events_outbox` table comment and
+[docs/features/audit-trail.md](audit-trail.md) for the sibling outbox's related gaps.
+
 **Implements**:
 - `cpt-cf-file-storage-algo-resolve-effective-policy`
 

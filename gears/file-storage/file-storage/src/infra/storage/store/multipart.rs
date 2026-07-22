@@ -169,8 +169,18 @@ impl Store {
             .await
     }
 
-    /// Mark a multipart upload session as `aborted` and record the audit row
-    /// in the same transaction.
+    /// Mark a multipart upload session as `aborted`, delete its
+    /// `multipart_upload_parts` rows, and record the audit row — all in the
+    /// same transaction.
+    ///
+    /// Part-row deletion (P2 remediation, `docs/features/multipart-coordinator.md`
+    /// `inst-abort-delete-parts`) lives here rather than at each call site so
+    /// both abort paths that share this single CAS -- the user-driven
+    /// `MultipartService::abort_multipart_upload` and the cleanup sweep's
+    /// `CleanupEngine::abort_expired_multipart_session` -- get it for free.
+    /// Folded into the same transaction as the state flip so a crash between
+    /// the two can never leave the session `aborted` with its part rows still
+    /// dangling.
     ///
     /// @cpt-cf-file-storage-fr-multipart-upload
     /// @cpt-cf-file-storage-fr-audit-trail
@@ -190,12 +200,30 @@ impl Store {
                         .update_state(tx, upload_id, "in_progress", "aborted", None)
                         .await?;
                     if updated {
+                        // @cpt-begin:cpt-cf-file-storage-flow-multipart-abort:p1:inst-abort-delete-parts
+                        multipart.delete_parts_for_upload(tx, upload_id).await?;
+                        // @cpt-end:cpt-cf-file-storage-flow-multipart-abort:p1:inst-abort-delete-parts
                         // @cpt-cf-file-storage-nfr-audit-completeness
                         audit_repo.insert(tx, &audit).await?;
                     }
                     Ok::<bool, DomainError>(updated)
                 })
             })
+            .await
+    }
+
+    /// Delete all `multipart_upload_parts` rows for `upload_id`. Returns the
+    /// number of rows removed.
+    ///
+    /// Exposed as a standalone `Store` method (in addition to being folded
+    /// into [`Self::abort_multipart_upload`]'s own transaction) so tests and
+    /// any future caller outside the abort CAS can assert on / drive part-row
+    /// cleanup directly.
+    pub async fn delete_parts_for_upload(&self, upload_id: Uuid) -> Result<u64, DomainError> {
+        let conn = self.db.conn().map_err(db_err)?;
+        self.repos
+            .multipart
+            .delete_parts_for_upload(&conn, upload_id)
             .await
     }
 }

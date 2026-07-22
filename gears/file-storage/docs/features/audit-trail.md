@@ -40,15 +40,40 @@ Updated:  2026-07-08 by Constructor Tech
 
 ### 1.1 Overview
 
-A transactional-outbox audit trail: every write mutation this gear performs — file
-create, finalize, bind, metadata patch, delete (file/version), multipart
-complete/abort, ownership transfer, backend migration, and the background
-cleanup engine's retention-delete/orphan-reconcile actions — inserts one
-`AuditEntry` row into the `audit_outbox` table **in the same DB transaction**
-as the mutation it describes. There is no separate "log after the fact" step
-and no code path that mutates state without also building an audit row, so a
-rolled-back mutation leaves zero audit rows (the same transaction covers
-both).
+A transactional-outbox audit trail: every write mutation that changes a
+**file's or version's durable, user-visible state** — create, finalize, bind,
+metadata patch, delete (file/version), multipart complete/abort, ownership
+transfer, backend migration, and the background cleanup engine's
+retention-delete/orphan-reconcile actions — inserts one `AuditEntry` row into
+the `audit_outbox` table **in the same DB transaction** as the mutation it
+describes. There is no separate "log after the fact" step for any of those
+operations, so a rolled-back mutation among them leaves zero audit rows (the
+same transaction covers both).
+
+This coverage is not, however, "every mutation in the gear" — a few mutating
+code paths are deliberately unaudited today:
+
+- **Transient coordination rows**, not yet a durable file/version state
+  change a consumer would care about: `presign_version`'s pending-version
+  insert (`FileService::presign_version` in `src/domain/service/create.rs` →
+  `Store::insert_pending_version`, `src/infra/storage/store/versions.rs`) and
+  multipart initiate's session + pending-version insert and per-part upserts
+  (`Store::create_multipart_upload`/`upsert_multipart_part`,
+  `src/infra/storage/store/multipart.rs`) write no audit row. These rows are
+  provisional — they either get promoted into an already-audited mutation
+  (`finalize_upload`/`bind`, `complete_multipart_upload`) or are cleaned up
+  by the orphan-reconciliation sweep (which *is* audited, as
+  `OrphanReconcile`) — so the durable outcome is always covered even though
+  the intermediate coordination state is not.
+- **Policy and retention-rule writes — a tracked gap, not a design choice.**
+  `upsert_policy`/`insert_retention_rule`/`delete_retention_rule`
+  (`src/infra/storage/store/policy.rs`) mutate tenant/user policy and
+  retention-rule rows with no audit row at all. Unlike the transient rows
+  above, these are durable configuration changes with real compliance
+  relevance (they alter what a *future* write is allowed to do), so this is
+  an acknowledged coverage gap, tracked here rather than closed, in the same
+  spirit as the outbox-drain gap documented in §1.2 below — no target date,
+  but explicitly recorded rather than silently assumed-covered.
 
 This feature has **no REST endpoint of its own** — it is a pure side effect of
 other features' write paths. The only way to read `audit_outbox` rows today is
@@ -88,7 +113,8 @@ only metadata/identifiers in `detail`, never content bytes)
 > downstream consumer to actually receive these audit events short of a direct
 > database read. The write-side guarantee (100% coverage, same-transaction
 > atomicity) is real and tested; the "and it reaches an audit sink" half of the
-> feature does not exist yet. See `../DEFERRED_ITEMS_PLAN.md` Tier-4 item 4.1.
+> feature does not exist yet. Tracked as a P3/Tier-4 follow-up (the EventBroker relay); no dedicated ticket exists in
+> this repo yet.
 
 ### 1.3 Actors
 
@@ -101,14 +127,16 @@ The background cleanup engine (`cpt-cf-file-storage-fr-orphan-reconciliation`,
 `cpt-cf-file-storage-fr-retention-policies`) also writes audit rows for its own
 sweep-triggered deletions, using a synthetic `actor_kind = "system"`,
 `actor_id = Uuid::nil()` identity rather than either actor above — there is no
-human or peer-gear caller to attribute those rows to. One inconsistency worth
-noting as observed, not corrected here: the `OrphanReconcile` audit rows built
-in `cleanup.rs` (`delete_abandoned_pending_version`, `orphan_reconcile_audit`)
-also set `tenant_id = Uuid::nil()`, whereas the `RetentionDelete` audit rows
-(`expire_file`) correctly carry the real `file.tenant_id`. `audit_outbox` has no
-tenant secure-column enforcement (`#[secure(no_tenant, ...)]`), so this does not
-bypass any access control, but it does mean a tenant-scoped query over
-orphan-reconcile rows by `tenant_id` would miss them.
+human or peer-gear caller to attribute those rows to. The `OrphanReconcile`
+audit rows built via `cleanup.rs`'s `orphan_reconcile_audit` helper carry the
+real `file.tenant_id` in the same way the `RetentionDelete` rows (`expire_file`)
+do: `maybe_delete_orphaned_file` resolves it from the orphan candidate's own
+file row, and `cleanup_expired_session_version`'s pending-version cleanup
+resolves it via a fresh `self.store.get_file(...)` lookup. `tenant_id` only
+falls back to `Uuid::nil()` in that second path when the file row is already
+gone by the time the sweep gets to it (`map_or_else(Uuid::nil, |file|
+file.tenant_id)`) — i.e. only when there is genuinely no real tenant left to
+attribute the row to, not as a standing inconsistency with `RetentionDelete`.
 
 ### 1.4 References
 
@@ -176,7 +204,7 @@ payload
 
 **Steps**:
 1. [x] - `p1` - Extract `tenant_id`/`actor_id` from the `SecurityContext` (`ctx.subject_tenant_id()`, `ctx.subject_id()`), or use `Uuid::nil()` for a background-sweep-originated entry - `inst-buildentry-identity`
-2. [x] - `p1` - Compute `actor_kind`: `"app"` if `ctx.subject_type() == Some("app")`, else `"user"`; `"system"` for the cleanup engine's own entries - `inst-buildentry-actor-kind`
+2. [x] - `p1` - Compute `actor_kind`: `"app"` if `ctx.subject_type() == Some("app")`, else `"user"` (`Self::actor_kind`); `"system"` for the cleanup engine's own entries; `"sidecar"` (with `Uuid::nil()` actor id) for `finalize_upload_by_token`'s token-authenticated callback, which has no `SecurityContext` to derive an actor from - `inst-buildentry-actor-kind`
 3. [x] - `p1` - Select the `AuditOperation` variant matching the mutation (`Create`, `PatchContent`, `PatchMetadata`, `DeleteFile`, `DeleteVersion`, `MultipartComplete`, `MultipartAbort`, `FinalizeVersion`, `RetentionDelete`, `BackendMigrate`, `OrphanReconcile`, `TransferOwnership`) - `inst-buildentry-operation`
 4. [x] - `p1` - Build a `detail` JSON object with operation-specific identifiers (e.g. `version_id`, `from_backend`/`to_backend`, `from_owner_id`/`to_owner_id`) — never content bytes - `inst-buildentry-detail`
 5. [x] - `p1` - Construct the `AuditEntry` via `AuditEntry::success(...)` (or `::failure(...)`, defined but not currently called by any production call site — every shipped call site only ever records successes, since a failed mutation's transaction rolls back before an audit row would matter) with `occurred_at = now_utc()` - `inst-buildentry-construct`

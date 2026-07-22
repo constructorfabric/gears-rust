@@ -418,7 +418,11 @@ impl FileService {
     /// `PATCH /files/{id}`: JSON-merge-patch the custom metadata and bump
     /// `meta_version`, optionally guarded by `If-Match-Metadata`.
     ///
+    /// A `PatchMetadata` audit row and a `file.metadata_updated` file event are
+    /// enqueued in the same transaction as the CAS + patch.
+    ///
     /// @cpt-cf-file-storage-fr-audit-trail
+    /// @cpt-cf-file-storage-fr-file-events
     pub async fn update_metadata(
         &self,
         ctx: &SecurityContext,
@@ -464,6 +468,20 @@ impl FileService {
             serde_json::json!({ "expected_meta_version": expected_meta_version }),
         );
 
+        // @cpt-cf-file-storage-fr-file-events
+        // The `meta_version` payload is left empty here and stamped with the
+        // authoritative committed revision inside `patch_metadata_atomic`'s
+        // transaction: an unconditional patch (`expected_meta_version = None`)
+        // that races another cannot know its post-bump revision from the
+        // pre-transaction snapshot, so the store fills it from the CAS result.
+        let event = Some(Self::make_file_event(
+            file.tenant_id,
+            file.owner_id,
+            file_id,
+            "file.metadata_updated",
+            serde_json::json!({}),
+        ));
+
         // Apply the meta-version CAS and the patch in ONE transaction. The CAS
         // runs first, so a stale `expected_meta_version` aborts before any row
         // is touched and the rollback guarantees no partial metadata change is
@@ -473,7 +491,15 @@ impl FileService {
         let now = OffsetDateTime::now_utc();
         let bumped = self
             .store
-            .patch_metadata_atomic(&scope, file_id, expected_meta_version, patch, now, audit)
+            .patch_metadata_atomic(
+                &scope,
+                file_id,
+                expected_meta_version,
+                patch,
+                now,
+                audit,
+                event,
+            )
             .await?;
         if !bumped {
             return Err(DomainError::precondition_failed(
@@ -624,7 +650,23 @@ impl FileService {
         // @cpt-end:cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance:p1:inst-rebalance-credit
         // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-usage-rebalance
 
-        self.store.require_file(&scope, file_id).await
+        // Return the file reflecting the just-committed owner swap, built
+        // from the pre-transfer row plus the exact fields
+        // `transfer_ownership_atomic`/`FileRepo::update_owner` mutate
+        // (`owner_kind`, `owner_id`, `last_modified_at` — see that repo
+        // method: `meta_version` is untouched by a transfer), rather than
+        // re-reading via `require_file` with the pre-transfer `scope`. The
+        // `files` entity declares `owner_col = "owner_id"`
+        // (`infra/storage/entity/file.rs`), so an owner-constrained
+        // `AccessScope` — one that only matches the *old* owner — would no
+        // longer match the row after a successful swap, and a re-read with
+        // that stale scope would incorrectly surface a 404 for a transfer
+        // that already committed (usage deltas and all).
+        let mut updated_file = file;
+        updated_file.owner_kind = new_owner_kind;
+        updated_file.owner_id = new_owner_id;
+        updated_file.last_modified_at = now;
+        Ok(updated_file)
     }
 
     /// Record an uploaded version's size+hash and mark it available, authorized
