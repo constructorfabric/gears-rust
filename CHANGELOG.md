@@ -9,6 +9,384 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-noop-usage-collector-plugin-v0.1.0...cf-gears-noop-usage-collector-plugin-v0.1.1) - 2026-07-22
+
+### Added
+
+- *(usage-collector)* BigDecimal aggregates, deterministic record ids, op-per-kind guard (by @capybutler)
+
+### Other
+
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+
+### Contributors
+
+* @capybutler
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-usage-collector-v0.1.0...cf-gears-usage-collector-v0.2.0) - 2026-07-22
+
+### Added
+
+- *(usage-collector)* BigDecimal aggregates, deterministic record ids, op-per-kind guard (by @capybutler)
+- *(usage-collector)* add OpenTelemetry metrics/observability layer (by @capybutler)
+
+### Other
+
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @capybutler
+* @aviator5
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-usage-collector-sdk-v0.1.0...cf-gears-usage-collector-sdk-v0.2.0) - 2026-07-22
+
+### Added
+
+- *(usage-collector)* BigDecimal aggregates, deterministic record ids, op-per-kind guard (by @capybutler)
+
+### Other
+
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @capybutler
+* @aviator5
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oidc-authn-plugin-v0.1.1...cf-gears-oidc-authn-plugin-v0.1.2) - 2026-07-22
+
+### Other
+
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @aviator5
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-cluster-conformance-v0.1.0) - 2026-07-22
+
+### Added
+
+- *(cluster)* add testing strategy and test scenario documentation + add cluster-conformance crate (by @asmith987)
+
+### Contributors
+
+* @asmith987
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-cluster-v0.1.0) - 2026-07-22
+
+### Added
+
+- *(cluster)* standalone backend plugin and cluster gear wiring (by @asmith987)
+- *(cluster)* add testing strategy and test scenario documentation + add cluster-conformance crate (by @asmith987)
+- *(cluster)* cluster docs and cluster-sdk crate (by @asmith987)
+
+### Contributors
+
+* @asmith987
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-standalone-cluster-plugin-v0.1.0) - 2026-07-22
+
+### Added
+
+- *(cluster)* standalone backend plugin and cluster gear wiring (by @asmith987)
+
+### Contributors
+
+* @asmith987
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-cluster-sdk-v0.1.0) - 2026-07-22
+
+### Added
+
+- *(cluster)* standalone backend plugin and cluster gear wiring (by @asmith987)
+- *(cluster)* cluster docs and cluster-sdk crate (by @asmith987)
+
+### Other
+
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @asmith987
+* @aviator5
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-toolkit-http-middleware-v0.1.0) - 2026-07-22
+
+### Added
+
+- *(security)* add two-plane auth primitives and HTTP/gRPC middleware (by @mattgarmon)
+
+### Contributors
+
+* @mattgarmon
+
+## [0.1.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tr-authz-plugin-v0.1.4...cf-gears-tr-authz-plugin-v0.1.5) - 2026-07-22
+
+### Other
+
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @aviator5
+
+## [0.1.23](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-tr-plugin-v0.1.22...cf-gears-static-tr-plugin-v0.1.23) - 2026-07-22
+
+### Other
+
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-idp-plugin-v0.1.1...cf-gears-static-idp-plugin-v0.1.2) - 2026-07-22
+
+### Other
+
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @aviator5
+
+## [0.1.20](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-credstore-plugin-v0.1.19...cf-gears-static-credstore-plugin-v0.1.20) - 2026-07-22
+
+### Other
+
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+
+## [0.1.22](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authz-plugin-v0.1.21...cf-gears-static-authz-plugin-v0.1.22) - 2026-07-22
+
+### Other
+
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @aviator5
+
+## [0.3.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authn-plugin-v0.3.1...cf-gears-static-authn-plugin-v0.3.2) - 2026-07-22
+
+### Fixed
+
+- *(security)* type credential fields as SecretString; close review gaps (by @MikeFalcon77)
+
+### Other
+
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @MikeFalcon77
+* @aviator5
+
+## [0.1.24](https://github.com/constructorfabric/gears-rust/compare/cf-gears-single-tenant-tr-plugin-v0.1.23...cf-gears-single-tenant-tr-plugin-v0.1.24) - 2026-07-22
+
+### Other
+
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+
+## [0.1.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-rg-tr-plugin-v0.1.4...cf-gears-rg-tr-plugin-v0.1.5) - 2026-07-22
+
+### Other
+
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-chat-engine-v0.1.0) - 2026-07-22
+
+### Fixed
+
+- *(security)* type credential fields as SecretString; close review gaps (by @MikeFalcon77)
+- fix cargo fmt
+- fix dylint
+- fix cargo fmt
+- fix clippy
+
+### Other
+
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+- drop unused inventory/async-stream deps
+- enforce domain/infra boundary + quick-xml advisory
+- author missing ADRs/entities and clear dylint lints
+- terse o/p/v delta keys + stop terminator (FR-024)
+- persist streamed vocabulary events
+- expand streaming event vocabulary
+- typed SSE delta events
+- drop dead NDJSON response path
+- sweep the resume buffer on a TTL cadence
+- add Last-Event-ID reconnect endpoint
+- driver outlives the client connection
+- tee streaming events into resume buffer
+- SSE buffer-reader for live-tail resume
+- stream resume buffer storage
+- SSE delta transport for streaming endpoints
+- delta-stream projector
+- hard-delete cascade + summary variant-index collision
+- canonicalize inbound text part content to {"text": ...}
+- mount /session-types + fix streaming cancel-on-drop
+- wire messaging REST handlers + fix message-id route arity
+- persist on_session_updated metadata on type-switch
+- session hooks return capabilities + metadata
+- per-part citations & references
+- structured message parts
+- add user_id and tenant_id to message
+- enforce root-message variant uniqueness
+- remove always-failing VariantService::assign_variant_index
+- report session-creation rollback failures explicitly
+- persist plugin_config at session-type registration
+- don't log plugin error payload in health-check warn
+- emit summary Complete only after successful persist
+- drop constructor-echo tautology tests in message_repo
+- model messages.role as enum
+- bound retention session scan with limit
+- batch delete_message_subtree by level
+- gate retention cleanup behind leader election
+- gate stubbed export/search behind HTTP 501
+- OData session pagination + port modkit→toolkit
+- move chat engine to gears
+
+### Contributors
+
+* @MikeFalcon77
+* @aviator5
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-chat-engine-sdk-v0.1.0) - 2026-07-22
+
+### Fixed
+
+- *(security)* type credential fields as SecretString; close review gaps (by @MikeFalcon77)
+- fix cargo fmt
+- fix cargo fmt
+- fix clippy
+
+### Other
+
+- author missing ADRs/entities and clear dylint lints
+- persist streamed vocabulary events
+- expand streaming event vocabulary
+- session hooks return capabilities + metadata
+- per-part citations & references
+- structured message parts
+- add user_id and tenant_id to message
+- register service
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @MikeFalcon77
+* @Artifizer
+
+## [0.6.9](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-http-v0.6.8...cf-gears-toolkit-http-v0.6.9) - 2026-07-22
+
+### Added
+
+- *(security)* add two-plane auth primitives and HTTP/gRPC middleware (by @mattgarmon)
+
+### Contributors
+
+* @mattgarmon
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-account-management-v0.2.0...cf-gears-account-management-v0.3.0) - 2026-07-22
+
+### Added
+
+- *(account-management)* classify IdP uniqueness and password-policy rejections (by @diffora)
+- *(account-management)* support $orderby=status on the tenant children listing (by @diffora)
+
+### Fixed
+
+- *(account-management)* count self_managed direct children in child_count (by @diffora)
+- *(account-management)* platform-scope the user-groups cascade system actor (by @diffora)
+- *(account-management)* cancel pending conversion in the tenant soft-delete TX (by @diffora)
+
+### Other
+
+- Merge pull request #4222 from fluiderson/rustupd (by @MikeFalcon77) - #4222
+- update the Rust version (by @fluiderson) - #4222
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @diffora
+* @MikeFalcon77
+* @fluiderson
+* @aviator5
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-account-management-sdk-v0.2.0...cf-gears-account-management-sdk-v0.3.0) - 2026-07-22
+
+### Added
+
+- *(account-management)* classify IdP uniqueness and password-policy rejections (by @diffora)
+- *(account-management)* support $orderby=status on the tenant children listing (by @diffora)
+
+### Other
+
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @diffora
+* @aviator5
+
+## [0.6.14](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-v0.6.13...cf-gears-toolkit-v0.6.14) - 2026-07-22
+
+### Fixed
+
+- *(security)* type credential fields as SecretString; close review gaps (by @MikeFalcon77)
+
+### Other
+
+- Merge pull request #4222 from fluiderson/rustupd (by @MikeFalcon77) - #4222
+- update the Rust version (by @fluiderson) - #4222
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+* @aviator5
+
+## [0.7.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-canonical-errors-v0.7.4...cf-gears-toolkit-canonical-errors-v0.7.5) - 2026-07-22
+
+### Other
+
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @aviator5
+
+## [0.6.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-canonical-errors-macro-v0.6.1...cf-gears-toolkit-canonical-errors-macro-v0.6.2) - 2026-07-22
+
+### Added
+
+- *(dylint)* enforce GTS prefix markers (by @aviator5)
+
+### Other
+
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @aviator5
+
 ## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-noop-usage-collector-plugin-v0.1.0) - 2026-06-29
 
 ### Added
