@@ -453,7 +453,7 @@ sea-orm-migration = { version = "1.1", default-features = false, features = [
 # sqlx: TLS via aws-lc-rs; runtime-tokio for async.  This is the sole TLS entry
 # point for the DB stack -- sea-orm/sea-orm-migration intentionally use runtime-tokio
 # (not runtime-tokio-rustls) to avoid pulling in ring.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs"] }
 
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
