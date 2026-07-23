@@ -18,13 +18,14 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::StreamExt;
 use oagw_sdk::error::StreamingError;
-use oagw_sdk::sse::{ServerEventsResponse, ServerEventsStream};
+use oagw_sdk::sse::{FromServerEvent, ServerEvent, ServerEventsResponse, ServerEventsStream};
 use oagw_sdk::{Body, ServiceGatewayClientV1};
+use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use toolkit_security::SecurityContext;
 use tracing::debug;
 
-use crate::infra::llm::request::ContentPart as MessageContentPart;
+use crate::infra::llm::request::{ContentPart as MessageContentPart, LlmTool};
 use crate::infra::llm::{
     ClientSseEvent, LlmProviderError, LlmRequest, NonStreaming, ProviderStream, ResponseResult,
     Streaming, TranslatedEvent,
@@ -34,6 +35,77 @@ use super::openai_responses::{
     ProviderEvent, ResponseObject, extract_citations, parse_error_response,
     translate_provider_event,
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// Event-type resolution
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Minimal projection used to recover the event type from the JSON payload.
+#[derive(Deserialize)]
+struct TypeTag {
+    r#type: String,
+}
+
+/// `response.reasoning_text.delta` payload (gpt-oss chain-of-thought).
+#[derive(Deserialize)]
+struct ReasoningTextDeltaData {
+    #[serde(default)]
+    delta: String,
+}
+
+/// vLLM-specific event, parsed from the upstream SSE stream.
+///
+/// Two divergences from `OpenAI`'s Responses API are handled here so the shared
+/// [`ProviderEvent`]/[`OpenAiResponsesProvider`](super::OpenAiResponsesProvider)
+/// path stays spec-clean:
+///
+/// 1. **No `event:` field.** vLLM omits the SSE `event:` line and carries the
+///    type only inside the JSON payload's `type` field. Without compensating,
+///    every frame would resolve to `"message"` → [`ProviderEvent::Unknown`],
+///    so no deltas would be emitted and no terminal event captured — surfacing
+///    to the client as "stream ended without terminal event".
+/// 2. **Dedicated reasoning events.** gpt-oss streams chain-of-thought as
+///    `response.reasoning_text.delta` events (not the `<think>…</think>` tags
+///    the [`ThinkState`] machine handles for Qwen). The shared parser doesn't
+///    model these, so they are captured here and surfaced as `"reasoning"`
+///    deltas.
+enum VllmProviderEvent {
+    /// A gpt-oss reasoning delta to surface as a `"reasoning"` SSE delta.
+    ReasoningDelta { delta: String },
+    /// Any event understood by the shared Responses parser.
+    Shared(ProviderEvent),
+}
+
+impl FromServerEvent for VllmProviderEvent {
+    fn from_server_event(event: ServerEvent) -> Result<Self, StreamingError> {
+        // Recover the missing `event:` field from the JSON payload `type`.
+        let event = if event.event.is_none() {
+            let r#type = serde_json::from_str::<TypeTag>(&event.data)
+                .ok()
+                .map(|t| t.r#type);
+            ServerEvent {
+                event: r#type,
+                ..event
+            }
+        } else {
+            event
+        };
+
+        // Reasoning deltas aren't modelled by the shared parser — capture the
+        // text here so it can be rendered in the "Thinking" panel.
+        if event.event.as_deref() == Some("response.reasoning_text.delta") {
+            let data: ReasoningTextDeltaData =
+                serde_json::from_str(&event.data).map_err(|e| {
+                    StreamingError::ServerEventsParse {
+                        detail: format!("failed to parse reasoning delta: {e}"),
+                    }
+                })?;
+            return Ok(VllmProviderEvent::ReasoningDelta { delta: data.delta });
+        }
+
+        ProviderEvent::from_server_event(event).map(VllmProviderEvent::Shared)
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Think-tag state machine
@@ -232,7 +304,9 @@ fn strip_think_tags(text: &str) -> String {
 /// Compared to the `OpenAI` variant, this:
 /// - Uses plain string `content` for assistant messages (vLLM rejects the
 ///   `output_text` array format).
-/// - Omits tool definitions (`file_search`, `web_search`, `code_interpreter`).
+/// - Serializes function tools (`LlmTool::Function`) so the model can call
+///   custom tools like `exa_search`. Provider-hosted tools (`file_search`,
+///   `web_search`, `code_interpreter`) are omitted — vLLM doesn't host them.
 /// - Omits `metadata` and `max_tool_calls`.
 fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::Value {
     let mut body = serde_json::json!({
@@ -294,8 +368,17 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
         })
         .collect();
 
-    if !input.is_empty() {
-        body["input"] = serde_json::Value::Array(input);
+    // Append raw input items (function_call + function_call_output) so the
+    // agentic loop can replay prior tool calls back to the model.
+    let combined_input = if request.raw_input_items.is_empty() {
+        input
+    } else {
+        let mut combined = input;
+        combined.extend(request.raw_input_items.iter().cloned());
+        combined
+    };
+    if !combined_input.is_empty() {
+        body["input"] = serde_json::Value::Array(combined_input);
     }
 
     if let Some(ref instructions) = request.system_instructions {
@@ -331,6 +414,30 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
                 body_obj.insert(k.clone(), v.clone());
             }
         }
+    }
+
+    // Serialize function tools so the model can call them (e.g. `exa_search`).
+    // Provider-hosted tools (file/web/code) are skipped — vLLM doesn't host
+    // them, and sending unknown tool types risks an upstream error.
+    let tools: Vec<serde_json::Value> = request
+        .tools
+        .iter()
+        .filter_map(|tool| match tool {
+            LlmTool::Function {
+                name,
+                description,
+                parameters,
+            } => Some(serde_json::json!({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "parameters": parameters
+            })),
+            _ => None,
+        })
+        .collect();
+    if !tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(tools);
     }
 
     // Adapter-specific extras outside the typed surface.
@@ -402,7 +509,7 @@ impl crate::infra::llm::LlmProvider for VllmResponsesProvider {
 
         let response = self.gateway.proxy_request(ctx, http_request).await?;
 
-        match ServerEventsStream::from_response::<ProviderEvent>(response) {
+        match ServerEventsStream::from_response::<VllmProviderEvent>(response) {
             ServerEventsResponse::Events(event_stream) => {
                 // Scan state: (accumulated_text, think_state_machine).
                 let translated = event_stream
@@ -411,7 +518,19 @@ impl crate::infra::llm::LlmProvider for VllmResponsesProvider {
                         |(accumulated, think), result| {
                             let output: Vec<Result<TranslatedEvent, StreamingError>> = match result
                             {
-                                Ok(event) => {
+                                Ok(VllmProviderEvent::ReasoningDelta { delta }) => {
+                                    // Surfaced as a reasoning delta; not added to
+                                    // `accumulated` (which holds visible text only).
+                                    if delta.is_empty() {
+                                        vec![]
+                                    } else {
+                                        vec![Ok(TranslatedEvent::Sse(ClientSseEvent::Delta {
+                                            r#type: "reasoning",
+                                            content: delta,
+                                        }))]
+                                    }
+                                }
+                                Ok(VllmProviderEvent::Shared(event)) => {
                                     if let ProviderEvent::ResponseOutputTextDelta { ref delta } =
                                         event
                                     {
