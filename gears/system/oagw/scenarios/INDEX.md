@@ -196,6 +196,26 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 - **Scenario**: [positive-9.8-hierarchical-auth-sharing-modes-behave-specified.md](proxy-api/authentication/positive-9.8-hierarchical-auth-sharing-modes-behave-specified.md)
 - **Mechanism**: `auth.sharing=inherit` + child provides auth → child override. `inherit` + child omits → parent auth. `enforce` → child cannot override. `private` → child must provide own.
 
+#### OAuth2 authorization code — interactive enrollment
+- **Scenario**: [positive-9.11-oauth2-authorization-code-enrollment.md](proxy-api/authentication/positive-9.11-oauth2-authorization-code-enrollment.md)
+- **Mechanism**: Per-user delegated access. `authorize` → browser consent → standard OAuth callback (`GET /oagw/v1/oauth/callback`, direct or BFF-relayed) exchanges the code (PKCE) and stores the token in `cred_store` with `Private` sharing. See → [ADR](../docs/adr-oauth2-authorization-code-auth-plugin.md).
+
+#### OAuth2 authorization code — bearer injection and transparent refresh
+- **Scenario**: [positive-9.12-oauth2-authorization-code-refresh.md](proxy-api/authentication/positive-9.12-oauth2-authorization-code-refresh.md)
+- **Mechanism**: Enrolled subject's token is injected; near-expiry tokens are refreshed and the rotated record written back. Plugin does not retry the original request.
+
+#### OAuth2 authorization code — authorization required
+- **Scenario**: [negative-9.13-oauth2-authorization-code-authorization-required.md](proxy-api/authentication/negative-9.13-oauth2-authorization-code-authorization-required.md)
+- **Mechanism**: No stored token → `Unauthenticated` with `reason = AUTHORIZATION_REQUIRED` and an `authorization_uri`; projected to `FailureReason::AuthorizationRequired`.
+
+#### OAuth2 authorization code — refresh rejection forces re-authorization
+- **Scenario**: [negative-9.14-oauth2-authorization-code-refresh-rejected.md](proxy-api/authentication/negative-9.14-oauth2-authorization-code-refresh-rejected.md)
+- **Mechanism**: Rejected/absent refresh token → stored record deleted → `AUTHORIZATION_REQUIRED`. Explicit `DELETE` revoke is idempotent and subject-scoped.
+
+#### OAuth2 authorization code — cross-subject token isolation
+- **Scenario**: [negative-9.15-oauth2-authorization-code-cross-subject-isolation.md](proxy-api/authentication/negative-9.15-oauth2-authorization-code-cross-subject-isolation.md)
+- **Mechanism**: Tokens keyed by `(subject_id, upstream_id)` and stored `Private`; no cross-subject or cross-tenant token reuse; revocation is subject-scoped.
+
 ---
 
 ### Request transforms

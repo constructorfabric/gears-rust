@@ -267,7 +267,7 @@ This is an area of active design. The trait shape, the metadata returned, and th
 
 ## Out of Scope
 
-- **Authorization Code Grant** (RFC 6749 §4.1): Requires user consent, redirect callbacks (OAuth Router), and refresh token storage across data centers. Separate ADR needed.
+- **Authorization Code Grant** (RFC 6749 §4.1): Requires user consent, redirect callbacks, and durable refresh-token storage. Covered by [ADR: OAuth2 Authorization Code Auth Plugin](./adr-oauth2-authorization-code-auth-plugin.md).
 
 ## Future Considerations
 
