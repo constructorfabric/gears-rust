@@ -57,6 +57,14 @@ pub struct ApiGatewayConfig {
     /// HTTP metrics configuration.
     #[serde(default)]
     pub metrics: MetricsConfig,
+
+    /// Optional filesystem path to a built admin-panel SPA (`dist/`).
+    /// When set, the gateway serves these static assets at `{prefix_path}/admin`
+    /// (e.g. `/cf/admin`) directly from disk, OUTSIDE the auth middleware stack
+    /// (the SPA itself is public; its API calls carry bearer tokens).
+    /// Unset (the default) means the admin panel is not served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_spa_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
