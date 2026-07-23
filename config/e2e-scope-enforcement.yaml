@@ -37,10 +37,6 @@ gears:
 
       defaults:
         body_limit_bytes: 64000000
-        rate_limit:
-          rps: 1000
-          burst: 200
-          in_flight: 64
 
       # Enable authentication (required for scope enforcement)
       auth_disabled: false
