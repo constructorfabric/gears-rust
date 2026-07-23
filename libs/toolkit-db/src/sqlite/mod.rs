@@ -6,7 +6,10 @@
 //! - Path preparation for `SQLite` databases
 
 pub mod dsn;
-pub mod path;
+// Crate-internal path helpers. `pub(crate)` is intentional API hygiene even though the parent
+// `sqlite` module is private (clippy::redundant_pub_crate would prefer `pub`).
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) mod path;
 pub mod pragmas;
 
 pub use dsn::{extract_sqlite_pragmas, is_memory_dsn};

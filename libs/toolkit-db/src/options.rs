@@ -86,13 +86,17 @@ impl DbConnectOptions {
 
                 let sqlx_pool = pool_opts.connect_with(opts.clone()).await?;
 
+                let filename = opts.get_filename().display().to_string();
+                let dsn = format!("sqlite://{filename}");
+                let database_scope = crate::advisory_locks::database_scope_from_dsn(&dsn);
+                let locks = crate::advisory_locks::LockManager::file(database_scope);
                 let sea = sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(sqlx_pool);
 
-                let filename = opts.get_filename().display().to_string();
                 let handle = DbHandle {
                     engine: crate::DbEngine::Sqlite,
-                    dsn: format!("sqlite://{filename}"),
+                    dsn,
                     sea,
+                    locks,
                 };
 
                 Ok(handle)
@@ -103,17 +107,22 @@ impl DbConnectOptions {
 
                 let sqlx_pool = pool_opts.connect_with(opts.clone()).await?;
 
+                let host = opts.get_host();
+                let port = opts.get_port();
+                let database = opts.get_database().unwrap_or("");
+                let identity = crate::advisory_locks::server_database_identity(
+                    "postgres", host, port, database,
+                );
+                let database_scope = crate::advisory_locks::database_scope_from_identity(&identity);
+                let locks =
+                    crate::advisory_locks::LockManager::postgres(sqlx_pool.clone(), database_scope);
                 let sea = sea_orm::SqlxPostgresConnector::from_sqlx_postgres_pool(sqlx_pool);
 
                 let handle = DbHandle {
                     engine: crate::DbEngine::Postgres,
-                    dsn: format!(
-                        "postgresql://<redacted>@{}:{}/{}",
-                        opts.get_host(),
-                        opts.get_port(),
-                        opts.get_database().unwrap_or("")
-                    ),
+                    dsn: format!("postgresql://<redacted>@{host}:{port}/{database}"),
                     sea,
+                    locks,
                 };
 
                 Ok(handle)
@@ -124,12 +133,21 @@ impl DbConnectOptions {
 
                 let sqlx_pool = pool_opts.connect_with(opts.clone()).await?;
 
+                let host = opts.get_host();
+                let port = opts.get_port();
+                let database = opts.get_database().unwrap_or("");
+                let identity =
+                    crate::advisory_locks::server_database_identity("mysql", host, port, database);
+                let database_scope = crate::advisory_locks::database_scope_from_identity(&identity);
+                let locks =
+                    crate::advisory_locks::LockManager::mysql(sqlx_pool.clone(), database_scope);
                 let sea = sea_orm::SqlxMySqlConnector::from_sqlx_mysql_pool(sqlx_pool);
 
                 let handle = DbHandle {
                     engine: crate::DbEngine::MySql,
-                    dsn: "mysql://<redacted>@...".to_owned(),
+                    dsn: format!("mysql://<redacted>@{host}:{port}/{database}"),
                     sea,
+                    locks,
                 };
 
                 Ok(handle)
