@@ -181,6 +181,10 @@ impl Gear for FileStorageGear {
         // Extract values needed by both services before moving svc_cfg.
         let sidecar_base_url = svc_cfg.sidecar_base_url.clone();
         let url_ttl_secs = svc_cfg.default_url_ttl_secs;
+        // Multipart sessions get their own, much longer-lived TTL, decoupled
+        // from the short per-part signed-URL TTL above (`multipart-session-ttl`
+        // remediation -- see `MultipartService::session_ttl_secs`'s doc).
+        let session_ttl_secs = i64::try_from(cfg.multipart_session_ttl_secs).unwrap_or(i64::MAX);
 
         // TODO(P2): wire the quota-enforcement client once the Quota Enforcement
         // gear exposes an SDK crate. For now, no quota checks are performed.
@@ -229,7 +233,11 @@ impl Gear for FileStorageGear {
                 url_ttl_secs,
             )
             .with_metrics(Arc::clone(&metrics))
-            .with_usage_reporter(None), // see TODO above `service`
+            .with_usage_reporter(None) // see TODO above `service`
+            .with_session_ttl_secs(session_ttl_secs)
+            .with_complete_lease_secs(
+                i64::try_from(cfg.multipart_complete_lease_secs).unwrap_or(120),
+            ),
         );
         self.multipart_service.set(multipart_svc).map_err(|_| {
             anyhow::anyhow!(

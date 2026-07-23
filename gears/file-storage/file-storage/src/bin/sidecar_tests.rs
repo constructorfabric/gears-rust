@@ -25,7 +25,7 @@ use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, Uploa
 
 use super::{
     DEFAULT_MAX_BODY_BYTES, SidecarState, build_router, finalize_with_control_plane,
-    write_multipart_part_native, write_multipart_part_offset_object,
+    parse_optional, write_multipart_part_native, write_multipart_part_offset_object,
 };
 
 fn test_state() -> SidecarState {
@@ -361,6 +361,7 @@ fn download_token_with_meta(
         request_id: "test-request-id".to_owned(),
         content_type: content_type.to_owned(),
         etag: etag.to_owned(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -479,6 +480,50 @@ async fn download_unsatisfiable_range_returns_416_with_content_range() {
         .to_str()
         .expect("valid header value");
     assert_eq!(content_range, "bytes */11");
+    // api.md: "every download response includes Accept-Ranges" — 416 is not
+    // an exception.
+    let accept_ranges = response
+        .headers()
+        .get(header::ACCEPT_RANGES)
+        .expect("Accept-Ranges header present on 416")
+        .to_str()
+        .expect("valid header value");
+    assert_eq!(accept_ranges, "bytes");
+}
+
+/// RFC 9110 §14.1.1: `bytes=5-2` (last-byte-pos < first-byte-pos) is
+/// syntactically invalid, not merely unsatisfiable — it MUST be ignored by
+/// the recipient, i.e. served as a full-body `200`, never a `416`.
+#[tokio::test]
+async fn download_inverted_range_is_ignored_and_returns_full_body() {
+    let (state, issuer, backend) = test_download_state();
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let path = format!("/{file_id}/{version_id}");
+    backend
+        .put(&path, bytes::Bytes::from_static(b"hello world")) // 11 bytes
+        .await
+        .expect("seed blob");
+    let token = download_token(&issuer, file_id, version_id, &path);
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let response = router
+        .oneshot(
+            Request::get(format!(
+                "/api/file-storage-data/v1/download/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .header(header::RANGE, "bytes=5-2")
+            .body(Body::empty())
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    assert_eq!(&body[..], b"hello world");
 }
 
 /// P2 1.11: a whole-file (`200`) download response must echo the
@@ -829,6 +874,7 @@ fn upload_token(
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -867,6 +913,7 @@ fn multipart_part_token(
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -1076,6 +1123,7 @@ async fn write_multipart_part_native_undersized_returns_400() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err = write_multipart_part_native(&backend, &claims, 1, Body::from(b"short".to_vec()))
@@ -1112,6 +1160,7 @@ async fn write_multipart_part_offset_object_undersized_returns_400() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err =
@@ -1122,6 +1171,87 @@ async fn write_multipart_part_offset_object_undersized_returns_400() {
         err.status(),
         StatusCode::BAD_REQUEST,
         "undersized part is a client size mismatch, not an over-limit body"
+    );
+}
+
+/// P2 remediation (replay-`PUT` overwrite fix, HIGH-severity immutability
+/// bug): a valid signed `PUT` token stays usable until `exp`, but replaying
+/// it after the backend object already exists must never overwrite the
+/// live bytes. The sidecar's backend publish is create-exclusive, so the
+/// second `PUT` (even with completely different bytes, using the SAME
+/// still-valid token) must be rejected with `409 Conflict` — not silently
+/// accepted with `200`, and not a `502`, which would misleadingly suggest a
+/// transient failure rather than "this write never took effect". This test
+/// runs in the sidecar's dev/no-control-plane mode (`control_base_url`
+/// empty), which is the conservative branch: with no control plane to
+/// consult, a rejected publish always reports `409` (see `upload`'s doc
+/// comment for the full decision table covering a real control plane too).
+#[tokio::test]
+async fn upload_replay_after_publish_is_rejected_with_409() {
+    let issuer = Issuer::generate(60).expect("issuer generation");
+    let backend = Arc::new(InMemoryBackend::new("test"));
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&backend) as Arc<dyn StorageBackend>],
+        "test",
+    )
+    .expect("build test backend registry");
+    let state = SidecarState {
+        verifier: Arc::new(issuer.verifier()),
+        backends,
+        control_base_url: String::new(),
+        internal_token: None,
+        http: reqwest::Client::new(),
+        metrics: Arc::new(NoopMetrics),
+    };
+
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let path = format!("/{file_id}/{version_id}");
+    let token = upload_token(&issuer, file_id, version_id, "test", &path);
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+
+    let first = router
+        .clone()
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(b"original-bytes".to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "first PUT to a fresh backend path must publish successfully"
+    );
+
+    // Replay the SAME still-valid token with DIFFERENT bytes.
+    let second = router
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(b"replayed-different-bytes".to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+    assert_eq!(
+        second.status(),
+        StatusCode::CONFLICT,
+        "a replayed PUT against an already-published path must be rejected with 409, \
+         never overwrite it"
+    );
+
+    // The backend must still hold the FIRST attempt's bytes, untouched.
+    let stored = backend.get(&path).await.expect("blob must still exist");
+    assert_eq!(
+        &stored[..],
+        b"original-bytes",
+        "a replayed PUT must never overwrite the already-published content"
     );
 }
 
@@ -1221,4 +1351,48 @@ async fn sidecar_resolves_backend_by_claims_backend_id() {
         .await
         .expect("get from other backend");
     assert_eq!(&got_b[..], b"bytes-for-other");
+}
+
+// ── `parse_optional` env-var parsing (fail-fast on typos) ───────────────────
+
+/// Unset (`raw = None`) must fall back to the default without error.
+#[test]
+fn parse_optional_unset_uses_default() {
+    let value: u64 = parse_optional("FS_SIDECAR_TEST_VAR", None, 10).expect("unset uses default");
+    assert_eq!(value, 10);
+}
+
+/// A well-formed value overrides the default.
+#[test]
+fn parse_optional_valid_value_overrides_default() {
+    let value: u64 = parse_optional("FS_SIDECAR_TEST_VAR", Some("42".to_owned()), 10)
+        .expect("valid value parses");
+    assert_eq!(value, 42);
+}
+
+/// A malformed value (e.g. `"5GB"` for a byte count, or any non-numeric
+/// typo) must fail fast with an error naming the variable, NOT silently fall
+/// back to the default — that used to be exactly how a typo like
+/// `FS_SIDECAR_MAX_BODY_BYTES=5GB` disappeared without a trace.
+#[test]
+fn parse_optional_invalid_value_errors() {
+    let err = parse_optional::<u64>("FS_SIDECAR_MAX_BODY_BYTES", Some("5GB".to_owned()), 10)
+        .expect_err("malformed value must fail fast, not fall back to the default");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("FS_SIDECAR_MAX_BODY_BYTES"),
+        "error should name the offending variable: {msg}"
+    );
+    assert!(
+        msg.contains("5GB"),
+        "error should include the offending value: {msg}"
+    );
+}
+
+/// An empty string is also not a valid `u64` and must error, not silently
+/// become the default.
+#[test]
+fn parse_optional_empty_string_errors() {
+    parse_optional::<u64>("FS_SIDECAR_TEST_VAR", Some(String::new()), 10)
+        .expect_err("empty string is not a valid u64");
 }

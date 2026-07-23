@@ -63,6 +63,14 @@ impl PolicyService {
             .authorize_scope_owner(ctx, actions::READ, scope_owner_id)
             .await?;
         // @cpt-end:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-authz
+        // A `User`-scope read with no `scope_owner_id`, or a `Tenant`-scope
+        // read with one, is a malformed request that would otherwise either
+        // silently resolve to an always-empty row (`None`, rendered as `204
+        // No Content`) instead of the `400` the caller needs to fix their
+        // request, or query an impossible row shape (tenant policy rows never
+        // have an owner). Shared with `validate_policy_body`'s identical
+        // check on the write path (`Self::validate_scope_owner_shape`, below).
+        Self::validate_scope_owner_shape(&policy_scope, scope_owner_id)?;
         // @cpt-begin:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-load
         self.store
             .get_policy(
@@ -235,21 +243,51 @@ impl PolicyService {
         // Fetch-then-reauthorize: a bare `rule_id` carries no ownership
         // information, so the coarse `DELETE, "", None` check alone would let
         // any tenant member delete any other member's retention rule. Resolve
-        // the rule's scope/target first (via `allow_all` — this is a read used
-        // only to make the authorization decision below, mirroring the
-        // `require_file` prefetch pattern already used elsewhere in this gear),
-        // then re-run the same scope-based check `create_retention_rule` uses.
+        // the rule's scope/target first — scoped to the caller's own tenant
+        // (`Self::tenant_scope`, same prefetch pattern `require_file` uses
+        // elsewhere in this gear) rather than `allow_all` — then re-run the
+        // same scope-based check `create_retention_rule` uses. Prefetching
+        // with `allow_all` would let SecureORM resolve *any* tenant's rule
+        // row here, so a foreign tenant's real `rule_id` would reach the
+        // authorization check below and 403 there, while a merely-nonexistent
+        // id 404s right here — a 403-vs-404 cross-tenant rule-ID oracle, the
+        // same class of bug already closed for files. Scoping this fetch to
+        // the caller's tenant means a foreign-tenant rule_id simply does not
+        // resolve (`None`), so it 404s uniformly with a nonexistent one,
+        // before authorization is ever consulted.
         // @cpt-begin:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-load
         let rule = self
             .store
-            .get_retention_rule(&AccessScope::allow_all(), rule_id)
+            .get_retention_rule(&Self::tenant_scope(ctx), rule_id)
             .await?
             .ok_or_else(|| DomainError::retention_rule_not_found(rule_id))?;
         // @cpt-end:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-load
         // @cpt-begin:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-authz
-        let scope = self
+        let scope = match self
             .authorize_retention_scope(ctx, &rule.scope, rule.scope_target_id)
-            .await?;
+            .await
+        {
+            // A `File`-scope rule whose target file has been deleted (there is
+            // no FK/cascade tying `retention_rules.scope_target_id` to
+            // `files.file_id`, see the m20260701_000001_p2_initial migration)
+            // would otherwise be permanently undeletable: every future call
+            // re-resolves the (now-gone) target via `require_file` and 404s
+            // before authorization is even attempted. Fall back to the same
+            // plain tenant-wide `WRITE` gate the `Tenant`-scope arm uses —
+            // there is no file left to check per-file `WRITE` against, so this
+            // is the closest equivalent, not a weaker one: the actual DELETE
+            // below still runs under the caller's own tenant scope, so a
+            // foreign-tenant caller's `delete_retention_rule` still matches
+            // zero rows and 404s (never `Forbidden`), staying consistent with
+            // how the `Tenant`/`User` arms already behave for a foreign-tenant
+            // `rule_id`.
+            Err(DomainError::FileNotFound { .. }) if rule.scope == RetentionScope::File => {
+                self.authorizer
+                    .authorize(ctx, actions::WRITE, "", None)
+                    .await?
+            }
+            other => other?,
+        };
         // @cpt-end:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-authz
         // @cpt-begin:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-remove
         self.store.delete_retention_rule(&scope, rule_id).await
@@ -324,13 +362,47 @@ impl PolicyService {
         // @cpt-end:cpt-cf-file-storage-algo-validate-retention-rule:p2:inst-validate-retention-return
     }
 
-    /// Reject a policy body that would be dangerous or dead on write.
+    /// Reject a `(scope, scope_owner_id)` pair whose shape is impossible or
+    /// dead, shared by both the read path (`get_own_policy`) and the write
+    /// path (`validate_policy_body`).
     ///
     /// - `scope = User` with `scope_owner_id = None`: the effective-policy
     ///   reader (`FileService::get_effective_policy_internal`,
     ///   `create.rs:40-43`) always queries the user-scope row with
     ///   `Some(owner_id)` — a `None`-owner user-scope row can never be read
-    ///   back, so it is a dead row from the moment it is written.
+    ///   back, so on write it is a dead row from the moment it is written,
+    ///   and on read it always resolves to `None`/`204` instead of surfacing
+    ///   the caller's malformed request as `400`.
+    /// - `scope = Tenant` with `scope_owner_id = Some(_)`: tenant policy rows
+    ///   never have an owner (`get_policy`/`upsert_policy` key tenant rows on
+    ///   `(tenant_id, scope)` alone) — this shape can never match a stored
+    ///   row on read, and on write would either be silently ignored or, if
+    ///   ever threaded further, query/write an impossible row.
+    ///
+    /// Shares the `cpt-cf-file-storage-dod-policy-semantic-validation` scope
+    /// with `validate_policy_body` below (which carries the marker) rather
+    /// than duplicating it here.
+    fn validate_scope_owner_shape(
+        scope: &PolicyScope,
+        scope_owner_id: Option<Uuid>,
+    ) -> Result<(), DomainError> {
+        match (scope, scope_owner_id) {
+            (PolicyScope::User, None) => Err(DomainError::validation(
+                "scope_owner_id",
+                "user-scope policy requires a scope_owner_id",
+            )),
+            (PolicyScope::Tenant, Some(_)) => Err(DomainError::validation(
+                "scope_owner_id",
+                "tenant-scope policy must not carry a scope_owner_id",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Reject a policy body that would be dangerous or dead on write.
+    ///
+    /// - the `(scope, scope_owner_id)` shape checks from
+    ///   `validate_scope_owner_shape` above.
     /// - a `*/*` entry in `allowed_mime_types` or `size_limits.per_mime`: the
     ///   wildcard matcher (`PolicyResolver::mime_allowed`) only special-cases
     ///   the *subtype* half of a pattern (`"image/*"`), so `*/*` splits into
@@ -350,12 +422,7 @@ impl PolicyService {
         body: &PolicyBody,
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-file-storage-algo-validate-policy-body:p2:inst-validate-user-owner
-        if matches!(scope, PolicyScope::User) && scope_owner_id.is_none() {
-            return Err(DomainError::validation(
-                "scope_owner_id",
-                "user-scope policy requires a scope_owner_id",
-            ));
-        }
+        Self::validate_scope_owner_shape(scope, scope_owner_id)?;
         // @cpt-end:cpt-cf-file-storage-algo-validate-policy-body:p2:inst-validate-user-owner
         // @cpt-begin:cpt-cf-file-storage-algo-validate-policy-body:p2:inst-validate-star-slash-star-allowed
         if body.allowed_mime_types.iter().any(|m| m == "*/*") {
@@ -454,10 +521,16 @@ impl PolicyService {
     ///   the caller holds `ADMIN_POLICY` (unlike [`Self::authorize_scope_owner`],
     ///   a missing target is treated as a mismatch, not as "no check" — a
     ///   `User`-scope retention rule always has a target user).
-    /// - `File`: resolves the target file via `require_file` (a missing/foreign
-    ///   file surfaces as `DomainError::FileNotFound`, closing verifier finding
-    ///   B4) and requires per-file `WRITE`, the same check `read_ops.rs`/
-    ///   `write.rs` use for ordinary file operations.
+    /// - `File`: resolves the target file via `require_file`, scoped to the
+    ///   caller's own tenant (the same `Self::tenant_scope` prefetch pattern
+    ///   `write.rs`/`create.rs` use for ordinary file operations) — a
+    ///   foreign-tenant or missing file surfaces as `DomainError::FileNotFound`
+    ///   (closing verifier finding B4 *and* a cross-tenant existence oracle: an
+    ///   `allow_all` prefetch would resolve a foreign tenant's file, and only
+    ///   then fail the *authorization* decision, letting a 201-vs-404 response
+    ///   reveal whether a foreign tenant's file UUID exists) — and requires
+    ///   per-file `WRITE`, the same check `read_ops.rs`/`write.rs` use for
+    ///   ordinary file operations.
     async fn authorize_retention_scope(
         &self,
         ctx: &SecurityContext,
@@ -481,12 +554,23 @@ impl PolicyService {
                 })?;
                 let file = self
                     .store
-                    .require_file(&AccessScope::allow_all(), target_id)
+                    .require_file(&Self::tenant_scope(ctx), target_id)
                     .await?;
                 self.authorizer
                     .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(target_id))
                     .await
             }
         }
+    }
+
+    /// The caller's own-tenant `AccessScope`, used as the prefetch scope
+    /// before a per-action `Authorizer::authorize` decision — mirrors
+    /// `FileService::tenant_scope` (`domain/service/mod.rs`) and
+    /// `MultipartService`'s private copy of the same helper; kept as its own
+    /// copy here rather than shared, following the existing precedent (each
+    /// service owns its dependencies independently, see this module's header
+    /// doc comment on why `PolicyService` avoids referencing `FileService`).
+    fn tenant_scope(ctx: &SecurityContext) -> AccessScope {
+        AccessScope::for_tenant(ctx.subject_tenant_id())
     }
 }

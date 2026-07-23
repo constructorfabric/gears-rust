@@ -334,11 +334,79 @@ impl Store {
                         events_repo.enqueue(tx, &ev).await?;
                     }
                     // Persist the idempotency record in the same transaction, so
-                    // a committed create always has a replay record. A PK
-                    // conflict (concurrent duplicate) is tolerated inside the
-                    // repo; any real DB error rolls the whole creation back.
+                    // a committed create always has a replay record. Only a
+                    // *lapsed* row for the same key is deleted first inside the
+                    // repo (an expired row's PK would otherwise collide with a
+                    // legitimate new insert); a live-key PK conflict from a
+                    // concurrent duplicate create is NOT tolerated — every
+                    // failure, including that conflict, is propagated by
+                    // `IdempotencyRepo::insert` and rolls this whole creation
+                    // back, so the racing caller retries and replays the
+                    // winner's record via `get` instead of ending up with two
+                    // files (see `IdempotencyRepo::insert`'s doc comment).
                     if let Some(idem) = idempotency {
                         idempotency_repo.insert(tx, &idem, file_id, now).await?;
+                    }
+                    Ok::<(), DomainError>(())
+                })
+            })
+            .await
+    }
+
+    /// Create the file row (+ initial custom metadata, audit, optional event)
+    /// WITHOUT pre-registering any version (upload-flow redesign). Used by
+    /// the merged `POST /files` create+plan path, where the multipart
+    /// initiate that follows registers its own pending version — the
+    /// pre-registered single-part version of
+    /// [`Self::create_file_with_pending_version_and_event`] would only become
+    /// an orphan here.
+    ///
+    /// @cpt-cf-file-storage-fr-audit-trail
+    /// @cpt-cf-file-storage-fr-file-events
+    pub async fn create_file_with_event(
+        &self,
+        new: &NewFile,
+        file_id: Uuid,
+        tenant_id: Uuid,
+        now: OffsetDateTime,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<(), DomainError> {
+        let file = File {
+            file_id,
+            tenant_id,
+            owner_kind: new.owner_kind,
+            owner_id: new.owner_id,
+            name: new.name.clone(),
+            gts_file_type: new.gts_file_type.clone(),
+            content_id: None,
+            meta_version: 0,
+            created_at: now,
+            last_modified_at: now,
+        };
+        let metadata_entries: Vec<(String, String)> = new
+            .custom_metadata
+            .iter()
+            .map(|e| (e.key.clone(), e.value.clone()))
+            .collect();
+
+        let files = self.repos.files.clone();
+        let metadata = self.repos.metadata.clone();
+        let audit_repo = self.repos.audit.clone();
+        let events_repo = self.repos.events_outbox.clone();
+        self.db
+            .db()
+            .transaction_ref_mapped(move |tx| {
+                Box::pin(async move {
+                    files.create(tx, &AccessScope::allow_all(), &file).await?;
+                    for (key, value) in &metadata_entries {
+                        metadata
+                            .upsert(tx, &AccessScope::allow_all(), file_id, key, value, now)
+                            .await?;
+                    }
+                    audit_repo.insert(tx, &audit).await?;
+                    if let Some(ev) = event {
+                        events_repo.enqueue(tx, &ev).await?;
                     }
                     Ok::<(), DomainError>(())
                 })

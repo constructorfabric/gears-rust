@@ -50,13 +50,29 @@
 //! ## Upload lifecycle
 //!
 //! After a successful single-part `PUT`, the sidecar:
-//! 1. Writes the blob to the backend.
+//! 1. Publishes the blob to the backend, **create-exclusive**
+//!    (`StorageBackend::publish_exclusive`, P2 remediation): a fresh
+//!    `backend_path` (a new version's canonical, never-before-used path)
+//!    always lands; a second `PUT` to a path that already holds a published
+//!    blob never overwrites it — closing a `PUT`-token-replay integrity gap
+//!    (a signed upload token's signature never covers the body bytes and
+//!    remains valid until `exp`, so without this guard a replay within the
+//!    TTL could silently swap out already-served content).
 //! 2. Posts a finalize callback to the control plane:
 //!    `POST {control_url}/api/file-storage/v1/files/{file_id}/versions/{version_id}/finalize`
 //!    carrying the signed upload token + the measured size+hash.
 //! 3. Returns `200 OK` to the client only when the callback succeeds.
-//!    A failed callback returns `502 Bad Gateway` — the client should retry
-//!    the upload (idempotent: the backend PUT is overwrite-safe).
+//!    A failed callback returns `502 Bad Gateway` and the client should
+//!    retry — safe because step 1 is idempotent, not because it is
+//!    overwrite-safe: if the earlier attempt's publish already landed but
+//!    its finalize call never did (version still `pending`), the retry's
+//!    publish is rejected (already-exclusive) but its finalize attempt still
+//!    runs and, once the control plane accepts it, converges the retry to
+//!    `200` without ever re-touching the backend object. If step 1 is
+//!    instead rejected because the version was already finalized (a genuine
+//!    replay, not a retry) the client gets `409 Conflict` and the live blob
+//!    is left untouched — see `upload`'s own doc comment for the exact
+//!    decision table.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -128,6 +144,37 @@ struct TokenQuery {
 /// this constant only bounds axum's blanket request-body floor (2 MiB default).
 const DEFAULT_MAX_BODY_BYTES: usize = 5_368_709_120;
 
+/// Parse an optional environment variable's raw value (already fetched by
+/// the caller, so this half is a pure function and unit-testable without
+/// touching real process env) as `T`, falling back to `default` when unset
+/// (`raw.is_none()`) — but failing fast when a value WAS supplied and
+/// doesn't parse, mirroring `FS_SIDECAR_PUBLIC_KEY`'s "set but invalid ->
+/// hard error at startup" treatment below. Silently swallowing a parse
+/// failure into the default (the previous `.ok().unwrap_or(default)`
+/// pattern) turns a typo like `FS_SIDECAR_MAX_BODY_BYTES=5GB` into a quiet,
+/// hard-to-notice fallback to the default instead of a loud misconfiguration.
+fn parse_optional<T>(name: &str, raw: Option<String>, default: T) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match raw {
+        Some(raw) => raw
+            .parse::<T>()
+            .map_err(|e| anyhow::anyhow!("invalid {name}={raw:?}: {e}")),
+        None => Ok(default),
+    }
+}
+
+/// Fetch `name` from the environment and parse it via [`parse_optional`].
+fn parse_env_or_default<T>(name: &str, default: T) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    parse_optional(name, std::env::var(name).ok(), default)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = std::env::var("FS_SIDECAR_ADDR")
@@ -158,24 +205,16 @@ async fn main() -> anyhow::Result<()> {
     // The real per-request ceiling is still enforced by the signed token's
     // `claims.upload.max_size`/`exact_size` inside the handlers; this value only
     // needs to be large enough that no policy-permitted upload ever hits it.
-    let max_body_bytes: usize = std::env::var("FS_SIDECAR_MAX_BODY_BYTES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MAX_BODY_BYTES);
+    let max_body_bytes: usize =
+        parse_env_or_default("FS_SIDECAR_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES)?;
 
     // `FS_SIDECAR_FINALIZE_TIMEOUT_SECS` / `FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS`
     // bound how long the sidecar will wait on the control-plane finalize/report-part
     // callbacks (P2 1.5) — without these, a hung or unreachable control plane could
     // block the client's upload request indefinitely.
-    let finalize_timeout_secs: u64 = std::env::var("FS_SIDECAR_FINALIZE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+    let finalize_timeout_secs: u64 = parse_env_or_default("FS_SIDECAR_FINALIZE_TIMEOUT_SECS", 10)?;
     let finalize_connect_timeout_secs: u64 =
-        std::env::var("FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
+        parse_env_or_default("FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS", 5)?;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(finalize_timeout_secs))
         .connect_timeout(Duration::from_secs(finalize_connect_timeout_secs))
@@ -397,11 +436,25 @@ fn extract_token(q: &TokenQuery, headers: &HeaderMap) -> Option<String> {
 ///
 /// P2 1.2b (memory-DoS fix): the body is never buffered whole in this
 /// handler — it is converted to a byte stream and handed to
-/// `StorageBackend::put_stream`, which writes + hashes chunks as they arrive
-/// and aborts mid-stream the moment `claims.upload.max_size` is exceeded.
-/// `exact_size`/`expected_hash` can only be checked once the stream is fully
-/// drained (the incremental length/hash are only final at that point), so
-/// those checks now run *after* `put_stream` returns.
+/// `StorageBackend::publish_exclusive`, which writes + hashes chunks as they
+/// arrive and aborts mid-stream the moment `claims.upload.max_size` is
+/// exceeded. `exact_size`/`expected_hash` can only be checked once the
+/// stream is fully drained (the incremental length/hash are only final at
+/// that point), so those checks now run *after* `publish_exclusive` returns.
+///
+/// P2 remediation (replay-`PUT` overwrite fix): `publish_exclusive` reports
+/// `created: false` instead of overwriting when `claims.backend_path` already
+/// holds a blob. This handler's response for that case is:
+/// * finalize succeeds (the earlier publish landed but finalize never ran,
+///   and this attempt's measured bytes match what's already stored) → `200`,
+///   a benign retry has converged;
+/// * anything else (finalize rejects because the version is already
+///   `available` — a genuine replay — a finalize transport failure, or no
+///   control plane configured at all) → `409 Conflict`. The one fact that is
+///   always true in the `!created` branch is that *this* `PUT` did not take
+///   effect, so `409` is reported even when the underlying finalize failure
+///   was transport-level rather than a logical conflict — the alternative
+///   (a `502`) would wrongly suggest the bytes might have been stored.
 async fn upload(
     State(state): State<SidecarState>,
     Path((file_id, version_id)): Path<(Uuid, Uuid)>,
@@ -439,22 +492,24 @@ async fn upload(
         body.into_data_stream()
             .map(|r| r.map_err(std::io::Error::other)),
     );
-    let (bytes_written, digest) = match backend
-        .put_stream(&claims.backend_path, byte_stream, claims.upload.max_size)
+    let outcome = match backend
+        .publish_exclusive(&claims.backend_path, byte_stream, claims.upload.max_size)
         .await
     {
         Ok(v) => v,
-        // `put_stream`'s only `Validation` error is the mid-stream `max_size`
-        // guard (see `StorageBackend::put_stream`'s default/`LocalFsBackend`
-        // implementations) — every other failure is a genuine backend error.
+        // `publish_exclusive`'s only `Validation` error is the mid-stream
+        // `max_size` guard (see `StorageBackend::publish_exclusive`'s
+        // default/`LocalFsBackend` implementations) — every other failure is
+        // a genuine backend error.
         Err(DomainError::Validation { .. }) => {
             return (StatusCode::PAYLOAD_TOO_LARGE, "exceeds max_size").into_response();
         }
         Err(e) => {
-            tracing::error!(error = %e, "backend put_stream failed");
+            tracing::error!(error = %e, "backend publish_exclusive failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response();
         }
     };
+    let (bytes_written, digest, created) = (outcome.bytes_written, outcome.digest, outcome.created);
 
     // Enforce the remaining upload constraints now that the streamed
     // length/hash are final.
@@ -485,7 +540,7 @@ async fn upload(
     // a pre-authorized upload (DESIGN §bind-service). `claims.request_id`
     // (P2 1.8) is echoed back as `x-request-id` so both planes' logs for this
     // upload can be correlated.
-    if let Err(resp) = finalize_with_control_plane(
+    let finalize_result = finalize_with_control_plane(
         &state,
         &token,
         &claims.request_id,
@@ -494,12 +549,93 @@ async fn upload(
         size,
         &hash_hex,
     )
-    .await
-    {
-        return resp;
+    .await;
+
+    if !created {
+        // Immutability guard (P2 remediation — replay-`PUT` overwrite fix):
+        // `publish_exclusive` refused to write because `claims.backend_path`
+        // already held a blob — either an earlier successful PUT for this
+        // same upload (finalize may or may not have run yet), or a
+        // PUT-token replay after the version was already finalized/bound.
+        // The live bytes on the backend were NOT touched either way. The
+        // finalize call above was still attempted with *this* attempt's
+        // measured size/hash: if the earlier publish landed but finalize
+        // never ran, this is a benign retry and finalize's own
+        // read-back-and-compare converges it to success without ever
+        // re-touching the backend object; any other outcome (finalize
+        // already ran, a transport failure, or no control plane configured)
+        // is reported as `409` rather than `502` — see `upload`'s doc
+        // comment for the full decision table.
+        //
+        // Why reporting *this* attempt's digest here cannot poison metadata:
+        // finalize never trusts the size/hash the sidecar reports, in this
+        // `!created` case or any other. `finalize_upload_by_token`
+        // (`domain/service/write.rs`) independently re-reads the actual
+        // stored blob at `version.backend_path` and recomputes both size and
+        // hash from those bytes (`read_back_and_hash_streaming`,
+        // `write.rs:757`), then rejects the request if that recomputed pair
+        // doesn't match what was reported (`write.rs`'s `actual_size !=
+        // size` / `actual_hash != hash_value` checks, immediately after the
+        // read-back). So there are exactly two possible outcomes here, and
+        // both are safe:
+        //   - this retry's bytes are identical to what's already published
+        //     (the common case: same client resending the same body) — the
+        //     reported digest matches the read-back digest, finalize
+        //     succeeds, and metadata reflects the one real object on disk;
+        //   - this retry's bytes differ from what's already published (an
+        //     adversarial or corrupted replay) — the reported digest does
+        //     NOT match the read-back digest of the *actual*, untouched
+        //     object, so finalize's own re-verification rejects it and the
+        //     version is never marked `available` from this call. The
+        //     version simply stays whatever it already was (`pending` or
+        //     `available` from the original successful publish); this
+        //     attempt cannot make it `available` with mismatched metadata.
+        // In neither case does the sidecar's self-reported digest get
+        // persisted unverified — `publish_exclusive` returning
+        // `created: false` only ever changes what gets *asserted* to
+        // finalize, never what finalize actually *trusts*.
+        return match finalize_result {
+            Err(_) => (
+                StatusCode::CONFLICT,
+                "content already published for this version",
+            )
+                .into_response(),
+            Ok(_) if state.control_base_url.is_empty() => (
+                StatusCode::CONFLICT,
+                "content already published for this version",
+            )
+                .into_response(),
+            Ok(echo) => uploaded_response(&echo),
+        };
     }
 
-    (StatusCode::OK, "uploaded").into_response()
+    match finalize_result {
+        Err(resp) => resp,
+        Ok(echo) => uploaded_response(&echo),
+    }
+}
+
+/// Build the sidecar's `200 uploaded` response, echoing the control plane's
+/// auto-bind outcome (upload-flow redesign) as `X-FS-Bound` / `ETag` headers
+/// when the finalize response carried them.
+fn uploaded_response(echo: &FinalizeEcho) -> Response {
+    let mut resp = (StatusCode::OK, "uploaded").into_response();
+    if let Some(bound) = &echo.bound
+        && let Ok(v) = HeaderValue::from_str(bound)
+    {
+        resp.headers_mut().insert("x-fs-bound", v);
+    }
+    if let Some(etag) = &echo.etag
+        && let Ok(v) = HeaderValue::from_str(etag)
+    {
+        resp.headers_mut().insert(header::ETAG, v);
+    }
+    if let Some(cur) = &echo.current_etag
+        && let Ok(v) = HeaderValue::from_str(cur)
+    {
+        resp.headers_mut().insert("x-fs-current-etag", v);
+    }
+    resp
 }
 
 /// Build the finalize request body bytes (JSON `{size, hash_hex}`).
@@ -515,15 +651,39 @@ fn finalize_body(size: i64, hash_hex: &str) -> Result<Vec<u8>, Response> {
     })
 }
 
+/// Auto-bind outcome echoed by the control plane's finalize response
+/// (upload-flow redesign): the `x-fs-bound` / `etag` response headers set by
+/// `handlers::finalize_version` when the upload token carried
+/// `bind_on_finalize`. The sidecar copies them verbatim onto its own `200`
+/// `PUT` response (as `X-FS-Bound` / `ETag`) so the uploading client learns
+/// the bind outcome without any extra request. Both `None` for tokens that
+/// did not request a bind (manual mode / pre-redesign clients).
+#[derive(Debug, Default, Clone)]
+struct FinalizeEcho {
+    bound: Option<String>,
+    etag: Option<String>,
+    current_etag: Option<String>,
+}
+
 /// Interpret the HTTP response from the control-plane finalize call.
 async fn interpret_finalize_response(
     resp: reqwest::Response,
     file_id: Uuid,
     version_id: Uuid,
-) -> Result<(), Response> {
+) -> Result<FinalizeEcho, Response> {
     if resp.status().is_success() {
         tracing::debug!(%file_id, %version_id, "finalize callback succeeded");
-        return Ok(());
+        let hdr = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        return Ok(FinalizeEcho {
+            bound: hdr("x-fs-bound"),
+            etag: hdr("etag"),
+            current_etag: hdr("x-fs-current-etag"),
+        });
     }
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
@@ -617,9 +777,9 @@ async fn finalize_with_control_plane(
     version_id: Uuid,
     size: i64,
     hash_hex: &str,
-) -> Result<(), Response> {
+) -> Result<FinalizeEcho, Response> {
     if state.control_base_url.is_empty() {
-        return Ok(());
+        return Ok(FinalizeEcho::default());
     }
 
     let url = format!(
@@ -1208,10 +1368,14 @@ async fn download_range(
         // Genuine range-unsatisfiable (RFC 9110 §14.4): the client asked for
         // bytes past the end of a blob that does exist.
         let mut resp = (StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable").into_response();
-        resp.headers_mut().insert(
+        let headers_mut = resp.headers_mut();
+        headers_mut.insert(
             header::CONTENT_RANGE,
             header_value(&format!("bytes */{total}")),
         );
+        // api.md: "every download response includes Accept-Ranges" — the 416
+        // path must not be an exception.
+        headers_mut.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         return resp;
     };
     match backend.get_range(path, r).await {

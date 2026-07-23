@@ -20,17 +20,19 @@ use file_storage_sdk::{CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
 use super::dto::{
     BindReq, CreateFileReq, CreateRetentionRuleReq, DownloadTicketDto, EffectivePolicyDto, FileDto,
     FileDtoList, InitiateMultipartReq, MigrateBackendReq, MissingPartDto, MultipartCompleteDto,
-    MultipartPartPlanDto, MultipartPlanDto, MultipartStatusDto, PolicyDto, ReceivedPartDto,
-    RetentionRuleDto, RetentionRuleDtoList, SetPolicyReq, StorageDto, StorageDtoList,
-    TransferOwnershipReq, UpdateMetadataReq, UploadTicketDto, VersionDto, VersionDtoList,
+    MultipartCompletingDto, MultipartPartPlanDto, MultipartPlanDto, MultipartStatusDto, PolicyDto,
+    ReceivedPartDto, RetentionRuleDto, RetentionRuleDtoList, SetPolicyReq, StorageDto,
+    StorageDtoList, TransferOwnershipReq, UpdateMetadataReq, UploadTicketDto, VersionDto,
+    VersionDtoList,
 };
 use crate::domain::error::DomainError;
 use crate::domain::etag;
-use crate::domain::multipart::{MultipartPlan, MultipartUploadStatus};
+use crate::domain::multipart::{MultipartCompleteOutcome, MultipartPlan, MultipartUploadStatus};
 use crate::domain::multipart_service::MultipartService;
 use crate::domain::policy::{PolicyScope, RetentionScope};
 use crate::domain::policy_service::PolicyService;
 use crate::domain::service::FileService;
+use crate::infra::content::hash_mode::HashMode;
 use crate::infra::signed_url::{Op, Verifier};
 
 type Svc = Extension<Arc<FileService>>;
@@ -124,21 +126,45 @@ impl FinalizeAuth {
 
 // ── create + presign ─────────────────────────────────────────────────────────
 
+/// `POST /files` — create a file and presign its first content upload
+/// (upload-flow redesign).
+///
+/// * No `multipart` block (or a plan that collapses to one part): the
+///   response carries a single-part `upload_url` (as before). With
+///   `bind: "auto"` (the default) the token instructs the sidecar's finalize
+///   to bind the first content itself under a `content_id IS NULL` CAS — the
+///   whole upload is 2 requests (`POST /files` + `PUT`); the `PUT` response
+///   echoes the outcome as `X-FS-Bound`/`ETag` headers.
+/// * `multipart` block with a ≥2-part plan: the response carries the full
+///   parts plan (`multipart` field — same shape as
+///   `POST /files/{id}/multipart`), no single-part version is
+///   pre-registered, and `complete` binds (for `bind: "auto"`) — N+2
+///   requests total. Resume stays `GET /files/{id}/multipart/{upload_id}`.
 pub async fn create_file(
     uri: Uri,
     Extension(ctx): Ctx,
     Extension(svc): Svc,
+    Extension(msvc): MultiSvc,
     Json(req): Json<CreateFileReq>,
 ) -> ApiResult<impl IntoResponse> {
     let owner_kind = req
         .parse_owner_kind()
         .ok_or_else(|| DomainError::validation("owner_kind", "must be 'user' or 'app'"))?;
+    let auto_bind = match req.bind.as_deref() {
+        None | Some("auto") => true,
+        Some("manual") => false,
+        Some(_) => {
+            return Err(
+                DomainError::validation("bind", "must be 'auto' or 'manual'").into(),
+            );
+        }
+    };
     let new = NewFile {
         owner_kind,
         owner_id: req.owner_id,
         name: req.name,
         gts_file_type: req.gts_file_type,
-        mime_type: req.mime_type,
+        mime_type: req.mime_type.clone(),
         custom_metadata: req
             .custom_metadata
             .into_iter()
@@ -148,13 +174,68 @@ pub async fn create_file(
             })
             .collect(),
     };
-    let ticket = svc.create_file(&ctx, new, req.idempotency_key).await?;
+
+    if let Some(mp) = &req.multipart {
+        // The idempotency record stores a single-part replay ticket; a
+        // multipart plan does not fit that contract — reject rather than
+        // silently ignoring one of the two.
+        if req.idempotency_key.is_some() {
+            return Err(DomainError::validation(
+                "idempotency_key",
+                "not supported together with the multipart intent block",
+            )
+            .into());
+        }
+        // Same plan computation the initiate path runs — decides up front
+        // whether this is a real (≥2 parts) multipart upload. One-part plans
+        // fall through to the ordinary single-part path below.
+        let (_, planned_parts) = crate::domain::multipart::compute_plan(
+            mp.declared_size,
+            mp.preferred_part_size,
+            None,
+        )?;
+        if planned_parts.len() >= 2 {
+            // Create the file row only (no single-part pending version — the
+            // multipart initiate registers its own; the old flow's abandoned
+            // presign orphan disappears).
+            let file_id = svc.create_file_bare(&ctx, new).await?;
+            let plan = msvc
+                .initiate_multipart_upload(
+                    &ctx,
+                    file_id,
+                    &req.mime_type,
+                    mp.declared_size,
+                    mp.preferred_part_size,
+                    mp.concurrency,
+                    auto_bind,
+                )
+                .await?;
+            let id = file_id.to_string();
+            let version_id = plan.version_id;
+            return Ok(created_json(
+                UploadTicketDto {
+                    file_id,
+                    version_id,
+                    upload_url: None,
+                    multipart: Some(plan_to_dto(plan)),
+                },
+                &uri,
+                &id,
+            )
+            .into_response());
+        }
+    }
+
+    let ticket = svc
+        .create_file(&ctx, new, req.idempotency_key, auto_bind)
+        .await?;
     let id = ticket.file_id.to_string();
     Ok(created_json(
         UploadTicketDto {
             file_id: ticket.file_id,
             version_id: ticket.version_id,
-            upload_url: ticket.upload_url,
+            upload_url: Some(ticket.upload_url),
+            multipart: None,
         },
         &uri,
         &id,
@@ -171,7 +252,8 @@ pub async fn presign_version(
     Ok(Json(UploadTicketDto {
         file_id: ticket.file_id,
         version_id: ticket.version_id,
-        upload_url: ticket.upload_url,
+        upload_url: Some(ticket.upload_url),
+        multipart: None,
     }))
 }
 
@@ -239,9 +321,16 @@ pub async fn list_files(
     let files = svc
         .list_files(&ctx, owner, q.limit, q.offset.unwrap_or(0))
         .await?;
+    // Batched (one `IN (...)` query for the whole page) rather than one
+    // `list_metadata` call per file — see `FileService::list_files_with_metadata`.
+    let file_ids: Vec<Uuid> = files.iter().map(|f| f.file_id).collect();
+    let mut metadata_by_file = svc.list_metadata_for_files(&file_ids).await?;
     let items = files
         .into_iter()
-        .map(|f| FileDto::from_parts(f, vec![]))
+        .map(|f| {
+            let meta = metadata_by_file.remove(&f.file_id).unwrap_or_default();
+            FileDto::from_parts(f, meta)
+        })
         .collect();
     Ok(Json(FileDtoList(items)))
 }
@@ -255,8 +344,23 @@ pub async fn list_versions(
     let versions = svc
         .list_versions(&ctx, file_id, q.limit, q.offset.unwrap_or(0))
         .await?;
+    // Attach the stored ADR-0006 offset-manifest to every
+    // multipart-composite version on the page, fetched in one batched query
+    // (mirrors list_files's list_metadata_for_files N+1 avoidance).
+    let composite_ids: Vec<Uuid> = versions
+        .iter()
+        .filter(|v| v.hash_mode == HashMode::MULTIPART_COMPOSITE_SHA256)
+        .map(|v| v.version_id)
+        .collect();
+    let mut manifests = svc.manifests_for_versions(&composite_ids).await?;
     Ok(Json(VersionDtoList(
-        versions.into_iter().map(VersionDto::from).collect(),
+        versions
+            .into_iter()
+            .map(|v| {
+                let manifest = manifests.remove(&v.version_id);
+                VersionDto::from_parts(v, manifest)
+            })
+            .collect(),
     )))
 }
 
@@ -527,6 +631,11 @@ pub async fn initiate_multipart(
             req.declared_size,
             req.preferred_part_size,
             req.concurrency,
+            // Standalone initiate keeps the staged pre-redesign behaviour:
+            // complete never binds; the client binds manually (this is the
+            // "new version of an existing file" path, where the CAS target
+            // is caller-controlled via bind's If-Match).
+            false,
         )
         .await?;
     Ok(Json(plan_to_dto(plan)))
@@ -545,21 +654,43 @@ pub async fn complete_multipart(
     Extension(svc): MultiSvc,
     Path((file_id, upload_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
-) -> ApiResult<JsonBody<MultipartCompleteDto>> {
+) -> ApiResult<axum::response::Response> {
     let if_match = header_str(&headers, "if-match");
-    let completed = svc
+    let outcome = svc
         .complete_multipart_upload(&ctx, file_id, upload_id, if_match.as_deref())
         .await?;
     // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-return
-    Ok(Json(MultipartCompleteDto {
-        version_id: completed.version_id,
-        size: completed.size,
-        hash_algorithm: completed.hash_algorithm.to_owned(),
-        content_hash: hex::encode(&completed.content_hash),
-        hash_mode: completed.hash_mode.as_str().to_owned(),
-        part_count: completed.part_count,
-        manifest: completed.manifest,
-    }))
+    Ok(match outcome {
+        MultipartCompleteOutcome::Completed(completed) => Json(MultipartCompleteDto {
+            version_id: completed.version_id,
+            size: completed.size,
+            hash_algorithm: completed.hash_algorithm.to_owned(),
+            content_hash: hex::encode(&completed.content_hash),
+            hash_mode: completed.hash_mode.as_str().to_owned(),
+            part_count: completed.part_count,
+            manifest: completed.manifest,
+            bind_state: completed.bind_state.as_str().to_owned(),
+            etag: completed.etag,
+            current_etag: completed.current_etag,
+        })
+        .into_response(),
+        // Another caller holds the completion lease — poll by re-issuing
+        // the same idempotent complete (Retry-After mirrors the body hint).
+        MultipartCompleteOutcome::Completing { retry_after_secs } => {
+            let mut resp = (
+                StatusCode::ACCEPTED,
+                Json(MultipartCompletingDto {
+                    state: "completing".to_owned(),
+                    retry_after_secs,
+                }),
+            )
+                .into_response();
+            if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                resp.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+            resp
+        }
+    })
     // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-return
 }
 
@@ -757,10 +888,39 @@ pub async fn finalize_version(
         .into());
     }
 
-    svc.finalize_upload_by_token(&claims, req.size, hash_value)
+    let outcome = svc
+        .finalize_upload_by_token(&claims, req.size, hash_value)
         .await?;
 
-    Ok(StatusCode::NO_CONTENT.into_response())
+    // Upload-flow redesign: surface the auto-bind outcome to the sidecar,
+    // which forwards it TRANSPARENTLY to the uploading client on its `PUT`
+    // response (fixed contract, the single-part half of the shared
+    // bind-state model): `X-FS-Bound: true` + `ETag: <new>` on a won CAS;
+    // `X-FS-Bound: conflict` + `X-FS-Current-ETag: <current>` on a lost one.
+    // No headers at all when the token requested no bind (manual mode).
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    match outcome.bind_state {
+        Some(crate::domain::multipart::BindState::Bound) => {
+            resp.headers_mut()
+                .insert("x-fs-bound", HeaderValue::from_static("true"));
+            if let Some(etag) = outcome.etag
+                && let Ok(v) = HeaderValue::from_str(&etag)
+            {
+                resp.headers_mut().insert(header::ETAG, v);
+            }
+        }
+        Some(crate::domain::multipart::BindState::Conflict) => {
+            resp.headers_mut()
+                .insert("x-fs-bound", HeaderValue::from_static("conflict"));
+            if let Some(cur) = outcome.current_etag
+                && let Ok(v) = HeaderValue::from_str(&cur)
+            {
+                resp.headers_mut().insert("x-fs-current-etag", v);
+            }
+        }
+        _ => {}
+    }
+    Ok(resp)
 }
 
 /// Request body for the data-plane report-part endpoint.
@@ -836,6 +996,20 @@ pub async fn report_multipart_part(
 
     let hash_value = hex::decode(&req.hash_hex)
         .map_err(|_| DomainError::validation("hash_hex", "must be valid hex-encoded SHA-256"))?;
+    // Bug fix (integrity remediation): `finalize_version` above already
+    // rejects a hash that does not decode to exactly 32 bytes; this route
+    // must mirror that check — otherwise a wrong-length hash is accepted
+    // here with a `204`, gets persisted unchecked by
+    // `MultipartService::report_part`, and only surfaces later as an opaque
+    // `400` at `complete` (against the wrong actor: whoever happens to call
+    // `complete`, not the caller that actually reported the bad hash).
+    if hash_value.len() != 32 {
+        return Err(DomainError::validation(
+            "hash_hex",
+            "must decode to exactly 32 bytes (SHA-256)",
+        )
+        .into());
+    }
 
     msvc.report_part(&claims, req.backend_etag, hash_value, req.size)
         .await?;

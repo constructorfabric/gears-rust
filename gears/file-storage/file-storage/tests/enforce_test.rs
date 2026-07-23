@@ -191,7 +191,7 @@ async fn create_file_with_disallowed_mime_is_rejected() {
 
     // text/plain is not allowed → reject.
     let err = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
+        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
         .await
         .unwrap_err();
     assert!(
@@ -200,7 +200,7 @@ async fn create_file_with_disallowed_mime_is_rejected() {
     );
 
     // image/png matches image/* → allowed.
-    svc.create_file(&ctx, new_file(Uuid::now_v7(), "image/png"), None)
+    svc.create_file(&ctx, new_file(Uuid::now_v7(), "image/png"), None, false)
         .await
         .expect("image/png should be allowed");
 }
@@ -230,7 +230,7 @@ async fn finalize_oversized_upload_is_rejected() {
     .unwrap();
 
     let t = svc
-        .create_file(&ctx, new_file(owner, "text/plain"), None)
+        .create_file(&ctx, new_file(owner, "text/plain"), None, false)
         .await
         .unwrap();
 
@@ -281,7 +281,7 @@ async fn finalize_negative_size_is_rejected_with_400_not_500() {
     let owner = Uuid::now_v7();
 
     let t = svc
-        .create_file(&ctx, new_file(owner, "text/plain"), None)
+        .create_file(&ctx, new_file(owner, "text/plain"), None, false)
         .await
         .unwrap();
 
@@ -320,6 +320,7 @@ async fn finalize_negative_size_is_rejected_with_400_not_500() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     let err = svc
         .finalize_upload_by_token(&claims, -1, vec![0u8; 32])
@@ -386,7 +387,7 @@ async fn finalize_via_router_with_hash_len(hash_byte_len: usize) -> (StatusCode,
 
     let ctx = ctx(Uuid::now_v7());
     let ticket = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
+        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
         .await
         .unwrap();
 
@@ -493,7 +494,7 @@ async fn update_metadata_via_router(if_match_header: Option<&str>) -> (StatusCod
     let owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file(owner, "text/plain"), None)
+        .create_file(&ctx, new_file(owner, "text/plain"), None, false)
         .await
         .unwrap();
 
@@ -601,7 +602,7 @@ async fn create_file_bakes_max_size_into_upload_url() {
     .await
     .unwrap();
     let t = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
+        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
         .await
         .unwrap();
     assert!(t.upload_url.contains("fs-token="));
@@ -639,7 +640,7 @@ async fn create_file_with_too_many_metadata_pairs_is_rejected() {
             value: "2".to_owned(),
         },
     ];
-    let err = svc.create_file(&ctx, nf, None).await.unwrap_err();
+    let err = svc.create_file(&ctx, nf, None, false).await.unwrap_err();
     assert!(
         matches!(err, DomainError::PolicyMetadataExceeded { .. }),
         "got {err:?}"
@@ -671,7 +672,7 @@ async fn update_metadata_over_limit_is_rejected_on_resulting_total() {
         key: "a".to_owned(),
         value: "1".to_owned(),
     }];
-    let t = svc.create_file(&ctx, nf, None).await.unwrap();
+    let t = svc.create_file(&ctx, nf, None, false).await.unwrap();
 
     // Patch adds two more keys → resulting total of 3 pairs > 2 → reject.
     let patch = CustomMetadataPatch {
@@ -723,7 +724,7 @@ async fn quota_exceeded_rejects_create_when_client_present() {
     .unwrap();
 
     let err = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
+        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
         .await
         .unwrap_err();
     assert!(
@@ -756,7 +757,7 @@ async fn quota_gates_version_creation_not_just_first_upload() {
     .unwrap();
 
     let t = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
+        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
         .await
         .expect("first create within quota");
 
@@ -775,7 +776,7 @@ async fn quota_client_error_fails_closed() {
 
     // No policy configured, but the quota client errors → fail closed (deny).
     let err = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
+        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
         .await
         .unwrap_err();
     assert!(
@@ -800,7 +801,7 @@ async fn no_policy_and_no_quota_is_fully_permissive() {
         })
         .collect();
     let t = svc
-        .create_file(&ctx, nf, None)
+        .create_file(&ctx, nf, None, false)
         .await
         .expect("permissive create");
 
