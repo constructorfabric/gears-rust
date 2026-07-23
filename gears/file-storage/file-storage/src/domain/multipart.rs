@@ -14,6 +14,12 @@ use crate::infra::content::hash_mode::HashMode;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultipartUploadState {
     InProgress,
+    /// A `complete` call holds the completion lease and is assembling on the
+    /// backend (upload-flow redesign). Entered/left by single conditional
+    /// UPDATEs — no DB transaction is ever held across the backend I/O. A
+    /// crashed completer leaves the state here until `lease_until` passes,
+    /// after which the next `complete` takes the lease over.
+    Completing,
     Completed,
     Aborted,
 }
@@ -23,6 +29,7 @@ impl MultipartUploadState {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::InProgress => "in_progress",
+            Self::Completing => "completing",
             Self::Completed => "completed",
             Self::Aborted => "aborted",
         }
@@ -32,6 +39,7 @@ impl MultipartUploadState {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "in_progress" => Some(Self::InProgress),
+            "completing" => Some(Self::Completing),
             "completed" => Some(Self::Completed),
             "aborted" => Some(Self::Aborted),
             _ => None,
@@ -57,8 +65,109 @@ pub struct MultipartUploadSession {
     pub declared_size: u64,
     /// Server-chosen plan unit (bytes, uniform except the final part).
     pub part_size: u64,
+    /// Whether `complete` binds the finalized version itself (upload-flow
+    /// redesign; set by the merged `POST /files` create+plan path with
+    /// `bind: "auto"`). `false` = staged behaviour (client binds manually).
+    pub auto_bind: bool,
+    /// Completion-lease expiry while `state == Completing`; a later
+    /// `complete` may take the lease over once this passes.
+    pub lease_until: Option<OffsetDateTime>,
+    /// Persisted JSON of the successful complete response
+    /// ([`StoredCompleteResult`]) once `state == Completed` — the idempotent
+    /// re-complete replays it verbatim.
+    pub complete_result: Option<String>,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
+}
+
+/// Outcome of `complete_multipart_upload` (upload-flow redesign): either the
+/// finished result, or "someone else currently holds the completion lease" —
+/// the caller answers `202` and the client polls by re-issuing the same
+/// (idempotent) `complete`.
+#[allow(unknown_lints, de0309_must_have_domain_model)]
+#[derive(Debug, Clone)]
+pub enum MultipartCompleteOutcome {
+    Completed(CompletedMultipartUpload),
+    Completing { retry_after_secs: u64 },
+}
+
+impl MultipartCompleteOutcome {
+    /// Unwrap the `Completed` variant; panics on `Completing`. Intended for
+    /// tests and single-completer contexts where a 202 is impossible.
+    ///
+    /// # Panics
+    /// Panics when the outcome is [`Self::Completing`].
+    #[must_use]
+    pub fn unwrap_completed(self) -> CompletedMultipartUpload {
+        match self {
+            Self::Completed(c) => c,
+            Self::Completing { .. } => {
+                panic!("complete is still in progress (completion lease held elsewhere)")
+            }
+        }
+    }
+}
+
+/// Serializable snapshot of a successful complete response, persisted on the
+/// session row (`multipart_uploads.complete_result`) in the same transaction
+/// that flips the state to `completed` — the source of truth every
+/// idempotent re-complete replays.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredCompleteResult {
+    pub version_id: Uuid,
+    pub size: i64,
+    /// Hex-encoded content hash.
+    pub content_hash: String,
+    /// `HashMode::as_str` spelling.
+    pub hash_mode: String,
+    pub part_count: i32,
+    pub manifest: Option<String>,
+    /// `BindState::as_str` spelling.
+    pub bind_state: String,
+    pub etag: Option<String>,
+    pub current_etag: Option<String>,
+}
+
+impl StoredCompleteResult {
+    #[must_use]
+    pub fn from_completed(c: &CompletedMultipartUpload) -> Self {
+        Self {
+            version_id: c.version_id,
+            size: c.size,
+            content_hash: hex::encode(&c.content_hash),
+            hash_mode: c.hash_mode.as_str().to_owned(),
+            part_count: c.part_count,
+            manifest: c.manifest.clone(),
+            bind_state: c.bind_state.as_str().to_owned(),
+            etag: c.etag.clone(),
+            current_etag: c.current_etag.clone(),
+        }
+    }
+
+    /// Rebuild the response object; `None` when the stored JSON predates the
+    /// current schema (caller falls back to rebuilding from the version row).
+    #[must_use]
+    pub fn into_completed(self) -> Option<CompletedMultipartUpload> {
+        let hash_mode = HashMode::parse(&self.hash_mode)?;
+        let bind_state = match self.bind_state.as_str() {
+            "bound" => BindState::Bound,
+            "conflict" => BindState::Conflict,
+            "manual" => BindState::Manual,
+            _ => return None,
+        };
+        Some(CompletedMultipartUpload {
+            version_id: self.version_id,
+            size: self.size,
+            hash_algorithm: crate::infra::content::hash::ALGORITHM,
+            content_hash: hex::decode(&self.content_hash).ok()?,
+            hash_mode,
+            part_count: self.part_count,
+            manifest: self.manifest,
+            bind_state,
+            etag: self.etag,
+            current_etag: self.current_etag,
+        })
+    }
 }
 
 /// Result of a successful `complete_multipart_upload` (item 3.3): everything
@@ -79,13 +188,61 @@ pub struct CompletedMultipartUpload {
     /// Always `"SHA-256"` — the only hash algorithm used by either ADR-0006
     /// hash mode.
     pub hash_algorithm: &'static str,
-    /// The ADR-0006 composite root: `sha256(manifest)`.
+    /// The ADR-0006 composite root `sha256(manifest)` — or, for a **one-part
+    /// plan** (ADR-0006 single-part amendment), plain `sha256(object bytes)`
+    /// (identical to the single part's streaming digest).
     pub content_hash: Vec<u8>,
-    /// Always [`HashMode::MultipartCompositeSha256`] for this completion path.
+    /// [`HashMode::MultipartCompositeSha256`] for a plan of two or more
+    /// parts; [`HashMode::WholeSha256`] for the degenerate one-part plan
+    /// (ADR-0006 single-part amendment — no composite wrapping, no manifest).
     pub hash_mode: HashMode,
     pub part_count: i32,
-    /// Wire-format manifest text (`Manifest::to_wire_string`).
-    pub manifest: String,
+    /// Wire-format manifest text (`Manifest::to_wire_string`); `None` for a
+    /// one-part plan, whose version is `whole-sha256` and has no manifest.
+    pub manifest: Option<String>,
+    /// Bind outcome (upload-flow redesign) — see [`BindState`].
+    pub bind_state: BindState,
+    /// The file's content ETag after a successful bind
+    /// (`bind_state == Bound` only).
+    pub etag: Option<String>,
+    /// The file's CURRENT content ETag when the bind CAS was lost
+    /// (`bind_state == Conflict` only) — the value a manual rebind's
+    /// `If-Match` needs, no re-upload required.
+    pub current_etag: Option<String>,
+}
+
+/// Bind outcome state — ONE state model shared by both upload paths
+/// (upload-flow redesign): the multipart `complete` response's `bind_state`
+/// field and the single-part `PUT` response's `X-FS-Bound` header carry the
+/// same three values.
+///
+/// * `Bound` — the upload bound its version as the file's current content
+///   (CAS won); the new content ETag accompanies it.
+/// * `Conflict` — an auto-bind was requested but the CAS lost (content moved
+///   concurrently). The upload itself SUCCEEDED: the version is `available`
+///   and a manual `bind` (with the accompanying current ETag as `If-Match`)
+///   makes it live without re-uploading a byte.
+/// * `Manual` — no bind was requested (`bind: "manual"` / the standalone
+///   initiate path); the client binds explicitly, as before the redesign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindState {
+    Bound,
+    Conflict,
+    Manual,
+}
+
+impl BindState {
+    /// Wire spelling (`bind_state` field / `X-FS-Bound` header value —
+    /// except `Bound`, which the header spells `"true"` for ergonomic
+    /// boolean-ish checks; see api.md).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bound => "bound",
+            Self::Conflict => "conflict",
+            Self::Manual => "manual",
+        }
+    }
 }
 
 /// Result of `GET /files/{id}/multipart/{upload_id}` (item 3.4): the

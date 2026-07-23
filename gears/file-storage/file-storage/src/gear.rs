@@ -234,7 +234,10 @@ impl Gear for FileStorageGear {
             )
             .with_metrics(Arc::clone(&metrics))
             .with_usage_reporter(None) // see TODO above `service`
-            .with_session_ttl_secs(session_ttl_secs),
+            .with_session_ttl_secs(session_ttl_secs)
+            .with_complete_lease_secs(
+                i64::try_from(cfg.multipart_complete_lease_secs).unwrap_or(120),
+            ),
         );
         self.multipart_service.set(multipart_svc).map_err(|_| {
             anyhow::anyhow!(

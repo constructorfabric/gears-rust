@@ -14,7 +14,8 @@ use crate::domain::authz::actions;
 use crate::domain::error::DomainError;
 use crate::domain::etag;
 use crate::domain::policy::PolicyResolver;
-use crate::domain::service::{FileService, VersionRef};
+use crate::domain::ports::AutoBindOnFinalize;
+use crate::domain::service::{FileService, FinalizeByTokenOutcome, VersionRef};
 use crate::infra::backend::StorageBackend;
 use crate::infra::content::hash;
 use crate::infra::content::mime::{
@@ -248,8 +249,12 @@ impl FileService {
                 None,
                 Some(validated_mime),
                 audit,
+                // No auto-bind on the user-facing (JWT-authorized) finalize
+                // path — binding stays an explicit `bind` call here.
+                None,
             )
-            .await?;
+            .await?
+            .updated;
         // @cpt-end:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-pass-through
         if !ok {
             // Distinguish "already finalized" (409, using the `version`
@@ -689,12 +694,17 @@ impl FileService {
     ///
     /// @cpt-cf-file-storage-fr-audit-trail
     #[tracing::instrument(skip_all)]
+    /// Returns the auto-bind outcome (upload-flow redesign): `bound` is
+    /// `true` only when the token carried `bind_on_finalize` and the
+    /// `content_id IS NULL` CAS won (first content of a brand-new file);
+    /// `etag` is the resulting content ETag in that case. The sidecar echoes
+    /// both to the uploading client as `X-FS-Bound`/`ETag` response headers.
     pub async fn finalize_upload_by_token(
         &self,
         claims: &Claims,
         size: i64,
         hash_value: Vec<u8>,
-    ) -> Result<(), DomainError> {
+    ) -> Result<FinalizeByTokenOutcome, DomainError> {
         if size < 0 {
             return Err(DomainError::validation("size", "must be non-negative"));
         }
@@ -718,6 +728,41 @@ impl FileService {
             .get_version(file_id, version_id)
             .await?
             .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+
+        // Idempotent PUT-retry convergence (upload-flow redesign; the
+        // dominant single-part case): the sidecar retries a `PUT` whose
+        // response was lost, `publish_exclusive` refuses the second write
+        // (replay-safe), and this finalize arrives for an ALREADY-available
+        // version. Converge to the same success the original got — never a
+        // 409 on an honest retry — but only when the retry reported the same
+        // bytes (size+hash match what was verified and stored); a mismatched
+        // replay stays rejected.
+        if version.status == file_storage_sdk::VersionStatus::Available
+            && claims.bind_on_finalize
+        {
+            if version.size != size || version.hash_value != hash_value {
+                return Err(DomainError::hash_mismatch(
+                    hex::encode(&hash_value),
+                    hex::encode(&version.hash_value),
+                ));
+            }
+            // Bind already decided by the original finalize's atomic CAS —
+            // report the current state, run no new CAS.
+            return Ok(if file.content_id == Some(version_id) {
+                FinalizeByTokenOutcome {
+                    bind_state: Some(crate::domain::multipart::BindState::Bound),
+                    etag: Some(etag::content_etag(file_id, version_id)),
+                    current_etag: None,
+                }
+            } else {
+                FinalizeByTokenOutcome {
+                    bind_state: Some(crate::domain::multipart::BindState::Conflict),
+                    etag: None,
+                    current_etag: etag::etag_for(&file),
+                }
+            });
+        }
+
         let version_mime = version.mime_type.clone();
         let backend_id = version.backend_id.clone();
         let policy = self
@@ -799,10 +844,39 @@ impl FileService {
             serde_json::json!({ "version_id": version_id, "size": size }),
         );
 
+        // Upload-flow redesign: a `bind_on_finalize` token additionally binds
+        // this version as the file's FIRST content, in the same transaction,
+        // under a strict `content_id IS NULL` CAS. Minted only by the
+        // new-file `create_file` path with `bind: "auto"` — this is a
+        // deliberate, narrow extension of the signed-URL delegated-authz
+        // model (DESIGN §3.6 amendment): the pointer swap happens under the
+        // authority of the token minted at create time, bounded by its `exp`,
+        // and can never replace existing content (a non-NULL pointer loses
+        // the CAS and the version simply stays available + unbound).
+        let auto_bind = claims.bind_on_finalize.then(|| AutoBindOnFinalize {
+            expected_content_id: None,
+            audit: AuditEntry::success(
+                file.tenant_id,
+                "sidecar",
+                Uuid::nil(),
+                Some(file_id),
+                AuditOperation::PatchContent,
+                serde_json::json!({ "version_id": version_id, "auto_bind": true }),
+            ),
+            event: Some(Self::make_file_event(
+                file.tenant_id,
+                file.owner_id,
+                file_id,
+                "file.content_updated",
+                serde_json::json!({ "version_id": version_id, "auto_bind": true }),
+            )),
+        });
+        let bind_attempted = auto_bind.is_some();
+
         // Persist the read-back-derived size and the verified hash, not the
         // caller's size claim. `validated_mime` is persisted in place of the
         // client's original declaration.
-        let ok = self
+        let outcome = self
             .store
             .finalize_version(
                 file_id,
@@ -816,9 +890,10 @@ impl FileService {
                 None,
                 Some(validated_mime),
                 audit,
+                auto_bind,
             )
             .await?;
-        if !ok {
+        if !outcome.updated {
             // Distinguish "already finalized" (409, using the `version`
             // snapshot read earlier in this call) from "row is gone" (404).
             return Err(
@@ -842,7 +917,33 @@ impl FileService {
 
         self.metrics
             .record_operation("finalize_upload_by_token", "ok");
-        Ok(())
+        if !bind_attempted {
+            return Ok(FinalizeByTokenOutcome {
+                bind_state: None,
+                etag: None,
+                current_etag: None,
+            });
+        }
+        Ok(if outcome.bound {
+            FinalizeByTokenOutcome {
+                bind_state: Some(crate::domain::multipart::BindState::Bound),
+                etag: Some(etag::content_etag(file_id, version_id)),
+                current_etag: None,
+            }
+        } else {
+            // Lost the `content_id IS NULL` CAS (e.g. two create-tokens on
+            // the same new file — the first finalize bound). Report the
+            // pointer that won so the client can resolve with a manual bind.
+            let fresh = self
+                .store
+                .require_file(&AccessScope::allow_all(), file_id)
+                .await?;
+            FinalizeByTokenOutcome {
+                bind_state: Some(crate::domain::multipart::BindState::Conflict),
+                etag: None,
+                current_etag: etag::etag_for(&fresh),
+            }
+        })
     }
 
     /// Delete a backend blob, logging (not failing) on error. A failed delete

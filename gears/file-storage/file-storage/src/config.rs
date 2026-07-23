@@ -47,6 +47,14 @@ pub struct FileStorageConfig {
     #[serde(default = "default_multipart_session_ttl_secs")]
     pub multipart_session_ttl_secs: u64,
 
+    /// Completion-lease duration (seconds) for multipart `complete`
+    /// (upload-flow redesign): how long one `complete` may hold the
+    /// `completing` state before another caller can take the lease over
+    /// after a crash. Sized to the backend-assembly time budget; the lease
+    /// is held WITHOUT any open DB transaction. Default: 120.
+    #[serde(default = "default_multipart_complete_lease_secs")]
+    pub multipart_complete_lease_secs: u64,
+
     /// Public base URL of the data-plane sidecar that signed URLs point at.
     #[serde(default = "default_sidecar_base_url")]
     pub sidecar_base_url: String,
@@ -386,6 +394,10 @@ impl fmt::Debug for FileStorageConfig {
                 "multipart_session_ttl_secs",
                 &self.multipart_session_ttl_secs,
             )
+            .field(
+                "multipart_complete_lease_secs",
+                &self.multipart_complete_lease_secs,
+            )
             .field("sidecar_base_url", &self.sidecar_base_url)
             .field("default_page_size", &self.default_page_size)
             .field("max_page_size", &self.max_page_size)
@@ -427,6 +439,7 @@ impl Default for FileStorageConfig {
             default_url_ttl_secs: default_default_url_ttl_secs(),
             max_url_ttl_secs: default_max_url_ttl_secs(),
             multipart_session_ttl_secs: default_multipart_session_ttl_secs(),
+            multipart_complete_lease_secs: default_multipart_complete_lease_secs(),
             sidecar_base_url: default_sidecar_base_url(),
             default_page_size: default_page_size(),
             max_page_size: default_max_page_size(),
@@ -455,6 +468,10 @@ fn default_default_url_ttl_secs() -> u64 {
 fn default_max_url_ttl_secs() -> u64 {
     // 7 days, the recommended maximum from the signed-URL FR.
     7 * 24 * 60 * 60
+}
+
+fn default_multipart_complete_lease_secs() -> u64 {
+    120 // backend-assembly budget; see FileStorageConfig::multipart_complete_lease_secs
 }
 
 fn default_multipart_session_ttl_secs() -> u64 {

@@ -66,6 +66,13 @@ fn to_wire_string_matches_hand_written_expected_string_exactly() {
 }
 
 /// Single-part manifest (the minimum-degenerate case per §3 rule 8).
+///
+/// The **type** still encodes a one-entry manifest (`v1,0:<digest>`) — the
+/// grammar has no special case — but the ADR-0006 single-part amendment
+/// means `complete_multipart_upload` never persists or returns one: a
+/// one-part plan finalizes as `whole-sha256` with no manifest at all (see
+/// `multipart_service.rs`). This test pins the wire encoding as a type-level
+/// property only.
 #[test]
 fn to_wire_string_single_part_minimal_shape() {
     let digest = digest_of(b"only-part");
