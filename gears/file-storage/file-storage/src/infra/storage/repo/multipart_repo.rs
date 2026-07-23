@@ -45,6 +45,7 @@ impl MultipartRepo {
         declared_mime: &str,
         declared_size: u64,
         part_size: u64,
+        auto_bind: bool,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
@@ -62,6 +63,10 @@ impl MultipartRepo {
             mime_validated: Set(false),
             declared_size: Set(declared_size_i64),
             part_size: Set(part_size_i64),
+            auto_bind: Set(auto_bind),
+            lease_until: Set(None),
+            lease_owner: Set(None),
+            complete_result: Set(None),
             created_at: Set(now),
             expires_at: Set(expires_at),
         };
@@ -120,6 +125,132 @@ impl MultipartRepo {
                 sea_orm::Condition::all()
                     .add(UploadColumn::UploadId.eq(upload_id))
                     .add(UploadColumn::State.eq(expected_state)),
+            )
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// Acquire (or take over) the completion lease (upload-flow redesign):
+    /// one conditional UPDATE moving the session to `completing` from either
+    /// `in_progress` (fresh acquire) or an **expired** `completing`
+    /// (takeover after a crashed completer). Never blocks and never holds a
+    /// transaction across I/O; `false` = someone else holds a live lease or
+    /// the session is terminal.
+    pub async fn acquire_complete_lease<C: DBRunner>(
+        &self,
+        conn: &C,
+        upload_id: Uuid,
+        owner: &str,
+        lease_until: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        use sea_orm::sea_query::Expr;
+        let res = UploadEntity::update_many()
+            .col_expr(UploadColumn::State, Expr::value("completing"))
+            .col_expr(UploadColumn::LeaseUntil, Expr::value(lease_until))
+            .col_expr(UploadColumn::LeaseOwner, Expr::value(owner))
+            .filter(
+                sea_orm::Condition::all()
+                    .add(UploadColumn::UploadId.eq(upload_id))
+                    .add(
+                        sea_orm::Condition::any()
+                            .add(UploadColumn::State.eq("in_progress"))
+                            .add(
+                                sea_orm::Condition::all()
+                                    .add(UploadColumn::State.eq("completing"))
+                                    .add(UploadColumn::LeaseUntil.lt(now)),
+                            ),
+                    ),
+            )
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// Release a held completion lease back to `in_progress` (assembly
+    /// failed with a real error — the next `complete` retries immediately
+    /// instead of waiting out `lease_until`). Scoped to `owner` so a
+    /// takeover's lease is never clobbered by the crashed original.
+    pub async fn release_complete_lease<C: DBRunner>(
+        &self,
+        conn: &C,
+        upload_id: Uuid,
+        owner: &str,
+    ) -> Result<bool, DomainError> {
+        use sea_orm::sea_query::Expr;
+        let res = UploadEntity::update_many()
+            .col_expr(UploadColumn::State, Expr::value("in_progress"))
+            .col_expr(UploadColumn::LeaseUntil, Expr::value(Option::<OffsetDateTime>::None))
+            .col_expr(UploadColumn::LeaseOwner, Expr::value(Option::<String>::None))
+            .filter(
+                sea_orm::Condition::all()
+                    .add(UploadColumn::UploadId.eq(upload_id))
+                    .add(UploadColumn::State.eq("completing"))
+                    .add(UploadColumn::LeaseOwner.eq(owner)),
+            )
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// Abort a `completing` session whose lease has EXPIRED (completer died
+    /// mid-assembly): CAS `state = 'completing' AND lease_until < now` →
+    /// `aborted`. A live lease never matches, so an in-flight completer is
+    /// never aborted out from under itself.
+    pub async fn abort_expired_completing<C: DBRunner>(
+        &self,
+        conn: &C,
+        upload_id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        use sea_orm::sea_query::Expr;
+        let res = UploadEntity::update_many()
+            .col_expr(UploadColumn::State, Expr::value("aborted"))
+            .col_expr(UploadColumn::LeaseUntil, Expr::value(Option::<OffsetDateTime>::None))
+            .col_expr(UploadColumn::LeaseOwner, Expr::value(Option::<String>::None))
+            .filter(
+                sea_orm::Condition::all()
+                    .add(UploadColumn::UploadId.eq(upload_id))
+                    .add(UploadColumn::State.eq("completing"))
+                    .add(UploadColumn::LeaseUntil.lt(now)),
+            )
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// Terminal transition `completing → completed`, persisting the response
+    /// snapshot (`complete_result` JSON) and clearing the lease.
+    pub async fn finish_complete<C: DBRunner>(
+        &self,
+        conn: &C,
+        upload_id: Uuid,
+        result_json: &str,
+    ) -> Result<bool, DomainError> {
+        use sea_orm::sea_query::Expr;
+        let res = UploadEntity::update_many()
+            .col_expr(UploadColumn::State, Expr::value("completed"))
+            .col_expr(UploadColumn::MimeValidated, Expr::value(true))
+            .col_expr(UploadColumn::CompleteResult, Expr::value(result_json))
+            .col_expr(UploadColumn::LeaseUntil, Expr::value(Option::<OffsetDateTime>::None))
+            .col_expr(UploadColumn::LeaseOwner, Expr::value(Option::<String>::None))
+            .filter(
+                sea_orm::Condition::all()
+                    .add(UploadColumn::UploadId.eq(upload_id))
+                    .add(UploadColumn::State.eq("completing")),
             )
             .secure()
             .scope_with(&AccessScope::allow_all())
@@ -267,8 +398,21 @@ impl MultipartRepo {
         let rows = UploadEntity::find()
             .filter(
                 sea_orm::Condition::all()
-                    .add(UploadColumn::State.eq("in_progress"))
-                    .add(UploadColumn::ExpiresAt.lt(now)),
+                    .add(UploadColumn::ExpiresAt.lt(now))
+                    .add(
+                        sea_orm::Condition::any()
+                            .add(UploadColumn::State.eq("in_progress"))
+                            // Upload-flow redesign: a `completing` session
+                            // whose completer died AND whose session lifetime
+                            // has passed is also abandoned — but only once
+                            // its lease has expired too, so a live completer
+                            // racing `expires_at` is never reaped mid-flight.
+                            .add(
+                                sea_orm::Condition::all()
+                                    .add(UploadColumn::State.eq("completing"))
+                                    .add(UploadColumn::LeaseUntil.lt(now)),
+                            ),
+                    ),
             )
             .order_by_asc(UploadColumn::ExpiresAt)
             .secure()
@@ -332,6 +476,9 @@ fn session_from_model(m: UploadModel) -> Result<MultipartUploadSession, DomainEr
         mime_validated: m.mime_validated,
         declared_size,
         part_size,
+        auto_bind: m.auto_bind,
+        lease_until: m.lease_until,
+        complete_result: m.complete_result,
         created_at: m.created_at,
         expires_at: m.expires_at,
     })

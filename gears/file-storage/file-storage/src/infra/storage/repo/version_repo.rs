@@ -242,6 +242,31 @@ impl VersionRepo {
         Ok(found.map(|m| m.manifest))
     }
 
+    /// Batched counterpart of [`Self::get_manifest`]: fetch the manifest text
+    /// for many versions in a single `IN (...)` query, keyed by `version_id`.
+    /// Used by `GET /files/{id}/versions` so that rendering a page of `N`
+    /// versions' manifests costs one query instead of `N` (mirrors
+    /// `MetadataRepo::list_for_files`'s N+1 avoidance). A version with no
+    /// manifest row (`whole-sha256`) simply has no entry in the returned map.
+    pub async fn get_manifests<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        version_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>, DomainError> {
+        if version_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = ManifestEntity::find()
+            .filter(ManifestColumn::VersionId.is_in(version_ids.iter().copied()))
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(|m| (m.version_id, m.manifest)).collect())
+    }
+
     /// Clear the `is_current` flag on all versions of a file (used before
     /// promoting a new current version, to honour the unique-current index).
     pub async fn clear_current<C: DBRunner>(

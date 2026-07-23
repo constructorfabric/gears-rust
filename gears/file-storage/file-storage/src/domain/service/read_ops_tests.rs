@@ -106,7 +106,7 @@ async fn list_files_returns_each_files_custom_metadata() {
 
     let mut nf_a = new_file();
     nf_a.owner_id = owner;
-    let file_a = svc.create_file(&ctx, nf_a, None).await.unwrap();
+    let file_a = svc.create_file(&ctx, nf_a, None, false).await.unwrap();
     svc.update_metadata(
         &ctx,
         file_a.file_id,
@@ -120,7 +120,7 @@ async fn list_files_returns_each_files_custom_metadata() {
 
     let mut nf_b = new_file();
     nf_b.owner_id = owner;
-    let file_b = svc.create_file(&ctx, nf_b, None).await.unwrap();
+    let file_b = svc.create_file(&ctx, nf_b, None, false).await.unwrap();
     svc.update_metadata(
         &ctx,
         file_b.file_id,
@@ -140,7 +140,7 @@ async fn list_files_returns_each_files_custom_metadata() {
     let mut nf_c = new_file();
     nf_c.owner_id = owner;
     nf_c.custom_metadata = vec![];
-    let file_c = svc.create_file(&ctx, nf_c, None).await.unwrap();
+    let file_c = svc.create_file(&ctx, nf_c, None, false).await.unwrap();
 
     let owner_filter = OwnerFilter {
         owner_kind: OwnerKind::User,

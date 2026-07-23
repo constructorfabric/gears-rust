@@ -25,6 +25,7 @@ impl Store {
         declared_mime: &str,
         declared_size: u64,
         part_size: u64,
+        auto_bind: bool,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
@@ -40,6 +41,7 @@ impl Store {
                 declared_mime,
                 declared_size,
                 part_size,
+                auto_bind,
                 expires_at,
                 now,
             )
@@ -148,16 +150,21 @@ impl Store {
     pub async fn complete_multipart_upload(
         &self,
         upload_id: Uuid,
+        result_json: &str,
         audit: AuditEntry,
     ) -> Result<bool, DomainError> {
         let multipart = self.repos.multipart.clone();
         let audit_repo = self.repos.audit.clone();
+        let result_json = result_json.to_owned();
         self.db
             .db()
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
+                    // Upload-flow redesign: the terminal transition comes
+                    // from `completing` (the completion lease), persisting
+                    // the response snapshot for idempotent re-completes.
                     let updated = multipart
-                        .update_state(tx, upload_id, "in_progress", "completed", Some(true))
+                        .finish_complete(tx, upload_id, &result_json)
                         .await?;
                     if updated {
                         // @cpt-cf-file-storage-nfr-audit-completeness
@@ -166,6 +173,36 @@ impl Store {
                     Ok::<bool, DomainError>(updated)
                 })
             })
+            .await
+    }
+
+    /// Acquire (or take over an expired) completion lease — see
+    /// `MultipartRepo::acquire_complete_lease`.
+    pub async fn acquire_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+        lease_until: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        let conn = self.db.conn().map_err(db_err)?;
+        self.repos
+            .multipart
+            .acquire_complete_lease(&conn, upload_id, owner, lease_until, now)
+            .await
+    }
+
+    /// Release a held completion lease after a failed assembly — see
+    /// `MultipartRepo::release_complete_lease`.
+    pub async fn release_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+    ) -> Result<bool, DomainError> {
+        let conn = self.db.conn().map_err(db_err)?;
+        self.repos
+            .multipart
+            .release_complete_lease(&conn, upload_id, owner)
             .await
     }
 
@@ -196,9 +233,20 @@ impl Store {
             .db()
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
-                    let updated = multipart
+                    let mut updated = multipart
                         .update_state(tx, upload_id, "in_progress", "aborted", None)
                         .await?;
+                    if !updated {
+                        // Upload-flow redesign: a `completing` session whose
+                        // lease has expired (completer died mid-assembly) is
+                        // also abortable — by the cleanup sweep or an
+                        // explicit client abort. A LIVE lease is never
+                        // aborted out from under its completer (the CAS
+                        // below requires `lease_until < now`).
+                        updated = multipart
+                            .abort_expired_completing(tx, upload_id, OffsetDateTime::now_utc())
+                            .await?;
+                    }
                     if updated {
                         // @cpt-begin:cpt-cf-file-storage-flow-multipart-abort:p1:inst-abort-delete-parts
                         multipart.delete_parts_for_upload(tx, upload_id).await?;
