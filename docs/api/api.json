@@ -681,6 +681,14 @@
       "CreateGroupDto": {
         "description": "REST DTO for creating a new resource group.",
         "properties": {
+          "id": {
+            "description": "Optional caller-supplied ID. If omitted, the server generates a UUID.\n\nFor tenant-typed groups the ID becomes the group's tenant scope\n(`tenant_id == group.id`), so a platform sync can align the RG tenant\nscope with an existing tenant identifier by supplying it here.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "metadata": {
             "description": "Type-specific metadata."
           },
