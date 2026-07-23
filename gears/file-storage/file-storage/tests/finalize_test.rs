@@ -195,7 +195,7 @@ fn backend_path(file_id: Uuid, version_id: Uuid) -> String {
 async fn finalize_without_prior_put_is_rejected() {
     let (svc, _backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
 
     // Nothing was ever `put` to the backend for this version.
     let err = svc
@@ -222,7 +222,7 @@ async fn finalize_without_prior_put_is_rejected() {
 async fn finalize_size_mismatch_is_rejected() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
 
     let path = backend_path(ticket.file_id, ticket.version_id);
     backend
@@ -259,7 +259,7 @@ async fn finalize_size_mismatch_is_rejected() {
 async fn finalize_hash_mismatch_is_rejected() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
 
     let path = backend_path(ticket.file_id, ticket.version_id);
     backend
@@ -290,7 +290,7 @@ async fn finalize_hash_mismatch_is_rejected() {
 async fn finalize_matching_size_and_hash_succeeds() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
 
     let known_bytes = Bytes::from_static(b"hello, world!");
     let path = backend_path(ticket.file_id, ticket.version_id);
@@ -331,7 +331,7 @@ async fn finalize_matching_size_and_hash_succeeds() {
 async fn finalize_by_token_without_prior_put_is_rejected() {
     let (svc, _backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
 
     // Hand-build claims mirroring how `handlers::finalize_version` constructs
     // them after verifying the signed token (op == Put, file/version match).
@@ -347,6 +347,7 @@ async fn finalize_by_token_without_prior_put_is_rejected() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err = svc
@@ -393,7 +394,7 @@ async fn version_repo_finalize_twice_second_call_returns_false() {
     let svc = FileService::new(store, backends, issuer, authorizer, cfg, None, None);
 
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
     let file_id = ticket.file_id;
 
     let conn = db.conn().expect("conn");
@@ -478,7 +479,7 @@ async fn version_repo_finalize_twice_second_call_returns_false() {
 async fn finalize_upload_after_already_available_returns_conflict() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
 
     let known_bytes = Bytes::from_static(b"hello, world!");
     let path = backend_path(ticket.file_id, ticket.version_id);
@@ -540,7 +541,7 @@ async fn finalize_rejects_content_not_matching_declared_mime() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
     let ticket = svc
-        .create_file(&ctx, new_file_with_mime("image/png"), None)
+        .create_file(&ctx, new_file_with_mime("image/png"), None, false)
         .await
         .unwrap();
 
@@ -595,7 +596,7 @@ async fn finalize_persists_validated_mime() {
     // not carry, so a passing assertion on the stored value proves the
     // *validated* type was persisted rather than the raw declared string.
     let ticket = svc
-        .create_file(&ctx, new_file_with_mime("image/png; charset=binary"), None)
+        .create_file(&ctx, new_file_with_mime("image/png; charset=binary"), None, false)
         .await
         .unwrap();
 
@@ -641,7 +642,7 @@ async fn finalize_persists_validated_mime() {
 async fn finalize_streams_readback_without_buffering_whole_blob() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
 
     // 4 MiB of non-trivial (non-all-zero) content — large enough that a
     // regression back to whole-blob buffering would still "work" here, but a
@@ -690,7 +691,7 @@ async fn finalize_with_internal_secret_required_rejects_missing_header() {
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
     let (svc, _msvc, _backend, _store) = build_full_service_with_issuer(Arc::clone(&issuer)).await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
 
     let claims = Claims {
         op: Op::Put,
@@ -704,6 +705,7 @@ async fn finalize_with_internal_secret_required_rejects_missing_header() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -746,7 +748,7 @@ async fn finalize_with_internal_secret_required_accepts_matching_header() {
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
     let (svc, _msvc, backend, store) = build_full_service_with_issuer(Arc::clone(&issuer)).await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
 
     let known_bytes = Bytes::from_static(b"hello, world!");
     let path = backend_path(ticket.file_id, ticket.version_id);
@@ -767,6 +769,7 @@ async fn finalize_with_internal_secret_required_accepts_matching_header() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -819,7 +822,7 @@ async fn report_part_with_internal_secret_required_rejects_missing_header() {
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
     let (svc, msvc, _backend, _store) = build_full_service_with_issuer(Arc::clone(&issuer)).await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
 
     let upload_id = Uuid::now_v7();
     let part_number = 1u32;
@@ -841,6 +844,7 @@ async fn report_part_with_internal_secret_required_rejects_missing_header() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -877,4 +881,151 @@ async fn report_part_with_internal_secret_required_rejects_missing_header() {
         403,
         "missing internal credential must map to 403"
     );
+}
+
+// ── Upload-flow redesign: auto-bind on finalize (single-part, 2 requests) ────
+
+use file_storage::domain::multipart::BindState;
+
+/// (б) A `bind_on_finalize` token (minted by `POST /files` with the default
+/// `bind: "auto"` for a NEW file) makes the finalize itself bind the first
+/// content under a `content_id IS NULL` CAS — the whole upload is
+/// `POST /files` + `PUT`, no separate bind request.
+#[tokio::test]
+async fn finalize_with_bind_claim_binds_first_content() {
+    let (svc, backend, store) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc.create_file(&ctx, new_file(), None, true).await.unwrap();
+
+    let bytes = Bytes::from_static(b"auto-bind me");
+    let path = backend_path(ticket.file_id, ticket.version_id);
+    backend.put(&path, bytes.clone()).await.unwrap();
+
+    let claims = Claims {
+        op: Op::Put,
+        file_id: ticket.file_id,
+        version_id: ticket.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: path,
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: true,
+    };
+    let outcome = svc
+        .finalize_upload_by_token(
+            &claims,
+            i64::try_from(bytes.len()).unwrap(),
+            hash::sha256(&bytes),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.bind_state, Some(BindState::Bound));
+    assert!(outcome.etag.is_some(), "bound finalize must return the new ETag");
+
+    let file = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), ticket.file_id)
+        .await
+        .unwrap()
+        .expect("file");
+    assert_eq!(
+        file.content_id,
+        Some(ticket.version_id),
+        "finalize with the bind claim must have bound the first content"
+    );
+
+    // Idempotent PUT retry (response lost): same claims, same size/hash →
+    // converges to the SAME success (X-FS-Bound: true again), never a 409.
+    let retry = svc
+        .finalize_upload_by_token(
+            &claims,
+            i64::try_from(bytes.len()).unwrap(),
+            hash::sha256(&bytes),
+        )
+        .await
+        .expect("honest PUT retry must converge to success");
+    assert_eq!(retry.bind_state, Some(BindState::Bound));
+    assert_eq!(retry.etag, outcome.etag);
+}
+
+/// Two create-tokens racing for the same new file: the second finalize loses
+/// the `content_id IS NULL` CAS and reports `conflict` + the CURRENT ETag —
+/// the upload itself succeeds (version available, manually bindable).
+#[tokio::test]
+async fn finalize_bind_claim_lost_cas_reports_conflict() {
+    let (svc, backend, store) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc.create_file(&ctx, new_file(), None, true).await.unwrap();
+
+    // Winner: ordinary finalize + bind (simulates the first token's flow).
+    let winner_bytes = Bytes::from_static(b"winner");
+    let path_a = backend_path(ticket.file_id, ticket.version_id);
+    backend.put(&path_a, winner_bytes.clone()).await.unwrap();
+    svc.finalize_upload(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        i64::try_from(winner_bytes.len()).unwrap(),
+        hash::sha256(&winner_bytes),
+    )
+    .await
+    .unwrap();
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    // Loser: a second pending version on the same file, finalized under a
+    // bind claim whose `content_id IS NULL` CAS can no longer win.
+    let ticket2 = svc.presign_version(&ctx, ticket.file_id).await.unwrap();
+    let loser_bytes = Bytes::from_static(b"loser!");
+    let path_b = backend_path(ticket.file_id, ticket2.version_id);
+    backend.put(&path_b, loser_bytes.clone()).await.unwrap();
+    let claims = Claims {
+        op: Op::Put,
+        file_id: ticket.file_id,
+        version_id: ticket2.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: path_b,
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: true,
+    };
+    let outcome = svc
+        .finalize_upload_by_token(
+            &claims,
+            i64::try_from(loser_bytes.len()).unwrap(),
+            hash::sha256(&loser_bytes),
+        )
+        .await
+        .expect("finalize itself succeeds — only the bind CAS is lost");
+    assert_eq!(outcome.bind_state, Some(BindState::Conflict));
+    assert!(
+        outcome.current_etag.is_some(),
+        "conflict must carry the CURRENT ETag for a manual rebind's If-Match"
+    );
+    assert_eq!(outcome.etag, None);
+
+    // The upload was not wasted: the version is available and a manual bind
+    // (with the reported current ETag) makes it live without a re-upload.
+    let version = store
+        .get_version(ticket.file_id, ticket2.version_id)
+        .await
+        .unwrap()
+        .expect("version");
+    assert_eq!(version.status, VersionStatus::Available);
+    svc.bind(
+        &ctx,
+        ticket.file_id,
+        ticket2.version_id,
+        outcome.current_etag.as_deref(),
+    )
+    .await
+    .expect("manual rebind with the conflict-reported ETag");
 }

@@ -67,7 +67,7 @@ Encoding conventions:
 6.  GET    /files/{id}                      file metadata (JSON)                                          — If-None-Match
 7.  DELETE /files/{id}                      delete file + all versions                                    — If-Match
 8.  GET    /files                           list files (owner_kind + owner_id required; paginated; JSON array of metadata incl. custom_metadata)
-9.  GET    /files/{id}/versions             list versions (version_id, size, hash, hash_mode, part_count?, created_at, is_current)
+9.  GET    /files/{id}/versions             list versions (version_id, size, hash, hash_mode, part_count?, manifest?, created_at, is_current)
 10. DELETE /files/{id}/versions/{version_id} delete a single, non-current version                          — 409 if current
 11. GET    /storages                        list storages + capabilities inline
 12. GET    /storages/{storage_id}           one storage + capabilities
@@ -85,9 +85,19 @@ Notes:
 - There is **no** `HEAD /files/{id}` route; no such route exists in `src/api/rest/routes.rs`.
 - `POST /files` request body (`application/json`, `CreateFileReq`): `{ "owner_kind": "user"|"app", "owner_id":
   "<uuid>", "name": "<string>", "gts_file_type": "<gts uri>", "mime_type": "<string>", "custom_metadata":
-  [{"key": "...", "value": "..."}] (optional, default []), "idempotency_key": "<string>" (optional) }`. `idempotency_key`
+  [{"key": "...", "value": "..."}] (optional, default []), "idempotency_key": "<string>" (optional),
+  "multipart": { "declared_size": <u64>, "preferred_part_size": <u64>? , "concurrency": <u32>? } (optional),
+  "bind": "auto"|"manual" (optional, default "auto") }`. `idempotency_key`
   is the field documented under "Idempotent-create semantics" (`operations.md`) — see the `409` cause in "Status code
-  summary" for what happens on a reused key with a different body.
+  summary" for what happens on a reused key with a different body; it is rejected (`400`) together with `multipart`.
+- **Upload-flow redesign.** With the `multipart` block and a server plan of **≥2 parts**, the `201` response carries
+  the full parts plan instead of a single-part URL: `{ file_id, version_id, multipart: { upload_id, version_id,
+  part_hash_algorithm, part_size, parts: [{part_number, offset, size, upload_url}], expires_at } }` — no separate
+  `POST /files/{id}/multipart` call, and no orphan single-part pending version. Resume is unchanged:
+  `GET /files/{id}/multipart/{upload_id}` (the `upload_id` now arrives from `POST /files`). A plan that collapses to
+  one part falls back to the single-part `upload_url` path below. `bind: "auto"` (default) makes the upload itself
+  bind the first content — see the `X-FS-Bound` contract and the `complete` `bind_state` field below — for a total of
+  **2 requests** single-part and **N+2** multipart; `bind: "manual"` keeps the staged flow (explicit `bind`).
 - `POST /files/{id}/versions` takes **no** request body and does **not** read `If-Match` (`handlers::presign_version`
   has no JSON extractor and no header parameter).
 - `GET /files` **requires** both `owner_kind` and `owner_id` query params (`400` if either is missing/invalid). A
@@ -101,16 +111,27 @@ Notes:
   `upload_url` on the sidecar; the sidecar streams them to the backend, measuring size + SHA-256, then calls the
   control plane's `POST .../versions/{version_id}/finalize` callback (see
   [Data-plane callbacks](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated)), which marks the
-  version `available`. The sidecar never binds: the client must always follow up with an explicit
-  `POST /files/{id}/bind` to swap `content_id := version_id` (see "Upload, bind, and the conflict retry" below).
+  version `available`.
+- **Single-part bind outcome headers (upload-flow redesign).** For a file created with `bind: "auto"` (the default),
+  the finalize also binds the first content under a strict `content_id IS NULL` CAS, and the sidecar's `200` `PUT`
+  response forwards the outcome transparently as fixed headers — the single-part half of the ONE bind-state model it
+  shares with `complete`'s `bind_state`: `X-FS-Bound: true` + `ETag: <new content etag>` (bound), or
+  `X-FS-Bound: conflict` + `X-FS-Current-ETag: <current etag>` (CAS lost — e.g. two create-tokens on one new file;
+  the version is `available`, resolve with a manual `bind` using that ETag as `If-Match`, no re-upload). No headers
+  for `bind: "manual"` uploads. An honest `PUT` retry (lost response) is idempotent: `publish_exclusive` is
+  replay-safe and finalize converges an already-`available` version with matching size/hash to the same headers —
+  never a 409. With `bind: "manual"` (or `POST /files/{id}/versions`, which never auto-binds), the client follows up
+  with an explicit `POST /files/{id}/bind` (see "Upload, bind, and the conflict retry" below).
 - `GET /files/{id}/versions` returns a JSON array of version objects. Each carries
-  `{ version_id, mime_type, size, hash_algorithm, hash, hash_mode, part_count?, status, is_current, created_at }`
+  `{ version_id, mime_type, size, hash_algorithm, hash, hash_mode, part_count?, manifest?, status, is_current, created_at }`
   (ADR-0006). `hash` is lowercase-hex; `hash_algorithm` is always `"SHA-256"`. `hash_mode` is `"whole-sha256"` (then
-  `hash` = `sha256(object bytes)` and `part_count` is omitted) or `"multipart-composite-sha256"` (then `hash` =
-  `sha256(manifest)`, the offset-manifest composite root, and `part_count` is the number of parts). The manifest text
-  itself is stored server-side (`version_hash_manifest`) and used by `migrate_backend`/re-verification. **It is not
-  returned by this or any other metadata endpoint** — the only place `manifest` appears on the wire is the multipart
-  `complete` response (see "P2 — Multipart upload" below).
+  `hash` = `sha256(object bytes)` and `part_count`/`manifest` are omitted) or `"multipart-composite-sha256"` (then
+  `hash` = `sha256(manifest)`, the offset-manifest composite root, `part_count` is the number of parts, and
+  `manifest` is the canonical offset-manifest wire text — the same string the multipart `complete` response carries,
+  re-served from the stored `version_hash_manifest` row so a client can re-verify `hash` for an already-existing
+  version, per [content-hash-modes.md](./features/content-hash-modes.md) §"Client-Side Manifest Re-Verification").
+  Note that a multipart upload whose plan had exactly **one part** finalizes as `whole-sha256` (ADR-0006 single-part
+  amendment), so it too carries no `part_count`/`manifest` here.
 - `GET /files/{id}/download-url` returns `{ download_url, etag, version_id }`. By default it pins the current
   `content_id`; `?version_id=<v>` pins a specific version.
 - Restoring a prior version is `POST /files/{id}/bind` with that `version_id` (a pointer swap, no re-upload).
@@ -292,18 +313,42 @@ for a successful part `PUT` is `{ "part_number": <u32>, "etag": "<backend-assign
   "content_hash": "<64-char lowercase hex — sha256(manifest), ADR-0006 composite root>",
   "hash_mode": "multipart-composite-sha256",
   "part_count": 2,
-  "manifest": "v1,0:<64-hex>,8388608:<64-hex>"
+  "manifest": "v1,0:<64-hex>,8388608:<64-hex>",
+  "bind_state": "bound",
+  "etag": "\"<content etag — bind_state == bound only>\""
 }
 ```
+
+**Bind inside complete (upload-flow redesign).** `bind_state` is the multipart half of the shared bind-state model
+(single-part: the `X-FS-Bound` header): `"bound"` — an `auto_bind` session (opened by `POST /files` with
+`bind: "auto"`) was bound here, in the same transaction as the finalize, under the endpoint's `If-Match` CAS
+(first content → `content_id IS NULL`), with the new content `etag`; `"conflict"` — the CAS lost, the response
+carries `current_etag` instead (manual rebind, no re-upload); `"manual"` — a `bind: "manual"` or standalone-initiate
+session, client binds explicitly. `complete` is **idempotent** (a retry — including after a page reload — replays the
+persisted result verbatim, "already bound" included) and is serialized by a completion **lease state machine**
+(`in_progress → completing(lease) → completed(result)`; instant conditional UPDATEs, no DB transaction across backend
+I/O): while another caller holds a live lease the response is `202 Accepted`
+`{ "state": "completing", "retry_after_secs": 2 }` (+`Retry-After`) — poll by re-issuing the same `complete`. A
+completer that crashes mid-assembly leaves `completing` behind; after `lease_until` (config
+`multipart_complete_lease_secs`, default 120s) the next `complete` takes the lease over and finishes (re-using the
+already-assembled object where possible). Sessions stuck in `completing` past `expires_at` (with an expired lease)
+are backstopped by the cleanup engine's abandoned-session sweep. The complete per-state failure matrix and race
+catalog for both upload paths is [concurrency-and-failure-model.md](./concurrency-and-failure-model.md).
+
+**One-part plans degenerate to `whole-sha256`** (ADR-0006 single-part amendment): when the plan had exactly one
+part, `hash_mode` is `"whole-sha256"`, `content_hash` is plain `sha256(object bytes)` (identical to the single
+part's digest), and `manifest` is **omitted** — there is no composite and no stored manifest row; the version then
+also reports `whole-sha256` with no `part_count`/`manifest` in `GET /files/{id}/versions`. `part_count` in this
+response still reports `1` (the plan's factual part count).
 
 Before `complete` assembles anything it diffs the plan's expected part numbers (`ceil(declared_size / part_size)`)
 against the parts actually reported; a non-empty diff is rejected with `409` and the missing part numbers in the
 error detail, **before** ever calling the backend's native multipart completion — giving a caller debugging a
 stalled upload an actionable list instead of an opaque total-assembled-size mismatch. `manifest` lets a client
 independently re-verify the composite hash (see [content-hash-modes.md](./features/content-hash-modes.md)
-§"Client-Side Manifest Re-Verification") without a second round-trip. This is also the **only** endpoint that
-returns `manifest` — it is not part of `GET /files/{id}/versions` or any other metadata response (see the note in
-"P1 — Control plane" above).
+§"Client-Side Manifest Re-Verification") without a second round-trip. The same manifest text is also re-served
+later by `GET /files/{id}/versions` (the `manifest` field on `multipart-composite-sha256` versions — see
+"P1 — Control plane" above), so a client that discarded the `complete` response can still re-verify.
 
 **`P2-5` introspect response** (`application/json`, `200`):
 

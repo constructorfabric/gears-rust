@@ -188,7 +188,7 @@ async fn idempotency_replay_requires_authorization() {
     // Seed a ticket while WRITE is still granted.
     let first = h
         .file_svc
-        .create_file(&ctx_caller, new_file(subject), Some(key.clone()))
+        .create_file(&ctx_caller, new_file(subject), Some(key.clone()), false)
         .await
         .expect("initial create should succeed while authorized");
 
@@ -196,7 +196,7 @@ async fn idempotency_replay_requires_authorization() {
     h.authz.deny_write_for_subject(subject);
     let replay = h
         .file_svc
-        .create_file(&ctx_caller, new_file(subject), Some(key))
+        .create_file(&ctx_caller, new_file(subject), Some(key), false)
         .await;
 
     assert!(
@@ -230,7 +230,7 @@ async fn idempotency_key_scoped_to_subject() {
 
     let ticket_a = h
         .file_svc
-        .create_file(&ctx_a, new_file(owner_id), Some(key.clone()))
+        .create_file(&ctx_a, new_file(owner_id), Some(key.clone()), false)
         .await
         .expect("caller A creates and stores the idempotency ticket");
 
@@ -238,7 +238,7 @@ async fn idempotency_key_scoped_to_subject() {
     // ticket.
     let result_b = h
         .file_svc
-        .create_file(&ctx_b, new_file(owner_id), Some(key.clone()))
+        .create_file(&ctx_b, new_file(owner_id), Some(key.clone()), false)
         .await;
     match &result_b {
         Ok(ticket_b) => assert_ne!(
@@ -252,7 +252,7 @@ async fn idempotency_key_scoped_to_subject() {
     // Caller A's own replay must still work unchanged.
     let replay_a = h
         .file_svc
-        .create_file(&ctx_a, new_file(owner_id), Some(key))
+        .create_file(&ctx_a, new_file(owner_id), Some(key), false)
         .await
         .expect("caller A's own replay must still succeed");
     assert_eq!(
@@ -282,7 +282,7 @@ async fn idempotency_replay_rejected_after_policy_tightened() {
     // "application/octet-stream", see `new_file`).
     let first = h
         .file_svc
-        .create_file(&ctx_caller, new_file(subject), Some(key.clone()))
+        .create_file(&ctx_caller, new_file(subject), Some(key.clone()), false)
         .await
         .expect("initial create should succeed with no policy configured");
 
@@ -304,7 +304,7 @@ async fn idempotency_replay_rejected_after_policy_tightened() {
     // type is no longer permitted by the CURRENT effective policy.
     let replay = h
         .file_svc
-        .create_file(&ctx_caller, new_file(subject), Some(key))
+        .create_file(&ctx_caller, new_file(subject), Some(key), false)
         .await;
     assert!(
         matches!(

@@ -49,10 +49,12 @@ Updated:  2026-07-07 by Constructor Tech
 
 Exactly two content-hash modes exist for file-storage, both SHA-256, distinguished only by upload path
 (non-multipart vs. multipart), never by user or operator choice: (1) non-multipart uploads use the plain
-`sha256(whole object bytes)`; (2) multipart uploads use a **SHA-256 offset-manifest composite** — a canonical
-manifest recording each part's byte offset and `sha256(part_bytes)`, with the stored digest being
-`root = sha256(manifest)` — built entirely from already-computed per-part digests, with no re-read of the assembled
-object at `complete` time (ADR-0006, `status: accepted`).
+`sha256(whole object bytes)`; (2) multipart uploads of **two or more parts** use a **SHA-256 offset-manifest
+composite** — a canonical manifest recording each part's byte offset and `sha256(part_bytes)`, with the stored digest
+being `root = sha256(manifest)` — built entirely from already-computed per-part digests, with no re-read of the
+assembled object at `complete` time (ADR-0006, `status: accepted`). A multipart plan of exactly **one part**
+degenerates to `whole-sha256` (ADR-0006 single-part amendment): the single part's streaming digest is already the
+whole-object digest, so no composite and no manifest are produced.
 
 ### 1.2 Purpose
 
@@ -75,7 +77,7 @@ SHA-256 is the only algorithm for both modes and there is no remaining choice to
 
 | Actor | Role in Feature |
 |-------|-----------------|
-| `cpt-cf-file-storage-actor-platform-user` | Receives `hash_mode`/`part_count` in both the `complete` response and version-metadata (`GET /files/{id}/versions`) responses; the `manifest` text itself is returned **only** by the one-shot `complete` response (not by metadata responses — a real limitation of the current API surface) and must be retained client-side to re-derive and verify the stored `root` from the object bytes plus the manifest later |
+| `cpt-cf-file-storage-actor-platform-user` | Receives `hash_mode`/`part_count` in both the `complete` response and version-metadata (`GET /files/{id}/versions`) responses; the `manifest` text is returned by the `complete` response **and** re-served on composite versions by `GET /files/{id}/versions` (`VersionDto.manifest`), so the stored `root` can be re-derived and verified from the object bytes plus the manifest at any time. One-part plans finalize as `whole-sha256` and carry no manifest at all (ADR-0006 single-part amendment) |
 | `cpt-cf-file-storage-actor-cf-gears` | Peer gear / service consuming the same additive metadata fields; also the actor that triggers `migrate_backend`, whose mode-aware verification this feature makes self-contained |
 
 ### 1.4 References
@@ -120,12 +122,11 @@ The one genuinely new actor-facing journey this feature enables is independent c
 
 **Steps**:
 1. [ ] - `p2` - Client: fetch version metadata (`GET /files/{id}/versions`), obtaining `hash_mode`, the stored hash
-   (wire field `hash` on `VersionDto`; the `root` for a composite version — stored as `hash_value` in the DB), and
-   `part_count`. **`manifest` is not available from this or any other GET endpoint** (`VersionDto` has
-   no `manifest` field — a real limitation of the current API surface): the manifest text is returned only once,
-   alongside the root as `content_hash`, on the original `POST .../complete` response, so a
-   `multipart-composite-sha256` version can be re-verified only if the client retained that response's `manifest`
-   text itself
+   (wire field `hash` on `VersionDto`; the `root` for a composite version — stored as `hash_value` in the DB),
+   `part_count`, and — for a `multipart-composite-sha256` version — the `manifest` wire text itself (`VersionDto`
+   now carries a `manifest` field, re-served from the stored `version_hash_manifest` row; the same text the original
+   `POST .../complete` response returned as `content_hash`'s companion, so retaining that response is no longer the
+   only way to re-verify)
    - `inst-reverify-fetch-metadata`
 2. [ ] - `p2` - **IF** `hash_mode == whole-sha256`: compute `sha256(object bytes)` directly and compare to
    the fetched hash (`VersionDto.hash`) - `inst-reverify-whole`
@@ -597,7 +598,11 @@ never diverge:**
    part by construction (S3 and this gear's own multipart flow both reject
    zero-part completion), so the manifest always has at least one `part`
    entry (`v1,0:<digest>` at minimum). There is no "empty manifest" case to
-   define.
+   define. **Amendment (ADR-0006 single-part amendment):** the one-entry
+   manifest remains valid *as an encoding*, but `complete` no longer
+   produces one — a plan of exactly one part finalizes as `whole-sha256`
+   with `hash_value = sha256(object bytes)` (== the single part's digest)
+   and no manifest row; only plans of ≥2 parts store a manifest.
 
 **Why a plain-text, human-inspectable format instead of a packed binary
 encoding** (e.g. concatenated raw `u64` offsets + 32-byte digest bytes): the

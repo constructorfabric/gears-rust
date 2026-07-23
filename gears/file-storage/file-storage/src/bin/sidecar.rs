@@ -594,22 +594,48 @@ async fn upload(
         // persisted unverified — `publish_exclusive` returning
         // `created: false` only ever changes what gets *asserted* to
         // finalize, never what finalize actually *trusts*.
-        return if state.control_base_url.is_empty() || finalize_result.is_err() {
-            (
+        return match finalize_result {
+            Err(_) => (
                 StatusCode::CONFLICT,
                 "content already published for this version",
             )
-                .into_response()
-        } else {
-            (StatusCode::OK, "uploaded").into_response()
+                .into_response(),
+            Ok(_) if state.control_base_url.is_empty() => (
+                StatusCode::CONFLICT,
+                "content already published for this version",
+            )
+                .into_response(),
+            Ok(echo) => uploaded_response(&echo),
         };
     }
 
-    if let Err(resp) = finalize_result {
-        return resp;
+    match finalize_result {
+        Err(resp) => resp,
+        Ok(echo) => uploaded_response(&echo),
     }
+}
 
-    (StatusCode::OK, "uploaded").into_response()
+/// Build the sidecar's `200 uploaded` response, echoing the control plane's
+/// auto-bind outcome (upload-flow redesign) as `X-FS-Bound` / `ETag` headers
+/// when the finalize response carried them.
+fn uploaded_response(echo: &FinalizeEcho) -> Response {
+    let mut resp = (StatusCode::OK, "uploaded").into_response();
+    if let Some(bound) = &echo.bound
+        && let Ok(v) = HeaderValue::from_str(bound)
+    {
+        resp.headers_mut().insert("x-fs-bound", v);
+    }
+    if let Some(etag) = &echo.etag
+        && let Ok(v) = HeaderValue::from_str(etag)
+    {
+        resp.headers_mut().insert(header::ETAG, v);
+    }
+    if let Some(cur) = &echo.current_etag
+        && let Ok(v) = HeaderValue::from_str(cur)
+    {
+        resp.headers_mut().insert("x-fs-current-etag", v);
+    }
+    resp
 }
 
 /// Build the finalize request body bytes (JSON `{size, hash_hex}`).
@@ -625,15 +651,39 @@ fn finalize_body(size: i64, hash_hex: &str) -> Result<Vec<u8>, Response> {
     })
 }
 
+/// Auto-bind outcome echoed by the control plane's finalize response
+/// (upload-flow redesign): the `x-fs-bound` / `etag` response headers set by
+/// `handlers::finalize_version` when the upload token carried
+/// `bind_on_finalize`. The sidecar copies them verbatim onto its own `200`
+/// `PUT` response (as `X-FS-Bound` / `ETag`) so the uploading client learns
+/// the bind outcome without any extra request. Both `None` for tokens that
+/// did not request a bind (manual mode / pre-redesign clients).
+#[derive(Debug, Default, Clone)]
+struct FinalizeEcho {
+    bound: Option<String>,
+    etag: Option<String>,
+    current_etag: Option<String>,
+}
+
 /// Interpret the HTTP response from the control-plane finalize call.
 async fn interpret_finalize_response(
     resp: reqwest::Response,
     file_id: Uuid,
     version_id: Uuid,
-) -> Result<(), Response> {
+) -> Result<FinalizeEcho, Response> {
     if resp.status().is_success() {
         tracing::debug!(%file_id, %version_id, "finalize callback succeeded");
-        return Ok(());
+        let hdr = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        return Ok(FinalizeEcho {
+            bound: hdr("x-fs-bound"),
+            etag: hdr("etag"),
+            current_etag: hdr("x-fs-current-etag"),
+        });
     }
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
@@ -727,9 +777,9 @@ async fn finalize_with_control_plane(
     version_id: Uuid,
     size: i64,
     hash_hex: &str,
-) -> Result<(), Response> {
+) -> Result<FinalizeEcho, Response> {
     if state.control_base_url.is_empty() {
-        return Ok(());
+        return Ok(FinalizeEcho::default());
     }
 
     let url = format!(

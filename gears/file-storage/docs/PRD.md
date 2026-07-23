@@ -959,7 +959,13 @@ system **MUST**:
 - Support `If-None-Match` on download/metadata reads — return `304 Not Modified` when the ETag matches
 - Support `If-Match` on reads — return `400 failed_precondition` when the ETag does not match
 - Require `If-Match` on every content **bind** (the optimistic CAS that swaps `content_id`) and on `DELETE` —
-  `400 failed_precondition` on mismatch. The retry re-binds the already-uploaded `version_id` without re-upload
+  `400 failed_precondition` on mismatch. The retry re-binds the already-uploaded `version_id` without re-upload.
+  *Amendment (upload-flow redesign):* the bind may also execute **inside** the upload itself (`bind: "auto"`, the
+  default on `POST /files`) — the CAS requirement is unchanged, only the transport differs: multipart `complete`
+  reuses its own `If-Match` (absent → the first-content `content_id IS NULL` case) as the embedded bind's
+  precondition, and the single-part finalize binds strictly under `content_id IS NULL` (first content of a new file
+  only). A lost CAS never fails the upload: it is reported (`bind_state: "conflict"` / `X-FS-Bound: conflict` with
+  the current ETag) and resolved by the same manual re-bind, still with no re-upload
 
 **ETag is content-only.** Metadata-only updates bump `meta_version` and `last_modified_at` but **MUST NOT** change the
 ETag or content hash — both remain tied to the content. Consequently `If-Match` on a metadata-only update protects

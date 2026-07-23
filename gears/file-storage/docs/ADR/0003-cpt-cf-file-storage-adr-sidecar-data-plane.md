@@ -87,7 +87,14 @@ planes:
   full authorization for that one `(file_id, version_id)` operation. The sidecar holds **no** direct
   database connection and is a thin, stateless byte-mover. It never binds a version as the file's
   current content — `bind` (the CAS swap of `content_id`) is a separate, later request the **client**
-  issues directly to the control plane. This trades a little per-op latency (the finalize round-trip)
+  issues directly to the control plane. *Amendment (upload-flow redesign):* this remains true of the
+  sidecar itself, but the **control plane's finalize handler** may now perform the bind as part of the
+  same finalize transaction when the upload token carries the `bind_on_finalize` claim — minted only by
+  `POST /files` with `bind: "auto"` for a brand-new file's first content, executed under a strict
+  `content_id IS NULL` CAS, and reported back through the sidecar as opaque `X-FS-Bound`/`ETag`
+  response headers. A deliberate, narrow extension of the same delegated-authorization model: the
+  sidecar still holds no DB access and makes no bind decision — it forwards headers it never
+  interprets; replacing existing content still requires the JWT-authorized `bind`/`complete` paths. This trades a little per-op latency (the finalize round-trip)
   for a clean security/failure boundary: the data plane never gets DB credentials and cannot mutate
   metadata except through the control plane's own, independently-verifying handlers. The alternative
   **direct-DB** mode — the sidecar as a full FileStorage instance over the shared metadata DB (lower

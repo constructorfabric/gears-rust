@@ -5,6 +5,8 @@
 //! rebind_version_backend, bind_atomic (+ events variant),
 //! transfer_ownership_atomic.
 
+use std::collections::HashMap;
+
 use time::OffsetDateTime;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -13,6 +15,7 @@ use file_storage_sdk::{File, FileVersion, VersionStatus};
 
 use crate::domain::audit::{AuditEntry, FileEvent};
 use crate::domain::error::DomainError;
+use crate::domain::ports::{AutoBindOnFinalize, FinalizeVersionOutcome};
 use crate::infra::content::hash_mode::HashMode;
 use crate::infra::storage::db::db_err;
 use crate::infra::storage::store::{Store, pending_version};
@@ -137,6 +140,13 @@ impl Store {
     ///
     /// An audit row is written in the same transaction.
     ///
+    /// `auto_bind` (upload-flow redesign): when `Some`, the finalized version
+    /// is additionally bound as the file's current content — the same CAS +
+    /// current-flag promotion as [`Self::bind_atomic_with_event`], executed
+    /// **inside this same transaction**. A lost CAS is reported via
+    /// [`FinalizeVersionOutcome::bound`], never an error: the version stays
+    /// `available` and can be rebound manually without a re-upload.
+    ///
     /// @cpt-cf-file-storage-fr-audit-trail
     /// @cpt-cf-file-storage-nfr-audit-completeness
     #[allow(clippy::too_many_arguments)]
@@ -151,9 +161,12 @@ impl Store {
         manifest: Option<String>,
         mime_type: Option<String>,
         audit: AuditEntry,
-    ) -> Result<bool, DomainError> {
+        auto_bind: Option<AutoBindOnFinalize>,
+    ) -> Result<FinalizeVersionOutcome, DomainError> {
+        let files = self.repos.files.clone();
         let versions = self.repos.versions.clone();
         let audit_repo = self.repos.audit.clone();
+        let events_repo = self.repos.events_outbox.clone();
         let hash_mode_str = hash_mode.as_str();
         let now = OffsetDateTime::now_utc();
         // @cpt-begin:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-commit-or-rollback
@@ -175,6 +188,7 @@ impl Store {
                             mime_type,
                         )
                         .await?;
+                    let mut bound = false;
                     if updated {
                         // Persist the manifest row transactionally with the
                         // version update for multipart-composite completions.
@@ -187,8 +201,35 @@ impl Store {
                         // @cpt-begin:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-insert-same-tx
                         audit_repo.insert(tx, &audit).await?;
                         // @cpt-end:cpt-cf-file-storage-flow-audit-trail-record-write:p1:inst-audit-insert-same-tx
+
+                        // Upload-flow redesign: bind in the same transaction
+                        // (mirrors `bind_atomic_with_event`'s steps 1:1).
+                        if let Some(ab) = auto_bind {
+                            let swapped = files
+                                .bind_content_cas(
+                                    tx,
+                                    &scope,
+                                    file_id,
+                                    ab.expected_content_id,
+                                    version_id,
+                                    now,
+                                )
+                                .await?;
+                            if swapped {
+                                versions.clear_current(tx, &scope, file_id).await?;
+                                versions.set_current(tx, &scope, file_id, version_id).await?;
+                                audit_repo.insert(tx, &ab.audit).await?;
+                                if let Some(ev) = ab.event {
+                                    events_repo.enqueue(tx, &ev).await?;
+                                }
+                            }
+                            bound = swapped;
+                        }
                     }
-                    Ok::<bool, DomainError>(updated)
+                    Ok::<FinalizeVersionOutcome, DomainError>(FinalizeVersionOutcome {
+                        updated,
+                        bound,
+                    })
                 })
             })
             .await
@@ -206,6 +247,23 @@ impl Store {
         self.repos
             .versions
             .get_manifest(&conn, &AccessScope::allow_all(), version_id)
+            .await
+    }
+
+    /// Batched counterpart of [`Self::get_version_manifest`]: fetch the
+    /// manifest text for a page of versions in one `IN (...)` query, keyed by
+    /// `version_id`. `GET /files/{id}/versions` uses this instead of calling
+    /// `get_version_manifest` once per version (an N+1 query pattern that
+    /// would scale with the page size). Versions without a manifest row
+    /// (`whole-sha256`) are simply absent from the map.
+    pub async fn get_version_manifests(
+        &self,
+        version_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, DomainError> {
+        let conn = self.db.conn().map_err(db_err)?;
+        self.repos
+            .versions
+            .get_manifests(&conn, &AccessScope::allow_all(), version_ids)
             .await
     }
 

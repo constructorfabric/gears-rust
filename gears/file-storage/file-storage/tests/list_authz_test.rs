@@ -177,7 +177,7 @@ async fn list_files_foreign_owner_without_admin_is_denied() {
     let ctx_b = ctx(tenant, user_b);
 
     h.file_svc
-        .create_file(&ctx_a, new_file(user_a), None)
+        .create_file(&ctx_a, new_file(user_a), None, false)
         .await
         .expect("user A creates own file");
 
@@ -201,7 +201,7 @@ async fn list_files_self_owner_is_allowed() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(user_a), None)
+        .create_file(&ctx_a, new_file(user_a), None, false)
         .await
         .expect("user A creates own file");
 
@@ -225,7 +225,7 @@ async fn list_files_foreign_owner_with_admin_scope_is_allowed() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(user_a), None)
+        .create_file(&ctx_a, new_file(user_a), None, false)
         .await
         .expect("user A creates own file");
     h.authz.set_admin(true);

@@ -226,12 +226,12 @@ fn new_file() -> NewFile {
 #[allow(clippy::type_complexity)]
 async fn drive_multipart(
     svc: &FileService,
-    msvc: &MultipartService,
+    msvc: &Arc<MultipartService>,
     store: &Store,
     backend: &Arc<dyn StorageBackend>,
     ctx: &SecurityContext,
 ) -> (Uuid, Uuid, Uuid, MultipartPlan, Vec<u8>) {
-    let ticket = svc.create_file(ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(ctx, new_file(), None, false).await.unwrap();
     let file_id = ticket.file_id;
 
     let part_size = 5 * 1024 * 1024usize;
@@ -252,6 +252,7 @@ async fn drive_multipart(
             declared_size,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -316,7 +317,7 @@ async fn complete_multipart_issues_no_object_reread() {
     let before = reads.load(Ordering::SeqCst);
     msvc.complete_multipart_upload(&ctx, file_id, upload_id, None)
         .await
-        .unwrap();
+        .unwrap().unwrap_completed();
     let during_complete = reads.load(Ordering::SeqCst) - before;
     assert_eq!(
         during_complete, 0,
@@ -355,7 +356,7 @@ async fn client_reverification_succeeds_and_detects_tampering() {
         drive_multipart(&svc, &msvc, &store, &backend, &ctx).await;
     msvc.complete_multipart_upload(&ctx, file_id, upload_id, None)
         .await
-        .unwrap();
+        .unwrap().unwrap_completed();
 
     let version = store
         .get_version(file_id, version_id)
@@ -427,7 +428,7 @@ async fn migrate_backend_verifies_multipart_composite_without_parts_rows() {
         drive_multipart(&svc, &msvc, &store, &src, &ctx).await;
     msvc.complete_multipart_upload(&ctx, file_id, upload_id, None)
         .await
-        .unwrap();
+        .unwrap().unwrap_completed();
 
     // Delete the multipart-session part rows: migrate_backend's verification
     // must NOT depend on them (ADR-0006 §4 — the manifest is the durable,

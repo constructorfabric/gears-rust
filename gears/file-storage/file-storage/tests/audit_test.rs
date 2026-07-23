@@ -126,7 +126,7 @@ async fn create_file_leaves_one_audit_row() {
     let (svc, _msvc, _dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
 
     let rows = store.list_audit(ticket.file_id).await.unwrap();
     assert_eq!(rows.len(), 1, "expected exactly 1 audit row after create");
@@ -144,7 +144,7 @@ async fn finalize_upload_leaves_audit_row() {
     let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
     // put_content calls finalize_upload internally.
     dp.put_content(
         &ctx,
@@ -178,7 +178,7 @@ async fn bind_leaves_audit_row() {
     let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -215,7 +215,7 @@ async fn update_metadata_leaves_audit_row() {
     let (svc, _msvc, _dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
     let patch = CustomMetadataPatch {
         entries: vec![("k".to_owned(), Some("v".to_owned()))],
     };
@@ -253,7 +253,7 @@ async fn update_metadata_enqueues_metadata_updated_event() {
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
     let patch = CustomMetadataPatch {
         entries: vec![("k".to_owned(), Some("v".to_owned()))],
     };
@@ -342,7 +342,7 @@ async fn delete_file_leaves_audit_row() {
     let (svc, _msvc, _dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
     let file_id = ticket.file_id;
 
     // Use wildcard If-Match (file has no bound content yet).
@@ -373,7 +373,7 @@ async fn delete_version_leaves_audit_row() {
     let ctx = ctx(Uuid::now_v7());
 
     // Create + upload v1 and bind it.
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -437,7 +437,7 @@ async fn delete_version_single_version_file_wrong_id_returns_not_found() {
     let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -479,7 +479,7 @@ async fn delete_version_single_version_file_matching_id_deletes_whole_file() {
     let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -548,7 +548,7 @@ async fn multipart_complete_leaves_audit_rows() {
     let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
 
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
 
     // Declare total size = 5 bytes ("part1").
     let part_data = Bytes::from_static(b"part1");
@@ -562,6 +562,7 @@ async fn multipart_complete_leaves_audit_rows() {
             declared_size,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -599,7 +600,7 @@ async fn multipart_complete_leaves_audit_rows() {
 
     msvc.complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
         .await
-        .unwrap();
+        .unwrap().unwrap_completed();
 
     let rows = store.list_audit(ticket.file_id).await.unwrap();
     let complete_rows: Vec<_> = rows
@@ -652,7 +653,7 @@ async fn failed_metadata_cas_leaves_no_audit_row() {
     let (svc, _msvc, _dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
     // There is 1 audit row: the "create".
     let rows_before = store.list_audit(ticket.file_id).await.unwrap();
     assert_eq!(rows_before.len(), 1);
@@ -691,7 +692,7 @@ async fn failed_bind_cas_leaves_no_audit_row() {
     let ctx = ctx(Uuid::now_v7());
 
     // Bind v1 successfully.
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc.create_file(&ctx, new_file(), None, false).await.unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
