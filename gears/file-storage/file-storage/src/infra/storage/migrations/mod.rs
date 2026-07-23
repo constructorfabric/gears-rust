@@ -9,6 +9,7 @@ mod m20260706_000001_idempotency_subject_id;
 mod m20260706_000002_idempotency_request_hash;
 mod m20260706_000003_policies_unique_scope;
 mod m20260707_000001_content_hash_modes;
+mod m20260722_000001_multipart_auto_bind;
 
 /// File-storage migrator. P1 ships the initial control-plane metadata tables;
 /// P2 adds the policy store, retention rules, multipart uploads + idempotency
@@ -25,6 +26,8 @@ mod m20260707_000001_content_hash_modes;
 /// ADR-0006 adds `hash_mode`/`part_count` to `file_versions` and the new
 /// `version_hash_manifest` table for the multipart offset-manifest composite
 /// content-hash mode.
+/// The upload-flow redesign adds `auto_bind` to `multipart_uploads` so
+/// `complete` knows whether to bind the finalized version itself.
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -38,6 +41,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260706_000002_idempotency_request_hash::Migration),
             Box::new(m20260706_000003_policies_unique_scope::Migration),
             Box::new(m20260707_000001_content_hash_modes::Migration),
+            Box::new(m20260722_000001_multipart_auto_bind::Migration),
         ]
     }
 }

@@ -391,7 +391,7 @@ async fn create_retention_rule_file_scope_target_not_writable_is_denied() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(owner), None)
+        .create_file(&ctx_a, new_file(owner), None, false)
         .await
         .expect("create victim file");
     h.authz.deny_write_for_file(ticket.file_id);
@@ -431,7 +431,7 @@ async fn create_retention_rule_file_scope_target_writable_is_allowed() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(owner), None)
+        .create_file(&ctx_a, new_file(owner), None, false)
         .await
         .expect("create file");
 
@@ -496,7 +496,7 @@ async fn create_retention_rule_file_scope_target_foreign_tenant_is_not_found() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(owner_a), None)
+        .create_file(&ctx_a, new_file(owner_a), None, false)
         .await
         .expect("tenant A creates a file");
 
@@ -582,7 +582,7 @@ async fn delete_retention_rule_file_scope_target_deleted_still_deletable() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(owner), None)
+        .create_file(&ctx_a, new_file(owner), None, false)
         .await
         .expect("create file");
 
@@ -641,7 +641,7 @@ async fn delete_retention_rule_file_scope_deleted_target_foreign_tenant_cannot_d
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(owner_a), None)
+        .create_file(&ctx_a, new_file(owner_a), None, false)
         .await
         .expect("tenant A creates a file");
 

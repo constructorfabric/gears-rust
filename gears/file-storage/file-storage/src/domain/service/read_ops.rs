@@ -190,6 +190,25 @@ impl FileService {
         self.store.list_versions_page(file_id, limit, offset).await
     }
 
+    /// Batched manifest lookup for `list_versions`'s page of results: one
+    /// `IN (...)` query for every version id in `version_ids` instead of one
+    /// `get_version_manifest` call per version. Only
+    /// `multipart-composite-sha256` versions have a manifest row, so
+    /// `whole-sha256` version ids are simply absent from the map.
+    ///
+    /// Takes raw version ids with **no `SecurityContext`/authorization check
+    /// of its own** — it trusts the caller to have already authorized every
+    /// id in `version_ids` (e.g. via a preceding `list_versions` call, which
+    /// tenant-scopes and `read`-authorizes the file before returning its
+    /// versions). It is `pub(crate)`, not `pub`, for exactly the same
+    /// foot-gun-avoidance reason as [`Self::list_metadata_for_files`] above.
+    pub(crate) async fn manifests_for_versions(
+        &self,
+        version_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>, DomainError> {
+        self.store.get_version_manifests(version_ids).await
+    }
+
     /// Restore a prior version as current (a rebind: pointer swap, no re-upload).
     pub async fn restore_version(
         &self,

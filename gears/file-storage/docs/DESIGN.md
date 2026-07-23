@@ -956,6 +956,24 @@ and is called by the **sidecar**, authorized solely by the same signed upload to
 app-token, no on-behalf-of delegation. `bind` swaps the file's `content_id` pointer under `If-Match` and is called
 **only** by the client, as a separate request after a successful upload; the sidecar never binds.
 
+**Amendment (upload-flow redesign): auto-bind on finalize for a NEW file's first content.** `POST /files` defaults to
+`bind: "auto"`, which bakes a `bind_on_finalize` claim into the upload token: the finalize callback then also swaps
+`content_id` — in the same transaction as the `pending → available` flip, under a strict `content_id IS NULL` CAS —
+making the dominant single-file upload exactly **2 requests** (`POST /files` + `PUT`). The `PUT` response reports the
+outcome via fixed headers the sidecar forwards transparently from the finalize response: `X-FS-Bound: true` +
+`ETag: <new>` on a won CAS, `X-FS-Bound: conflict` + `X-FS-Current-ETag: <current>` on a lost one (e.g. two
+create-tokens minted for one new file — the client resolves with a manual `bind`, no re-upload). This is a
+**deliberate, narrow extension of the signed-URL delegated-authorization model (§4.5, ADR-0003/ADR-0004)**: the
+pointer swap executes under the authority of a token whose authz decision was made at presign, bounded by the token's
+`exp` — accepted because it is restricted to the first-content case of a file the same principal created moments
+earlier, and the `IS NULL` CAS makes replacing *existing* content through this path impossible. Replacing content on
+an existing file still requires the JWT-authorized paths: multipart `complete` (whose embedded bind runs under the
+endpoint's own `If-Match`) or the explicit `bind`. `bind: "manual"` restores the staged 3-request flow above, and the
+`bind` endpoint itself remains (restore/rebind-after-conflict). The finalize retry contract is idempotent: a replayed
+`PUT`+finalize for an already-`available` version with the same size/hash converges to the same headers, never a 409.
+The full per-state failure/race analysis of both upload paths (who recovers, what garbage is left, who reaps it)
+lives in [concurrency-and-failure-model.md](./concurrency-and-failure-model.md).
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -1459,6 +1477,12 @@ offset-manifest, and the version's `hash_value` is `root = sha256(manifest)` wit
 (transactionally with the version row). The **only** read against the assembled object at complete-time is a bounded
 ~8 KiB ranged `GetObject`/`get_range` for MIME magic-byte sniffing (`MIME_SNIFF_PREFIX_BYTES`) — not a full re-read.
 
+**One-part plans degenerate to `whole-sha256`** (ADR-0006 single-part amendment): when the plan has exactly one part,
+that part's streaming digest is already `sha256(whole object bytes)`, so `complete_multipart` stores it directly with
+`hash_mode = 'whole-sha256'`, `part_count = NULL`, and **no manifest row** — still no re-read, and the same content
+now hashes identically whether it arrived as a single-shot PUT or a one-part multipart session. Only plans of two or
+more parts produce the composite mode.
+
 **Per-part hash trust (multipart only).** Unlike single-part finalize's read-back-and-rehash, a part's `sha256` is
 never independently re-verified by the control plane — the sidecar computes it and reports it over the
 token-authenticated `report-part` callback, and the control plane simply persists it (only the part's claimed *size*
@@ -1953,7 +1977,10 @@ resumes** without re-uploading what already landed. Same hosts as §4.6. The stu
    The control plane reads `multipart_upload_parts`, reports parts **1, 3, 4 as already uploaded**, and mints **fresh
    signed URLs only for the missing parts 2 and 5** (new `exp`) — the missing set can be any subset, not just a
    trailing range. Parts 1, 3, 4 are **not** re-uploaded — that is the resumability guarantee
-   (`cpt-cf-file-storage-fr-multipart-upload`).
+   (`cpt-cf-file-storage-fr-multipart-upload`). The same introspect call also covers the humbler **page-reload (F5)
+   case**: a browser client that persisted `{file_id, upload_id}` locally (e.g. localStorage) reloads, re-selects the
+   same file, introspects, and continues with only the missing parts — and since `complete` is idempotent (see
+   Phase D), a reload racing an in-flight `complete` simply re-issues it and receives the recorded result.
 7. The browser uploads only parts 2 and 5 with the fresh URLs (same durable-state path as Phase B).
 
 #### Phase D — Complete
@@ -1968,12 +1995,25 @@ resumes** without re-uploading what already landed. Same hosts as §4.6. The stu
    from the **reported total part size** and the **composite manifest root** (`root = sha256(manifest)`, folded from
    the persisted per-part `(offset, part_hash)` pairs — no re-read or re-hash of the assembled object; the only
    complete-time read is the bounded ~8 KiB MIME-sniff, §4.2). This flips `pending → available` like single-shot
-   finalize, but it does **not** bind: `content_id` is untouched. The endpoint accepts an **optional** `If-Match`
-   and returns `200` with a JSON body `{version_id, size, hash_algorithm, content_hash, hash_mode, part_count,
-   manifest}` (see [features/multipart-coordinator.md](./features/multipart-coordinator.md)). The client
-   still issues a **separate** `POST /files/9c2a4f10/bind {version_id: "5e0db7a2"}` afterwards, under the same
-   `If-Match` CAS as single-shot completion, to make the assembled content live. The `multipart_uploads` row flips to
-   `completed` once `complete` succeeds, independently of whether the client has bound it yet.
+   finalize. The endpoint accepts an **optional** `If-Match` and returns `200` with a JSON body `{version_id, size,
+   hash_algorithm, content_hash, hash_mode, part_count, manifest, bind_state, etag?, current_etag?}` (see
+   [features/multipart-coordinator.md](./features/multipart-coordinator.md)).
+
+   **Updated by the upload-flow redesign — bind now happens inside `complete` by default.** A session opened by the
+   merged `POST /files` create+plan call with `bind: "auto"` (the default) is bound by `complete` itself, in the same
+   transaction as the finalize, under the same CAS a manual bind uses (the endpoint's `If-Match`; for a new file's
+   first content, `content_id IS NULL`) — `bind_state: "bound"` + the new `etag` in the response, and **no separate
+   `bind` request**. A lost CAS is `bind_state: "conflict"` + `current_etag` (manual rebind, no re-upload);
+   `bind: "manual"` and sessions opened via the standalone `POST /files/{id}/multipart` (this §4.7 example's own
+   path, which presumes an existing file) keep the pre-redesign staged behaviour — `bind_state: "manual"` and the
+   separate `POST /files/9c2a4f10/bind {version_id: "5e0db7a2"}` afterwards. `complete` is also **idempotent** (a
+   retry replays the persisted result — including after an F5/page reload, see the refresh note in Phase C) and can
+   answer `202 {state: "completing", retry_after_secs}` while another caller holds the completion lease: completion
+   runs as a lease-guarded state machine (`in_progress → completing → completed`, single conditional UPDATEs, no DB
+   transaction held across the backend assembly; a crashed completer's lease expires and the next `complete` takes
+   over). The `multipart_uploads` row flips to `completed` once `complete` succeeds. The exhaustive
+   state/race/failure model of this machine — per-transition DB ops, backend I/O, timeout inventory, and the full
+   failure matrix — is [concurrency-and-failure-model.md](./concurrency-and-failure-model.md).
 
 #### The other branch — session already reaped
 

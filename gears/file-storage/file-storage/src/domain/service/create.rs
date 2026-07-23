@@ -97,6 +97,15 @@ impl FileService {
     /// `POST /files`: create a file and presign the first content upload.
     /// An optional `idempotency_key` deduplicates retried requests.
     ///
+    /// `auto_bind` (upload-flow redesign): when `true` the minted upload
+    /// token carries `bind_on_finalize`, so the sidecar's finalize callback
+    /// binds this first content itself under a `content_id IS NULL` CAS —
+    /// no separate client `bind` request. Safe to scope to this path only:
+    /// the file is brand-new, so the CAS can never replace existing content.
+    /// The flag is not part of the idempotency `request_hash` — a replay
+    /// re-mints the URL with the *current* request's flag, exactly like the
+    /// policy-derived `max_size` is re-derived on replay.
+    ///
     /// @cpt-cf-file-storage-fr-upload-idempotency
     /// @cpt-cf-file-storage-fr-audit-trail
     #[tracing::instrument(skip_all)]
@@ -105,6 +114,7 @@ impl FileService {
         ctx: &SecurityContext,
         new: NewFile,
         idempotency_key: Option<String>,
+        auto_bind: bool,
     ) -> Result<UploadTicket, DomainError> {
         let tenant_id = ctx.subject_tenant_id();
         let owner_id = new.owner_id;
@@ -229,7 +239,7 @@ impl FileService {
                 // still be bypassed by replaying the idempotency key.
                 self.check_quota(tenant_id, owner_id, effective_max, "create_file")
                     .await?;
-                let upload_url = self.sign_url(
+                let upload_url = self.sign_url_with_bind(
                     Op::Put,
                     &VersionRef {
                         file_id: stored.file_id,
@@ -242,6 +252,7 @@ impl FileService {
                         ..UploadConstraints::default()
                     },
                     None,
+                    auto_bind,
                 )?;
                 let ticket = UploadTicket {
                     file_id: stored.file_id,
@@ -307,7 +318,7 @@ impl FileService {
         // Sign the upload URL up front — `sign_url` has no DB dependency, so the
         // ticket (and the idempotency replay body derived from it) can be built
         // before the create transaction and persisted atomically within it.
-        let upload_url = self.sign_url(
+        let upload_url = self.sign_url_with_bind(
             Op::Put,
             &VersionRef {
                 file_id,
@@ -320,6 +331,7 @@ impl FileService {
                 ..UploadConstraints::default()
             },
             None,
+            auto_bind,
         )?;
         let ticket = UploadTicket {
             file_id,
@@ -382,6 +394,84 @@ impl FileService {
 
         self.metrics.record_operation("create_file", "ok");
         Ok(ticket)
+    }
+
+    /// Create the file row only — no pending version, no presigned URL
+    /// (upload-flow redesign). Used by the merged `POST /files` create+plan
+    /// path: the multipart initiate that follows registers its own pending
+    /// version, so pre-registering a single-part one here would only mint the
+    /// orphan the redesign exists to remove. Runs the same authz + policy +
+    /// quota gates as [`Self::create_file`]. Returns the new `file_id`.
+    ///
+    /// @cpt-cf-file-storage-fr-audit-trail
+    #[tracing::instrument(skip_all)]
+    pub async fn create_file_bare(
+        &self,
+        ctx: &SecurityContext,
+        new: NewFile,
+    ) -> Result<Uuid, DomainError> {
+        let tenant_id = ctx.subject_tenant_id();
+        let owner_id = new.owner_id;
+
+        Self::validate_gts_type(&new.gts_file_type)?;
+        let _scope = self
+            .authorizer
+            .authorize(ctx, actions::WRITE, &new.gts_file_type, None)
+            .await?;
+
+        // Same policy + quota gates as `create_file`.
+        let policy = self
+            .get_effective_policy_internal(tenant_id, owner_id)
+            .await?;
+        PolicyResolver::check_allowed_mime(&policy, &new.mime_type)?;
+        let backend = self.backends.default_backend();
+        let effective_max = PolicyResolver::compute_effective_max_bytes(
+            &policy,
+            &new.mime_type,
+            backend.capabilities().max_size_bytes,
+        );
+        let initial_meta: Vec<(String, String)> = new
+            .custom_metadata
+            .iter()
+            .map(|e| (e.key.clone(), e.value.clone()))
+            .collect();
+        PolicyResolver::check_metadata_limits(&policy, &initial_meta)?;
+        self.check_quota(tenant_id, owner_id, effective_max, "create_file")
+            .await?;
+
+        let now = OffsetDateTime::now_utc();
+        let file_id = Uuid::now_v7();
+
+        // @cpt-cf-file-storage-fr-audit-trail
+        let audit = Self::audit_ok(
+            ctx,
+            Some(file_id),
+            AuditOperation::Create,
+            serde_json::json!({ "gts_file_type": new.gts_file_type }),
+        );
+        // @cpt-cf-file-storage-fr-file-events
+        let event = Some(Self::make_file_event(
+            tenant_id,
+            owner_id,
+            file_id,
+            "file.created",
+            serde_json::json!({ "gts_file_type": new.gts_file_type }),
+        ));
+
+        self.store
+            .create_file_with_event(&new, file_id, tenant_id, now, audit, event)
+            .await?;
+
+        // @cpt-cf-file-storage-fr-usage-reporting
+        self.report_usage(UsageDelta {
+            tenant_id,
+            owner_id,
+            bytes_delta: 0,
+            file_count_delta: 1,
+        });
+
+        self.metrics.record_operation("create_file", "ok");
+        Ok(file_id)
     }
 
     /// `POST /files/{id}/versions`: presign a new content version on an existing

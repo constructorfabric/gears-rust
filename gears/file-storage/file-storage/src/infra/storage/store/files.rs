@@ -353,6 +353,67 @@ impl Store {
             .await
     }
 
+    /// Create the file row (+ initial custom metadata, audit, optional event)
+    /// WITHOUT pre-registering any version (upload-flow redesign). Used by
+    /// the merged `POST /files` create+plan path, where the multipart
+    /// initiate that follows registers its own pending version — the
+    /// pre-registered single-part version of
+    /// [`Self::create_file_with_pending_version_and_event`] would only become
+    /// an orphan here.
+    ///
+    /// @cpt-cf-file-storage-fr-audit-trail
+    /// @cpt-cf-file-storage-fr-file-events
+    pub async fn create_file_with_event(
+        &self,
+        new: &NewFile,
+        file_id: Uuid,
+        tenant_id: Uuid,
+        now: OffsetDateTime,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<(), DomainError> {
+        let file = File {
+            file_id,
+            tenant_id,
+            owner_kind: new.owner_kind,
+            owner_id: new.owner_id,
+            name: new.name.clone(),
+            gts_file_type: new.gts_file_type.clone(),
+            content_id: None,
+            meta_version: 0,
+            created_at: now,
+            last_modified_at: now,
+        };
+        let metadata_entries: Vec<(String, String)> = new
+            .custom_metadata
+            .iter()
+            .map(|e| (e.key.clone(), e.value.clone()))
+            .collect();
+
+        let files = self.repos.files.clone();
+        let metadata = self.repos.metadata.clone();
+        let audit_repo = self.repos.audit.clone();
+        let events_repo = self.repos.events_outbox.clone();
+        self.db
+            .db()
+            .transaction_ref_mapped(move |tx| {
+                Box::pin(async move {
+                    files.create(tx, &AccessScope::allow_all(), &file).await?;
+                    for (key, value) in &metadata_entries {
+                        metadata
+                            .upsert(tx, &AccessScope::allow_all(), file_id, key, value, now)
+                            .await?;
+                    }
+                    audit_repo.insert(tx, &audit).await?;
+                    if let Some(ev) = event {
+                        events_repo.enqueue(tx, &ev).await?;
+                    }
+                    Ok::<(), DomainError>(())
+                })
+            })
+            .await
+    }
+
     /// List file-event rows for a specific file ordered by occurrence time.
     ///
     /// Intended for testing; not exposed on the REST API.

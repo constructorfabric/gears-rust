@@ -146,6 +146,29 @@ over both the prior 3-mode BLAKE3 draft and ADR-0002's original P2 vision:
   per-session choice between BLAKE3-tree and composite-SHA-256 before any bytes arrived), the multipart mode here is
   a constant, not a decision.
 
+#### Amendment (2026-07): the one-part plan degenerates to `whole-sha256`
+
+The original decision made "uploaded via multipart" imply the composite mode unconditionally. This amendment narrows
+that: **a multipart plan consisting of exactly one part finalizes as `whole-sha256`**, not
+`multipart-composite-sha256`. Rationale: for a one-part plan the single part spans the entire object, so the part's
+streaming SHA-256 digest **is** `sha256(whole object bytes)` — already computed on the fly, no re-read needed — and
+wrapping it in a one-entry manifest (`root = sha256("v1,0:<h>")`) would only make the same bytes hash differently
+depending on whether they arrived as a single-shot PUT or a one-part multipart session. Consequences:
+
+* `complete_multipart_upload` stores `hash_mode = 'whole-sha256'`, `hash_value = sha256(bytes)` (the part digest),
+  `part_count = NULL`, and persists **no** `version_hash_manifest` row; the `complete` response's `manifest` field is
+  omitted (it became `Option` on the wire).
+* The mode-selection invariant above is unchanged: `hash_mode` still records which mode actually produced the stored
+  hash, set at finalize from the executed path — the "path" now includes the plan's part count.
+* §3's "minimum-degenerate" single-entry manifest (`v1,0:<digest>`) remains a **valid encoding at the type level**
+  (the grammar has no special case); it is simply never persisted or returned by `complete` anymore.
+* **Compatibility**: versions finalized as one-part composites before this amendment keep their stored
+  `multipart-composite-sha256` mode and manifest row, and verify by that mode — verification always follows the
+  version row's own `hash_mode`, never re-derives it.
+* The split-dependent-identity trade-off (risk 2 below) is thereby removed for the one-part case only: a one-part
+  multipart upload of some content now hashes identically to a single-shot upload of the same content. Plans of two
+  or more parts keep the composite semantics unchanged.
+
 ### The on-the-fly / no-re-read principle and its trust model
 
 Every mode is computed **as bytes flow to the backend during upload**, never by reading the object back afterward.
