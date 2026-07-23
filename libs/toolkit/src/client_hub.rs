@@ -187,6 +187,23 @@ impl ClientHub {
         Err(ClientHubError::TypeMismatch { type_key })
     }
 
+    /// Try to fetch a client by interface type `T`.
+    ///
+    /// Returns `None` if no client is registered for the type or if the stored
+    /// type doesn't match. Used as a short-circuit probe by consumer wiring:
+    /// a compile-time (local) registration takes priority over a discovery-based
+    /// REST proxy, so the wiring closure checks `try_get` before registering a
+    /// resolving client.
+    pub fn try_get<T>(&self) -> Option<Arc<T>>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        let type_key = TypeKey::of::<T>();
+        let r = self.map.read();
+        let boxed = r.get(&type_key)?;
+        boxed.downcast_ref::<Arc<T>>().cloned()
+    }
+
     /// Fetch a scoped client by interface type `T` and scope.
     ///
     /// # Errors

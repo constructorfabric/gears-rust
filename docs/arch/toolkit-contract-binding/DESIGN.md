@@ -568,15 +568,96 @@ Generated `error_code` values: `NOTIFICATION_NOT_FOUND`, `DELIVERY_UNAVAILABLE`,
 
 **Enforcement**: Currently by convention. Future work may add a Dylint lint that rejects traits with incorrect suffixes or transport projections on Extension/Embedded types.
 
+### D7: Server-Side Route Registration via OperationBuilder
+
+- [ ] `p1` - **ID**: `cpt-cf-binding-decision-server-codegen`
+
+**Decision**: The `#[toolkit::rest_contract]` macro additionally generates a server-side registration function `register_<trait>_routes(router, openapi, svc)` that uses `OperationBuilder` internally. This function is the drop-in replacement for hand-written `routes.rs` files. The same IR that drives REST client generation drives server route registration — single source of truth.
+
+**Rationale**: Eliminates manual duplication of path templates, HTTP verbs, and request/response schemas between the projection trait and server-side handler code. The HTTP binding IR (`HttpBindingIr`) generated for the client is now also used by the macro to emit `OperationBuilder` calls that register routes, collect OpenAPI specs, and attach Axum handlers.
+
+**What the developer writes:**
+
+```rust
+// SDK crate — projection trait with HTTP annotations (unchanged)
+#[toolkit::rest_contract(base_path = "/api/billing/v1")]
+pub trait BillingApiRest: BillingApi {
+    #[post("/payments/charge")]
+    async fn charge(&self, ctx: SecurityContext, req: ChargeRequest) 
+        -> Result<ChargeResponse, BillingError>;
+}
+```
+
+**What the macro emits (new):**
+
+```rust
+/// Register all `BillingApi` REST routes on the given router.
+pub fn register_billing_api_rest_routes(
+    router: axum::Router,
+    openapi: &dyn toolkit::api::OpenApiRegistry,
+    svc: std::sync::Arc<dyn BillingApi>,
+) -> axum::Router {
+    let router = OperationBuilder::post("/api/billing/v1/payments/charge")
+        .operation_id("billing.charge")
+        .summary("Charge a payment")
+        .authenticated()
+        .no_license_required()
+        .json_request::<ChargeRequest>(openapi, "")
+        .handler({
+            let svc = Arc::clone(&svc);
+            move |Extension(ctx): Extension<SecurityContext>, 
+                  Json(req): Json<ChargeRequest>| {
+                let svc = Arc::clone(&svc);
+                async move {
+                    // `CanonicalError: IntoResponse` renders the RFC 9457
+                    // Problem at the framework boundary — no explicit map_err.
+                    svc.charge(ctx, req).await.map(Json)
+                }
+            }
+        })
+        .json_response_with_schema::<ChargeResponse>(openapi, StatusCode::OK, "")
+        .standard_errors(openapi)
+        .register(router, openapi);
+    router
+}
+```
+
+**Server-side usage (replaces `routes.rs`):**
+
+```rust
+impl RestApiCapability for MyGear {
+    fn register_rest(&self, ctx: &GearCtx, router: Router, openapi: &dyn OpenApiRegistry) 
+        -> anyhow::Result<Router> {
+        let svc = ctx.client_hub().get::<dyn BillingApi>()?;
+        Ok(api_contracts_sdk::rest::register_billing_api_rest_routes(router, openapi, svc))
+    }
+}
+```
+
+**Consequences:**
+
+- The projection trait becomes the **primary source of REST API specification** — paths, HTTP methods, response schemas, authentication derive from it for every method the macro covers.
+- Generation is **additive, not a replacement**. The generated `register_<trait>_routes()` and a hand-written `OperationBuilder::verb(..).register(router, openapi)` chain share the identical `axum::Router -> axum::Router` shape and compose on one router. The manual `OperationBuilder` path (used across `file-parser`, `mini-chat`, etc.) remains **first-class** and is not removed.
+- **Per-method opt-out**: a projection method marked `#[server_manual]` is skipped by the generator (but stays in the client + IR). The author registers it by hand and chains it onto the generated router. This is the escape hatch for routes the macro cannot (yet) express.
+- OpenAPI spec is assembled via a single `OpenApiRegistry` (utoipa) as routes are registered — generated and manual routes contribute to the same registry.
+- Handler generation is synchronized with the IR — parameter binding order (`SecurityContext` → path → body → query) and error mapping (`CanonicalError: IntoResponse` → RFC 9457 `Problem`) follow from the binding metadata.
+- Current scope (PoC): unary HTTP verbs (`#[get]`, `#[post]`, `#[put]`, `#[delete]`) with path/query/body parameters and default `authenticated()` auth. **Streaming (`#[streaming]`) server generation is deferred** — such methods must be marked `#[server_manual]` and registered by hand (a non-opted-out streaming method raises a `compile_error!`). Complex authentication (license, OData, multipart) and base↔projection parity enforcement are follow-up work.
+
+**Trade-offs:**
+
+- The macro's responsibility grows — now generating both client and server paths. Debugging becomes more complex.
+- Server route generation is synchronous; async patterns in routes require manual composition with the generated function.
+- For routes that cannot be expressed by the macro (streaming/SSE in the PoC, complex authentication, custom response shapes, multipart uploads), `#[server_manual]` + manual `OperationBuilder` calls compose alongside the generated function on the same router.
+
 ## 4. Crate Structure
 
 | Crate | Type | Responsibility |
 |-------|------|----------------|
-| `cf-toolkit-contract-macros` | proc-macro | `#[toolkit_rest_contract]` -- generates REST client struct, OpenAPI spec function, SSE streaming, retryable methods. `#[derive(ContractError)]` -- generates Problem Details conversion with `error_code` + `error_domain`. Method annotations: `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `#[patch]`. Parameter annotations: `#[path]`, `#[query]`, `#[header]`, `#[streaming]`, `#[retryable]`. |
+| `cf-toolkit-contract-macros` | proc-macro | `#[toolkit_rest_contract]` -- generates REST client struct, server route registration function (`register_<name>_routes()`), HTTP binding IR, OpenAPI spec function, SSE streaming, retryable methods. `#[derive(ContractError)]` -- generates Problem Details conversion with `error_code` + `error_domain`. Method annotations: `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `#[patch]`, `#[streaming]`, `#[retryable]`. |
 | `cf-toolkit-contract-runtime` | lib | `ProblemDetails` struct (RFC 9457 with extension fields). SSE stream parser (byte stream to typed events). `ClientConfig` (base URL, timeout, retry policy). `RetryConfig` and `with_retry()` helper for exponential backoff. |
-| Gear SDK crates (e.g., `notification-sdk`) | lib | Base traits (zero annotations, no macro dependency). Transport projection traits (behind `rest-client` feature). Feature-gated: `rest-client` enables `reqwest`, `schemars`, and the generated REST client. Without the feature, only the base trait is available. |
+| Gear SDK crates (e.g., `notification-sdk`) | lib | Base traits (zero annotations, no macro dependency). Transport projection traits (behind `rest-client` feature). Feature-gated: `rest-client` enables `reqwest`, `schemars`, and the generated REST client. `rest-server` feature enables server route registration function (`register_<name>_routes()`) and `OperationBuilder`, `axum`, `utoipa` dependencies. Without features, only the base trait is available. |
 | `cf-toolkit` (modified) | lib | ClientHub: fallback resolution (compile-time first, then REST proxy from directory). Gear lifecycle: new proxy wiring phase after plugin discovery, before post-init. |
-| `cf-toolkit-macros` (modified) | proc-macro | Alignment with ADR-0004 gear/plugin declaration macros. |
+| `cf-toolkit-macros` (modified) | proc-macro | Alignment with ADR-0004 (PR #1380) gear/plugin declaration macros. |
 
 ### SDK Crate Layout (per gear)
 
@@ -592,6 +673,7 @@ notification-sdk/
   Cargo.toml
     [features]
     rest-client = ["reqwest", "schemars", "cf-toolkit-contract-macros", "cf-toolkit-contract-runtime"]
+    rest-server = ["toolkit", "axum", "utoipa", "cf-toolkit-contract-macros"]
 ```
 
 ## 5. Contract Enforcement
@@ -765,5 +847,7 @@ Path variables (`#[path]`), query parameters (`#[query]`), header injection (`#[
 - **DESIGN** (this document): [`./DESIGN.md`](./DESIGN.md)
 - **ADR-0001** — contract source of truth: [`./ADR/0001-cpt-cf-binding-adr-contract-source-of-truth.md`](./ADR/0001-cpt-cf-binding-adr-contract-source-of-truth.md)
 - **ADR-0002** — OpenAPI spec limits: [`./ADR/0002-cpt-cf-binding-adr-openapi-spec-limits.md`](./ADR/0002-cpt-cf-binding-adr-openapi-spec-limits.md)
+- **ADR-0003** — projection server generation: [`./ADR/0003-cpt-cf-binding-adr-projection-server-gen.md`](./ADR/0003-cpt-cf-binding-adr-projection-server-gen.md)
+- **ADR-0004** — consumer wiring: [`./ADR/0004-cpt-cf-binding-adr-consumer-wiring.md`](./ADR/0004-cpt-cf-binding-adr-consumer-wiring.md)
 - **PoC**: [striped-zebra-dev/toolkit-binding-poc](https://github.com/striped-zebra-dev/toolkit-binding-poc)
 - **Gear/plugin declaration and resolution**: [PR #1380](https://github.com/constructorfabric/gears-rust/pull/1380)

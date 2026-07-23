@@ -6,12 +6,16 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tonic::transport::Channel;
 
-use crate::api::{DirectoryClient, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo};
+use crate::api::{
+    DirectoryClient, DirectoryNotFound, GrpcServiceInfo, RegisterInstanceInfo, ServiceEndpoint,
+    ServiceInstanceInfo,
+};
 use toolkit_transport_grpc::client::{GrpcClientConfig, connect_with_retry};
 
 use crate::{
     DeregisterInstanceRequest, DirectoryServiceClient, GrpcServiceEndpoint, HeartbeatRequest,
     ListInstancesRequest, RegisterInstanceRequest, ResolveGrpcServiceRequest,
+    ResolveRestServiceRequest,
 };
 
 /// gRPC client for Directory API
@@ -110,6 +114,31 @@ impl DirectoryClient for DirectoryGrpcClient {
             .map_err(|e| anyhow::anyhow!("gRPC call failed: {e}"))?;
 
         let proto_response = response.into_inner();
+        if proto_response.endpoint_uri.is_empty() {
+            return Err(anyhow::Error::new(DirectoryNotFound::new(format!(
+                "service {service_name}"
+            ))));
+        }
+        Ok(ServiceEndpoint::new(proto_response.endpoint_uri))
+    }
+
+    async fn resolve_rest_service(&self, gear_name: &str) -> Result<ServiceEndpoint> {
+        let mut client = self.inner.clone();
+        let request = tonic::Request::new(ResolveRestServiceRequest {
+            gear_name: gear_name.to_owned(),
+        });
+
+        let response = client
+            .resolve_rest_service(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("gRPC call failed: {e}"))?;
+
+        let proto_response = response.into_inner();
+        if proto_response.endpoint_uri.is_empty() {
+            return Err(anyhow::Error::new(DirectoryNotFound::new(format!(
+                "gear {gear_name}"
+            ))));
+        }
         Ok(ServiceEndpoint::new(proto_response.endpoint_uri))
     }
 
@@ -133,12 +162,23 @@ impl DirectoryClient for DirectoryGrpcClient {
             .map(|proto_inst| ServiceInstanceInfo {
                 gear: proto_inst.gear_name,
                 instance_id: proto_inst.instance_id,
-                endpoint: ServiceEndpoint::new(proto_inst.endpoint_uri),
+                grpc_services: proto_inst
+                    .grpc_services
+                    .into_iter()
+                    .map(|svc| GrpcServiceInfo {
+                        service_name: svc.service_name,
+                        endpoint: ServiceEndpoint::new(svc.endpoint_uri),
+                    })
+                    .collect(),
                 version: if proto_inst.version.is_empty() {
                     None
                 } else {
                     Some(proto_inst.version)
                 },
+                rest_endpoint: proto_inst
+                    .rest_endpoint_uri
+                    .filter(|uri| !uri.is_empty())
+                    .map(ServiceEndpoint::new),
             })
             .collect();
 
@@ -152,9 +192,9 @@ impl DirectoryClient for DirectoryGrpcClient {
         let grpc_services = info
             .grpc_services
             .into_iter()
-            .map(|(name, ep)| GrpcServiceEndpoint {
-                service_name: name,
-                endpoint_uri: ep.uri,
+            .map(|service| GrpcServiceEndpoint {
+                service_name: service.service_name,
+                endpoint_uri: service.endpoint.uri,
             })
             .collect();
 
@@ -163,6 +203,7 @@ impl DirectoryClient for DirectoryGrpcClient {
             instance_id: info.instance_id,
             grpc_services,
             version: info.version.unwrap_or_default(),
+            rest_endpoint_uri: info.rest_endpoint.map(|ep| ep.uri),
         };
 
         client

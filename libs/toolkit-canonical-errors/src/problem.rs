@@ -17,6 +17,124 @@ use crate::error::CanonicalError;
 pub const APPLICATION_PROBLEM_JSON: &str = "application/problem+json";
 
 // ---------------------------------------------------------------------------
+// ProblemCategory — canonical-category selector for typed contract errors.
+// ---------------------------------------------------------------------------
+
+/// One of the 16 canonical AIP-193 categories. Mirrors [`CanonicalError`]
+/// variants for the purpose of building a [`Problem`] envelope from a
+/// typed contract error (PRD #1536 `#[derive(ContractError)]`) without
+/// requiring the SDK author to construct a full `CanonicalError`
+/// (which requires per-category context payloads).
+///
+/// HTTP status and GTS URI are determined entirely by the category; the
+/// contract error supplies `error_code` / `error_domain` extensions plus a
+/// JSON payload in `context["data"]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ProblemCategory {
+    Cancelled,
+    Unknown,
+    InvalidArgument,
+    DeadlineExceeded,
+    NotFound,
+    AlreadyExists,
+    PermissionDenied,
+    ResourceExhausted,
+    FailedPrecondition,
+    Aborted,
+    OutOfRange,
+    Unimplemented,
+    Internal,
+    ServiceUnavailable,
+    DataLoss,
+    Unauthenticated,
+}
+
+impl ProblemCategory {
+    /// GTS URI fragment (without the `gts://` scheme). Identical to the
+    /// fragment emitted by [`CanonicalError::gts_type`] for the matching
+    /// variant.
+    #[must_use]
+    pub fn gts_fragment(self) -> &'static str {
+        match self {
+            Self::Cancelled => "gts.cf.core.errors.err.v1~cf.core.err.cancelled.v1~",
+            Self::Unknown => "gts.cf.core.errors.err.v1~cf.core.err.unknown.v1~",
+            Self::InvalidArgument => "gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            Self::DeadlineExceeded => "gts.cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1~",
+            Self::NotFound => "gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+            Self::AlreadyExists => "gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~",
+            Self::PermissionDenied => "gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            Self::ResourceExhausted => {
+                "gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~"
+            }
+            Self::FailedPrecondition => {
+                "gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~"
+            }
+            Self::Aborted => "gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~",
+            Self::OutOfRange => "gts.cf.core.errors.err.v1~cf.core.err.out_of_range.v1~",
+            Self::Unimplemented => "gts.cf.core.errors.err.v1~cf.core.err.unimplemented.v1~",
+            Self::Internal => "gts.cf.core.errors.err.v1~cf.core.err.internal.v1~",
+            Self::ServiceUnavailable => {
+                "gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~"
+            }
+            Self::DataLoss => "gts.cf.core.errors.err.v1~cf.core.err.data_loss.v1~",
+            Self::Unauthenticated => "gts.cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~",
+        }
+    }
+
+    /// HTTP status mapping per AIP-193 and gRPC↔HTTP conventions.
+    #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "each canonical category is mapped explicitly per AIP-193; collapsing arms whose codes happen to coincide today would silently hide a future schema mismatch."
+    )]
+    pub fn http_status(self) -> u16 {
+        match self {
+            Self::Cancelled => 499,
+            Self::Unknown => 500,
+            Self::InvalidArgument => 400,
+            Self::DeadlineExceeded => 504,
+            Self::NotFound => 404,
+            Self::AlreadyExists => 409,
+            Self::PermissionDenied => 403,
+            Self::ResourceExhausted => 429,
+            Self::FailedPrecondition => 400,
+            Self::Aborted => 409,
+            Self::OutOfRange => 400,
+            Self::Unimplemented => 501,
+            Self::Internal => 500,
+            Self::ServiceUnavailable => 503,
+            Self::DataLoss => 500,
+            Self::Unauthenticated => 401,
+        }
+    }
+
+    /// Human-readable title for the RFC 9457 envelope. Same string as
+    /// [`CanonicalError::title`] for the matching variant.
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Cancelled => "Cancelled",
+            Self::Unknown => "Unknown",
+            Self::InvalidArgument => "Invalid argument",
+            Self::DeadlineExceeded => "Deadline exceeded",
+            Self::NotFound => "Not found",
+            Self::AlreadyExists => "Already exists",
+            Self::PermissionDenied => "Permission denied",
+            Self::ResourceExhausted => "Resource exhausted",
+            Self::FailedPrecondition => "Failed precondition",
+            Self::Aborted => "Aborted",
+            Self::OutOfRange => "Out of range",
+            Self::Unimplemented => "Unimplemented",
+            Self::Internal => "Internal",
+            Self::ServiceUnavailable => "Service unavailable",
+            Self::DataLoss => "Data loss",
+            Self::Unauthenticated => "Unauthenticated",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Problem (RFC 9457)
 // ---------------------------------------------------------------------------
 
@@ -32,6 +150,20 @@ pub struct Problem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
     pub context: serde_json::Value,
+
+    /// Machine-readable identifier of the typed error variant inside its
+    /// domain. Set by [`#[derive(ContractError)]`] when a contract error
+    /// crosses the wire so PRD-conformant peers can reconstruct the
+    /// original Rust enum variant via `error_code` + `error_domain`.
+    /// `None` for canonical-category-only errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+
+    /// Namespace owning the `error_code`. Conventionally
+    /// `<service>.<version>` (e.g. `billing.v1`). `None` when no contract
+    /// error is in play.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_domain: Option<String>,
 }
 
 impl Problem {
@@ -67,7 +199,56 @@ impl Problem {
             instance: None,
             trace_id: None,
             context,
+            error_code: None,
+            error_domain: None,
         })
+    }
+
+    /// Attach the `error_code` extension field (PRD #1536 contract-error
+    /// envelope). Returns `self` for chaining.
+    #[must_use]
+    pub fn with_error_code(mut self, code: impl Into<String>) -> Self {
+        self.error_code = Some(code.into());
+        self
+    }
+
+    /// Attach the `error_domain` extension field. Returns `self` for chaining.
+    #[must_use]
+    pub fn with_error_domain(mut self, domain: impl Into<String>) -> Self {
+        self.error_domain = Some(domain.into());
+        self
+    }
+
+    /// Build a [`Problem`] for a typed contract error (PRD #1536 envelope).
+    ///
+    /// `category` selects one of the 16 canonical AIP-193 categories; the
+    /// resulting `Problem` carries the matching GTS URI in `type`, the
+    /// canonical HTTP status, and the canonical title. `error_code` and
+    /// `error_domain` populate the PRD extension fields, and `data` is
+    /// placed at `context["data"]` to carry variant-specific payload.
+    ///
+    /// Used by `#[derive(ContractError)]` emit-paths; SDK authors rarely
+    /// call this directly.
+    pub fn contract_error(
+        category: ProblemCategory,
+        error_code: impl Into<String>,
+        error_domain: impl Into<String>,
+        detail: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        let mut context = serde_json::Map::new();
+        context.insert("data".to_owned(), data);
+        Problem {
+            problem_type: format!("gts://{}", category.gts_fragment()),
+            title: category.title().to_owned(),
+            status: category.http_status(),
+            detail: detail.into(),
+            instance: None,
+            trace_id: None,
+            context: serde_json::Value::Object(context),
+            error_code: Some(error_code.into()),
+            error_domain: Some(error_domain.into()),
+        }
     }
 
     /// Convert a `CanonicalError` to a `Problem`, including the internal
@@ -81,9 +262,14 @@ impl Problem {
     /// In production, use [`from_error`](Self::from_error) instead — it
     /// never leaks the diagnostic string.
     ///
+    /// Available only when the `debug-problem` feature is enabled — intended for
+    /// local development. Enabling this in production leaks diagnostic detail
+    /// onto the wire.
+    ///
     /// # Errors
     ///
     /// Returns `serde_json::Error` if the context fails to serialize.
+    #[cfg(feature = "debug-problem")]
     pub fn from_error_debug(err: &CanonicalError) -> Result<Self, serde_json::Error> {
         let mut problem = Self::from_error(err)?;
 
@@ -130,9 +316,9 @@ fn serialize_context(err: &CanonicalError) -> Result<serde_json::Value, serde_js
     }
 }
 
-// `Problem.context` is `serde_json::Value`, so stringifying the serialization
-// error is the intended fallback here. The original CanonicalError is already
-// preserved in the other Problem fields.
+// `Problem.context` must be a JSON object per the OpenAPI schema, so we wrap
+// the serialization error in `{ "serialization_error": ... }`. The original
+// CanonicalError is already preserved in the other Problem fields.
 #[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<CanonicalError> for Problem {
     fn from(err: CanonicalError) -> Self {
@@ -145,7 +331,9 @@ impl From<CanonicalError> for Problem {
                 detail: err.detail().to_owned(),
                 instance: None,
                 trace_id: None,
-                context: serde_json::Value::String(ser_err.to_string()),
+                context: serde_json::json!({ "serialization_error": ser_err.to_string() }),
+                error_code: None,
+                error_domain: None,
             },
         }
     }
@@ -484,5 +672,75 @@ impl utoipa::PartialSchema for Problem {
 impl utoipa::ToSchema for Problem {
     fn name() -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Borrowed("Problem")
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_found_round_trips_through_problem() {
+        let original = CanonicalError::__not_found(crate::context::NotFound::new())
+            .with_detail("invoice 42 missing")
+            .with_resource_type("invoice")
+            .with_resource("42");
+
+        let problem = Problem::from(original.clone());
+        let recovered = CanonicalError::try_from(problem).expect("known problem_type");
+
+        assert!(matches!(recovered, CanonicalError::NotFound { .. }));
+        assert_eq!(recovered.detail(), original.detail());
+        assert_eq!(recovered.resource_type(), Some("invoice"));
+        assert_eq!(recovered.resource_name(), Some("42"));
+    }
+
+    #[test]
+    fn already_exists_round_trips_through_problem() {
+        let original = CanonicalError::__already_exists(crate::context::AlreadyExists::new())
+            .with_detail("duplicate payment")
+            .with_resource_type("payment")
+            .with_resource("xyz");
+
+        let problem = Problem::from(original);
+        let recovered = CanonicalError::try_from(problem).expect("known problem_type");
+
+        assert!(matches!(recovered, CanonicalError::AlreadyExists { .. }));
+        assert_eq!(recovered.resource_type(), Some("payment"));
+        assert_eq!(recovered.resource_name(), Some("xyz"));
+    }
+
+    #[test]
+    fn permission_denied_round_trips_through_problem() {
+        let original = CanonicalError::__permission_denied(crate::context::PermissionDenied::new(
+            "missing scope",
+        ))
+        .with_detail("forbidden")
+        .with_resource_type("invoice")
+        .with_resource("42");
+
+        let problem = Problem::from(original);
+        let recovered = CanonicalError::try_from(problem).expect("known problem_type");
+
+        assert!(matches!(recovered, CanonicalError::PermissionDenied { .. }));
+        assert_eq!(recovered.resource_type(), Some("invoice"));
+        assert_eq!(recovered.resource_name(), Some("42"));
+    }
+
+    #[test]
+    fn unknown_problem_type_errors() {
+        let problem = Problem {
+            problem_type: "gts://something.else.unknown".to_owned(),
+            title: "X".to_owned(),
+            status: 500,
+            detail: String::new(),
+            instance: None,
+            trace_id: None,
+            context: serde_json::json!({}),
+            error_code: None,
+            error_domain: None,
+        };
+        assert!(CanonicalError::try_from(problem).is_err());
     }
 }

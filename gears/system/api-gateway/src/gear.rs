@@ -77,6 +77,10 @@ pub struct ApiGateway {
     pub(crate) final_router: Mutex<Option<axum::Router>>,
     // AuthN Resolver client (resolved during init, None when auth_disabled)
     pub(crate) authn_client: Mutex<Option<Arc<dyn AuthNResolverClient>>>,
+    // REST base URL the server bound to (e.g. `http://127.0.0.1:8080`), set
+    // once `serve()` binds its listener. Read by the runtime's directory-
+    // register phase to advertise REST providers.
+    pub(crate) bound_endpoint: Mutex<Option<String>>,
 
     // Duplicate detection (per (method, path) and per handler id)
     pub(crate) registered_routes: DashMap<(Method, String), ()>,
@@ -92,6 +96,7 @@ impl Default for ApiGateway {
             router_cache: RouterCache::new(default_router),
             final_router: Mutex::new(None),
             authn_client: Mutex::new(None),
+            bound_endpoint: Mutex::new(None),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
         }
@@ -122,6 +127,7 @@ impl ApiGateway {
             router_cache: RouterCache::new(default_router),
             final_router: Mutex::new(None),
             authn_client: Mutex::new(None),
+            bound_endpoint: Mutex::new(None),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
         }
@@ -160,6 +166,7 @@ impl ApiGateway {
         // Always mark built-in health check routes as public
         public_routes.insert((Method::GET, "/health".to_owned()));
         public_routes.insert((Method::GET, "/healthz".to_owned()));
+        public_routes.insert((Method::GET, "/readyz".to_owned()));
 
         public_routes.insert((Method::GET, "/docs".to_owned()));
         public_routes.insert((Method::GET, "/openapi.json".to_owned()));
@@ -555,7 +562,23 @@ impl ApiGateway {
 
         // Bind the socket, only now consider the service "ready"
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        tracing::info!("HTTP server bound on {}", addr);
+        let bound = listener.local_addr().unwrap_or(addr);
+        tracing::info!("HTTP server bound on {}", bound);
+
+        // Publish the bound REST base URL so the runtime can advertise this
+        // gateway's REST providers in the directory. Substitute a loopback host
+        // for unspecified bind addresses (0.0.0.0 / ::) so an in-process
+        // consumer resolving via the directory can actually connect.
+        let ip = bound.ip();
+        let host = if ip.is_unspecified() {
+            if ip.is_ipv4() { "127.0.0.1".to_owned() } else { "[::1]".to_owned() }
+        } else if ip.is_ipv6() {
+            format!("[{ip}]")
+        } else {
+            ip.to_string()
+        };
+        *self.bound_endpoint.lock() = Some(format!("http://{host}:{}", bound.port()));
+
         ready.notify(); // Starting -> Running
 
         // Graceful shutdown on cancel
@@ -710,18 +733,27 @@ impl toolkit::Gear for ApiGateway {
 impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
     fn rest_prepare(
         &self,
-        _ctx: &toolkit::context::GearCtx,
+        ctx: &toolkit::context::GearCtx,
         router: axum::Router,
     ) -> anyhow::Result<axum::Router> {
-        // Add health check endpoints:
-        // - /health: detailed JSON response with status and timestamp
-        // - /healthz: simple "ok" liveness probe (Kubernetes-style)
-        let router = router
+        // Add probe endpoints:
+        // - /health, /healthz: liveness (200 once serving).
+        // - /readyz: readiness (503 starting/draining, 200 ready) — gated to the
+        //   process `ReadinessState` published by the runtime.
+        let mut router = router
             .route("/health", get(web::health_check))
             .route("/healthz", get(|| async { "ok" }));
 
+        if let Ok(readiness) = ctx.client_hub().get::<toolkit::ReadinessState>() {
+            router = router
+                .route("/readyz", get(web::readyz))
+                .layer(axum::Extension(readiness));
+        } else {
+            tracing::warn!("ReadinessState not published in ClientHub; /readyz not mounted");
+        }
+
         // You may attach global middlewares here (trace, compression, cors), but do not start server.
-        tracing::debug!("REST host prepared base router with health check endpoints");
+        tracing::debug!("REST host prepared base router with health + readiness endpoints");
         Ok(router)
     }
 
@@ -753,6 +785,10 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
 
     fn as_registry(&self) -> &dyn toolkit::contracts::OpenApiRegistry {
         self
+    }
+
+    fn bound_endpoint(&self) -> Option<String> {
+        self.bound_endpoint.lock().clone()
     }
 }
 
