@@ -14,9 +14,10 @@ pub mod directory {
 pub use directory::directory_service_client::DirectoryServiceClient;
 pub use directory::directory_service_server::{DirectoryService, DirectoryServiceServer};
 pub use directory::{
-    DeregisterInstanceRequest, GrpcServiceEndpoint, HeartbeatRequest, InstanceInfo,
-    ListInstancesRequest, ListInstancesResponse, RegisterInstanceRequest,
-    ResolveGrpcServiceRequest, ResolveGrpcServiceResponse,
+    DeregisterInstanceRequest, GetOpenApiSpecRequest, GetOpenApiSpecResponse, GrpcServiceEndpoint,
+    HeartbeatRequest, InstanceInfo, ListInstancesRequest, ListInstancesResponse,
+    RegisterInstanceRequest, ResolveGrpcServiceRequest, ResolveGrpcServiceResponse,
+    ResolveRestServiceRequest, ResolveRestServiceResponse,
 };
 
 // Re-export the gRPC client implementation

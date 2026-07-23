@@ -10,8 +10,9 @@ use crate::api::{DirectoryClient, RegisterInstanceInfo, ServiceEndpoint, Service
 use toolkit_transport_grpc::client::{GrpcClientConfig, connect_with_retry};
 
 use crate::{
-    DeregisterInstanceRequest, DirectoryServiceClient, GrpcServiceEndpoint, HeartbeatRequest,
-    ListInstancesRequest, RegisterInstanceRequest, ResolveGrpcServiceRequest,
+    DeregisterInstanceRequest, DirectoryServiceClient, GetOpenApiSpecRequest, GrpcServiceEndpoint,
+    HeartbeatRequest, ListInstancesRequest, RegisterInstanceRequest, ResolveGrpcServiceRequest,
+    ResolveRestServiceRequest,
 };
 
 /// gRPC client for Directory API
@@ -113,6 +114,35 @@ impl DirectoryClient for DirectoryGrpcClient {
         Ok(ServiceEndpoint::new(proto_response.endpoint_uri))
     }
 
+    async fn resolve_rest_service(&self, gear_name: &str) -> Result<ServiceEndpoint> {
+        let mut client = self.inner.clone();
+        let request = tonic::Request::new(ResolveRestServiceRequest {
+            gear_name: gear_name.to_owned(),
+        });
+
+        let response = client
+            .resolve_rest_service(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("gRPC call failed: {e}"))?;
+
+        let proto_response = response.into_inner();
+        Ok(ServiceEndpoint::new(proto_response.endpoint_uri))
+    }
+
+    async fn get_openapi_spec(&self, gear_name: &str) -> Result<String> {
+        let mut client = self.inner.clone();
+        let request = tonic::Request::new(GetOpenApiSpecRequest {
+            gear_name: gear_name.to_owned(),
+        });
+
+        let response = client
+            .get_open_api_spec(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("gRPC call failed: {e}"))?;
+
+        Ok(response.into_inner().openapi_spec)
+    }
+
     async fn list_instances(&self, gear: &str) -> Result<Vec<ServiceInstanceInfo>> {
         let mut client = self.inner.clone();
         let request = tonic::Request::new(ListInstancesRequest {
@@ -139,6 +169,7 @@ impl DirectoryClient for DirectoryGrpcClient {
                 } else {
                     Some(proto_inst.version)
                 },
+                rest_endpoint: proto_inst.rest_endpoint_uri.map(ServiceEndpoint::new),
             })
             .collect();
 
@@ -163,6 +194,8 @@ impl DirectoryClient for DirectoryGrpcClient {
             instance_id: info.instance_id,
             grpc_services,
             version: info.version.unwrap_or_default(),
+            rest_endpoint_uri: info.rest_endpoint.map(|ep| ep.uri),
+            openapi_spec: info.openapi_spec,
         };
 
         client

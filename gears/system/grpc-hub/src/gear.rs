@@ -534,6 +534,8 @@ impl GrpcHub {
                         })
                         .collect(),
                     version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                    rest_endpoint: None,
+                    openapi_spec: None,
                 };
 
                 directory.register_instance(info).await?;
@@ -1132,6 +1134,15 @@ mod tests {
                 _service_name: &str,
             ) -> anyhow::Result<ServiceEndpoint> {
                 Ok(ServiceEndpoint::new("mock://endpoint"))
+            }
+            async fn resolve_rest_service(
+                &self,
+                _gear_name: &str,
+            ) -> anyhow::Result<ServiceEndpoint> {
+                Ok(ServiceEndpoint::new("mock://rest"))
+            }
+            async fn get_openapi_spec(&self, _gear_name: &str) -> anyhow::Result<String> {
+                Ok(String::new())
             }
             async fn list_instances(
                 &self,
