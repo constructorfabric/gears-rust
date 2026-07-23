@@ -328,6 +328,10 @@ safety: clippy kani lint dylint # geiger
 validate-gear-names:
 	@$(PYTHON) tools/scripts/validate_gear_names.py
 
+## Validate readme/license-file paths declared by publishable crates exist
+check-packaging-metadata:
+	@$(PYTHON) tools/scripts/check_packaging_metadata.py
+
 # -------- Code security checks --------
 
 .PHONY: deny fips-policy security
