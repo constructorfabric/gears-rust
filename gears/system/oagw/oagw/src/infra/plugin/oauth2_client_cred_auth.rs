@@ -312,6 +312,7 @@ mod tests {
             headers: HashMap::new(),
             config,
             security_context: test_security_context(),
+            upstream_id: Uuid::nil(),
         }
     }
 
@@ -487,6 +488,24 @@ mod tests {
                     sharing: SharingMode::default(),
                     is_inherited: false,
                 }))
+            }
+
+            async fn put(
+                &self,
+                _ctx: &toolkit_security::SecurityContext,
+                _key: &SecretRef,
+                _value: SecretValue,
+                _sharing: SharingMode,
+            ) -> Result<(), CredStoreError> {
+                Ok(())
+            }
+
+            async fn delete(
+                &self,
+                _ctx: &toolkit_security::SecurityContext,
+                _key: &SecretRef,
+            ) -> Result<(), CredStoreError> {
+                Ok(())
             }
         }
 
@@ -688,6 +707,7 @@ mod tests {
             headers: HashMap::new(),
             config,
             security_context: sc,
+            upstream_id: Uuid::nil(),
         }
     }
 

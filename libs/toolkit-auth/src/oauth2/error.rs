@@ -36,6 +36,16 @@ pub enum TokenError {
     /// freshness ratio.
     #[error("invalid token lifetime: {0}")]
     InvalidTokenLifetime(String),
+
+    /// Dynamic client registration (RFC 7591) failed.
+    #[error("client registration failed: {0}")]
+    RegistrationFailed(String),
+
+    /// A refresh-token exchange was rejected by the authorization server,
+    /// signalling that the caller should trigger re-authorization instead of
+    /// retrying.
+    #[error("refresh rejected: {0}")]
+    RefreshRejected(String),
 }
 
 #[cfg(test)]

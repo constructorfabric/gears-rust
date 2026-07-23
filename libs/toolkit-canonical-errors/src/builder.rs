@@ -609,6 +609,22 @@ impl CanonicalError {
         }
     }
 
+    /// Build an `Unimplemented` (HTTP 501) error for an operation the callee
+    /// deliberately does not provide, distinct from `internal` (500) which
+    /// signals an unexpected failure of an implemented operation.
+    #[must_use]
+    pub fn unimplemented(
+        detail: impl Into<String>,
+    ) -> ResourceErrorBuilder<ResourceAbsent, NoContext> {
+        ResourceErrorBuilder {
+            resource_type: None,
+            detail: detail.into(),
+            variant: ErrorVariant::Unimplemented,
+            resource: ResourceAbsent,
+            context: NoContext,
+        }
+    }
+
     #[must_use]
     pub fn service_unavailable() -> ServiceUnavailableBuilder {
         ServiceUnavailableBuilder {

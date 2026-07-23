@@ -41,6 +41,9 @@ url = { workspace = true }
 # OAuth2 token lifecycle
 rand = { workspace = true }
 base64 = { workspace = true }
+# FIPS-validated SHA-256 for the PKCE S256 code-challenge (same crypto provider
+# the platform installs at bootstrap); avoids a direct RustCrypto `sha2` dep.
+aws-lc-rs = { workspace = true }
 
 # Shared utilities
 toolkit-utils = { workspace = true, features = ["serde"] }

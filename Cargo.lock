@@ -2608,6 +2608,7 @@ version = "0.7.3"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "aws-lc-rs",
  "base64 0.22.1",
  "bytes",
  "cf-gears-toolkit-http",

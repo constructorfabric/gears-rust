@@ -411,6 +411,7 @@ mod sdk_vocabulary_round_trip_tests {
             reason::auth::PLUGIN_NOT_FOUND,
             reason::auth::PLUGIN_FAILED,
             reason::auth::PLUGIN_INTERNAL,
+            reason::auth::AUTHORIZATION_REQUIRED,
         ] {
             let err = CanonicalError::unauthenticated().with_reason(r).create();
             let json = problem(err);
@@ -623,6 +624,10 @@ mod projection_tests {
             (
                 reason::auth::PLUGIN_INTERNAL,
                 AuthFailureReason::PluginInternal,
+            ),
+            (
+                reason::auth::AUTHORIZATION_REQUIRED,
+                AuthFailureReason::AuthorizationRequired,
             ),
         ];
         for (wire_reason, expected) in cases {

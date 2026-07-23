@@ -15,6 +15,8 @@ use uuid::Uuid;
 
 use credstore_sdk::SecretRef;
 
+type WriteFn = Arc<dyn Fn() -> Result<(), CredStoreError> + Send + Sync>;
+
 // ── SecurityContext ───────────────────────────────────────────────────────────
 
 /// Build a minimal [`SecurityContext`] suitable for unit tests.
@@ -37,6 +39,11 @@ type PluginFn = Arc<dyn Fn() -> Result<Option<SecretMetadata>, CredStoreError> +
 
 pub struct MockPlugin {
     handler: PluginFn,
+    write_handler: WriteFn,
+}
+
+fn ok_write() -> WriteFn {
+    Arc::new(|| Ok(()))
 }
 
 impl MockPlugin {
@@ -55,6 +62,7 @@ impl MockPlugin {
                     owner_tenant_id,
                 }))
             }),
+            write_handler: ok_write(),
         })
     }
 
@@ -62,6 +70,7 @@ impl MockPlugin {
     pub fn errors_not_found() -> Arc<Self> {
         Arc::new(Self {
             handler: Arc::new(|| Err(CredStoreError::NotFound)),
+            write_handler: ok_write(),
         })
     }
 
@@ -69,6 +78,17 @@ impl MockPlugin {
     pub fn errors_internal(msg: &'static str) -> Arc<Self> {
         Arc::new(Self {
             handler: Arc::new(move || Err(CredStoreError::Internal(msg.into()))),
+            write_handler: ok_write(),
+        })
+    }
+
+    /// A plugin whose `get` returns `None` but whose writes (`put`/`delete`)
+    /// fail with `CredStoreError::Internal(msg)`.
+    #[must_use]
+    pub fn write_errors_internal(msg: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            handler: Arc::new(|| Ok(None)),
+            write_handler: Arc::new(move || Err(CredStoreError::Internal(msg.into()))),
         })
     }
 }
@@ -81,5 +101,19 @@ impl CredStorePluginClientV1 for MockPlugin {
         _key: &SecretRef,
     ) -> Result<Option<SecretMetadata>, CredStoreError> {
         (self.handler)()
+    }
+
+    async fn put(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+        _value: SecretValue,
+        _sharing: SharingMode,
+    ) -> Result<(), CredStoreError> {
+        (self.write_handler)()
+    }
+
+    async fn delete(&self, _ctx: &SecurityContext, _key: &SecretRef) -> Result<(), CredStoreError> {
+        (self.write_handler)()
     }
 }

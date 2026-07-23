@@ -5,17 +5,20 @@ use toolkit_auth::oauth2::types::ClientAuthMethod;
 
 use crate::config::TokenCacheConfig;
 use crate::domain::plugin::{AuthPlugin, GuardPlugin, PluginError, TransformPlugin};
+use crate::infra::oauth::UserTokenStore;
 use credstore_sdk::CredStoreClientV1;
 
 use super::apikey_auth::ApiKeyAuthPlugin;
 use super::noop_auth::NoopAuthPlugin;
+use super::oauth2_auth_code_auth::OAuth2AuthCodeAuthPlugin;
 use super::oauth2_client_cred_auth::OAuth2ClientCredAuthPlugin;
 use super::request_id_transform::RequestIdTransformPlugin;
 use super::required_headers_guard::RequiredHeadersGuardPlugin;
 use crate::domain::gts_helpers::{
     APIKEY_AUTH_PLUGIN_ID, GUARD_PLUGIN_SCHEMA, NOOP_AUTH_PLUGIN_ID,
-    OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID, OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID,
-    REQUEST_ID_TRANSFORM_PLUGIN_ID, REQUIRED_HEADERS_GUARD_PLUGIN_ID, TRANSFORM_PLUGIN_SCHEMA,
+    OAUTH2_AUTH_CODE_AUTH_PLUGIN_ID, OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID,
+    OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID, REQUEST_ID_TRANSFORM_PLUGIN_ID,
+    REQUIRED_HEADERS_GUARD_PLUGIN_ID, TRANSFORM_PLUGIN_SCHEMA,
 };
 
 /// Registry that resolves auth plugin GTS identifiers to plugin implementations.
@@ -28,6 +31,7 @@ impl AuthPluginRegistry {
     #[must_use]
     pub fn with_builtins(
         credstore: Arc<dyn CredStoreClientV1>,
+        token_store: Arc<dyn UserTokenStore>,
         token_http_config: Option<toolkit_http::HttpClientConfig>,
         token_cache_config: TokenCacheConfig,
     ) -> Self {
@@ -63,6 +67,17 @@ impl AuthPluginRegistry {
             OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID.to_string(),
             Arc::new(basic_plugin),
         );
+
+        let mut auth_code_plugin = OAuth2AuthCodeAuthPlugin::new(token_store.clone());
+        if let Some(ref cfg) = token_http_config {
+            auth_code_plugin =
+                OAuth2AuthCodeAuthPlugin::with_http_config(token_store.clone(), cfg.clone());
+        }
+        plugins.insert(
+            OAUTH2_AUTH_CODE_AUTH_PLUGIN_ID.to_string(),
+            Arc::new(auth_code_plugin),
+        );
+
         Self { plugins }
     }
 
@@ -161,16 +176,15 @@ mod tests {
     use std::sync::Arc;
 
     use crate::domain::test_support::MockCredStoreClient;
+    use crate::infra::oauth::CredStoreUserTokenStore;
     use toolkit_gts::gts_id;
 
     use super::*;
 
     fn make_registry() -> AuthPluginRegistry {
-        AuthPluginRegistry::with_builtins(
-            Arc::new(MockCredStoreClient::empty()),
-            None,
-            TokenCacheConfig::default(),
-        )
+        let credstore = Arc::new(MockCredStoreClient::empty());
+        let token_store = Arc::new(CredStoreUserTokenStore::new(credstore.clone()));
+        AuthPluginRegistry::with_builtins(credstore, token_store, None, TokenCacheConfig::default())
     }
 
     #[test]
@@ -199,6 +213,12 @@ mod tests {
                 .resolve(OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn resolves_oauth2_auth_code_plugin() {
+        let registry = make_registry();
+        assert!(registry.resolve(OAUTH2_AUTH_CODE_AUTH_PLUGIN_ID).is_ok());
     }
 
     #[test]

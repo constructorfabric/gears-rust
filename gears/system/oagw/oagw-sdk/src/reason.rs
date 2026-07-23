@@ -59,6 +59,13 @@ pub mod auth {
     /// can usually be retried.
     pub const PLUGIN_INTERNAL: &str = "AUTH_PLUGIN_INTERNAL";
 
+    /// The caller has no usable per-user authorization for the upstream and
+    /// must complete an interactive OAuth authorization-code flow (e.g. via
+    /// mini-chat's connection `:authorize` endpoint). Distinct from
+    /// [`PLUGIN_FAILED`]: credentials are not merely rejected — none exist
+    /// yet — so the remedy is (re-)authorization, not a credential refresh.
+    pub const AUTHORIZATION_REQUIRED: &str = "AUTHORIZATION_REQUIRED";
+
     use core::fmt;
 
     /// Typed view of the wire `reason` strings emitted alongside
@@ -75,6 +82,9 @@ pub mod auth {
         PluginFailed,
         /// See [`PLUGIN_INTERNAL`]. Transient — retry usually clears it.
         PluginInternal,
+        /// See [`AUTHORIZATION_REQUIRED`]. User must (re-)authorize — no
+        /// usable per-user authorization exists yet (not a credential refresh).
+        AuthorizationRequired,
         /// Unknown / unmodeled reason — preserves the raw wire string.
         Unknown(String),
     }
@@ -89,6 +99,7 @@ pub mod auth {
                 PLUGIN_NOT_FOUND => Self::PluginNotFound,
                 PLUGIN_FAILED => Self::PluginFailed,
                 PLUGIN_INTERNAL => Self::PluginInternal,
+                AUTHORIZATION_REQUIRED => Self::AuthorizationRequired,
                 other => Self::Unknown(other.to_owned()),
             }
         }
@@ -100,6 +111,7 @@ pub mod auth {
                 Self::PluginNotFound => PLUGIN_NOT_FOUND,
                 Self::PluginFailed => PLUGIN_FAILED,
                 Self::PluginInternal => PLUGIN_INTERNAL,
+                Self::AuthorizationRequired => AUTHORIZATION_REQUIRED,
                 Self::Unknown(s) => s.as_str(),
             }
         }

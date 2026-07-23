@@ -218,3 +218,144 @@ async fn private_takes_precedence_over_tenant_and_shared_via_plugin() {
     assert_eq!(meta.owner_id, OwnerId(owner_b()));
     assert_eq!(meta.owner_tenant_id, TenantId(tenant_b()));
 }
+
+// --- Runtime writes: put / delete (in-memory) ---
+
+fn empty_service() -> Service {
+    Service::from_config(&StaticCredStorePluginConfig::default()).unwrap()
+}
+
+#[tokio::test]
+async fn put_then_get_returns_stored_private_secret() {
+    let service = empty_service();
+    let plugin: &dyn CredStorePluginClientV1 = &service;
+    let key = SecretRef::new("tok").unwrap();
+    let caller = ctx(tenant_a(), owner_a());
+
+    plugin
+        .put(
+            &caller,
+            &key,
+            SecretValue::from("access-token"),
+            SharingMode::Private,
+        )
+        .await
+        .unwrap();
+
+    let meta = plugin.get(&caller, &key).await.unwrap().unwrap();
+    assert_eq!(meta.value.as_bytes(), b"access-token");
+    assert_eq!(meta.sharing, SharingMode::Private);
+    assert_eq!(meta.owner_id, OwnerId(owner_a()));
+    assert_eq!(meta.owner_tenant_id, TenantId(tenant_a()));
+}
+
+#[tokio::test]
+async fn put_overwrites_existing_value() {
+    let service = empty_service();
+    let plugin: &dyn CredStorePluginClientV1 = &service;
+    let key = SecretRef::new("tok").unwrap();
+    let caller = ctx(tenant_a(), owner_a());
+
+    plugin
+        .put(&caller, &key, SecretValue::from("v1"), SharingMode::Private)
+        .await
+        .unwrap();
+    plugin
+        .put(&caller, &key, SecretValue::from("v2"), SharingMode::Private)
+        .await
+        .unwrap();
+
+    let meta = plugin.get(&caller, &key).await.unwrap().unwrap();
+    assert_eq!(meta.value.as_bytes(), b"v2");
+}
+
+#[tokio::test]
+async fn delete_then_get_returns_none() {
+    let service = empty_service();
+    let plugin: &dyn CredStorePluginClientV1 = &service;
+    let key = SecretRef::new("tok").unwrap();
+    let caller = ctx(tenant_a(), owner_a());
+
+    plugin
+        .put(&caller, &key, SecretValue::from("v"), SharingMode::Private)
+        .await
+        .unwrap();
+    plugin.delete(&caller, &key).await.unwrap();
+
+    assert!(plugin.get(&caller, &key).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn delete_is_idempotent_for_missing_key() {
+    let service = empty_service();
+    let plugin: &dyn CredStorePluginClientV1 = &service;
+    let key = SecretRef::new("missing").unwrap();
+    // Should not error even though nothing is stored.
+    plugin
+        .delete(&ctx(tenant_a(), owner_a()), &key)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn private_put_isolated_across_owners() {
+    let service = empty_service();
+    let plugin: &dyn CredStorePluginClientV1 = &service;
+    let key = SecretRef::new("tok").unwrap();
+
+    plugin
+        .put(
+            &ctx(tenant_a(), owner_a()),
+            &key,
+            SecretValue::from("a-secret"),
+            SharingMode::Private,
+        )
+        .await
+        .unwrap();
+
+    // Different owner in the same tenant cannot read a Private secret.
+    assert!(
+        plugin
+            .get(&ctx(tenant_a(), owner_b()), &key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The owner can.
+    assert_eq!(
+        plugin
+            .get(&ctx(tenant_a(), owner_a()), &key)
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .as_bytes(),
+        b"a-secret"
+    );
+}
+
+#[tokio::test]
+async fn private_put_isolated_across_tenants() {
+    let service = empty_service();
+    let plugin: &dyn CredStorePluginClientV1 = &service;
+    let key = SecretRef::new("tok").unwrap();
+
+    plugin
+        .put(
+            &ctx(tenant_a(), owner_a()),
+            &key,
+            SecretValue::from("a-secret"),
+            SharingMode::Private,
+        )
+        .await
+        .unwrap();
+
+    // Same subject id but a different tenant must not resolve the secret.
+    assert!(
+        plugin
+            .get(&ctx(tenant_b(), owner_a()), &key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

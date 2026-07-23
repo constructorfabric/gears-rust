@@ -1,5 +1,6 @@
 // Updated: 2026-04-07 by Constructor Tech
 use std::collections::HashMap;
+use std::sync::{PoisonError, RwLock};
 
 use credstore_sdk::{OwnerId, SecretRef, SecretValue, SharingMode, TenantId};
 use toolkit_macros::domain_model;
@@ -15,6 +16,31 @@ pub struct SecretEntry {
     pub sharing: SharingMode,
     pub owner_id: OwnerId,
     pub owner_tenant_id: TenantId,
+}
+
+impl Clone for SecretEntry {
+    fn clone(&self) -> Self {
+        // `SecretValue` intentionally does not derive `Clone` (to discourage
+        // copies of secret material); rebuild it explicitly from the bytes.
+        Self {
+            value: SecretValue::new(self.value.as_bytes().to_vec()),
+            sharing: self.sharing,
+            owner_id: self.owner_id,
+            owner_tenant_id: self.owner_tenant_id,
+        }
+    }
+}
+
+/// Mutable in-memory secret store, guarded by a single [`RwLock`].
+///
+/// Config-seeded secrets and runtime writes (via `put`) share these maps.
+#[derive(Default)]
+#[allow(clippy::struct_field_names)]
+struct Store {
+    private_secrets: HashMap<(TenantId, OwnerId, SecretRef), SecretEntry>,
+    tenant_secrets: HashMap<(TenantId, SecretRef), SecretEntry>,
+    shared_secrets: HashMap<(TenantId, SecretRef), SecretEntry>,
+    global_secrets: HashMap<SecretRef, SecretEntry>,
 }
 
 /// Static credstore service.
@@ -34,13 +60,14 @@ pub struct SecretEntry {
 ///   operational shortcut specific to the static plugin.
 ///
 /// Lookup order: **Private → Tenant → Shared → Global** (most specific first).
+///
+/// The store is mutable at runtime: [`Service::put`] and [`Service::delete`]
+/// update the maps behind an [`RwLock`], while config-seeded secrets are
+/// inserted once at construction. Storage is in-memory only (not durable
+/// across restarts).
 #[domain_model]
-#[allow(clippy::struct_field_names)]
 pub struct Service {
-    private_secrets: HashMap<(TenantId, OwnerId, SecretRef), SecretEntry>,
-    tenant_secrets: HashMap<(TenantId, SecretRef), SecretEntry>,
-    shared_secrets: HashMap<(TenantId, SecretRef), SecretEntry>,
-    global_secrets: HashMap<SecretRef, SecretEntry>,
+    store: RwLock<Store>,
 }
 
 impl Service {
@@ -190,26 +217,122 @@ impl Service {
         }
 
         Ok(Self {
-            private_secrets,
-            tenant_secrets,
-            shared_secrets,
-            global_secrets,
+            store: RwLock::new(Store {
+                private_secrets,
+                tenant_secrets,
+                shared_secrets,
+                global_secrets,
+            }),
         })
     }
 
     /// Look up a secret using the caller's security context.
     ///
     /// Lookup order: **Private → Tenant → Shared → Global** (most specific first).
+    ///
+    /// Returns an owned entry (the value bytes are cloned) because the backing
+    /// maps live behind an [`RwLock`].
     #[must_use]
-    pub fn get(&self, ctx: &SecurityContext, key: &SecretRef) -> Option<&SecretEntry> {
+    pub fn get(&self, ctx: &SecurityContext, key: &SecretRef) -> Option<SecretEntry> {
         let tenant_id = TenantId(ctx.subject_tenant_id());
         let subject_id = OwnerId(ctx.subject_id());
 
-        self.private_secrets
+        let store = self.store.read().unwrap_or_else(PoisonError::into_inner);
+        store
+            .private_secrets
             .get(&(tenant_id, subject_id, key.clone()))
-            .or_else(|| self.tenant_secrets.get(&(tenant_id, key.clone())))
-            .or_else(|| self.shared_secrets.get(&(tenant_id, key.clone())))
-            .or_else(|| self.global_secrets.get(key))
+            .or_else(|| store.tenant_secrets.get(&(tenant_id, key.clone())))
+            .or_else(|| store.shared_secrets.get(&(tenant_id, key.clone())))
+            .or_else(|| store.global_secrets.get(key))
+            .cloned()
+    }
+
+    /// Store (create or overwrite) a secret scoped by the caller's context.
+    ///
+    /// - [`SharingMode::Private`] keys by `(tenant, owner, key)`, where owner is
+    ///   the caller's subject.
+    /// - [`SharingMode::Tenant`] and [`SharingMode::Shared`] key by
+    ///   `(tenant, key)`; the stored `owner_id` is a nil placeholder resolved
+    ///   from the caller's context at read time (mirrors config-seeded entries).
+    ///
+    /// There is no consumer-facing path to write a global secret; those are
+    /// config-only.
+    pub fn put(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        value: SecretValue,
+        sharing: SharingMode,
+    ) {
+        let tenant_id = TenantId(ctx.subject_tenant_id());
+        let owner_id = OwnerId(ctx.subject_id());
+
+        let mut store = self.store.write().unwrap_or_else(PoisonError::into_inner);
+        match sharing {
+            SharingMode::Private => {
+                store.private_secrets.insert(
+                    (tenant_id, owner_id, key.clone()),
+                    SecretEntry {
+                        value,
+                        sharing,
+                        owner_id,
+                        owner_tenant_id: tenant_id,
+                    },
+                );
+            }
+            SharingMode::Tenant => {
+                store.tenant_secrets.insert(
+                    (tenant_id, key.clone()),
+                    SecretEntry {
+                        value,
+                        sharing,
+                        owner_id: OwnerId::nil(),
+                        owner_tenant_id: tenant_id,
+                    },
+                );
+            }
+            SharingMode::Shared => {
+                store.shared_secrets.insert(
+                    (tenant_id, key.clone()),
+                    SecretEntry {
+                        value,
+                        sharing,
+                        owner_id: OwnerId::nil(),
+                        owner_tenant_id: tenant_id,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Delete the secret resolved for the caller's context, following the
+    /// scoped **Private → Tenant → Shared** precedence as [`Service::get`].
+    ///
+    /// Global secrets are config-only (see [`Service::put`]) and are never
+    /// removed through this consumer-facing path: a missed scoped lookup
+    /// returns without mutating global configuration.
+    ///
+    /// Idempotent: does nothing if no scoped entry matches.
+    pub fn delete(&self, ctx: &SecurityContext, key: &SecretRef) {
+        let tenant_id = TenantId(ctx.subject_tenant_id());
+        let owner_id = OwnerId(ctx.subject_id());
+
+        let mut store = self.store.write().unwrap_or_else(PoisonError::into_inner);
+        if store
+            .private_secrets
+            .remove(&(tenant_id, owner_id, key.clone()))
+            .is_some()
+        {
+            return;
+        }
+        if store
+            .tenant_secrets
+            .remove(&(tenant_id, key.clone()))
+            .is_some()
+        {
+            return;
+        }
+        store.shared_secrets.remove(&(tenant_id, key.clone()));
     }
 }
 

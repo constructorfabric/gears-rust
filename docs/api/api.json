@@ -139,6 +139,41 @@
         ],
         "type": "object"
       },
+      "BeginOAuthRequest": {
+        "description": "Request body to begin an interactive OAuth authorization for an upstream.\n\nNeither the scopes nor the OAuth `redirect_uri` are caller-supplied: scopes\ncome from the upstream's stored auth config and the `redirect_uri` is the\ngateway's deployment-configured callback URL. The caller only chooses where\nthe browser should land afterwards (`return_to`), which must be on the\ngateway's configured allowlist.",
+        "properties": {
+          "client_name": {
+            "description": "Human-readable client name used for dynamic client registration.",
+            "type": "string"
+          },
+          "return_to": {
+            "description": "Absolute URL the gateway redirects the browser to once the callback\ncompletes (success or failure). Must be an exact member of the gateway's\nconfigured `return_to` allowlist, or the request is rejected.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "return_to"
+        ],
+        "type": "object"
+      },
+      "BeginOAuthResponse": {
+        "description": "Response for a begun authorization: the browser URL and CSRF state.",
+        "properties": {
+          "authorization_url": {
+            "description": "URL to open in the user's browser to obtain consent.",
+            "type": "string"
+          },
+          "state": {
+            "description": "Opaque CSRF state; echoed back on the callback.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "authorization_url",
+          "state"
+        ],
+        "type": "object"
+      },
       "BindReq": {
         "description": "Request body for `POST /files/{id}/bind`.",
         "properties": {
@@ -2457,6 +2492,27 @@
           "host",
           "gpus",
           "collected_at"
+        ],
+        "type": "object"
+      },
+      "OAuthConnectionStatusResponse": {
+        "description": "Per-user connection status for an upstream's OAuth authorization.",
+        "properties": {
+          "connected": {
+            "description": "`true` if a usable token is stored for the caller.",
+            "type": "boolean"
+          },
+          "expires_at_unix": {
+            "description": "Access-token expiry (Unix seconds), when connected.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "connected"
         ],
         "type": "object"
       },
@@ -14203,6 +14259,140 @@
         ]
       }
     },
+    "/oagw/v1/oauth/callback": {
+      "get": {
+        "description": "Authorization-server redirect target: on success, exchanges the authorization code inside OAGW and persists the per-user token (the code never leaves OAGW); on an error redirect (RFC 6749 §4.1.2.1) it completes the browser flow without an exchange. Returns an HTML page describing the outcome.",
+        "operationId": "oagw.oauth_callback",
+        "parameters": [
+          {
+            "description": "Authorization code (present on a successful redirect)",
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "CSRF state from the begin step",
+            "in": "query",
+            "name": "state",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OAuth error code on a failed authorization (e.g. access_denied)",
+            "in": "query",
+            "name": "error",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional human-readable description accompanying error",
+            "in": "query",
+            "name": "error_description",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "format": "text/html",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Browser page completing the authorization flow"
+          },
+          "302": {
+            "description": "Redirect to the allowlisted return_to URL (oauth=success|error appended)"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "OAuth authorization callback",
+        "tags": [
+          "OAGW OAuth"
+        ]
+      }
+    },
     "/oagw/v1/routes": {
       "get": {
         "description": "Retrieve routes with optional upstream_id filter",
@@ -15317,6 +15507,339 @@
         "summary": "Update upstream",
         "tags": [
           "OAGW Upstreams"
+        ]
+      }
+    },
+    "/oagw/v1/upstreams/{id}/oauth": {
+      "delete": {
+        "description": "Delete the caller's stored OAuth token for an upstream",
+        "operationId": "oagw.revoke_oauth_authorization",
+        "parameters": [
+          {
+            "description": "Upstream GTS identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Authorization revoked"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revoke OAuth authorization",
+        "tags": [
+          "OAGW OAuth"
+        ]
+      },
+      "get": {
+        "description": "Report whether the caller has a usable OAuth authorization for an upstream",
+        "operationId": "oagw.oauth_connection_status",
+        "parameters": [
+          {
+            "description": "Upstream GTS identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthConnectionStatusResponse"
+                }
+              }
+            },
+            "description": "OAuth connection status"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get OAuth connection status",
+        "tags": [
+          "OAGW OAuth"
+        ]
+      }
+    },
+    "/oagw/v1/upstreams/{id}/oauth/authorize": {
+      "post": {
+        "description": "Start an interactive authorization-code flow and return the browser URL + state",
+        "operationId": "oagw.begin_oauth_authorization",
+        "parameters": [
+          {
+            "description": "Upstream GTS identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BeginOAuthRequest"
+              }
+            }
+          },
+          "description": "Authorization parameters",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BeginOAuthResponse"
+                }
+              }
+            },
+            "description": "Authorization URL and state"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Begin OAuth authorization",
+        "tags": [
+          "OAGW OAuth"
         ]
       }
     },

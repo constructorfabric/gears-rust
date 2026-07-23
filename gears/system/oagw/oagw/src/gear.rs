@@ -22,7 +22,7 @@ use crate::api::rest::routes;
 use crate::domain::ports::OagwMetricsPort;
 use crate::domain::services::{
     ControlPlaneService, ControlPlaneServiceImpl, DataPlaneService, EndpointSelector,
-    ServiceGatewayClientV1Facade,
+    OAuthEnrollmentService, ServiceGatewayClientV1Facade,
 };
 use crate::infra::metrics::OagwMetricsMeter;
 use crate::infra::proxy::DataPlaneServiceImpl;
@@ -33,6 +33,7 @@ use crate::infra::storage::{InMemoryRouteRepo, InMemoryUpstreamRepo};
 pub struct AppState {
     pub(crate) cp: Arc<dyn ControlPlaneService>,
     pub(crate) dp: Arc<dyn DataPlaneService>,
+    pub(crate) oauth: Arc<dyn OAuthEnrollmentService>,
     pub(crate) backend_selector: Arc<dyn EndpointSelector>,
     pub(crate) config: crate::config::RuntimeConfig,
 }
@@ -135,12 +136,35 @@ impl Gear for OutboundApiGatewayGear {
             None
         };
 
+        // Effective token HTTP policy, honoring `allow_http_upstream`, shared by
+        // both the data plane and the interactive OAuth enrollment service so
+        // discovery, registration, and code exchange match the data plane's
+        // transport security.
+        let oauth_http_config = token_http_config
+            .clone()
+            .unwrap_or_else(toolkit_http::HttpClientConfig::token_endpoint);
+
         let token_cache_config = TokenCacheConfig::from(&cfg);
+
+        // Shared per-user token store: the single seam through which the
+        // `oauth2_auth_code` plugin (reader) and the enrollment service (writer)
+        // agree on the storage key derived from `(subject, upstream_id)`.
+        let token_store: Arc<dyn crate::infra::oauth::UserTokenStore> = Arc::new(
+            crate::infra::oauth::CredStoreUserTokenStore::new(credstore.clone()),
+        );
+        // Transient PKCE/CSRF state lives only in memory with a TTL; never in
+        // durable secret storage.
+        let pending = Arc::new(
+            crate::infra::oauth::pending_store::PendingAuthorizationStore::new(
+                Duration::from_secs(600),
+            ),
+        );
 
         let dp: Arc<dyn DataPlaneService> = Arc::new(
             DataPlaneServiceImpl::new(
                 cp.clone(),
-                credstore,
+                credstore.clone(),
+                token_store.clone(),
                 policy_enforcer,
                 token_http_config,
                 token_cache_config,
@@ -155,6 +179,18 @@ impl Gear for OutboundApiGatewayGear {
             .with_websocket_close_timeout(Duration::from_secs(cfg.websocket_close_timeout_secs))
             .with_websocket_max_frame_size(cfg.websocket_max_frame_size_bytes)
             .with_streaming_idle_timeout(Duration::from_secs(cfg.streaming_idle_timeout_secs)),
+        );
+
+        // -- Interactive OAuth enrollment service --
+        let oauth: Arc<dyn OAuthEnrollmentService> = Arc::new(
+            crate::infra::oauth::OAuthEnrollmentServiceImpl::with_http_config(
+                cp.clone(),
+                token_store,
+                pending,
+                cfg.oauth_callback_url.clone(),
+                cfg.oauth_return_to_allowlist.clone(),
+                oauth_http_config,
+            ),
         );
 
         // -- Facade (for external SDK consumers) --
@@ -202,6 +238,7 @@ impl Gear for OutboundApiGatewayGear {
         let app_state = AppState {
             cp,
             dp,
+            oauth,
             backend_selector,
             config: (&cfg).into(),
         };
