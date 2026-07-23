@@ -116,6 +116,38 @@ fn dto_create_group_deserialize_type_key() {
     );
     assert_eq!(dto.name, "X");
     assert!(dto.parent_id.is_none());
+    assert!(dto.id.is_none());
+}
+
+// TC-DTO-05b: Caller-supplied `id` is deserialized and passed through to the SDK request
+#[test]
+fn dto_create_group_id_passthrough() {
+    let id = Uuid::now_v7();
+    let json = serde_json::json!({
+        "id": id,
+        "type": gts_id!("cf.system.rg.type.v1~x.test.dto.mytype.v1~"),
+        "name": "X"
+    })
+    .to_string();
+    let dto: CreateGroupDto = serde_json::from_str(&json).unwrap();
+    assert_eq!(dto.id, Some(id));
+
+    let req: CreateGroupRequest = dto.into();
+    assert_eq!(req.id, Some(id));
+}
+
+// TC-DTO-05c: Omitted `id` maps to `None` in the SDK request (server generates it)
+#[test]
+fn dto_create_group_no_id_maps_to_none() {
+    let dto = CreateGroupDto {
+        id: None,
+        type_path: gts_id!("cf.system.rg.type.v1~x.test.dto.mytype.v1~").to_owned(),
+        name: "X".to_owned(),
+        parent_id: None,
+        metadata: None,
+    };
+    let req: CreateGroupRequest = dto.into();
+    assert!(req.id.is_none());
 }
 
 // TC-DTO-06: Deserialize with no vectors -> defaults to empty
