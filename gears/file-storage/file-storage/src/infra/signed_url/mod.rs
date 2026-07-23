@@ -138,6 +138,17 @@ pub struct Claims {
     /// before this field existed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub etag: String,
+    /// Upload-flow redesign: instructs the control plane's **finalize**
+    /// callback handler to also bind the finalized version as the file's
+    /// current content, under a `content_id IS NULL` CAS (`op = put` tokens
+    /// only). Minted **exclusively** by `POST /files` for a brand-new file
+    /// with `bind: "auto"` — never for `POST /files/{id}/versions` (replacing
+    /// existing content must go through the JWT-authorized `bind`/`complete`
+    /// paths; see DESIGN §3.6's delegated-authorization amendment). The
+    /// sidecar itself never reads this claim. `#[serde(default)]` keeps
+    /// verification tolerant of tokens minted before this field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bind_on_finalize: bool,
 }
 
 fn is_default_constraints(c: &UploadConstraints) -> bool {

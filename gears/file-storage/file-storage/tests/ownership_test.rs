@@ -118,7 +118,7 @@ async fn transfer_ownership_updates_owner_fields() {
     let new_owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(original_owner), None)
+        .create_file(&ctx, new_file_for(original_owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -152,7 +152,7 @@ async fn transfer_ownership_leaves_audit_row() {
     let new_owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(original_owner), None)
+        .create_file(&ctx, new_file_for(original_owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -189,7 +189,7 @@ async fn transfer_ownership_enqueues_file_event() {
     let new_owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(original_owner), None)
+        .create_file(&ctx, new_file_for(original_owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -229,7 +229,7 @@ async fn create_file_enqueues_created_event() {
     let owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(owner), None)
+        .create_file(&ctx, new_file_for(owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -260,7 +260,7 @@ async fn delete_file_enqueues_deleted_event() {
     let owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(owner), None)
+        .create_file(&ctx, new_file_for(owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -314,7 +314,7 @@ async fn bind_enqueues_content_updated_event() {
     let owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(owner), None)
+        .create_file(&ctx, new_file_for(owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -419,7 +419,7 @@ async fn transfer_to_malformed_owner_is_rejected() {
     let original_owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(original_owner), None)
+        .create_file(&ctx, new_file_for(original_owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -456,7 +456,7 @@ async fn transfer_to_same_tenant_member_succeeds() {
     let new_owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(original_owner), None)
+        .create_file(&ctx, new_file_for(original_owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -501,7 +501,7 @@ async fn transfer_ownership_response_reflects_committed_swap() {
     let new_owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(original_owner), None)
+        .create_file(&ctx, new_file_for(original_owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;

@@ -18,16 +18,19 @@ fn gear_provides_p1_and_p2_migrations() {
     //      per (tenant_id, scope, scope_owner_id), closing the upsert race)
     //   7. ADR-0006 content-hash modes: file_versions.hash_mode/part_count +
     //      the version_hash_manifest table
+    //   8. Upload-flow redesign: multipart_uploads.auto_bind + the completion
+    //      lease/state-machine columns (lease_until/lease_owner/complete_result)
     // (init()/register_rest() need a live GearCtx — those seams are covered by
     // the E2E suite, not here.)
     let gear = FileStorageGear::default();
     assert_eq!(
         gear.migrations().len(),
-        7,
+        8,
         "gear must provide the P1, P2 initial, P2 multipart plan columns, P2 \
          remediation 0.10 idempotency subject_id, P2 remediation 2.1 \
          idempotency request_hash, P2 remediation 2.4 policies unique \
-         scope, and ADR-0006 content-hash-modes migrations"
+         scope, ADR-0006 content-hash-modes, and upload-flow-redesign \
+         (auto_bind + completion lease) migrations"
     );
 }
 
