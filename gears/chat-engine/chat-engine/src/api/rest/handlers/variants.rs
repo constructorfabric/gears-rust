@@ -37,7 +37,7 @@ use uuid::Uuid;
 use toolkit_security::SecurityContext;
 
 use crate::api::rest::handlers::sessions::reject_body_identity;
-use crate::domain::error::{ChatEngineError, Result};
+use crate::domain::error::Result;
 use crate::domain::service::variant_service::{VariantEntry, VariantListing, VariantService};
 
 // ============================================================================
@@ -267,20 +267,11 @@ pub async fn set_active_variant_compat(
 ) -> Result<Json<VariantInfo>> {
     reject_body_identity(&body.tenant_id, &body.user_id)?;
 
-    // Look up siblings + locate the entry at the requested variant_index.
-    let listing = svc.list_variants(&ctx, session_id, message_id).await?;
-    let target = listing
-        .variants
-        .into_iter()
-        .find(|e| e.info.variant_index == body.variant_index)
-        .ok_or_else(|| {
-            ChatEngineError::not_found(
-                "variant",
-                format!("{}:variant_index={}", message_id, body.variant_index),
-            )
-        })?;
+    // Resolve `(message_id, variant_index)` → target sibling and activate it,
+    // all inside a single UPDATE-authorized service call — no separate
+    // read/list-gated lookup.
     let entry = svc
-        .set_active_variant(&ctx, session_id, target.message.message_id)
+        .set_active_variant_by_index(&ctx, session_id, message_id, body.variant_index)
         .await?;
     Ok(Json(entry.info))
 }

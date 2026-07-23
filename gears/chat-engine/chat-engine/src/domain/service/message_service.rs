@@ -306,6 +306,29 @@ impl MessageService {
             .ok_or_else(|| ChatEngineError::not_found("message", message_id))
     }
 
+    /// DELETE-authorized counterpart to [`Self::resolve_owned_message`] for the
+    /// `message_id`-keyed delete route. Authorizes MESSAGE **delete** (not
+    /// read) so a caller holding delete — but not read — permission is not
+    /// spuriously denied, while preserving ownership and out-of-scope → 404
+    /// (anti-enumeration, ADR-0021). Resolves the owning `session_id` for the
+    /// session-scoped `delete_message_cascade` that follows.
+    pub async fn resolve_owned_message_for_delete(
+        &self,
+        ctx: &SecurityContext,
+        message_id: Uuid,
+    ) -> Result<Message> {
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        // @cpt-cf-chat-engine-interface-pep
+        let scope = self
+            .enforcer
+            .access_scope(ctx, &resource_types::MESSAGE, actions::DELETE, Some(message_id))
+            .await?;
+        self.messages
+            .find_message_by_id_scoped(&scope, message_id)
+            .await?
+            .ok_or_else(|| ChatEngineError::not_found("message", message_id))
+    }
+
     /// List the active, visible conversation path of a session in
     /// chronological order (ownership-checked). When `parent_message_id` is
     /// supplied, only the direct replies under that node are returned.

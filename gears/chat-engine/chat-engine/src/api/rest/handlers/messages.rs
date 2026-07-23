@@ -171,9 +171,11 @@ pub async fn delete_message(
     Path(message_id): Path<Uuid>,
 ) -> Result<Json<DeleteMessageResponse>> {
     // The spec keys this route on `message_id` only; resolve the owning
-    // session (PDP-authorized, out-of-scope → 404) before the cascade.
+    // session (out-of-scope → 404) before the cascade. Authorize this
+    // pre-resolve as MESSAGE delete — not read — so the delete route does not
+    // additionally require read permission.
     let session_id = svc
-        .resolve_owned_message(&ctx, message_id)
+        .resolve_owned_message_for_delete(&ctx, message_id)
         .await?
         .session_id;
     tracing::Span::current().record("session_id", tracing::field::display(session_id));

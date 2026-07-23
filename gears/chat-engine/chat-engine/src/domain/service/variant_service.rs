@@ -386,6 +386,98 @@ impl VariantService {
         })
     }
 
+    /// Compat `PUT /sessions/{s}/messages/{m}/variants/active`: activate the
+    /// sibling of `message_id` at `variant_index`.
+    ///
+    /// The index → sibling resolution runs INSIDE this UPDATE-authorized
+    /// method (no separate read/list-gated `list_variants` call), so the
+    /// mutation route requires only update permission. Ownership and
+    /// out-of-scope → 404 are preserved by `authorize_session_op`.
+    #[instrument(
+        skip(self, ctx),
+        fields(
+            session_id = %session_id,
+            message_id = %message_id,
+            operation = "set_active_by_index",
+        ),
+    )]
+    pub async fn set_active_variant_by_index(
+        &self,
+        ctx: &SecurityContext,
+        session_id: Uuid,
+        message_id: Uuid,
+        variant_index: u32,
+    ) -> Result<VariantEntry> {
+        let started = OffsetDateTime::now_utc();
+
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        let session = self
+            .authorize_session_op(
+                ctx,
+                session_id,
+                &resource_types::MESSAGE,
+                actions::UPDATE,
+                Some(session_id),
+            )
+            .await?;
+        self.gate_lifecycle_mutation(&session)?;
+
+        // Resolve the requested sibling under the same UPDATE authorization.
+        let path_msg = self
+            .messages
+            .find_message_in_session(session_id, message_id)
+            .await?
+            .ok_or_else(|| ChatEngineError::not_found("message", message_id))?;
+        let sibling = self
+            .variants
+            .list_siblings(session_id, path_msg.parent_message_id)
+            .await?
+            .into_iter()
+            .find(|m| m.variant_index == variant_index)
+            .ok_or_else(|| {
+                ChatEngineError::not_found(
+                    "variant",
+                    format!("{message_id}:variant_index={variant_index}"),
+                )
+            })?;
+
+        self.update_active_path(session_id, sibling.message_id)
+            .await?;
+
+        // Re-load to capture the freshly-applied `is_active=true`.
+        let refreshed = self
+            .messages
+            .find_message_in_session(session_id, sibling.message_id)
+            .await?
+            .ok_or_else(|| ChatEngineError::not_found("message", sibling.message_id))?;
+        let total = u32::try_from(
+            self.variants
+                .list_siblings(session_id, refreshed.parent_message_id)
+                .await?
+                .len(),
+        )
+        .unwrap_or(u32::MAX);
+
+        let info = VariantInfo {
+            message_id: refreshed.message_id,
+            variant_index: refreshed.variant_index,
+            total_variants: total,
+            is_active: refreshed.is_active,
+        };
+        log_op_finished(
+            started,
+            "set_active",
+            session_id,
+            message_id,
+            Some(refreshed.variant_index),
+        );
+        increment_variant_creation_total("set_active");
+        Ok(VariantEntry {
+            message: refreshed,
+            info,
+        })
+    }
+
     /// Compute and apply the active-path mutation for a newly-active
     /// `message_id`.
     ///

@@ -417,7 +417,7 @@ impl MigrationTrait for Migration {
         // half-reverted state. Fail loudly instead of doing partial work.
         Err(DbErr::Custom(
             "m20260417_000006_authz_owner_columns is irreversible: the \
-             text→UUID cast on sessions.tenant_id / sessions.user_id cannot be \
+             text->UUID cast on sessions.tenant_id / sessions.user_id cannot be \
              safely reverted"
                 .to_owned(),
         ))
