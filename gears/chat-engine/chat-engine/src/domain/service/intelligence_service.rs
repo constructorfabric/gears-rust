@@ -376,13 +376,16 @@ impl IntelligenceService {
     ) -> Result<SummaryStream> {
         // Opaque tenant/user strings for the plugin ctx + summary owner stamp.
         let identity = identity_from_ctx(ctx)?;
+        // Summarization mutates the session: it persists a system summary
+        // message and flips `is_hidden_from_backend` on summarized messages, so
+        // it is authorized as a SESSION update — not a read.
         // @cpt-cf-chat-engine-seq-authz-point-op
         let session = self
             .authorize_session_op(
                 ctx,
                 session_id,
                 &resource_types::SESSION,
-                actions::READ,
+                actions::UPDATE,
                 Some(session_id),
             )
             .await?;
