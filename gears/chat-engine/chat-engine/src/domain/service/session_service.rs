@@ -581,6 +581,91 @@ impl SessionService {
             ));
         }
 
+        let (new_caps_json, plugin_metadata) = self
+            .negotiate_capabilities(&identity, &row, session_id, &caps)
+            .await?;
+
+        let mut updated = self
+            .sessions
+            .update_capabilities_scoped(&scope, session_id, Some(new_caps_json))
+            .await?;
+
+        // Merge plugin-supplied metadata into the session metadata.
+        if let Some(plugin_meta) = plugin_metadata {
+            let merged = merge_plugin_metadata(updated.metadata.clone(), plugin_meta);
+            updated = self
+                .sessions
+                .update_metadata_scoped(&scope, session_id, Some(merged))
+                .await?;
+        }
+        Ok(redact_session(updated))
+    }
+
+    /// Atomic PATCH path when both `metadata` and `enabled_capabilities` are
+    /// supplied. Runs a single UPDATE authorization and persists both columns
+    /// in one transactional write, so either both changes commit or neither
+    /// does (no partial update). Behavior matches applying `update_metadata`
+    /// then `update_capabilities` sequentially — plugin-returned metadata merges
+    /// on top of the request metadata — minus the partial-commit window.
+    pub async fn update_metadata_and_capabilities(
+        &self,
+        ctx: &SecurityContext,
+        session_id: Uuid,
+        metadata: JsonValue,
+        caps: Vec<CapabilityValue>,
+    ) -> Result<Session> {
+        reject_reserved_metadata(Some(&metadata))?;
+        // Opaque tenant/user strings for plugin-call construction only.
+        let identity = identity_from_ctx(ctx)?;
+        let (row, scope) = self
+            .authorize_session_op(ctx, session_id, actions::UPDATE)
+            .await?;
+        let state = row.lifecycle_state;
+        if matches!(
+            state,
+            LifecycleState::SoftDeleted | LifecycleState::HardDeleted
+        ) {
+            return Err(ChatEngineError::conflict(
+                "session is deleted and cannot accept updates",
+            ));
+        }
+
+        let (new_caps_json, plugin_metadata) = self
+            .negotiate_capabilities(&identity, &row, session_id, &caps)
+            .await?;
+
+        // Base = request metadata; plugin-returned metadata (if any) merges on
+        // top — mirroring the sequential path where `update_capabilities` merges
+        // plugin metadata onto whatever `update_metadata` just wrote.
+        let final_metadata = match plugin_metadata {
+            Some(plugin_meta) => merge_plugin_metadata(Some(metadata), plugin_meta),
+            None => metadata,
+        };
+
+        let updated = self
+            .sessions
+            .update_metadata_and_capabilities_scoped(
+                &scope,
+                session_id,
+                Some(final_metadata),
+                Some(new_caps_json),
+            )
+            .await?;
+        Ok(redact_session(updated))
+    }
+
+    /// Run the capability-negotiation plugin round-trip (`on_session_updated`)
+    /// for a session update: resolves the bound plugin (if any), invokes it, and
+    /// returns the negotiated capabilities JSON plus any plugin-returned
+    /// metadata. When no plugin is bound, returns the request capabilities
+    /// verbatim and no metadata.
+    async fn negotiate_capabilities(
+        &self,
+        identity: &Identity,
+        row: &Session,
+        session_id: Uuid,
+        caps: &[CapabilityValue],
+    ) -> Result<(JsonValue, Option<JsonValue>)> {
         let session_type_id = row.session_type_id;
         let plugin_instance_id = match session_type_id {
             Some(st_id) => self
@@ -591,7 +676,7 @@ impl SessionService {
             None => None,
         };
 
-        let mut new_caps_json = capability_values_to_json(&caps);
+        let mut new_caps_json = capability_values_to_json(caps);
         let mut plugin_metadata: Option<JsonValue> = None;
 
         if let Some(ref plugin_instance_id) = plugin_instance_id {
@@ -608,7 +693,7 @@ impl SessionService {
                 plugin_instance_id: plugin_instance_id.clone(),
                 session_type_id: session_type_id.unwrap_or_else(Uuid::nil),
                 plugin_config,
-                enabled_capabilities: Some(caps.clone()),
+                enabled_capabilities: Some(caps.to_vec()),
                 deadline: Some(Instant::now() + self.plugin_timeout),
                 cancel: cancel.clone(),
             };
@@ -626,20 +711,7 @@ impl SessionService {
             plugin_metadata = returned.metadata;
         }
 
-        let mut updated = self
-            .sessions
-            .update_capabilities_scoped(&scope, session_id, Some(new_caps_json))
-            .await?;
-
-        // Merge plugin-supplied metadata into the session metadata.
-        if let Some(plugin_meta) = plugin_metadata {
-            let merged = merge_plugin_metadata(updated.metadata.clone(), plugin_meta);
-            updated = self
-                .sessions
-                .update_metadata_scoped(&scope, session_id, Some(merged))
-                .await?;
-        }
-        Ok(redact_session(updated))
+        Ok((new_caps_json, plugin_metadata))
     }
 
     pub async fn archive_session(

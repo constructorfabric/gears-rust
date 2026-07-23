@@ -853,6 +853,42 @@ impl SessionRepo for SeaSessionRepo {
             .await
     }
 
+    async fn update_metadata_and_capabilities_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        metadata: Option<JsonValue>,
+        capabilities: Option<JsonValue>,
+    ) -> Result<Session, ChatEngineError> {
+        let scope = scope.clone();
+        self.db
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    let _existing = Self::read_scoped(tx, &scope, session_id).await?;
+                    let now = OffsetDateTime::now_utc();
+                    // Single UPDATE sets both columns atomically — either both
+                    // land or neither does.
+                    SessionEntity::update_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+                        .col_expr(
+                            session_entity::Column::Metadata,
+                            Expr::value(metadata.clone()),
+                        )
+                        .col_expr(
+                            session_entity::Column::EnabledCapabilities,
+                            Expr::value(capabilities.clone()),
+                        )
+                        .col_expr(session_entity::Column::UpdatedAt, Expr::value(now))
+                        .exec(tx)
+                        .await?;
+                    Self::read_scoped(tx, &scope, session_id).await
+                })
+            })
+            .await
+    }
+
     async fn update_lifecycle_state_scoped(
         &self,
         scope: &AccessScope,

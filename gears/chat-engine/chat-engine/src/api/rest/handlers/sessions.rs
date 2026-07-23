@@ -126,24 +126,23 @@ pub async fn patch_session(
     Json(body): Json<PatchSessionBody>,
 ) -> Result<Json<chat_engine_sdk::models::Session>> {
     reject_body_identity(&body.tenant_id, &body.user_id)?;
-    if body.metadata.is_none() && body.enabled_capabilities.is_none() {
-        return Err(ChatEngineError::bad_request(
-            "request must supply at least one of `metadata` or `enabled_capabilities`",
-        ));
-    }
-    let mut latest: Option<chat_engine_sdk::models::Session> = None;
-    if let Some(metadata) = body.metadata {
-        latest = Some(svc.update_metadata(&ctx, session_id, metadata).await?);
-    }
-    if let Some(caps) = body.enabled_capabilities {
-        latest = Some(svc.update_capabilities(&ctx, session_id, caps).await?);
-    }
-
-    // At least one branch ran (guarded above), so `latest` is `Some`; map the
-    // impossible `None` to an internal error rather than panicking.
-    latest
-        .map(Json)
-        .ok_or_else(|| ChatEngineError::internal("patch produced no session update"))
+    // When both fields are supplied, apply them in a single authorized,
+    // transactional operation so either both changes commit or neither does.
+    // Single-field requests keep their existing dedicated paths.
+    let session = match (body.metadata, body.enabled_capabilities) {
+        (Some(metadata), Some(caps)) => {
+            svc.update_metadata_and_capabilities(&ctx, session_id, metadata, caps)
+                .await?
+        }
+        (Some(metadata), None) => svc.update_metadata(&ctx, session_id, metadata).await?,
+        (None, Some(caps)) => svc.update_capabilities(&ctx, session_id, caps).await?,
+        (None, None) => {
+            return Err(ChatEngineError::bad_request(
+                "request must supply at least one of `metadata` or `enabled_capabilities`",
+            ));
+        }
+    };
+    Ok(Json(session))
 }
 
 #[tracing::instrument(skip(svc, ctx), fields(session_id = %session_id))]

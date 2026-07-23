@@ -205,6 +205,38 @@ async fn pdp_denied_update_session_returns_forbidden() {
 }
 
 #[tokio::test]
+async fn update_metadata_and_capabilities_persists_both_atomically() {
+    // Both fields supplied → single authorized transactional write; both the
+    // metadata and the enabled_capabilities must land (no partial update).
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+
+    let svc = build_session_service(&db, enforcer_allow());
+    let session = svc
+        .update_metadata_and_capabilities(
+            &ctx_for_subject(user, tenant),
+            sid,
+            serde_json::json!({ "title": "combined" }),
+            vec![CapabilityValue {
+                name: "feedback".into(),
+                value: serde_json::json!(true),
+            }],
+        )
+        .await
+        .expect("combined update ok");
+
+    // Metadata written (seeded session has no plugin → request metadata verbatim).
+    let meta = session.metadata.expect("metadata set");
+    assert_eq!(meta.get("title").and_then(|v| v.as_str()), Some("combined"));
+    // Capabilities written in the same commit.
+    assert!(
+        session.enabled_capabilities.is_some(),
+        "enabled_capabilities must be persisted alongside metadata",
+    );
+}
+
+#[tokio::test]
 async fn pdp_denied_delete_session_returns_forbidden() {
     let db = inmem_db().await;
     let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());

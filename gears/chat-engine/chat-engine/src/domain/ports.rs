@@ -763,6 +763,24 @@ pub trait SessionRepo: Send + Sync {
         ))
     }
 
+    /// Atomically replace both the metadata JSONB and the enabled-capabilities
+    /// JSONB in a single scoped write, under a PDP-derived scope. Used by the
+    /// PATCH flow when both fields are supplied so either both changes commit or
+    /// neither does (no partial update).
+    // @cpt-cf-chat-engine-interface-pep
+    async fn update_metadata_and_capabilities_scoped(
+        &self,
+        scope: &AccessScope,
+        session_id: Uuid,
+        metadata: Option<JsonValue>,
+        capabilities: Option<JsonValue>,
+    ) -> Result<Session, ChatEngineError> {
+        let _ = (scope, session_id, metadata, capabilities);
+        Err(ChatEngineError::internal(
+            "update_metadata_and_capabilities_scoped not implemented for this repository",
+        ))
+    }
+
     /// Transition the lifecycle state under a PDP-derived scope. Restoring to
     /// `Active` clears the soft-delete bookkeeping columns.
     // @cpt-cf-chat-engine-interface-pep
