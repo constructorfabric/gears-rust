@@ -95,6 +95,101 @@ release-plz updates this file in the Release PR.
 - *(cluster)* add testing strategy and test scenario documentation + add cluster-conformance crate (by @asmith987)
 - *(cluster)* cluster docs and cluster-sdk crate (by @asmith987)
 
+### Fixed
+
+- *(cluster)* add version to plugin path dep and extend packaging check (by @mattgarmon)
+
+### Contributors
+
+* @mattgarmon
+* @asmith987
+
+## [0.1.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-noop-usage-collector-plugin-v0.1.0...cf-gears-noop-usage-collector-plugin-v0.1.1) - 2026-07-23
+
+### Added
+
+- *(usage-collector)* BigDecimal aggregates, deterministic record ids, op-per-kind guard (by @capybutler)
+
+### Other
+
+- release (by @github-actions[bot]) - #4168
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+
+### Contributors
+
+* @github-actions[bot]
+* @capybutler
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-usage-collector-v0.1.0...cf-gears-usage-collector-v0.2.0) - 2026-07-23
+
+### Added
+
+- *(usage-collector)* BigDecimal aggregates, deterministic record ids, op-per-kind guard (by @capybutler)
+- *(usage-collector)* add OpenTelemetry metrics/observability layer (by @capybutler)
+
+### Other
+
+- release (by @github-actions[bot]) - #4168
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @github-actions[bot]
+* @capybutler
+* @aviator5
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-usage-collector-sdk-v0.1.0...cf-gears-usage-collector-sdk-v0.2.0) - 2026-07-23
+
+### Added
+
+- *(usage-collector)* BigDecimal aggregates, deterministic record ids, op-per-kind guard (by @capybutler)
+
+### Other
+
+- release (by @github-actions[bot]) - #4168
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @github-actions[bot]
+* @capybutler
+* @aviator5
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oidc-authn-plugin-v0.1.1...cf-gears-oidc-authn-plugin-v0.1.2) - 2026-07-23
+
+### Other
+
+- release (by @github-actions[bot]) - #4168
+- Adapt gears macro invocations to new format
+- Add full crates for deps exporting
+- *(deps)* migrate to gts-rust v0.11.0 (by @aviator5)
+
+### Contributors
+
+* @github-actions[bot]
+* @aviator5
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-cluster-conformance-v0.1.0) - 2026-07-23
+
+### Added
+
+- *(cluster)* add testing strategy and test scenario documentation + add cluster-conformance crate (by @asmith987)
+
+### Contributors
+
+* @asmith987
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-cluster-v0.1.0) - 2026-07-23
+
+### Added
+
+- *(cluster)* standalone backend plugin and cluster gear wiring (by @asmith987)
+- *(cluster)* add testing strategy and test scenario documentation + add cluster-conformance crate (by @asmith987)
+- *(cluster)* cluster docs and cluster-sdk crate (by @asmith987)
+
 ### Contributors
 
 * @asmith987
