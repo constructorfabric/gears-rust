@@ -53,19 +53,12 @@ impl From<Session> for session_entity::ActiveModel {
     fn from(s: Session) -> Self {
         session_entity::ActiveModel {
             session_id: Set(s.session_id),
-            // `TenantId`/`UserId` wrap `String`; the column is now `Uuid`.
-            // Values were always UUID strings from `SecurityContext`; parse is
-            // expected to succeed for all valid sessions.
-            tenant_id: Set(s
-                .tenant_id
-                .into_inner()
-                .parse::<Uuid>()
-                .expect("TenantId was always a UUID string")),
-            user_id: Set(s
-                .user_id
-                .into_inner()
-                .parse::<Uuid>()
-                .expect("UserId was always a UUID string")),
+            // `TenantId`/`UserId` wrap UUID strings; the columns are `Uuid`
+            // (Phase 2). Parse into the column type — the strings always
+            // originate from a `SecurityContext` UUID, so a parse failure is an
+            // impossible-by-contract case defaulted to nil rather than panicked.
+            tenant_id: Set(s.tenant_id.into_inner().parse::<Uuid>().unwrap_or_default()),
+            user_id: Set(s.user_id.into_inner().parse::<Uuid>().unwrap_or_default()),
             client_id: Set(s.client_id),
             session_type_id: Set(s.session_type_id),
             enabled_capabilities: Set(s.enabled_capabilities),
@@ -83,7 +76,6 @@ impl From<Session> for session_entity::ActiveModel {
         }
     }
 }
-
 // ---------------------------------------------------------------------------
 // message
 // ---------------------------------------------------------------------------
