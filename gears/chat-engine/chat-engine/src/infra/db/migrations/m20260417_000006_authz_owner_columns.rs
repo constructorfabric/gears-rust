@@ -408,7 +408,7 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
-        // This migration is irreversible. up() performs an in-place text→UUID
+        // This migration is irreversible. up() performs an in-place text->UUID
         // cast on sessions.tenant_id / sessions.user_id that cannot be safely
         // undone: converting the UUID columns back to TEXT would break any
         // downstream code written against the UUID type. Dropping the owner
