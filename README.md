@@ -97,6 +97,23 @@ cargo run --bin cf-gears-example-server -- --config config/no-db.yaml run
 cargo run --bin cf-gears-example-server -- --config config/quickstart.yaml --mock run
 ```
 
+### Admin panel
+
+An optional Django-admin-style management console (`apps/admin-panel`, React + Refine) is
+available. It manages the platform through the Gears APIs only — with platform-admin and
+per-tenant modes — and is metadata-driven, so new resources are added by registering a
+descriptor. `make admin` builds the SPA and serves it from the example server:
+
+```bash
+make admin                       # builds the SPA, serves it at http://localhost:8087/cf/admin
+                                 #   (Gears APIs at /cf, non-prod dev tokens)
+# for frontend hot reload instead:
+cd apps/admin-panel && npm install && npm run dev
+```
+
+See the [Admin panel guide](docs/web-docs/build-with-gears/admin-panel.md) and the design set under
+[`docs/arch/admin-panel/`](docs/arch/admin-panel/) (PRD, DESIGN, ADRs).
+
 ### Example Configuration (config/quickstart.yaml)
 
 ```yaml
