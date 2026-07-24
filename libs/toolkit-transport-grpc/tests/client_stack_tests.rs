@@ -22,13 +22,11 @@ fn default_config_is_sane() {
     );
 
     // Retry settings should be reasonable (max_retries is u32, always non-negative)
+    assert!(cfg.backoff_base_ms > 0, "backoff base should be positive");
+    assert!(cfg.backoff_factor > 0, "backoff factor should be positive");
     assert!(
-        cfg.base_backoff > Duration::from_millis(0),
-        "base_backoff should be positive"
-    );
-    assert!(
-        cfg.max_backoff >= cfg.base_backoff,
-        "max_backoff should be >= base_backoff"
+        cfg.max_backoff > Duration::from_millis(0),
+        "max_backoff should be positive"
     );
 
     // Service name should be set
@@ -190,7 +188,8 @@ fn retry_config_is_accessible() {
 
     // Verify retry-related config is accessible
     let _ = cfg.max_retries;
-    let _ = cfg.base_backoff;
+    let _ = cfg.backoff_base_ms;
+    let _ = cfg.backoff_factor;
     let _ = cfg.max_backoff;
 
     // Test builder methods for retry config
@@ -235,8 +234,10 @@ fn rpc_retry_config_from_grpc_config() {
 
     let retry_cfg = RpcRetryConfig::from(&grpc_cfg);
 
+    // The two configs share one vocabulary, so `From` copies every field 1:1.
     assert_eq!(retry_cfg.max_retries, 7);
-    assert_eq!(retry_cfg.base_backoff, grpc_cfg.base_backoff);
+    assert_eq!(retry_cfg.backoff_base_ms, grpc_cfg.backoff_base_ms);
+    assert_eq!(retry_cfg.backoff_factor, grpc_cfg.backoff_factor);
     assert_eq!(retry_cfg.max_backoff, grpc_cfg.max_backoff);
 }
 
@@ -245,18 +246,21 @@ fn rpc_retry_config_default() {
     let cfg = RpcRetryConfig::default();
 
     assert_eq!(cfg.max_retries, 3);
-    assert!(cfg.base_backoff > Duration::from_millis(0));
-    assert!(cfg.max_backoff >= cfg.base_backoff);
+    assert!(cfg.backoff_base_ms > 0);
+    assert!(cfg.backoff_factor > 0);
+    assert!(cfg.max_backoff > Duration::from_millis(0));
 }
 
 #[test]
 fn rpc_retry_config_builder() {
     let cfg = RpcRetryConfig::new(5)
-        .with_base_backoff(Duration::from_millis(50))
+        .with_backoff_base_ms(50)
+        .with_backoff_factor(1)
         .with_max_backoff(Duration::from_secs(2));
 
     assert_eq!(cfg.max_retries, 5);
-    assert_eq!(cfg.base_backoff, Duration::from_millis(50));
+    assert_eq!(cfg.backoff_base_ms, 50);
+    assert_eq!(cfg.backoff_factor, 1);
     assert_eq!(cfg.max_backoff, Duration::from_secs(2));
 }
 
@@ -266,7 +270,7 @@ fn rpc_retry_config_cloning() {
     let cfg2 = cfg1.clone();
 
     assert_eq!(cfg1.max_retries, cfg2.max_retries);
-    assert_eq!(cfg1.base_backoff, cfg2.base_backoff);
+    assert_eq!(cfg1.backoff_base_ms, cfg2.backoff_base_ms);
 }
 
 #[test]
@@ -283,6 +287,7 @@ fn rpc_retry_config_debug() {
 
 #[tokio::test]
 async fn call_with_retry_success_first_try() {
+    #[derive(Clone)]
     struct MockClient;
 
     let mut client = MockClient;
@@ -305,6 +310,7 @@ async fn call_with_retry_success_first_try() {
 async fn call_with_retry_non_retryable_error_fails_immediately() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    #[derive(Clone)]
     struct MockClient {
         call_count: Arc<AtomicU32>,
     }
@@ -337,6 +343,7 @@ async fn call_with_retry_non_retryable_error_fails_immediately() {
 async fn call_with_retry_recovers_from_unavailable() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    #[derive(Clone)]
     struct MockClient {
         call_count: Arc<AtomicU32>,
     }
@@ -347,7 +354,7 @@ async fn call_with_retry_recovers_from_unavailable() {
     };
     let cfg = Arc::new(
         RpcRetryConfig::new(5)
-            .with_base_backoff(Duration::from_millis(1))
+            .with_backoff_base_ms(1)
             .with_max_backoff(Duration::from_millis(5)),
     );
 
@@ -378,6 +385,7 @@ async fn call_with_retry_recovers_from_unavailable() {
 async fn call_with_retry_exhausts_retries() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    #[derive(Clone)]
     struct MockClient {
         call_count: Arc<AtomicU32>,
     }
@@ -388,7 +396,7 @@ async fn call_with_retry_exhausts_retries() {
     };
     let cfg = Arc::new(
         RpcRetryConfig::new(2)
-            .with_base_backoff(Duration::from_millis(1))
+            .with_backoff_base_ms(1)
             .with_max_backoff(Duration::from_millis(5)),
     );
 
@@ -414,6 +422,7 @@ async fn call_with_retry_exhausts_retries() {
 async fn call_with_retry_zero_retries_means_single_attempt() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    #[derive(Clone)]
     struct MockClient {
         call_count: Arc<AtomicU32>,
     }
@@ -450,6 +459,7 @@ async fn call_with_retry_clones_request() {
         value: i32,
     }
 
+    #[derive(Clone)]
     struct MockClient {
         call_count: Arc<AtomicU32>,
     }
@@ -458,7 +468,7 @@ async fn call_with_retry_clones_request() {
     let mut client = MockClient {
         call_count: call_count.clone(),
     };
-    let cfg = Arc::new(RpcRetryConfig::new(2).with_base_backoff(Duration::from_millis(1)));
+    let cfg = Arc::new(RpcRetryConfig::new(2).with_backoff_base_ms(1));
 
     let result = call_with_retry(
         &mut client,

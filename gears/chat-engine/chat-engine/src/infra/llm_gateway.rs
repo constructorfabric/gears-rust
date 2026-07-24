@@ -51,6 +51,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::select;
+use tokio_retry::RetryIf;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -365,7 +366,7 @@ impl LlmGatewayPlugin {
     async fn with_retry<F, Fut, T>(
         config: &LlmPluginConfig,
         cancel: &CancellationToken,
-        mut op: F,
+        op: F,
     ) -> Result<T, PluginError>
     where
         F: FnMut() -> Fut,
@@ -373,35 +374,23 @@ impl LlmGatewayPlugin {
     {
         let max_attempts = config.effective_retry_count().max(1);
         let base_delay = config.effective_retry_delay();
-        let mut last_err: Option<PluginError> = None;
-        for attempt in 0..max_attempts {
-            if cancel.is_cancelled() {
-                return Err(PluginError::transient("cancelled"));
-            }
-            let result = select! {
-                _ = cancel.cancelled() => Err(PluginError::transient("cancelled")),
-                r = op() => r,
-            };
-            match result {
-                Ok(v) => return Ok(v),
-                Err(e) if !e.is_retryable() => return Err(e),
-                Err(e) => {
-                    last_err = Some(e);
-                    if attempt + 1 < max_attempts {
-                        let backoff = base_delay.saturating_mul(2u32.saturating_pow(attempt));
-                        select! {
-                            _ = cancel.cancelled() => {
-                                return Err(PluginError::transient("cancelled"));
-                            }
-                            _ = tokio::time::sleep(backoff) => {}
-                        }
-                    }
-                }
-            }
+
+        // Same schedule as the previous `base_delay * 2^attempt`: base_delay,
+        // 2·base_delay, 4·base_delay, … over the `max_attempts - 1` retries.
+        let strategy = std::iter::successors(Some(base_delay), |d| Some(d.saturating_mul(2)))
+            .take((max_attempts - 1) as usize);
+
+        // Retry only errors the gateway marks retryable; anything else stops
+        // immediately. The cancellation sentinel never reaches this predicate
+        // because cancellation resolves the outer `select!` first.
+        let retryable = |e: &PluginError| e.is_retryable();
+
+        // Cancellation aborts the whole retry — including any in-flight backoff
+        // sleep and the op future — at once, matching the prior per-step checks.
+        select! {
+            _ = cancel.cancelled() => Err(PluginError::transient("cancelled")),
+            r = RetryIf::start(strategy, op, retryable) => r,
         }
-        Err(last_err.unwrap_or_else(|| {
-            PluginError::internal("retry budget exhausted without recording an error")
-        }))
     }
 }
 

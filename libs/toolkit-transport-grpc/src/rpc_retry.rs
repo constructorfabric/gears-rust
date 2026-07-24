@@ -36,7 +36,7 @@
 //!     &mut client,
 //!     retry_cfg.clone(),
 //!     req,
-//!     |c, r| async move { c.my_call(r).await.map(|resp| resp.into_inner()) },
+//!     |mut c, r| async move { c.my_call(r).await.map(|resp| resp.into_inner()) },
 //!     "my_service.my_call",
 //! ).await?;
 //! ```
@@ -44,14 +44,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::RngExt as _;
-use tokio::time::sleep;
+use tokio_retry::RetryIf;
+use tokio_retry::strategy::{ExponentialBackoff, jitter};
 use tonic::{Code, Status};
 use tracing::Instrument;
-
-fn duration_to_i64_ms(duration: Duration) -> i64 {
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-}
 
 /// Configuration for RPC-level retry policy.
 ///
@@ -63,13 +59,15 @@ pub struct RpcRetryConfig {
     /// Maximum number of retry attempts (not including the initial call).
     pub max_retries: u32,
 
-    /// Base duration for exponential backoff.
-    ///
-    /// The actual backoff duration is `base_backoff * 2^(attempt - 1)`,
-    /// capped at `max_backoff`, plus up to 25 % random jitter.
-    pub base_backoff: Duration,
+    /// Base fed to [`ExponentialBackoff::from_millis`] — the growth ratio between
+    /// delays (sequence `backoff_base_ms^n * backoff_factor`).
+    pub backoff_base_ms: u64,
 
-    /// Maximum duration for exponential backoff.
+    /// Multiplicative factor applied to every backoff delay. With the defaults
+    /// (base `2`, factor `50`) the schedule is 100ms, 200ms, 400ms, ….
+    pub backoff_factor: u64,
+
+    /// Upper bound on any single backoff delay ([`ExponentialBackoff::max_delay`]).
     pub max_backoff: Duration,
 }
 
@@ -77,7 +75,8 @@ impl Default for RpcRetryConfig {
     fn default() -> Self {
         Self {
             max_retries: 3,
-            base_backoff: Duration::from_millis(100),
+            backoff_base_ms: 2,
+            backoff_factor: 50,
             max_backoff: Duration::from_secs(5),
         }
     }
@@ -85,9 +84,12 @@ impl Default for RpcRetryConfig {
 
 impl From<&crate::client::GrpcClientConfig> for RpcRetryConfig {
     fn from(cfg: &crate::client::GrpcClientConfig) -> Self {
+        // The two configs share one vocabulary, so every field copies across
+        // unchanged — no value transformation.
         Self {
             max_retries: cfg.max_retries,
-            base_backoff: cfg.base_backoff,
+            backoff_base_ms: cfg.backoff_base_ms,
+            backoff_factor: cfg.backoff_factor,
             max_backoff: cfg.max_backoff,
         }
     }
@@ -102,9 +104,15 @@ impl RpcRetryConfig {
         }
     }
 
-    /// Set the base backoff duration.
-    pub fn with_base_backoff(mut self, duration: Duration) -> Self {
-        self.base_backoff = duration;
+    /// Set the [`ExponentialBackoff`] base (see the field docs).
+    pub fn with_backoff_base_ms(mut self, base_ms: u64) -> Self {
+        self.backoff_base_ms = base_ms;
+        self
+    }
+
+    /// Set the multiplicative factor applied to every backoff delay.
+    pub fn with_backoff_factor(mut self, factor: u64) -> Self {
+        self.backoff_factor = factor;
         self
     }
 
@@ -148,7 +156,7 @@ impl RpcRetryConfig {
 ///     &mut client,
 ///     retry_cfg.clone(),
 ///     my_request,
-///     |c, r| async move { c.get_user(r).await.map(|r| r.into_inner()) },
+///     |mut c, r| async move { c.get_user(r).await.map(|r| r.into_inner()) },
 ///     "users.get_user",
 /// ).await?;
 /// ```
@@ -163,75 +171,68 @@ pub async fn call_with_retry<TClient, F, Fut, Req, Res>(
     op_name: &'static str,
 ) -> Result<Res, Status>
 where
-    F: Fn(&mut TClient, Req) -> Fut,
+    TClient: Clone,
+    F: Fn(TClient, Req) -> Fut,
     Fut: std::future::Future<Output = Result<Res, Status>>,
     Req: Clone,
 {
+    // Each attempt runs against a fresh client clone (tonic clients clone
+    // cheaply, sharing the underlying channel) so the retry future can own it
+    // for its whole lifetime — `tokio-retry`'s `Action` cannot hand out a future
+    // that borrows the driving closure.
     let mut attempt: u32 = 0;
-
-    loop {
+    let action = || {
         attempt += 1;
-
-        let span = tracing::debug_span!("grpc_call", op = op_name, attempt,);
-
-        let result = async {
-            let res = call(client, req.clone()).await;
+        let this_attempt = attempt;
+        let fut = call(client.clone(), req.clone());
+        async move {
+            let res = fut
+                .instrument(tracing::debug_span!(
+                    "grpc_call",
+                    op = op_name,
+                    attempt = this_attempt,
+                ))
+                .await;
             if let Err(ref status) = res {
                 tracing::warn!(
                     code = ?status.code(),
                     message = %status.message(),
-                    attempt,
+                    attempt = this_attempt,
                     op = op_name,
                     "gRPC call failed",
                 );
             }
             res
         }
-        .instrument(span)
-        .await;
+    };
+    // Retry only on transient, network-like errors; everything else short-circuits.
+    let retryable =
+        |status: &Status| matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded);
 
-        match result {
-            Ok(res) => {
-                if attempt > 1 {
-                    tracing::info!(op = op_name, attempt, "gRPC call succeeded after retries");
-                }
-                return Ok(res);
-            }
-            Err(status) => {
-                let code = status.code();
+    // Exponential backoff capped at `max_backoff`, with full jitter, over
+    // `max_retries` retries — the config fields map straight onto the strategy.
+    let strategy = ExponentialBackoff::from_millis(cfg.backoff_base_ms)
+        .factor(cfg.backoff_factor)
+        .max_delay(cfg.max_backoff)
+        .map(jitter)
+        .take(cfg.max_retries as usize);
+    let result = RetryIf::start(strategy, action, retryable).await;
 
-                // Retry only on network-like errors
-                let retryable = matches!(code, Code::Unavailable | Code::DeadlineExceeded);
-
-                if !retryable || attempt > cfg.max_retries {
-                    tracing::error!(
-                        op = op_name,
-                        attempt,
-                        code = ?code,
-                        "gRPC call giving up"
-                    );
-                    return Err(status);
-                }
-
-                let jitter_factor = rand::rng().random_range(0.0..=0.25);
-                let backoff = crate::backoff::compute_backoff(
-                    cfg.base_backoff,
-                    cfg.max_backoff,
-                    attempt,
-                    jitter_factor,
-                );
-
-                tracing::debug!(
-                    op = op_name,
-                    attempt,
-                    backoff_ms = duration_to_i64_ms(backoff),
-                    "Retrying gRPC call after backoff"
-                );
-
-                sleep(backoff).await;
-            }
+    match &result {
+        Ok(_) if attempt > 1 => {
+            tracing::info!(op = op_name, attempt, "gRPC call succeeded after retries");
         }
+        Err(status) => {
+            tracing::error!(
+                op = op_name,
+                attempt,
+                code = ?status.code(),
+                "gRPC call giving up"
+            );
+        }
+        Ok(_) => {}
     }
+    result
 }
 
 #[cfg(test)]
@@ -243,7 +244,8 @@ mod tests {
     fn test_default_retry_config() {
         let cfg = RpcRetryConfig::default();
         assert_eq!(cfg.max_retries, 3);
-        assert_eq!(cfg.base_backoff, Duration::from_millis(100));
+        assert_eq!(cfg.backoff_base_ms, 2);
+        assert_eq!(cfg.backoff_factor, 50);
         assert_eq!(cfg.max_backoff, Duration::from_secs(5));
     }
 
@@ -252,24 +254,29 @@ mod tests {
         let grpc_cfg = crate::client::GrpcClientConfig::new("test").with_max_retries(5);
         let retry_cfg = RpcRetryConfig::from(&grpc_cfg);
 
+        // The two configs share one vocabulary, so `From` copies every field 1:1.
         assert_eq!(retry_cfg.max_retries, 5);
-        assert_eq!(retry_cfg.base_backoff, grpc_cfg.base_backoff);
+        assert_eq!(retry_cfg.backoff_base_ms, grpc_cfg.backoff_base_ms);
+        assert_eq!(retry_cfg.backoff_factor, grpc_cfg.backoff_factor);
         assert_eq!(retry_cfg.max_backoff, grpc_cfg.max_backoff);
     }
 
     #[test]
     fn test_retry_config_builder() {
         let cfg = RpcRetryConfig::new(10)
-            .with_base_backoff(Duration::from_millis(200))
+            .with_backoff_base_ms(200)
+            .with_backoff_factor(1)
             .with_max_backoff(Duration::from_secs(10));
 
         assert_eq!(cfg.max_retries, 10);
-        assert_eq!(cfg.base_backoff, Duration::from_millis(200));
+        assert_eq!(cfg.backoff_base_ms, 200);
+        assert_eq!(cfg.backoff_factor, 1);
         assert_eq!(cfg.max_backoff, Duration::from_secs(10));
     }
 
     #[tokio::test]
     async fn test_call_with_retry_succeeds_first_attempt() {
+        #[derive(Clone)]
         struct MockClient;
 
         let mut client = MockClient;
@@ -290,6 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_call_with_retry_non_retryable_error() {
+        #[derive(Clone)]
         struct MockClient;
 
         let mut client = MockClient;
@@ -312,6 +320,7 @@ mod tests {
     async fn test_call_with_retry_retries_on_unavailable() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
+        #[derive(Clone)]
         struct MockClient {
             call_count: Arc<AtomicU32>,
         }
@@ -323,7 +332,8 @@ mod tests {
 
         let cfg = Arc::new(
             RpcRetryConfig::new(3)
-                .with_base_backoff(Duration::from_millis(1))
+                .with_backoff_base_ms(1)
+                .with_backoff_factor(1)
                 .with_max_backoff(Duration::from_millis(10)),
         );
 
@@ -354,6 +364,7 @@ mod tests {
     async fn test_call_with_retry_gives_up_after_max_retries() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
+        #[derive(Clone)]
         struct MockClient {
             call_count: Arc<AtomicU32>,
         }
@@ -365,7 +376,8 @@ mod tests {
 
         let cfg = Arc::new(
             RpcRetryConfig::new(2)
-                .with_base_backoff(Duration::from_millis(1))
+                .with_backoff_base_ms(1)
+                .with_backoff_factor(1)
                 .with_max_backoff(Duration::from_millis(10)),
         );
 
@@ -392,6 +404,7 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::time::Instant;
 
+        #[derive(Clone)]
         struct MockClient {
             call_count: Arc<AtomicU32>,
         }
@@ -401,11 +414,11 @@ mod tests {
             call_count: call_count.clone(),
         };
 
-        // Set base_backoff high enough that without max_backoff cap,
-        // total time would be much longer
+        // First delay (base 100 × default factor 50 = 5000ms) is far above the
+        // 50ms cap, so without the cap total time would be much longer.
         let cfg = Arc::new(
             RpcRetryConfig::new(2)
-                .with_base_backoff(Duration::from_millis(100))
+                .with_backoff_base_ms(100)
                 .with_max_backoff(Duration::from_millis(50)),
         );
 

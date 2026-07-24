@@ -110,9 +110,10 @@ fn install_jwks_mock(server: &MockServer) {
 
 fn make_validator() -> JwtValidator {
     let retry_policy = RetryPolicyConfig {
-        max_attempts: 3,
-        initial_backoff_ms: 100,
-        max_backoff_ms: 2_000,
+        max_retries: 3,
+        backoff_base_ms: 2,
+        backoff_factor: 50,
+        max_backoff: std::time::Duration::from_secs(2),
         jitter: true,
     };
     let discovery = Arc::new(OidcDiscovery::new_allowing_insecure_http_for_tests(

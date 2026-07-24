@@ -206,29 +206,38 @@ type AddrMap = Arc<ArcSwap<HashMap<String, Endpoint>>>;
 /// transient DNS failures (common in container environments where CoreDNS
 /// may briefly drop queries under load).
 async fn dns_lookup_with_retry(addr: &str) -> Result<Vec<std::net::SocketAddr>, std::io::Error> {
-    const MAX_RETRIES: u32 = 3;
-    const BASE_DELAY_MS: u64 = 100;
+    use tokio_retry::Retry;
+    use tokio_retry::strategy::ExponentialBackoff;
 
-    let mut last_err = None;
-    for attempt in 0..=MAX_RETRIES {
-        match tokio::net::lookup_host(addr).await {
-            Ok(addrs) => return Ok(addrs.collect()),
-            Err(e) => {
-                last_err = Some(e);
-                if attempt < MAX_RETRIES {
-                    let delay = BASE_DELAY_MS * 5u64.pow(attempt); // 100ms, 500ms, 2500ms
-                    tracing::debug!(
-                        addr,
-                        attempt = attempt + 1,
-                        delay_ms = delay,
-                        "DNS lookup failed, retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                }
+    // `ExponentialBackoff::from_millis(base).factor(f)` yields
+    // `base*f, base^2*f, base^3*f, ...`; base 5 and factor 20 give 100ms, 500ms,
+    // 2500ms across the retries.
+    const BACKOFF_BASE_MS: u64 = 5;
+    const BACKOFF_FACTOR: u64 = 20;
+    const MAX_RETRIES: usize = 3;
+
+    let strategy = ExponentialBackoff::from_millis(BACKOFF_BASE_MS)
+        .factor(BACKOFF_FACTOR)
+        .take(MAX_RETRIES);
+
+    let mut attempt: u32 = 0;
+    Retry::start(strategy, || {
+        attempt += 1;
+        let this_attempt = attempt;
+        async move {
+            let result = tokio::net::lookup_host(addr).await;
+            if let Err(ref e) = result {
+                tracing::debug!(
+                    addr,
+                    attempt = this_attempt,
+                    error = %e,
+                    "DNS lookup failed, retrying"
+                );
             }
+            result.map(|addrs| addrs.collect::<Vec<_>>())
         }
-    }
-    Err(last_err.expect("retry loop always sets last_err on failure"))
+    })
+    .await
 }
 
 /// [`ServiceDiscovery`] implementation that re-resolves hostnames on every

@@ -41,8 +41,8 @@ jsonwebtoken.workspace = true
 reqwest = { workspace = true, features = ["form", "json"] }
 httpdate.workspace = true
 
-# Random jitter for retry backoff
-rand.workspace = true
+# Retry driver + backoff/jitter strategies for outbound IdP calls
+tokio-retry.workspace = true
 
 # Regex-based issuer_pattern matching
 regex.workspace = true

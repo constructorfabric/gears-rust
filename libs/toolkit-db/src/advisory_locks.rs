@@ -31,33 +31,48 @@ use tokio::fs::File;
 // --------------------------- Config ------------------------------------------
 
 /// Configuration for lock acquisition attempts.
+///
+/// The backoff/jitter fields use the workspace-wide retry vocabulary and map
+/// straight onto [`tokio_retry::strategy::ExponentialBackoff`]. `max_wait` and
+/// `max_retries` are lock-specific termination knobs layered on top.
 #[derive(Debug, Clone)]
 pub struct LockConfig {
-    /// Maximum duration to wait for lock acquisition (`None` = unlimited).
+    /// Maximum wall-clock time to wait for acquisition (`None` = unlimited).
     pub max_wait: Option<Duration>,
-    /// Initial delay between retry attempts.
-    pub initial_backoff: Duration,
-    /// Maximum delay between retry attempts (cap for exponential backoff).
+    /// Maximum retries after the first attempt (`None` = unlimited, bounded
+    /// only by `max_wait`).
+    pub max_retries: Option<u32>,
+    /// [`ExponentialBackoff`](tokio_retry::strategy::ExponentialBackoff) base —
+    /// the growth ratio between retry delays.
+    pub backoff_base_ms: u64,
+    /// Multiplicative factor applied to every retry delay.
+    pub backoff_factor: u64,
+    /// Upper bound on any single retry delay (cap for exponential backoff).
     pub max_backoff: Duration,
-    /// Backoff multiplier for exponential backoff.
-    pub backoff_multiplier: f64,
-    /// Jitter percentage in [0.0, 1.0]; e.g. 0.2 means ±20% jitter.
-    pub jitter_pct: f32,
-    /// Maximum number of retry attempts (`None` = unlimited).
-    pub max_attempts: Option<u32>,
+    /// Apply full jitter to each retry delay.
+    pub jitter: bool,
 }
 
 impl Default for LockConfig {
     fn default() -> Self {
         Self {
             max_wait: Some(Duration::from_secs(30)),
-            initial_backoff: Duration::from_millis(50),
+            max_retries: None,
+            // base 2 × factor 25 → 50ms, 100ms, 200ms, … (doubling), capped at
+            // `max_backoff`.
+            backoff_base_ms: 2,
+            backoff_factor: 25,
             max_backoff: Duration::from_secs(5),
-            backoff_multiplier: 1.5,
-            jitter_pct: 0.2,
-            max_attempts: None,
+            jitter: true,
         }
     }
+}
+
+/// Outcome of a single `try_acquire_once` used to drive the retry loop:
+/// `Pending` is the retryable "held elsewhere, try again" signal.
+enum TryLockError {
+    Pending,
+    Fatal(DbLockError),
 }
 
 /* --------------------------- Guard ------------------------------------------- */
@@ -155,55 +170,48 @@ impl LockManager {
         key: &str,
         config: LockConfig,
     ) -> Result<Option<DbLockGuard>, DbLockError> {
+        use tokio_retry::RetryIf;
+        use tokio_retry::strategy::{ExponentialBackoff, jitter};
+
         let namespaced_key = format!("{gear}:{key}");
         let start = Instant::now();
-        let mut attempt = 0u32;
-        let mut backoff = config.initial_backoff;
 
-        loop {
-            attempt += 1;
+        // Exponential backoff in the shared retry vocabulary, capped at
+        // `max_backoff`.
+        let jitter_on = config.jitter;
+        let max_wait = config.max_wait;
+        let strategy = ExponentialBackoff::from_millis(config.backoff_base_ms)
+            .factor(config.backoff_factor)
+            .max_delay(config.max_backoff)
+            // Stop yielding delays once the wall-clock budget is spent — this is
+            // what bounds total wait when `max_wait` is set. Pulled between
+            // attempts, exactly where the previous loop checked the deadline.
+            .take_while(move |_| max_wait.is_none_or(|mw| start.elapsed() < mw))
+            // Cap each delay by the remaining budget, then optionally jitter.
+            .map(move |d| {
+                let capped = max_wait.map_or(d, |mw| d.min(mw.saturating_sub(start.elapsed())));
+                if jitter_on { jitter(capped) } else { capped }
+            })
+            // Retries after the first attempt (unlimited when `None`, bounded
+            // only by `max_wait`).
+            .take(config.max_retries.map_or(usize::MAX, |r| r as usize));
 
-            if let Some(max_attempts) = config.max_attempts
-                && attempt > max_attempts
-            {
-                return Ok(None);
+        // `try_acquire_once` returns `Ok(None)` while the lock is held
+        // elsewhere; model that as a retryable sentinel so tokio-retry drives
+        // the backoff, and fold the exhausted sentinel back into `Ok(None)`.
+        let action = || async {
+            match self.try_acquire_once(&namespaced_key).await {
+                Ok(Some(guard)) => Ok(guard),
+                Ok(None) => Err(TryLockError::Pending),
+                Err(e) => Err(TryLockError::Fatal(e)),
             }
-            if let Some(max_wait) = config.max_wait
-                && start.elapsed() >= max_wait
-            {
-                return Ok(None);
-            }
+        };
+        let retryable = |e: &TryLockError| matches!(e, TryLockError::Pending);
 
-            if let Some(guard) = self.try_acquire_once(&namespaced_key).await? {
-                return Ok(Some(guard));
-            }
-
-            // Sleep with jitter, capped by remaining time if any.
-            let remaining = config
-                .max_wait
-                .map_or(backoff, |mw| mw.saturating_sub(start.elapsed()));
-
-            if remaining.is_zero() {
-                return Ok(None);
-            }
-
-            #[allow(clippy::cast_precision_loss)]
-            let jitter_factor = {
-                let pct = f64::from(config.jitter_pct.clamp(0.0, 1.0));
-                let lo = 1.0 - pct;
-                let hi = 1.0 + pct;
-                // Deterministic jitter from key hash (no rand dep).
-                let h = xxh3_64(namespaced_key.as_bytes()) as f64;
-                let frac = h / u64::MAX as f64; // 0..1
-                lo + frac * (hi - lo)
-            };
-
-            let sleep_for = std::cmp::min(backoff, remaining);
-            tokio::time::sleep(sleep_for.mul_f64(jitter_factor)).await;
-
-            // Exponential backoff
-            let next = backoff.mul_f64(config.backoff_multiplier);
-            backoff = std::cmp::min(next, config.max_backoff);
+        match RetryIf::start(strategy, action, retryable).await {
+            Ok(guard) => Ok(Some(guard)),
+            Err(TryLockError::Pending) => Ok(None),
+            Err(TryLockError::Fatal(e)) => Err(e),
         }
     }
 
@@ -391,8 +399,7 @@ mod tests {
         // Different key should succeed quickly even with retries/timeouts
         let config = LockConfig {
             max_wait: Some(Duration::from_millis(200)),
-            initial_backoff: Duration::from_millis(50),
-            max_attempts: Some(3),
+            max_retries: Some(3),
             ..Default::default()
         };
 
@@ -466,7 +473,7 @@ mod tests {
         let _guard = lock_manager.lock("gear", &key).await?;
         let config = LockConfig {
             max_wait: Some(Duration::from_millis(100)),
-            max_attempts: Some(2),
+            max_retries: Some(2),
             ..Default::default()
         };
         let res = lock_manager.try_lock("gear", &key, config).await?;

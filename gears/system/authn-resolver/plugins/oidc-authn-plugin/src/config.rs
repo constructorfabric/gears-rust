@@ -191,17 +191,20 @@ impl OidcAuthNGearConfig {
         };
 
         let retry_policy_config = RetryPolicyConfig {
-            max_attempts: retry_policy.max_attempts,
-            initial_backoff_ms: parse_duration_millis(&retry_policy.initial_backoff)?,
-            max_backoff_ms: parse_duration_millis(&retry_policy.max_backoff)?,
+            max_retries: retry_policy.max_retries,
+            backoff_base_ms: retry_policy.backoff_base_ms,
+            backoff_factor: retry_policy.backoff_factor,
+            max_backoff: Duration::from_millis(retry_policy.max_backoff_ms),
             jitter: retry_policy.jitter,
         };
 
-        if retry_policy_config.initial_backoff_ms == 0
-            || retry_policy_config.initial_backoff_ms > retry_policy_config.max_backoff_ms
+        if retry_policy_config.backoff_base_ms == 0
+            || retry_policy_config.backoff_factor == 0
+            || retry_policy_config.max_backoff.is_zero()
         {
             return Err(anyhow!(
-                "`retry_policy.initial_backoff` must be > 0 and <= `retry_policy.max_backoff`"
+                "`retry_policy.backoff_base_ms`, `retry_policy.backoff_factor` and \
+                 `retry_policy.max_backoff_ms` must all be > 0"
             ));
         }
 
@@ -685,11 +688,20 @@ pub struct CircuitBreakerConfig {
     pub reset_timeout_secs: u64,
 }
 
+/// Outbound-`IdP` retry policy in the workspace-wide retry vocabulary; the
+/// backoff fields map straight onto [`tokio_retry::strategy::ExponentialBackoff`].
 #[derive(Debug, Clone)]
 pub struct RetryPolicyConfig {
-    pub max_attempts: u32,
-    pub initial_backoff_ms: u64,
-    pub max_backoff_ms: u64,
+    /// Maximum retries after the initial outbound attempt (`0` disables retries).
+    pub max_retries: u32,
+    /// [`ExponentialBackoff`](tokio_retry::strategy::ExponentialBackoff) base —
+    /// the growth ratio between delays.
+    pub backoff_base_ms: u64,
+    /// Multiplicative factor applied to every backoff delay.
+    pub backoff_factor: u64,
+    /// Upper bound on any single backoff delay.
+    pub max_backoff: Duration,
+    /// Apply full jitter to each backoff delay.
     pub jitter: bool,
 }
 
@@ -697,22 +709,11 @@ pub struct RetryPolicyConfig {
 #[must_use]
 pub(crate) fn default_retry_policy_config() -> RetryPolicyConfig {
     RetryPolicyConfig {
-        max_attempts: 3,
-        initial_backoff_ms: 100,
-        max_backoff_ms: 2_000,
+        max_retries: 3,
+        backoff_base_ms: 2,
+        backoff_factor: 50,
+        max_backoff: Duration::from_secs(2),
         jitter: true,
-    }
-}
-
-impl RetryPolicyConfig {
-    #[must_use]
-    pub fn initial_backoff(&self) -> Duration {
-        Duration::from_millis(self.initial_backoff_ms)
-    }
-
-    #[must_use]
-    pub fn max_backoff(&self) -> Duration {
-        Duration::from_millis(self.max_backoff_ms)
     }
 }
 
@@ -987,16 +988,19 @@ impl Default for HttpClientInput {
 pub struct RetryPolicyInput {
     /// Maximum number of retries after the initial outbound attempt.
     ///
-    /// `0` disables retries.
-    pub max_attempts: u32,
-    /// Initial retry delay in [`humantime`] format.
+    /// `0` disables retries. Maps to
+    /// [`ExponentialBackoff`](tokio_retry::strategy::ExponentialBackoff)`::take`.
+    pub max_retries: u32,
+    /// `ExponentialBackoff` base — the growth ratio between delays. The delay
+    /// sequence is `backoff_base_ms^n * backoff_factor`, capped by `max_backoff_ms`.
+    pub backoff_base_ms: u64,
+    /// Multiplicative factor applied to every backoff delay.
     ///
-    /// Backoff grows exponentially (doubling each retry) from this value and is
-    /// capped by `max_backoff`.
-    pub initial_backoff: String,
-    /// Upper bound for computed retry backoff in
-    /// [`humantime`] format.
-    pub max_backoff: String,
+    /// With `backoff_base_ms: 2`, `backoff_factor: 50` the schedule is
+    /// 100ms, 200ms, 400ms, ….
+    pub backoff_factor: u64,
+    /// Upper bound for any single retry delay, in milliseconds.
+    pub max_backoff_ms: u64,
     /// Enables full jitter for retry delays.
     ///
     /// When `true`, each delay is randomized in `[0, computed_backoff]`.
@@ -1008,9 +1012,10 @@ pub struct RetryPolicyInput {
 impl Default for RetryPolicyInput {
     fn default() -> Self {
         Self {
-            max_attempts: 3,
-            initial_backoff: "100ms".to_owned(),
-            max_backoff: "2s".to_owned(),
+            max_retries: 3,
+            backoff_base_ms: 2,
+            backoff_factor: 50,
+            max_backoff_ms: 2_000,
             jitter: true,
         }
     }
@@ -1107,13 +1112,6 @@ fn parse_duration_secs(input: &str) -> Result<u64> {
     humantime::parse_duration(input)
         .map(|duration| duration.as_secs())
         .map_err(|error| anyhow!("invalid duration {input:?}: {error}"))
-}
-
-fn parse_duration_millis(input: &str) -> Result<u64> {
-    let duration = humantime::parse_duration(input)
-        .map_err(|error| anyhow!("invalid duration {input:?}: {error}"))?;
-    u64::try_from(duration.as_millis())
-        .map_err(|_| anyhow!("duration too large in milliseconds: {input:?}"))
 }
 
 #[cfg(test)]
@@ -1515,7 +1513,7 @@ mod gear_input_tests {
                 "request_timeout": "5s",
                 "custom_ca_certificate_paths": ["custom-root-ca.pem"]
             },
-            "retry_policy": { "max_attempts": 5, "initial_backoff": "250ms", "max_backoff": "3s", "jitter": false },
+            "retry_policy": { "max_retries": 5, "backoff_base_ms": 2, "backoff_factor": 125, "max_backoff_ms": 3000, "jitter": false },
             "circuit_breaker": { "failure_threshold": 10, "reset_timeout": "60s" },
             "s2s_oauth": {
                 "discovery_url": "https://oidc/realms/platform",
@@ -1552,9 +1550,13 @@ mod gear_input_tests {
             .expect("circuit breaker should be enabled");
         assert_eq!(circuit_breaker.failure_threshold, 10);
         assert_eq!(circuit_breaker.reset_timeout_secs, 60);
-        assert_eq!(resolved.plugin.retry_policy.max_attempts, 5);
-        assert_eq!(resolved.plugin.retry_policy.initial_backoff_ms, 250);
-        assert_eq!(resolved.plugin.retry_policy.max_backoff_ms, 3000);
+        assert_eq!(resolved.plugin.retry_policy.max_retries, 5);
+        assert_eq!(resolved.plugin.retry_policy.backoff_base_ms, 2);
+        assert_eq!(resolved.plugin.retry_policy.backoff_factor, 125);
+        assert_eq!(
+            resolved.plugin.retry_policy.max_backoff,
+            std::time::Duration::from_secs(3)
+        );
         assert!(!resolved.plugin.retry_policy.jitter);
         assert_eq!(resolved.plugin.claim_mapper.subject_tenant_id, "tenant_id");
         assert_eq!(

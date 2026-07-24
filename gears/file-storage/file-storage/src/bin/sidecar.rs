@@ -568,8 +568,13 @@ async fn post_with_retry(
     internal_token: Option<&str>,
     body_bytes: &[u8],
 ) -> Result<reqwest::Response, reqwest::Error> {
-    let mut attempt: u32 = 1;
-    loop {
+    use tokio_retry::RetryIf;
+    use tokio_retry::strategy::FixedInterval;
+
+    let mut attempt: u32 = 0;
+    let action = || {
+        attempt += 1;
+        let this_attempt = attempt;
         let mut req = http
             .post(url)
             .header("content-type", "application/json")
@@ -585,21 +590,29 @@ async fn post_with_retry(
         if let Some(internal_token) = internal_token {
             req = req.header("x-fs-internal-token", internal_token);
         }
-        let result = req.body(body_bytes.to_vec()).send().await;
-        match result {
-            Ok(resp) => return Ok(resp),
-            Err(e) if attempt < CALLBACK_MAX_ATTEMPTS && (e.is_connect() || e.is_timeout()) => {
+        let fut = req.body(body_bytes.to_vec()).send();
+        async move {
+            let result = fut.await;
+            if let Err(ref e) = result
+                && this_attempt < CALLBACK_MAX_ATTEMPTS
+                && (e.is_connect() || e.is_timeout())
+            {
                 tracing::warn!(
-                    attempt,
+                    attempt = this_attempt,
                     error = %e,
                     "control-plane callback transport error, retrying"
                 );
-                tokio::time::sleep(CALLBACK_RETRY_DELAY).await;
-                attempt += 1;
             }
-            Err(e) => return Err(e),
+            result
         }
-    }
+    };
+    // Retry only transport connect/timeout failures; a real HTTP status is
+    // returned to the caller unchanged (P2 1.5). `CALLBACK_MAX_ATTEMPTS`
+    // includes the initial attempt, so the schedule carries one fewer delay.
+    let retryable = |e: &reqwest::Error| e.is_connect() || e.is_timeout();
+    let strategy =
+        FixedInterval::new(CALLBACK_RETRY_DELAY).take((CALLBACK_MAX_ATTEMPTS - 1) as usize);
+    RetryIf::start(strategy, action, retryable).await
 }
 
 /// Call the control-plane finalize endpoint after a successful PUT.

@@ -10,7 +10,8 @@
 
 use std::time::Duration;
 
-use rand::RngExt as _;
+use tokio_retry::Retry;
+use tokio_retry::strategy::{ExponentialBackoff, jitter};
 use tonic::transport::{Channel, Endpoint};
 use tracing::Instrument;
 
@@ -18,15 +19,12 @@ fn duration_to_i64_ms(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
-fn duration_to_u64_ms(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
 /// Configuration for gRPC client transport stack.
 ///
 /// This configuration controls transport-level settings such as timeouts and keepalive.
-/// Retry-related fields (`max_retries`, `base_backoff`, `max_backoff`) are stored here
-/// for convenience but are used by the [`crate::rpc_retry`] gear, not by the transport layer.
+/// Retry-related fields (`max_retries`, `backoff_base_ms`, `backoff_factor`,
+/// `max_backoff`) are stored here for convenience but are used by the
+/// [`crate::rpc_retry`] gear, not by the transport layer.
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct GrpcClientConfig {
@@ -42,12 +40,20 @@ pub struct GrpcClientConfig {
     /// [`crate::rpc_retry::call_with_retry`] (RPC-call retries).
     pub max_retries: u32,
 
-    /// Initial backoff duration; doubled each attempt (`base * 2^(attempt-1)`).
+    /// Base fed to `ExponentialBackoff::from_millis` — the growth ratio between
+    /// attempts (delay sequence `backoff_base_ms^n * backoff_factor`).
     ///
     /// Used by both [`connect_with_retry`] and [`crate::rpc_retry::call_with_retry`].
-    pub base_backoff: Duration,
+    pub backoff_base_ms: u64,
 
-    /// Strict upper bound on backoff duration, enforced both before and after jitter.
+    /// Multiplicative factor applied to every backoff delay. With the defaults
+    /// (base `2`, factor `50`) the schedule is 100ms, 200ms, 400ms, ….
+    ///
+    /// Used by both [`connect_with_retry`] and [`crate::rpc_retry::call_with_retry`].
+    pub backoff_factor: u64,
+
+    /// Strict upper bound on backoff duration; each delay is capped here before
+    /// full jitter (which only reduces it) is applied.
     ///
     /// Used by both [`connect_with_retry`] and [`crate::rpc_retry::call_with_retry`].
     pub max_backoff: Duration,
@@ -68,7 +74,8 @@ impl Default for GrpcClientConfig {
             connect_timeout: Duration::from_secs(10),
             rpc_timeout: Duration::from_secs(30),
             max_retries: 3,
-            base_backoff: Duration::from_millis(100),
+            backoff_base_ms: 2,
+            backoff_factor: 50,
             max_backoff: Duration::from_secs(5),
             service_name: "grpc_client",
             enable_metrics: true,
@@ -103,6 +110,25 @@ impl GrpcClientConfig {
     /// This value is used by [`crate::rpc_retry::call_with_retry`].
     pub fn with_max_retries(mut self, retries: u32) -> Self {
         self.max_retries = retries;
+        self
+    }
+
+    /// Set the [`ExponentialBackoff`](tokio_retry::strategy::ExponentialBackoff)
+    /// base (growth ratio between delays).
+    pub fn with_backoff_base_ms(mut self, base_ms: u64) -> Self {
+        self.backoff_base_ms = base_ms;
+        self
+    }
+
+    /// Set the multiplicative factor applied to every backoff delay.
+    pub fn with_backoff_factor(mut self, factor: u64) -> Self {
+        self.backoff_factor = factor;
+        self
+    }
+
+    /// Set the strict upper bound on any single backoff delay.
+    pub fn with_max_backoff(mut self, duration: Duration) -> Self {
+        self.max_backoff = duration;
         self
     }
 
@@ -220,10 +246,11 @@ where
 /// This function attempts to establish a connection and retries on failure
 /// using the retry parameters from [`GrpcClientConfig`]:
 /// - `max_retries`: Maximum number of retry attempts
-/// - `base_backoff`: Initial backoff duration; doubled each attempt (`base * 2^(attempt-1)`)
-/// - `max_backoff`: Strict upper bound on backoff duration (enforced both before and after jitter)
+/// - `backoff_base_ms` / `backoff_factor`: `ExponentialBackoff` base and factor
+///   (defaults `2`/`50` → 100ms, 200ms, 400ms, …)
+/// - `max_backoff`: Strict upper bound on backoff duration (each delay is capped here)
 ///
-/// A random jitter of 0–25 % is added after capping to spread out concurrent retries.
+/// Full jitter is then applied to each delay to spread out concurrent retries.
 ///
 /// # Example
 ///
@@ -248,57 +275,67 @@ pub async fn connect_with_retry<TClient>(
 where
     TClient: From<Channel>,
 {
-    use anyhow::Context;
+    use anyhow::Context as _;
 
     let uri_string = uri.into();
+    let uri_ref: &str = uri_string.as_str();
     let mut attempt: u32 = 0;
-
-    loop {
+    let action = || {
         attempt += 1;
-
-        match connect_with_stack::<TClient>(&uri_string, cfg).await {
-            Ok(client) => {
-                if attempt > 1 {
-                    tracing::info!(
-                        service = cfg.service_name,
-                        attempt,
-                        "gRPC connection established after retries"
-                    );
-                }
-                return Ok(client);
-            }
-            Err(e) if attempt <= cfg.max_retries => {
-                let jitter_factor = rand::rng().random_range(0.0..=0.25);
-                let backoff = crate::backoff::compute_backoff(
-                    cfg.base_backoff,
-                    cfg.max_backoff,
-                    attempt,
-                    jitter_factor,
-                );
+        let this_attempt = attempt;
+        async move {
+            let res = connect_with_stack::<TClient>(uri_ref, cfg).await;
+            // A failure that still has retries left mirrors the previous
+            // per-attempt WARN; the final failure is logged once after the loop.
+            if let Err(ref e) = res
+                && this_attempt <= cfg.max_retries
+            {
                 tracing::warn!(
                     service = cfg.service_name,
-                    attempt,
+                    attempt = this_attempt,
                     max_retries = cfg.max_retries,
                     error = %e,
-                    backoff_ms = duration_to_u64_ms(backoff),
                     "gRPC connection failed, retrying..."
                 );
-                tokio::time::sleep(backoff).await;
             }
-            Err(e) => {
-                tracing::error!(
-                    service = cfg.service_name,
-                    attempt,
-                    error = %e,
-                    "gRPC connection failed after all retries"
-                );
-                return Err(e).context(format!(
-                    "Failed to connect to {} after {} attempts",
-                    cfg.service_name, attempt
-                ));
-            }
+            res
         }
+    };
+
+    // Exponential backoff capped at `max_backoff`, with full jitter, over
+    // `max_retries` retries — the config fields map straight onto the strategy.
+    let strategy = ExponentialBackoff::from_millis(cfg.backoff_base_ms)
+        .factor(cfg.backoff_factor)
+        .max_delay(cfg.max_backoff)
+        .map(jitter)
+        .take(cfg.max_retries as usize);
+    let result = Retry::start(strategy, action).await;
+
+    match &result {
+        Ok(_) if attempt > 1 => {
+            tracing::info!(
+                service = cfg.service_name,
+                attempt,
+                "gRPC connection established after retries"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                service = cfg.service_name,
+                attempt,
+                error = %e,
+                "gRPC connection failed after all retries"
+            );
+        }
+        Ok(_) => {}
     }
+
+    result.with_context(|| {
+        format!(
+            "Failed to connect to {} after {} attempts",
+            cfg.service_name, attempt
+        )
+    })
 }
 
 /// Simple connection helper without custom configuration.
