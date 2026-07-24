@@ -15,7 +15,22 @@ use serde_json::{Value, json};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
-use account_management_sdk::{IdpNewUser, IdpProvisionTarget, IdpProvisionTenantRequest, IdpUser};
+use account_management_sdk::{
+    IdpNewUser, IdpProvisionTarget, IdpProvisionTenantRequest, IdpUser, IdpUserPatch,
+};
+
+/// Outcome of [`Service::update_user`], translated to the public
+/// `IdpUserOperationFailure` taxonomy by [`crate::domain::client`].
+#[domain_model]
+pub enum UpdateUserOutcome {
+    /// User patched; carries the post-update projection.
+    Updated(IdpUser),
+    /// No user with that id in this tenant scope.
+    NotFound,
+    /// A `username` rename collided with another user's login in the
+    /// same tenant scope.
+    UsernameTaken,
+}
 
 /// In-memory per-tenant user cache that backs every `IdpPluginClient` method on this plugin.
 #[domain_model]
@@ -119,6 +134,58 @@ impl Service {
             guard.remove(&tenant_id);
         }
         removed
+    }
+
+    /// Apply a JSON Merge Patch to a stored user and return the
+    /// post-update projection. Mirrors what a real provider's admin API
+    /// exposes: omitted fields are left untouched, `Some(None)` clears a
+    /// nullable profile field, and a `username` rename is rejected when
+    /// it collides with another login in the same tenant scope. The
+    /// `password` field is write-only and not part of the echo
+    /// projection, so it is accepted and ignored by the in-memory store.
+    pub fn apply_user_patch(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        patch: &IdpUserPatch,
+    ) -> UpdateUserOutcome {
+        let mut guard = self.users.lock();
+        let Some(scope) = guard.get_mut(&tenant_id) else {
+            return UpdateUserOutcome::NotFound;
+        };
+        if !scope.contains_key(&user_id) {
+            return UpdateUserOutcome::NotFound;
+        }
+        // Uniqueness guard runs before the mutable borrow: a rename that
+        // collides with a *different* user's login is a conflict.
+        if let Some(new_username) = &patch.username
+            && scope
+                .iter()
+                .any(|(id, u)| *id != user_id && &u.username == new_username)
+        {
+            return UpdateUserOutcome::UsernameTaken;
+        }
+        let Some(user) = scope.get_mut(&user_id) else {
+            // Unreachable after the `contains_key` guard above, but this
+            // keeps the mutable borrow total without an `expect`.
+            return UpdateUserOutcome::NotFound;
+        };
+        if let Some(username) = &patch.username {
+            user.username.clone_from(username);
+        }
+        if let Some(email) = &patch.email {
+            user.email.clone_from(email);
+        }
+        if let Some(display_name) = &patch.display_name {
+            user.display_name.clone_from(display_name);
+        }
+        if let Some(first_name) = &patch.first_name {
+            user.first_name.clone_from(first_name);
+        }
+        if let Some(last_name) = &patch.last_name {
+            user.last_name.clone_from(last_name);
+        }
+        UpdateUserOutcome::Updated(user.clone())
     }
 
     /// Returns the full per-tenant user snapshot. Filtering / ordering /

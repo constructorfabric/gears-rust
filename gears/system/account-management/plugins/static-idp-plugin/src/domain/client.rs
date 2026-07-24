@@ -8,11 +8,11 @@ use toolkit_security::SecurityContext;
 use account_management_sdk::{
     IdpDeprovisionFailure, IdpDeprovisionTenantRequest, IdpDeprovisionUserRequest,
     IdpListUsersRequest, IdpPluginClient, IdpProvisionFailure, IdpProvisionResult,
-    IdpProvisionTenantRequest, IdpProvisionUserRequest, IdpUser, IdpUserFilterField,
-    IdpUserOperationFailure,
+    IdpProvisionTenantRequest, IdpProvisionUserRequest, IdpUpdateUserRequest, IdpUser,
+    IdpUserDuplicateField, IdpUserFilterField, IdpUserOperationFailure,
 };
 
-use super::service::Service;
+use super::service::{Service, UpdateUserOutcome};
 
 fn matches_filter(user: &IdpUser, filter: &FilterNode<IdpUserFilterField>) -> bool {
     match filter {
@@ -192,6 +192,26 @@ impl IdpPluginClient for Service {
         // doc on `deprovision_user`; AM does not distinguish them.
         let _ = self.forget_user(req.tenant_context.tenant_id, req.user_id);
         Ok(())
+    }
+
+    async fn update_user(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpUpdateUserRequest,
+    ) -> Result<IdpUser, IdpUserOperationFailure> {
+        match self.apply_user_patch(req.tenant_context.tenant_id, req.user_id, &req.patch) {
+            UpdateUserOutcome::Updated(user) => Ok(user),
+            UpdateUserOutcome::NotFound => Err(IdpUserOperationFailure::NotFound {
+                detail: format!(
+                    "user {} not found in tenant {}",
+                    req.user_id, req.tenant_context.tenant_id
+                ),
+            }),
+            UpdateUserOutcome::UsernameTaken => Err(IdpUserOperationFailure::DuplicateUser {
+                field: IdpUserDuplicateField::Username,
+                detail: "username already in use in this tenant scope".to_owned(),
+            }),
+        }
     }
 
     async fn list_users(

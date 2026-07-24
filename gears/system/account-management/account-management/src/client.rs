@@ -32,7 +32,7 @@
 use std::sync::Arc;
 
 use account_management_sdk::client::AccountManagementClient;
-use account_management_sdk::idp_user::{IdpNewUser, IdpUser, ListUsersQuery};
+use account_management_sdk::idp_user::{IdpNewUser, IdpUser, IdpUserPatch, ListUsersQuery};
 use account_management_sdk::metadata::{MetadataEntry, UpsertMetadataRequest};
 use account_management_sdk::tenant::{CreateTenantRequest, Tenant, UpdateTenantRequest};
 use async_trait::async_trait;
@@ -214,6 +214,19 @@ where
     ) -> Result<(), CanonicalError> {
         self.user_service
             .delete_user(ctx, tenant_id, user_id)
+            .await
+            .map_err(CanonicalError::from)
+    }
+
+    async fn update_user(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        patch: IdpUserPatch,
+    ) -> Result<IdpUser, CanonicalError> {
+        self.user_service
+            .update_user(ctx, tenant_id, user_id, patch)
             .await
             .map_err(CanonicalError::from)
     }

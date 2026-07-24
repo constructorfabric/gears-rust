@@ -11,7 +11,8 @@ use toolkit_gts::gts_id;
 use account_management_sdk::{
     IdpDeprovisionTenantRequest, IdpDeprovisionUserRequest, IdpListUsersRequest, IdpNewUser,
     IdpPluginClient, IdpProvisionTenantRequest, IdpProvisionUserRequest, IdpTenantContext,
-    IdpUserFilterField, IdpUserOperationFailure, IdpUserPagination,
+    IdpUpdateUserRequest, IdpUserDuplicateField, IdpUserFilterField, IdpUserOperationFailure,
+    IdpUserPagination, IdpUserPatch,
 };
 use serde_json::{Value, json};
 use toolkit_odata::filter::{FilterNode, FilterOp, ODataValue};
@@ -757,4 +758,112 @@ async fn cursor_with_drifted_orderby_surfaces_as_rejected() {
         detail.contains("$filter / $orderby"),
         "rejection detail mentions the contract: got {detail:?}"
     );
+}
+
+// ─── update_user ─────────────────────────────────────────────────────
+
+/// Provision `username` (with an email) and return its stored id.
+async fn provision(svc: &Service, tenant_id: Uuid, username: &str) -> Uuid {
+    let payload =
+        IdpNewUser::new(username.to_owned()).with_email(format!("{username}@example.com"));
+    let req = IdpProvisionUserRequest::new(tenant_ctx(tenant_id), payload);
+    svc.provision_user(&ctx(), &req)
+        .await
+        .expect("provision precondition")
+        .id
+}
+
+#[tokio::test]
+async fn update_user_applies_patch_and_returns_projection() {
+    let svc = Service::new();
+    let tenant_id = Uuid::new_v4();
+    let id = provision(&svc, tenant_id, "alice").await;
+
+    let patch = IdpUserPatch::new()
+        .with_email(Some("new@example.com".to_owned()))
+        .with_display_name(Some("Alice A.".to_owned()));
+    let updated = svc
+        .update_user(
+            &ctx(),
+            &IdpUpdateUserRequest::new(tenant_ctx(tenant_id), id, patch),
+        )
+        .await
+        .expect("update applies");
+    assert_eq!(updated.id, id, "id is stable");
+    assert_eq!(updated.email.as_deref(), Some("new@example.com"));
+    assert_eq!(updated.display_name.as_deref(), Some("Alice A."));
+}
+
+#[tokio::test]
+async fn update_user_clears_nullable_field() {
+    let svc = Service::new();
+    let tenant_id = Uuid::new_v4();
+    let id = provision(&svc, tenant_id, "bob").await;
+
+    let patch = IdpUserPatch::new().with_email(None); // Some(None) → clear
+    let updated = svc
+        .update_user(
+            &ctx(),
+            &IdpUpdateUserRequest::new(tenant_ctx(tenant_id), id, patch),
+        )
+        .await
+        .expect("update applies");
+    assert!(updated.email.is_none(), "email cleared");
+}
+
+#[tokio::test]
+async fn update_user_rename_keeps_stable_id() {
+    let svc = Service::new();
+    let tenant_id = Uuid::new_v4();
+    let id = provision(&svc, tenant_id, "carol").await;
+
+    let patch = IdpUserPatch::new().with_username("carol2");
+    let updated = svc
+        .update_user(
+            &ctx(),
+            &IdpUpdateUserRequest::new(tenant_ctx(tenant_id), id, patch),
+        )
+        .await
+        .expect("rename applies");
+    assert_eq!(updated.id, id, "rename does not re-key the user");
+    assert_eq!(updated.username, "carol2");
+}
+
+#[tokio::test]
+async fn update_user_absent_returns_not_found() {
+    let svc = Service::new();
+    let tenant_id = Uuid::new_v4();
+    let patch = IdpUserPatch::new().with_email(Some("x@example.com".to_owned()));
+    let err = svc
+        .update_user(
+            &ctx(),
+            &IdpUpdateUserRequest::new(tenant_ctx(tenant_id), Uuid::new_v4(), patch),
+        )
+        .await
+        .expect_err("absent user must not be a silent success");
+    assert!(matches!(err, IdpUserOperationFailure::NotFound { .. }));
+}
+
+#[tokio::test]
+async fn update_user_rename_collision_returns_duplicate() {
+    let svc = Service::new();
+    let tenant_id = Uuid::new_v4();
+    provision(&svc, tenant_id, "alice").await;
+    let bob_id = provision(&svc, tenant_id, "bob").await;
+
+    let patch = IdpUserPatch::new().with_username("alice");
+    let err = svc
+        .update_user(
+            &ctx(),
+            &IdpUpdateUserRequest::new(tenant_ctx(tenant_id), bob_id, patch),
+        )
+        .await
+        .expect_err("rename onto an existing login must conflict");
+    assert!(matches!(
+        err,
+        IdpUserOperationFailure::DuplicateUser {
+            field: IdpUserDuplicateField::Username,
+            ..
+        }
+    ));
 }

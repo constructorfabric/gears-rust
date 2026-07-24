@@ -45,7 +45,8 @@ use std::sync::Arc;
 use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RG_TYPE_CODE};
 use account_management_sdk::{
     IdpDeprovisionUserRequest, IdpListUsersRequest, IdpNewUser, IdpPluginClient,
-    IdpProvisionUserRequest, IdpTenantContext, IdpUser, IdpUserFilterField, ListUsersQuery,
+    IdpProvisionUserRequest, IdpTenantContext, IdpUpdateUserRequest, IdpUser, IdpUserFilterField,
+    IdpUserOperationFailure, IdpUserPatch, ListUsersQuery,
 };
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::ResourceType;
@@ -131,6 +132,7 @@ pub(crate) mod pep {
         pub const CREATE: &str = "create";
         pub const LIST: &str = "list";
         pub const DELETE: &str = "delete";
+        pub const UPDATE: &str = "update";
     }
 }
 
@@ -610,6 +612,170 @@ impl UserService {
     // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-deprovision-user:p1:inst-flow-duser-service
 
     // ----------------------------------------------------------------
+    // Update user
+    // ----------------------------------------------------------------
+
+    /// Apply a JSON Merge Patch to `user_id`'s mutable attributes in
+    /// `tenant_id` via the configured `IdP` plugin. The `IdP` remains
+    /// the source of truth; AM orchestrates the saga (empty-patch guard
+    /// -> PEP gate -> tenant scope -> username normalisation -> GTS
+    /// structural validation of changed fields -> `IdP` call -> nil-id
+    /// guard) and persists nothing per
+    /// `cpt-cf-account-management-constraint-no-user-storage`.
+    ///
+    /// The patch semantics are documented on [`IdpUserPatch`]: omitted
+    /// fields are unchanged, `Some(None)` clears a nullable profile
+    /// field, and a `password` value sets a new credential. Unlike
+    /// `delete_user`, an absent user is NOT folded into success — the
+    /// provider surfaces [`account_management_sdk::IdpUserOperationFailure::NotFound`]
+    /// which AM maps to [`DomainError::UserNotFound`] (HTTP 404).
+    ///
+    /// # Errors
+    ///
+    /// * [`DomainError::Validation`] -- empty patch; a username rename
+    ///   that is all-whitespace or over the length cap; a profile field
+    ///   over its cap or failing the GTS schema; a provider payload
+    ///   rejection (incl. rejected password).
+    /// * [`DomainError::UserAlreadyExists`] -- a username rename
+    ///   collided with an existing login (HTTP 409).
+    /// * [`DomainError::UserNotFound`] -- the `IdP` reports the target
+    ///   user absent in this tenant scope (HTTP 404).
+    /// * [`DomainError::NotFound`] -- `tenant_id` does not resolve.
+    /// * [`DomainError::ServiceUnavailable`] -- GTS Types Registry / DB
+    ///   transport failure inside `resolve_active_tenant` or the patch
+    ///   validator.
+    /// * [`DomainError::IdpUnavailable`] -- transport failure or timeout
+    ///   on the `IdP` call.
+    /// * [`DomainError::UnsupportedOperation`] -- provider declined the
+    ///   operation.
+    /// * [`DomainError::Internal`] -- provider returned `Uuid::nil()`
+    ///   (plugin contract violation) or an unknown SDK failure variant.
+    // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-update-user:p1:inst-flow-uuser-service
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "flat guard sequence (empty-patch -> PEP gate -> tenant scope -> username normalisation -> profile caps -> GTS structural -> IdP call -> response nil-id guard) is the security-critical ordering reviewers eyeball-check; mirrors create_user and keeps the @cpt-* CPT markers anchored per step"
+    )]
+    pub async fn update_user(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        mut patch: IdpUserPatch,
+    ) -> Result<IdpUser, DomainError> {
+        // Reject an all-`None` patch before any PEP / IdP round trip:
+        // a no-field PATCH carries no intent and must not issue an IdP
+        // call. Mirrors `TenantService::update_tenant`'s empty guard.
+        if patch.is_empty() {
+            return Err(DomainError::Validation {
+                detail: "update_user: patch is empty; at least one field required".to_owned(),
+            });
+        }
+
+        // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-update-user:p1:inst-flow-uuser-resolve-tenant
+        // @cpt-begin:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-uuser
+        // PEP gate FIRST, then tenant existence + status guard — same
+        // security ordering as create_user / delete_user.
+        let scope = self.authorize(ctx, pep::actions::UPDATE, tenant_id).await?;
+        let actor = ctx.subject_id();
+        let tenant_context = self.resolve_active_tenant(&scope, tenant_id).await?;
+        // @cpt-end:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-uuser
+        // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-update-user:p1:inst-flow-uuser-resolve-tenant
+
+        // Normalise + bound a username rename exactly as create_user
+        // treats the create-time username: trim (whitespace-equivalence
+        // is AM policy, not schema-level), reject all-whitespace, cap
+        // before the IdP round-trip.
+        if let Some(username) = patch.username.as_ref() {
+            let trimmed = username.trim();
+            if trimmed.is_empty() {
+                return Err(DomainError::Validation {
+                    detail: "update_user: username MUST not be all-whitespace".to_owned(),
+                });
+            }
+            if trimmed.chars().count() > MAX_USERNAME_CHARS {
+                return Err(DomainError::Validation {
+                    detail: format!(
+                        "update_user: username MUST be {MAX_USERNAME_CHARS} characters or fewer"
+                    ),
+                });
+            }
+            if trimmed.len() != username.len() {
+                patch.username = Some(trimmed.to_owned());
+            }
+        }
+
+        // Pre-flight char-count caps on the profile fields being SET to
+        // a value (`Some(Some(_))`); clearing (`Some(None)`) carries no
+        // value to cap. Cuts megabyte-scale payloads before the GTS
+        // validator's registry round-trip, mirroring create_user.
+        check_profile_field_bound("email", patch.email.as_ref().and_then(|e| e.as_deref()))?;
+        check_profile_field_bound(
+            "display_name",
+            patch.display_name.as_ref().and_then(|d| d.as_deref()),
+        )?;
+        crate::domain::gts_validation::validate_user_patch_via_gts(&patch, &*self.types_registry)
+            .await?;
+
+        // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-update-user:p1:inst-flow-uuser-invoke-contract
+        // Convert internal `TenantContext` → SDK `IdpTenantContext` at
+        // the plugin-SPI boundary.
+        let req =
+            IdpUpdateUserRequest::new(IdpTenantContext::from(&tenant_context), user_id, patch);
+        let outcome = self.idp_user.update_user(ctx, &req).await;
+        // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-update-user:p1:inst-flow-uuser-invoke-contract
+
+        match outcome {
+            // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-update-user:p1:inst-flow-uuser-success-return
+            Ok(projection) => {
+                // Plugin-contract guard: a `Uuid::nil()` user id is a
+                // contract violation (mirrors create_user). The id
+                // flows into `am.events` as the authoritative IdP-issued
+                // identifier; a nil value would coalesce distinct users
+                // into one audit bucket.
+                if projection.id.is_nil() {
+                    tracing::warn!(
+                        target: "am.user.audit",
+                        tenant_id = %tenant_id,
+                        "update_user: provider returned Uuid::nil() as user id (plugin contract violation)"
+                    );
+                    return Err(DomainError::Internal {
+                        diagnostic: format!(
+                            "update_user: provider returned Uuid::nil() as user id for tenant {tenant_id} (plugin contract violation)"
+                        ),
+                        cause: None,
+                    });
+                }
+                tracing::info!(
+                    target: "am.events",
+                    event = "user_updated",
+                    tenant_id = %tenant_id,
+                    user_id = %projection.id,
+                    actor_uuid = %actor,
+                    outcome = "ok",
+                    "am user updated"
+                );
+                Ok(projection)
+            }
+            // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-update-user:p1:inst-flow-uuser-success-return
+            // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-update-user:p1:inst-flow-uuser-provider-error-return
+            // Absent target user is a 404 for update (NOT folded into
+            // success the way `deprovision_user` treats an absent user).
+            // Pre-empt the shared failure mapping here — where `user_id`
+            // is in scope — so the canonical envelope carries the precise
+            // resource identifier.
+            Err(IdpUserOperationFailure::NotFound { .. }) => Err(DomainError::UserNotFound {
+                detail: format!("user {user_id} not found in tenant {tenant_id}"),
+                resource: user_id.to_string(),
+            }),
+            // All other failure categories share the redact + warn
+            // mapping in [`UserOperationFailureExt::into_domain_error`].
+            Err(failure) => Err(failure.into_domain_error(tenant_id)),
+            // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-update-user:p1:inst-flow-uuser-provider-error-return
+        }
+    }
+    // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-update-user:p1:inst-flow-uuser-service
+
+    // ----------------------------------------------------------------
     // List users
     // ----------------------------------------------------------------
 
@@ -622,13 +788,12 @@ impl UserService {
     /// one-shot filtered lookup the authoritative existence check for
     /// a specific user.
     ///
-    /// User profile mutation is intentionally **not** exposed by AM —
-    /// `email` / `display_name` / `username` live in the `IdP` and
-    /// SCIM-style edits go directly to the provider's admin API per
-    /// `cpt-cf-account-management-adr-idp-user-identity-source-of-truth`.
-    /// AM exposes only the lifecycle saga (`create_user` /
-    /// `delete_user`) and read-side projection (`get_user` /
-    /// `list_users`).
+    /// User profile mutation is exposed through [`Self::update_user`]
+    /// as a pure pass-through to the `IdP` (AM persists nothing per
+    /// `cpt-cf-account-management-adr-idp-user-identity-source-of-truth`).
+    /// This method is the read-side projection; the full user surface is
+    /// the lifecycle saga (`create_user` / `update_user` / `delete_user`)
+    /// plus the read side (`get_user` / `list_users`).
     ///
     /// # Errors
     ///

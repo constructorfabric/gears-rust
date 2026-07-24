@@ -2321,7 +2321,9 @@
             "type": "boolean"
           },
           "value": {
-            "type": "string"
+            "description": "Plaintext password. Write-only: accepted on requests, never\nserialized into any response body.",
+            "type": "string",
+            "writeOnly": true
           }
         },
         "required": [
@@ -5287,6 +5289,56 @@
           "at"
         ],
         "title": "UserEvent",
+        "type": "object"
+      },
+      "UserUpdateRequestDto": {
+        "additionalProperties": false,
+        "description": "PATCH body for `/tenants/{tenant_id}/users/{user_id}` — a JSON Merge\nPatch (RFC 7396) over a user's mutable attributes. An omitted field is\nleft unchanged; an explicit `null` clears a nullable field; a value\nsets it.\n\n`username` is the login identifier: it can be renamed (send a value)\nbut NOT cleared — an explicit `null` is rejected with\n`code=validation`. `password` sets a new credential (write-only; it is\nnever echoed in the response projection). An all-empty patch is\nrejected with `code=validation`. `deny_unknown_fields` locks the wire\nenvelope so a client that sends an immutable field (e.g. `id`) in the\npatch sees an explicit 400 rather than a silently-dropped mutation.",
+        "properties": {
+          "display_name": {
+            "description": "`null` clears the display name, a string sets it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email": {
+            "description": "`null` clears the email, a string sets it, omission leaves it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "first_name": {
+            "description": "`null` clears the given name, a string sets it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_name": {
+            "description": "`null` clears the family name, a string sets it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "password": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NewUserPasswordDto",
+                "description": "Set a new credential. Omit to leave the password unchanged."
+              }
+            ]
+          },
+          "username": {
+            "description": "Rename the login identifier. Omit to leave unchanged; an explicit\n`null` is rejected (the login identifier is required). Modelled as\ntri-state `Option<Option<String>>` NOT to permit `null` but to\ndistinguish it from an omitted field so the explicit-`null` case\ncan be rejected; the schema advertises it as an optional,\nnon-nullable string (`value_type = String`) to match that contract.",
+            "type": "string"
+          }
+        },
         "type": "object"
       },
       "Vec": {
@@ -8967,6 +9019,152 @@
           }
         ],
         "summary": "Deprovision a user from a tenant",
+        "tags": [
+          "Tenant Users"
+        ]
+      },
+      "patch": {
+        "description": "Apply a JSON Merge Patch (RFC 7396) to a user's mutable attributes via the configured IdP plugin. AM persists no local user state; the update is a pass-through and the IdP remains the source of truth. Omitted fields are left unchanged; an explicit `null` clears a nullable profile field (`email`, `display_name`, `first_name`, `last_name`); `username` may be renamed (send a value) but NOT cleared (an explicit `null` is rejected); `password` sets a new credential and is never echoed back. Returns 200 OK with the post-update user body projected through `gts.cf.core.am.user.v1~`. An empty patch is rejected with `code=validation`. Unlike DELETE, a patch against a user the IdP reports absent returns 404 -- it is NOT folded into success. A username rename that collides with an existing login returns 409.",
+        "operationId": "account_management.update_tenant_user",
+        "parameters": [
+          {
+            "description": "Tenant UUID",
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "IdP-issued UUID user identifier",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserUpdateRequestDto"
+              }
+            }
+          },
+          "description": "User attributes merge patch",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserDto"
+                }
+              }
+            },
+            "description": "Updated tenant user"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "501": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "IdP plugin does not support user updates"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "IdP unavailable (transport failure or timeout)"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Update mutable attributes of a tenant user",
         "tags": [
           "Tenant Users"
         ]

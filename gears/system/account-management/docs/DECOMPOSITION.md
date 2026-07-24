@@ -419,7 +419,7 @@ upstream PRD/DESIGN definition, with no broken references.
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-feature-idp-user-operations-contract`
 
-- **Purpose**: Define the pluggable IdP user-operations contract that makes the configured IdP the source of truth for user identity and user-tenant binding, and expose that contract through Account Management's tenant-scoped user REST surface. The feature owns the `IdpPluginClient` trait for user provisioning, deprovisioning, and tenant-scoped user query, together with the provisioning saga and compensation reaper that keep AM intent and IdP state aligned without AM ever becoming the system of record for user profiles or credentials. Concrete IdP adapter crates (Keycloak, Zitadel, Dex, etc.) are intentionally excluded — they conform to this contract but ship outside this gear.
+- **Purpose**: Define the pluggable IdP user-operations contract that makes the configured IdP the source of truth for user identity and user-tenant binding, and expose that contract through Account Management's tenant-scoped user REST surface. The feature owns the `IdpPluginClient` trait for user provisioning, update, deprovisioning, and tenant-scoped user query, together with the provisioning saga and compensation reaper that keep AM intent and IdP state aligned without AM ever becoming the system of record for user profiles or credentials. Concrete IdP adapter crates (Keycloak, Zitadel, Dex, etc.) are intentionally excluded — they conform to this contract but ship outside this gear.
 
 - **Depends On**: `cpt-cf-account-management-feature-tenant-hierarchy-management`, `cpt-cf-account-management-feature-errors-observability`
 
@@ -427,9 +427,10 @@ upstream PRD/DESIGN definition, with no broken references.
   - Pluggable `IdpPluginClient` user-operations trait (contract surface) consumed by the user-service handlers and wired through ClientHub.
   - Tenant-scoped user provisioning: authenticated request → contract `provision_user` call → IdP becomes the SoT for the resulting user and its binding to the tenant.
   - Tenant-scoped user deprovisioning: contract `deprovision_user` call; already-absent IdP user is a successful no-op.
+  - Tenant-scoped user update: contract `update_user` call applying a JSON Merge Patch of mutable attributes (`username`, `email`, `display_name`, `first_name`, `last_name`, `password`) as a pass-through; an absent user surfaces as `not_found` (NOT folded into success). No AM-side user state is persisted.
   - Tenant-scoped user query: list users in a tenant and point-existence checks used by other features (e.g. callers combine this with Resource Group membership operations).
   - IdP unavailability contract: user operations fail with `idp_unavailable` rather than serving stale data — AM holds no local user table, projection, or membership cache.
-  - Three REST user operations layered on top of the contract (listed under API below).
+  - Four REST user operations layered on top of the contract (listed under API below).
   - User-identity schema reference (`gts://gts.cf.core.am.user.v1~`) published for downstream consumers that need the user projection shape at tenant boundary.
 
 - **Out of scope**:
@@ -443,6 +444,7 @@ upstream PRD/DESIGN definition, with no broken references.
 
   - [ ] `p1` - `cpt-cf-account-management-fr-idp-user-provision`
   - [ ] `p1` - `cpt-cf-account-management-fr-idp-user-deprovision`
+  - [ ] `p1` - `cpt-cf-account-management-fr-idp-user-update`
   - [ ] `p1` - `cpt-cf-account-management-fr-idp-user-query`
   - [ ] `p1` - `cpt-cf-account-management-nfr-authentication-context`
 
@@ -452,6 +454,7 @@ upstream PRD/DESIGN definition, with no broken references.
   - `cpt-cf-account-management-adr-idp-contract-separation`
   - `cpt-cf-account-management-adr-idp-user-identity-source-of-truth`
   - `cpt-cf-account-management-adr-idp-user-tenant-binding`
+  - `cpt-cf-account-management-adr-user-attribute-update`
 
 - **Design Constraints Covered**:
 
@@ -470,6 +473,7 @@ upstream PRD/DESIGN definition, with no broken references.
 - **API**:
   - GET /tenants/{tenant_id}/users (`listUsers`)
   - POST /tenants/{tenant_id}/users (`createUser`)
+  - PATCH /tenants/{tenant_id}/users/{user_id} (`updateTenantUser`)
   - DELETE /tenants/{tenant_id}/users/{user_id} (`deleteUser`)
 
 - **Sequences**:

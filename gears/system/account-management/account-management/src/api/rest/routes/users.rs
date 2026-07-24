@@ -127,5 +127,49 @@ pub(super) fn register_users_routes(mut router: Router, openapi: &dyn OpenApiReg
         )
         .register(router, openapi);
 
+    // PATCH /account-management/v1/tenants/{tenant_id}/users/{user_id}
+    router = OperationBuilder::patch(ENTRY_PATH)
+        .operation_id("account_management.update_tenant_user")
+        .summary("Update mutable attributes of a tenant user")
+        .description(
+            "Apply a JSON Merge Patch (RFC 7396) to a user's mutable attributes via the \
+             configured IdP plugin. AM persists no local user state; the update is a \
+             pass-through and the IdP remains the source of truth. Omitted fields are left \
+             unchanged; an explicit `null` clears a nullable profile field (`email`, \
+             `display_name`, `first_name`, `last_name`); `username` may be renamed (send a \
+             value) but NOT cleared (an explicit `null` is rejected); `password` sets a new \
+             credential and is never echoed back. Returns 200 OK with the post-update user \
+             body projected through `gts.cf.core.am.user.v1~`. An empty patch is rejected \
+             with `code=validation`. Unlike DELETE, a patch against a user the IdP reports \
+             absent returns 404 -- it is NOT folded into success. A username rename that \
+             collides with an existing login returns 409.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .no_license_required()
+        .path_param("tenant_id", "Tenant UUID")
+        .path_param("user_id", "IdP-issued UUID user identifier")
+        .json_request::<dto::UserUpdateRequestDto>(openapi, "User attributes merge patch")
+        .handler(handlers::update_user)
+        .json_response_with_schema::<dto::UserDto>(
+            openapi,
+            http::StatusCode::OK,
+            "Updated tenant user",
+        )
+        .standard_errors(openapi)
+        // 501 / 503 are outside the standard set: `idp_unsupported_operation`
+        // and `idp_unavailable` surface from `IdpPluginClient`.
+        .problem_response(
+            openapi,
+            http::StatusCode::NOT_IMPLEMENTED,
+            "IdP plugin does not support user updates",
+        )
+        .problem_response(
+            openapi,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "IdP unavailable (transport failure or timeout)",
+        )
+        .register(router, openapi);
+
     router
 }

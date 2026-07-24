@@ -533,3 +533,276 @@ async fn list_users_http_default_no_filter_no_orderby_returns_200() {
     let body = response_body(resp).await;
     assert!(body.get("items").is_some());
 }
+
+// ─── PATCH /tenants/{id}/users/{user_id} ─────────────────────────────
+
+/// Provision `username` in `root` and return the IdP-assigned id from
+/// the 201 response body.
+async fn provision_and_id(router: &axum::Router, root: Uuid, body: serde_json::Value) -> Uuid {
+    let req = json_request(
+        "POST",
+        &format!("/account-management/v1/tenants/{root}/users"),
+        Some(body),
+        ctx_for(root),
+    );
+    let resp = router.clone().oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::CREATED, "provision precondition");
+    let body = response_body(resp).await;
+    Uuid::parse_str(body["id"].as_str().expect("id string")).expect("id uuid")
+}
+
+#[tokio::test]
+async fn update_user_patches_attributes_returns_200() {
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let router = build_users_router(&h);
+
+    let id = provision_and_id(&router, root, serde_json::json!({ "username": "alice" })).await;
+
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{root}/users/{id}"),
+        Some(serde_json::json!({ "email": "alice@example.com", "display_name": "Alice A." })),
+        ctx_for(root),
+    );
+    let resp = router.clone().oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    assert_eq!(body["id"].as_str().expect("id"), id.to_string());
+    assert_eq!(body["username"], "alice");
+    assert_eq!(body["email"], "alice@example.com");
+    assert_eq!(body["display_name"], "Alice A.");
+
+    // Confirm the mutation persisted at the IdP via the point-lookup.
+    let req = json_request(
+        "GET",
+        &format!(
+            "/account-management/v1/tenants/{root}/users\
+             ?%24filter=id%20eq%20{id}&limit=1"
+        ),
+        None,
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    assert_eq!(body["items"][0]["email"], "alice@example.com");
+}
+
+#[tokio::test]
+async fn update_user_null_clears_nullable_field() {
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let router = build_users_router(&h);
+
+    let id = provision_and_id(
+        &router,
+        root,
+        serde_json::json!({ "username": "bob", "email": "bob@example.com", "display_name": "Bob" }),
+    )
+    .await;
+
+    // JSON Merge Patch: explicit null clears `email`, `display_name`
+    // omitted stays unchanged.
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{root}/users/{id}"),
+        Some(serde_json::json!({ "email": null })),
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    assert!(
+        body.get("email").is_none() || body["email"].is_null(),
+        "email MUST be cleared: {body}"
+    );
+    assert_eq!(body["display_name"], "Bob", "display_name MUST be retained");
+}
+
+#[tokio::test]
+async fn update_user_rename_username_returns_200() {
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let router = build_users_router(&h);
+
+    let id = provision_and_id(&router, root, serde_json::json!({ "username": "carol" })).await;
+
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{root}/users/{id}"),
+        Some(serde_json::json!({ "username": "carol2" })),
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    assert_eq!(body["username"], "carol2");
+    assert_eq!(
+        body["id"].as_str().expect("id"),
+        id.to_string(),
+        "id is stable across rename"
+    );
+}
+
+#[tokio::test]
+async fn update_user_rename_collision_returns_409() {
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let router = build_users_router(&h);
+
+    provision_and_id(&router, root, serde_json::json!({ "username": "alice" })).await;
+    let bob_id = provision_and_id(&router, root, serde_json::json!({ "username": "bob" })).await;
+
+    // Rename bob → "alice" collides with the existing login.
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{root}/users/{bob_id}"),
+        Some(serde_json::json!({ "username": "alice" })),
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    let (status, _body) = response_problem(resp).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn update_user_unknown_user_returns_404() {
+    // Unlike DELETE, a PATCH against an absent user is a 404 — the
+    // provider's NotFound is NOT folded into success.
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let router = build_users_router(&h);
+
+    let ghost = Uuid::new_v4();
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{root}/users/{ghost}"),
+        Some(serde_json::json!({ "email": "ghost@example.com" })),
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    let (status, _body) = response_problem(resp).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn update_user_empty_patch_returns_400() {
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let router = build_users_router(&h);
+
+    let id = provision_and_id(&router, root, serde_json::json!({ "username": "dave" })).await;
+
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{root}/users/{id}"),
+        Some(serde_json::json!({})),
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    let (status, _body) = response_problem(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "empty patch MUST be 400");
+}
+
+#[tokio::test]
+async fn update_user_null_username_returns_400() {
+    // `username` is the required login identifier: an explicit null
+    // (clear) is rejected at the wire boundary.
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let router = build_users_router(&h);
+
+    let id = provision_and_id(&router, root, serde_json::json!({ "username": "erin" })).await;
+
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{root}/users/{id}"),
+        Some(serde_json::json!({ "username": null })),
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    let (status, _body) = response_problem(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "null username MUST be 400");
+}
+
+#[tokio::test]
+async fn update_user_unknown_field_returns_400_or_422() {
+    // `deny_unknown_fields` locks the wire envelope: a client that
+    // PATCHes an immutable field (e.g. `id`) sees an explicit client
+    // error rather than a silently-dropped mutation.
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let router = build_users_router(&h);
+
+    let id = provision_and_id(&router, root, serde_json::json!({ "username": "frank" })).await;
+
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{root}/users/{id}"),
+        Some(serde_json::json!({ "id": Uuid::new_v4() })),
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    assert!(
+        matches!(
+            resp.status(),
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+        ),
+        "unknown field MUST surface as 400/422, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn update_user_for_unknown_tenant_returns_404() {
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let router = build_users_router(&h);
+
+    let unknown = Uuid::new_v4();
+    let some_user = Uuid::new_v4();
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{unknown}/users/{some_user}"),
+        Some(serde_json::json!({ "email": "x@example.com" })),
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    let (status, _body) = response_problem(resp).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn update_user_password_only_returns_200_and_never_echoes_password() {
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let router = build_users_router(&h);
+
+    let id = provision_and_id(&router, root, serde_json::json!({ "username": "grace" })).await;
+
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{root}/users/{id}"),
+        Some(serde_json::json!({ "password": { "value": "s3cret!", "temporary": true } })),
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    assert_eq!(body["username"], "grace");
+    assert!(
+        body.get("password").is_none(),
+        "password MUST NOT be echoed: {body}"
+    );
+}

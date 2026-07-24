@@ -3,8 +3,9 @@
 //! Public contract that deployment-specific `IdP` plugins implement and
 //! that AM consumes through `ClientHub`. The trait carries two
 //! tenant-lifecycle methods ([`IdpPluginClient::provision_tenant`],
-//! [`IdpPluginClient::deprovision_tenant`]) and three user-lifecycle
+//! [`IdpPluginClient::deprovision_tenant`]) and four user-lifecycle
 //! methods ([`IdpPluginClient::provision_user`],
+//! [`IdpPluginClient::update_user`],
 //! [`IdpPluginClient::deprovision_user`],
 //! [`IdpPluginClient::list_users`]) — together with the
 //! request / result / failure shapes they exchange. Every method
@@ -78,7 +79,7 @@ use toolkit_odata::Page;
 
 use crate::idp_user::{
     IdpDeprovisionUserRequest, IdpListUsersRequest, IdpProvisionUserRequest, IdpTenantContext,
-    IdpUser, IdpUserOperationFailure,
+    IdpUpdateUserRequest, IdpUser, IdpUserOperationFailure,
 };
 
 /// Whether the tenant being provisioned is the platform root or a
@@ -432,8 +433,9 @@ impl core::error::Error for IdpDeprovisionFailure {}
 ///   tick (both `hard_delete_batch` and `reap_stuck_provisioning`
 ///   take a 600-second DB lease before invoking the plugin so two
 ///   replicas cannot simultaneously call for the same tenant).
-/// * `provision_user` / `deprovision_user` / `list_users` — exactly
-///   one call per public REST request (or sibling SDK consumer).
+/// * `provision_user` / `update_user` / `deprovision_user` /
+///   `list_users` — exactly one call per public REST request (or
+///   sibling SDK consumer).
 ///
 /// Plugins MUST own their transport-level resilience: retries with
 /// vendor-appropriate backoff, ratelimit handling, circuit breaking
@@ -623,6 +625,38 @@ pub trait IdpPluginClient: Send + Sync + 'static {
         let _ = (ctx, req);
         Err(IdpUserOperationFailure::UnsupportedOperation {
             detail: "list_users not implemented".to_owned(),
+        })
+    }
+
+    /// Apply a JSON Merge Patch to a user's mutable attributes in the
+    /// supplied tenant scope.
+    ///
+    /// On success the provider returns the post-update [`IdpUser`]
+    /// projection. The patch semantics are documented on
+    /// [`crate::IdpUserPatch`]: omitted fields are left unchanged,
+    /// `Some(None)` clears a nullable field, and a `password` value
+    /// sets a new credential.
+    ///
+    /// Unlike `deprovision_user`, this operation MUST NOT treat an
+    /// absent user as a success: a patch against a user the provider
+    /// cannot find returns [`IdpUserOperationFailure::NotFound`] so the
+    /// REST surface can answer `404`. A username rename that collides
+    /// with an existing login returns
+    /// [`IdpUserOperationFailure::DuplicateUser`]; a rejected password
+    /// returns [`IdpUserOperationFailure::PasswordPolicy`].
+    ///
+    /// Default impl returns
+    /// [`IdpUserOperationFailure::UnsupportedOperation`] so tenant-only
+    /// and read-only adapters compile without stubbing this method;
+    /// mutating providers MUST override it and MUST NOT silently no-op.
+    async fn update_user(
+        &self,
+        ctx: &SecurityContext,
+        req: &IdpUpdateUserRequest,
+    ) -> Result<IdpUser, IdpUserOperationFailure> {
+        let _ = (ctx, req);
+        Err(IdpUserOperationFailure::UnsupportedOperation {
+            detail: "update_user not implemented".to_owned(),
         })
     }
     // @cpt-end:cpt-cf-account-management-dod-idp-user-operations-contract-contract-trait-surface:p1:inst-trait-user-ops-surface

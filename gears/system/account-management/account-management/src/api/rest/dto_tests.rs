@@ -29,7 +29,7 @@ use toolkit_security::SecurityContext;
 use super::{
     MeDto, NewUserPasswordDto, PutTenantMetadataDto, ResolvedTenantMetadataDto,
     TenantCreateRequestDto, TenantDto, TenantMetadataEntryDto, TenantUpdateRequestDto,
-    UserCreateRequestDto, UserDto,
+    UserCreateRequestDto, UserDto, UserUpdateRequestDto,
 };
 
 fn sample_tenant() -> Uuid {
@@ -189,6 +189,86 @@ fn user_create_dto_required_username_only_deserialises() {
     assert_eq!(dto.username, "alice");
     assert!(dto.email.is_none());
     assert!(dto.display_name.is_none());
+}
+
+#[test]
+fn user_update_dto_tri_state_distinguishes_absent_null_and_value() {
+    // RFC 7396 JSON Merge Patch: an omitted key leaves the field
+    // unchanged (`None`), an explicit `null` clears it (`Some(None)`),
+    // and a value sets it (`Some(Some(v))`). This is the load-bearing
+    // wire behaviour the `double_option` deserializer provides.
+    //
+    // Here: `email` is set, `display_name` is cleared, `first_name` is
+    // omitted (absent), `last_name` is set.
+    let raw = r#"{"email":"a@example.test","display_name":null,"last_name":"Zed"}"#;
+    let dto: UserUpdateRequestDto = serde_json::from_str(raw).unwrap();
+    assert_eq!(
+        dto.email,
+        Some(Some("a@example.test".to_owned())),
+        "value -> Some(Some)"
+    );
+    assert_eq!(
+        dto.display_name,
+        Some(None),
+        "explicit null -> Some(None) (clear)"
+    );
+    assert_eq!(dto.first_name, None, "omitted -> None (unchanged)");
+    assert_eq!(dto.last_name, Some(Some("Zed".to_owned())));
+    assert_eq!(dto.username, None, "omitted username -> None (unchanged)");
+}
+
+#[test]
+fn user_update_dto_lowers_tri_state_into_idp_user_patch() {
+    let raw = r#"{"username":"alice2","email":null,"first_name":"Al"}"#;
+    let dto: UserUpdateRequestDto = serde_json::from_str(raw).unwrap();
+    let patch = dto.into_idp_user_patch().expect("valid patch lowers");
+    assert_eq!(
+        patch.username.as_deref(),
+        Some("alice2"),
+        "rename propagates"
+    );
+    assert_eq!(patch.email, Some(None), "explicit null lowers to clear");
+    assert_eq!(patch.first_name, Some(Some("Al".to_owned())));
+    assert_eq!(patch.display_name, None, "omitted stays unchanged");
+    assert!(patch.password.is_none());
+}
+
+#[test]
+fn user_update_dto_null_username_is_rejected_by_lowering() {
+    // The login identifier is required and cannot be cleared: an
+    // explicit `null` on `username` MUST surface as a validation error
+    // at the wire boundary, not silently become "unchanged".
+    let dto: UserUpdateRequestDto = serde_json::from_str(r#"{"username":null}"#).unwrap();
+    assert_eq!(
+        dto.username,
+        Some(None),
+        "null username parses to Some(None)"
+    );
+    assert!(
+        dto.into_idp_user_patch().is_err(),
+        "clearing the required username MUST be rejected"
+    );
+}
+
+#[test]
+fn user_update_dto_rejects_unknown_fields() {
+    // `deny_unknown_fields` locks the wire envelope so an immutable /
+    // misspelled field is an explicit error rather than a dropped write.
+    let err = serde_json::from_str::<UserUpdateRequestDto>(r#"{"id":"x"}"#);
+    assert!(err.is_err(), "unknown field MUST fail deserialization");
+}
+
+#[test]
+fn user_update_dto_password_lowers_into_patch() {
+    let raw = r#"{"password":{"value":"s3cret!","temporary":true}}"#;
+    let dto: UserUpdateRequestDto = serde_json::from_str(raw).unwrap();
+    let patch = dto
+        .into_idp_user_patch()
+        .expect("password-only patch is valid");
+    let pw = patch.password.as_ref().expect("password lowered");
+    assert_eq!(pw.value, "s3cret!");
+    assert!(pw.temporary);
+    assert!(!patch.is_empty(), "password-only patch is non-empty");
 }
 
 #[test]

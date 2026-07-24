@@ -24,7 +24,7 @@ use toolkit_odata::ODataQuery;
 use toolkit_odata::filter::convert_expr_to_filter_node;
 use toolkit_security::SecurityContext;
 
-use crate::api::rest::dto::{UserCreateRequestDto, UserDto};
+use crate::api::rest::dto::{UserCreateRequestDto, UserDto, UserUpdateRequestDto};
 use crate::domain::error::DomainError;
 use crate::domain::user::service::UserService;
 
@@ -186,13 +186,13 @@ mod tests;
 ///
 /// # No `Location` header
 ///
-/// AM intentionally does not surface a single-user GET — per
-/// DECOMPOSITION §2.5 the user-ops API list is exactly
-/// `{listUsers, createUser, deleteUser}`. The canonical read-back
-/// shape is the filtered listing
+/// AM intentionally does not surface a single-user GET. The per-user
+/// entry path `/users/{user_id}` exists for `PATCH` (update) and
+/// `DELETE` (deprovision) only — there is no `GET` on it. The canonical
+/// read-back shape is the filtered listing
 /// `GET /tenants/{tenant_id}/users?$filter=id eq <uuid>`. A `Location`
-/// pointing at `/users/{user_id}` would imply a per-user resource
-/// that does not exist on the AM REST surface and would yield a 405.
+/// pointing at `/users/{user_id}` would advertise a readable resource
+/// that does not exist and would 405 on a follow-up `GET`.
 ///
 /// # Errors
 ///
@@ -223,6 +223,41 @@ pub async fn create_user(
     // do NOT swap to `created_json` without first landing the per-user
     // GET endpoint.
     Ok((axum::http::StatusCode::CREATED, Json(dto)))
+}
+
+/// `PATCH /account-management/v1/tenants/{tenant_id}/users/{user_id}`
+///
+/// JSON Merge Patch (RFC 7396) over the user's mutable attributes.
+/// Returns HTTP 200 with the post-update `IdP`-projected user body.
+/// Omitted fields are unchanged; an explicit `null` clears a nullable
+/// profile field; `username` may be renamed but not cleared; `password`
+/// sets a new credential (never echoed back).
+///
+/// # Errors
+///
+/// Surfaces a canonical `Problem` envelope. Notable codes:
+/// `validation` (400 — empty patch; explicit `null` on `username`;
+/// username all-whitespace / oversized; profile field oversized or GTS
+/// schema rejection; rejected password; unknown field on the body;
+/// provider-side validation; tenant not in `Active` status),
+/// `cross_tenant_denied` (403), tenant or user `not_found` (404 — the
+/// `IdP` reports the target user absent, which — unlike `DELETE` — is
+/// NOT folded into success), `already_exists` (409 — a username rename
+/// collided with an existing login), `idp_unavailable` (503),
+/// `idp_unsupported_operation` (501).
+#[tracing::instrument(
+    skip(svc, ctx, body),
+    fields(tenant_id = %tenant_id, user_id = %user_id, request_id = Empty)
+)]
+pub async fn update_user(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<UserService>>,
+    Path((tenant_id, user_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<UserUpdateRequestDto>,
+) -> ApiResult<Json<UserDto>> {
+    let patch = body.into_idp_user_patch()?;
+    let user = svc.update_user(&ctx, tenant_id, user_id, patch).await?;
+    Ok(Json(UserDto::from_idp_user(user)))
 }
 
 /// `DELETE /account-management/v1/tenants/{tenant_id}/users/{user_id}`

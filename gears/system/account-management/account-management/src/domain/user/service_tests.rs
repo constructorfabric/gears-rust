@@ -28,7 +28,7 @@ use std::sync::Arc;
 use toolkit_gts::gts_id;
 
 use account_management_sdk::{
-    IdpNewUser, IdpUser, IdpUserFilterField, IdpUserPagination, ListUsersQuery,
+    IdpNewUser, IdpUser, IdpUserFilterField, IdpUserPagination, IdpUserPatch, ListUsersQuery,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -575,6 +575,146 @@ async fn delete_user_rejects_unknown_tenant_no_idp_call() {
         .expect_err("unknown tenant must reject");
     assert!(matches!(err, DomainError::NotFound { .. }));
     assert_eq!(idp.delete_call_count(), 0);
+}
+
+// ---- update_user ---------------------------------------------
+
+/// A patch that sets `email` to a valid value — the minimal non-empty
+/// patch that passes GTS validation against the registered user schema.
+fn email_patch(email: &str) -> IdpUserPatch {
+    IdpUserPatch::new().with_email(Some(email.to_owned()))
+}
+
+#[tokio::test]
+async fn update_user_happy_path_returns_projection() {
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x50);
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    let pinned_id = Uuid::from_u128(0xF00D);
+    idp.set_update_projection(IdpUser::new(pinned_id, "alice").with_email("new@example.com"));
+    let svc = make_service(tenants, idp.clone());
+
+    let projection = svc
+        .update_user(&ctx(), tenant_id, pinned_id, email_patch("new@example.com"))
+        .await
+        .expect("happy path update");
+
+    assert_eq!(projection.id, pinned_id);
+    assert_eq!(projection.email.as_deref(), Some("new@example.com"));
+    assert_eq!(idp.update_call_count(), 1);
+    assert_eq!(idp.update_calls_snapshot()[0], (tenant_id, pinned_id));
+}
+
+#[tokio::test]
+async fn update_user_empty_patch_rejected_no_idp_call() {
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x51);
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    let svc = make_service(tenants, idp.clone());
+
+    let err = svc
+        .update_user(&ctx(), tenant_id, Uuid::from_u128(0x1), IdpUserPatch::new())
+        .await
+        .expect_err("empty patch must reject");
+    assert!(matches!(err, DomainError::Validation { .. }));
+    assert_eq!(idp.update_call_count(), 0, "empty patch issues no IdP call");
+}
+
+#[tokio::test]
+async fn update_user_rejects_unknown_tenant_no_idp_call() {
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    let svc = make_service(tenants, idp.clone());
+
+    let unknown = Uuid::from_u128(0x52);
+    let err = svc
+        .update_user(
+            &ctx(),
+            unknown,
+            Uuid::from_u128(0x1),
+            email_patch("x@example.com"),
+        )
+        .await
+        .expect_err("unknown tenant must reject");
+    assert!(matches!(err, DomainError::NotFound { .. }));
+    assert_eq!(idp.update_call_count(), 0);
+}
+
+#[tokio::test]
+async fn update_user_rejects_suspended_tenant_no_idp_call() {
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x53);
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Suspended, "acme");
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    let svc = make_service(tenants, idp.clone());
+
+    let err = svc
+        .update_user(
+            &ctx(),
+            tenant_id,
+            Uuid::from_u128(0x1),
+            email_patch("x@example.com"),
+        )
+        .await
+        .expect_err("non-Active tenant must reject");
+    assert!(matches!(err, DomainError::Validation { .. }));
+    assert_eq!(idp.update_call_count(), 0);
+}
+
+#[tokio::test]
+async fn update_user_username_whitespace_rejected_no_idp_call() {
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x54);
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    let svc = make_service(tenants, idp.clone());
+
+    let patch = IdpUserPatch::new().with_username("   ");
+    let err = svc
+        .update_user(&ctx(), tenant_id, Uuid::from_u128(0x1), patch)
+        .await
+        .expect_err("all-whitespace username must reject");
+    assert!(matches!(err, DomainError::Validation { .. }));
+    assert_eq!(idp.update_call_count(), 0);
+}
+
+#[tokio::test]
+async fn update_user_maps_unavailable_unsupported_rejected_and_not_found() {
+    for (outcome, want) in [
+        (FakeUserOutcome::Unavailable, "unavailable"),
+        (FakeUserOutcome::Unsupported, "unsupported"),
+        (FakeUserOutcome::RejectPayload, "rejected"),
+        (FakeUserOutcome::NotFound, "not_found"),
+    ] {
+        let tenants = Arc::new(FakeTenantRepo::new());
+        let tenant_id = Uuid::from_u128(0x55);
+        seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+        let idp = Arc::new(FakeIdpUserProvisioner::new());
+        idp.set_update_outcome(outcome);
+        let svc = make_service(tenants, idp);
+
+        let err = svc
+            .update_user(
+                &ctx(),
+                tenant_id,
+                Uuid::from_u128(0x1),
+                email_patch("x@example.com"),
+            )
+            .await
+            .expect_err("failure outcome must surface");
+        match want {
+            "unavailable" => assert!(matches!(err, DomainError::IdpUnavailable { .. })),
+            "unsupported" => assert!(matches!(err, DomainError::UnsupportedOperation { .. })),
+            "rejected" => assert!(matches!(err, DomainError::Validation { .. })),
+            "not_found" => assert!(
+                matches!(err, DomainError::UserNotFound { .. }),
+                "NotFound must map to UserNotFound (404), got {err:?}"
+            ),
+            _ => unreachable!(),
+        }
+    }
 }
 
 // ---- list_users ---------------------------------------------------

@@ -638,6 +638,138 @@ impl IdpDeprovisionUserRequest {
     }
 }
 
+/// Partial-update payload for [`crate::idp::IdpPluginClient::update_user`].
+///
+/// JSON Merge Patch (RFC 7396) tri-state, lowered from the REST DTO by
+/// the AM service layer:
+///
+/// * `username`: `None` leaves the login identifier unchanged; `Some(v)`
+///   renames it. The login identifier is REQUIRED per the published
+///   `gts.cf.core.am.user.v1~` schema, so it can never be cleared — the
+///   REST boundary rejects an explicit `null`.
+/// * nullable profile fields (`email` / `display_name` / `first_name` /
+///   `last_name`): `None` = leave unchanged, `Some(None)` = clear the
+///   field, `Some(Some(v))` = set it.
+/// * `password`: `None` = unchanged; `Some(pw)` sets a new credential.
+///   Not part of the user projection; the `IdP` enforces its own
+///   password policy. Redacted in `Debug` via [`NewUserPassword`].
+///
+/// The AM service rejects an all-`None` patch as a validation error
+/// before the plugin is invoked (see [`Self::is_empty`]).
+#[derive(Debug, Clone, Default)]
+#[allow(clippy::option_option)]
+#[non_exhaustive]
+pub struct IdpUserPatch {
+    /// Rename the login identifier. `None` = unchanged.
+    pub username: Option<String>,
+    /// `Some(None)` clears the email, `Some(Some(v))` sets it.
+    pub email: Option<Option<String>>,
+    /// `Some(None)` clears the display name, `Some(Some(v))` sets it.
+    pub display_name: Option<Option<String>>,
+    /// `Some(None)` clears the given name, `Some(Some(v))` sets it.
+    pub first_name: Option<Option<String>>,
+    /// `Some(None)` clears the family name, `Some(Some(v))` sets it.
+    pub last_name: Option<Option<String>>,
+    /// `Some(pw)` sets a new credential; `None` leaves it unchanged.
+    pub password: Option<NewUserPassword>,
+}
+
+impl IdpUserPatch {
+    /// An empty patch (every field `None`). Populate via field
+    /// assignment or the `with_*` builders.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `true` when the patch carries no field. The AM service maps this
+    /// to a validation error rather than issuing a no-op `IdP` call.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.username.is_none()
+            && self.email.is_none()
+            && self.display_name.is_none()
+            && self.first_name.is_none()
+            && self.last_name.is_none()
+            && self.password.is_none()
+    }
+
+    /// Builder: rename the login identifier.
+    #[must_use]
+    pub fn with_username(mut self, username: impl Into<String>) -> Self {
+        self.username = Some(username.into());
+        self
+    }
+
+    /// Builder: set (`Some`) or clear (`None`) the email.
+    #[must_use]
+    pub fn with_email(mut self, email: Option<String>) -> Self {
+        self.email = Some(email);
+        self
+    }
+
+    /// Builder: set (`Some`) or clear (`None`) the display name.
+    #[must_use]
+    pub fn with_display_name(mut self, display_name: Option<String>) -> Self {
+        self.display_name = Some(display_name);
+        self
+    }
+
+    /// Builder: set (`Some`) or clear (`None`) the given name.
+    #[must_use]
+    pub fn with_first_name(mut self, first_name: Option<String>) -> Self {
+        self.first_name = Some(first_name);
+        self
+    }
+
+    /// Builder: set (`Some`) or clear (`None`) the family name.
+    #[must_use]
+    pub fn with_last_name(mut self, last_name: Option<String>) -> Self {
+        self.last_name = Some(last_name);
+        self
+    }
+
+    /// Builder: attach a new password credential. Pass `temporary=true`
+    /// to force `UPDATE_PASSWORD` on the user's next interactive sign-in.
+    #[must_use]
+    pub fn with_password(mut self, value: impl Into<String>, temporary: bool) -> Self {
+        self.password = Some(NewUserPassword {
+            value: value.into(),
+            temporary,
+        });
+        self
+    }
+}
+
+/// Request shape for [`crate::idp::IdpPluginClient::update_user`].
+///
+/// `tenant_context.tenant_id` is the tenant scope; see
+/// [`IdpProvisionUserRequest`] for the duplication-removal rationale.
+/// The resolved tenant context is forwarded on every contract method
+/// per `cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation`
+/// step `package-request`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct IdpUpdateUserRequest {
+    /// Resolved tenant context (id, name, optional chained type).
+    pub tenant_context: IdpTenantContext,
+    /// `IdP`-issued identifier of the user being patched.
+    pub user_id: Uuid,
+    /// JSON Merge Patch over the user's mutable attributes.
+    pub patch: IdpUserPatch,
+}
+
+impl IdpUpdateUserRequest {
+    #[must_use]
+    pub const fn new(tenant_context: IdpTenantContext, user_id: Uuid, patch: IdpUserPatch) -> Self {
+        Self {
+            tenant_context,
+            user_id,
+            patch,
+        }
+    }
+}
+
 /// Request shape for [`crate::idp::IdpPluginClient::list_users`].
 ///
 /// `filter` and `order` carry the validated `OData` translation handed
@@ -736,6 +868,13 @@ pub enum IdpUserOperationFailure {
     /// clients can attribute the failure to the password field
     ///; the raw policy text stays provider-side.
     PasswordPolicy { detail: String },
+    /// Provider reported the target user does not exist in this tenant
+    /// scope. Unlike `deprovision_user` — which folds a vendor-side
+    /// "user does not exist" response into `Ok(())` for idempotency —
+    /// `update_user` MUST surface absence: a PATCH against a missing
+    /// user is a `404`, not a silent no-op. AM maps this to the
+    /// canonical `not_found` envelope.
+    NotFound { detail: String },
 }
 
 /// Which unique user attribute an [`IdpUserOperationFailure::DuplicateUser`]
@@ -800,6 +939,7 @@ impl IdpUserOperationFailure {
             Self::Rejected { .. } => "rejected",
             Self::DuplicateUser { .. } => "duplicate_user",
             Self::PasswordPolicy { .. } => "password_policy",
+            Self::NotFound { .. } => "not_found",
         }
     }
 
@@ -814,7 +954,8 @@ impl IdpUserOperationFailure {
             | Self::UnsupportedOperation { detail }
             | Self::Rejected { detail }
             | Self::DuplicateUser { detail, .. }
-            | Self::PasswordPolicy { detail } => detail,
+            | Self::PasswordPolicy { detail }
+            | Self::NotFound { detail } => detail,
         }
     }
 }

@@ -325,6 +325,44 @@ paths:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/UserId'
+    patch:
+      operationId: updateTenantUser
+      tags: [users]
+      summary: Update mutable attributes of a tenant user
+      description: |
+        Applies a JSON Merge Patch (RFC 7396) to a user's mutable attributes
+        via the configured IdP plugin. AM persists no local user state; the
+        update is a pass-through and the IdP remains the source of truth.
+
+        Merge semantics: an omitted field is left unchanged; an explicit
+        `null` clears a nullable profile field (`email`, `display_name`,
+        `first_name`, `last_name`); a value sets it. `username` may be renamed
+        (send a value) but NOT cleared — an explicit `null` on `username` is
+        rejected with `code=validation`. `password` sets a new credential and
+        is never echoed back in the response. An empty patch (`{}`) is
+        rejected with `code=validation`.
+
+        Unlike DELETE, a patch against a user the IdP reports absent returns
+        404 (`code=not_found`) — it is NOT folded into success. A username
+        rename that collides with an existing login returns 409
+        (`code=already_exists`). Unsupported by a legacy provider surfaces as
+        `code=idp_unsupported_operation` (501); IdP transport failure as
+        `code=idp_unavailable` (503).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserUpdateRequest'
+      responses:
+        '200':
+          description: Updated tenant user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        default:
+          $ref: '#/components/responses/Problem'
     delete:
       operationId: deleteTenantUser
       tags: [users]
@@ -1229,6 +1267,64 @@ components:
           type: [string, 'null']
           description: Optional display name surfaced through the projection.
 
+    NewUserPassword:
+      type: object
+      additionalProperties: false
+      required: [value]
+      description: |
+        Credential bundle. `value` is write-only and never returned in any
+        response body. Set `temporary: true` to force a password change on the
+        user's next interactive sign-in.
+      properties:
+        value:
+          type: string
+          minLength: 1
+          writeOnly: true
+          description: Plaintext password (write-only; never echoed back).
+        temporary:
+          type: boolean
+          default: false
+
+    UserUpdateRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: |
+        JSON Merge Patch (RFC 7396) over a user's mutable attributes. Every
+        field is optional. For the nullable profile fields an explicit `null`
+        clears the attribute and a string sets it; omission leaves it
+        unchanged. `username` accepts a string (rename) but NOT `null` (the
+        login identifier is required — an explicit `null` is rejected). An
+        all-empty patch is rejected. `password` sets a new credential and is
+        never returned in any response.
+      properties:
+        username:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Rename the login identifier. Cannot be cleared.
+        email:
+          type: [string, 'null']
+          format: email
+          description: '`null` clears the email; a string sets it.'
+        display_name:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 255
+          description: '`null` clears the display name; a string sets it.'
+        first_name:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 255
+          description: '`null` clears the given name; a string sets it.'
+        last_name:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 255
+          description: '`null` clears the family name; a string sets it.'
+        password:
+          $ref: '#/components/schemas/NewUserPassword'
+
     User:
       type: object
       additionalProperties: false
@@ -1245,6 +1341,18 @@ components:
           format: email
         display_name:
           type: [string, 'null']
+          minLength: 1
+          maxLength: 255
+        first_name:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 255
+          description: Optional given name (Keycloak firstName, OIDC given_name); `null` when unset.
+        last_name:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 255
+          description: Optional family name (Keycloak lastName, OIDC family_name); `null` when unset.
 
     UserPage:
       type: object
@@ -1339,8 +1447,13 @@ components:
             (e.g. `"integrity_check"`) for the exhaustion-source
             identifier rather than a top-level reason.
 
-        AM-internal 503 subsources (IdP-unavailable, IdP-unsupported-operation)
-        are intentionally NOT exposed as public discriminators on the
+        An unsupported IdP operation is a distinct, permanent failure: it
+        maps to `Unimplemented` (HTTP 501, sub-code
+        `idp_unsupported_operation`) — NOT to the 503 `service_unavailable`
+        envelope — because it is not retryable (the provider simply does
+        not implement the operation). Only transport failures and timeouts
+        are 503 sources; their AM-internal sub-source (`idp_unavailable`)
+        is intentionally NOT exposed as a public discriminator on the
         `service_unavailable` envelope. The 503 envelope is opaque to
         external clients by design: retry-after semantics are uniform
         across all 503 sources, so a sub-source code adds no actionable

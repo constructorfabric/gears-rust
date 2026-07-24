@@ -60,7 +60,7 @@ use uuid::Uuid;
 
 use toolkit_canonical_errors::CanonicalError;
 
-use crate::idp_user::{IdpNewUser, IdpUser, ListUsersQuery};
+use crate::idp_user::{IdpNewUser, IdpUser, IdpUserPatch, ListUsersQuery};
 use crate::metadata::{MetadataEntry, UpsertMetadataRequest};
 use crate::tenant::{CreateTenantRequest, Tenant, UpdateTenantRequest};
 
@@ -285,10 +285,10 @@ pub trait AccountManagementClient: Send + Sync + 'static {
     /// `NotFound` for REST semantics — `GET /users/{id}` is either 200
     /// or 404).
     ///
-    /// Profile-mutation (`email` / `display_name` / `username`) is
-    /// intentionally not exposed by AM: those attributes live in the
-    /// `IdP` and `SCIM`-style edits go directly to the provider's admin
-    /// API per `cpt-cf-account-management-adr-idp-user-identity-source-of-truth`.
+    /// Profile mutation is exposed through [`Self::update_user`] as a
+    /// pure pass-through to the `IdP` (AM persists nothing per
+    /// `cpt-cf-account-management-adr-idp-user-identity-source-of-truth`);
+    /// this method is the read-side projection only.
     ///
     /// # Errors
     ///
@@ -348,6 +348,43 @@ pub trait AccountManagementClient: Send + Sync + 'static {
         tenant_id: Uuid,
         user_id: Uuid,
     ) -> Result<(), CanonicalError>;
+
+    /// Apply a JSON Merge Patch to a user's mutable attributes in
+    /// `tenant_id` via the configured `IdP` plugin. The `IdP` remains
+    /// the source of truth; AM orchestrates the saga (tenant guard ->
+    /// GTS validation of changed fields -> `IdP` plugin call ->
+    /// projection back to [`IdpUser`]) and persists nothing.
+    ///
+    /// The patch semantics are documented on [`IdpUserPatch`]: omitted
+    /// fields are unchanged, `Some(None)` clears a nullable profile
+    /// field, and a `password` value sets a new credential. An
+    /// all-empty patch is rejected.
+    ///
+    /// The actor recorded on audit lines is `ctx.subject_id()`.
+    ///
+    /// # Errors
+    ///
+    /// * `PermissionDenied` (HTTP 403) -- caller is not authorised to
+    ///   update users on `tenant_id`.
+    /// * `NotFound` (HTTP 404) -- `tenant_id` does not resolve, sits
+    ///   outside the caller's PDP-compiled subtree, or the `IdP`
+    ///   reports the target user as absent.
+    /// * `InvalidArgument` (HTTP 400) -- empty patch, profile-field
+    ///   validation failure (length / GTS schema), an attempt to clear
+    ///   the required `username`, a rejected password, or the `IdP`
+    ///   plugin rejected the request.
+    /// * `AlreadyExists` (HTTP 409) -- a username rename collided with
+    ///   an existing login.
+    /// * `Unimplemented` (HTTP 501) -- `IdP` plugin does not support
+    ///   user updates.
+    /// * `ServiceUnavailable` (HTTP 503) -- `IdP` transport failure.
+    async fn update_user(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        patch: IdpUserPatch,
+    ) -> Result<IdpUser, CanonicalError>;
 
     // -----------------------------------------------------------------
     // Tenant metadata — PEP-gated inside the impl by `MetadataService::authorize`

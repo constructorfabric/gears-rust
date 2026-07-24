@@ -397,6 +397,26 @@ impl UserOperationFailureExt for IdpUserOperationFailure {
                         .to_owned(),
                 }
             }
+            // Absent target user. `update_user` surfaces this as a
+            // `404`; the shared mapping here carries no `user_id`, so
+            // `UserService::update_user` pre-empts this arm to attach
+            // the precise resource identifier. Kept explicit (rather
+            // than falling through to the `Internal`/"unknown variant"
+            // arm below) so a `NotFound` from any path is a clean 404.
+            Self::NotFound { detail } => {
+                let (digest, len) = redact_provider_detail(&detail);
+                tracing::warn!(
+                    target: "am.idp",
+                    tenant_id = %tenant_id,
+                    provider_detail_digest = digest,
+                    provider_detail_len = len,
+                    "IdP user operation NotFound; surfacing UserNotFound, raw detail redacted"
+                );
+                DomainError::UserNotFound {
+                    detail: "user not found for the requested operation".to_owned(),
+                    resource: String::new(),
+                }
+            }
             // SDK enum is `#[non_exhaustive]`. A new variant added in
             // a future SDK release lands here until the AM-side
             // mapping is updated; surface as `Internal` with a loud

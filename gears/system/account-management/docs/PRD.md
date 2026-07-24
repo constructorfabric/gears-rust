@@ -152,7 +152,7 @@ The platform needs a tenant model with unlimited hierarchy depth (configurable a
 | Conversion Request Status | Lifecycle state of a mode conversion request: `pending` (awaiting counterparty decision), `approved` (counterparty consented, conversion applied), `cancelled` (**initiator withdrew** the request from their own scope), `rejected` (**counterparty declined** the request from their own scope), or `expired` (configured approval window elapsed without resolution). `cancelled` and `rejected` are distinct terminal states — the distinction is carried in the status itself, not only in audit. |
 | Tenant Type | Classification of a tenant node. Types are extensible at runtime via the GTS types registry. Deployments define their own type topology. |
 | User | A human subject managed by AM via the IdP contract (provisioning, tenant binding, group membership). Corresponds to the platform-level [Subject](../../../../docs/arch/authorization/DESIGN.md#core-terms) term narrowed to human identities; API clients and service accounts are not AM-managed users. |
-| IdP Contract | Abstract pluggable interface for Identity Provider operations (tenant provisioning, tenant deprovisioning, user provisioning, deprovisioning, and tenant-scoped user query). |
+| IdP Contract | Abstract pluggable interface for Identity Provider operations (tenant provisioning, tenant deprovisioning, user provisioning, update, deprovisioning, and tenant-scoped user query). |
 | User Group | A [Resource Group](../../resource-group/docs/PRD.md) entity with a Resource Group type configured for user membership (`allowed_memberships` includes the user resource type). AM delegates group hierarchy, membership management, and cycle detection to the Resource Group gear. |
 | Tenant Metadata Schema | A GTS-registered schema that defines a category of extensible tenant data (e.g., branding, contacts), its validation rules, and its `inheritance_policy` trait; identified by its chained `schema_id`. |
 | Inheritance Policy | The `inheritance_policy` trait on a tenant metadata schema, controlling parent-to-child propagation: `override_only` (default; each tenant sets its own value, no inheritance) or `inherit` (child inherits parent value unless overridden). |
@@ -241,7 +241,7 @@ AM does not:
 
 ### 3.2 IdP Integration Boundary
 
-AM consumes a pluggable outbound IdP contract for tenant provisioning and deprovisioning, tenant-scoped user provisioning and deprovisioning, and user listing. AM defines the expected lifecycle outcomes and deterministic public error categories; the concrete provider protocol, provider credentials, federation setup, and session policy remain owned by the IdP implementation and the platform AuthN layer. The IdP contract is intentionally separate from the AuthN Resolver contract because AM performs low-frequency administrative operations, while AuthN Resolver handles request-path token validation.
+AM consumes a pluggable outbound IdP contract for tenant provisioning and deprovisioning, tenant-scoped user provisioning, update, and deprovisioning, and user listing. AM defines the expected lifecycle outcomes and deterministic public error categories; the concrete provider protocol, provider credentials, federation setup, and session policy remain owned by the IdP implementation and the platform AuthN layer. The IdP contract is intentionally separate from the AuthN Resolver contract because AM performs low-frequency administrative operations, while AuthN Resolver handles request-path token validation.
 
 ### 3.3 Barrier Tenant Isolation
 
@@ -283,7 +283,7 @@ AM coordinates user lifecycle operations but **does not own user identity data**
 - Managed tenant model: parent eligible for delegated child administration with no barrier, subject to platform authorization policy (p1).
 - Self-managed tenant model: strict isolation via barrier; metadata inheritance stops at self-managed boundaries (p1).
 - Tenant CRUD operations: create, read, update, soft-delete with configurable retention (p1).
-- IdP user operations contract: pluggable contract for user provisioning, deprovisioning, and query (p1).
+- IdP user operations contract: pluggable contract for user provisioning, update, deprovisioning, and query (p1).
 - User groups management (via Resource Group): create groups, manage membership, nested groups with cycle detection delegated to Resource Group (p1).
 - Observability metrics: domain-specific metrics exported via platform observability conventions (OpenTelemetry) (p1).
 - Extensible tenant metadata: GTS-registered schemas for tenant-specific data kinds (e.g., branding, contacts) with per-schema inheritance policy and validation (p2).
@@ -656,6 +656,16 @@ The system **MUST** deprovision users through the IdP integration contract and t
 
 - **Rationale**: Deprovisioning through the shared contract keeps AM intent and IdP identity state aligned while closing access promptly.
 
+#### User Update
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-fr-idp-user-update`
+
+**Actors**: `cpt-cf-account-management-actor-tenant-admin`, `cpt-cf-account-management-actor-idp`
+
+The system **MUST** update a tenant user's mutable attributes (`username`, `email`, `display_name`, `first_name`, `last_name`, `password`) through the IdP integration contract as a partial update (JSON Merge Patch), persisting no local user state. An update against a user the IdP reports absent **MUST** surface as `not_found` (not folded into success); the tenant-user binding attribute is out of scope (user reassignment remains a v1 non-goal).
+
+- **Rationale**: Attribute update is the missing verb in the AM-mediated user lifecycle. Routing it through the shared contract keeps edits inside AM's tenant-scoped authorization, GTS validation, and audit envelope — the same posture as create and delete — while the IdP stays the single source of truth and AM persists no local user state.
+
 #### User Tenant Query
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-fr-idp-user-query`
@@ -984,7 +994,7 @@ The authoritative wire contract for the public REST surface is [account-manageme
 
 - **Type**: REST API
 - **Stability**: stable
-- **Description**: API for tenant-scoped user provisioning, deprovisioning, and query operations delegated to the configured IdP provider contract.
+- **Description**: API for tenant-scoped user provisioning, update, deprovisioning, and query operations delegated to the configured IdP provider contract.
 - **Breaking Change Policy**: Major version bump required for endpoint removal or incompatible request/response schema changes.
 
 ### 7.2 External Integration Contracts
@@ -1660,6 +1670,31 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 
 **Alternative Flows**:
 - **IdP unavailable**: IdP contract call fails or times out. AM returns `CanonicalError::ServiceUnavailable` (HTTP 503) to the caller. User `U1` remains in its current state. (See `cpt-cf-account-management-fr-deterministic-errors`.)
+
+#### Scenario: Update User in Tenant
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-usecase-update-user`
+
+**Actor**: `cpt-cf-account-management-actor-tenant-admin`, `cpt-cf-account-management-actor-idp`
+
+**Preconditions**:
+- Tenant `T1` exists with status `active`
+- User `U1` exists in tenant `T1`
+
+**Main Flow**:
+1. Tenant admin submits a JSON Merge Patch of `U1`'s mutable attributes via the AM API.
+2. AM authorizes the caller, resolves `T1`, and validates the changed fields against `gts.cf.core.am.user.v1~`.
+3. AM invokes the IdP integration contract's user-update operation with tenant scope `T1`.
+4. IdP applies the patch and returns the updated user projection.
+
+**Postconditions**:
+- User `U1`'s attributes are updated in the IdP
+- No AM-side user record is created or modified (AM owns none)
+
+**Alternative Flows**:
+- **User absent**: the IdP reports `U1` absent in `T1`. AM returns `CanonicalError::NotFound` (HTTP 404) — the absence is NOT folded into success (contrast: deprovision). (See `cpt-cf-account-management-fr-idp-user-update`.)
+- **Username collision**: a `username` rename collides with an existing login. AM returns `CanonicalError::AlreadyExists` (HTTP 409).
+- **IdP unavailable**: the IdP contract call fails or times out (both collapse to `IdpUserOperationFailure::Unavailable`). AM returns `CanonicalError::ServiceUnavailable` (HTTP 503) and persists no local state (it owns none). On a timeout the outcome is **ambiguous** — the IdP may have applied the patch before the response was lost — so AM does NOT assert the attributes are unchanged. Because a JSON Merge Patch is idempotent, the caller may re-read `U1` to observe the actual state or safely retry the same patch once the IdP recovers. (See `cpt-cf-account-management-fr-deterministic-errors`.)
 
 #### Scenario: Query Users by Tenant
 

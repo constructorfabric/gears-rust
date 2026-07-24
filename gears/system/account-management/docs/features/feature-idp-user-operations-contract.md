@@ -11,6 +11,7 @@
 - [2. Actor Flows (CDSL)](#2-actor-flows-cdsl)
   - [Provision User](#provision-user)
   - [Deprovision User](#deprovision-user)
+  - [Update User](#update-user)
   - [List Users](#list-users)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [IdP Contract Invocation](#idp-contract-invocation)
@@ -119,6 +120,34 @@ Delivers the user-operations half of the AM↔IdP integration described in PRD �
    1. [ ] - `p1` - **RETURN** the mapped provider error through the envelope - `inst-flow-duser-provider-error-return`
 6. [ ] - `p1` - **RETURN** 204 No Content on `Ok(())` from the contract — the plugin folds vendor "user does not exist" responses into `Ok(())` per `algo-deprovision-idempotency-guard`, so AM observes one success arm whether the user was removed on this call or was already absent (see `inst-flow-duser-absent-branch` / `inst-flow-duser-idempotency-check` / `inst-flow-duser-idempotent-return` / `inst-flow-duser-success-return` — all four traceability anchors collapse onto this single step)
 
+### Update User
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-flow-idp-user-operations-contract-update-user`
+
+**Actor**: `cpt-cf-account-management-actor-tenant-admin`
+
+**Success Scenarios**:
+
+- Authenticated tenant-admin PATCHes `/tenants/{tenant_id}/users/{user_id}` with a JSON Merge Patch of the user's mutable attributes (`username`, `email`, `display_name`, `first_name`, `last_name`, `password`); UserService resolves the target tenant, validates the changed string fields against `gts.cf.core.am.user.v1~`, invokes `IdpPluginClient::update_user` with tenant-scope binding, and returns 200 OK with the updated user projected through the schema. AM persists no local user state — the IdP applies and owns the change.
+
+**Error Scenarios**:
+
+- Empty patch (no field supplied) — rejected with `validation` before any IdP call.
+- Explicit `null` on `username` (the required login identifier cannot be cleared) — rejected with `validation` at the wire boundary.
+- `{tenant_id}` does not resolve to an `active` tenant — rejected with `not_found` / `validation`; no IdP call issued.
+- IdP reports the target user absent in the tenant scope — surfaced as `not_found` (HTTP 404). Unlike `deprovision_user`, absence is **NOT** folded into success.
+- A `username` rename collides with an existing login — surfaced as `already_exists` (HTTP 409).
+- IdP contract call fails or times out — mapped to `idp_unavailable`.
+- Provider does not support user update (legacy IdP) — returned as `idp_unsupported_operation`; providers **MUST NOT** silently no-op.
+
+**Steps**:
+
+1. [ ] - `p1` - Validate caller identity and `SecurityContext` via platform AuthN middleware per `nfr-authentication-context` - `inst-flow-uuser-validate-caller`
+2. [ ] - `p1` - Resolve `{tenant_id}` to an `active` tenant via `TenantService`; forward any not-found / non-active outcome as the envelope-mapped error - `inst-flow-uuser-resolve-tenant`
+3. [ ] - `p1` - Invoke `algo-idp-contract-invocation` with operation `update_user(tenant_id, tenant_context, user_id, patch)` via `ClientHub` plugin resolution - `inst-flow-uuser-invoke-contract`
+4. [ ] - `p1` - **RETURN** 200 OK with the updated user projected through `gts.cf.core.am.user.v1~` - `inst-flow-uuser-success-return`
+5. [ ] - `p1` - **IF** the contract returned any provider error (`idp_unavailable`, `idp_unsupported_operation`, `not_found`, `already_exists`, or a generic rejection) **RETURN** the mapped error through the `feature-errors-observability` envelope; no AM state is mutated (AM owns none) - `inst-flow-uuser-provider-error-return`
+
 ### List Users
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-flow-idp-user-operations-contract-list-users`
@@ -197,7 +226,7 @@ Delivers the user-operations half of the AM↔IdP integration described in PRD �
 
 - [x] `p1` - **ID**: `cpt-cf-account-management-dod-idp-user-operations-contract-contract-trait-surface`
 
-The system **MUST** expose the `IdpPluginClient` trait for `provision_user`, `deprovision_user`, and `list_users` (tenant-scoped) as the single outbound integration point for user operations, resolved through `ClientHub` per `adr-idp-contract-separation`. Handler code **MUST NOT** hard-code IdP-specific logic, call any IdP library directly, or bypass the plugin resolution. The trait **MUST** accept tenant-scope metadata (tenant_id + resolved `TenantContext`) on every invocation so provider implementations can resolve IdP-specific context (e.g., effective Keycloak realm) per `fr-idp-user-provision`. `TenantContext` carries `(tenant_id, tenant_name, tenant_type, metadata)` where `tenant_type` is the **mandatory** chained `GtsSchemaId` resolved through the GTS types registry — Types Registry blips surface as `service_unavailable` rather than leaking `Option::None` to plugin code — and `metadata` is the plugin-private opaque blob AM replays back from `tenant_idp_metadata` (the same `IdpProvisionResult::metadata` AM persisted at tenant `provision_tenant` time; AM does not inspect, namespace, or validate its shape).
+The system **MUST** expose the `IdpPluginClient` trait for `provision_user`, `update_user`, `deprovision_user`, and `list_users` (tenant-scoped) as the single outbound integration point for user operations, resolved through `ClientHub` per `adr-idp-contract-separation`. `update_user` applies a JSON Merge Patch of mutable attributes as a pure pass-through (AM persists no user state per `adr-user-attribute-update`); a provider that cannot mutate attributes **MUST** decline with `idp_unsupported_operation` rather than silently no-op, and a target user the provider reports absent **MUST** surface as `not_found` (NOT folded into success, unlike `deprovision_user`). Handler code **MUST NOT** hard-code IdP-specific logic, call any IdP library directly, or bypass the plugin resolution. The trait **MUST** accept tenant-scope metadata (tenant_id + resolved `TenantContext`) on every invocation so provider implementations can resolve IdP-specific context (e.g., effective Keycloak realm) per `fr-idp-user-provision`. `TenantContext` carries `(tenant_id, tenant_name, tenant_type, metadata)` where `tenant_type` is the **mandatory** chained `GtsSchemaId` resolved through the GTS types registry — Types Registry blips surface as `service_unavailable` rather than leaking `Option::None` to plugin code — and `metadata` is the plugin-private opaque blob AM replays back from `tenant_idp_metadata` (the same `IdpProvisionResult::metadata` AM persisted at tenant `provision_tenant` time; AM does not inspect, namespace, or validate its shape).
 
 `list_users` uses cursor-based pagination wire-compatible with `toolkit_odata::Page<T>` (the same envelope shipped by RG and tenant-resolver SDKs and consumed by the AM REST surface). The `IdpUserPagination` shape carries `top: u32` plus an `Option<String>` continuation cursor. The cursor is an **opaque token owned by the IdP plugin** — AM never inspects, signs, or namespaces it; the only AM-side check is a length cap (`IdpUserPagination::MAX_CURSOR_LEN`) that prevents a hostile / buggy plugin from recycling a listing into an unbounded heap allocation through the AM proxy. Plugins backed by a queryable store **SHOULD** encode a filter hash and a stable sort key (see [`libs/toolkit-odata/src/pagination.rs`](../../../../../libs/toolkit-odata/src/pagination.rs)) so a client switching `user_id_filter` mid-pagination receives a deterministic invalid-cursor error rather than silently jumping pages; plugins wrapping a vendor SDK (e.g. Zitadel `next_token`, Keycloak `first/max`) **MAY** forward a native cursor token unchanged. AM owns one cross-cutting guard: when `user_id_filter` is set the call is an authoritative existence check, so `top` is pinned to `1` and `cursor` **MUST** be absent — a continuation would let the provider step past the matching row and turn the lookup into a false negative.
 
@@ -205,6 +234,7 @@ The system **MUST** expose the `IdpPluginClient` trait for `provision_user`, `de
 
 - `cpt-cf-account-management-flow-idp-user-operations-contract-provision-user`
 - `cpt-cf-account-management-flow-idp-user-operations-contract-deprovision-user`
+- `cpt-cf-account-management-flow-idp-user-operations-contract-update-user`
 - `cpt-cf-account-management-flow-idp-user-operations-contract-list-users`
 - `cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation`
 
@@ -221,10 +251,11 @@ The system **MUST** expose the `IdpPluginClient` trait for `provision_user`, `de
 
 - [x] `p1` - **ID**: `cpt-cf-account-management-dod-idp-user-operations-contract-no-local-user-storage`
 
-The system **MUST NOT** maintain any AM-side user table, user projection cache, user-tenant binding table, or in-memory membership cache used for admit decisions. Every user read and write **MUST** be a live pass-through to the IdP through the contract; no per-request fallback to a local store is permitted when the IdP is unavailable, consistent with `principle-idp-agnostic` + `constraint-no-user-storage`. AM **MUST NOT** precompute or mirror the IdP's user catalog for tenant-scoped queries; `list_users` invocations are live calls into the IdP with tenant filtering.
+The system **MUST NOT** maintain any AM-side user table, user projection cache, user-tenant binding table, or in-memory membership cache used for admit decisions. Every user read and write — including the `update_user` attribute mutation — **MUST** be a live pass-through to the IdP through the contract; no per-request fallback to a local store is permitted when the IdP is unavailable, consistent with `principle-idp-agnostic` + `constraint-no-user-storage`. AM **MUST NOT** precompute or mirror the IdP's user catalog for tenant-scoped queries; `list_users` invocations are live calls into the IdP with tenant filtering.
 
 **Implements**:
 
+- `cpt-cf-account-management-flow-idp-user-operations-contract-update-user`
 - `cpt-cf-account-management-flow-idp-user-operations-contract-list-users`
 - `cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation`
 
@@ -240,12 +271,13 @@ The system **MUST NOT** maintain any AM-side user table, user projection cache, 
 
 - [x] `p1` - **ID**: `cpt-cf-account-management-dod-idp-user-operations-contract-idp-unavailability-contract`
 
-When the IdP contract call fails or times out on any user operation, the system **MUST** map the failure to `code=idp_unavailable` via the `feature-errors-observability` envelope and **MUST NOT** serve a stale projection, an optimistic success, or a cached membership decision to the caller. `list_users` during an IdP outage **MUST** return the envelope-mapped error, not a degraded or partial result. The contract call timeout is governed by platform configuration and is observable; per-operation retry policy is not owned here (delegated to platform reliability operations).
+When the IdP contract call fails or times out on any user operation, the system **MUST** map the failure to `code=idp_unavailable` via the `feature-errors-observability` envelope and **MUST NOT** serve a stale projection, an optimistic success, or a cached membership decision to the caller. `list_users` during an IdP outage **MUST** return the envelope-mapped error, not a degraded or partial result; likewise `update_user` **MUST** surface `idp_unavailable` and **MUST NOT** assert the attributes were left unchanged (a timeout is ambiguous). The contract call timeout is governed by platform configuration and is observable; per-operation retry policy is not owned here (delegated to platform reliability operations).
 
 **Implements**:
 
 - `cpt-cf-account-management-flow-idp-user-operations-contract-provision-user`
 - `cpt-cf-account-management-flow-idp-user-operations-contract-deprovision-user`
+- `cpt-cf-account-management-flow-idp-user-operations-contract-update-user`
 - `cpt-cf-account-management-flow-idp-user-operations-contract-list-users`
 - `cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation`
 
@@ -273,11 +305,12 @@ The system **MUST** treat an already-absent user on `DELETE /tenants/{tenant_id}
 
 - [x] `p1` - **ID**: `cpt-cf-account-management-dod-idp-user-operations-contract-user-projection-schema`
 
-The system **MUST** publish the user-projection schema at the chained GTS schema identifier `gts.cf.core.am.user.v1~` and **MUST** project every user response returned from the contract through that schema before returning to REST clients. Downstream consumers (e.g., `feature-user-groups` for user-existence checks, platform observability for audit emission) consume the published schema — no per-response custom projection is permitted. The schema **MUST NOT** include IdP-internal fields or credentials; the projection is tenant-minimal per `adr-idp-user-identity-source-of-truth` and `adr-idp-user-tenant-binding`.
+The system **MUST** publish the user-projection schema at the chained GTS schema identifier `gts.cf.core.am.user.v1~` and **MUST** project every user response returned from the contract — including the post-update body from `update_user` — through that schema before returning to REST clients. Downstream consumers (e.g., `feature-user-groups` for user-existence checks, platform observability for audit emission) consume the published schema — no per-response custom projection is permitted. The schema **MUST NOT** include IdP-internal fields or credentials (the write-only `password` is never projected back); the projection is tenant-minimal per `adr-idp-user-identity-source-of-truth` and `adr-idp-user-tenant-binding`.
 
 **Implements**:
 
 - `cpt-cf-account-management-flow-idp-user-operations-contract-provision-user`
+- `cpt-cf-account-management-flow-idp-user-operations-contract-update-user`
 - `cpt-cf-account-management-flow-idp-user-operations-contract-list-users`
 
 **Touches**:
@@ -295,6 +328,7 @@ Every REST endpoint layered over the contract **MUST** require a valid `Security
 
 - `cpt-cf-account-management-flow-idp-user-operations-contract-provision-user`
 - `cpt-cf-account-management-flow-idp-user-operations-contract-deprovision-user`
+- `cpt-cf-account-management-flow-idp-user-operations-contract-update-user`
 - `cpt-cf-account-management-flow-idp-user-operations-contract-list-users`
 
 **Touches**:
@@ -312,11 +346,13 @@ Every REST endpoint layered over the contract **MUST** require a valid `Security
 - [ ] A `DELETE /tenants/{tenant_id}/users/{user_id}` for a user that the IdP reports as absent in the tenant scope returns 204 No Content (idempotent success) per `fr-idp-user-deprovision`; a subsequent retry of the same DELETE also returns 204. `idp_unavailable` and `idp_unsupported_operation` outcomes on the same endpoint pass through unchanged and are NOT treated as absent-equivalent. Fingerprints `dod-idp-user-operations-contract-deprovision-idempotency`.
 - [ ] A `DELETE /tenants/{tenant_id}/users/{user_id}` routed to a provider that does not support user deprovisioning returns `code=idp_unsupported_operation` through the envelope; the provider implementation does not silently no-op per PRD §5.5 and DESIGN §3.8. Fingerprints `dod-idp-user-operations-contract-deprovision-idempotency`, `dod-idp-user-operations-contract-contract-trait-surface`.
 - [ ] A `GET /tenants/{tenant_id}/users?user_id=<id>` returns either a one-element list (user exists in this tenant scope) or an empty list (user absent in this tenant scope); both outcomes are 200 OK and are the authoritative user-existence signal consumed by sibling features such as `user-groups`. The response body is projected through `gts.cf.core.am.user.v1~` and does not include IdP-internal fields or credentials. Fingerprints `dod-idp-user-operations-contract-user-projection-schema`, `dod-idp-user-operations-contract-no-local-user-storage`.
+- [ ] An authenticated tenant-admin `PATCH /tenants/{tenant_id}/users/{user_id}` on an `active` tenant with a JSON Merge Patch validates the changed fields against `gts.cf.core.am.user.v1~`, invokes `IdpPluginClient::update_user` through `ClientHub`, and returns 200 OK with the updated projection; an omitted field is unchanged, an explicit `null` clears a nullable profile field, and `username` cannot be cleared. No AM-side user row is written per `constraint-no-user-storage`. An empty patch returns `validation` (400), a user the IdP reports absent returns `not_found` (404, NOT folded into success), a `username` collision returns `already_exists` (409), an unsupported provider returns `idp_unsupported_operation` (501), and an IdP outage returns `idp_unavailable` (503). Fingerprints `dod-idp-user-operations-contract-contract-trait-surface`, `dod-idp-user-operations-contract-no-local-user-storage`, `dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation`.
 
 ## 7. Deliberate Omissions
 
 - **Conforming IdP plugin implementations (Keycloak adapter, Zitadel adapter, Dex adapter, etc.)** — *Delivered in separate crates outside this gear.* This feature owns the `IdpPluginClient` trait surface and the AM-side handler layer; concrete adapters conform to the trait but ship independently per `adr-idp-contract-separation` and DECOMPOSITION §2.5 scope.
 - **Tenant-lifecycle IdP operations (`provision_tenant`, `deprovision_tenant`)** — *Owned by `cpt-cf-account-management-feature-tenant-hierarchy-management`* (DECOMPOSITION §2.2). Those are side effects of tenant create / delete at the tenant boundary; this feature owns only the user-operations half of the contract.
+- **User-tenant reassignment via `update_user`** — *v1 non-goal* (PRD §1.4 / §13, `adr-idp-user-tenant-binding`). `update_user` mutates only profile / credential / `username` attributes; it **MUST NOT** move a user between tenants. Reassignment requires cross-platform coordination (Resource Group membership migration, AuthZ cache invalidation, session revocation) and is deferred.
 - **Token validation, session renewal, federation, credential policy, MFA policy** — *Inherited from the platform AuthN layer and the configured IdP provider* (DESIGN §4.2; PRD §6.2). AM does not validate tokens, enforce MFA, rotate credentials, or manage federation; `SecurityContext` validation is a platform-layer precondition for every endpoint.
 - **User-group orchestration, user-group membership, nested user groups** — *Owned by `cpt-cf-account-management-feature-user-groups`* (DECOMPOSITION §2.6). That feature depends on this one for authoritative user-existence checks but owns the group hierarchy, membership writes, and Resource Group delegation itself.
 - **AuthZ policy evaluation for user-level operations** — *Owned by `PolicyEnforcer` / AuthZ Resolver* (DESIGN §4.2; out of AM domain logic). This feature delegates policy evaluation to the platform AuthZ surface at the REST layer; no authorization decisions are made inside the contract or the handlers beyond tenant-scope resolution.

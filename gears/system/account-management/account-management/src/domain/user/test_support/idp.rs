@@ -25,7 +25,7 @@ use std::sync::Mutex;
 
 use account_management_sdk::{
     IdpDeprovisionUserRequest, IdpListUsersRequest, IdpPluginClient, IdpProvisionUserRequest,
-    IdpUser, IdpUserFilterField, IdpUserOperationFailure,
+    IdpUpdateUserRequest, IdpUser, IdpUserFilterField, IdpUserOperationFailure,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -62,6 +62,11 @@ pub enum FakeUserOutcome {
     Unsupported,
     /// Returns `Err(IdpUserOperationFailure::Rejected)`.
     RejectPayload,
+    /// Returns `Err(IdpUserOperationFailure::NotFound)`. Only
+    /// meaningful for `update_user` (deprovision folds absent into
+    /// `Ok(())`); exposed on the shared enum so update tests can pin
+    /// the `NotFound` -> `UserNotFound` (404) mapping.
+    NotFound,
 }
 
 /// Capture of a `list_users` invocation sufficient for AM service-layer
@@ -90,9 +95,11 @@ pub struct FakeIdpUserProvisioner {
     create_outcome: Mutex<FakeUserOutcome>,
     delete_outcome: Mutex<FakeUserOutcome>,
     list_outcome: Mutex<FakeUserOutcome>,
+    update_outcome: Mutex<FakeUserOutcome>,
     create_calls: Mutex<Vec<(Uuid, String)>>,
     delete_calls: Mutex<Vec<(Uuid, Uuid)>>,
     list_calls: Mutex<Vec<RecordedListCall>>,
+    update_calls: Mutex<Vec<(Uuid, Uuid)>>,
     /// Per-call snapshot of `req.tenant_context.metadata` recorded
     /// from every `IdP` method (provision / deprovision / list). Lets
     /// service-level tests pin that the AM-loaded
@@ -102,9 +109,14 @@ pub struct FakeIdpUserProvisioner {
     create_metadata_snapshots: Mutex<Vec<Option<Value>>>,
     delete_metadata_snapshots: Mutex<Vec<Option<Value>>>,
     list_metadata_snapshots: Mutex<Vec<Option<Value>>>,
+    update_metadata_snapshots: Mutex<Vec<Option<Value>>>,
     /// Optional projection returned on the `provision_user` happy path.
     /// Defaults to a synthesized projection with `id = Uuid::new_v4()`.
     create_projection: Mutex<Option<IdpUser>>,
+    /// Optional projection returned on the `update_user` happy path.
+    /// Defaults to a projection with `id = req.user_id` reflecting the
+    /// applied patch fields.
+    update_projection: Mutex<Option<IdpUser>>,
     /// Optional page returned on the `list_users` happy path.
     /// Defaults to an empty page with the request's `top` / `skip`.
     list_page_items: Mutex<Vec<IdpUser>>,
@@ -116,13 +128,17 @@ impl FakeIdpUserProvisioner {
             create_outcome: Mutex::new(FakeUserOutcome::Ok),
             delete_outcome: Mutex::new(FakeUserOutcome::Ok),
             list_outcome: Mutex::new(FakeUserOutcome::Ok),
+            update_outcome: Mutex::new(FakeUserOutcome::Ok),
             create_calls: Mutex::new(Vec::new()),
             delete_calls: Mutex::new(Vec::new()),
             list_calls: Mutex::new(Vec::new()),
+            update_calls: Mutex::new(Vec::new()),
             create_metadata_snapshots: Mutex::new(Vec::new()),
             delete_metadata_snapshots: Mutex::new(Vec::new()),
             list_metadata_snapshots: Mutex::new(Vec::new()),
+            update_metadata_snapshots: Mutex::new(Vec::new()),
             create_projection: Mutex::new(None),
+            update_projection: Mutex::new(None),
             list_page_items: Mutex::new(Vec::new()),
         }
     }
@@ -137,6 +153,17 @@ impl FakeIdpUserProvisioner {
 
     pub fn set_list_outcome(&self, oc: FakeUserOutcome) {
         *self.list_outcome.lock().expect("lock") = oc;
+    }
+
+    pub fn set_update_outcome(&self, oc: FakeUserOutcome) {
+        *self.update_outcome.lock().expect("lock") = oc;
+    }
+
+    /// Override the projection returned on the `update_user` happy
+    /// path. Without this override the fake synthesizes a projection
+    /// with `id = req.user_id` reflecting the applied patch fields.
+    pub fn set_update_projection(&self, projection: IdpUser) {
+        *self.update_projection.lock().expect("lock") = Some(projection);
     }
 
     /// Override the projection returned on the `provision_user` happy
@@ -163,6 +190,20 @@ impl FakeIdpUserProvisioner {
 
     pub fn list_call_count(&self) -> usize {
         self.list_calls.lock().expect("lock").len()
+    }
+
+    pub fn update_call_count(&self) -> usize {
+        self.update_calls.lock().expect("lock").len()
+    }
+
+    pub fn update_calls_snapshot(&self) -> Vec<(Uuid, Uuid)> {
+        self.update_calls.lock().expect("lock").clone()
+    }
+
+    /// Snapshot of `tenant_context.metadata` recorded on every
+    /// `update_user` call, in call order.
+    pub fn update_metadata_snapshots(&self) -> Vec<Option<Value>> {
+        self.update_metadata_snapshots.lock().expect("lock").clone()
     }
 
     pub fn create_calls_snapshot(&self) -> Vec<(Uuid, String)> {
@@ -242,6 +283,9 @@ impl IdpPluginClient for FakeIdpUserProvisioner {
             FakeUserOutcome::RejectPayload => Err(IdpUserOperationFailure::Rejected {
                 detail: "fake rejected".into(),
             }),
+            FakeUserOutcome::NotFound => Err(IdpUserOperationFailure::NotFound {
+                detail: "fake not found".into(),
+            }),
         }
     }
 
@@ -269,6 +313,68 @@ impl IdpPluginClient for FakeIdpUserProvisioner {
             }),
             FakeUserOutcome::RejectPayload => Err(IdpUserOperationFailure::Rejected {
                 detail: "fake rejected".into(),
+            }),
+            FakeUserOutcome::NotFound => Err(IdpUserOperationFailure::NotFound {
+                detail: "fake not found".into(),
+            }),
+        }
+    }
+
+    async fn update_user(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpUpdateUserRequest,
+    ) -> Result<IdpUser, IdpUserOperationFailure> {
+        self.update_calls
+            .lock()
+            .expect("lock")
+            .push((req.tenant_context.tenant_id, req.user_id));
+        self.update_metadata_snapshots
+            .lock()
+            .expect("lock")
+            .push(req.tenant_context.metadata.clone());
+        let oc = self.update_outcome.lock().expect("lock").clone();
+        match oc {
+            FakeUserOutcome::Ok => {
+                let projection = self.update_projection.lock().expect("lock").clone();
+                Ok(projection.unwrap_or_else(|| {
+                    // Synthesize a projection reflecting the applied
+                    // patch so service tests can assert the mutated
+                    // fields. Username defaults to a stable placeholder
+                    // when the patch does not rename (the fake holds no
+                    // pre-update state).
+                    let username = req
+                        .patch
+                        .username
+                        .clone()
+                        .unwrap_or_else(|| "user".to_owned());
+                    let mut p = IdpUser::new(req.user_id, username);
+                    if let Some(Some(email)) = req.patch.email.clone() {
+                        p = p.with_email(email);
+                    }
+                    if let Some(Some(display_name)) = req.patch.display_name.clone() {
+                        p = p.with_display_name(display_name);
+                    }
+                    if let Some(Some(first_name)) = req.patch.first_name.clone() {
+                        p = p.with_first_name(first_name);
+                    }
+                    if let Some(Some(last_name)) = req.patch.last_name.clone() {
+                        p = p.with_last_name(last_name);
+                    }
+                    p
+                }))
+            }
+            FakeUserOutcome::Unavailable => Err(IdpUserOperationFailure::Unavailable {
+                detail: "fake unavailable".into(),
+            }),
+            FakeUserOutcome::Unsupported => Err(IdpUserOperationFailure::UnsupportedOperation {
+                detail: "fake unsupported".into(),
+            }),
+            FakeUserOutcome::RejectPayload => Err(IdpUserOperationFailure::Rejected {
+                detail: "fake rejected".into(),
+            }),
+            FakeUserOutcome::NotFound => Err(IdpUserOperationFailure::NotFound {
+                detail: "fake not found".into(),
             }),
         }
     }
@@ -334,6 +440,9 @@ impl IdpPluginClient for FakeIdpUserProvisioner {
             }),
             FakeUserOutcome::RejectPayload => Err(IdpUserOperationFailure::Rejected {
                 detail: "fake rejected".into(),
+            }),
+            FakeUserOutcome::NotFound => Err(IdpUserOperationFailure::NotFound {
+                detail: "fake not found".into(),
             }),
         }
     }

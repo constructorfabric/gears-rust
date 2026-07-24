@@ -77,7 +77,7 @@
 //! call. The plugin owns the shape (input and output) end-to-end;
 //! AM does not interpret it.
 
-use account_management_sdk::IdpNewUser;
+use account_management_sdk::{IdpNewUser, IdpUserPatch};
 use serde_json::Value;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::gts_id;
@@ -161,6 +161,66 @@ pub async fn validate_new_user_payload_via_gts(
             USER_TYPE_ID,
             "display_name",
             &Value::String(display_name.to_owned()),
+            &properties,
+        )?;
+    }
+    Ok(())
+}
+
+/// Validate the changed string fields of an [`IdpUserPatch`] against
+/// the registered `gts.cf.core.am.user.v1~` schema.
+///
+/// Only fields being *set to a value* are validated: a `username`
+/// rename and a nullable profile field with `Some(Some(v))`. Clearing
+/// a nullable field (`Some(None)`) and leaving one untouched (`None`)
+/// carry no value to check. Mirrors the field set validated by
+/// [`validate_new_user_payload_via_gts`] (`username`, `email`,
+/// `display_name`) so the create and update paths enforce the same
+/// structural bounds; `first_name` / `last_name` follow create's
+/// forwarded-but-unbounded treatment, and `password` is not part of the
+/// user projection schema (the `IdP` enforces its own password policy).
+///
+/// Fail-closed identically to [`validate_new_user_payload_via_gts`]:
+/// AM persists no user state
+/// (`cpt-cf-account-management-constraint-no-user-storage`), so a
+/// missing schema surfaces as [`DomainError::ServiceUnavailable`]
+/// rather than silently degrading to length-only caps.
+///
+/// # Errors
+///
+/// See gear-level docs.
+pub async fn validate_user_patch_via_gts(
+    patch: &IdpUserPatch,
+    types_registry: &dyn TypesRegistryClient,
+) -> Result<(), DomainError> {
+    let Some(properties) = lookup_effective_properties(USER_TYPE_ID, types_registry).await? else {
+        return Err(DomainError::service_unavailable(format!(
+            "user patch validation requires `{USER_TYPE_ID}` to be registered \
+             in the Types Registry; update_user is unavailable until the \
+             catalog is seeded"
+        )));
+    };
+    if let Some(username) = &patch.username {
+        validate_property_value(
+            USER_TYPE_ID,
+            "username",
+            &Value::String(username.clone()),
+            &properties,
+        )?;
+    }
+    if let Some(Some(email)) = &patch.email {
+        validate_property_value(
+            USER_TYPE_ID,
+            "email",
+            &Value::String(email.clone()),
+            &properties,
+        )?;
+    }
+    if let Some(Some(display_name)) = &patch.display_name {
+        validate_property_value(
+            USER_TYPE_ID,
+            "display_name",
+            &Value::String(display_name.clone()),
             &properties,
         )?;
     }

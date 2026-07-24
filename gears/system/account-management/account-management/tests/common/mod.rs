@@ -726,7 +726,8 @@ use account_management::infra::storage::repo_impl::{ConversionRepoImpl, Metadata
 use account_management_sdk::{
     IdpDeprovisionTenantRequest, IdpDeprovisionUserRequest, IdpListUsersRequest, IdpPluginClient,
     IdpProvisionFailure, IdpProvisionResult, IdpProvisionTenantRequest, IdpProvisionUserRequest,
-    IdpUser, IdpUserFilterField, IdpUserOperationFailure,
+    IdpUpdateUserRequest, IdpUser, IdpUserDuplicateField, IdpUserFilterField,
+    IdpUserOperationFailure,
 };
 use axum::Router;
 use axum::body::Body;
@@ -877,6 +878,59 @@ impl IdpPluginClient for FakeIdpPlugin {
             }
         }
         Ok(())
+    }
+
+    async fn update_user(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpUpdateUserRequest,
+    ) -> Result<IdpUser, IdpUserOperationFailure> {
+        let tenant_id = req.tenant_context.tenant_id;
+        let mut guard = self.users.lock();
+        let Some(scope) = guard.get_mut(&tenant_id) else {
+            return Err(IdpUserOperationFailure::NotFound {
+                detail: format!("user {} not found in tenant {tenant_id}", req.user_id),
+            });
+        };
+        if !scope.contains_key(&req.user_id) {
+            return Err(IdpUserOperationFailure::NotFound {
+                detail: format!("user {} not found in tenant {tenant_id}", req.user_id),
+            });
+        }
+        // Username uniqueness on rename, checked against OTHER users.
+        if let Some(new_username) = &req.patch.username
+            && scope
+                .iter()
+                .any(|(id, u)| *id != req.user_id && &u.username == new_username)
+        {
+            return Err(IdpUserOperationFailure::DuplicateUser {
+                field: IdpUserDuplicateField::Username,
+                detail: "username already in use in this tenant scope".to_owned(),
+            });
+        }
+        let Some(user) = scope.get_mut(&req.user_id) else {
+            return Err(IdpUserOperationFailure::NotFound {
+                detail: format!("user {} not found in tenant {tenant_id}", req.user_id),
+            });
+        };
+        if let Some(username) = &req.patch.username {
+            user.username.clone_from(username);
+        }
+        if let Some(email) = &req.patch.email {
+            user.email.clone_from(email);
+        }
+        if let Some(display_name) = &req.patch.display_name {
+            user.display_name.clone_from(display_name);
+        }
+        if let Some(first_name) = &req.patch.first_name {
+            user.first_name.clone_from(first_name);
+        }
+        if let Some(last_name) = &req.patch.last_name {
+            user.last_name.clone_from(last_name);
+        }
+        // `password` is write-only and never projected; accepted and
+        // ignored by the in-memory store.
+        Ok(user.clone())
     }
 
     async fn list_users(

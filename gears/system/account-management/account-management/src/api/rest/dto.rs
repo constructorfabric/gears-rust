@@ -14,7 +14,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use account_management_sdk::{
-    CreateTenantRequest, IdpNewUser, IdpUser, MetadataEntry, Tenant, TenantStatus,
+    CreateTenantRequest, IdpNewUser, IdpUser, IdpUserPatch, MetadataEntry, Tenant, TenantStatus,
     UpdateTenantRequest,
 };
 use toolkit_security::SecurityContext;
@@ -25,6 +25,7 @@ use crate::domain::conversion::model::{
 use crate::domain::conversion::service::{
     ConversionCaller, ConversionRequestParentProjection, RequestConversionInput,
 };
+use crate::domain::error::DomainError;
 
 /// One metadata entry. `tenant_id` is echoed from the path so consumers carry
 /// the full `(tenant_id, type_id)` identity tuple; the SDK projection drops
@@ -142,6 +143,9 @@ pub struct UserCreateRequestDto {
 #[derive(Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct NewUserPasswordDto {
+    /// Plaintext password. Write-only: accepted on requests, never
+    /// serialized into any response body.
+    #[schema(write_only)]
     pub value: String,
     #[serde(default)]
     pub temporary: bool,
@@ -180,6 +184,101 @@ impl UserCreateRequestDto {
             payload = payload.with_password(pw.value, pw.temporary);
         }
         payload
+    }
+}
+
+/// Serde helper for RFC 7396 JSON-Merge-Patch tri-state fields:
+/// distinguishes an omitted key (`None`), an explicit JSON `null`
+/// (`Some(None)`), and a value (`Some(Some(v))`). Pair with
+/// `#[serde(default, deserialize_with = "double_option")]`.
+#[allow(clippy::option_option)]
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
+}
+
+/// PATCH body for `/tenants/{tenant_id}/users/{user_id}` — a JSON Merge
+/// Patch (RFC 7396) over a user's mutable attributes. An omitted field is
+/// left unchanged; an explicit `null` clears a nullable field; a value
+/// sets it.
+///
+/// `username` is the login identifier: it can be renamed (send a value)
+/// but NOT cleared — an explicit `null` is rejected with
+/// `code=validation`. `password` sets a new credential (write-only; it is
+/// never echoed in the response projection). An all-empty patch is
+/// rejected with `code=validation`. `deny_unknown_fields` locks the wire
+/// envelope so a client that sends an immutable field (e.g. `id`) in the
+/// patch sees an explicit 400 rather than a silently-dropped mutation.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::option_option)]
+pub struct UserUpdateRequestDto {
+    /// Rename the login identifier. Omit to leave unchanged; an explicit
+    /// `null` is rejected (the login identifier is required). Modelled as
+    /// tri-state `Option<Option<String>>` NOT to permit `null` but to
+    /// distinguish it from an omitted field so the explicit-`null` case
+    /// can be rejected; the schema advertises it as an optional,
+    /// non-nullable string (`value_type = String`) to match that contract.
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = String)]
+    pub username: Option<Option<String>>,
+    /// `null` clears the email, a string sets it, omission leaves it.
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = Option<String>)]
+    pub email: Option<Option<String>>,
+    /// `null` clears the display name, a string sets it.
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = Option<String>)]
+    pub display_name: Option<Option<String>>,
+    /// `null` clears the given name, a string sets it.
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = Option<String>)]
+    pub first_name: Option<Option<String>>,
+    /// `null` clears the family name, a string sets it.
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = Option<String>)]
+    pub last_name: Option<Option<String>>,
+    /// Set a new credential. Omit to leave the password unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<NewUserPasswordDto>,
+}
+
+impl UserUpdateRequestDto {
+    /// Lower the wire DTO into the SDK-layer
+    /// [`IdpUserPatch`](account_management_sdk::IdpUserPatch). Tri-state
+    /// profile fields propagate 1:1 (`Some(None)` = clear). Rejects an
+    /// explicit `null` on `username`, which the required login
+    /// identifier cannot represent.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::Validation`] when `username` is explicitly `null`.
+    pub(crate) fn into_idp_user_patch(self) -> Result<IdpUserPatch, DomainError> {
+        let mut patch = IdpUserPatch::new();
+        match self.username {
+            None => {}
+            Some(Some(username)) => patch.username = Some(username),
+            Some(None) => {
+                return Err(DomainError::Validation {
+                    detail: "update_user: `username` cannot be cleared to null \
+                             (the login identifier is required); send a new value \
+                             or omit the field"
+                        .to_owned(),
+                });
+            }
+        }
+        patch.email = self.email;
+        patch.display_name = self.display_name;
+        patch.first_name = self.first_name;
+        patch.last_name = self.last_name;
+        if let Some(pw) = self.password {
+            patch = patch.with_password(pw.value, pw.temporary);
+        }
+        Ok(patch)
     }
 }
 

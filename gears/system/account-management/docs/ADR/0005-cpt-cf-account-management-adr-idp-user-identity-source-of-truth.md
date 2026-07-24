@@ -99,7 +99,7 @@ AM references users exclusively by IdP-issued UUID user identifiers. It does not
 
 ## More Information
 
-The IdP-agnostic principle (`cpt-cf-account-management-principle-idp-agnostic`) and the IdP contract separation decision (`cpt-cf-account-management-adr-idp-contract-separation`) establish the architectural context for this ADR. The `IdpPluginClient` trait defines the boundary through which AM interacts with user identity — `provision_user`, `deprovision_user`, `list_users` are the only user data access paths.
+The IdP-agnostic principle (`cpt-cf-account-management-principle-idp-agnostic`) and the IdP contract separation decision (`cpt-cf-account-management-adr-idp-contract-separation`) establish the architectural context for this ADR. The `IdpPluginClient` trait defines the boundary through which AM interacts with user identity — `provision_user`, `update_user` (added by `cpt-cf-account-management-adr-user-attribute-update`), `deprovision_user`, and `list_users` are the only user data access paths. Each is a pure pass-through: this decision's no-local-storage invariant holds unchanged across all of them.
 
 PRD Section 3.4 (User Data Ownership) defines the ownership boundaries that this ADR formalizes as an architectural decision.
 
@@ -108,6 +108,7 @@ PRD Section 3.4 (User Data Ownership) defines the ownership boundaries that this
 - **PRD**: [PRD.md](../PRD.md)
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
 - **Related**: [ADR-0006](0006-cpt-cf-account-management-adr-idp-user-tenant-binding.md) — ADR-0005 establishes that AM maintains no local user table; ADR-0006 decides where the user-tenant binding lives within that constraint. Decided together on the same date.
+- **Extended by**: [ADR-0008](0008-cpt-cf-account-management-adr-user-attribute-update.md) — adds `update_user` as a fourth pass-through user operation; the no-local-storage invariant established here is preserved unchanged.
 
 This decision directly addresses the following requirements and design elements:
 
