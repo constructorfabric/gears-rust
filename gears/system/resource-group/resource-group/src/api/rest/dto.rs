@@ -171,6 +171,9 @@ pub struct GroupWithDepthDto {
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct CreateGroupDto {
+    /// Optional caller-supplied ID. If omitted, the server generates a UUID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
     /// GTS chained type path. Must have prefix `gts.cf.core.rg.type.v1~`.
     #[serde(rename = "type")]
     pub type_path: String,
@@ -244,7 +247,7 @@ impl From<ResourceGroupWithDepth> for GroupWithDepthDto {
 impl From<CreateGroupDto> for CreateGroupRequest {
     fn from(dto: CreateGroupDto) -> Self {
         Self {
-            id: None,
+            id: dto.id,
             code: dto.type_path,
             name: dto.name,
             parent_id: dto.parent_id,

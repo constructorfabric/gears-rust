@@ -681,6 +681,14 @@
       "CreateGroupDto": {
         "description": "REST DTO for creating a new resource group.",
         "properties": {
+          "id": {
+            "description": "Optional caller-supplied ID. If omitted, the server generates a UUID.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "metadata": {
             "description": "Type-specific metadata."
           },
