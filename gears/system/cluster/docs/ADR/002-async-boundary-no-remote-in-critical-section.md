@@ -46,7 +46,7 @@ Both questions have the same root: **Gears middleware is an async-only, cooperat
 - Detached tasks (`tokio::spawn` of a release future) are cancelled during runtime shutdown, causing silent leaks in exactly the scenarios release matters most.
 - TTL on the backend is an unavoidable safety net for every distributed resource; it handles process crash, panic, and forgotten release identically.
 - The Kleppmann fencing-token argument requires an "unbounded pause of the lock holder while still able to reach the guarded resource". Async + timeouts cannot bound *every* pause source — VM suspend or kernel-scheduler stalls freeze the entire runtime, including any timeout futures. The argument that eliminates the stale-writer scenario is therefore the no-remote-in-critical-section rule: it removes the *guarded resource access* from the critical section, so even an unbounded pause of arbitrary cause cannot produce a stale writer.
-- Gears already enforces architectural constraints via dylint (layer rules, no-serde-in-contracts); adding one more rule is cheap.
+- Gears already enforces architectural constraints via `cargo gears lint` (layer rules, no-serde-in-contracts); adding one more rule is cheap.
 
 ## Considered Options
 
@@ -59,7 +59,7 @@ Both questions have the same root: **Gears middleware is an async-only, cooperat
 
 ## Decision Outcome
 
-Chosen options: **Option 4** (no-op `Drop` + explicit async release) combined with **Option 6** (remove fencing tokens; enforce no-remote-in-critical-section via dylint).
+Chosen options: **Option 4** (no-op `Drop` + explicit async release) combined with **Option 6** (remove fencing tokens; enforce no-remote-in-critical-section via `cargo gears lint`).
 
 The `LockGuard`, `ServiceHandle`, and `LeaderWatch` types have no-op `Drop` implementations. Remote cleanup is exposed as explicit async methods:
 
@@ -69,7 +69,7 @@ The `LockGuard`, `ServiceHandle`, and `LeaderWatch` types have no-op `Drop` impl
 
 Consumers that forget to call these rely on the backend TTL for eventual cleanup. The TTL is bounded (seconds, not hours) and identical in behavior to the process-crash case.
 
-The `LockGuard` does not expose a fencing token. Instead, Gears enforces two architectural principles via a dylint rule:
+The `LockGuard` does not expose a fencing token. Instead, Gears enforces two architectural principles via a architecture lint rule:
 
 1. All cluster operations are `async fn` invoked within Tokio. Consumers SHOULD wrap them with `tokio::time::timeout` to bound blocking on network calls.
 2. Code protected by a `LockGuard` (or inside a database transaction) MUST NOT make additional remote I/O calls. Remote effects MUST occur before `try_lock` or after `release`, never between them.
@@ -83,13 +83,13 @@ The TTL safety net composes with both: any pause of duration ≥ TTL produces an
 
 This coverage is intentional and complete: bounded pauses (GC) and unbounded pauses (VM suspend) are handled by the same mechanism, because the mechanism doesn't depend on the pause being bounded.
 
-The dylint rule that enforces "no remote I/O in critical sections" is initially scoped to the four cluster backend traits within `try_lock` / `release` scopes. Database-transaction enforcement (treating an open `sqlx::Transaction` as a critical section) is deferred to a follow-up rule extension once the wiring crate and consumer migrations land — the lint surface for cluster locks alone is the high-value target and worth shipping first.
+The architecture lint rule that enforces "no remote I/O in critical sections" is initially scoped to the four cluster backend traits within `try_lock` / `release` scopes. Database-transaction enforcement (treating an open `sqlx::Transaction` as a critical section) is deferred to a follow-up rule extension once the wiring crate and consumer migrations land — the lint surface for cluster locks alone is the high-value target and worth shipping first.
 
 ### Consequences
 
 - Consumers MUST explicitly call `release().await` (or `deregister().await`, `resign().await`) for timely handoff. Forgetting the call leaks the resource until TTL — a bounded but undesirable delay. Linters and code review catch most forgotten calls.
 - The `LockGuard` API is simpler (no `fencing_token()` method). Provider implementations are significantly simpler: no Lua `INCR` (Redis), no sequence table (Postgres), no annotation CAS (K8s), no `mod_revision` coupling (etcd).
-- Consumers whose critical section contained remote I/O must restructure: compute locally, release the lock, then apply remote effects. The dylint rule flags violations at compile time.
+- Consumers whose critical section contained remote I/O must restructure: compute locally, release the lock, then apply remote effects. The architecture lint rule flags violations at compile time.
 - The TTL becomes the operationally-visible bound on forgotten cleanup. Monitoring SHOULD alert on unusually long TTL-expiry rates (indicator of a bug where release is consistently missed).
 - If a future consumer has a genuine fencing need for a resource with its own concurrency control (e.g., an external storage layer with fencing support), they can generate a monotonic sequence via `ClusterCache::compare_and_swap` at the application level. The primitive does not need to be in the lock API.
 
@@ -97,7 +97,7 @@ The dylint rule that enforces "no remote I/O in critical sections" is initially 
 
 - Unit tests verify that `Drop` on `LockGuard`, `ServiceHandle`, and `LeaderWatch` performs no I/O (no panics under Tokio; no detached tasks spawned).
 - Integration tests verify that forgotten release results in TTL-bounded cleanup (lock becomes available within TTL+epsilon).
-- Dylint rule `no-remote-in-critical-section` flags violations in unit tests with known-bad inputs; passes on known-good inputs.
+- Architecture lint rule `no-remote-in-critical-section` flags violations in unit tests with known-bad inputs; passes on known-good inputs.
 - Cluster provider implementations are reviewed to confirm no fencing-token generation exists in production code paths.
 - Unbounded-pause coverage test (per-backend integration suite): simulate a holder pause longer than TTL by suspending the holder process or pausing its async runtime via `pause_runtime_for(ttl + epsilon)`. Assert: (a) backend releases the lock at TTL, (b) a successor acquires within `epsilon`, (c) on resume, the original holder's `release().await` is a benign no-op against the foreign holder, (d) the original holder's subsequent CAS write attempt against the guarded resource returns `CasConflict` when the successor has changed it, and `Ok` only when the resource state matches the holder's pre-pause expected_version.
 
@@ -159,11 +159,11 @@ The dylint rule that enforces "no remote I/O in critical sections" is initially 
 
 - Good, because it eliminates the scenario fencing protects against at the architectural level, not at the API level.
 - Good, because the principle (no remote I/O inside critical sections) is a good architectural rule independent of fencing — it prevents deadlocks, bounds critical section duration, and simplifies reasoning about partial-failure scenarios.
-- Good, because compile-time enforcement (dylint) catches violations early. Existing workspace dylint rules establish the pattern.
+- Good, because compile-time enforcement (`cargo gears lint`) catches violations early. Existing workspace architecture lint rules establish the pattern.
 - Good, because it removes significant provider implementation complexity.
 - Good, because if a future consumer needs fencing for a specific external resource, they can implement it at the application level via `ClusterCache::compare_and_swap`.
 - Bad, because it imposes a restriction on consumers: their critical sections cannot contain remote I/O. Consumers whose existing patterns violate this must refactor.
-- Bad, because the dylint rule has to distinguish "remote" traits from "local" traits. Requires a maintained registry of remote-trait signatures.
+- Bad, because the architecture lint rule has to distinguish "remote" traits from "local" traits. Requires a maintained registry of remote-trait signatures.
 - Neutral, because "no remote I/O inside critical sections" is an architectural best practice regardless; formalizing it strengthens the system.
 
 ## More Information
@@ -216,7 +216,7 @@ async fn update_tenant_rate_limit(
 }
 ```
 
-**Bad pattern — remote I/O inside the critical section (dylint rule rejects this):**
+**Bad pattern — remote I/O inside the critical section (architecture lint rule rejects this):**
 
 ```rust
 async fn update_tenant_rate_limit_BAD(
@@ -231,13 +231,13 @@ async fn update_tenant_rate_limit_BAD(
     // If the cache is slow or partitioned, the lock TTL expires while the
     // holder is still trying to read, creating the classic stale-writer scenario.
     let current = cluster.cache().get(&format!("oagw/counter/{}", tenant_id)).await?;
-    //           ^^^^^^^^^^^^^^^ dylint: E0001 `no-remote-in-critical-section`
+    //           ^^^^^^^^^^^^^^^ `cargo gears lint`: E0001 `no-remote-in-critical-section`
 
     let new_val = increment(&current.unwrap().value);
 
     // WRONG: another remote call inside the critical section.
     cluster.cache().put(&format!("oagw/counter/{}", tenant_id), &new_val, None).await?;
-    //              ^^^ dylint: E0001 `no-remote-in-critical-section`
+    //              ^^^ `cargo gears lint`: E0001 `no-remote-in-critical-section`
 
     guard.release().await?;
     Ok(())
@@ -303,7 +303,7 @@ This decision directly addresses the following requirements and design elements:
 - `cpt-cf-clst-fr-leader-resign` — `LeaderWatch::resign(self)` as explicit step-down.
 - `cpt-cf-clst-fr-sd-register` — `ServiceHandle::deregister(self)` as explicit teardown.
 - `cpt-cf-clst-nfr-bounded-critical-section` — Async + timeouts + no-remote-in-critical-section structurally bounds critical sections.
-- `cpt-cf-clst-constraint-no-remote-in-critical-section` (DESIGN §2.2) — Architectural rule enforced via dylint.
+- `cpt-cf-clst-constraint-no-remote-in-critical-section` (DESIGN §2.2) — Architectural rule enforced via `cargo gears lint`.
 - DESIGN §3.3 lock contract — Method signatures and `Drop` semantics realize this ADR.
 - DESIGN §3.7 Lifecycle Pattern (Builder/Handle) — Post-shutdown best-effort `Ok` semantics for `release` / `deregister` / `resign` derive from this ADR's release model.
 

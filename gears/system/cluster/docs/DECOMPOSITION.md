@@ -423,12 +423,12 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 
 - [x] `p3` - **ID**: `cpt-cf-clst-feature-lock-lint`
 
-- **Purpose**: Make the no-remote-I/O-in-critical-section rule enforceable rather than aspirational, via a workspace dylint rule that flags cross-instance remote calls inside a cluster lock's critical section at compile time. Sequenced after the lock primitive so the lint has real `try_lock`/`release` scopes to target.
+- **Purpose**: Make the no-remote-I/O-in-critical-section rule enforceable rather than aspirational, via a workspace architecture lint rule (via `cargo gears lint`) that flags cross-instance remote calls inside a cluster lock's critical section at compile time. Sequenced after the lock primitive so the lint has real `try_lock`/`release` scopes to target.
 
 - **Depends On**: `cpt-cf-clst-feature-distributed-lock`
 
 - **Scope**:
-  - New dylint crate under `tools/dylint_lints/` (e.g. `de14_cluster/de14XX_no_remote_in_critical_section/`); added to that workspace's members; modeled on the existing `de0707_drop_zeroize` lint.
+  - New architecture lint rule in the `cargo-gears` CLI (e.g. `de14_cluster/de14XX_no_remote_in_critical_section/`); modeled on the existing `de0707_drop_zeroize` lint.
   - Lint scope restricted to the four cluster backend traits within `try_lock`/`release` scopes (DB-tx enforcement is a follow-up rule extension).
 
 - **Out of scope**:
@@ -444,7 +444,7 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
   - [x] `p3` - `cpt-cf-clst-constraint-no-remote-in-critical-section`
 
 - **Domain Model Entities**:
-  - None (workspace dylint crate; no domain entities).
+  - None (architecture lint rule; no domain entities).
 
 - **API**:
   - Lint: `DE14XX_NO_REMOTE_IN_CRITICAL_SECTION` (Deny).

@@ -50,7 +50,7 @@ No reviewer comments found.
 
 {Assessment of logic, edge cases, error handling.}
 
-### Cargo / Clippy / Dylint / Rustfmt Conformance {icon}
+### Cargo / Clippy / Architecture Lints / Rustfmt Conformance {icon}
 
 {Assessment of tooling conformance. N/A if no Rust code changed.}
 

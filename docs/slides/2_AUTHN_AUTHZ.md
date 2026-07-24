@@ -530,7 +530,7 @@ Being honest about the gaps; each has a clear path:
 - **Authorization decision caching** — cache PDP decisions + constraints (TTL-bounded)
 - **Multi-Factor Authentication (MFA)** — step-up / assurance-level awareness in AuthN
 - **S2S `SecurityContext` caching** — reuse client-credentials identities
-- **More dylint rules** — widen compile-time architecture enforcement
+- **More architecture lints** — widen compile-time architecture enforcement
 - **Access Management built-in gear** — policy administration (PAP) + a default PDP
 
 > Mostly performance, coverage, and tooling — the core model is already in place.

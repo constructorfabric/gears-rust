@@ -112,9 +112,6 @@ members = [
 exclude = ["tools/fuzz"]
 resolver = "3"
 
-# Note: dylint_lints is a separate workspace for custom linters
-# See tools/dylint_lints/README.md for usage instructions
-
 [workspace.lints.rust]
 deprecated = "warn"
 non_ascii_idents = "forbid"

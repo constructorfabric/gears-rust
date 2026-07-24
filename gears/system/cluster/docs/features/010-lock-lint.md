@@ -26,7 +26,7 @@
 
 ### 1.1 Overview
 
-Makes the no-remote-I/O-in-critical-section rule enforceable rather than aspirational, via a workspace static-analysis (dylint) rule that flags cross-instance remote calls inside a cluster lock's critical section at compile time. It is sequenced after the lock primitive so the lint has real acquire/release scopes to target.
+Makes the no-remote-I/O-in-critical-section rule enforceable rather than aspirational, via a workspace architecture lint rule (via `cargo gears lint`) that flags cross-instance remote calls inside a cluster lock's critical section at compile time. It is sequenced after the lock primitive so the lint has real acquire/release scopes to target.
 
 ### 1.2 Purpose
 
@@ -43,7 +43,7 @@ Forbidding remote I/O inside the critical section, combined with async timeouts 
 ### 1.4 References
 
 - **PRD**: [PRD.md](../PRD.md) §5.3 (no remote I/O in critical section), §6.1 (bounded critical section NFR)
-- **Design**: [DESIGN.md](../DESIGN.md) §2.2 (constraint and dylint scope), §1.2 (NFR allocation)
+- **Design**: [DESIGN.md](../DESIGN.md) §2.2 (constraint and lint scope), §1.2 (NFR allocation)
 - **ADRs**: [ADR-002](../ADR/002-async-boundary-no-remote-in-critical-section.md)
 - **Dependencies**:
   - [x] `p2` - `cpt-cf-clst-feature-distributed-lock`
@@ -101,7 +101,7 @@ Not applicable — the lint is a static-analysis rule with no runtime entity lif
 
 - [ ] `p1` - **ID**: `cpt-cf-clst-dod-lock-lint-rule`
 
-The system **MUST** provide a workspace dylint rule (under the workspace lint tooling, modeled on the existing drop-zeroize lint) that flags, at deny level, cross-instance remote calls inside a cluster lock's critical section, scoped initially to the four cluster backend traits between acquisition and release.
+The system **MUST** provide a workspace architecture lint rule (via `cargo gears lint`, modeled on the existing drop-zeroize lint) that flags, at deny level, cross-instance remote calls inside a cluster lock's critical section, scoped initially to the four cluster backend traits between acquisition and release.
 
 **Implements**:
 - `cpt-cf-clst-flow-lock-lint-build-fail`
@@ -110,7 +110,7 @@ The system **MUST** provide a workspace dylint rule (under the workspace lint to
 **Constraints**: `cpt-cf-clst-constraint-no-remote-in-critical-section`
 
 **Touches**:
-- Entities: workspace dylint rule crate
+- Entities: workspace architecture lint rule (in `cargo-gears` CLI)
 
 ## 6. Acceptance Criteria
 

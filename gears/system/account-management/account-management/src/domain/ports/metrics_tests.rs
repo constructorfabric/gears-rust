@@ -1,7 +1,7 @@
 //! Unit tests for the AM observability port traits and label taxonomy.
 //!
 //! Kept in a sibling file (not an inline `#[cfg(test)] mod tests`) per
-//! the workspace convention enforced by dylint `DE1101`. The tests pin:
+//! the workspace convention enforced by `cargo gears lint` rule `DE1101`. The tests pin:
 //!
 //! * Every port trait is object-safe and `Arc<dyn Trait>`-coercible.
 //! * Closed-set label enums map to the literal strings the legacy

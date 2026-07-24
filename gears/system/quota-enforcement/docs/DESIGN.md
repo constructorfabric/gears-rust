@@ -906,7 +906,7 @@ Layered chain: `StorageError → DomainError → CanonicalError`. The SDK error 
   validation errors (`InvalidAmount`, `BulkTooLarge`, `CannotDeleteSeededGlobalPolicy`, …) have no `StorageError`
   counterpart by construction.
 - **`From<StorageError> for DomainError`** — every `StorageError` variant has a 1:1 lift; defined alongside
-  `DomainError` in `domain/error.rs` (no `sea_orm`/`toolkit_db` imports — same Dylint discipline as AM).
+  `DomainError` in `domain/error.rs` (no `sea_orm`/`toolkit_db` imports — same architecture lint discipline as AM).
 - **`From<DomainError> for CanonicalError`** — boundary mapping in `quota-enforcement/src/infra/canonical_mapping.rs`
   (kept out of `domain/` because the lift may classify backend-specific failures via `cf-toolkit-db` helpers, which the
   `domain/` layer is not permitted to import). Handlers return `ApiResult<T> = Result<T, Problem>` and use `?` for

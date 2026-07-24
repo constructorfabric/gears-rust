@@ -105,7 +105,7 @@ pub(crate) fn is_db_availability_error(err: &DbError) -> bool {
     // `DbErr::Conn` (handled above) before they would surface as raw
     // `sqlx::Error`. Deconstructing the wrapped error here would
     // require depending on `sqlx` directly, which the project-wide
-    // dylint `de0706_no_direct_sqlx` rule forbids — outside of
+    // `cargo gears lint` rule `de0706_no_direct_sqlx` forbids — outside of
     // `toolkit-db`, code must talk to the SecORM abstraction, not raw
     // `sqlx`. The variant therefore falls through to `Internal`.
     matches!(

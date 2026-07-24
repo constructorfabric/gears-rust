@@ -2,7 +2,7 @@
 //!
 //! Lives in `infra/` because the classifier reads `sea_orm::DbErr`
 //! SQLSTATE codes and `toolkit_db::DbError` variant discriminants —
-//! both forbidden inside `domain/` by the project-wide Dylint rules
+//! both forbidden inside `domain/` by the project-wide `cargo gears lint` rules
 //! (`DE0301`, `DE0309`). Keeping the classifier here lets
 //! `domain::error::DomainError` stay pure (no `sea_orm`/`toolkit_db`
 //! imports, `#[domain_model]` enforced) while still routing DB

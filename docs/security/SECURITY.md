@@ -28,7 +28,7 @@ Gears take a **defense-in-depth** approach to security, combining Rust's compile
     - [Auth Plugins](#auth-plugins)
     - [Request Hardening](#request-hardening)
   - [6. Compile-Time Linting — Clippy](#6-compile-time-linting--clippy)
-  - [7. Compile-Time Linting — Custom Dylint Rules](#7-compile-time-linting--custom-dylint-rules)
+  - [7. Compile-Time Linting — Custom Architecture Lints](#7-compile-time-linting--custom-architecture-lints)
   - [8. Dependency Security — cargo-deny](#8-dependency-security--cargo-deny)
   - [9. Cryptographic Stack \& FIPS-140-3](#9-cryptographic-stack--fips-140-3)
     - [Default (non-FIPS) cryptographic stack](#default-non-fips-cryptographic-stack)
@@ -211,7 +211,7 @@ Optional M:N, tenant-scoped resource grouping that acts as a **PIP** alongside t
 
 ### GTS-Based Attribute Access Control (ABAC)
 
-> Source: [gts-spec](https://github.com/globalTypeSystem/gts-spec/) · [`dylint_lints/de09_gts_layer/`](../../tools/dylint_lints/de09_gts_layer/) · [`gears/system/types-registry/`](../../gears/system/types-registry/)
+> Source: [gts-spec](https://github.com/globalTypeSystem/gts-spec/) · [`gears/system/types-registry/`](../../gears/system/types-registry/)
 
 Gears use the **Global Type System (GTS)** as the foundation for attribute-based access control. GTS defines a hierarchical identifier scheme for data types and instances:
 
@@ -238,7 +238,7 @@ gts.<vendor>.<package>.<namespace>.<type>.v<MAJOR>[.<MINOR>]~
 | GTS-typed authorization resources | Implemented |
 | Secure ORM `type_col` auto-injection via PDP | Under development |
 
-Custom dylint rules (`DE0901`, `DE0902`) validate GTS identifier correctness at compile time, preventing malformed type strings from entering the codebase.
+Custom architecture lints (`DE0901`, `DE0902`, via `cargo gears lint`) validate GTS identifier correctness at compile time, preventing malformed type strings from entering the codebase.
 
 ## 4. Credentials Storage Architecture
 
@@ -355,11 +355,9 @@ The project enforces **90+ Clippy rules at `deny` level**, including the full `p
 - Stack size threshold of 512 KB
 - Max 2 boolean fields per struct (prevents boolean blindness)
 
-## 7. Compile-Time Linting — Custom Dylint Rules
+## 7. Compile-Time Linting — Custom Architecture Lints
 
-> Source: [`dylint_lints/`](../../tools/dylint_lints/)
-
-Project-specific architectural lints run on every CI build via `cargo dylint`. These enforce design boundaries that generic linters cannot:
+Project-specific architectural lints run on every CI build via `cargo gears lint` (provided by the `cargo-gears` CLI). These enforce design boundaries that generic linters cannot:
 
 | ID | Lint | Security Relevance |
 |---|---|---|
@@ -451,7 +449,7 @@ make security           # Runs both `deny` (license/advisory) and `fips-policy`
 
 **Phase A** (shipped) bans crates not currently in the graph — zero-pain regression gate: future PRs adding `md2`/`md4`/`ripemd`, `chacha20poly1305`/`salsa20`, the Curve25519 family (`x25519-dalek`, `ed25519-dalek`, …), alternative TLS frameworks (`openssl`, `boring`, `native-tls`), or alternative rustls CryptoProviders (`rustls-symcrypt`, `rustls-mbedcrypto-provider`, `rustls-openssl`, `rustls-rustcrypto`, `rustls-graviola`, `rustls-wolfcrypto-provider`, `boring-rustls-provider`) all fail the gate.
 
-**Non-FIPS hasher guard** — Dylint lint **DE0708** (`no_non_fips_hasher`) rejects new `sha2`/`sha1`/`md5` imports outside an explicit allow-list (one entry: file-storage content hashing — see [Non-cryptographic `sha2` and `rand` usage](#non-cryptographic-sha2-and-rand-usage)), preventing unreviewed non-FIPS crypto usage from creeping in. All previous direct use sites have been replaced with inline FNV-1a (a deterministic, non-cryptographic fingerprint): `libs/toolkit-odata/src/pagination.rs` (cursor consistency) and `oidc-authn-plugin/src/infra/token_client.rs` (credential cache key). `sha2` remains in the dependency graph as a Phase B transitive (via `sqlx-core`, `sqlx-postgres`, `lopdf`, `rust-embed-utils`) and will be promoted to Phase A once those pull-throughs are eliminated.
+**Non-FIPS hasher guard** — Architecture lint **DE0708** (`no_non_fips_hasher`, via `cargo gears lint`) rejects new `sha2`/`sha1`/`md5` imports outside an explicit allow-list (one entry: file-storage content hashing — see [Non-cryptographic `sha2` and `rand` usage](#non-cryptographic-sha2-and-rand-usage)), preventing unreviewed non-FIPS crypto usage from creeping in. All previous direct use sites have been replaced with inline FNV-1a (a deterministic, non-cryptographic fingerprint): `libs/toolkit-odata/src/pagination.rs` (cursor consistency) and `oidc-authn-plugin/src/infra/token_client.rs` (credential cache key). `sha2` remains in the dependency graph as a Phase B transitive (via `sqlx-core`, `sqlx-postgres`, `lopdf`, `rust-embed-utils`) and will be promoted to Phase A once those pull-throughs are eliminated.
 
 **Phase B** (pending transitive cleanup) is documented inline in `deny-fips.toml` — `ring`, non-FIPS `aws-lc-rs`, `chacha20`, `md-5`, `sha1`, `blake2`/`blake3`, `aes`, `hmac`, `hkdf`, etc. — currently pulled by upstream deps (`pingora-rustls`/`ureq`, rustls's default features, `rand`). Each moves to Phase A as its upstream pull-through is replaced. **Tracking**: [ADR 0005 §"Phasing"](fips/adrs/0005-fips-dependency-policy.md) and [FIPS PRD §13 TODO-7](fips/PRD.md#13-open-questions) — promotion to Phase A is the unit of work; no per-crate sub-tickets today.
 
@@ -489,7 +487,7 @@ The HTTP client (`cf-gears-toolkit-http`) exposes the following transport knobs 
 
 ### Non-cryptographic `sha2` and `rand` usage
 
-Any residual `sha2` / `rand` usage in the tree is **non-cryptographic** and is **not part of the FIPS claim**. Non-cryptographic fingerprints use inline FNV-1a (OData pagination cursor consistency in `libs/toolkit-odata/src/pagination.rs`; the OIDC token-cache key in `oidc-authn-plugin`), and the `rand` ecosystem is pulled in transitively rather than used for key material on the TLS data plane. New `sha2`/`sha1`/`md5` imports are rejected at compile time by Dylint **DE0708** (`no_non_fips_hasher`) outside an explicit allow-list. See the [Non-FIPS hasher guard](#build-time-dependency-graph-policy) note above and [What this does NOT claim](#what-this-does-not-claim) below for the transitive-dependency posture.
+Any residual `sha2` / `rand` usage in the tree is **non-cryptographic** and is **not part of the FIPS claim**. Non-cryptographic fingerprints use inline FNV-1a (OData pagination cursor consistency in `libs/toolkit-odata/src/pagination.rs`; the OIDC token-cache key in `oidc-authn-plugin`), and the `rand` ecosystem is pulled in transitively rather than used for key material on the TLS data plane. New `sha2`/`sha1`/`md5` imports are rejected at compile time by architecture lint **DE0708** (`no_non_fips_hasher`, via `cargo gears lint`) outside an explicit allow-list. See the [Non-FIPS hasher guard](#build-time-dependency-graph-policy) note above and [What this does NOT claim](#what-this-does-not-claim) below for the transitive-dependency posture.
 
 **DE0708 allow-list entry — file-storage content hashing.** `gears/file-storage/file-storage/src/infra/content/hash.rs` is the single SHA-256 call site in the file-storage gear and is on the DE0708 allow-list. It is used for **content addressing/integrity** — the `expected_hash` upload constraint and version-identity check (SHA-256 is mandated by file-storage ADR-0002) — and to derive the opaque content ETag. It is **not** used for signatures, key derivation, or password storage: the signed-URL signing primitive runs behind a replaceable `SignatureProvider` abstraction (file-storage ADR-0004), so a FIPS deployment swaps the signing module without touching this hasher. All `sha2` usage in the gear is confined to this one reviewable module.
 
@@ -653,8 +651,8 @@ Gears provide a CLI tool for scaffolding new repositories that automatically inh
 | Inherited Configuration | Description |
 |---|---|
 | **Compiler configuration** | `rust-toolchain.toml`, workspace lint rules (`#[deny(warnings)]`, 90+ Clippy rules at deny level), `unsafe_code = "forbid"` |
-| **Custom dylint rules** | Architectural boundary enforcement (DE01xx–DE13xx series), GTS validation (DE09xx) |
-| **Makefile targets** | `make deny` (cargo-deny), `make fuzz` (continuous fuzzing), `make dylint` (custom lints), `make safety` (full suite) |
+| **Custom architecture lints** | Architectural boundary enforcement (DE01xx–DE13xx series), GTS validation (DE09xx), run via `cargo gears lint` |
+| **Makefile targets** | `make deny` (cargo-deny), `make fuzz` (continuous fuzzing), `make safety` (full suite) |
 | **cargo-deny configuration** | `deny.toml` with RustSec advisory checks, license allow-lists, source restrictions |
 
 This ensures every new service or gear repository starts with the same defense-in-depth baseline described in this document, eliminating configuration drift across the platform.
@@ -670,7 +668,7 @@ The following areas have been identified for future hardening:
 2. **Secure ORM type-column auto-injection** — the `ScopableEntity` trait supports a `type_col` dimension, but automatic GTS type constraint injection from PDP → `AccessScope` → SQL `WHERE` is under development
 3. **Tenant Resolver access-control plugins** — the `Unauthorized` error variant is reserved in the SDK, but no production plugin enforces caller-vs-target authorization (the static plugin allows any caller to query any configured tenant; the single-tenant plugin uses identity matching only). A policy-backed plugin would enforce fine-grained tenant visibility
 4. **Security guidelines in spec templates** — add explicit security checklist sections to PRD and DESIGN templates (threat modeling, data classification, authentication requirements per feature)
-5. **Security-focused dylint lints** — extend the `DE07xx` series with additional rules:
+5. **Security-focused architecture lints** — extend the `DE07xx` series with additional rules:
    - Detecting hardcoded secrets or API keys
    - Enforcing `SecretString` / `SecretValue` usage for sensitive fields
    - Flagging raw SQL string construction

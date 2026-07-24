@@ -152,7 +152,6 @@ fn gts_uri_macro_prepends_uri_and_configured_id_prefix() {
 }
 
 #[test]
-#[allow(unknown_lints, de0904_no_hardcoded_gts_prefix)]
 fn gts_id_macro_detects_already_prefixed_literal() {
     // gts_id! on a literal that already starts with GTS_ID_PREFIX should
     // emit it as-is, without doubling the prefix.

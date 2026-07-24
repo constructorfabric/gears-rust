@@ -119,7 +119,7 @@ All services communicate via in-process trait method calls. There is no inter-se
 
 * Good, because trait-based isolation enables independent testing of CP and DP (e.g., `MockControlPlaneService`)
 * Good, because single crate simplifies build, dependency management, and deployment
-* Good, because DDD-Light layering keeps domain logic separate from infrastructure, enforced by dylint linters
+* Good, because DDD-Light layering keeps domain logic separate from infrastructure, enforced by architecture lints (via `cargo gears lint`)
 * Good, because migration to separate crates remains possible if needed
 * Good, because zero overhead — direct Rust function calls, no serialization or RPC
 

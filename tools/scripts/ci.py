@@ -173,8 +173,6 @@ def cmd_check(args):
     cmd_cfs_validate(args)
     cmd_clippy(args)
     cmd_test(args)
-    cmd_dylint_test(args)
-    cmd_dylint(args)
     cmd_gts_docs(args)
     cmd_security(args)
     print("All checks passed")
@@ -554,104 +552,6 @@ def cmd_e2e_docker(args):
     cmd_e2e(args)
 
 
-def cmd_dylint(_args):
-    step("Building dylint lints")
-    dylint_dir = os.path.join(PROJECT_ROOT, "tools/dylint_lints")
-    run_cmd(["cargo", "build", "--release"], cwd=dylint_dir)
-    # Copy toolchain-suffixed names similar to Makefile
-    rustc_host = (
-        subprocess.check_output(["rustc", "--version", "--verbose"])
-        .decode()
-        .splitlines()
-    )
-    host = next((line.split()[-1] for line in rustc_host if line.startswith("host:")), "")
-    toolchain = "nightly"
-    rust_toolchain_path = os.path.join(dylint_dir, "rust-toolchain.toml")
-    if os.path.isfile(rust_toolchain_path):
-        with open(rust_toolchain_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if "channel" in line:
-                    toolchain = line.split('"')[1]
-                    break
-    target_release = os.path.join(dylint_dir, "target", "release")
-    for fname in os.listdir(target_release):
-        if not fname.startswith("libde") and not fname.startswith("de"):
-            continue
-        if "@" in fname:
-            continue
-        if fname.endswith(".dylib"):
-            ext = ".dylib"
-        elif fname.endswith(".so"):
-            ext = ".so"
-        elif fname.endswith(".dll"):
-            ext = ".dll"
-        else:
-            continue
-        base = fname[: -len(ext)]
-        target = f"{base}@{toolchain}-{host}{ext}"
-        src = os.path.join(target_release, fname)
-        dst = os.path.join(target_release, target)
-        try:
-            shutil.copyfile(src, dst)
-        except OSError:
-            pass
-    dylint_libs = sorted(
-        [
-            os.path.join(target_release, f)
-            for f in os.listdir(target_release)
-            if (f.startswith("libde") or f.startswith("de"))
-            and ("@" in f)
-            and (
-                f.endswith(".dylib")
-                or f.endswith(".so")
-                or f.endswith(".dll")
-            )
-        ]
-    )
-    if not dylint_libs:
-        print("ERROR: No dylint libraries found after build.")
-        sys.exit(1)
-    lib_args = []
-    for lib in dylint_libs:
-        lib_args.extend(["--lib-path", lib])
-    run_cmd(
-        ["cargo", f"+{toolchain}", "dylint", *lib_args, "--workspace"],
-        cwd=PROJECT_ROOT,
-    )
-    print("Dylint checks passed")
-
-
-def cmd_dylint_test(_args):
-    step("Running dylint tests")
-    dylint_dir = os.path.join(PROJECT_ROOT, "tools/dylint_lints")
-    run_cmd(["cargo", "test"], cwd=dylint_dir)
-    print("Dylint tests passed")
-
-
-def cmd_dylint_list(_args):
-    step("Listing dylint lints")
-    dylint_dir = os.path.join(PROJECT_ROOT, "tools/dylint_lints")
-    target_release = os.path.join(dylint_dir, "target", "release")
-    dylint_libs = sorted(
-        [
-            os.path.join(target_release, f)
-            for f in os.listdir(target_release)
-            if (f.startswith("libde") or f.startswith("de"))
-            and (
-                f.endswith(".dylib")
-                or f.endswith(".so")
-                or f.endswith(".dll")
-            )
-        ]
-    )
-    if not dylint_libs:
-        print("ERROR: No dylint libraries found. Run 'python scripts/ci.py dylint' first.")
-        sys.exit(1)
-    for lib in dylint_libs:
-        print(f"=== {lib} ===")
-        run_cmd(["cargo", "dylint", "list", "--lib-path", lib], cwd=PROJECT_ROOT)
-
-
 def ensure_nightly_toolchain():
     """Ensure Rust nightly toolchain is installed."""
     result = run_cmd_allow_fail(["rustup", "run", "nightly", "rustc", "--version"])
@@ -903,18 +803,6 @@ def build_parser():
         help="Extra arguments passed to pytest (use -- to separate)",
     )
     p_e2e_docker.set_defaults(func=cmd_e2e_docker)
-
-    # dylint
-    p_dylint = subparsers.add_parser("dylint", help="Build and run dylint lints")
-    p_dylint.set_defaults(func=cmd_dylint)
-
-    # dylint-test
-    p_dylint_test = subparsers.add_parser("dylint-test", help="Run dylint UI tests")
-    p_dylint_test.set_defaults(func=cmd_dylint_test)
-
-    # dylint-list
-    p_dylint_list = subparsers.add_parser("dylint-list", help="List available dylint lints")
-    p_dylint_list.set_defaults(func=cmd_dylint_list)
 
     # fuzz-build
     p_fuzz_build = subparsers.add_parser("fuzz-build", help="Build all fuzz targets")

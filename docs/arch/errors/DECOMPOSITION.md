@@ -55,14 +55,14 @@ Build the `CanonicalError` enum, context types, `Problem` mapping, and `#[resour
 - [ ] 1.4.4 `From<serde_json::Error> for CanonicalError` → `InvalidArgument`
 - [ ] 1.4.5 `From<std::io::Error> for CanonicalError` → `Internal`
 
-#### 1.5 Dylint enforcement rules
+#### 1.5 `cargo gears lint` enforcement rules
 
-> Traces to: `cpt-cf-errors-component-dylint-rules`, PRD § 12 Risks — "LLM agents bypass compile checks"
+> Traces to: `cpt-cf-errors-component-`cargo gears lint`-rules`, PRD § 12 Risks — "LLM agents bypass compile checks"
 
-- [ ] 1.5.1 Implement a dylint rule — **No direct `Problem` construction**: reject `Problem { ... }` struct literals and direct `IntoResponse` impls that bypass `CanonicalError`; all `Problem` instances must originate from `CanonicalError` via the `From` impl
-- [ ] 1.5.2 Implement a dylint rule — **No legacy error patterns**: reject usage of `Problem::new()`, `ErrDef`, `declare_errors!`, or `ErrorCode`
-- [ ] 1.5.3 Implement a dylint rule — **No raw status-code error responses**: handlers must return `Result<T, CanonicalError>`, not ad-hoc HTTP error responses or gear-specific error enums
-- [ ] 1.5.4 Add dylint CI gate to run on all gear code
+- [ ] 1.5.1 Implement a architecture lint rule — **No direct `Problem` construction**: reject `Problem { ... }` struct literals and direct `IntoResponse` impls that bypass `CanonicalError`; all `Problem` instances must originate from `CanonicalError` via the `From` impl
+- [ ] 1.5.2 Implement a architecture lint rule — **No legacy error patterns**: reject usage of `Problem::new()`, `ErrDef`, `declare_errors!`, or `ErrorCode`
+- [ ] 1.5.3 Implement a architecture lint rule — **No raw status-code error responses**: handlers must return `Result<T, CanonicalError>`, not ad-hoc HTTP error responses or gear-specific error enums
+- [ ] 1.5.4 Add `cargo gears lint` CI gate to run on all gear code
 
 #### 1.6 Contract enforcement (Tier 2)
 

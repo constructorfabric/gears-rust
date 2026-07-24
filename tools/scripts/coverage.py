@@ -140,8 +140,7 @@ def ensure_coverage_disk_space():
         "Coverage builds large instrumented test binaries. Free space under the "
         "workspace volume, then retry. Common cleanup commands:\n"
         "  cargo llvm-cov clean --workspace\n"
-        "  cargo clean\n"
-        "  rm -rf tools/dylint_lints/target",
+        "  cargo clean",
         file=sys.stderr,
     )
     sys.exit(1)

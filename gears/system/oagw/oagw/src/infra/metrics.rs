@@ -18,7 +18,7 @@ use crate::domain::ports::metric_labels::{METHOD_OTHER, key};
 /// so both gears emit the same `http.request.method` vocabulary.
 ///
 /// Lives in the infra layer because the domain layer must not depend on
-/// transport-level types like `http::Method` (dylint `DE0301`/`DE0308`).
+/// transport-level types like `http::Method` (`cargo gears lint` rules `DE0301`/`DE0308`).
 #[must_use]
 pub(crate) fn normalize_method(method: &http::Method) -> &'static str {
     match *method {

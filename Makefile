@@ -138,8 +138,7 @@ setup: .setup-stamp
 	cargo install lychee
 	cargo install cargo-geiger
 	cargo install cargo-deny
-	cargo install cargo-dylint
-	cargo install dylint-link
+	cargo install cargo-gears
 	cargo install cargo-fuzz
 	cargo install cargo-hack
 	cargo install gts-validator
@@ -161,7 +160,15 @@ setup: .setup-stamp
 	@echo "Setup complete. All tools installed."
 	@touch .setup-stamp
 
-# -------- Checks --------
+# -------- Gear naming validation --------
+
+.PHONY: validate-gear-names
+
+## Validate gear folder names follow kebab-case convention
+validate-gear-names:
+	@$(PYTHON) tools/scripts/validate_gear_names.py
+
+# -------- Code safety checks --------
 #
 # Tool Comparison - What Each Tool Checks:
 # +-------------+----------------------------------------------------------------------+
@@ -195,14 +202,6 @@ setup: .setup-stamp
 # |             | - Missing documentation warnings                                     |
 # |             | - Ensures clean compilation across all targets and features          |
 # +-------------+----------------------------------------------------------------------+
-# | dylint      | - Project-specific architectural conventions (custom lints)          |
-# |             | - DTO declaration and placement (only in api/rest folders)           |
-# |             | - DTO isolation (no references from domain/contract layers)          |
-# |             | - API endpoint versioning requirements (e.g., /users/v1/users)       |
-# |             | - Contract layer purity (no serde, HTTP types, or ToSchema)          |
-# |             | - Layer separation and dependency rules enforcement                  |
-# |             | - Use 'make dylint-list' to see all available custom lints           |
-# +-------------+----------------------------------------------------------------------+
 
 .PHONY: fmt clippy clippy-deep lychee docs-preview kani geiger safety lint dylint dylint-list dylint-test shear gts-docs cfs-ensure cfs-repair cfs-validate cfs-validate-kits cfs-validate-kit-local cfs-spec-coverage
 
@@ -210,7 +209,6 @@ setup: .setup-stamp
 fmt:
 	$(call check_rustup_component,rustfmt)
 	cargo fmt --all --check
-	cargo fmt --all --check --manifest-path tools/dylint_lints/Cargo.toml
 
 CFS ?= cfs
 CFS_PIPX_SPEC ?= git+https://github.com/constructorfabric/studio.git
@@ -248,7 +246,7 @@ clippy-deep:
 # Run markdown checks with 'lychee'
 lychee:
 	$(call check_tool,lychee)
-	lychee --exclude-path 'docs/web-docs' docs examples tools/dylint_lints guidelines
+	lychee --exclude-path 'docs/web-docs' docs examples guidelines
 
 ## Validate internal links in web-docs.
 # The web-docs pages use Starlight route-relative links (e.g. ../foo/) that only
@@ -291,34 +289,15 @@ gts-docs:
 install-tools:
 	@command -v cargo-nextest >/dev/null 2>&1 || cargo install --locked cargo-nextest
 
-## List all custom project compliance lints (see tools/dylint_lints/README.md)
-dylint-list:
-	@cd tools/dylint_lints && \
-	DYLINT_LIBS=$$(find target/release -maxdepth 1 \( -name "libde*@*.so" -o -name "libde*@*.dylib" -o -name "de*@*.dll" \) -type f | sort -u); \
-	if [ -z "$$DYLINT_LIBS" ]; then \
-		echo "ERROR: No dylint libraries found. Run 'make dylint' first to build them."; \
-		exit 1; \
-	fi; \
-	for lib in $$DYLINT_LIBS; do \
-		echo "=== $$lib ==="; \
-		cargo dylint list --lib-path "$$lib"; \
-	done
-
-## Test dylint lints on UI test cases (compile and verify violations)
-dylint-test: install-tools
-	@cd tools/dylint_lints && cargo nextest run
-
-# Run project compliance dylint lints on the workspace (see `make dylint-list`)
+# Run architecture lints via cargo-gears (see Gears.toml for configuration).
 dylint:
-	$(call check_tool,cargo-dylint)
-	$(call check_tool,dylint-link)
-	cargo dylint --all --workspace
+	$(call check_tool,cargo-gears)
+	cargo gears lint --dylint
 
 # Check for unused dependencies with cargo-shear.
 shear:
 	$(call check_tool,cargo-shear)
 	cargo +nightly-2026-04-16 shear --expand --deny-warnings
-	cd tools/dylint_lints && cargo shear --expand --deny-warnings
 
 # Run all code safety checks
 safety: clippy kani lint dylint # geiger
@@ -436,7 +415,6 @@ dev-fmt:
 ## Auto-fix clippy warnings
 dev-clippy:
 	cargo clippy --workspace --all-targets --all-features --fix --allow-dirty
-	@cd tools/dylint_lints && cargo clippy --all-targets --workspace
 
 # Auto-fix formatting and clippy warnings
 dev: dev-fmt dev-clippy dev-test
@@ -829,14 +807,14 @@ oop-example:
 	cargo run --bin cf-gears-example-server --features oop-example,users-info-example,static-authn,static-authz,static-tenants,static-credstore -- --config config/quickstart.yaml run
 
 # Run all quality checks
-check: .setup-stamp fmt cfs-validate clippy lychee security dylint-test dylint gts-docs test
+check: .setup-stamp fmt cfs-validate clippy lychee security dylint gts-docs test
 
 ci_test: fmt clippy
 
 ci_docs: lychee gts-docs
 
 # Run CI pipeline locally, requires docker
-ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg lychee gts-docs dylint dylint-test
+ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg lychee gts-docs dylint
 
 ## Build the cf-gears-example-server release binary using a toolchain from the rust-toolchain.toml
 .cargo-build:

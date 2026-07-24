@@ -25,7 +25,7 @@ This ADR captures the workaround: **dependency-graph policy enforced at build ti
 ## Considered Options
 
 * **Option A** — `cargo-deny` `[bans]` policy enforced under a separate config — **chosen**
-* **Option B** — Workspace-wide custom `dylint` rule that refuses `use md5;` / `use sha1;` / etc. at gear level
+* **Option B** — Workspace-wide custom `cargo gears lint` rule that refuses `use md5;` / `use sha1;` / etc. at gear level
 * **Option C** — Runtime check at `init_crypto_provider`: probe loaded libraries with `dladdr` / `vmmap`, refuse to start if non-validated crypto libs are present
 * **Option D** — Accept the current gap; document as a known limitation
 
@@ -39,7 +39,7 @@ Key reasons:
 * `[bans]` enforces at dep-graph resolution time, before any compilation — catches accidental additions in the smallest possible blast radius.
 * The `[graph] features = ["fips"]` directive scopes the policy to the FIPS build, so non-fips developer workflows are unaffected.
 * `make fips-policy` is the explicit gate; CI wires it into `make security`.
-* Option B (dylint) is complementary but lower priority — catches workspace-internal `use` paths that bypass the graph (rare). Tracked separately as Phase C below if/when needed.
+* Option B (`cargo gears lint`) is complementary but lower priority — catches workspace-internal `use` paths that bypass the graph (rare). Tracked separately as Phase C below if/when needed.
 * Option C (runtime probe) was rejected: brittle (every macOS update changes loader behavior), opaque to operators, and doesn't catch a non-FIPS crypto crate that compiles in but doesn't call `dlopen`.
 * Option D was rejected: the gap is documented in PRD §7.2 already; closing it via build-time policy adds measurable assurance with low effort.
 
@@ -88,7 +88,7 @@ These will be denied as their upstream usage is removed. Each move from Phase B 
 
 ### Phase C — Source-level enforcement (deferred)
 
-If even stricter assurance is needed later, a custom `dylint` lint can walk `use` and `extern crate` paths at the source-code level. This catches a forbidden crate that is **in** the dep graph but the workspace's own code does not directly import — covering workspace discipline beyond what `cargo-deny` enforces. Not built today because Phase A + B closes the practical gap.
+If even stricter assurance is needed later, a custom `cargo gears lint` lint can walk `use` and `extern crate` paths at the source-code level. This catches a forbidden crate that is **in** the dep graph but the workspace's own code does not directly import — covering workspace discipline beyond what `cargo-deny` enforces. Not built today because Phase A + B closes the practical gap.
 
 ## Pros and Cons of the Options
 
@@ -99,13 +99,13 @@ If even stricter assurance is needed later, a custom `dylint` lint can walk `use
 * Good: `[graph] features = ["fips"]` scopes the policy to FIPS build, no impact on non-fips developer workflow.
 * Good: phased deny-list approach gives a clear road-map for moving Phase B crates to Phase A as transitives are cleaned.
 * Neutral: two `*.toml` configs to maintain (`deny.toml` + `deny-fips.toml`); minor cognitive overhead.
-* Bad: does not catch a forbidden crate that is in the graph but only used by transitive deps (a workspace member could `use` it via re-export tricks). Phase C / dylint covers that.
+* Bad: does not catch a forbidden crate that is in the graph but only used by transitive deps (a workspace member could `use` it via re-export tricks). Phase C / `cargo gears lint` covers that.
 
-### Option B — `dylint` rule (deferred)
+### Option B — `cargo gears lint` rule (deferred)
 
 * Good: covers source-level imports that `cargo-deny` cannot.
 * Bad: no protection against transitive crates linked into the binary but `use`d only by transitive code — `cargo-deny` protects against that.
-* Bad: dylint rules are more expensive to author and maintain.
+* Bad: architecture lint rules are more expensive to author and maintain.
 * Deferred until measurable signal that workspace-internal imports bypass the graph policy.
 
 ### Option C — Runtime probe via dladdr / vmmap

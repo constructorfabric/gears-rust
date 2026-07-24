@@ -79,7 +79,7 @@ All services communicate via in-process trait method calls. There is no inter-se
 - **Testability**: Services are tested in isolation via trait mocking (e.g., `MockControlPlaneService`)
 - **Performance**: Zero overhead — direct Rust function calls, no serialization or RPC
 - **Simplicity**: Single crate eliminates multi-crate coordination, versioning, and build complexity
-- **Maintainability**: DDD-Light layering (`domain/infra/api`) enforced by dylint linters
+- **Maintainability**: DDD-Light layering (`domain/infra/api`) enforced by architecture lints (via `cargo gears lint`)
 
 ### Negative
 

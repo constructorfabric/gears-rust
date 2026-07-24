@@ -29,7 +29,7 @@ resolution of the two open questions.
 - **Feature source**: the assignment recorded in [DECOMPOSITION.md](DECOMPOSITION.md)
   §2 ("Requirements Covered" per feature).
 - **Marker source**: `@cpt-dod:` markers grepped from `cluster-sdk/src`,
-  `cluster-sdk/tests`, `cluster/examples`, and `tools/dylint_lints/de14_cluster`.
+  `cluster-sdk/tests`, `cluster/examples`, and architecture lints (in `cargo-gears` CLI).
 - **Scope key**: `code` = realized by this change's shipped code; `follow-up` =
   enabling contract shipped here, full realization deferred to the wiring crate /
   parent host gear per PRD §4.1 (each still maps to a realizing ADR/DESIGN section,

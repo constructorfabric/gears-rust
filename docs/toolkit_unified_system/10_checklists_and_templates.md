@@ -72,7 +72,7 @@ pub struct MyGear {
 - [ ] Use `db.sea_secure()` for all DB access in handlers/services
 - [ ] Pass `SecurityContext` to repository methods
 - [ ] Use `secure_conn.find::<Entity>(&scope).all(&secure_conn)` for auto-scoped queries
-- [ ] Use raw SQL only in `migrations/*.rs` (enforced later via dylint)
+- [ ] Use raw SQL only in `migrations/*.rs` (enforced via `cargo gears lint`)
 - [ ] Add indexes on security columns (tenant_id, resource_id)
 - [ ] Test with `SecurityContext::test_tenant()` for unit tests
 

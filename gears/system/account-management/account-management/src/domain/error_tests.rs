@@ -292,7 +292,7 @@ fn service_unavailable_without_hint_omits_retry_after() {
 // by service-layer tests to pin the variant→code/status contract without
 // going through `AccountManagementError::from(...)` on every assertion.
 // Production callers MUST go through [`crate::infra::sdk_error_mapping`];
-// this impl block lives in the companion test file (per dylint `DE1101`) so
+// this impl block lives in the companion test file (per `cargo gears lint` rule `DE1101`) so
 // the production [`DomainError`] surface stays free of test-only items.
 
 impl DomainError {

@@ -23,7 +23,7 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 | Errors, RFC-9457 Problem | `05_errors_rfc9457.md` | |
 | Lifecycle, background tasks, cancellation | `08_lifecycle_stateful_tasks.md` | |
 | Out-of-Process / gRPC / SDK pattern | `09_oop_grpc_sdk_pattern.md` | |
-| Domain model macro, DDD enforcement | `02_gear_layout_and_sdk_pattern.md` (§ Domain types) | `dylint_lints/de03_domain_layer/de0309_must_have_domain_model/README.md` |
+| Domain model macro, DDD enforcement | `02_gear_layout_and_sdk_pattern.md` (§ Domain types) | Architecture lint DE0309 (via `cargo gears lint`) |
 | Quick checklists, templates | `10_checklists_and_templates.md` | |
 | Unit & integration testing (philosophy, patterns, infrastructure) | `12_unit_testing.md` | |
 | E2E testing (philosophy, patterns, infrastructure) | `13_e2e_testing.md` | |

@@ -78,7 +78,7 @@ No gear-specific environment constraints. The canonical error system runs within
 - Round-trip serialization/deserialization (server → wire → SDK)
 - Public vs private detail isolation (client-facing context vs server-side logging with trace_id)
 - Migration of all existing gears to the new error system
-- Dylint-level rules enforcement
+- `cargo gears lint`-level rules enforcement
 
 ### 4.2 Out of Scope
 
@@ -295,7 +295,7 @@ Error construction MUST be O(1) enum + struct allocation with no heap allocation
 - [ ] No error reaches API consumers outside the canonical vocabulary
 - [ ] Production error responses for `internal`/`unknown` contain no stack traces, query text, or file paths
 - [ ] Every error response includes a trace ID
-- [ ] Dylint static analysis rules enforce correct error construction patterns (no bypassing canonical errors)
+- [ ] `cargo gears lint` static analysis rules enforce correct error construction patterns (no bypassing canonical errors)
 - [ ] `CanonicalError` variants cannot be constructed directly from outside the crate (`#[non_exhaustive]` on variants, `pub(crate)` internal constructors)
 
 ## 10. Dependencies
@@ -319,7 +319,7 @@ Error construction MUST be O(1) enum + struct allocation with no heap allocation
 |------|--------|------------|
 | CI schema checks become maintenance burden | Devs skip updates, reducing trust | One check per category; auto-generate from error definitions |
 | 16 categories insufficient long-term | Ad-hoc types outside canonical set | Additive categories (minor version bump) |
-| LLM agents bypass compile checks | Contract violated despite CI gates | Dylint lint rules (`dylint_lints/`) that enforce canonical error construction patterns |
+| LLM agents bypass compile checks | Contract violated despite CI gates | Architecture lint rules (via `cargo gears lint`) that enforce canonical error construction patterns |
 
 ## 13. Open Questions
 
