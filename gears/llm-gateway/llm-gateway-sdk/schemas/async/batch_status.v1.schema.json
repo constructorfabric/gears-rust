@@ -1,8 +1,0 @@
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "gts://gts.cf.llmgw.async.batch_status.v1~",
-  "title": "BatchStatus",
-  "description": "Status of a batch request",
-  "type": "string",
-  "enum": ["pending", "in_progress", "completed", "failed", "cancelled"]
-}

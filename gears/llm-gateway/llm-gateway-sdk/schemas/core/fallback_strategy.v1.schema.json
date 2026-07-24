@@ -1,8 +1,0 @@
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "gts://gts.cf.llmgw.core.fallback_strategy.v1~",
-  "title": "FallbackStrategy",
-  "description": "Strategy for provider fallback",
-  "type": "string",
-  "enum": ["sequential", "parallel"]
-}

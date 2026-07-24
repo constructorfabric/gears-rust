@@ -600,6 +600,71 @@ The Hook Plugin interface is defined in `llm-gateway-sdk` as a plugin client tra
 - `post_response` timeout: a warning is logged but the response is not affected — `post_response` is observe-only, and the response has already been delivered to the consumer by the time `post_response` runs. The timed-out plugin call is cancelled.
 - The timeout value is configured per-gear (not per-plugin) and applies uniformly to all hook plugin invocations.
 
+#### Provider Plugin SDK Interface
+
+**ID**: `cpt-cf-llm-gateway-interface-provider-plugin-sdk-v1`
+
+**GTS Schema ID**: `gts.cf.toolkit.plugins.plugin.v1~cf.llmgw.provider.plugin.v1~`
+
+**Technology**: ToolKit SDK trait (`LlmGatewayProviderPluginClient`), resolved via ClientHub scoped clients following Gears plugin architecture (see `docs/TOOLKIT_PLUGINS.md`)
+
+The Provider Plugin interface is the realization of the `cpt-cf-llm-gateway-component-provider-adapters` component (section 3.2): each supported provider (OpenAI, Anthropic, Google, …) is implemented as its own provider plugin gear built on the ToolKit plugin system, isolating per-provider wire format, authentication routing, and streaming framing behind one SDK trait. Provider plugins are distinct from the Hook Plugin interface above — different trait, different extension point, different selection mechanism (identity-based vs. vendor/priority-based, see discovery below). A provider plugin owns translation (Open Responses ⇆ provider-native format) and transport (the provider call via Outbound API GW); everything stateful and cross-cutting (model resolution, capability validation, hooks, quota, usage, fallback, timeouts, FileStorage prefetch/store) stays in the core Gateway gear. The core gear registers the provider-plugin schema in types-registry during `init()` and depends only on `llm-gateway-sdk` and `types_registry`, never on a plugin crate directly; per-provider plugin gears are planned but not yet implemented — only the SDK trait and a demo/mock plugin exist at this time.
+
+**Plugin trait methods** (`LlmGatewayProviderPluginClient`):
+
+| Method | Invoked | Inputs | Output |
+|--------|---------|--------|--------|
+| `capabilities` | Local, no external call | `&self` only (provider-wide, static per plugin instance) | `ProviderPluginCapabilities` — integration-level capability report (see below) |
+| `create_response` | Sync `/responses` call, after provider resolution and capability check | `SecurityContext`, `ProviderCallCtx`, `CreateResponseBody` | `ResponseResource` or `Err(LlmGatewayError)` |
+| `create_response_stream` | Streaming `/responses` call | `SecurityContext`, `ProviderCallCtx`, `CreateResponseBody` | `Stream` of `StreamingEvent`s in `sequence_number` order, or `Err(LlmGatewayError)` for pre-stream setup failures |
+| `create_embedding` | `POST /embeddings` | `SecurityContext`, `ProviderCallCtx`, `EmbeddingRequest` | `EmbeddingResponse` or `Err(LlmGatewayError)` |
+
+`ProviderCallCtx` is a core-owned, per-call context passed to every method: the resolved model info as the GTS-typed `ModelInfoV1` envelope (default `serde_json::Value` provider settings) and the request correlation id. The plugin narrows the envelope to its own typed view via `ProviderCallCtx::typed_info::<Q>()` (delegating to Model Registry's `ModelInfoV1::try_into_typed`, keyed on `gts_type`), then reads `provider_model_id`, `provider_settings`, and its OAGW routing handle (e.g. an `oagw_alias`) from there. Carrying the same GTS type Model Registry produces lets the plugin validate its input through the registry SDK's own narrowing path, without its own Model Registry access.
+
+**Semantics**:
+
+- `create_response_stream` yields events matching the Open Responses SSE contract (section 3.3). The plugin translates provider-native stream framing into `StreamingEvent`s and performs the streaming transport through OAGW; it does not survive consumer disconnect, buffer for hooks, or assemble the terminal `ResponseResource` — the core does all of that (`cpt-cf-llm-gateway-seq-hook-plugin-streaming-v1`).
+- Streaming failures are in-band: the plugin surfaces a terminal error event and closes the stream. Pre-stream setup failures surface as the outer `Err(LlmGatewayError)`.
+- The core always requests usage from the provider (`stream_options.include_usage = true`) regardless of the consumer's value (section 3.3); the plugin forwards that flag when translating.
+- **Capability model**: `ProviderPluginCapabilities` reports only integration-level concerns Model Registry does not track — `streaming_transport` (whether the integration can stream at all, independent of a model's `streaming` flag) and `media_input` (`url_forward` vs. `prefetch_required`, see media handling below). Per-model feature capabilities (`vision`, `function_calling`, `streaming`, `reasoning`, `response_schema`, `audio_*`, `image_generation`, `web_search`) live in `ModelInfoV1.capabilities` and `supported_api`, validated by the Application Layer pre-dispatch (`cpt-cf-llm-gateway-fr-model-capability-check-v1`); plugins must not duplicate or override them. `capabilities()` takes no model or request context (`&self` only), so its reported values are provider-wide and static per plugin instance — they describe how the provider *integration* behaves, not a specific model.
+- **Transport & errors**: the plugin performs the provider HTTP/SSE call itself, but only through Outbound API GW using the routing handle carried in `ProviderCallCtx.model_info.provider_settings` (constraints `cpt-cf-llm-gateway-constraint-outbound-dependency`, `cpt-cf-llm-gateway-constraint-no-credentials`); OAGW injects credentials and applies infrastructure-level circuit breaking (`cpt-cf-llm-gateway-adr-circuit-breaking`). Plugins return `LlmGatewayError` variants, which the core/REST layer maps to the Open Responses error contract (section 3.3): a provider API error maps to `ProviderError` (→ `provider_error`), a provider timeout to `ProviderTimeout` (→ `provider_timeout`), a missing model capability to `CapabilityNotSupported`, and translation/unexpected transport failures to `Internal`. Timeout policy (TTFT + total) and provider fallback are enforced by the core around plugin calls (`cpt-cf-llm-gateway-seq-timeout-v1`, `cpt-cf-llm-gateway-seq-provider-fallback-v1`) — the plugin reports the underlying failure and the core decides whether to fall back (only before the first delta for streams).
+- **Media handling**: content parts referencing FileStorage or external URLs (`input_image`, `input_file`, `input_audio`, `input_video`) are handled per the plugin's declared `media_input` capability — `url_forward` plugins receive external/base64 URLs as-is with no core prefetch; `prefetch_required` plugins receive core-fetched bytes from FileStorage (`cpt-cf-llm-gateway-adr-file-storage`) before dispatch, matching the vision/document/audio sequences in section 3.4. Output media (image/audio/video generation) is returned as `DataOutput` items; the core persists generated media to FileStorage and rewrites the item URL (`cpt-cf-llm-gateway-seq-image-generation-v1`).
+- Async/background jobs, batch processing, and the realtime-audio (`WS /realtime`) surface are out of scope for this version of the trait.
+
+**Plugin discovery and selection**:
+
+- LLM Gateway (core gear) registers the GTS plugin schema (`gts.cf.toolkit.plugins.plugin.v1~cf.llmgw.provider.plugin.v1~`) during gear `init()`.
+- Each provider plugin registers a GTS instance under a stable instance ID of the form `gts.cf.toolkit.plugins.plugin.v1~cf.llmgw.provider.plugin.v1~<vendor>.<pkg>.<name>.plugin.v1`, declaring the Model Registry provider `gts_type` it serves via a `provider_type` field on its `LlmGatewayProviderPluginSpecV1` properties (e.g. `properties.provider_type = "gts.cf.genai.model.info.v1~cf.genai._.openai.v1~"`).
+- Selection keys on **provider identity**, not on configured vendor — this is a deliberate deviation from the platform's default "By Vendor" selection strategy (`docs/TOOLKIT_PLUGINS.md`), which the Hook Plugin interface above uses. The core does not have a single vendor config; instead it builds a **`ProviderPluginMap`** — an in-memory `HashMap<GtsTypeId, Arc<str>>` that maps each plugin's `provider_type` to its GTS instance ID (see pattern below). This refines the provider-selection step of `cpt-cf-llm-gateway-seq-provider-resolution-v1` (section 3.4).
+
+**Resolution mechanism** (`ProviderPluginMap`, analogous to `GtsPluginSelector` but keyed by multiple provider types):
+
+1. **Lazy bulk resolution** — On the first request that needs any provider plugin, the core queries `types-registry` for all `LlmGatewayProviderPluginSpecV1` instances in a single call (`InstanceQuery::new().with_pattern("gts.cf.toolkit.plugins.plugin.v1~cf.llmgw.provider.plugin.v1~*")`). This avoids races with types-registry startup readiness.
+
+2. **Build map** — Each instance is deserialized as `PluginV1<LlmGatewayProviderPluginSpecV1>`. The core groups instances by their `properties.provider_type` field. Within each group, the instance with the lowest `priority` value wins (tie-break). The winning instance's GTS ID is cached in the map:
+   ```
+   HashMap<GtsTypeId, Arc<str>>:
+     "gts.cf.genai.model.info.v1~cf.genai._.openai.v1~"    →  "gts.cf.toolkit.plugins.plugin.v1~cf.llmgw.provider.plugin.v1~cf.builtin.openai.plugin.v1"
+     "gts.cf.genai.model.info.v1~cf.genai._.anthropic.v1~"  →  "gts.cf.toolkit.plugins.plugin.v1~cf.llmgw.provider.plugin.v1~cf.builtin.anthropic.plugin.v1"
+     "gts.cf.genai.model.info.v1~cf.genai._.gemini.v1~"     →  "gts.cf.toolkit.plugins.plugin.v1~cf.llmgw.provider.plugin.v1~cf.builtin.google.plugin.v1"
+   ```
+   The map is cached for the `Service`'s lifetime (single-flight gate ensures exactly one types-registry query even under concurrent first-request racing).
+
+3. **Per-request lookup** — For each incoming request:
+   - Core resolves `ModelInfo` from Model Registry, reads `model_info.gts_type()` (the authoritative provider key).
+   - Looks up `model_info.gts_type()` in the cached `HashMap` — O(1), no external call.
+   - Resolves the scoped client: `hub.get_scoped::<dyn LlmGatewayProviderPluginClient>(ClientScope::gts_id(&instance_id))`.
+   - If the scoped client is not registered yet (plugin gear hasn't finished init), the request fails with `provider_error` — providers are never silently bypassed.
+
+4. **Multiple plugins for the same provider** — If two plugin instances claim the same `provider_type` (e.g. two OpenAI plugins with different priorities), the one with the lowest `priority` value is selected. This is handled at map-build time, not per-request.
+
+5. **Plugin unavailability** after resolution (scoped client not found in ClientHub) fails the request with `provider_error` — providers are never silently bypassed. This resolution-time failure deliberately reuses the existing `provider_error` code (section 3.3) rather than minting a new SDK variant at this stage; a dedicated `provider_unavailable` code, distinguishing gateway-side plugin-resolution failure from an upstream provider error, is noted as future work should operational needs require the distinction.
+
+**Timeout enforcement**:
+
+- Timeout policy (TTFT + total) around provider plugin calls is enforced by the core (`cpt-cf-llm-gateway-seq-timeout-v1`), not by the plugin itself, consistent with the Hook Plugin timeout model above.
+- A TTFT timeout before the first response chunk, or a total timeout during streaming, fails the request/stream with `provider_timeout`. Provider fallback (`cpt-cf-llm-gateway-seq-provider-fallback-v1`) is only attempted before the first delta is sent — once streaming has started, the request is committed to the resolved plugin.
+
 ### 3.4 Interactions & Sequences
 
 > **Note**: In the sequence diagrams below, "LLM Gateway" (GW) represents the full gateway stack including Provider Adapters. In practice, the Application Layer delegates to provider-specific adapters, which then call Outbound API Gateway. This is simplified for diagram readability. See Component Model (section 3.2) for the detailed layer structure.
@@ -608,7 +673,7 @@ The Hook Plugin interface is defined in `llm-gateway-sdk` as a plugin client tra
 
 - [ ] `p1` - **ID**: `cpt-cf-llm-gateway-seq-provider-resolution-v1`
 
-This sequence is used by all request flows to resolve the target provider. Other diagrams show "Resolve provider" as a simplified step — this is the detailed flow.
+This sequence is used by all request flows to resolve the target provider. Other diagrams show "Resolve provider" as a simplified step — this is the detailed flow. The "Select best available" / "Use primary provider" step resolves to a scoped `LlmGatewayProviderPluginClient` — see the Provider Plugin SDK Interface (section 3.3) for the detailed discovery/selection algorithm keyed on `ModelInfo.gts_type` (provider identity), including the `priority` tie-break and the `provider_error` outcome on plugin unavailability.
 
 ```mermaid
 sequenceDiagram
@@ -627,13 +692,15 @@ sequenceDiagram
     else Single provider
         GW->>GW: Use primary provider
     end
+    GW->>GW: Resolve provider plugin by gts_type (section 3.3)
 ```
 
 **Resolution outcomes**:
 - `model_not_found` — model not in catalog
 - `model_not_approved` — model not approved for tenant
 - `model_deprecated` — model sunset by provider
-- Success — returns provider endpoint + health metrics
+- `provider_error` — resolved provider has no available plugin instance (section 3.3)
+- Success — returns provider endpoint + health metrics + resolved provider plugin scope
 
 #### Create Response (Sync)
 
@@ -1461,3 +1528,4 @@ All functional requirements (24 FRs) and non-functional requirements (4 NFRs) fr
 | ADRs (7) | → | DESIGN Architecture Drivers + inline on principles/constraints | All covered |
 | DESIGN Components (7) | → | DECOMPOSITION | Pending |
 | DESIGN Sequences (23) | → | FEATURE | Pending |
+| `cpt-cf-llm-gateway-interface-provider-plugin-sdk-v1` | → | `cpt-cf-llm-gateway-component-provider-adapters` (section 3.2), `cpt-cf-llm-gateway-fr-chat-completion-v1`, `cpt-cf-llm-gateway-fr-streaming-v1`, `cpt-cf-llm-gateway-fr-embeddings-v1`, `cpt-cf-llm-gateway-adr-circuit-breaking`, `cpt-cf-llm-gateway-adr-file-storage` | Covered; further refined in [plugins.md](./plugins.md) |

@@ -347,7 +347,7 @@ deny:
 ## Run on every PR that touches deps.
 fips-policy:
 	$(call check_tool,cargo-deny)
-	cargo deny check bans --config deny-fips.toml
+	cargo deny --config deny-fips.toml check bans
 
 security: deny fips-policy
 

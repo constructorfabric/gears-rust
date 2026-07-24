@@ -152,3 +152,194 @@ pub struct ModelInfoV1<P: gts::GtsSchema = serde_json::Value> {
     /// parameters, and token pricing.
     pub provider_settings: P,
 }
+
+impl ModelInfoV1<serde_json::Value> {
+    /// Narrow a raw-JSON-payload model info to a typed view by validating
+    /// `gts_type` against `Q::TYPE_ID` and deserializing `provider_settings`
+    /// into `Q`. Common fields are preserved.
+    ///
+    /// # Errors
+    ///
+    /// - [`gts::NarrowError::SchemaId`] when `gts_type` doesn't match `Q::TYPE_ID`.
+    /// - [`gts::NarrowError::Deserialize`] when the payload can't be deserialized into `Q`.
+    pub fn try_into_typed<Q>(self) -> Result<ModelInfoV1<Q>, gts::NarrowError>
+    where
+        Q: gts::GtsSchema,
+        for<'de> Q: gts::GtsDeserialize<'de>,
+    {
+        let provider_settings =
+            gts::try_narrow::<Q>(self.gts_type.as_ref(), self.provider_settings)?;
+        Ok(ModelInfoV1 {
+            gts_type: self.gts_type,
+            display_name: self.display_name,
+            description: self.description,
+            family: self.family,
+            vendor: self.vendor,
+            managed: self.managed,
+            architecture: self.architecture,
+            size_bytes: self.size_bytes,
+            format: self.format,
+            region: self.region,
+            hosted_by: self.hosted_by,
+            last_release_at: self.last_release_at,
+            reasoning_level: self.reasoning_level,
+            version: self.version,
+            sort_order: self.sort_order,
+            icon: self.icon,
+            multiplier_display: self.multiplier_display,
+            performance: self.performance,
+            additional_info: self.additional_info,
+            supported_api: self.supported_api,
+            provider_model_id: self.provider_model_id,
+            capabilities: self.capabilities,
+            disabled_capabilities: self.disabled_capabilities,
+            context_window: self.context_window,
+            default_parameters: self.default_parameters,
+            allow_parameter_override: self.allow_parameter_override,
+            allow_extra_params: self.allow_extra_params,
+            provider_settings,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    use gts::GtsSchema;
+    use toolkit_gts::gts_id;
+
+    use crate::models::{
+        ContextWindow, DefaultInferenceParametersV1, DisabledCapabilities, MediaCapability,
+        ModelCapabilities, OpenAiSettingsV1, ReasoningCapability, WebSearchCapability,
+    };
+
+    fn raw_info(gts_type: &str, provider_settings: serde_json::Value) -> ModelInfoV1 {
+        ModelInfoV1 {
+            gts_type: gts::GtsTypeId::new(gts_type),
+            display_name: "Sample".into(),
+            description: None,
+            family: None,
+            vendor: None,
+            managed: false,
+            architecture: None,
+            size_bytes: None,
+            format: None,
+            region: None,
+            hosted_by: None,
+            last_release_at: None,
+            reasoning_level: None,
+            version: None,
+            sort_order: None,
+            icon: None,
+            multiplier_display: None,
+            performance: ModelPerformance {
+                response_latency_ms: None,
+                tokens_per_second: None,
+            },
+            additional_info: HashMap::new(),
+            supported_api: HashSet::from([SupportedApi::Completion]),
+            provider_model_id: "gpt-4o".into(),
+            capabilities: ModelCapabilities {
+                vision: MediaCapability::default(),
+                reasoning: ReasoningCapability {
+                    effort: false,
+                    toggle: false,
+                    resume: false,
+                    budget: false,
+                },
+                function_calling: false,
+                response_schema: false,
+                streaming: false,
+                file_input: MediaCapability::default(),
+                image_generation: MediaCapability::default(),
+                audio_input: MediaCapability::default(),
+                audio_output: MediaCapability::default(),
+                code_interpreter: false,
+                web_search: WebSearchCapability {
+                    enabled: false,
+                    allowed_domains: false,
+                    excluded_domains: false,
+                },
+            },
+            disabled_capabilities: DisabledCapabilities::none(),
+            context_window: ContextWindow {
+                max_input_tokens: 8192,
+                max_output_tokens: Some(4096),
+                output_vector_size: None,
+            },
+            default_parameters: DefaultInferenceParametersV1::default(),
+            allow_parameter_override: false,
+            allow_extra_params: Vec::new(),
+            provider_settings,
+        }
+    }
+
+    /// Full `OpenAI` settings JSON — the generated deserializer requires every
+    /// field to be present (missing `Option` fields are not defaulted).
+    fn openai_payload() -> serde_json::Value {
+        serde_json::json!({
+            "oagw_alias": "openai-prod",
+            "endpoint_kind": "chat_completions",
+            "organization": null,
+            "project": null,
+            "temperature": 0.7,
+            "top_p": null,
+            "presence_penalty": null,
+            "frequency_penalty": null,
+            "top_logprobs": null,
+            "service_tier": null,
+            "prompt_cache_retention": null,
+            "reasoning_effort": null,
+            "reasoning_summary": null,
+            "verbosity": null,
+            "parallel_tool_calls": null,
+            "store": null,
+            "response_format": null,
+            "max_tokens": 4096,
+            "max_completion_tokens": null,
+            "n": null,
+            "stop": null,
+            "seed": null,
+            "logprobs": null,
+            "max_output_tokens": null,
+            "max_tool_calls": null,
+            "truncation": null,
+            "encoding_format": null,
+            "dimensions": null,
+            "cost": {
+                "input_per_1k_micro": null,
+                "cached_input_per_1k_micro": null,
+                "output_per_1k_micro": null,
+                "long_context_input_per_1k_micro": null,
+                "long_context_cached_input_per_1k_micro": null,
+                "long_context_output_per_1k_micro": null,
+                "long_context_threshold_tokens": null,
+                "web_search_per_1k_calls_micro": null,
+                "file_search_per_1k_calls_micro": null,
+            },
+        })
+    }
+
+    #[test]
+    fn try_into_typed_narrows_matching_schema() {
+        let info = raw_info(OpenAiSettingsV1::TYPE_ID, openai_payload());
+        let typed: ModelInfoV1<OpenAiSettingsV1> =
+            info.try_into_typed().expect("openai schema matches");
+        assert_eq!(typed.provider_settings.oagw_alias, "openai-prod");
+        assert_eq!(typed.provider_model_id, "gpt-4o");
+    }
+
+    #[test]
+    fn try_into_typed_fails_on_schema_id_mismatch() {
+        let info = raw_info(
+            gts_id!("cf.genai.model.info.v1~cf.genai._.anthropic.v1~"),
+            serde_json::json!({ "oagw_alias": "openai-prod" }),
+        );
+        let err = info
+            .try_into_typed::<OpenAiSettingsV1>()
+            .expect_err("schema id mismatch");
+        assert!(matches!(err, gts::NarrowError::SchemaId { .. }));
+    }
+}

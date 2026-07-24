@@ -1,8 +1,0 @@
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "gts://gts.cf.llmgw.core.role.v1~",
-  "title": "Role",
-  "description": "Message author role in Open Responses protocol",
-  "type": "string",
-  "enum": ["user", "assistant", "system", "developer"]
-}

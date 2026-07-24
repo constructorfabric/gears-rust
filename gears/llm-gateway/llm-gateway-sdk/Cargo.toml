@@ -1,0 +1,34 @@
+[package]
+name = "cf-gears-llm-gateway-sdk"
+description = "SDK for the LLM Gateway: Open Responses domain models"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "llm_gateway_sdk"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+futures-core = { workspace = true }
+toolkit-security = { workspace = true }
+
+# GTS types for provider-plugin discovery
+gts = { workspace = true }
+toolkit-gts = { workspace = true }
+toolkit = { workspace = true }
+
+# Model Registry SDK: the GTS `ModelInfoV1` carried in `ProviderCallCtx`
+model-registry-sdk = { package = "cf-gears-model-registry-sdk", path = "../../model-registry/model-registry-sdk" }
