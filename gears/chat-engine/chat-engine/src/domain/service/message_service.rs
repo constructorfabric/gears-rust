@@ -53,6 +53,7 @@ use toolkit_macros::domain_model;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
+use crate::domain::authz::{actions, bypass, resource_types};
 use crate::domain::context::{
     is_context_overflow_error, read_memory_strategy, validate_memory_strategy,
     write_memory_strategy,
@@ -69,7 +70,6 @@ use crate::domain::ports::StreamEventBuffer;
 use crate::domain::ports::{
     FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage, PartCitations,
 };
-use crate::domain::authz::{actions, bypass, resource_types};
 use crate::domain::service::plugin_service::PluginService;
 use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer};
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
@@ -298,7 +298,12 @@ impl MessageService {
         // A 0-row scoped result hides existence from out-of-scope callers (404).
         let scope = self
             .enforcer
-            .access_scope(ctx, &resource_types::MESSAGE, actions::READ, Some(message_id))
+            .access_scope(
+                ctx,
+                &resource_types::MESSAGE,
+                actions::READ,
+                Some(message_id),
+            )
             .await?;
         self.messages
             .find_message_by_id_scoped(&scope, message_id)
@@ -321,7 +326,12 @@ impl MessageService {
         // @cpt-cf-chat-engine-interface-pep
         let scope = self
             .enforcer
-            .access_scope(ctx, &resource_types::MESSAGE, actions::DELETE, Some(message_id))
+            .access_scope(
+                ctx,
+                &resource_types::MESSAGE,
+                actions::DELETE,
+                Some(message_id),
+            )
             .await?;
         self.messages
             .find_message_by_id_scoped(&scope, message_id)
@@ -1049,7 +1059,12 @@ impl MessageService {
         // @cpt-cf-chat-engine-interface-pep
         let scope = self
             .enforcer
-            .access_scope(ctx, &resource_types::MESSAGE, actions::DELETE, Some(message_id))
+            .access_scope(
+                ctx,
+                &resource_types::MESSAGE,
+                actions::DELETE,
+                Some(message_id),
+            )
             .await?;
 
         // 2. Resolve the target message scoped to `session_id` under the PDP
@@ -1164,10 +1179,7 @@ impl MessageService {
                 action,
                 Some(session_id),
                 &AccessRequest::new()
-                    .resource_property(
-                        pep_properties::OWNER_TENANT_ID,
-                        prefetch.tenant_id.as_str(),
-                    )
+                    .resource_property(pep_properties::OWNER_TENANT_ID, prefetch.tenant_id.as_str())
                     .resource_property(pep_properties::OWNER_ID, prefetch.user_id.as_str())
                     .require_constraints(false),
             )

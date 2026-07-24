@@ -8,7 +8,12 @@ use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "sessions")]
-#[secure(tenant_col = "tenant_id", owner_col = "user_id", resource_col = "session_id", no_type)]
+#[secure(
+    tenant_col = "tenant_id",
+    owner_col = "user_id",
+    resource_col = "session_id",
+    no_type
+)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub session_id: Uuid,

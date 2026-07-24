@@ -1083,10 +1083,7 @@ impl VariantService {
                 action,
                 resource_id,
                 &AccessRequest::new()
-                    .resource_property(
-                        pep_properties::OWNER_TENANT_ID,
-                        prefetch.tenant_id.as_str(),
-                    )
+                    .resource_property(pep_properties::OWNER_TENANT_ID, prefetch.tenant_id.as_str())
                     .resource_property(pep_properties::OWNER_ID, prefetch.user_id.as_str())
                     .require_constraints(false),
             )

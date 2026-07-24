@@ -19,7 +19,12 @@ pub const VARIANT_INDEX_MAX_RETRIES: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "messages")]
-#[secure(tenant_col = "owner_tenant_id", owner_col = "owner_id", resource_col = "message_id", no_type)]
+#[secure(
+    tenant_col = "owner_tenant_id",
+    owner_col = "owner_id",
+    resource_col = "message_id",
+    no_type
+)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

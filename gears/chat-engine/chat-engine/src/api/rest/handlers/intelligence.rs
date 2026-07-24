@@ -94,9 +94,7 @@ pub async fn get_retention_policy(
     Extension(svc): Extension<Arc<IntelligenceService>>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Json<RetentionPolicy>> {
-    let policy = svc
-        .get_effective_retention_policy(&ctx, session_id)
-        .await?;
+    let policy = svc.get_effective_retention_policy(&ctx, session_id).await?;
     Ok(Json(policy))
 }
 

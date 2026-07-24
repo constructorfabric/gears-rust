@@ -46,11 +46,11 @@ use toolkit_macros::domain_model;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
+use crate::domain::authz::{actions, resource_types};
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::message::{Message, MessagePart, MessageRole, message_text};
 use crate::domain::ports::MessageRepo;
 use crate::domain::ports::SessionRepo;
-use crate::domain::authz::{actions, resource_types};
 use crate::domain::search::{
     Cursor, MAX_QUERY_LENGTH, MessageRef, SearchError, SearchPage, SearchQuery, SearchResult,
     SessionMeta, make_snippet, sanitize_for_tsquery,

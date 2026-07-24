@@ -1,7 +1,7 @@
 use super::*;
-use crate::domain::service::test_support;
 use crate::domain::ports::NewSession;
 use crate::domain::ports::NewSessionType;
+use crate::domain::service::test_support;
 use crate::domain::session::LifecycleState;
 use crate::domain::session::Session;
 use crate::domain::session::SessionType;
@@ -1567,7 +1567,11 @@ async fn delete_cascade_happy_path_removes_subtree_and_reactions() {
     let tenant = Uuid::new_v4();
     let user = Uuid::new_v4();
     let outcome = svc
-        .delete_message_cascade(&test_support::ctx_for_subject(user, tenant), session_id, target_id)
+        .delete_message_cascade(
+            &test_support::ctx_for_subject(user, tenant),
+            session_id,
+            target_id,
+        )
         .await
         .expect("happy path cascade");
 
@@ -1759,7 +1763,10 @@ async fn pdp_denied_list_messages_returns_forbidden() {
         .list_active_messages(&make_ctx(), Uuid::new_v4(), None)
         .await
         .unwrap_err();
-    assert!(matches!(err, ChatEngineError::Forbidden { .. }), "got: {err:?}");
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -1770,7 +1777,10 @@ async fn pdp_denied_get_message_returns_forbidden() {
         .resolve_owned_message(&make_ctx(), Uuid::new_v4())
         .await
         .unwrap_err();
-    assert!(matches!(err, ChatEngineError::Forbidden { .. }), "got: {err:?}");
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -1781,7 +1791,10 @@ async fn pdp_denied_delete_message_returns_forbidden() {
         .delete_message_cascade(&make_ctx(), Uuid::new_v4(), Uuid::new_v4())
         .await
         .unwrap_err();
-    assert!(matches!(err, ChatEngineError::Forbidden { .. }), "got: {err:?}");
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -1816,7 +1829,10 @@ async fn evaluation_failed_list_messages_returns_forbidden() {
         .list_active_messages(&make_ctx(), Uuid::new_v4(), None)
         .await
         .unwrap_err();
-    assert!(matches!(err, ChatEngineError::Forbidden { .. }), "got: {err:?}");
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -1827,7 +1843,10 @@ async fn compile_failed_list_messages_returns_forbidden() {
         .list_active_messages(&make_ctx(), Uuid::new_v4(), None)
         .await
         .unwrap_err();
-    assert!(matches!(err, ChatEngineError::Forbidden { .. }), "got: {err:?}");
+    assert!(
+        matches!(err, ChatEngineError::Forbidden { .. }),
+        "got: {err:?}"
+    );
 }
 
 // --- Point-op scope-miss -> 404 (anti-enumeration) ------------------------
@@ -1839,7 +1858,10 @@ async fn get_message_wrong_tenant_returns_not_found() {
 
     let svc = test_support::build_message_service(&db, test_support::enforcer_allow());
     let err = svc
-        .resolve_owned_message(&test_support::ctx_allow_tenants(&[Uuid::new_v4()]), ins.user_message_id)
+        .resolve_owned_message(
+            &test_support::ctx_allow_tenants(&[Uuid::new_v4()]),
+            ins.user_message_id,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -1895,6 +1917,9 @@ async fn internal_write_copies_owner_pair_from_session() {
         .await
         .expect("query message")
         .expect("message row visible under session tenant scope");
-    assert_eq!(row.owner_tenant_id, tenant, "child inherits session owner_tenant_id");
+    assert_eq!(
+        row.owner_tenant_id, tenant,
+        "child inherits session owner_tenant_id"
+    );
     assert_eq!(row.owner_id, user, "child inherits session owner_id");
 }

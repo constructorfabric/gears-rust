@@ -370,7 +370,12 @@ fn make_service(
     messages: Arc<dyn MessageRepo>,
     reactions: Arc<dyn ReactionRepo>,
 ) -> ReactionService {
-    make_service_with_enforcer(sessions, messages, reactions, test_support::enforcer_allow())
+    make_service_with_enforcer(
+        sessions,
+        messages,
+        reactions,
+        test_support::enforcer_allow(),
+    )
 }
 
 fn make_service_with_enforcer(
@@ -412,7 +417,7 @@ async fn set_reaction_returns_409_when_feedback_capability_missing() {
     );
 
     let err = svc
-        .set_reaction(&make_ctx(),session_id, message_id, ReactionType::Like)
+        .set_reaction(&make_ctx(), session_id, message_id, ReactionType::Like)
         .await
         .expect_err("capability gate must reject");
     match err {
@@ -441,7 +446,7 @@ async fn set_reaction_upserts_when_capability_enabled() {
     );
 
     let (resp, mutation) = svc
-        .set_reaction(&make_ctx(),session_id, message_id, ReactionType::Like)
+        .set_reaction(&make_ctx(), session_id, message_id, ReactionType::Like)
         .await
         .expect("ok");
     assert_eq!(resp.message_id, message_id);
@@ -469,7 +474,7 @@ async fn set_reaction_deletes_on_none_with_applied_true() {
     );
 
     let (resp, mutation) = svc
-        .set_reaction(&make_ctx(),session_id, message_id, ReactionType::None)
+        .set_reaction(&make_ctx(), session_id, message_id, ReactionType::None)
         .await
         .expect("ok");
     assert_eq!(resp.reaction_type, ReactionType::None);
@@ -526,7 +531,7 @@ async fn set_reaction_returns_400_on_non_assistant_target() {
     );
 
     let err = svc
-        .set_reaction(&make_ctx(),session_id, message_id, ReactionType::Like)
+        .set_reaction(&make_ctx(), session_id, message_id, ReactionType::Like)
         .await
         .expect_err("user-message target must be rejected");
     assert!(matches!(err, ChatEngineError::BadRequest { .. }));
@@ -550,7 +555,7 @@ async fn list_reactions_bypasses_capability_gate() {
     );
 
     let listing = svc
-        .list_reactions(&make_ctx(),session_id, message_id)
+        .list_reactions(&make_ctx(), session_id, message_id)
         .await
         .expect("ok");
     assert_eq!(listing.message_id, message_id);
@@ -741,9 +746,7 @@ fn ensure_feedback_capability_rejects_when_array_missing() {
 // The read path is trust-parent (unrestricted table, no PDP call).
 // @cpt-cf-chat-engine-interface-pep
 
-fn authz_fixture(
-    enforcer: PolicyEnforcer,
-) -> (ReactionService, Uuid, Uuid) {
+fn authz_fixture(enforcer: PolicyEnforcer) -> (ReactionService, Uuid, Uuid) {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let session = make_session(

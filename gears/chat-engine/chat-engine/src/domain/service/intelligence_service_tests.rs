@@ -1351,9 +1351,7 @@ async fn get_effective_pdp_denied_returns_forbidden() {
     let msgs = MockMessageRepo::new(vec![]);
     let svc = make_service_with_enforcer(sessions, msgs, test_support::enforcer_deny());
 
-    let res = svc
-        .get_effective_retention_policy(&ctx(), session_id)
-        .await;
+    let res = svc.get_effective_retention_policy(&ctx(), session_id).await;
     assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
 }
 
@@ -1364,9 +1362,7 @@ async fn get_effective_evaluation_failed_returns_forbidden() {
     let msgs = MockMessageRepo::new(vec![]);
     let svc = make_service_with_enforcer(sessions, msgs, test_support::enforcer_failing());
 
-    let res = svc
-        .get_effective_retention_policy(&ctx(), session_id)
-        .await;
+    let res = svc.get_effective_retention_policy(&ctx(), session_id).await;
     assert!(matches!(res, Err(ChatEngineError::Forbidden { .. })));
 }
 

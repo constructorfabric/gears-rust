@@ -8,13 +8,13 @@ use crate::domain::ports::SessionRepo;
 use crate::domain::ports::{FinalizeOutcome, InsertedPair, MessageRepo, NewUserMessage};
 use crate::domain::service::test_support;
 use crate::domain::session::LifecycleState;
-use toolkit_security::AccessScope;
 use crate::domain::session::METADATA_KEY_SHARE_EXPIRES_AT;
 use crate::domain::session::Session;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::json;
 use std::sync::Arc;
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 // --- mocks -----------------------------------------------------------
@@ -423,10 +423,7 @@ async fn access_shared_returns_view_without_user_or_tenant() {
         .lock()
         .push(sample_message(MessageRole::Assistant, "hi there"));
 
-    let issue = svc
-        .create_share(&ctx(), session_id, None)
-        .await
-        .unwrap();
+    let issue = svc.create_share(&ctx(), session_id, None).await.unwrap();
 
     let view = svc.access_shared(&issue.share_token).await.expect("ok");
     assert!(view.read_only);
@@ -484,10 +481,7 @@ async fn revoke_share_clears_token_and_expires() {
     let session_id = Uuid::new_v4();
     sessions.seed(owned_session(session_id));
 
-    let issue = svc
-        .create_share(&ctx(), session_id, Some(1))
-        .await
-        .unwrap();
+    let issue = svc.create_share(&ctx(), session_id, Some(1)).await.unwrap();
     assert!(!issue.share_token.is_empty());
 
     svc.revoke_share(&ctx(), session_id).await.unwrap();

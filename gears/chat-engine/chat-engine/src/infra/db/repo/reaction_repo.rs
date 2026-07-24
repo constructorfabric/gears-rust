@@ -32,9 +32,9 @@ use time::OffsetDateTime;
 use toolkit_db::secure::{SecureDeleteExt, SecureEntityExt, SecureInsertExt, TxConfig};
 use uuid::Uuid;
 
+use crate::domain::authz::bypass;
 use crate::domain::error::ChatEngineError;
 use crate::domain::ports::{ReactionDeleteOutcome, ReactionRepo, ReactionUpsertOutcome};
-use crate::domain::authz::bypass;
 use crate::domain::reaction::{MessageReaction, ReactionType};
 use crate::infra::db::entity::message_reaction::{
     self as reaction_entity, Column as ReactionColumn, Entity as ReactionEntity,
@@ -113,12 +113,11 @@ impl ReactionRepo for SeaReactionRepo {
                         // @cpt-cf-chat-engine-design-authz-bypass-registry
                         let scope = bypass::unrestricted_table_scope();
 
-                        let previous =
-                            ReactionEntity::find_by_id((message_id, user_id_owned))
-                                .secure()
-                                .scope_with(&scope)
-                                .one(tx)
-                                .await?;
+                        let previous = ReactionEntity::find_by_id((message_id, user_id_owned))
+                            .secure()
+                            .scope_with(&scope)
+                            .one(tx)
+                            .await?;
 
                         let am = reaction_entity::ActiveModel {
                             message_id: Set(message_id),

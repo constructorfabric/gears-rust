@@ -218,9 +218,7 @@ pub async fn list_variants(
         .resolve_owned_message(&ctx, message_id)
         .await?
         .session_id;
-    let listing = variants
-        .list_variants(&ctx, session_id, message_id)
-        .await?;
+    let listing = variants.list_variants(&ctx, session_id, message_id).await?;
     Ok(Json(VariantListDto {
         current_index: listing.current_index,
         variants: listing

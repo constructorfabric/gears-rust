@@ -825,7 +825,9 @@ impl SessionRepo for SeaSessionRepo {
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
-                        .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+                        .filter(
+                            Condition::all().add(session_entity::Column::SessionId.eq(session_id)),
+                        )
                         .col_expr(
                             session_entity::Column::Metadata,
                             Expr::value(metadata.clone()),
@@ -854,7 +856,9 @@ impl SessionRepo for SeaSessionRepo {
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
-                        .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+                        .filter(
+                            Condition::all().add(session_entity::Column::SessionId.eq(session_id)),
+                        )
                         .col_expr(
                             session_entity::Column::EnabledCapabilities,
                             Expr::value(capabilities.clone()),
@@ -886,7 +890,9 @@ impl SessionRepo for SeaSessionRepo {
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
-                        .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+                        .filter(
+                            Condition::all().add(session_entity::Column::SessionId.eq(session_id)),
+                        )
                         .col_expr(
                             session_entity::Column::Metadata,
                             Expr::value(metadata.clone()),
@@ -921,7 +927,9 @@ impl SessionRepo for SeaSessionRepo {
                     let mut update = SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
-                        .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+                        .filter(
+                            Condition::all().add(session_entity::Column::SessionId.eq(session_id)),
+                        )
                         .col_expr(
                             session_entity::Column::LifecycleState,
                             Expr::value(state_str.clone()),
@@ -960,7 +968,9 @@ impl SessionRepo for SeaSessionRepo {
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
-                        .filter(Condition::all().add(session_entity::Column::SessionId.eq(session_id)))
+                        .filter(
+                            Condition::all().add(session_entity::Column::SessionId.eq(session_id)),
+                        )
                         .col_expr(
                             session_entity::Column::LifecycleState,
                             Expr::value(LifecycleState::SoftDeleted.as_str().to_string()),

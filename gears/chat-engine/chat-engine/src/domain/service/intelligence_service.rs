@@ -70,12 +70,12 @@ use toolkit_macros::domain_model;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
+use crate::domain::authz::{actions, bypass, resource_types};
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::message::{
     StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent, StreamingEvent,
     StreamingStartEvent,
 };
-use crate::domain::authz::{actions, bypass, resource_types};
 use crate::domain::ports::MessageRepo;
 use crate::domain::ports::SessionRepo;
 use crate::domain::ports::SessionTypeRepo;
@@ -820,10 +820,7 @@ impl IntelligenceService {
                 action,
                 resource_id,
                 &AccessRequest::new()
-                    .resource_property(
-                        pep_properties::OWNER_TENANT_ID,
-                        prefetch.tenant_id.as_str(),
-                    )
+                    .resource_property(pep_properties::OWNER_TENANT_ID, prefetch.tenant_id.as_str())
                     .resource_property(pep_properties::OWNER_ID, prefetch.user_id.as_str())
                     .require_constraints(false),
             )

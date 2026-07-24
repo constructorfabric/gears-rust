@@ -38,7 +38,5 @@ pub const REACTION: ResourceType = ResourceType::from_static(
 /// `session_types` is a globally non-tenant table (DESIGN §3.5.1); the PDP
 /// governs mutation permission (`create`/`update`/`delete`) via allow/deny
 /// decision only. No `supported_properties` are advertised.
-pub const SESSION_TYPE: ResourceType = ResourceType::from_static(
-    gts_id!("cf.core.chat_engine.session_type.v1~"),
-    &[],
-);
+pub const SESSION_TYPE: ResourceType =
+    ResourceType::from_static(gts_id!("cf.core.chat_engine.session_type.v1~"), &[]);

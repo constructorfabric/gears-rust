@@ -19,7 +19,12 @@ use crate::domain::error::ChatEngineError;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "message_parts")]
-#[secure(tenant_col = "owner_tenant_id", owner_col = "owner_id", resource_col = "id", no_type)]
+#[secure(
+    tenant_col = "owner_tenant_id",
+    owner_col = "owner_id",
+    resource_col = "id",
+    no_type
+)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,

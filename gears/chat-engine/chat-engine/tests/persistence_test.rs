@@ -600,8 +600,12 @@ async fn pdp_denied_send_returns_forbidden_and_writes_nothing_against_sqlite() {
 
     let plugin = FakePlugin::new(plugin_id, FakePluginScript::Events(vec![]));
     let plugin_dyn: Arc<dyn ChatEngineBackendPlugin> = plugin;
-    let svc =
-        build_service_with_enforcer(&harness, plugin_id, plugin_dyn, common::authz::enforcer_deny());
+    let svc = build_service_with_enforcer(
+        &harness,
+        plugin_id,
+        plugin_dyn,
+        common::authz::enforcer_deny(),
+    );
 
     let cancel = CancellationToken::new();
     let Err(err) = svc

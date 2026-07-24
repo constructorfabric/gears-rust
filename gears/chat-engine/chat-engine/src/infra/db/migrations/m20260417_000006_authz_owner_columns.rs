@@ -274,7 +274,6 @@ impl MigrationTrait for Migration {
                         )));
                     }
                 }
-
             }
             sea_orm::DatabaseBackend::Sqlite => {
                 // SQLite does not support UPDATE ... FROM; use correlated subquery.
@@ -348,7 +347,6 @@ impl MigrationTrait for Migration {
                         )));
                     }
                 }
-
             }
             sea_orm::DatabaseBackend::MySql => {
                 return Err(DbErr::Custom(

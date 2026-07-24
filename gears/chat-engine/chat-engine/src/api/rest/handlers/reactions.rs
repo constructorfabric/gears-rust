@@ -202,9 +202,7 @@ pub async fn list_reactions(
     Extension(svc): Extension<Arc<ReactionService>>,
     Path((session_id, message_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<ListReactionsResponseDto>> {
-    let listing = svc
-        .list_reactions(&ctx, session_id, message_id)
-        .await?;
+    let listing = svc.list_reactions(&ctx, session_id, message_id).await?;
     Ok(Json(ListReactionsResponseDto::from(listing)))
 }
 

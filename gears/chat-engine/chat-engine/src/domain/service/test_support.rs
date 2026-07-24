@@ -74,7 +74,6 @@ pub fn ctx_for_subject(subject_id: Uuid, tenant_id: Uuid) -> SecurityContext {
         .unwrap()
 }
 
-
 // ---------------------------------------------------------------------------
 // In-memory database + repo builders
 // ---------------------------------------------------------------------------
