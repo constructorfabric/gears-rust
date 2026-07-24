@@ -54,7 +54,22 @@ With tracing enabled the gateway and toolkit give you, without per-gear wiring:
 - **W3C trace-context** propagation in and out (`traceparent`);
 - a **request id** correlated across logs and injected as a response header
   (`inject_request_id_header`);
-- health endpoints **`/health`** and **`/healthz`** exposed by the API Gateway.
+- health endpoints **`/healthz`** (liveness, shallow "ok"), **`/readyz`** (readiness,
+  200/503), and **`/health`** (detailed per-component JSON) exposed by the API Gateway. All
+  three are public (no auth) and run on the gateway's middleware surface.
+
+### Health serving modes
+
+`api-gateway` config controls where the probes are served:
+
+- `health.serve: main` (default) — probes ride the main listener, sharing `prefix_path`
+  (e.g. `/cf/healthz`).
+- `health.serve: separate` — probes are served only on a dedicated listener; set
+  `health.bind_addr` (e.g. `0.0.0.0:8081`) and expect the paths **unprefixed** on that port.
+- `health.serve: both` — served on both. `bind_addr` is required for `separate`/`both`.
+
+Register one composite `Healthcheck` per gear (see `RestApiCapability::healthcheck`); report
+external SaaS/LLM dependencies as `degraded` rather than gating readiness on them.
 
 ## Instrument your own code
 

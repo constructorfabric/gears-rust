@@ -349,7 +349,11 @@ async fn e2e_full_middleware_stack_logs_remote_addr() -> anyhow::Result<()> {
         .handler(get(e2e_handler))
         .register(Router::new(), &api);
 
-    let app = api.rest_finalize(&ctx, router)?;
+    let app = api.rest_finalize(
+        &ctx,
+        router,
+        Arc::new(toolkit::RestHealthcheckRegistry::new()),
+    )?;
 
     // Set up capturing layer for the access log.
     let layer = CapturingLayer::default();

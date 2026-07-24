@@ -1,10 +1,19 @@
 use axum::{
+    extract::Extension,
     http::StatusCode,
-    response::{Html, Json},
+    response::{Html, IntoResponse, Json, Response},
     routing::{MethodRouter, get},
 };
 use chrono::{SecondsFormat, Utc};
-use serde_json::{Value, json};
+use serde_json::json;
+use std::sync::Arc;
+use std::time::Duration;
+use toolkit::RestHealthcheckRegistry;
+
+/// Per-check timeout (from `ApiGatewayConfig::healthcheck_timeout_ms`), injected as an
+/// `Extension`. A newtype avoids colliding with any other `Duration` extension.
+#[derive(Clone, Copy)]
+pub struct HealthcheckTimeout(pub Duration);
 
 /// Returns a 501 Not Implemented handler for operations without implementations
 #[allow(dead_code)]
@@ -20,11 +29,39 @@ pub fn placeholder_handler_501() -> MethodRouter {
     })
 }
 
-pub async fn health_check() -> Json<Value> {
-    Json(json!({
-        "status": "healthy",
-        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
-    }))
+/// `GET /health`: runs all checks, returns JSON with per-component detail. Public (no auth) in
+/// every serving mode; the per-component detail is protected by network placement, not auth,
+/// and check messages are sanitized. 200 (Healthy/Degraded), 503 (Unhealthy).
+pub async fn health_detail(
+    Extension(registry): Extension<Arc<RestHealthcheckRegistry>>,
+    Extension(timeout): Extension<HealthcheckTimeout>,
+) -> Response {
+    let report = registry.report(timeout.0).await;
+    let status_code = status_for_report(report.is_ready());
+    let body = Json(json!({
+        "status": report.status,
+        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "components": report.components,
+    }));
+    (status_code, body).into_response()
+}
+
+/// `GET /readyz`: runs all checks, public, status code only (no detail).
+/// 200 (Healthy/Degraded), 503 (Unhealthy).
+pub async fn readyz_check(
+    Extension(registry): Extension<Arc<RestHealthcheckRegistry>>,
+    Extension(timeout): Extension<HealthcheckTimeout>,
+) -> StatusCode {
+    let report = registry.report(timeout.0).await;
+    status_for_report(report.is_ready())
+}
+
+fn status_for_report(report_ready: bool) -> StatusCode {
+    if report_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 #[cfg(not(feature = "embed_elements"))]

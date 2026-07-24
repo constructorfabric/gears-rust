@@ -136,6 +136,14 @@ pub use directory::{
     ServiceInstanceInfo,
 };
 
+// REST healthcheck infrastructure. Module private so types have one public path
+// (flat re-export below), not two.
+mod healthcheck;
+pub use healthcheck::{
+    Healthcheck, HealthcheckComponentReport, HealthcheckReport, HealthcheckResult,
+    HealthcheckStatus, RestHealthcheckRegistry,
+};
+
 // GTS schema support
 pub mod gts;
 

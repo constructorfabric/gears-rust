@@ -599,8 +599,9 @@ cd gears-rust
 make build      # build libs + example server
 make example    # run the example server -> http://127.0.0.1:8087/cf/docs
 
-curl http://127.0.0.1:8087/cf/health    # detailed JSON
-curl http://127.0.0.1:8087/healthz      # liveness "ok"
+curl http://127.0.0.1:8087/cf/health    # detailed JSON (all component checks)
+curl http://127.0.0.1:8087/cf/readyz    # readiness: 200 ready / 503 not ready
+curl http://127.0.0.1:8087/cf/healthz   # liveness "ok"
 ```
 
 **Next steps**

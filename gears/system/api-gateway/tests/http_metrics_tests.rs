@@ -158,7 +158,11 @@ async fn metrics_capture_successful_request() -> Result<()> {
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::get(ok_handler))
         .register(Router::new(), &api);
-    let app = api.rest_finalize(&ctx, router)?;
+    let app = api.rest_finalize(
+        &ctx,
+        router,
+        Arc::new(toolkit::RestHealthcheckRegistry::new()),
+    )?;
 
     let res = app
         .oneshot(
@@ -212,7 +216,11 @@ async fn metrics_capture_mime_rejection() -> Result<()> {
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::post(ok_handler))
         .register(Router::new(), &api);
-    let app = api.rest_finalize(&ctx, router)?;
+    let app = api.rest_finalize(
+        &ctx,
+        router,
+        Arc::new(toolkit::RestHealthcheckRegistry::new()),
+    )?;
 
     let res = app
         .oneshot(
@@ -275,7 +283,11 @@ async fn metrics_capture_rate_limit() -> Result<()> {
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::get(ok_handler))
         .register(Router::new(), &api);
-    let app = api.rest_finalize(&ctx, router)?;
+    let app = api.rest_finalize(
+        &ctx,
+        router,
+        Arc::new(toolkit::RestHealthcheckRegistry::new()),
+    )?;
 
     // First request — succeeds and consumes the token
     let res1 = app
@@ -335,7 +347,11 @@ async fn metrics_route_attribute_uses_template() -> Result<()> {
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::get(ok_handler))
         .register(Router::new(), &api);
-    let app = api.rest_finalize(&ctx, router)?;
+    let app = api.rest_finalize(
+        &ctx,
+        router,
+        Arc::new(toolkit::RestHealthcheckRegistry::new()),
+    )?;
 
     let res = app
         .oneshot(
@@ -387,7 +403,11 @@ async fn metrics_unmatched_route() -> Result<()> {
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::get(ok_handler))
         .register(Router::new(), &api);
-    let app = api.rest_finalize(&ctx, router)?;
+    let app = api.rest_finalize(
+        &ctx,
+        router,
+        Arc::new(toolkit::RestHealthcheckRegistry::new()),
+    )?;
 
     let res = app
         .oneshot(
@@ -453,7 +473,11 @@ async fn metrics_prefix_applied_to_instrument_names() -> Result<()> {
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::get(ok_handler))
         .register(Router::new(), &api);
-    let app = api.rest_finalize(&ctx, router)?;
+    let app = api.rest_finalize(
+        &ctx,
+        router,
+        Arc::new(toolkit::RestHealthcheckRegistry::new()),
+    )?;
 
     let res = app
         .oneshot(

@@ -188,6 +188,7 @@ impl ApiGatewayCapability for TestApiGatewayGear {
         &self,
         _ctx: &toolkit::context::GearCtx,
         router: axum::Router,
+        _hc_registry: std::sync::Arc<toolkit::RestHealthcheckRegistry>,
     ) -> anyhow::Result<axum::Router> {
         Ok(router)
     }
@@ -196,6 +197,7 @@ impl ApiGatewayCapability for TestApiGatewayGear {
         &self,
         _ctx: &toolkit::context::GearCtx,
         router: axum::Router,
+        _hc_registry: std::sync::Arc<toolkit::RestHealthcheckRegistry>,
     ) -> anyhow::Result<axum::Router> {
         Ok(router)
     }
