@@ -538,7 +538,7 @@ Centralizes outbound HTTP behavior (request timeout and transient-failure retry)
 - Apply `http_client.request_timeout` to each outbound HTTP attempt (per-attempt, not per logical operation)
 - Retry transient failures per `retry_policy` with exponential backoff + jitter
 - Classify responses as retryable vs permanent and surface the final outcome to callers
-- Honor `Retry-After` on HTTP 429 responses (bounded by `retry_policy.max_backoff` and `retry_policy.max_attempts`)
+- Honor `Retry-After` on HTTP 429 responses (bounded by `retry_policy.max_backoff_ms` and `retry_policy.max_retries`)
 
 ##### Responsibility boundaries
 
@@ -555,9 +555,10 @@ Does not decide which issuer/host to call (that is the caller's responsibility).
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `http_client.request_timeout` | duration | `5s` | HTTP timeout for every outbound IdP call (discovery, JWKS, S2S token endpoint). Replaces the former `discovery_timeout`. Applies per attempt — a retried call gets a fresh `request_timeout` on each attempt. |
-| `retry_policy.max_attempts` | integer | `3` | Number of retry attempts performed **after** the initial call. `0` disables retries. Default `3` means worst case = 1 initial call + 3 retries = 4 total requests. Must be ≥ 0. |
-| `retry_policy.initial_backoff` | duration | `100ms` | Starting backoff before the first retry. Doubles on each subsequent retry (exponential). |
-| `retry_policy.max_backoff` | duration | `2s` | Upper bound on the computed backoff per retry. |
+| `retry_policy.max_retries` | integer | `3` | Number of retry attempts performed **after** the initial call. `0` disables retries. Default `3` means worst case = 1 initial call + 3 retries = 4 total requests. Must be ≥ 0. |
+| `retry_policy.backoff_base_ms` | integer | `2` | Exponential-backoff base (growth ratio between delays). Computed delay for retry `n` is `backoff_base_ms^n × backoff_factor` ms, capped at `max_backoff_ms`. Must be > 0. |
+| `retry_policy.backoff_factor` | integer | `50` | Multiplier applied to every backoff delay. With `backoff_base_ms: 2`, `backoff_factor: 50` the schedule is 100ms, 200ms, 400ms, …. Must be > 0. |
+| `retry_policy.max_backoff_ms` | integer | `2000` | Upper bound (ms) on any single retry delay. Must be > 0. |
 | `retry_policy.jitter` | boolean | `true` | When `true`, the actual wait is randomized uniformly in `[0, computed_backoff]` (full jitter) to avoid thundering herd. When `false`, the retry waits exactly `computed_backoff`. |
 
 A full operator-facing configuration example covering every knob documented in this DESIGN is maintained alongside these docs at [`config-example.yaml`](config-example.yaml).
@@ -567,9 +568,9 @@ A full operator-facing configuration example covering every knob documented in t
 | Failure | Retried? | Notes |
 |---------|----------|-------|
 | Connection error (DNS, refused, TLS, reset) | Yes | Transient infra failure. |
-| Request timeout (`request_timeout` elapsed) | **No** | Not retried. A timeout is a slow failure — retrying multiplies user-facing latency (worst case `(max_attempts + 1) × request_timeout`) and adds load to an already-struggling IdP. Repeated timeouts for a host are instead absorbed by the circuit breaker: each timed-out logical operation counts as one failure, and the host's breaker opens at `failure_threshold`. |
+| Request timeout (`request_timeout` elapsed) | **No** | Not retried. A timeout is a slow failure — retrying multiplies user-facing latency (worst case `(max_retries + 1) × request_timeout`) and adds load to an already-struggling IdP. Repeated timeouts for a host are instead absorbed by the circuit breaker: each timed-out logical operation counts as one failure, and the host's breaker opens at `failure_threshold`. |
 | HTTP 5xx | Yes | Server-side transient. |
-| HTTP 429 | Yes | Honors `Retry-After` header when present; otherwise uses computed backoff. Bounded by `retry_policy.max_attempts` and `retry_policy.max_backoff`. |
+| HTTP 429 | Yes | Honors `Retry-After` header when present; otherwise uses computed backoff. Bounded by `retry_policy.max_retries` and `retry_policy.max_backoff_ms`. |
 | HTTP 4xx (not 429) | No | Treated as permanent — retrying will not succeed (e.g., bad credentials, bad request). |
 | 2xx with unparseable body | No | Permanent — returned as parse error. |
 
@@ -577,7 +578,7 @@ A full operator-facing configuration example covering every knob documented in t
 
 | Operation | Input | Output | Key Behavior |
 |-----------|-------|--------|-------------|
-| `send` (GET / POST) | URL, headers, optional body | HTTP response | 1. Apply `request_timeout` to the attempt. 2. On retryable failure, wait `jitter(min(initial_backoff × 2^(attempt-1), max_backoff))`, honoring `Retry-After` for 429 when present. 3. Stop after `max_attempts` retries and surface the last error. 4. On success, return the response. |
+| `send` (GET / POST) | URL, headers, optional body | HTTP response | 1. Apply `request_timeout` to the attempt. 2. On retryable failure, wait `jitter(min(backoff_base_ms^n × backoff_factor, max_backoff_ms))` for retry `n`, honoring `Retry-After` for 429 when present. 3. Stop after `max_retries` retries and surface the last error. 4. On success, return the response. |
 
 #### Circuit Breaker
 
@@ -649,8 +650,8 @@ The plugin validates all configuration parameters during initialization. Invalid
 | `jwt.clock_skew_leeway` must be ≤ 300s | `Internal("clock_skew_leeway exceeds 5 minute maximum")` | Fatal — excessive leeway weakens expiry enforcement |
 | `jwks_cache.stale_ttl` must be ≥ `jwks_cache.ttl` | `Internal("stale_ttl must be >= ttl")` | Fatal — stale window shorter than fresh window is contradictory |
 | `http_client.request_timeout` must be > 0 | `Internal("http_client.request_timeout must be positive")` | Fatal — unbounded requests would exhaust connection pools |
-| `retry_policy.max_attempts` must be ≥ 0 | `Internal("retry_policy.max_attempts must be >= 0")` | Fatal — negative retry counts are meaningless (`0` is valid and disables retries) |
-| `retry_policy.initial_backoff` must be > 0 and ≤ `retry_policy.max_backoff` | `Internal("retry_policy.initial_backoff must be > 0 and <= max_backoff")` | Fatal — zero or inverted backoff window is contradictory |
+| `retry_policy.max_retries` must be ≥ 0 | `Internal("retry_policy.max_retries must be >= 0")` | Fatal — negative retry counts are meaningless (`0` is valid and disables retries) |
+| `retry_policy.backoff_base_ms`, `backoff_factor` and `max_backoff_ms` must be > 0 | `Internal("retry_policy.backoff_base_ms, backoff_factor and max_backoff_ms must all be > 0")` | Fatal — a zero base, factor, or cap yields a degenerate backoff schedule |
 | `retry_policy.jitter` must be a boolean | `Internal("retry_policy.jitter must be a boolean")` | Fatal — non-boolean value prevents scheduler initialization |
 
 Issuer selection is deterministic by configuration order: entries are evaluated top-to-bottom and the first match wins. Operators should place specific exact or regex entries before broader regex patterns.
@@ -1096,7 +1097,7 @@ Authentication events are emitted as structured log entries for compliance and i
 | **JWKS cache poisoning** | JWKS fetched only from `jwks_uri` resolved from trusted issuer's `.well-known/openid-configuration`; HTTPS with certificate validation |
 | **Credential leakage** | `SecretString` types for all tokens and secrets; no logging; env var injection for credentials |
 | **S2S credential compromise** | Tokens cached with bounded TTL; credential rotation handled at IdP level; circuit breaker prevents abuse amplification |
-| **Denial of service via JWKS refresh** | Rate-limited JWKS refresh; stale-while-revalidate pattern; single in-flight refresh per issuer; retries bounded by `retry_policy.max_attempts` and `retry_policy.max_backoff` so a failing IdP cannot be retried indefinitely per request; per-host circuit breaker stops repeated outbound attempts against a degraded host |
+| **Denial of service via JWKS refresh** | Rate-limited JWKS refresh; stale-while-revalidate pattern; single in-flight refresh per issuer; retries bounded by `retry_policy.max_retries` and `retry_policy.max_backoff_ms` so a failing IdP cannot be retried indefinitely per request; per-host circuit breaker stops repeated outbound attempts against a degraded host |
 
 ### Reliability Architecture
 
@@ -1138,9 +1139,10 @@ stateDiagram-v2
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `retry_policy.max_attempts` | `3` | Number of retry attempts after the initial call. `0` disables retries. |
-| `retry_policy.initial_backoff` | `100ms` | Starting backoff before the first retry (doubled each subsequent retry). |
-| `retry_policy.max_backoff` | `2s` | Upper bound on the computed backoff per retry. |
+| `retry_policy.max_retries` | `3` | Number of retry attempts after the initial call. `0` disables retries. |
+| `retry_policy.backoff_base_ms` | `2` | Exponential-backoff base (growth ratio); delay for retry `n` is `backoff_base_ms^n × backoff_factor` ms. |
+| `retry_policy.backoff_factor` | `50` | Backoff multiplier; base `2` × factor `50` → 100ms, 200ms, 400ms, …. |
+| `retry_policy.max_backoff_ms` | `2000` | Upper bound (ms) on any single retry delay. |
 | `retry_policy.jitter` | `true` | When `true`, the wait is randomized uniformly in `[0, computed_backoff]` (full jitter); when `false`, wait exactly `computed_backoff`. |
 
 Retryable failures: connection errors (DNS, refused, TLS, reset), HTTP 5xx, HTTP 429 (`Retry-After` honored). Request timeout is **not** retried — it is a slow failure that would multiply user-facing latency and add load to a struggling IdP; repeated timeouts for a host are absorbed by the circuit breaker. HTTP 4xx other than 429 is treated as permanent and not retried. Retries run **inside** each breaker call, so exhausted retries count as a single failure toward `failure_threshold`.

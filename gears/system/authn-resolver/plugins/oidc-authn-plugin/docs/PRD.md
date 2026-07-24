@@ -326,8 +326,8 @@ The plugin MUST retry transient outbound IdP failures with exponential backoff p
 
 - Retryable: connection errors (DNS, refused, TLS, reset), HTTP 5xx, HTTP 429.
 - Not retryable: request timeout (a slow failure — retrying multiplies user-facing latency and adds load to a struggling IdP; repeated timeouts are absorbed by the per-host circuit breaker instead), HTTP 4xx other than 429 (permanent), 2xx with unparseable body.
-- `retry_policy.max_attempts` (default `3`) MUST bound the number of retry attempts **after** the initial call. `0` MUST disable retries. `max_attempts = 3` means the worst case is 1 initial call + 3 retries = 4 total requests.
-- When an HTTP 429 response includes a `Retry-After` header, the plugin MUST honor it, capped by `retry_policy.max_backoff`.
+- `retry_policy.max_retries` (default `3`) MUST bound the number of retry attempts **after** the initial call. `0` MUST disable retries. `max_retries = 3` means the worst case is 1 initial call + 3 retries = 4 total requests.
+- When an HTTP 429 response includes a `Retry-After` header, the plugin MUST honor it, capped by `retry_policy.max_backoff_ms`.
 - Retries MUST occur **inside** each circuit-breaker call — one logical operation MUST equal one breaker attempt, so exhausted retries count as a single failure toward the breaker's `failure_threshold`.
 
 - **Rationale**: Transient blips (one-off network hiccups, brief IdP 5xx, rate-limit bursts) should not surface as failed authentications. Inside-the-breaker semantics prevent retry amplification from prematurely tripping the breaker.
@@ -515,7 +515,7 @@ Bearer tokens and client secrets MUST never be logged, persisted, or included in
 - [ ] No bearer tokens or client secrets appear in any log output.
 - [ ] Circuit breaker opens **per host** after consecutive IdP failures; JWT validation continues with cached JWKS for that host; other hosts remain unaffected.
 - [ ] `circuit_breaker.enabled: false` disables tripping globally — every host behaves as permanently Closed; the plugin relies on retries and caches.
-- [ ] Transient IdP failures (connection errors, HTTP 5xx, HTTP 429) are retried up to `retry_policy.max_attempts` additional attempts after the initial call (default `3`; `0` disables); HTTP 4xx other than 429 is not retried; `Retry-After` on 429 is honored (capped by `retry_policy.max_backoff`).
+- [ ] Transient IdP failures (connection errors, HTTP 5xx, HTTP 429) are retried up to `retry_policy.max_retries` additional attempts after the initial call (default `3`; `0` disables); HTTP 4xx other than 429 is not retried; `Retry-After` on 429 is honored (capped by `retry_policy.max_backoff_ms`).
 - [ ] Every outbound IdP HTTP call respects `http_client.request_timeout` per attempt (default `5s`).
 
 ## 10. Dependencies

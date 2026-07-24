@@ -806,40 +806,53 @@ impl<
         scope: &AccessScope,
         chat_id: Uuid,
     ) -> Result<String, DomainError> {
-        const BACKOFF_MS: &[u64] = &[100, 200, 400, 800, 1600];
+        use std::time::Duration;
 
-        for delay_ms in BACKOFF_MS {
-            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+        use tokio_retry::RetryIf;
 
+        const BACKOFF_MS: [u64; 5] = [100, 200, 400, 800, 1600];
+
+        // Wait once before the first poll (the winning writer needs time to
+        // populate `vector_store_id`), then let tokio-retry space the remaining
+        // polls with the tail of the doubling schedule — same 5 polls / 3100ms
+        // budget as the previous hand-rolled loop.
+        tokio::time::sleep(Duration::from_millis(BACKOFF_MS[0])).await;
+
+        let strategy = BACKOFF_MS[1..].iter().map(|ms| Duration::from_millis(*ms));
+
+        let poll = || async {
             let conn = self.db.conn().map_err(DomainError::from)?;
             match self
                 .vector_store_repo
                 .find_by_chat(&conn, scope, chat_id)
                 .await?
             {
-                Some(row) if row.vector_store_id.is_some() => {
+                Some(row) if row.vector_store_id.is_some() =>
+                {
                     #[allow(clippy::unwrap_used)]
-                    return Ok(row.vector_store_id.unwrap());
+                    Ok(row.vector_store_id.unwrap())
                 }
-                Some(_) => {
-                    // Still NULL — winner hasn't finished yet. Keep polling.
-                }
-                None => {
-                    // Row vanished — winner rolled back. Return error so the
-                    // caller can retry the full get-or-create flow.
-                    return Err(DomainError::ProviderError {
-                        code: "vector_store_race".to_owned(),
-                        sanitized_message:
-                            "Vector store row vanished during creation; please retry".to_owned(),
-                    });
-                }
+                // Still NULL — winner hasn't finished yet. Signal "keep polling"
+                // with the timeout error so that, once retries are exhausted,
+                // that is exactly the error the caller receives.
+                Some(_) => Err(DomainError::ProviderError {
+                    code: "vector_store_timeout".to_owned(),
+                    sanitized_message: "Timed out waiting for vector store creation".to_owned(),
+                }),
+                // Row vanished — winner rolled back. Non-retryable: the caller
+                // retries the full get-or-create flow.
+                None => Err(DomainError::ProviderError {
+                    code: "vector_store_race".to_owned(),
+                    sanitized_message: "Vector store row vanished during creation; please retry"
+                        .to_owned(),
+                }),
             }
-        }
+        };
 
-        Err(DomainError::ProviderError {
-            code: "vector_store_timeout".to_owned(),
-            sanitized_message: "Timed out waiting for vector store creation".to_owned(),
-        })
+        // Keep polling only while the row exists but is still pending.
+        let still_pending = |e: &DomainError| matches!(e, DomainError::ProviderError { code, .. } if code.as_str() == "vector_store_timeout");
+
+        RetryIf::start(strategy, poll, still_pending).await
     }
 
     /// Upload a file attachment to a chat.

@@ -33,6 +33,7 @@ chat-engine-sdk = { package = "cf-chat-engine-sdk", version = "0.1.0", path = ".
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+tokio-retry = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }

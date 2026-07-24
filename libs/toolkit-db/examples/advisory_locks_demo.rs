@@ -40,11 +40,11 @@ async fn main() -> anyhow::Result<()> {
     // Now try to acquire the same lock with a timeout policy
     let config = LockConfig {
         max_wait: Some(Duration::from_millis(500)),
-        initial_backoff: Duration::from_millis(50),
+        max_retries: Some(5),
+        backoff_base_ms: 2,
+        backoff_factor: 25,
         max_backoff: Duration::from_millis(200),
-        backoff_multiplier: 1.5,
-        jitter_pct: 0.2,
-        max_attempts: Some(5),
+        jitter: true,
     };
 
     let start = std::time::Instant::now();

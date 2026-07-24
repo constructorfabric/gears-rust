@@ -3,10 +3,13 @@
 use std::error::Error as _;
 use std::future::Future;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use rand::RngExt as _;
 use reqwest::StatusCode;
+use tokio_retry::RetryIf;
+use tokio_retry::strategy::{ExponentialBackoff, jitter};
 
 use crate::config::RetryPolicyConfig;
 
@@ -65,32 +68,6 @@ fn has_transient_io_source(error: &reqwest::Error) -> bool {
     false
 }
 
-/// Compute exponential backoff for `retry_index` (1-based).
-#[must_use]
-pub fn compute_backoff(policy: &RetryPolicyConfig, retry_index: u32) -> Duration {
-    let shift = retry_index.saturating_sub(1).min(20);
-    let multiplier = 1_u64 << shift;
-    let computed_ms = policy
-        .initial_backoff_ms
-        .saturating_mul(multiplier)
-        .min(policy.max_backoff_ms);
-    Duration::from_millis(computed_ms)
-}
-
-/// Apply full-jitter in `[0, upper]` when enabled.
-#[must_use]
-pub fn apply_jitter(upper: Duration, enabled: bool) -> Duration {
-    if !enabled {
-        return upper;
-    }
-    let upper_ms = u64::try_from(upper.as_millis()).unwrap_or(u64::MAX);
-    if upper_ms <= 1 {
-        return upper;
-    }
-    let jitter_ms = rand::rng().random_range(0..=upper_ms);
-    Duration::from_millis(jitter_ms)
-}
-
 /// Parse `Retry-After` delta-seconds or HTTP-date value and cap to `max_backoff`.
 #[must_use]
 pub fn retry_after_delay(response: &reqwest::Response, max_backoff: Duration) -> Option<Duration> {
@@ -111,69 +88,64 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = reqwest::Result<reqwest::Response>>,
 {
-    let mut attempt = 0_u32;
-    loop {
-        let response = match send().await {
-            Ok(response) => response,
-            Err(error) => {
-                if let Some(delay) = transport_retry_delay(policy, &mut attempt, &error) {
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
-                return Err(RetriedRequestError::Transport(error));
+    // Server `Retry-After` (HTTP 429) overrides our computed backoff for the
+    // next delay. The action writes the parsed value (ms; `0` = none) here and
+    // the strategy consumes it, so the override rides inside tokio-retry instead
+    // of a separate bespoke sleep.
+    let retry_after_ms = Arc::new(AtomicU64::new(0));
+
+    let jitter_on = policy.jitter;
+    let strat_cell = Arc::clone(&retry_after_ms);
+    let strategy = ExponentialBackoff::from_millis(policy.backoff_base_ms)
+        .factor(policy.backoff_factor)
+        .max_delay(policy.max_backoff)
+        .map(move |computed| {
+            let override_ms = strat_cell.swap(0, Ordering::Relaxed);
+            if override_ms > 0 {
+                // `Retry-After` is server-authoritative — used verbatim (already
+                // capped to `max_backoff`), never jittered.
+                Duration::from_millis(override_ms)
+            } else if jitter_on {
+                jitter(computed)
+            } else {
+                computed
             }
-        };
+        })
+        .take(policy.max_retries as usize);
 
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
+    let max_backoff = policy.max_backoff;
+    let action_cell = Arc::clone(&retry_after_ms);
+    let action = || {
+        let cell = Arc::clone(&action_cell);
+        let fut = send();
+        async move {
+            match fut.await {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        return Ok(response);
+                    }
+                    if status == StatusCode::TOO_MANY_REQUESTS
+                        && let Some(delay) = retry_after_delay(&response, max_backoff)
+                    {
+                        let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                        // Clamp to >=1 so `0` stays the "no override" sentinel.
+                        cell.store(ms.max(1), Ordering::Relaxed);
+                    }
+                    Err(RetriedRequestError::Status(status))
+                }
+                Err(error) => Err(RetriedRequestError::Transport(error)),
+            }
         }
+    };
 
-        if let Some(delay) = status_retry_delay(policy, &mut attempt, &response) {
-            tokio::time::sleep(delay).await;
-            continue;
-        }
+    // Classify which failures are worth retrying; everything else short-circuits.
+    let retryable = |e: &RetriedRequestError| match e {
+        RetriedRequestError::Transport(error) => is_retryable_transport(error),
+        RetriedRequestError::Status(status) => is_retryable_status(*status),
+    };
 
-        return Err(RetriedRequestError::Status(status));
-    }
-}
-
-fn transport_retry_delay(
-    policy: &RetryPolicyConfig,
-    attempt: &mut u32,
-    error: &reqwest::Error,
-) -> Option<Duration> {
-    if !is_retryable_transport(error) || *attempt >= policy.max_attempts {
-        return None;
-    }
-
-    *attempt += 1;
-    Some(jittered_backoff(policy, *attempt))
-}
-
-fn status_retry_delay(
-    policy: &RetryPolicyConfig,
-    attempt: &mut u32,
-    response: &reqwest::Response,
-) -> Option<Duration> {
-    let status = response.status();
-    if !is_retryable_status(status) || *attempt >= policy.max_attempts {
-        return None;
-    }
-
-    *attempt += 1;
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        return Some(
-            retry_after_delay(response, policy.max_backoff())
-                .unwrap_or_else(|| jittered_backoff(policy, *attempt)),
-        );
-    }
-
-    Some(jittered_backoff(policy, *attempt))
-}
-
-fn jittered_backoff(policy: &RetryPolicyConfig, retry_index: u32) -> Duration {
-    apply_jitter(compute_backoff(policy, retry_index), policy.jitter)
+    RetryIf::start(strategy, action, retryable).await
 }
 
 fn parse_retry_after_delay(raw: &str, now: SystemTime, max_backoff: Duration) -> Option<Duration> {

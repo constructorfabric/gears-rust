@@ -635,8 +635,7 @@ mod tests {
 
         let config = LockConfig {
             max_wait: Some(Duration::from_millis(200)),
-            initial_backoff: Duration::from_millis(50),
-            max_attempts: Some(3),
+            max_retries: Some(3),
             ..Default::default()
         };
 

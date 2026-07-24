@@ -66,9 +66,10 @@ http_client:
   request_timeout: 5s                 # per attempt; replaces the former `discovery_timeout`
 
 retry_policy:
-  max_attempts: 3                     # retries AFTER the initial call; 0 disables retries
-  initial_backoff: 100ms              # doubles each retry (exponential)
-  max_backoff: 2s                     # upper bound on the computed backoff per retry
+  max_retries: 3                      # retries AFTER the initial call; 0 disables retries
+  backoff_base_ms: 2                  # exponential base (growth ratio); delay = backoff_base_ms^n * backoff_factor
+  backoff_factor: 50                  # multiplier; base 2 * factor 50 => 100ms, 200ms, 400ms, ...
+  max_backoff_ms: 2000                # upper bound on any single retry delay
   jitter: true                        # full jitter in [0, computed_backoff] — false = wait exactly computed_backoff
   # Retryable: connection errors (DNS, refused, TLS, reset), HTTP 5xx, HTTP 429 (Retry-After honored)
   # NOT retried: request timeout, HTTP 4xx other than 429, 2xx with unparseable body.

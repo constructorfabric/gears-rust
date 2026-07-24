@@ -62,6 +62,7 @@ preview-outbox = ["dep:tokio-util", "dep:futures-util"]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+tokio-retry = { workspace = true }
 xxhash-rust = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true, features = ["serde", "clock"] }

@@ -143,9 +143,10 @@ pub fn create_test_metrics() -> Arc<AuthNMetrics> {
 #[must_use]
 pub fn default_retry_policy_config() -> RetryPolicyConfig {
     RetryPolicyConfig {
-        max_attempts: 3,
-        initial_backoff_ms: 100,
-        max_backoff_ms: 2_000,
+        max_retries: 3,
+        backoff_base_ms: 2,
+        backoff_factor: 50,
+        max_backoff: std::time::Duration::from_secs(2),
         jitter: true,
     }
 }

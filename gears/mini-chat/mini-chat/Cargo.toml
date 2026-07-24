@@ -51,6 +51,7 @@ tracing-opentelemetry = { workspace = true }
 inventory = { workspace = true }
 
 # Streaming / async utilities
+tokio-retry = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }

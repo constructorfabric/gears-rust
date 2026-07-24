@@ -298,9 +298,10 @@ async fn token_endpoint_breaker_opens_after_retryable_failure_and_blocks_host() 
     let endpoint = token_endpoint.endpoint();
     let calls = token_endpoint.calls();
     let retry_policy = RetryPolicyConfig {
-        max_attempts: 0,
-        initial_backoff_ms: 1,
-        max_backoff_ms: 10,
+        max_retries: 0,
+        backoff_base_ms: 1,
+        backoff_factor: 1,
+        max_backoff: std::time::Duration::from_millis(10),
         jitter: false,
     };
     let client = reqwest::Client::new();
@@ -468,9 +469,10 @@ async fn retries_transient_5xx_then_succeeds() -> anyhow::Result<()> {
     let endpoint = token_endpoint.endpoint();
     let calls = token_endpoint.calls();
     let retry_policy = RetryPolicyConfig {
-        max_attempts: 2,
-        initial_backoff_ms: 1,
-        max_backoff_ms: 10,
+        max_retries: 2,
+        backoff_base_ms: 1,
+        backoff_factor: 1,
+        max_backoff: std::time::Duration::from_millis(10),
         jitter: false,
     };
     let client = reqwest::Client::new();
@@ -496,9 +498,10 @@ async fn retries_429_using_retry_after_capped_by_max_backoff() -> anyhow::Result
     let endpoint = token_endpoint.endpoint();
     let calls = token_endpoint.calls();
     let retry_policy = RetryPolicyConfig {
-        max_attempts: 1,
-        initial_backoff_ms: 1,
-        max_backoff_ms: 120,
+        max_retries: 1,
+        backoff_base_ms: 1,
+        backoff_factor: 1,
+        max_backoff: std::time::Duration::from_millis(120),
         jitter: false,
     };
     let client = reqwest::Client::new();
