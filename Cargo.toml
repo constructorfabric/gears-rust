@@ -98,6 +98,7 @@ members = [
     "gears/system/authz-resolver/authz-resolver",
     "gears/system/authz-resolver/plugins/static-authz-plugin",
     "gears/system/authz-resolver/plugins/tr-authz-plugin",
+    "gears/system/license-resolver/license-resolver-sdk",
     "gears/system/oagw/oagw",
     "gears/system/oagw/oagw-sdk",
     "gears/system/usage-collector/usage-collector-sdk",
@@ -309,6 +310,7 @@ authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.1
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.2", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.5", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.3", path = "gears/system/usage-collector/usage-collector-sdk" }
+license-resolver-sdk = { package = "cf-gears-license-resolver-sdk", version = "0.1.0", path = "gears/system/license-resolver/license-resolver-sdk" }
 
 # BSS gears (ported from vhp-core)
 bss-ledger-sdk = { path = "gears/bss/ledger/ledger-sdk" }

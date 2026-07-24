@@ -1991,6 +1991,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-license-resolver-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-security",
+ "gts",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-llm-gateway-sdk"
 version = "0.1.2"
 dependencies = [
