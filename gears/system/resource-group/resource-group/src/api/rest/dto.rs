@@ -172,10 +172,6 @@ pub struct GroupWithDepthDto {
 #[toolkit_macros::api_dto(request)]
 pub struct CreateGroupDto {
     /// Optional caller-supplied ID. If omitted, the server generates a UUID.
-    ///
-    /// For tenant-typed groups the ID becomes the group's tenant scope
-    /// (`tenant_id == group.id`), so a platform sync can align the RG tenant
-    /// scope with an existing tenant identifier by supplying it here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Uuid>,
     /// GTS chained type path. Must have prefix `gts.cf.core.rg.type.v1~`.
