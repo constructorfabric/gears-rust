@@ -414,7 +414,7 @@ impl ExportService {
 
         // @cpt-cf-chat-engine-interface-pep
         // @cpt-cf-chat-engine-constraint-fail-closed-authz
-        let _scope = self
+        let scope = self
             .enforcer
             .access_scope_with(
                 ctx,
@@ -430,7 +430,20 @@ impl ExportService {
                     .require_constraints(false),
             )
             .await?;
-        Ok(prefetch)
+
+        // A constrained decision MUST be validated against the ROW: re-read
+        // under the compiled scope so a cross-tenant / out-of-scope target
+        // resolves to 0 rows → NotFound (anti-enumeration, ADR-0021) rather than
+        // being exported/shared from the unrestricted prefetch. An unconstrained
+        // decision safely uses the prefetch.
+        if scope.is_unconstrained() {
+            Ok(prefetch)
+        } else {
+            self.sessions
+                .find_by_id_scoped(&scope, session_id)
+                .await?
+                .ok_or_else(|| ChatEngineError::not_found("session", session_id))
+        }
     }
 }
 

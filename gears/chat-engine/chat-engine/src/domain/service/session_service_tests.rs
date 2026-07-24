@@ -342,6 +342,38 @@ async fn delete_session_wrong_tenant_returns_not_found() {
     );
 }
 
+#[tokio::test]
+async fn cross_tenant_update_on_deleted_session_is_not_found_not_conflict() {
+    // Anti-enumeration: a cross-tenant caller mutating a soft-deleted session
+    // must get NotFound (404), never Conflict "session is deleted" (409) — the
+    // latter would leak the row's existence + lifecycle state. This is only
+    // correct if authorize_session_op re-reads under the constrained scope
+    // instead of consuming the unrestricted prefetch's lifecycle_state.
+    let db = inmem_db().await;
+    let (tenant_a, user_a, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant_a, user_a).await;
+
+    let svc = build_session_service(&db, enforcer_allow());
+    // Owner soft-deletes the session.
+    svc.delete_session(&ctx_for_subject(user_a, tenant_a), sid, false)
+        .await
+        .expect("owner soft-delete ok");
+
+    // Cross-tenant caller attempts a metadata update → must be 404, not 409.
+    let err = svc
+        .update_metadata(
+            &ctx_for_subject(Uuid::new_v4(), Uuid::new_v4()),
+            sid,
+            serde_json::json!({ "title": "x" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::NotFound { .. }),
+        "cross-tenant update on a deleted session must be NotFound (not Conflict), got: {err:?}",
+    );
+}
+
 // --- happy path: owner can read its own session ---------------------------
 
 #[tokio::test]

@@ -470,7 +470,21 @@ impl ReactionService {
                     .require_constraints(false),
             )
             .await?;
-        Ok((prefetch, scope))
+
+        // A constrained decision MUST be validated against the ROW: re-read
+        // under the compiled scope so a cross-tenant / out-of-scope target
+        // resolves to 0 rows → NotFound (anti-enumeration, ADR-0021) instead of
+        // acting on the unrestricted prefetch. An unconstrained decision safely
+        // uses the prefetch.
+        let row = if scope.is_unconstrained() {
+            prefetch
+        } else {
+            self.sessions
+                .find_by_id_scoped(&scope, session_id)
+                .await?
+                .ok_or_else(|| ChatEngineError::not_found("session", session_id))?
+        };
+        Ok((row, scope))
     }
 }
 

@@ -499,20 +499,12 @@ impl SessionService {
     }
 
     pub async fn get_session(&self, ctx: &SecurityContext, session_id: Uuid) -> Result<Session> {
-        let (prefetch, scope) = self
+        // authorize_session_op returns a scope-validated row (constrained
+        // decisions re-read under the compiled scope → NotFound when out of
+        // scope), so no additional re-read is needed here.
+        let (row, _scope) = self
             .authorize_session_op(ctx, session_id, actions::READ)
             .await?;
-        // Unconstrained → PDP allowed with no row-level filter; return prefetch.
-        // Constrained → scoped re-read validates against the PDP constraints;
-        // 0 rows hides the row's existence from out-of-scope callers (NotFound).
-        let row = if scope.is_unconstrained() {
-            prefetch
-        } else {
-            self.sessions
-                .find_by_id_scoped(&scope, session_id)
-                .await?
-                .ok_or_else(|| ChatEngineError::not_found("session", session_id))?
-        };
         Ok(redact_session(row))
     }
 
@@ -901,7 +893,22 @@ impl SessionService {
                     .require_constraints(false),
             )
             .await?;
-        Ok((prefetch, scope))
+
+        // Apply the PDP decision to the ROW, not just to downstream writes: a
+        // constrained decision MUST be validated by re-reading under the
+        // compiled scope, so a cross-tenant / out-of-scope target resolves to
+        // 0 rows → NotFound (anti-enumeration, ADR-0021) instead of leaking the
+        // unrestricted prefetch. An unconstrained decision (PDP allowed with no
+        // row filter) safely uses the prefetch.
+        let row = if scope.is_unconstrained() {
+            prefetch
+        } else {
+            self.sessions
+                .find_by_id_scoped(&scope, session_id)
+                .await?
+                .ok_or_else(|| ChatEngineError::not_found("session", session_id))?
+        };
+        Ok((row, scope))
     }
 
     /// Run a plugin call future against the cancellation token + deadline
