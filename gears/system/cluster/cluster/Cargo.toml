@@ -40,4 +40,6 @@ tracing-test = { workspace = true }
 parking_lot = { workspace = true }
 # The shared backend-agnostic conformance suite, run against this gear's real
 # cache-derived default backends in `tests/conformance.rs`.
-cf-gears-cluster-conformance = { workspace = true }
+# Path-only, no version on purpose: cargo drops a path-only dev-dependency from the published
+# manifest, so publishing this gear never needs the conformance crate on crates.io.
+cf-gears-cluster-conformance = { path = "../cluster-conformance" }
