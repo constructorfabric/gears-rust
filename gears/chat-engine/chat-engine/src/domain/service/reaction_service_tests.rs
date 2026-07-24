@@ -651,6 +651,46 @@ async fn list_reactions_unknown_message_returns_empty() {
     assert!(listing.reactions.is_empty());
 }
 
+#[tokio::test]
+async fn list_reactions_excludes_reactions_for_mismatched_session() {
+    // A reaction exists for `message_id` in session A, but the caller lists it
+    // under a DIFFERENT session id. Because `message_id` does not belong to the
+    // requested session, the pair is invalid and the listing is empty — the
+    // reaction must not leak across the mismatched (session_id, message_id) pair.
+    let session_a = Uuid::new_v4();
+    let session_b = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let now = OffsetDateTime::now_utc();
+
+    let reactions = Arc::new(StubReactionRepo {
+        list_returns: Mutex::new(vec![MessageReaction {
+            message_id,
+            user_id: "u".into(),
+            reaction_type: ReactionType::Like,
+            created_at: now,
+            updated_at: now,
+        }]),
+        ..Default::default()
+    });
+    let svc = make_service(
+        StubSessionRepo::new(make_session("t", "u", session_a, None)),
+        // Message lives in session A only.
+        StubMessageRepo::assistant(session_a, message_id),
+        reactions,
+    );
+
+    // Same message_id, but listed under session B → pair invalid → empty.
+    let listing = svc
+        .list_reactions(&make_ctx(), session_b, message_id)
+        .await
+        .expect("mismatched pair lists empty");
+    assert_eq!(listing.message_id, message_id);
+    assert!(
+        listing.reactions.is_empty(),
+        "reaction must not leak when message_id does not belong to session_id",
+    );
+}
+
 #[test]
 fn ensure_feedback_capability_passes_when_present() {
     let now = OffsetDateTime::now_utc();

@@ -244,10 +244,26 @@ impl ReactionService {
         message_id: Uuid,
     ) -> Result<ReactionsListing> {
         // Trust-parent: `message_reactions` is an unrestricted table with no
-        // owner columns. Callers authorize the parent message in the same
-        // request (set_reaction authorizes before echoing the list); ctx /
-        // session_id are retained for signature stability + tracing.
-        let _ = (ctx, session_id);
+        // owner columns; access is governed at the parent-message level. `ctx`
+        // carries no reaction-level PDP scope (unrestricted table).
+        //
+        // Validate that `message_id` actually belongs to `session_id` before
+        // listing: a mismatched or unknown pair yields an empty listing
+        // (anti-enumeration) rather than another session's reactions — the GET
+        // route reaches this method directly, so the pair is not validated
+        // upstream (unlike the set_reaction echo path).
+        let _ = ctx;
+        if self
+            .messages
+            .find_message_in_session(session_id, message_id)
+            .await?
+            .is_none()
+        {
+            return Ok(ReactionsListing {
+                message_id,
+                reactions: Vec::new(),
+            });
+        }
         let reactions = self.reactions.list_by_message(message_id).await?;
         Ok(ReactionsListing {
             message_id,
