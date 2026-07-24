@@ -88,11 +88,20 @@ impl SeaSessionRepo {
     /// Build the `(session_id, tenant_id, user_id)` AND filter every scoped
     /// write reuses. Centralising it avoids drift between read and update
     /// paths.
-    fn owned_filter(session_id: Uuid, tenant_id: &str, user_id: &str) -> Condition {
-        Condition::all()
+    fn owned_filter(
+        session_id: Uuid,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Condition, ChatEngineError> {
+        // `sessions.tenant_id` / `user_id` are UUID columns; parse the caller's
+        // ids once and compare Uuid-to-Uuid (a String predicate is a type error
+        // on Postgres, and only silently works on typeless SQLite).
+        let tenant_uuid = parse_owner_uuid(tenant_id, "tenant_id")?;
+        let user_uuid = parse_owner_uuid(user_id, "user_id")?;
+        Ok(Condition::all()
             .add(session_entity::Column::SessionId.eq(session_id))
-            .add(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
-            .add(session_entity::Column::UserId.eq(user_id.to_owned()))
+            .add(session_entity::Column::TenantId.eq(tenant_uuid))
+            .add(session_entity::Column::UserId.eq(user_uuid)))
     }
 
     /// Re-read a session by `(tenant_id, user_id, session_id)` after a
@@ -110,7 +119,7 @@ impl SeaSessionRepo {
         let row = SessionEntity::find()
             .secure()
             .scope_with(&scope)
-            .filter(Self::owned_filter(session_id, tenant_id, user_id))
+            .filter(Self::owned_filter(session_id, tenant_id, user_id)?)
             .one(runner)
             .await?;
         let row = row.ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
@@ -190,7 +199,7 @@ impl SessionRepo for SeaSessionRepo {
         let row = SessionEntity::find()
             .secure()
             .scope_with(&scope)
-            .filter(Self::owned_filter(session_id, tenant_id, user_id))
+            .filter(Self::owned_filter(session_id, tenant_id, user_id)?)
             .one(&conn)
             .await?;
         Ok(row.and_then(|m| m.scheduled_hard_delete_at))
@@ -209,7 +218,7 @@ impl SessionRepo for SeaSessionRepo {
         let row = SessionEntity::find()
             .secure()
             .scope_with(&scope)
-            .filter(Self::owned_filter(session_id, tenant_id, user_id))
+            .filter(Self::owned_filter(session_id, tenant_id, user_id)?)
             .one(&conn)
             .await?;
 
@@ -229,13 +238,17 @@ impl SessionRepo for SeaSessionRepo {
         // @cpt-cf-chat-engine-design-authz-bypass-registry
         let scope = bypass::unrestricted_table_scope();
 
+        // UUID columns: parse the caller's ids once and compare Uuid-to-Uuid.
+        let tenant_uuid = parse_owner_uuid(tenant_id, "tenant_id")?;
+        let user_uuid = parse_owner_uuid(user_id, "user_id")?;
+
         // Tenant / user scoping and the hard-delete exclusion come from the
         // caller's identity, never from the OData `$filter`, so they live in
         // the base query rather than the caller-controlled clause.
         let base_query = SessionEntity::find().secure().scope_with(&scope).filter(
             Condition::all()
-                .add(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
-                .add(session_entity::Column::UserId.eq(user_id.to_owned()))
+                .add(session_entity::Column::TenantId.eq(tenant_uuid))
+                .add(session_entity::Column::UserId.eq(user_uuid))
                 .add(
                     session_entity::Column::LifecycleState
                         .ne(LifecycleState::HardDeleted.as_str().to_string()),
@@ -296,7 +309,7 @@ impl SessionRepo for SeaSessionRepo {
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
-                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id))
+                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id)?)
                         .col_expr(
                             session_entity::Column::Metadata,
                             Expr::value(metadata.clone()),
@@ -330,7 +343,7 @@ impl SessionRepo for SeaSessionRepo {
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
-                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id))
+                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id)?)
                         .col_expr(
                             session_entity::Column::EnabledCapabilities,
                             Expr::value(capabilities.clone()),
@@ -366,7 +379,7 @@ impl SessionRepo for SeaSessionRepo {
                     let mut update = SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
-                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id))
+                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id)?)
                         .col_expr(
                             session_entity::Column::LifecycleState,
                             Expr::value(state_str.clone()),
@@ -414,7 +427,7 @@ impl SessionRepo for SeaSessionRepo {
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
-                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id))
+                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id)?)
                         .col_expr(
                             session_entity::Column::LifecycleState,
                             Expr::value(LifecycleState::SoftDeleted.as_str().to_string()),
@@ -459,7 +472,7 @@ impl SessionRepo for SeaSessionRepo {
                         .scope_with(&scope)
                         .filter(SeaSessionRepo::owned_filter(
                             session_id, &tenant_id, &user_id,
-                        ))
+                        )?)
                         .one(tx)
                         .await?;
 
@@ -538,7 +551,7 @@ impl SessionRepo for SeaSessionRepo {
                         .scope_with(&scope)
                         .filter(SeaSessionRepo::owned_filter(
                             session_id, &tenant_id, &user_id,
-                        ))
+                        )?)
                         .exec(tx)
                         .await?;
 
@@ -558,8 +571,10 @@ impl SessionRepo for SeaSessionRepo {
         // AUTHZ-BYPASS: system op; not HTTP-exposed
         // @cpt-cf-chat-engine-design-authz-bypass-registry
         let scope = bypass::system_read_scope();
+        // UUID column: parse the caller's tenant id once and compare Uuid-to-Uuid.
+        let tenant_uuid = parse_owner_uuid(tenant_id, "tenant_id")?;
         let mut filter = Condition::all()
-            .add(session_entity::Column::TenantId.eq(tenant_id.to_owned()))
+            .add(session_entity::Column::TenantId.eq(tenant_uuid))
             .add(
                 session_entity::Column::LifecycleState
                     .eq(LifecycleState::Active.as_str().to_string()),
@@ -677,7 +692,7 @@ impl SessionRepo for SeaSessionRepo {
                     SessionEntity::update_many()
                         .secure()
                         .scope_with(&scope)
-                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id))
+                        .filter(Self::owned_filter(session_id, &tenant_id, &user_id)?)
                         .col_expr(
                             session_entity::Column::ShareToken,
                             Expr::value(share_token.clone()),
