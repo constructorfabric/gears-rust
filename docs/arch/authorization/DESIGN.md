@@ -370,8 +370,8 @@ api-gateway:
 Authentication is performed by **AuthN middleware** within the gear that accepts the request. The middleware:
 1. Extracts the bearer token from the request
 2. Calls **AuthN Resolver** to do authentication
-3. Receives `AuthenticationResult` containing validated subject identity
-4. Passes the `SecurityContext` from `AuthenticationResult` to the gear's handler (PEP)
+3. Receives `AuthenticationResult` containing validated subject identity (and, optionally, a `VerifiedPrincipal`)
+4. Passes the `SecurityContext` from `AuthenticationResult` to the gear's handler (PEP); when the result also carries a `VerifiedPrincipal`, the middleware inserts it into the request extensions as well (see [ADR 0005](./ADR/0005-verified-principal-request-extension.md))
 
 Authentication is handled by the **AuthN Resolver** — a gear with plugins and a minimalist interface that validates bearer tokens and produces `AuthenticationResult`.
 
@@ -457,8 +457,18 @@ The `AuthenticationResult` is returned by the AuthN Resolver upon successful aut
 pub struct AuthenticationResult {
     /// The validated security context.
     pub security_context: SecurityContext,
+
+    /// Optional verified profile/time claims for the same token (ADR 0005).
+    /// Populated only by plugins that expose them; most leave it `None`.
+    /// Kept off `SecurityContext` so the PDP identity stays minimal.
+    pub principal: Option<VerifiedPrincipal>,
 }
 ```
+
+Construct via `AuthenticationResult::authenticated(ctx)` (no principal) or
+`AuthenticationResult::with_principal(ctx, principal)`. When `principal` is `Some`, its `subject_id`
+equals `security_context.subject_id()`. Handlers that require a principal treat a missing extension on
+an authenticated request as an internal error (5xx), not a 401 — see [ADR 0005](./ADR/0005-verified-principal-request-extension.md).
 
 ### SecurityContext
 
@@ -493,6 +503,48 @@ SecurityContext {
 - The token is included for:
   1. **PDP validation** — In out-of-process deployments, AuthZ Resolver may independently validate the token for defense-in-depth
   2. **Forwarding** — AuthZ Resolver plugin may need to call external vendor services requiring authentication
+
+### VerifiedPrincipal
+
+`SecurityContext` is the **authorization** identity: it stays PDP-minimal and carries only what the PDP
+needs to make a decision. But some handlers also need the caller's **verified profile** — email,
+identity provider, anonymous flag, and token timestamps — for the *same* token that authenticated the
+request. The canonical case is a product-facing `GET /me` endpoint that returns the backend-verified
+profile so clients and downstream features rely on server-verified identity instead of trusting
+client-supplied hints (the internal `subject_id`, for instance, is server-assigned and cannot be
+computed by the client).
+
+Those profile claims do **not** belong on `SecurityContext` (that would bloat the PDP identity and blur
+the AuthN/AuthZ boundary — see [ADR 0002](./ADR/0002-split-authn-authz-resolvers.md)). Instead, the
+AuthN Resolver may attach an optional, provider-agnostic `VerifiedPrincipal` to `AuthenticationResult`,
+and the AuthN middleware inserts it into the request extensions alongside `SecurityContext`. Carrying it
+on the request — rather than looking it up from a process-local cache — guarantees the handler reads the
+profile derived from *this* request's token (correct across evictions, TTLs, and replicas).
+
+```rust
+pub struct VerifiedPrincipal {
+    subject_id: Uuid,               // matches SecurityContext.subject_id
+    external_subject: String,       // IdP `sub` / provider UID
+    issuer: String,                 // token `iss`
+    email: Option<String>,
+    email_verified: Option<bool>,
+    provider: String,               // identity provider / sign-in method
+    is_anonymous: bool,
+    issued_at: i64,                 // unix seconds (`iat`)
+    auth_time: i64,                 // unix seconds
+    expires_at: i64,                // unix seconds (`exp`)
+}
+```
+
+**Notes:**
+- **Optional** — most plugins/routes never need it, so plugins leave it `None` and the field costs them
+  nothing (`AuthenticationResult::authenticated(ctx)`). Plugins that expose a profile use
+  `AuthenticationResult::with_principal(ctx, principal)`.
+- **Invariant** — when present, `principal.subject_id == security_context.subject_id()`.
+- **Missing on a route that requires it** → treat as an internal error (5xx), not 401: absence is a
+  wiring problem, not a failed credential, and a 401 would trigger client token-refresh loops.
+- See [ADR 0005](./ADR/0005-verified-principal-request-extension.md) for the full rationale and rejected
+  alternatives (extending `SecurityContext`, a process-local cache, a token-digest handoff).
 
 ### Plugin Responsibilities
 
