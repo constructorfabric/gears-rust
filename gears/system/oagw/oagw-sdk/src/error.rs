@@ -248,10 +248,18 @@ impl From<CanonicalError> for ServiceGatewayError {
                 retry_after_secs: ctx.retry_after_seconds,
             },
 
-            CanonicalError::Unauthenticated { ctx, .. } => Self::AuthFailed {
-                reason: AuthFailureReason::from_wire(ctx.reason.as_deref()),
-                detail,
-            },
+            CanonicalError::Unauthenticated { ctx, .. } => {
+                // `from_wire` reconstructs `AuthorizationRequired` with an empty
+                // `resource_name` (the flat wire reason is payload-free); fill
+                // it from the canonical `resource_name` the impl attached via
+                // `.with_resource(...)` for the re-auth signal (#4225).
+                let mut reason = AuthFailureReason::from_wire(ctx.reason.as_deref());
+                if let AuthFailureReason::AuthorizationRequired { resource_name: rn } = &mut reason
+                {
+                    rn.clone_from(&resource_name);
+                }
+                Self::AuthFailed { reason, detail }
+            }
 
             CanonicalError::PermissionDenied { ctx, .. } => Self::PermissionDenied {
                 reason: PermissionDenialReason::from_wire(ctx.reason.as_str()),
@@ -411,6 +419,7 @@ mod sdk_vocabulary_round_trip_tests {
             reason::auth::PLUGIN_NOT_FOUND,
             reason::auth::PLUGIN_FAILED,
             reason::auth::PLUGIN_INTERNAL,
+            reason::auth::AUTHORIZATION_REQUIRED,
         ] {
             let err = CanonicalError::unauthenticated().with_reason(r).create();
             let json = problem(err);
@@ -624,6 +633,14 @@ mod projection_tests {
                 reason::auth::PLUGIN_INTERNAL,
                 AuthFailureReason::PluginInternal,
             ),
+            (
+                reason::auth::AUTHORIZATION_REQUIRED,
+                // No `.with_resource(...)` on these canonical errors, so the
+                // projected resource_name is empty.
+                AuthFailureReason::AuthorizationRequired {
+                    resource_name: String::new(),
+                },
+            ),
         ];
         for (wire_reason, expected) in cases {
             let canonical = CanonicalError::unauthenticated()
@@ -648,6 +665,40 @@ mod projection_tests {
             } => assert_eq!(s, "CUSTOM_PLUGIN_CODE"),
             other => panic!("expected AuthFailed::Unknown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn authorization_required_projects_resource_name() {
+        // #4225: the impl attaches the protected resource via
+        // `.with_resource(...)`; the projection must carry it into the typed
+        // `AuthorizationRequired { resource_name }` variant.
+        let canonical = CanonicalError::unauthenticated()
+            .with_reason(reason::auth::AUTHORIZATION_REQUIRED)
+            .with_resource("https://mcp.example.com/")
+            .create();
+        match ServiceGatewayError::from(canonical) {
+            ServiceGatewayError::AuthFailed {
+                reason: AuthFailureReason::AuthorizationRequired { resource_name },
+                ..
+            } => assert_eq!(resource_name, "https://mcp.example.com/"),
+            other => panic!("expected AuthFailed::AuthorizationRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authorization_required_reason_round_trips_flat() {
+        // The flat wire `reason` is payload-free: `as_wire` emits the bare
+        // constant and `from_wire` reconstructs an empty `resource_name`.
+        let reason = AuthFailureReason::AuthorizationRequired {
+            resource_name: "ignored-on-wire".to_owned(),
+        };
+        assert_eq!(reason.as_wire(), reason::auth::AUTHORIZATION_REQUIRED);
+        assert_eq!(
+            AuthFailureReason::from_wire(Some(reason::auth::AUTHORIZATION_REQUIRED)),
+            AuthFailureReason::AuthorizationRequired {
+                resource_name: String::new(),
+            },
+        );
     }
 
     #[test]

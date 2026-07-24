@@ -95,6 +95,70 @@ pub(crate) trait ControlPlaneService: Send + Sync {
     ) -> Result<(Upstream, Route), DomainError>;
 }
 
+/// Outcome of beginning an interactive OAuth authorization.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub(crate) struct OAuthBeginOutcome {
+    pub authorization_url: String,
+    pub state: String,
+}
+
+/// Per-user OAuth connection status for an upstream.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub(crate) struct OAuthConnectionStatus {
+    pub connected: bool,
+    pub expires_at_unix: Option<i64>,
+}
+
+/// Internal service trait for interactive per-user OAuth authorization-code
+/// enrollment (out-of-band browser flow). Implemented in the infra layer
+/// against credstore (token store) and an HTTP client (discovery / DCR /
+/// token exchange).
+#[async_trait]
+pub(crate) trait OAuthEnrollmentService: Send + Sync {
+    /// Discover metadata, register a client, generate PKCE, persist pending
+    /// state, and return the browser authorization URL + CSRF state.
+    ///
+    /// `scopes` and the `redirect_uri` are NOT caller-supplied: scopes come
+    /// from the upstream's stored auth config and the `redirect_uri` is the
+    /// deployment-configured OAGW callback URL. `return_to` is the
+    /// consumer-supplied, allowlisted URL the browser is sent to once the
+    /// callback completes.
+    async fn begin(
+        &self,
+        ctx: &SecurityContext,
+        upstream_id: Uuid,
+        return_to: String,
+        client_name: String,
+    ) -> Result<OAuthBeginOutcome, DomainError>;
+
+    /// Exchange the authorization code and persist the per-user token record,
+    /// returning the allowlisted `return_to` URL captured at `begin` so the
+    /// callback can redirect the browser there.
+    ///
+    /// Invoked from the unauthenticated browser callback, so it carries no
+    /// `SecurityContext`: the acting identity is recovered from the pending
+    /// state resolved by the unguessable CSRF `state`.
+    async fn complete(&self, state: String, code: String) -> Result<String, DomainError>;
+
+    /// Discard the pending authorization for `state` without exchanging a code
+    /// (used when the authorization server returns an error redirect), and
+    /// return its allowlisted `return_to` URL if the entry existed so the
+    /// callback can still redirect the browser back to the app.
+    async fn abort(&self, state: String) -> Option<String>;
+
+    /// Delete the caller's stored token for an upstream.
+    async fn revoke(&self, ctx: &SecurityContext, upstream_id: Uuid) -> Result<(), DomainError>;
+
+    /// Report whether the caller has a stored token for an upstream.
+    async fn status(
+        &self,
+        ctx: &SecurityContext,
+        upstream_id: Uuid,
+    ) -> Result<OAuthConnectionStatus, DomainError>;
+}
+
 /// Internal Data Plane service trait — proxy orchestration and plugin execution.
 #[async_trait]
 pub(crate) trait DataPlaneService: Send + Sync {

@@ -59,6 +59,13 @@ pub mod auth {
     /// can usually be retried.
     pub const PLUGIN_INTERNAL: &str = "AUTH_PLUGIN_INTERNAL";
 
+    /// The caller has no usable per-user authorization for the upstream and
+    /// must complete an interactive OAuth authorization-code flow (e.g. via
+    /// mini-chat's connection `:authorize` endpoint). Distinct from
+    /// [`PLUGIN_FAILED`]: credentials are not merely rejected — none exist
+    /// yet — so the remedy is (re-)authorization, not a credential refresh.
+    pub const AUTHORIZATION_REQUIRED: &str = "AUTHORIZATION_REQUIRED";
+
     use core::fmt;
 
     /// Typed view of the wire `reason` strings emitted alongside
@@ -75,6 +82,17 @@ pub mod auth {
         PluginFailed,
         /// See [`PLUGIN_INTERNAL`]. Transient — retry usually clears it.
         PluginInternal,
+        /// See [`AUTHORIZATION_REQUIRED`]. User must (re-)authorize — no
+        /// usable per-user authorization exists yet (not a credential refresh).
+        AuthorizationRequired {
+            /// Protected-resource hint projected from the canonical
+            /// `resource_name` (empty when the wire carried none). The RFC 6750
+            /// `WWW-Authenticate` challenge on the 401 also references the OAGW
+            /// authorize endpoint for the upstream. Reconstructed **empty** by
+            /// [`Self::from_wire`], which sees only the flat `reason` string;
+            /// the impl's `From<CanonicalError>` fills it from `resource_name`.
+            resource_name: String,
+        },
         /// Unknown / unmodeled reason — preserves the raw wire string.
         Unknown(String),
     }
@@ -89,6 +107,12 @@ pub mod auth {
                 PLUGIN_NOT_FOUND => Self::PluginNotFound,
                 PLUGIN_FAILED => Self::PluginFailed,
                 PLUGIN_INTERNAL => Self::PluginInternal,
+                // The flat wire `reason` carries no payload; the protected
+                // resource travels separately in canonical `resource_name`, so
+                // reconstruct empty here. `From<CanonicalError>` fills it in.
+                AUTHORIZATION_REQUIRED => Self::AuthorizationRequired {
+                    resource_name: String::new(),
+                },
                 other => Self::Unknown(other.to_owned()),
             }
         }
@@ -100,6 +124,10 @@ pub mod auth {
                 Self::PluginNotFound => PLUGIN_NOT_FOUND,
                 Self::PluginFailed => PLUGIN_FAILED,
                 Self::PluginInternal => PLUGIN_INTERNAL,
+                // The flat wire `reason` is payload-free; the resource travels
+                // separately in canonical `resource_name`, so emit the bare
+                // constant regardless of `resource_name`.
+                Self::AuthorizationRequired { .. } => AUTHORIZATION_REQUIRED,
                 Self::Unknown(s) => s.as_str(),
             }
         }

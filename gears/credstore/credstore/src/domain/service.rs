@@ -7,7 +7,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use credstore_sdk::{CredStorePluginClientV1, CredStorePluginSpecV1, GetSecretResponse, SecretRef};
+use credstore_sdk::{
+    CredStorePluginClientV1, CredStorePluginSpecV1, GetSecretResponse, SecretRef, SecretValue,
+    SharingMode,
+};
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::plugins::{GtsPluginSelector, choose_plugin_instance};
 use toolkit::telemetry::ThrottledLog;
@@ -121,6 +124,38 @@ impl Service {
             sharing: meta.sharing,
             is_inherited: false,
         }))
+    }
+
+    /// Stores a secret via the plugin, creating or overwriting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DomainError` for plugin resolution or backend failures
+    /// (including read-only backends).
+    #[tracing::instrument(skip_all, fields(key = ?key))]
+    pub async fn put(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        value: SecretValue,
+        sharing: SharingMode,
+    ) -> Result<(), DomainError> {
+        let plugin = self.get_plugin().await?;
+        plugin.put(ctx, key, value, sharing).await?;
+        Ok(())
+    }
+
+    /// Deletes a secret via the plugin. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DomainError` for plugin resolution or backend failures
+    /// (including read-only backends).
+    #[tracing::instrument(skip_all, fields(key = ?key))]
+    pub async fn delete(&self, ctx: &SecurityContext, key: &SecretRef) -> Result<(), DomainError> {
+        let plugin = self.get_plugin().await?;
+        plugin.delete(ctx, key).await?;
+        Ok(())
     }
 }
 

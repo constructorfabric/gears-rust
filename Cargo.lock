@@ -2610,6 +2610,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "cf-gears-toolkit",
  "cf-gears-toolkit-http",
  "cf-gears-toolkit-utils",
  "http",

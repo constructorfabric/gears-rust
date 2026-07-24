@@ -8,7 +8,7 @@ These crates use pure-Rust RustCrypto implementations that are not FIPS-validate
 
 ## Allow-list
 
-Currently empty — all direct call sites have been replaced. To add an exception, update `is_in_hasher_allow_list()` in `lint_utils/src/lib.rs`.
+One entry, approved per `SECURITY.md §9`: file-storage content hashing (`gears/file-storage/file-storage/src/infra/content/hash.rs`). Other call sites (e.g. the toolkit-auth PKCE `S256` code-challenge) route through the FIPS-validated `aws-lc-rs` provider instead of RustCrypto `sha2`, so they need no allow-list entry. To add an exception, update `is_in_hasher_allow_list()` in `lint_utils/src/lib.rs`.
 
 ## Example
 

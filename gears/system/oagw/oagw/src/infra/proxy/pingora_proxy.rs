@@ -845,6 +845,12 @@ impl ProxyHttp for PingoraProxy {
             },
         };
 
+        // Compute the RFC 6750 re-auth challenge (#4225) before `domain_err`
+        // is consumed by the problem conversion. Emitted on this path
+        // separately from the axum `error_response` path.
+        let www_authenticate =
+            crate::api::rest::error::authorization_required_challenge(&domain_err);
+
         // Pingora's response path is outside the axum router stack, so the
         // canonical error middleware does not reach it. Pre-populate
         // `instance` here so the wire body still carries the request URI.
@@ -855,6 +861,9 @@ impl ProxyHttp for PingoraProxy {
         if let Ok(mut resp) = ResponseHeader::build(status, Some(body_bytes.len())) {
             let _ = resp.insert_header("content-type", "application/problem+json");
             let _ = resp.insert_header("x-oagw-error-source", "gateway");
+            if let Some(challenge) = &www_authenticate {
+                let _ = resp.insert_header("www-authenticate", challenge.as_str());
+            }
             let _ = session.write_response_header(Box::new(resp), false).await;
             let _ = session.write_response_body(Some(body_bytes), true).await;
         } else {

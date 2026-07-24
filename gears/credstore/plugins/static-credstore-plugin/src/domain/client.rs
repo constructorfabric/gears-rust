@@ -2,7 +2,7 @@
 use async_trait::async_trait;
 use credstore_sdk::{
     CredStoreError, CredStorePluginClientV1, OwnerId, SecretMetadata, SecretRef, SecretValue,
-    TenantId,
+    SharingMode, TenantId,
 };
 use toolkit_security::SecurityContext;
 
@@ -38,6 +38,23 @@ impl CredStorePluginClientV1 for Service {
             sharing: entry.sharing,
             owner_tenant_id,
         }))
+    }
+
+    async fn put(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        value: SecretValue,
+        sharing: SharingMode,
+    ) -> Result<(), CredStoreError> {
+        // Inherent `Service::put` takes precedence over the trait method here.
+        Service::put(self, ctx, key, value, sharing);
+        Ok(())
+    }
+
+    async fn delete(&self, ctx: &SecurityContext, key: &SecretRef) -> Result<(), CredStoreError> {
+        Service::delete(self, ctx, key);
+        Ok(())
     }
 }
 

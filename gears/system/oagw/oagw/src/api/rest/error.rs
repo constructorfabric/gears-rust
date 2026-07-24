@@ -187,11 +187,20 @@ impl From<DomainError> for CanonicalError {
                 .with_field_violation("x-target-host", detail, field::UNKNOWN_TARGET_HOST)
                 .create(),
 
-            DomainError::AuthenticationFailed { reason, detail, .. } => {
+            DomainError::AuthenticationFailed {
+                reason,
+                detail,
+                resource,
+                ..
+            } => {
                 tracing::debug!(reason, detail = %detail, "OAGW authentication failed");
-                CanonicalError::unauthenticated()
-                    .with_reason(reason)
-                    .create()
+                let builder = CanonicalError::unauthenticated().with_reason(reason);
+                // Attach the protected-resource hint as `resource_name` for the
+                // re-auth signal (#4225); absent/empty resources stay unnamed.
+                match resource.as_deref().filter(|r| !r.is_empty()) {
+                    Some(res) => builder.with_resource(res).create(),
+                    None => builder.create(),
+                }
             }
 
             // The `entity` discriminator already encodes which resource
@@ -469,6 +478,60 @@ pub(crate) fn domain_error_to_problem(err: DomainError, instance: &str) -> Probl
     problem
 }
 
+/// Build the RFC 6750 `WWW-Authenticate: Bearer` re-authorization challenge for
+/// an [`reason::auth::AUTHORIZATION_REQUIRED`] authentication failure, or `None`
+/// for any other error (which emits no challenge).
+///
+/// This is the re-auth signal (#4225): it names the protected resource (when
+/// known) and references the OAGW authorize endpoint for the upstream so a
+/// consumer can drive the interactive OAuth flow. The data plane knows only the
+/// resource and the upstream id — **not** a fully-formed, ready-to-follow
+/// `authorization_url` (that is minted by `begin`, which allocates PKCE +
+/// `state`). The challenge therefore references the authorize *endpoint* as a
+/// relative path, not a launchable URL.
+///
+/// Shared by the axum [`error_response`] path and the Pingora error path, which
+/// build responses separately.
+#[must_use]
+pub fn authorization_required_challenge(err: &DomainError) -> Option<String> {
+    let DomainError::AuthenticationFailed {
+        reason,
+        resource,
+        upstream_id,
+        ..
+    } = err
+    else {
+        return None;
+    };
+    if *reason != reason::auth::AUTHORIZATION_REQUIRED {
+        return None;
+    }
+
+    let authorize_uri = format!("/oagw/v1/upstreams/{upstream_id}/oauth/authorize");
+    let mut challenge = format!(
+        "Bearer error=\"authorization_required\", \
+         error_description=\"interactive OAuth authorization required\", \
+         authorization_uri=\"{authorize_uri}\""
+    );
+    if let Some(res) = resource.as_deref()
+        && !res.is_empty()
+        && is_safe_challenge_value(res)
+    {
+        challenge.push_str(&format!(", resource=\"{res}\""));
+    }
+    Some(challenge)
+}
+
+/// True if `s` is safe to embed inside a double-quoted `WWW-Authenticate`
+/// auth-param value: printable ASCII with no `"` or `\` (which would need
+/// escaping) and no control bytes (which would corrupt the header). The
+/// `resource` originates from operator-controlled upstream config, so this is
+/// defence in depth against a malformed value breaking the header.
+fn is_safe_challenge_value(s: &str) -> bool {
+    s.bytes()
+        .all(|b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\')
+}
+
 /// Convert a `DomainError` into an axum `Response` with the
 /// `x-oagw-error-source: gateway` header. Used by the proxy data-plane.
 ///
@@ -492,6 +555,10 @@ pub fn error_response(err: DomainError) -> Response {
         _ => None,
     };
 
+    // Compute the RFC 6750 re-auth challenge before `err` is consumed by the
+    // canonical conversion (#4225).
+    let www_authenticate = authorization_required_challenge(&err);
+
     let canonical = CanonicalError::from(err);
     let mut problem = Problem::from(canonical);
 
@@ -507,6 +574,12 @@ pub fn error_response(err: DomainError) -> Response {
         "x-oagw-error-source",
         HeaderValue::from_static(ErrorSource::Gateway.as_str()),
     );
+
+    if let Some(challenge) = www_authenticate
+        && let Ok(v) = HeaderValue::from_str(&challenge)
+    {
+        response.headers_mut().insert("www-authenticate", v);
+    }
 
     if let Some((retry_after_secs, limit, remaining, reset_epoch)) = rate_limit_meta {
         if let Some(secs) = retry_after_secs
@@ -841,6 +914,8 @@ mod tests {
                 reason: reason::auth::PLUGIN_FAILED,
                 detail: "test".into(),
                 instance: "/test".into(),
+                resource: None,
+                upstream_id: uuid::Uuid::nil(),
             },
             DomainError::NotFound {
                 entity: "route",
@@ -1113,6 +1188,8 @@ mod tests {
                 reason: auth_reason,
                 detail: "plugin failed".into(),
                 instance: "/test".into(),
+                resource: None,
+                upstream_id: uuid::Uuid::nil(),
             };
             let p: Problem = err.into_test_problem();
             assert_eq!(p.status, 401);
@@ -1125,6 +1202,88 @@ mod tests {
                 "reason must reach the wire",
             );
         }
+    }
+
+    #[test]
+    fn authorization_required_lands_resource_name_and_challenge() {
+        // #4225: AUTHORIZATION_REQUIRED threads the protected-resource hint as
+        // canonical `resource_name` and emits an RFC 6750 `WWW-Authenticate`
+        // challenge referencing the upstream's authorize endpoint.
+        let upstream_id = uuid::Uuid::nil();
+        let err = DomainError::AuthenticationFailed {
+            reason: reason::auth::AUTHORIZATION_REQUIRED,
+            detail: "authorization required".into(),
+            instance: "/oagw/v1/proxy/x".into(),
+            resource: Some("https://mcp.example.com/".into()),
+            upstream_id,
+        };
+
+        let challenge =
+            authorization_required_challenge(&err).expect("challenge for AUTHORIZATION_REQUIRED");
+        assert!(challenge.starts_with("Bearer "));
+        assert!(challenge.contains(&format!(
+            "authorization_uri=\"/oagw/v1/upstreams/{upstream_id}/oauth/authorize\""
+        )));
+        assert!(challenge.contains("resource=\"https://mcp.example.com/\""));
+
+        let p: Problem = err.into_test_problem();
+        assert_eq!(p.status, 401);
+        assert_eq!(p.context["reason"], reason::auth::AUTHORIZATION_REQUIRED);
+        assert_eq!(p.context["resource_name"], "https://mcp.example.com/");
+    }
+
+    #[test]
+    fn authorization_required_without_resource_omits_resource_param() {
+        // An empty/absent resource still emits the challenge (naming the
+        // authorize endpoint) but no `resource` auth-param, and lands no
+        // `resource_name` on the wire.
+        let err = DomainError::AuthenticationFailed {
+            reason: reason::auth::AUTHORIZATION_REQUIRED,
+            detail: "authorization required".into(),
+            instance: "/oagw/v1/proxy/x".into(),
+            resource: Some(String::new()),
+            upstream_id: uuid::Uuid::nil(),
+        };
+        let challenge = authorization_required_challenge(&err).expect("challenge");
+        assert!(!challenge.contains("resource="));
+
+        let p: Problem = err.into_test_problem();
+        assert!(p.context.get("resource_name").is_none());
+    }
+
+    #[test]
+    fn non_authorization_auth_failures_emit_no_challenge() {
+        // Only AUTHORIZATION_REQUIRED carries the re-auth challenge; other
+        // auth failures (creds rejected, plugin internal) do not.
+        for reason in [
+            reason::auth::PLUGIN_NOT_FOUND,
+            reason::auth::PLUGIN_FAILED,
+            reason::auth::PLUGIN_INTERNAL,
+        ] {
+            let err = DomainError::AuthenticationFailed {
+                reason,
+                detail: "x".into(),
+                instance: "/test".into(),
+                resource: None,
+                upstream_id: uuid::Uuid::nil(),
+            };
+            assert!(authorization_required_challenge(&err).is_none());
+        }
+    }
+
+    #[test]
+    fn challenge_omits_unsafe_resource_value() {
+        // A resource carrying a quote (which would break the quoted auth-param)
+        // is dropped from the challenge as defence in depth.
+        let err = DomainError::AuthenticationFailed {
+            reason: reason::auth::AUTHORIZATION_REQUIRED,
+            detail: "authorization required".into(),
+            instance: "/test".into(),
+            resource: Some("bad\"value".into()),
+            upstream_id: uuid::Uuid::nil(),
+        };
+        let challenge = authorization_required_challenge(&err).expect("challenge");
+        assert!(!challenge.contains("resource="));
     }
 
     #[test]

@@ -775,3 +775,61 @@ fn same_key_across_all_four_scopes() {
 
     assert!(Service::from_config(&cfg).is_ok());
 }
+
+// --- Delete scoping ---
+
+#[test]
+fn delete_does_not_remove_global_secret_for_tenant_caller() {
+    let cfg = StaticCredStorePluginConfig {
+        secrets: vec![SecretConfig {
+            tenant_id: None,
+            owner_id: None,
+            key: "global_key".to_owned(),
+            value: "global-val".to_owned(),
+            sharing: None,
+        }],
+        ..StaticCredStorePluginConfig::default()
+    };
+    let service = Service::from_config(&cfg).unwrap();
+    let key = SecretRef::new("global_key").unwrap();
+
+    // A tenant caller with no scoped entry must not be able to delete the
+    // config-only global secret.
+    service.delete(&ctx(tenant_a(), owner_a()), &key);
+
+    let entry = service.get(&ctx(tenant_a(), owner_a()), &key).unwrap();
+    assert_eq!(entry.value.as_bytes(), b"global-val");
+    // Still visible to other tenants too.
+    assert!(service.get(&ctx(tenant_b(), owner_b()), &key).is_some());
+}
+
+#[test]
+fn delete_removes_scoped_entry_but_preserves_global_fallback() {
+    let cfg = StaticCredStorePluginConfig {
+        secrets: vec![
+            SecretConfig {
+                tenant_id: None,
+                owner_id: None,
+                key: "k".to_owned(),
+                value: "global-val".to_owned(),
+                sharing: None,
+            },
+            SecretConfig {
+                tenant_id: Some(tenant_a()),
+                owner_id: None,
+                key: "k".to_owned(),
+                value: "tenant-val".to_owned(),
+                sharing: Some(SharingMode::Tenant),
+            },
+        ],
+        ..StaticCredStorePluginConfig::default()
+    };
+    let service = Service::from_config(&cfg).unwrap();
+    let key = SecretRef::new("k").unwrap();
+
+    // Deleting the tenant-scoped entry falls back to global on next lookup,
+    // and the global secret itself remains intact.
+    service.delete(&ctx(tenant_a(), owner_a()), &key);
+    let entry = service.get(&ctx(tenant_a(), owner_a()), &key).unwrap();
+    assert_eq!(entry.value.as_bytes(), b"global-val");
+}

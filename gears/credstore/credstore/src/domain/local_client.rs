@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use credstore_sdk::{CredStoreClientV1, CredStoreError, GetSecretResponse, SecretRef};
+use credstore_sdk::{
+    CredStoreClientV1, CredStoreError, GetSecretResponse, SecretRef, SecretValue, SharingMode,
+};
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 
@@ -49,6 +51,26 @@ impl CredStoreClientV1 for CredStoreLocalClient {
             .get(ctx, key)
             .await
             .map_err(|e| log_and_convert("get", e))
+    }
+
+    async fn put(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        value: SecretValue,
+        sharing: SharingMode,
+    ) -> Result<(), CredStoreError> {
+        self.svc
+            .put(ctx, key, value, sharing)
+            .await
+            .map_err(|e| log_and_convert("put", e))
+    }
+
+    async fn delete(&self, ctx: &SecurityContext, key: &SecretRef) -> Result<(), CredStoreError> {
+        self.svc
+            .delete(ctx, key)
+            .await
+            .map_err(|e| log_and_convert("delete", e))
     }
 }
 

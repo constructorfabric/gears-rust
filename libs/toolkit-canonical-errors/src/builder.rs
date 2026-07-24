@@ -609,6 +609,22 @@ impl CanonicalError {
         }
     }
 
+    /// Build an `Unimplemented` (HTTP 501) error for an operation the callee
+    /// deliberately does not provide, distinct from `internal` (500) which
+    /// signals an unexpected failure of an implemented operation.
+    #[must_use]
+    pub fn unimplemented(
+        detail: impl Into<String>,
+    ) -> ResourceErrorBuilder<ResourceAbsent, NoContext> {
+        ResourceErrorBuilder {
+            resource_type: None,
+            detail: detail.into(),
+            variant: ErrorVariant::Unimplemented,
+            resource: ResourceAbsent,
+            context: NoContext,
+        }
+    }
+
     #[must_use]
     pub fn service_unavailable() -> ServiceUnavailableBuilder {
         ServiceUnavailableBuilder {
@@ -617,13 +633,21 @@ impl CanonicalError {
         }
     }
 
+    /// Build an `Unauthenticated` (HTTP 401) error. `.with_reason(...)` is
+    /// required before `.create()`.
+    ///
+    /// The resource typestate is `ResourceOptional`: `.with_resource(...)` may
+    /// be attached to name the protected resource the challenge refers to (e.g.
+    /// an RFC 6750 `WWW-Authenticate` re-authorization hint), but it is not
+    /// mandatory — callers that only carry a `reason` still `.create()` an error
+    /// with `resource_name = None`, exactly as before.
     #[must_use]
-    pub fn unauthenticated() -> ResourceErrorBuilder<ResourceAbsent, NeedsReason> {
+    pub fn unauthenticated() -> ResourceErrorBuilder<ResourceOptional, NeedsReason> {
         ResourceErrorBuilder {
             resource_type: None,
             detail: String::from("Authentication required"),
             variant: ErrorVariant::Unauthenticated,
-            resource: ResourceAbsent,
+            resource: ResourceOptional,
             context: NeedsReason,
         }
     }

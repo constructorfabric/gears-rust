@@ -1,4 +1,4 @@
-error[E0599]: the method `create` exists for struct `ResourceErrorBuilder<toolkit_canonical_errors::builder::ResourceAbsent, toolkit_canonical_errors::builder::NeedsReason>`, but its trait bounds were not satisfied
+error[E0599]: the method `create` exists for struct `ResourceErrorBuilder<toolkit_canonical_errors::builder::ResourceOptional, toolkit_canonical_errors::builder::NeedsReason>`, but its trait bounds were not satisfied
  --> tests/ui/missing_reason_on_unauthenticated.rs:7:50
   |
 7 |     let _err = CanonicalError::unauthenticated().create();

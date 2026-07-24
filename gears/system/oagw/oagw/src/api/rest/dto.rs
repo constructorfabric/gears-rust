@@ -1082,6 +1082,77 @@ impl From<UpdateRouteRequest> for domain::UpdateRouteRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Interactive OAuth authorization-code management
+// ---------------------------------------------------------------------------
+
+/// Request body to begin an interactive OAuth authorization for an upstream.
+///
+/// Neither the scopes nor the OAuth `redirect_uri` are caller-supplied: scopes
+/// come from the upstream's stored auth config and the `redirect_uri` is the
+/// gateway's deployment-configured callback URL. The caller only chooses where
+/// the browser should land afterwards (`return_to`), which must be on the
+/// gateway's configured allowlist.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BeginOAuthRequest {
+    /// Absolute URL the gateway redirects the browser to once the callback
+    /// completes (success or failure). Must be an exact member of the gateway's
+    /// configured `return_to` allowlist, or the request is rejected.
+    pub return_to: String,
+    /// Human-readable client name used for dynamic client registration.
+    #[serde(default = "default_client_name")]
+    pub client_name: String,
+}
+
+fn default_client_name() -> String {
+    "cf-oagw".to_owned()
+}
+
+/// Response for a begun authorization: the browser URL and CSRF state.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BeginOAuthResponse {
+    /// URL to open in the user's browser to obtain consent.
+    pub authorization_url: String,
+    /// Opaque CSRF state; echoed back on the callback.
+    pub state: String,
+}
+
+/// Query parameters delivered by the authorization server to the OAGW OAuth
+/// callback (`GET /oagw/v1/oauth/callback`). The authorization `code` is
+/// exchanged inside OAGW and never returned to the caller.
+///
+/// A redirect can be either a success (`code` + `state`) or an error
+/// (`error` [+ `error_description`] + `state`, no `code`) per RFC 6749
+/// §4.1.2.1, so `code`/`error` are optional. `state` is always echoed by the
+/// authorization server (it is the CSRF binding we send on the begin step) and
+/// stays required.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OAuthCallbackQuery {
+    /// The authorization `code` delivered on a successful redirect. Absent on
+    /// an error redirect.
+    #[serde(default)]
+    pub code: Option<String>,
+    /// The `state` returned by the begin call (CSRF binding).
+    pub state: String,
+    /// OAuth error code on a failed authorization (e.g. `access_denied`).
+    /// Present instead of `code` on an error redirect.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Optional human-readable description accompanying `error`.
+    #[serde(default)]
+    pub error_description: Option<String>,
+}
+
+/// Per-user connection status for an upstream's OAuth authorization.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct OAuthConnectionStatusResponse {
+    /// `true` if a usable token is stored for the caller.
+    pub connected: bool,
+    /// Access-token expiry (Unix seconds), when connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
 // API DTO marker traits (required by OperationBuilder typed methods)
 // ---------------------------------------------------------------------------
 
@@ -1089,9 +1160,12 @@ impl toolkit::api::api_dto::RequestApiDto for CreateUpstreamRequest {}
 impl toolkit::api::api_dto::RequestApiDto for UpdateUpstreamRequest {}
 impl toolkit::api::api_dto::RequestApiDto for CreateRouteRequest {}
 impl toolkit::api::api_dto::RequestApiDto for UpdateRouteRequest {}
+impl toolkit::api::api_dto::RequestApiDto for BeginOAuthRequest {}
 
 impl toolkit::api::api_dto::ResponseApiDto for UpstreamResponse {}
 impl toolkit::api::api_dto::ResponseApiDto for RouteResponse {}
+impl toolkit::api::api_dto::ResponseApiDto for BeginOAuthResponse {}
+impl toolkit::api::api_dto::ResponseApiDto for OAuthConnectionStatusResponse {}
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -43,6 +43,12 @@ rand = { workspace = true }
 base64 = { workspace = true }
 
 # Shared utilities
+# `toolkit`'s `bootstrap` feature provides `toolkit::bootstrap::crypto::sha256`,
+# the FIPS-safe SHA-256 used for the PKCE S256 code-challenge. It routes through
+# the process-wide rustls `CryptoProvider` installed at bootstrap (aws-lc-fips
+# on Linux, Apple corecrypto on macOS, Windows CNG, or aws-lc-rs in non-FIPS
+# builds), so we never link a hash crate (`sha2`/`aws-lc-rs`/`ring`) directly.
+toolkit = { workspace = true, features = ["bootstrap"] }
 toolkit-utils = { workspace = true, features = ["serde"] }
 zeroize = { workspace = true }
 

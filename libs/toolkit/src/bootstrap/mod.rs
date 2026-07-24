@@ -15,7 +15,7 @@
 //! Backend types for spawning `OoP` gears have been moved to `toolkit::backends`.
 
 pub mod config;
-mod crypto;
+pub mod crypto;
 pub mod host;
 
 pub mod oop;
@@ -34,4 +34,4 @@ pub use oop::{OopRunOptions, run_oop_with_options};
 mod run;
 pub use run::{run_migrate, run_server};
 
-pub use crypto::{CryptoProviderError, init_crypto_provider};
+pub use crypto::{CryptoProviderError, init_crypto_provider, sha256};

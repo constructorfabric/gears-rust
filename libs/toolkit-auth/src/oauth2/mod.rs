@@ -3,6 +3,7 @@
 //! This gear implements token acquisition, caching, and automatic injection
 //! for outbound HTTP requests to vendor services secured with `OAuth2`.
 
+pub mod authcode;
 pub mod auto_refresh;
 pub mod builder_ext;
 pub mod config;
@@ -15,6 +16,12 @@ pub mod token;
 pub(crate) mod token_watcher;
 pub mod types;
 
+pub use authcode::{
+    AuthCodeExchange, AuthorizationServerMetadata, Pkce, ProtectedResourceMetadata,
+    RegisteredClient, TokenSet, build_authorize_url, discover_authorization_server,
+    discover_from_resource, discover_from_resource_challenge, discover_protected_resource,
+    exchange_code, generate_state, refresh_token, register_client,
+};
 pub use auto_refresh::{
     BearerAuthAutoRefreshLayer, BearerAuthAutoRefreshOpts, BearerAuthAutoRefreshService,
     DEFAULT_MIN_INVALIDATION_INTERVAL, ShouldRefreshFn,

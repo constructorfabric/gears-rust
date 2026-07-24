@@ -57,6 +57,16 @@ pub enum DomainError {
         reason: &'static str,
         detail: String,
         instance: String,
+        /// Protected-resource hint carried in the RFC 6750 `WWW-Authenticate`
+        /// re-authorization challenge. Present only for
+        /// [`reason::auth::AUTHORIZATION_REQUIRED`] (sourced from the upstream
+        /// auth binding's `resource` config); `None` for other auth failures,
+        /// which emit no challenge.
+        resource: Option<String>,
+        /// Upstream being authorized. Used to reference the OAGW authorize
+        /// endpoint (`/oagw/v1/upstreams/{id}/oauth/authorize`) in the
+        /// `WWW-Authenticate` challenge so a consumer can drive re-authorization.
+        upstream_id: Uuid,
     },
 
     #[error("{detail}")]

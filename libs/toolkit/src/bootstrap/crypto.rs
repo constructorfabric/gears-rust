@@ -1,5 +1,9 @@
 use std::sync::OnceLock;
 
+use rustls::SupportedCipherSuite;
+use rustls::crypto::CryptoProvider;
+use rustls::crypto::hash::HashAlgorithm;
+
 /// Error returned when the crypto provider cannot be installed.
 // `Clone` required by `OnceLock<Result<_>>` cache in `init_crypto_provider` --
 // the cached result is cloned on every call.
@@ -203,4 +207,42 @@ pub fn init_crypto_provider() -> Result<(), CryptoProviderError> {
             Ok(())
         })
         .clone()
+}
+
+/// Compute a SHA-256 digest through the process-wide rustls [`CryptoProvider`]
+/// installed by [`init_crypto_provider`].
+///
+/// FIPS-safe way for gears to hash arbitrary bytes: the digest is produced by
+/// the same validated module backing TLS (aws-lc-fips on Linux, Apple
+/// corecrypto on macOS, Windows CNG, or aws-lc-rs in non-FIPS builds) rather
+/// than a directly-linked hash crate. Do **not** depend on
+/// `sha2`/`aws-lc-rs`/`ring` directly for hashing.
+///
+/// # Panics
+///
+/// Panics if no crypto provider is installed (call [`init_crypto_provider`]
+/// first) or if it exposes no SHA-256 cipher suite — both are startup
+/// invariants; failing closed beats hashing outside the validated module.
+#[must_use]
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let Some(provider) = CryptoProvider::get_default() else {
+        panic!(
+            "no CryptoProvider installed - call toolkit::bootstrap::init_crypto_provider() first"
+        );
+    };
+
+    let Some(hash) = provider.cipher_suites.iter().find_map(|cs| {
+        let common = match cs {
+            SupportedCipherSuite::Tls13(cs) => &cs.common,
+            SupportedCipherSuite::Tls12(cs) => &cs.common,
+        };
+        (common.hash_provider.algorithm() == HashAlgorithm::SHA256).then_some(common.hash_provider)
+    }) else {
+        panic!("installed CryptoProvider has no SHA-256 cipher suite");
+    };
+
+    let output = hash.hash(data);
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(output.as_ref());
+    buf
 }

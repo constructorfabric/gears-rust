@@ -62,6 +62,22 @@ pub struct OagwConfig {
     /// (create / update / delete) are omitted. Default: `true`.
     #[serde(default = "default_true")]
     pub management_api_enabled: bool,
+    /// Absolute URL of OAGW's own OAuth callback endpoint
+    /// (`.../oagw/v1/oauth/callback`), registered as the `redirect_uri` with the
+    /// authorization server during interactive `oauth2_auth_code` enrollment.
+    ///
+    /// This is a **deployment value and MUST NOT be caller-supplied**: an
+    /// attacker-chosen `redirect_uri` is the canonical authorization-code
+    /// interception vector. When unset, the interactive `begin` step fails with
+    /// a configuration error. Default: `None`.
+    #[serde(default)]
+    pub oauth_callback_url: Option<String>,
+    /// Exact-match allowlist of `return_to` URLs the OAuth callback may redirect
+    /// the browser to after enrollment completes. A `return_to` that is not an
+    /// exact member of this list is rejected at `begin` time. Default: empty
+    /// (no post-callback redirect target is permitted).
+    #[serde(default)]
+    pub oauth_return_to_allowlist: Vec<String>,
     /// SSRF protection policy. Controls which upstream IPs and hostnames are
     /// blocked. See [`SsrfPolicy`] for available fields.
     /// Default: enabled with built-in deny-list, no extra rules.
@@ -110,6 +126,8 @@ impl Default for OagwConfig {
             streaming_idle_timeout_secs: default_streaming_idle_timeout_secs(),
             protocol_cache_ttl_secs: default_protocol_cache_ttl_secs(),
             management_api_enabled: true,
+            oauth_callback_url: None,
+            oauth_return_to_allowlist: Vec::new(),
             ssrf_policy: SsrfPolicy::default(),
             metrics: MetricsConfig::default(),
         }
@@ -173,8 +191,39 @@ impl OagwConfig {
                     .to_owned(),
             );
         }
+        // The interactive OAuth `redirect_uri` and post-callback `return_to`
+        // targets are deployment-controlled security boundaries; reject
+        // malformed / insecure values at startup rather than at `begin` time.
+        if let Some(callback_url) = &self.oauth_callback_url {
+            validate_secure_absolute_url(callback_url, "oauth_callback_url")?;
+        }
+        for (i, entry) in self.oauth_return_to_allowlist.iter().enumerate() {
+            validate_secure_absolute_url(entry, &format!("oauth_return_to_allowlist[{i}]"))?;
+        }
         Ok(())
     }
+}
+
+/// Validate that `raw` is an absolute URL using `https` (or `http` only for the
+/// loopback development exception), has a host, and carries no fragment — the
+/// same constraints the OAuth flow enforces on redirect targets.
+fn validate_secure_absolute_url(raw: &str, field: &str) -> Result<(), String> {
+    let url = url::Url::parse(raw).map_err(|e| format!("{field}: invalid URL: {e}"))?;
+    let is_loopback = match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => return Err(format!("{field}: URL must have a host")),
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback => {}
+        other => return Err(format!("{field}: must use https (got scheme '{other}')")),
+    }
+    if url.fragment().is_some() {
+        return Err(format!("{field}: must not contain a fragment"));
+    }
+    Ok(())
 }
 
 /// Read-only runtime configuration exposed to handlers via `AppState`.
@@ -254,6 +303,8 @@ impl fmt::Debug for OagwConfig {
             )
             .field("protocol_cache_ttl_secs", &self.protocol_cache_ttl_secs)
             .field("management_api_enabled", &self.management_api_enabled)
+            .field("oauth_callback_url", &self.oauth_callback_url)
+            .field("oauth_return_to_allowlist", &self.oauth_return_to_allowlist)
             .field("ssrf_policy", &self.ssrf_policy)
             .finish()
     }
@@ -335,6 +386,37 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_insecure_oauth_callback_url() {
+        let config = OagwConfig {
+            oauth_callback_url: Some("http://evil.example.com/cb".to_owned()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_https_oauth_callback_and_return_to() {
+        let config = OagwConfig {
+            oauth_callback_url: Some("https://gw.example.com/oagw/v1/oauth/callback".to_owned()),
+            oauth_return_to_allowlist: vec!["https://app.example.com/connected".to_owned()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_insecure_return_to_entry() {
+        let config = OagwConfig {
+            oauth_return_to_allowlist: vec![
+                "https://ok.example.com".to_owned(),
+                "ftp://x".to_owned(),
+            ],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     #[cfg(feature = "fips")]
