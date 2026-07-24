@@ -164,9 +164,17 @@ pub(in crate::domain::services) async fn validate_secret_ref_accessible(
 
     match credstore.get(ctx, &key).await {
         Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(DomainError::validation(format!(
-            "secret_ref '{raw_ref}' is not accessible to this tenant"
-        ))),
+        // Not a malformed argument: the ref parses, the secret just isn't
+        // there (yet) or isn't shared. Distinguished from `Validation` so
+        // provisioning callers can defer-and-retry instead of treating it
+        // as a deterministic misconfiguration.
+        Ok(None) => Err(DomainError::SecretRefNotAccessible {
+            detail: format!(
+                "secret_ref '{raw_ref}' is not accessible to this tenant \
+                 (not provisioned yet, or not shared)"
+            ),
+            instance: String::new(),
+        }),
         Err(credstore_sdk::CredStoreError::Internal(msg)) => {
             // Fail-closed: cred_store unavailability → reject.
             tracing::warn!(secret_ref = raw_ref, error = %msg, "cred_store unavailable during secret_ref validation");
@@ -174,6 +182,17 @@ pub(in crate::domain::services) async fn validate_secret_ref_accessible(
                 message: format!("credential validation unavailable: {msg}"),
             })
         }
+        // Same state as `Ok(None)`, reported as an error by some client
+        // implementations (e.g. a metadata row whose value is still being
+        // provisioned): not accessible *yet*, so provisioning callers must be
+        // able to defer-and-retry rather than fail fast.
+        Err(e) if e.is_not_found() => Err(DomainError::SecretRefNotAccessible {
+            detail: format!(
+                "secret_ref '{raw_ref}' is not accessible to this tenant \
+                 (not provisioned yet, or not shared)"
+            ),
+            instance: String::new(),
+        }),
         Err(e) => Err(DomainError::validation(format!(
             "secret_ref '{raw_ref}' validation failed: {e}"
         ))),

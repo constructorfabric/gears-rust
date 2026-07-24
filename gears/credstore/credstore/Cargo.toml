@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-credstore"
-description = "credstore gateway module"
+description = "credstore gear module"
 version = "0.1.25"
 edition.workspace = true
 license.workspace = true
@@ -19,26 +19,57 @@ name = "credstore"
 workspace = true
 
 [dependencies]
-# Trait boundaries of consumed SDKs are `CanonicalError` (ADR 0005).
-toolkit-canonical-errors = { workspace = true }
 credstore-sdk = { workspace = true }
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-db = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+authz-resolver-sdk = { workspace = true }
+authz-resolver = { workspace = true }
+tenant-resolver-sdk = { workspace = true }
+tenant-resolver = { workspace = true }
 types-registry-sdk = { workspace = true }
 types-registry = { workspace = true }
 
-anyhow = { workspace = true }
 async-trait = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-inventory = { workspace = true }
+axum = { workspace = true }
+# Value-fingerprint fence (docs/features/001-value-fingerprint-fence.md):
+# HMAC-SHA256 over the backend value + fence-key generation via AWS-LC
+# (aws-lc-rs) — the workspace's FIPS-capable crypto backend, so the fence runs
+# through the validated module under a `--features fips` build (RustCrypto's
+# pure-Rust sha2/hmac, banned by the DE0708 FIPS-hasher lint, cannot).
+aws-lc-rs = { workspace = true }
+# Non-crypto retry jitter only (fence-key bootstrap de-sync); not key material.
+rand = { workspace = true }
+# Zeroize the in-process cached fence key on drop (highest-value single secret).
+zeroize = { workspace = true }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+jsonschema = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
-
-toolkit = { workspace = true }
-toolkit-security = { workspace = true }
-toolkit-macros = { workspace = true }
+anyhow = { workspace = true }
+time = { workspace = true }
+utoipa = { workspace = true }
+opentelemetry = { workspace = true, features = ["metrics"] }
 
 [dev-dependencies]
 toolkit-gts = { workspace = true }
+tower = { workspace = true }
+toolkit-db = { workspace = true, features = ["sqlite"] }
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
+
+[features]
+test-support = ["dep:opentelemetry_sdk"]
+
+[dependencies.opentelemetry_sdk]
+workspace = true
+features = ["metrics", "testing"]
+optional = true

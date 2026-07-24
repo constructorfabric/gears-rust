@@ -229,6 +229,17 @@ impl From<DomainError> for CanonicalError {
                 CanonicalError::internal(detail).create()
             }
 
+            // A state precondition, not a malformed request: the referenced
+            // secret is not provisioned yet or not shared. Kept distinct from
+            // `Validation`/`invalid_argument` so in-process provisioning
+            // callers can classify it as retryable (HTTP status is 400 for
+            // both, but the canonical category differs).
+            DomainError::SecretRefNotAccessible { detail, .. } => {
+                OagwUpstreamError::failed_precondition()
+                    .with_precondition_violation("auth.config.secret_ref", detail, "STATE")
+                    .create()
+            }
+
             DomainError::DownstreamError { detail, .. } => {
                 tracing::warn!(reason = %detail, "OAGW downstream error");
                 CanonicalError::service_unavailable()
@@ -862,6 +873,10 @@ mod tests {
                 detail: "test".into(),
                 instance: "/test".into(),
             },
+            DomainError::SecretRefNotAccessible {
+                detail: "test".into(),
+                instance: "/test".into(),
+            },
             DomainError::DownstreamError {
                 detail: "test".into(),
                 instance: "/test".into(),
@@ -1063,6 +1078,23 @@ mod tests {
         );
         // resource_name must be absent — guard didn't supply an id.
         assert!(p.context.get("resource_name").is_none());
+    }
+
+    #[test]
+    fn secret_ref_not_accessible_maps_to_failed_precondition_400() {
+        // A state precondition (the secret may be provisioned later), NOT
+        // invalid_argument: in-process provisioning callers rely on the
+        // canonical category to classify the failure as retryable.
+        let err = DomainError::SecretRefNotAccessible {
+            detail: "secret_ref 'cred://missing' is not accessible to this tenant".into(),
+            instance: "/test".into(),
+        };
+        let p: Problem = err.into_test_problem();
+        assert_eq!(p.status, 400);
+        assert_eq!(
+            p.problem_type,
+            gts_uri!("cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~")
+        );
     }
 
     #[test]

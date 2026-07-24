@@ -65,8 +65,14 @@ jobs:
           base_ref="${{ github.base_ref }}"
 
           if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "$base_ref" ]; then
-            git fetch --no-tags --depth=1 origin "$base_ref"
-            changed_files="$(git diff --name-only "origin/$base_ref"...HEAD)"
+            # Full (not --depth=1) fetch so the three-dot diff can find a merge
+            # base: checkout uses fetch-depth: 0 (full HEAD), so a shallow base
+            # ref has no reachable common ancestor and the diff fails with
+            # "no merge base" (notably on fork PRs). Tolerate a failed fetch and
+            # a failed diff so this detection step never hard-fails the job (the
+            # run shell is `bash -eo pipefail`, so an unguarded fetch would exit).
+            git fetch --no-tags origin "$base_ref" || true
+            changed_files="$(git diff --name-only "origin/$base_ref"...HEAD 2>/dev/null || true)"
           else
             changed_files="$(
               git diff --name-only HEAD~1 HEAD 2>/dev/null || true

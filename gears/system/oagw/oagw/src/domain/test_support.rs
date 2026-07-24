@@ -17,10 +17,7 @@ use authz_resolver_sdk::{
     AuthZResolverClient, AuthZResolverError, EvaluationRequest, EvaluationResponse,
     EvaluationResponseContext, PolicyEnforcer,
 };
-use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, GetSecretResponse, SecretRef, SecretValue, SharingMode,
-    TenantId as CredstoreTenantId,
-};
+use credstore_sdk::CredStoreClientV1;
 use oagw_sdk::api::ServiceGatewayClientV1;
 use tenant_resolver_sdk::{
     GetAncestorsOptions, GetAncestorsResponse, GetDescendantsOptions, GetDescendantsResponse,
@@ -161,68 +158,13 @@ impl AuthZResolverClient for CapturingAuthZResolverClient {
     }
 }
 
-/// Mock `CredStoreClientV1` for tests. Stores secrets in memory keyed by
-/// the bare secret name (without `cred://` prefix).
-pub struct MockCredStoreClient {
-    store: HashMap<String, Vec<u8>>,
-}
-
-impl MockCredStoreClient {
-    /// Create a mock pre-loaded with secrets.
-    ///
-    /// Keys may optionally include the `cred://` prefix — it is stripped
-    /// automatically so lookups work regardless of the prefix convention.
-    pub fn with_secrets(creds: Vec<(String, String)>) -> Self {
-        let store = creds
-            .into_iter()
-            .map(|(k, v)| {
-                let key = k.strip_prefix("cred://").unwrap_or(k.as_str()).to_string();
-                (key, v.into_bytes())
-            })
-            .collect();
-        Self { store }
-    }
-
-    /// Create an empty mock (all lookups return `Ok(None)`).
-    pub fn empty() -> Self {
-        Self {
-            store: HashMap::new(),
-        }
-    }
-}
-
-#[async_trait]
-impl CredStoreClientV1 for MockCredStoreClient {
-    async fn get(
-        &self,
-        _ctx: &SecurityContext,
-        key: &SecretRef,
-    ) -> Result<Option<GetSecretResponse>, CredStoreError> {
-        Ok(self.store.get(key.as_ref()).map(|v| GetSecretResponse {
-            value: SecretValue::new(v.clone()),
-            owner_tenant_id: CredstoreTenantId::nil(),
-            sharing: SharingMode::default(),
-            is_inherited: false,
-        }))
-    }
-}
-
-/// Mock `CredStoreClientV1` that always returns `CredStoreError::Internal`.
-/// Useful for testing error-handling paths.
-#[cfg(test)]
-pub struct FailingCredStoreClient;
-
-#[cfg(test)]
-#[async_trait]
-impl CredStoreClientV1 for FailingCredStoreClient {
-    async fn get(
-        &self,
-        _ctx: &SecurityContext,
-        _key: &SecretRef,
-    ) -> Result<Option<GetSecretResponse>, CredStoreError> {
-        Err(CredStoreError::Internal("backend failure".into()))
-    }
-}
+// The `CredStoreClientV1` test double is centralized in the SDK
+// (`credstore_sdk::test_util`, behind its `test-util` feature) so every gear
+// shares one configurable mock instead of hand-rolling its own. Modes:
+// `empty()` (all `get` → None), `with_secrets(..)` (keyed store),
+// `returning_raw_value(..)` (any ref → fixed bytes, e.g. non-UTF-8),
+// `always_failing()` (every op → `Internal`).
+pub use credstore_sdk::test_util::MockCredStoreClient;
 
 /// Re-export for tests that need a `CredStoreClientV1` mock.
 pub use MockCredStoreClient as TestCredStoreClient;

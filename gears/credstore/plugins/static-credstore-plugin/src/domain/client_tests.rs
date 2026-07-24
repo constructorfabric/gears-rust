@@ -1,220 +1,106 @@
-// Created: 2026-04-07 by Constructor Tech
-use super::*;
-use crate::config::{SecretConfig, StaticCredStorePluginConfig};
+// Created: 2026-06-06 — tests for the `CredStorePluginClientV1` trait impl.
+use credstore_sdk::{CredStorePluginClientV1, OwnerId, SecretRef, SecretValue, TenantId};
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-fn tenant_a() -> Uuid {
-    Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()
-}
+use crate::config::{SecretConfig, StaticCredStorePluginConfig};
+use crate::domain::service::Service;
 
-fn tenant_b() -> Uuid {
-    Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap()
-}
-
-fn owner_a() -> Uuid {
-    Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap()
-}
-
-fn owner_b() -> Uuid {
-    Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap()
-}
-
-fn ctx(tenant_id: Uuid, subject_id: Uuid) -> SecurityContext {
+fn ctx() -> SecurityContext {
     SecurityContext::builder()
-        .subject_id(subject_id)
-        .subject_tenant_id(tenant_id)
+        .subject_tenant_id(Uuid::new_v4())
+        .subject_id(Uuid::new_v4())
         .build()
-        .unwrap()
+        .expect("test security context")
 }
 
-/// Private secret: `tenant_a` + `owner_a`.
-fn service_with_single_secret() -> Service {
+fn empty_service() -> Service {
+    Service::from_config(&StaticCredStorePluginConfig::default()).expect("config builds")
+}
+
+fn seeded_service() -> Service {
     let cfg = StaticCredStorePluginConfig {
         secrets: vec![SecretConfig {
-            tenant_id: Some(tenant_a()),
-            owner_id: Some(owner_a()),
-            key: "openai_api_key".to_owned(),
-            value: "sk-test-123".to_owned(),
-            sharing: None,
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-
-    Service::from_config(&cfg).unwrap()
-}
-
-#[tokio::test]
-async fn get_returns_metadata_for_matching_tenant_and_owner() {
-    let service = service_with_single_secret();
-    let plugin: &dyn CredStorePluginClientV1 = &service;
-    let key = SecretRef::new("openai_api_key").unwrap();
-
-    let metadata = plugin
-        .get(&ctx(tenant_a(), owner_a()), &key)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(metadata.value.as_bytes(), b"sk-test-123");
-    assert_eq!(metadata.owner_id, OwnerId(owner_a()));
-    assert_eq!(metadata.owner_tenant_id, TenantId(tenant_a()));
-}
-
-#[tokio::test]
-async fn get_returns_none_for_other_tenant() {
-    let service = service_with_single_secret();
-    let plugin: &dyn CredStorePluginClientV1 = &service;
-    let key = SecretRef::new("openai_api_key").unwrap();
-
-    let result = plugin.get(&ctx(tenant_b(), owner_a()), &key).await.unwrap();
-    assert!(result.is_none());
-}
-
-#[tokio::test]
-async fn get_returns_none_for_other_owner() {
-    let service = service_with_single_secret();
-    let plugin: &dyn CredStorePluginClientV1 = &service;
-    let key = SecretRef::new("openai_api_key").unwrap();
-
-    let result = plugin.get(&ctx(tenant_a(), owner_b()), &key).await.unwrap();
-    assert!(result.is_none());
-}
-
-#[tokio::test]
-async fn get_returns_none_for_missing_key() {
-    let service = service_with_single_secret();
-    let plugin: &dyn CredStorePluginClientV1 = &service;
-    let key = SecretRef::new("missing").unwrap();
-
-    let result = plugin.get(&ctx(tenant_a(), owner_a()), &key).await.unwrap();
-    assert!(result.is_none());
-}
-
-#[tokio::test]
-async fn get_returns_none_when_no_secrets_configured() {
-    let service = Service::from_config(&StaticCredStorePluginConfig::default()).unwrap();
-    let plugin: &dyn CredStorePluginClientV1 = &service;
-    let key = SecretRef::new("openai_api_key").unwrap();
-
-    let result = plugin.get(&ctx(tenant_a(), owner_a()), &key).await.unwrap();
-    assert!(result.is_none());
-}
-
-// --- Shared secret fills owner from SecurityContext ---
-
-#[tokio::test]
-async fn shared_secret_resolves_owner_from_context() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: None,
+            tenant_id: Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()),
             owner_id: None,
-            key: "global_key".to_owned(),
-            value: "global-val".to_owned(),
+            key: "openai-key".to_owned(),
+            value: "seeded".to_owned(),
             sharing: None,
         }],
-        ..StaticCredStorePluginConfig::default()
+        ..Default::default()
     };
-    let service = Service::from_config(&cfg).unwrap();
-    let plugin: &dyn CredStorePluginClientV1 = &service;
-    let key = SecretRef::new("global_key").unwrap();
-
-    let metadata = plugin
-        .get(&ctx(tenant_a(), owner_b()), &key)
-        .await
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(metadata.value.as_bytes(), b"global-val");
-    assert_eq!(metadata.owner_id, OwnerId(owner_b()));
-    assert_eq!(metadata.owner_tenant_id, TenantId(tenant_a()));
+    Service::from_config(&cfg).expect("config builds")
 }
 
-// --- Tenant secret fills owner from SecurityContext ---
-
-#[tokio::test]
-async fn tenant_secret_resolves_owner_from_context() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: Some(tenant_a()),
-            owner_id: None,
-            key: "scoped_key".to_owned(),
-            value: "scoped-val".to_owned(),
-            sharing: None,
-        }],
-        ..StaticCredStorePluginConfig::default()
-    };
-    let service = Service::from_config(&cfg).unwrap();
-    let plugin: &dyn CredStorePluginClientV1 = &service;
-    let key = SecretRef::new("scoped_key").unwrap();
-
-    let metadata = plugin
-        .get(&ctx(tenant_a(), owner_b()), &key)
-        .await
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(metadata.owner_id, OwnerId(owner_b()));
-    assert_eq!(metadata.owner_tenant_id, TenantId(tenant_a()));
+fn tid() -> TenantId {
+    TenantId(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap())
 }
 
-// --- Lookup precedence via plugin ---
+#[tokio::test]
+async fn get_seeded_tenant_secret() {
+    let svc = seeded_service();
+    let got = svc
+        .get(&ctx(), &tid(), &SecretRef::new("openai-key").unwrap(), None)
+        .await
+        .unwrap()
+        .expect("secret present");
+    assert_eq!(got.as_bytes(), b"seeded");
+}
 
 #[tokio::test]
-async fn private_takes_precedence_over_tenant_and_shared_via_plugin() {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![
-            SecretConfig {
-                tenant_id: None,
-                owner_id: None,
-                key: "k".to_owned(),
-                value: "shared-val".to_owned(),
-                sharing: None,
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: None,
-                key: "k".to_owned(),
-                value: "tenant-val".to_owned(),
-                sharing: None,
-            },
-            SecretConfig {
-                tenant_id: Some(tenant_a()),
-                owner_id: Some(owner_a()),
-                key: "k".to_owned(),
-                value: "private-val".to_owned(),
-                sharing: None,
-            },
-        ],
-        ..StaticCredStorePluginConfig::default()
-    };
-    let service = Service::from_config(&cfg).unwrap();
-    let plugin: &dyn CredStorePluginClientV1 = &service;
-    let key = SecretRef::new("k").unwrap();
-
-    // owner_a in tenant_a → Private
-    let meta = plugin
-        .get(&ctx(tenant_a(), owner_a()), &key)
+async fn get_missing_returns_none() {
+    let svc = empty_service();
+    let got = svc
+        .get(&ctx(), &tid(), &SecretRef::new("absent").unwrap(), None)
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(meta.value.as_bytes(), b"private-val");
-    assert_eq!(meta.owner_id, OwnerId(owner_a()));
+    assert!(got.is_none());
+}
 
-    // owner_b in tenant_a → Tenant (owner resolved from ctx)
-    let meta = plugin
-        .get(&ctx(tenant_a(), owner_b()), &key)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(meta.value.as_bytes(), b"tenant-val");
-    assert_eq!(meta.owner_id, OwnerId(owner_b()));
+#[tokio::test]
+async fn put_then_get_roundtrip() {
+    let svc = empty_service();
+    let key = SecretRef::new("written").unwrap();
 
-    // tenant_b → Shared (owner resolved from ctx)
-    let meta = plugin
-        .get(&ctx(tenant_b(), owner_b()), &key)
+    svc.put(&ctx(), &tid(), &key, SecretValue::from("v1"), None)
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(meta.value.as_bytes(), b"shared-val");
-    assert_eq!(meta.owner_id, OwnerId(owner_b()));
-    assert_eq!(meta.owner_tenant_id, TenantId(tenant_b()));
+
+    let got = svc.get(&ctx(), &tid(), &key, None).await.unwrap();
+    assert_eq!(got.unwrap().as_bytes(), b"v1");
+}
+
+#[tokio::test]
+async fn private_put_is_owner_scoped() {
+    let svc = empty_service();
+    let key = SecretRef::new("owned").unwrap();
+    let owner = OwnerId(Uuid::new_v4());
+
+    svc.put(
+        &ctx(),
+        &tid(),
+        &key,
+        SecretValue::from("secret"),
+        Some(&owner),
+    )
+    .await
+    .unwrap();
+
+    // Visible to the owner, not to the tenant class.
+    assert!(
+        svc.get(&ctx(), &tid(), &key, Some(&owner))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(svc.get(&ctx(), &tid(), &key, None).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn delete_removes_value() {
+    let svc = seeded_service();
+    let key = SecretRef::new("openai-key").unwrap();
+
+    svc.delete(&ctx(), &tid(), &key, None).await.unwrap();
+    assert!(svc.get(&ctx(), &tid(), &key, None).await.unwrap().is_none());
 }

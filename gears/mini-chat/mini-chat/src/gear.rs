@@ -505,12 +505,47 @@ impl RunnableCapability for MiniChatGear {
             let ctx =
                 exchange_client_credentials(&deferred.authn, &deferred.client_credentials).await?;
             let mut providers = deferred.providers.clone();
-            crate::infra::oagw_provisioning::register_oagw_upstreams(
+            let report = crate::infra::oagw_provisioning::register_oagw_upstreams(
                 &deferred.gateway,
                 &ctx,
                 &mut providers,
             )
             .await?;
+            // Fail-fast: a deterministically misconfigured provider (OAGW
+            // rejected its request as invalid — retrying cannot help) aborts
+            // startup instead of leaving the provider silently unavailable.
+            // Only genuinely deferrable providers (secret not provisioned
+            // yet, transient errors) proceed to the background retry below.
+            report.ensure_no_misconfigured()?;
+            let deferred_ids = report.deferred;
+
+            // Providers whose backend secret was not accessible at boot are
+            // registered lazily. With the stateful credstore, provider secrets
+            // are created at runtime via the credstore API, so the upstream
+            // cannot be registered until the secret exists. Retry in the
+            // background rather than blocking startup: start() must return for
+            // the server to report healthy, which is itself a precondition for
+            // the secret to be provisioned.
+            if !deferred_ids.is_empty() {
+                tracing::warn!(
+                    deferred = ?deferred_ids,
+                    "OAGW upstreams deferred at boot (secret not yet accessible); \
+                     retrying registration in the background"
+                );
+                let gateway = Arc::clone(&deferred.gateway);
+                let authn = Arc::clone(&deferred.authn);
+                let creds = deferred.client_credentials.clone();
+                let providers = providers.clone();
+                let cancel = cancel.clone();
+                tokio::spawn(reconcile_deferred_upstreams_with_retry(
+                    gateway,
+                    authn,
+                    creds,
+                    providers,
+                    deferred_ids,
+                    cancel,
+                ));
+            }
         }
 
         // Start the outbox pipeline now that OAGW upstreams are registered.
@@ -736,6 +771,118 @@ impl MiniChatGear {
             anyhow::bail!("{} {msg}", Self::MODULE_NAME);
         }
         Ok(())
+    }
+}
+
+/// Background retry loop for providers whose OAGW upstream could not be
+/// registered at boot because their credstore secret was not yet accessible.
+///
+/// Re-exchanges an S2S context and re-attempts registration on a backing-off
+/// cadence until every deferred provider is registered or the gear is
+/// cancelled. There is no attempt budget: with the stateful credstore a
+/// provider's secret can be provisioned at any time after boot, and giving up
+/// would leave that provider unavailable until an operator restart. The
+/// interval grows from `RETRY_INTERVAL_MIN` to `RETRY_INTERVAL_MAX` so late
+/// provisioning is still picked up without hammering OAGW indefinitely.
+/// Registration is idempotent, so any provider registered on a previous
+/// attempt is reused rather than duplicated.
+// The retry loop's `select!`/tracing macros inflate the measured cognitive
+// complexity; the control flow itself is a simple backing-off loop.
+#[allow(clippy::cognitive_complexity)]
+async fn reconcile_deferred_upstreams_with_retry(
+    gateway: Arc<dyn ServiceGatewayClientV1>,
+    authn: Arc<dyn AuthNResolverClient>,
+    creds: crate::config::ClientCredentialsConfig,
+    providers: std::collections::HashMap<String, ProviderEntry>,
+    mut deferred: Vec<String>,
+    cancel: CancellationToken,
+) {
+    const RETRY_INTERVAL_MIN: Duration = Duration::from_secs(2);
+    const RETRY_INTERVAL_MAX: Duration = Duration::from_mins(1);
+    // Warn once (not on every slow tick) after this much wall-clock time still
+    // deferred, so an operator notices without log spam. Time-based, not
+    // attempt-based: the interval backs off, so a fixed attempt count would
+    // drift far from the intended window.
+    const WARN_AFTER: Duration = Duration::from_mins(2);
+
+    let started = tokio::time::Instant::now();
+    let mut warned = false;
+    let mut backoff = RETRY_INTERVAL_MIN;
+    let mut attempt: u32 = 0;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => {
+                info!(remaining = deferred.len(), "OAGW upstream reconcile cancelled");
+                return;
+            }
+            () = tokio::time::sleep(backoff) => {}
+        }
+
+        attempt = attempt.saturating_add(1);
+        deferred =
+            reconcile_deferred_once(&gateway, &authn, &creds, &providers, deferred, attempt).await;
+        if deferred.is_empty() {
+            info!("OAGW reconcile: all deferred provider upstreams registered");
+            return;
+        }
+
+        if !warned && started.elapsed() >= WARN_AFTER {
+            warned = true;
+            tracing::warn!(
+                remaining = ?deferred,
+                elapsed_secs = started.elapsed().as_secs(),
+                "OAGW reconcile: provider(s) still UNAVAILABLE; will keep retrying at a slower \
+                 cadence until their secret is provisioned. Check for a missing secret or a \
+                 misconfigured secret_ref/host for these providers"
+            );
+        }
+        backoff = (backoff * 2).min(RETRY_INTERVAL_MAX);
+    }
+}
+
+/// One reconcile attempt: exchange a fresh S2S context and re-register the
+/// still-deferred providers. Returns the ids that remain deferred (the input
+/// unchanged on a transient failure, so the caller keeps retrying).
+// Two match arms plus tracing macros push the measured complexity over the
+// threshold; the logic is linear.
+#[allow(clippy::cognitive_complexity)]
+async fn reconcile_deferred_once(
+    gateway: &Arc<dyn ServiceGatewayClientV1>,
+    authn: &Arc<dyn AuthNResolverClient>,
+    creds: &crate::config::ClientCredentialsConfig,
+    providers: &std::collections::HashMap<String, ProviderEntry>,
+    deferred: Vec<String>,
+    attempt: u32,
+) -> Vec<String> {
+    let ctx = match exchange_client_credentials(authn, creds).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            tracing::warn!(error = %e, attempt, "OAGW reconcile: credential exchange failed; will retry");
+            return deferred;
+        }
+    };
+
+    match crate::infra::oagw_provisioning::reconcile_deferred_upstreams(
+        gateway, &ctx, providers, &deferred,
+    )
+    .await
+    {
+        Ok(still_deferred) => {
+            let registered = deferred.len().saturating_sub(still_deferred.len());
+            if registered > 0 {
+                info!(
+                    registered,
+                    remaining = still_deferred.len(),
+                    attempt,
+                    "OAGW reconcile: registered deferred provider upstream(s)"
+                );
+            }
+            still_deferred
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, attempt, "OAGW reconcile attempt failed; will retry");
+            deferred
+        }
     }
 }
 

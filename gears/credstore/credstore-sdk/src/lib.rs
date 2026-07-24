@@ -1,44 +1,20 @@
-//! `CredStore` SDK
-//!
-//! This crate provides the public API for the `credstore` gear:
-//!
-//! - [`CredStoreClientV1`] — Consumer API trait for storing/retrieving secrets
-//! - [`CredStorePluginClientV1`] — Plugin API trait for backend storage adapters
-//! - [`SecretRef`], [`SecretValue`], [`SharingMode`], [`GetSecretResponse`], [`SecretMetadata`] — Domain models
-//! - [`CredStoreError`] — Error types
-//! - [`CredStorePluginSpecV1`] — GTS schema for plugin discovery
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use credstore_sdk::{CredStoreClientV1, SecretRef, SecretValue, SharingMode};
-//!
-//! async fn store_secret(client: &dyn CredStoreClientV1, ctx: &SecurityContext) {
-//!     let key = SecretRef::new("partner-openai-key").unwrap();
-//!     let value = SecretValue::from("sk-abc123");
-//!
-//!     client.put(ctx, &key, value, SharingMode::Tenant).await.unwrap();
-//!
-//!     if let Some(resp) = client.get(ctx, &key).await.unwrap() {
-//!         // Use resp.value.as_bytes()
-//!         // Check resp.is_inherited, resp.sharing, resp.owner_tenant_id
-//!     }
-//! }
-//! ```
-
-#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
-
+//! credstore SDK — public API traits, models, errors, GTS schema, secret types.
 pub mod api;
 pub mod error;
 pub mod gts;
 pub mod models;
 pub mod plugin_api;
+#[cfg(feature = "test-util")]
+pub mod test_util;
+pub mod types;
 
-// Re-export main types at crate root
+pub use ::gts::GtsId;
 pub use api::CredStoreClientV1;
 pub use error::CredStoreError;
-pub use gts::CredStorePluginSpecV1;
+pub use gts::{CredStorePluginSpecV1, SECRET_RESOURCE_TYPE, SecretTypeTraits, SecretV1};
 pub use models::{
-    GetSecretResponse, OwnerId, SecretMetadata, SecretRef, SecretValue, SharingMode, TenantId,
+    ExpiryWrite, GetSecretResponse, OwnerId, SecretRef, SecretValue, SharingMode, TenantId,
+    WriteOptions, WritePrecondition,
 };
 pub use plugin_api::CredStorePluginClientV1;
+pub use types::{SECRET_TYPE_CATALOG, SecretType, SecretTypeDescriptor};

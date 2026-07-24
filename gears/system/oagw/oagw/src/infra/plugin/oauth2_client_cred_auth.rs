@@ -260,13 +260,10 @@ mod tests {
     use toolkit_security::SecurityContext;
     use uuid::Uuid;
 
-    use credstore_sdk::{
-        CredStoreClientV1, CredStoreError, GetSecretResponse, SecretRef, SecretValue, SharingMode,
-        TenantId as CredstoreTenantId,
-    };
+    use credstore_sdk::CredStoreClientV1;
 
     use crate::domain::plugin::{AuthContext, AuthPlugin, PluginError};
-    use crate::domain::test_support::{FailingCredStoreClient, MockCredStoreClient};
+    use crate::domain::test_support::MockCredStoreClient;
 
     use super::*;
 
@@ -463,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn credstore_error_maps_to_internal() {
         let server = MockServer::start();
-        let plugin = make_plugin(Arc::new(FailingCredStoreClient));
+        let plugin = make_plugin(Arc::new(MockCredStoreClient::always_failing()));
         let mut ctx = make_auth_ctx(make_config(&server));
 
         let err = plugin.authenticate(&mut ctx).await.unwrap_err();
@@ -472,26 +469,11 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_utf8_secret_returns_internal_error() {
-        struct Utf8ErrorCredStore;
-
-        #[async_trait::async_trait]
-        impl CredStoreClientV1 for Utf8ErrorCredStore {
-            async fn get(
-                &self,
-                _ctx: &toolkit_security::SecurityContext,
-                _key: &SecretRef,
-            ) -> Result<Option<GetSecretResponse>, CredStoreError> {
-                Ok(Some(GetSecretResponse {
-                    value: SecretValue::new(vec![0xFF, 0xFE]),
-                    owner_tenant_id: CredstoreTenantId::nil(),
-                    sharing: SharingMode::default(),
-                    is_inherited: false,
-                }))
-            }
-        }
-
         let server = MockServer::start();
-        let plugin = make_plugin(Arc::new(Utf8ErrorCredStore));
+        // Any reference resolves to non-UTF-8 bytes.
+        let plugin = make_plugin(Arc::new(MockCredStoreClient::returning_raw_value(vec![
+            0xFF, 0xFE,
+        ])));
         let mut ctx = make_auth_ctx(make_config(&server));
 
         let err = plugin.authenticate(&mut ctx).await.unwrap_err();

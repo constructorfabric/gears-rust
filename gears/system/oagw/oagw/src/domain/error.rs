@@ -75,6 +75,17 @@ pub enum DomainError {
     #[error("{detail}")]
     SecretNotFound { detail: String, instance: String },
 
+    /// A management-plane `secret_ref` did not resolve to an accessible
+    /// secret — not provisioned yet, or not shared with the tenant. A state
+    /// precondition rather than a malformed argument: the same request
+    /// succeeds once the secret becomes accessible, so in-process callers
+    /// (gear provisioning loops) can distinguish it from `Validation` and
+    /// retry. Maps to canonical `failed_precondition` (HTTP 400), unlike the
+    /// request-time [`DomainError::SecretNotFound`] which is a server-side
+    /// config failure (500).
+    #[error("{detail}")]
+    SecretRefNotAccessible { detail: String, instance: String },
+
     #[error("{detail}")]
     DownstreamError { detail: String, instance: String },
 

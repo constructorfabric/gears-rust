@@ -1,0 +1,432 @@
+# Generated from docs/api/api.json (make openapi) — do not edit by hand.
+openapi: 3.1.0
+info:
+  title: CredStore API
+  version: 0.1.0
+  description: Stateful, tenant-scoped credential-storage gear. Extracted (credstore paths + referenced
+    components) from the platform OpenAPI document `docs/api/api.json`; regenerate via `make openapi`.
+paths:
+  /credstore/v1/secrets:
+    post:
+      description: Create a new secret for the authenticated tenant.
+      operationId: credstore.create_secret
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSecretRequestDto'
+        description: Secret reference, value, and sharing mode
+        required: true
+      responses:
+        '201':
+          description: Secret created (see Location header)
+        '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Bad Request
+        '401':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Unauthorized
+        '403':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Forbidden
+        '409':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Conflict
+        '500':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
+        '503':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Service Unavailable
+      security:
+      - bearerAuth: []
+      summary: Create a secret
+      tags:
+      - Credential Store
+  /credstore/v1/secrets/{ref}:
+    delete:
+      description: Delete a secret owned by the authenticated tenant.
+      operationId: credstore.delete_secret
+      parameters:
+      - description: Secret reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
+        in: path
+        name: ref
+        required: true
+        schema:
+          type: string
+      - description: Optimistic-concurrency precondition (RFC 7232). `*` requires the secret to exist;
+          a quoted `"<id>.<version>"` ETag requires the current version to match, otherwise the request
+          fails with `409 OPTIMISTIC_LOCK_FAILURE`.
+        in: header
+        name: If-Match
+        required: false
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Secret deleted
+        '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Bad Request
+        '401':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Unauthorized
+        '403':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Forbidden
+        '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Not Found
+        '409':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Conflict
+        '500':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
+        '503':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Service Unavailable
+      security:
+      - bearerAuth: []
+      summary: Delete a secret by reference
+      tags:
+      - Credential Store
+    get:
+      description: Retrieve a secret for the authenticated tenant, with walk-up resolution.
+      operationId: credstore.get_secret
+      parameters:
+      - description: Secret reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
+        in: path
+        name: ref
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetSecretResponseDto'
+          description: Resolved secret value and metadata
+        '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Bad Request
+        '401':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Unauthorized
+        '403':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Forbidden
+        '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Not Found
+        '500':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
+        '503':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Service Unavailable
+      security:
+      - bearerAuth: []
+      summary: Get a secret by reference
+      tags:
+      - Credential Store
+    put:
+      description: Store a secret for the authenticated tenant.
+      operationId: credstore.put_secret
+      parameters:
+      - description: Secret reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
+        in: path
+        name: ref
+        required: true
+        schema:
+          type: string
+      - description: Optimistic-concurrency precondition (RFC 7232). `*` requires the secret to exist;
+          a quoted `"<id>.<version>"` ETag requires the current version to match, otherwise the request
+          fails with `409 OPTIMISTIC_LOCK_FAILURE`.
+        in: header
+        name: If-Match
+        required: false
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSecretRequestDto'
+        description: Secret value and sharing mode
+        required: true
+      responses:
+        '204':
+          description: Secret stored
+        '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Bad Request
+        '401':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Unauthorized
+        '403':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Forbidden
+        '409':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Conflict
+        '500':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
+        '503':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Service Unavailable
+      security:
+      - bearerAuth: []
+      summary: Create or update a secret by reference
+      tags:
+      - Credential Store
+components:
+  schemas:
+    CreateSecretRequestDto:
+      additionalProperties: false
+      description: 'Request body for `POST /credstore/v1/secrets`.
+
+
+        `Debug` is hand-written to redact `value` — a derived `Debug` would expose
+
+        the plaintext secret if this DTO is ever `{:?}`-logged by a future layer.'
+      properties:
+        expires_at:
+          description: Expiry instant (RFC 3339); only for expirable types.
+          format: date-time
+          type:
+          - string
+          - 'null'
+        reference:
+          description: Secret reference key — `[a-zA-Z0-9_-]+`, max 255 characters.
+          maxLength: 255
+          minLength: 1
+          pattern: ^[A-Za-z0-9_-]+$
+          type: string
+        sharing:
+          $ref: '#/components/schemas/SharingModeDto'
+          description: Sharing mode for the secret.
+        type:
+          description: 'Secret type as a full GTS type id (built-in or custom); defaults to
+
+            the generic type. Resolved and existence-checked against the
+
+            types-registry.'
+          type:
+          - string
+          - 'null'
+        value:
+          description: Secret value as a UTF-8 string.
+          type: string
+      required:
+      - reference
+      - value
+      type: object
+    GetSecretResponseDto:
+      description: 'Response body for `GET /credstore/v1/secrets/{ref}`.
+
+
+        `Debug` is hand-written to redact `value` (see [`CreateSecretRequestDto`]).'
+      properties:
+        metadata:
+          $ref: '#/components/schemas/SecretMetadataDto'
+          description: Access metadata for the resolved secret.
+        value:
+          description: Secret value as a UTF-8 string.
+          type: string
+      required:
+      - value
+      - metadata
+      type: object
+    Problem:
+      description: RFC 9457 problem+json. `context` varies by error category.
+      properties:
+        context:
+          type: object
+        detail:
+          type: string
+        instance:
+          type: string
+        status:
+          format: int32
+          type: integer
+        title:
+          type: string
+        trace_id:
+          type: string
+        type:
+          type: string
+      required:
+      - type
+      - title
+      - status
+      - detail
+      - context
+      type: object
+    SecretMetadataDto:
+      description: Access metadata returned alongside the secret value.
+      properties:
+        expires_at:
+          description: Expiry instant (RFC 3339), when set.
+          format: date-time
+          type:
+          - string
+          - 'null'
+        is_inherited:
+          description: Whether the secret came from an ancestor tenant.
+          type: boolean
+        owner_tenant_id:
+          description: The tenant that owns this secret.
+          format: uuid
+          type: string
+        sharing:
+          $ref: '#/components/schemas/SharingModeDto'
+          description: The sharing mode that governed the lookup result.
+        type:
+          description: Secret type as its full GTS type id.
+          type: string
+        version:
+          description: Monotonic version of the resolved secret (also returned as `ETag`).
+          format: int64
+          type: integer
+      required:
+      - owner_tenant_id
+      - sharing
+      - is_inherited
+      - version
+      - type
+      type: object
+    SharingModeDto:
+      description: Sharing mode for the REST transport layer.
+      enum:
+      - private
+      - tenant
+      - shared
+      type: string
+    UpdateSecretRequestDto:
+      additionalProperties: false
+      description: 'Request body for `PUT /credstore/v1/secrets/{ref}`.
+
+
+        `Debug` is hand-written to redact `value` (see [`CreateSecretRequestDto`]).'
+      properties:
+        expires_at:
+          description: 'Expiry instant (RFC 3339); only for expirable types. A PUT is a
+
+            whole-value replace: omitting `expires_at` clears a stored expiry.'
+          format: date-time
+          type:
+          - string
+          - 'null'
+        sharing:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/SharingModeDto'
+            description: 'Sharing mode for the secret. **Optional: when omitted on an overwrite
+
+              the secret''s current sharing is preserved**, so rotating a `shared`
+
+              secret''s value with `{"value": "..."}` alone no longer silently narrows
+
+              it back to `tenant` (review finding #8). On create-via-upsert an omitted
+
+              `sharing` defaults to `tenant`. Send an explicit value to change the
+
+              sharing mode.'
+        type:
+          description: 'Secret type as a full GTS type id. Optional; when present must match
+
+            the existing secret''s type (the type is immutable). On create via
+
+            upsert it selects the new secret''s type (default: the generic type).'
+          type:
+          - string
+          - 'null'
+        value:
+          description: Secret value as a UTF-8 string.
+          type: string
+      required:
+      - value
+      type: object
+  securitySchemes:
+    bearerAuth:
+      bearerFormat: JWT
+      scheme: bearer
+      type: http

@@ -1,68 +1,66 @@
-// Updated: 2026-04-07 by Constructor Tech
+// Updated: 2026-06-06 — adapted to the per-tenant value-store `CredStorePluginClientV1`.
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 use credstore_sdk::{OwnerId, SecretRef, SecretValue, SharingMode, TenantId};
 use toolkit_macros::domain_model;
-use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::config::StaticCredStorePluginConfig;
 
-/// Pre-built secret entry for O(1) lookup.
+/// In-memory key classes backing the static plugin.
+///
+/// The `private`/`tenant` classes mirror the two classes the gear selects
+/// via `owner_id` (`Some`/`None`). The `shared`/`global` maps hold
+/// config-seeded entries that have no equivalent at write time; they are kept
+/// as read-only fallbacks for `owner_id = None` lookups so existing
+/// development configs keep resolving.
 #[domain_model]
-pub struct SecretEntry {
-    pub value: SecretValue,
-    pub sharing: SharingMode,
-    pub owner_id: OwnerId,
-    pub owner_tenant_id: TenantId,
+#[derive(Debug, Default)]
+struct Store {
+    /// Private key class — keyed by `(tenant, owner, key)`.
+    private: HashMap<(TenantId, OwnerId, SecretRef), SecretValue>,
+    /// Tenant key class — keyed by `(tenant, key)`.
+    tenant: HashMap<(TenantId, SecretRef), SecretValue>,
+    /// Config-seeded `shared` secrets — read fallback for the tenant key class.
+    shared: HashMap<(TenantId, SecretRef), SecretValue>,
+    /// Config-seeded global secrets — final read fallback for the tenant class.
+    global: HashMap<SecretRef, SecretValue>,
 }
 
-/// Static credstore service.
+/// Static credstore backend.
 ///
-/// Secrets are stored in four maps based on their resolved `SharingMode`
-/// and whether a `tenant_id` is present:
+/// A pure per-tenant value store implementing the `CredStorePluginClientV1`
+/// contract: `owner_id = Some` selects the private key class, `None` the
+/// tenant key class. Sharing, hierarchy and policy live in the gear, not
+/// here.
 ///
-/// - **`Private`**: keyed by `(TenantId, OwnerId, SecretRef)` — accessible only
-///   when both tenant and subject match.
-/// - **`Tenant`**: keyed by `(TenantId, SecretRef)` — accessible by any subject
-///   within the matching tenant.
-/// - **`Shared`**: keyed by `(TenantId, SecretRef)` — tenant-scoped but
-///   accessible by descendant tenants via hierarchical resolution in the
-///   gateway. The plugin stores them per-tenant; walk-up is the gateway's job.
-/// - **Global**: keyed by `SecretRef` only — no `tenant_id`; returned as
-///   fallback for any caller. Not a `SharingMode` variant; it is an
-///   operational shortcut specific to the static plugin.
-///
-/// Lookup order: **Private → Tenant → Shared → Global** (most specific first).
+/// The store is seeded from configuration and stays mutable at runtime, so the
+/// stateful gear's write saga (`put`/`delete`) can use it as a development
+/// backend. Config-seeded `shared`/global entries remain read-only fallbacks
+/// for `owner_id = None` lookups.
 #[domain_model]
-#[allow(clippy::struct_field_names)]
+#[derive(Debug, Default)]
 pub struct Service {
-    private_secrets: HashMap<(TenantId, OwnerId, SecretRef), SecretEntry>,
-    tenant_secrets: HashMap<(TenantId, SecretRef), SecretEntry>,
-    shared_secrets: HashMap<(TenantId, SecretRef), SecretEntry>,
-    global_secrets: HashMap<SecretRef, SecretEntry>,
+    inner: RwLock<Store>,
 }
 
 impl Service {
     /// Create a service from plugin configuration.
     ///
-    /// Validates each secret key via `SecretRef::new` and builds the lookup maps.
+    /// Validates each configured key via `SecretRef::new` and seeds the
+    /// in-memory key classes from the resolved sharing mode.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - any configured key fails `SecretRef` validation
     /// - duplicate keys within the same sharing scope
-    /// - a global secret has an explicit sharing mode other than `Shared`
     /// - a secret without `owner_id` has an explicit `SharingMode::Private`
     /// - `tenant_id` or `owner_id` is an explicit nil UUID
     /// - `owner_id` is set without `tenant_id`
     pub fn from_config(cfg: &StaticCredStorePluginConfig) -> anyhow::Result<Self> {
-        let mut private_secrets: HashMap<(TenantId, OwnerId, SecretRef), SecretEntry> =
-            HashMap::new();
-        let mut tenant_secrets: HashMap<(TenantId, SecretRef), SecretEntry> = HashMap::new();
-        let mut shared_secrets: HashMap<(TenantId, SecretRef), SecretEntry> = HashMap::new();
-        let mut global_secrets: HashMap<SecretRef, SecretEntry> = HashMap::new();
+        let mut store = Store::default();
 
         for entry in &cfg.secrets {
             if entry.tenant_id == Some(Uuid::nil()) {
@@ -71,7 +69,6 @@ impl Service {
             if entry.owner_id == Some(Uuid::nil()) {
                 anyhow::bail!("secret '{}': owner_id must not be nil UUID", entry.key);
             }
-
             if entry.tenant_id.is_none() && entry.owner_id.is_some() {
                 anyhow::bail!(
                     "secret '{}': owner_id cannot be set without tenant_id",
@@ -88,7 +85,6 @@ impl Service {
                     entry.key
                 );
             }
-
             if entry.owner_id.is_none() && sharing == SharingMode::Private {
                 anyhow::bail!(
                     "secret '{}' with sharing mode 'private' requires an explicit owner_id",
@@ -97,40 +93,26 @@ impl Service {
             }
 
             let key = SecretRef::new(&entry.key)?;
+            let value = SecretValue::from(entry.value.as_str());
 
             match (sharing, entry.tenant_id) {
                 (SharingMode::Shared, None) => {
-                    // Global secret: no tenant_id, accessible by any caller.
-                    let secret_entry = SecretEntry {
-                        value: SecretValue::from(entry.value.as_str()),
-                        sharing,
-                        owner_id: OwnerId::nil(),
-                        owner_tenant_id: TenantId::nil(),
-                    };
-                    if global_secrets.contains_key(&key) {
+                    if store.global.contains_key(&key) {
                         anyhow::bail!("duplicate global secret key '{}'", entry.key);
                     }
-                    global_secrets.insert(key, secret_entry);
+                    store.global.insert(key, value);
                 }
                 (SharingMode::Shared, Some(raw_tenant_id)) => {
-                    // Shared secret: tenant-scoped, visible to descendants
-                    // via gateway hierarchical resolution.
                     let tenant_id = TenantId(raw_tenant_id);
-                    let secret_entry = SecretEntry {
-                        value: SecretValue::from(entry.value.as_str()),
-                        sharing,
-                        owner_id: OwnerId::nil(),
-                        owner_tenant_id: tenant_id,
-                    };
                     let map_key = (tenant_id, key);
-                    if shared_secrets.contains_key(&map_key) {
+                    if store.shared.contains_key(&map_key) {
                         anyhow::bail!(
                             "duplicate shared secret key '{}' for tenant {}",
                             entry.key,
                             tenant_id
                         );
                     }
-                    shared_secrets.insert(map_key, secret_entry);
+                    store.shared.insert(map_key, value);
                 }
                 (SharingMode::Tenant, _) => {
                     let tenant_id = TenantId(entry.tenant_id.ok_or_else(|| {
@@ -139,21 +121,15 @@ impl Service {
                             entry.key
                         )
                     })?);
-                    let secret_entry = SecretEntry {
-                        value: SecretValue::from(entry.value.as_str()),
-                        sharing,
-                        owner_id: OwnerId::nil(),
-                        owner_tenant_id: tenant_id,
-                    };
                     let map_key = (tenant_id, key);
-                    if tenant_secrets.contains_key(&map_key) {
+                    if store.tenant.contains_key(&map_key) {
                         anyhow::bail!(
                             "duplicate tenant secret key '{}' for tenant {}",
                             entry.key,
                             tenant_id
                         );
                     }
-                    tenant_secrets.insert(map_key, secret_entry);
+                    store.tenant.insert(map_key, value);
                 }
                 (SharingMode::Private, _) => {
                     let tenant_id = TenantId(entry.tenant_id.ok_or_else(|| {
@@ -162,21 +138,14 @@ impl Service {
                             entry.key
                         )
                     })?);
-                    // owner_id is guaranteed Some by the validation above.
                     let owner_id = OwnerId(entry.owner_id.ok_or_else(|| {
                         anyhow::anyhow!(
                             "secret '{}': private sharing mode requires owner_id",
                             entry.key
                         )
                     })?);
-                    let secret_entry = SecretEntry {
-                        value: SecretValue::from(entry.value.as_str()),
-                        sharing,
-                        owner_id,
-                        owner_tenant_id: tenant_id,
-                    };
                     let map_key = (tenant_id, owner_id, key);
-                    if private_secrets.contains_key(&map_key) {
+                    if store.private.contains_key(&map_key) {
                         anyhow::bail!(
                             "duplicate private secret key '{}' for tenant {} owner {}",
                             entry.key,
@@ -184,32 +153,89 @@ impl Service {
                             owner_id
                         );
                     }
-                    private_secrets.insert(map_key, secret_entry);
+                    store.private.insert(map_key, value);
                 }
             }
         }
 
         Ok(Self {
-            private_secrets,
-            tenant_secrets,
-            shared_secrets,
-            global_secrets,
+            inner: RwLock::new(store),
         })
     }
 
-    /// Look up a secret using the caller's security context.
+    /// Read a value for the selected key class.
     ///
-    /// Lookup order: **Private → Tenant → Shared → Global** (most specific first).
+    /// `owner_id = Some` reads the private class; `None` reads the tenant class
+    /// and falls back to config-seeded `shared` then global entries.
     #[must_use]
-    pub fn get(&self, ctx: &SecurityContext, key: &SecretRef) -> Option<&SecretEntry> {
-        let tenant_id = TenantId(ctx.subject_tenant_id());
-        let subject_id = OwnerId(ctx.subject_id());
+    pub fn get_value(
+        &self,
+        tenant_id: &TenantId,
+        key: &SecretRef,
+        owner_id: Option<&OwnerId>,
+    ) -> Option<SecretValue> {
+        let store = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bytes = match owner_id {
+            Some(owner) => store
+                .private
+                .get(&(*tenant_id, *owner, key.clone()))
+                .map(SecretValue::as_bytes),
+            None => store
+                .tenant
+                .get(&(*tenant_id, key.clone()))
+                .or_else(|| store.shared.get(&(*tenant_id, key.clone())))
+                .or_else(|| store.global.get(key))
+                .map(SecretValue::as_bytes),
+        };
+        // `SecretValue` is not `Clone` (it zeroizes on drop), so reconstruct.
+        bytes.map(|b| SecretValue::new(b.to_vec()))
+    }
 
-        self.private_secrets
-            .get(&(tenant_id, subject_id, key.clone()))
-            .or_else(|| self.tenant_secrets.get(&(tenant_id, key.clone())))
-            .or_else(|| self.shared_secrets.get(&(tenant_id, key.clone())))
-            .or_else(|| self.global_secrets.get(key))
+    /// Insert or overwrite a value in the selected key class.
+    pub fn put_value(
+        &self,
+        tenant_id: &TenantId,
+        key: &SecretRef,
+        value: SecretValue,
+        owner_id: Option<&OwnerId>,
+    ) {
+        let mut store = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match owner_id {
+            Some(owner) => {
+                store
+                    .private
+                    .insert((*tenant_id, *owner, key.clone()), value);
+            }
+            None => {
+                store.tenant.insert((*tenant_id, key.clone()), value);
+            }
+        }
+    }
+
+    /// Remove a value from the selected key class.
+    ///
+    /// Deletes address the **runtime** maps only. The config-seeded `shared`
+    /// and global fallbacks are cross-tenant reference data: a tenant-scoped
+    /// delete (including gear saga retries and reaper reconciliation
+    /// issued on behalf of one tenant) must never destroy an entry that
+    /// serves other tenants. A miss is a no-op — the gear treats a
+    /// missing backend value as success.
+    pub fn delete_value(&self, tenant_id: &TenantId, key: &SecretRef, owner_id: Option<&OwnerId>) {
+        let mut store = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(owner) = owner_id {
+            store.private.remove(&(*tenant_id, *owner, key.clone()));
+        } else {
+            store.tenant.remove(&(*tenant_id, key.clone()));
+        }
     }
 }
 

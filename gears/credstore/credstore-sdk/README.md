@@ -6,8 +6,12 @@ SDK crate for the CredStore gear, providing public API contracts for credential 
 
 This crate defines the transport-agnostic interface for the CredStore gear:
 
-- **`CredStoreClientV1`** — Async trait for consumers (get/put/delete secrets)
-- **`CredStorePluginClientV1`** — Async trait for backend storage plugin implementations
+- **`CredStoreClientV1`** — consumer-facing trait (`get`/`put`/`create`/`delete`);
+  `get` returns the value plus metadata (`owner_tenant_id`, `sharing`,
+  `is_inherited`, `id`, `version`, `secret_type`, `expires_at`)
+- **`CredStorePluginClientV1`** — backend trait: a pure per-tenant value store
+  (`get`/`put`/`delete` keyed by `tenant_id` + `key` + optional `owner_id`); it
+  holds no sharing/hierarchy/policy — that lives in the gear
 - **`SecretRef`** / **`SecretValue`** / **`SharingMode`** / **`GetSecretResponse`** — Domain models
 - **`CredStoreError`** — Error types for all operations
 - **`CredStorePluginSpecV1`** — GTS schema for plugin registration
