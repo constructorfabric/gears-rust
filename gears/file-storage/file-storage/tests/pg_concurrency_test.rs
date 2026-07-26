@@ -393,6 +393,17 @@ async fn simulate_all_parts(
 /// row -- `sweep_abandoned_pending` only ever visits rows returned by
 /// `list_abandoned_pending_versions`, and there is no pending version here
 /// at all to trigger it.
+///
+/// FS-01/F1 is now FIXED, but at the orchestration layer
+/// (`api/rest/handlers.rs::create_file`'s multipart branch calls
+/// `FileService::compensate_failed_multipart_initiate` on exactly this
+/// failure) -- correctly: only that caller knows "this file was just
+/// created together with this specific initiate attempt." This test calls
+/// `create_file_bare` + `initiate_multipart_upload` directly, the same raw
+/// sequence the handler makes *before* its own error-handling branch, so it
+/// still (by design) shows the sweep alone not reclaiming the orphan. See
+/// `f1_capability_reject_with_compensation_reclaims_orphan` below for the
+/// fixed end-to-end flow.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn f1_capability_reject_orphan_survives_real_sweep() {
     let (db, _pg_guard) = pg_db_or_skip!();
@@ -435,9 +446,54 @@ async fn f1_capability_reject_orphan_survives_real_sweep() {
     let still_there = svc.get_file(&ctx, file_id).await;
     assert!(
         still_there.is_ok(),
-        "known defect FS-01/F1: expected the orphaned bare file to survive a real sweep pass \
-         (no pending version was ever created to trigger the orphan-parent reclamation path), \
-         got: {still_there:?}"
+        "expected the orphaned bare file to survive a real sweep pass with no compensation \
+         invoked (no pending version was ever created to trigger the sweep's own orphan-parent \
+         reclamation path) -- got: {still_there:?}"
+    );
+}
+
+/// FS-01/F1 fix, end-to-end, against real PostgreSQL: mirrors exactly what
+/// `api/rest/handlers.rs::create_file`'s multipart branch now does on an
+/// initiate failure -- call `compensate_failed_multipart_initiate` with the
+/// same `file_id`, then confirm the orphan is gone (no sweep needed at
+/// all).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f1_capability_reject_with_compensation_reclaims_orphan() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let backend: Arc<dyn StorageBackend> = Arc::new(LocalFsBackend::new("fs", tmp.keep()));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "fs").expect("registry");
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = make_file_service(store.clone(), backends.clone());
+    let msvc = make_multipart_service(multipart_store, backends, 120);
+
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+    let file_id = svc
+        .create_file_bare(&ctx, new_file())
+        .await
+        .expect("create_file_bare commits the bare file row");
+    msvc.initiate_multipart_upload(
+        &ctx,
+        file_id,
+        "application/octet-stream",
+        20,
+        Some(10),
+        None,
+        false,
+    )
+    .await
+    .expect_err("local-fs backend does not advertise multipart_native");
+
+    svc.compensate_failed_multipart_initiate(&ctx, file_id)
+        .await;
+
+    let gone = svc.get_file(&ctx, file_id).await;
+    assert!(
+        matches!(gone, Err(DomainError::FileNotFound { .. })),
+        "FS-01/F1 fix: the compensating delete must reclaim the orphan file against real \
+         PostgreSQL too, got: {gone:?}"
     );
 }
 
