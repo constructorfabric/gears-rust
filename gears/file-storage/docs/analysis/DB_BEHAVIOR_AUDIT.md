@@ -25,7 +25,7 @@ inventory + remediation. Methodology:
 This audit runs on `audit/fs-db-behavior`, branched from
 `docs-file-storage-final-state` (`aba5d9de`, PR #4231, not yet merged into
 `main`) — **not** from `main` and **not** from any resource-group (RG)
-branch. One platform commit was cherry-picked from RG's own audit branch,
+branch. Two platform commits were cherry-picked from RG's own audit branch,
 each as its own commit with an explicit note in the message:
 
 - `7064fdf3` (`test-support(toolkit-db): expose metric-callback attach +
@@ -35,25 +35,34 @@ each as its own commit with an explicit note in the message:
   Without it there is no way to attach a metric callback before a connection
   is wrapped into a `DBProvider` (see `06_authn_authz_secure_orm.md`'s
   security model), so this cherry-pick has no alternative.
-- `92149362` (RG-15 contention fix) and `1ec463a9` (`secure_insert_many`)
-  were **not** cherry-picked — neither was needed. file-storage never uses
-  `transaction_with_retry`/`TxConfig::serializable()` at all (§1.1), so
-  RG-15's error-shape-swallowing fix (which is specifically about
+- `1ec463a9` (`feat(toolkit-db): add secure_insert_many, the batch-insert
+  counterpart of secure_insert`) — turned out to be **genuinely needed**
+  during Part B: fixing FS-11 (`patch_metadata_atomic`'s per-entry
+  insert/delete loop) and FS-14 (the same shape at `create_file`'s own
+  sibling call site) needed a batch-insert primitive file-storage didn't
+  have, and RG's own commit is exactly that, gear-agnostic, at the
+  `toolkit-db` platform layer. Purely additive (a new function + its own
+  tests in `toolkit-db`'s existing SQLite integration suite); verified
+  `cargo test`/`cargo clippy --all-features --tests -- -D warnings -p
+  cf-gears-toolkit-db` both clean after cherry-picking.
+- `92149362` (RG-15 contention fix) was **not** cherry-picked — not needed.
+  file-storage never uses `transaction_with_retry`/`TxConfig::serializable()`
+  at all (§1.1), so RG-15's error-shape-swallowing fix (specifically about
   `is_retryable_contention`/`transaction_with_retry`'s interaction) has no
-  applicable call site here; `secure_insert_many` was not needed by any
-  remediation in Part B (see §4).
+  applicable call site here.
 
-**Consequence for merge order**: `libs/toolkit-db/src/secure/db.rs` (or
-wherever `7064fdf3` touches) is the only file this audit's branch and any RG
-branch both modify. Merging the RG branch (`audit/rg-db-behavior` or its
-successor) into `main` **before** this branch will not conflict — the
-cherry-picked commit here is identical in content to the one already on the
-RG branch, so a subsequent merge/rebase of this branch onto a `main` that
-already has RG's version will fast-forward cleanly on that file. Merging
-this branch first, then RG's, is equally clean for the same reason. There is
-no ordering hazard either way, only the (mild) redundancy of the same
-cherry-picked commit potentially appearing in both branches' history until
-one is rebased onto the other's result.
+**Consequence for merge order**: `libs/toolkit-db/` is the only place this
+audit's branch and any RG branch both modify (the `7064fdf3` test-support
+surface, plus the additive `1ec463a9` function). Merging the RG branch
+(`audit/rg-db-behavior` or its successor) into `main` **before** this branch
+will not conflict — both cherry-picked commits here are identical in content
+to the ones already on the RG branch, so a subsequent merge/rebase of this
+branch onto a `main` that already has RG's versions will fast-forward
+cleanly on those files. Merging this branch first, then RG's, is equally
+clean for the same reason. There is no ordering hazard either way, only the
+(mild) redundancy of the same two cherry-picked commits potentially
+appearing in both branches' history until one is rebased onto the other's
+result.
 
 ## 1. Methodology
 
@@ -159,13 +168,16 @@ consecutively, plus every run since).
 New for this gear (the coordinator's own instruction: "check
 `concurrency-and-failure-model.md` and ADRs against code"). Two shapes:
 
-- **Behavioral drift** (FS-06/F4): a documented property ("every retry is
-  safe") reproduced as false for a specific, real input via the domain
-  layer directly (`contract_drift_test.rs`).
-- **Documentation drift** (FS-12, new finding): a doc claim
-  (`concurrency-and-failure-model.md`'s Race Catalog item 2) pinned via
-  `include_str!` against the doc text itself, cross-referenced to the
-  PostgreSQL test that mechanically falsifies it.
+- **Behavioral drift** (FS-06/F4, **fixed**, §5.5): a documented property
+  ("every retry is safe") reproduced as false for a specific, real input via
+  the domain layer directly (`contract_drift_test.rs`), then fixed by
+  reordering the session-replay check ahead of the `If-Match` precondition
+  check.
+- **Documentation drift** (FS-12, new finding, **resolved as a side effect
+  of FS-02's fix**, §5.2): a doc claim (`concurrency-and-failure-model.md`'s
+  Race Catalog item 2) pinned via `include_str!` against the doc text
+  itself, cross-referenced to the PostgreSQL test that used to falsify it
+  and now confirms the claim holds.
 
 F5–F8 (also contract corrections, all in `tmp-review0.md`'s ground truth)
 were verified by direct code reading against the doc/PRD claims they
@@ -187,14 +199,19 @@ are contract corrections outside this layer's scope by design, see §1.4).
 Every F-number maps to an FS-ID (§4 has the full inventory including new
 findings FS-11–FS-14).
 
+All are now **Fixed** except F3 (latent) — see §5 for the fix details. Test
+names below are the ones now in the tree (several were renamed from their
+original "known defect" names once the fix landed, so their names read as
+fix verification, not defect reproduction — the git history has both).
+
 | F# | FS-ID | Class | Location | Rule that reopens it | Executable evidence |
 |----|-------|-------|----------|----------------------|----------------------|
-| F1 | FS-01 | no automatic compensation (orphan) | `handlers.rs:201` (`create_file_bare`), `multipart_service.rs:479-482` (capability reject before any pending version exists), `cleanup.rs:321-352` (only reclaim path, never triggered) | direct reproduction + real sweep | `multipart_initiate_capability_reject_leaves_orphan_bare_file` (SQLite); `f1_capability_reject_orphan_survives_real_sweep` + `f1_backend_initiation_failure_orphan_survives_real_sweep` (real PG, both capability-reject AND backend-error halves, sweep run for real) |
-| F2 | FS-02 | check-then-act-without-constraint (owner-fencing gap) | `multipart_repo.rs:244-260` (`finish_complete`'s CAS filters `state='completing'` only, not `lease_owner`); `multipart_service.rs:1294-1313` (finalize CAS fenced by pending-status only) | raw-SQL CAS-shape inspection (no general mechanized rule exists for this class — see `14_db_behavior_testing.md`'s own stated boundary) + real-PG deterministic race | `multipart_finish_complete_cas_omits_lease_owner` (SQLite, pins the WHERE-clause shape); `f2_stale_completer_strands_session_after_owner_unfenced_release` (real PG, full mechanism: both callers error, session stranded at `in_progress` with the version genuinely `available`/bound underneath, confirmed still-stuck across a third retry, confirmed permanently `aborted`-while-bound after the eventual sweep) |
+| F1 | FS-01 | no automatic compensation (orphan) | `handlers.rs:201` (`create_file_bare`), `multipart_service.rs:479-482` (capability reject before any pending version exists), `cleanup.rs:321-352` (only reclaim path, never triggered) | direct reproduction + real sweep | `multipart_initiate_capability_reject_leaves_orphan_bare_file` + `multipart_initiate_capability_reject_with_compensation_reclaims_orphan` (SQLite); `f1_capability_reject_orphan_survives_real_sweep` + `f1_backend_initiation_failure_orphan_survives_real_sweep` + `f1_capability_reject_with_compensation_reclaims_orphan` (real PG) |
+| F2 | FS-02 | check-then-act-without-constraint (owner-fencing gap) | `multipart_repo.rs:244-260` (`finish_complete`'s CAS filters `state='completing'` only, not `lease_owner`); `multipart_service.rs:1294-1313` (finalize CAS fenced by pending-status only) | raw-SQL CAS-shape inspection (no general mechanized rule exists for this class — see `14_db_behavior_testing.md`'s own stated boundary) + real-PG deterministic race | `multipart_finish_complete_cas_omits_lease_owner` (SQLite, still pins the pre-fix WHERE-clause shape — the CAS predicate itself is unchanged by the fix, see §5); `f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix` (real PG, full mechanism, now verifying both callers converge to `Ok(Completed(...))`) |
 | F3 | FS-03 | latent (usage undercounting on crash-recovery) | `multipart_service.rs:1027-1034` (takeover fast-path returns early, bypassing the byte-credit call at `:1361-1373`) | none mechanized — **latent per the Runtime Caveat**: `gear.rs` wires `usage_reporter: None` in the shipped build (confirmed by reading `gear.rs:189-217,230,236,264`), so there is no live reporter behavior to observe a miscount against at all today. Re-classify once a reporter is wired; not testable as a live defect before then | — (see §6 Method Boundaries) |
-| F4 | FS-06 | behavioral drift (retry-safety edge) | `multipart_service.rs:796-806` (If-Match check) runs before `:809-833` (session-state replay check) | direct reproduction against the domain layer | `fs06_f4_completed_retry_with_stale_if_match_precondition_fails_instead_of_replaying` (SQLite); negative control `negative_control_fs06_completed_retry_without_if_match_replays_correctly` |
-| F9 | FS-04 | check-then-act-without-constraint (CAS target staleness) | `multipart_service.rs:1273-1274` (`expected_content_id: file.content_id`, captured once at complete's start, not re-validated); `file_repo.rs:110-114` (`bind_content_cas`) | raw-SQL CAS-shape inspection + deterministic sequential reproduction (no barrier needed — see below) | `multipart_complete_auto_bind_cas_targets_observed_pointer_not_null` (SQLite, pins the CAS SQL shape); `f9_autobind_no_if_match_clobbers_prior_rebind` (real PG) + negative control `negative_control_f9_autobind_with_correct_if_match_rejects_stale_rebind` |
-| F10 | FS-05 | ordering defect within one `run_sweep()` pass ("second path into F1") | `multipart_repo.rs:455-472` (`has_in_progress_for_file`, step-1-vs-step-2 ordering); `cleanup.rs:151-163` | direct reproduction (backdated timestamps, real sweep) — deterministic, no barrier needed (see below) | `f10_expired_session_orphans_parent_permanently_across_sweeps` (real PG): confirms the file survives the FIRST sweep pass as a version-less orphan, and confirms a SECOND sweep pass never revisits it either (the existing unit test this defect's sibling scenario resembles, `sweep_reclaims_version_after_session_expires` in `cleanup_test.rs`, never actually checked the parent file's fate — a real gap in existing coverage this audit found) |
+| F4 | FS-06 | behavioral drift (retry-safety edge) | `multipart_service.rs:796-806` (If-Match check) runs before `:809-833` (session-state replay check) | direct reproduction against the domain layer | `fs06_f4_completed_retry_with_stale_if_match_now_replays_instead_of_failing_precondition` (SQLite); negative control `negative_control_fs06_completed_retry_without_if_match_replays_correctly` |
+| F9 | FS-04 | check-then-act-without-constraint (CAS target staleness) | `multipart_service.rs:1273-1274` (`expected_content_id: file.content_id`, captured once at complete's start, not re-validated); `file_repo.rs:110-114` (`bind_content_cas`) | raw-SQL CAS-shape inspection + deterministic sequential reproduction (no barrier needed — see below) | `multipart_complete_auto_bind_no_if_match_cas_now_requires_content_id_is_null` (SQLite, pins the fixed CAS SQL shape) + negative control `negative_control_multipart_complete_auto_bind_with_if_match_still_binds`; `f9_autobind_no_if_match_no_longer_clobbers_prior_rebind` (real PG) + negative control `negative_control_f9_autobind_with_correct_if_match_rejects_stale_rebind` |
+| F10 | FS-05 | ordering defect within one `run_sweep()` pass ("second path into F1") | `multipart_repo.rs:455-472` (`has_in_progress_for_file`, step-1-vs-step-2 ordering); `cleanup.rs:151-163` | direct reproduction (backdated timestamps, real sweep) — deterministic, no barrier needed (see below) | `f10_expired_session_orphan_reclaimed_by_step2_in_same_sweep_pass` (real PG): confirms the file is now reclaimed WITHIN the same sweep pass; `sweep_before_complete_wins_cleans_up_expired_session` (`cleanup_test.rs`, an existing test whose own scenario turned out to be F10-shaped and had never checked the parent file's fate — a real gap in existing coverage this audit found — now asserts the file is correctly reclaimed too) |
 
 **F9 and F10 are not barrier races** — both were deliberately implemented
 without `tokio::sync::Notify`/`Barrier` gating, and this is a documented
@@ -268,26 +285,26 @@ own code reading and test construction, mirroring how RG's own audit
 surfaced RG-11 through RG-16 beyond its ground truth. Severity is this
 audit's own judgment (impact × likelihood under the gear's actual write
 surface — see §6), not a CVSS-style score. **Status** reflects Part B of
-this audit (§5): `Open` (not yet fixed, this audit is diagnostic-only for
-that finding), `Fixed` (remediated in this branch, own commit), or
-`Deferred` (a documented, reasoned decision not to fix now).
+this audit (§5, final): `Fixed` (remediated in this branch, own commit),
+`Deferred` (a documented, reasoned decision not to fix now), or `N/A`
+(a doc-only correction or a non-defect, nothing to fix in code).
 
 | ID | Class | Severity | Location | Repro | Status |
 |----|-------|----------|----------|-------|--------|
-| FS-01 | no automatic compensation (orphan) | **High** | `handlers.rs:201`, `multipart_service.rs:479-482`, `cleanup.rs:321-352` | `multipart_initiate_capability_reject_leaves_orphan_bare_file`; `f1_capability_reject_orphan_survives_real_sweep`; `f1_backend_initiation_failure_orphan_survives_real_sweep` | See §5 |
-| FS-02 | check-then-act-without-constraint | **Medium** (worst case: session stranded until expiry) | `multipart_repo.rs:143-175,244-260`; `multipart_service.rs:1294-1321` | `multipart_finish_complete_cas_omits_lease_owner`; `f2_stale_completer_strands_session_after_owner_unfenced_release` | See §5 |
-| FS-03 | latent (usage undercount) | Medium-High (latent) | `multipart_service.rs:1027-1034,1361-1373` | none (latent per Runtime Caveat) | Open — no reporter to fix against yet |
-| FS-04 | check-then-act-without-constraint | Medium | `multipart_service.rs:1273-1274`; `file_repo.rs:110-114` | `multipart_complete_auto_bind_cas_targets_observed_pointer_not_null`; `f9_autobind_no_if_match_clobbers_prior_rebind` | See §5 |
-| FS-05 | ordering defect ("second path into F1") | Medium | `multipart_repo.rs:455-472`; `cleanup.rs:151-163` | `f10_expired_session_orphans_parent_permanently_across_sweeps` | See §5 |
-| FS-06 | behavioral drift | Medium | `multipart_service.rs:796-833` | `fs06_f4_completed_retry_with_stale_if_match_precondition_fails_instead_of_replaying` | Deferred (§5) |
+| FS-01 | no automatic compensation (orphan) | **High** | `handlers.rs:201`, `multipart_service.rs:479-482`, `cleanup.rs:321-352` | `multipart_initiate_capability_reject_leaves_orphan_bare_file` + `..._with_compensation_reclaims_orphan`; `f1_capability_reject_orphan_survives_real_sweep` + `f1_backend_initiation_failure_orphan_survives_real_sweep` + `f1_capability_reject_with_compensation_reclaims_orphan` | **Fixed** (§5.1) |
+| FS-02 | check-then-act-without-constraint | **Medium** (worst case: session stranded until expiry) | `multipart_repo.rs:143-175,244-260`; `multipart_service.rs:1294-1321` | `multipart_finish_complete_cas_omits_lease_owner`; `f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix` | **Fixed** (§5.2) |
+| FS-03 | latent (usage undercount) | Medium-High (latent) | `multipart_service.rs:1027-1034,1361-1373` | none (latent per Runtime Caveat) | **Deferred** (§5.7) — no reporter to fix against yet |
+| FS-04 | check-then-act-without-constraint | Medium | `multipart_service.rs:1273-1274`; `file_repo.rs:110-114` | `multipart_complete_auto_bind_no_if_match_cas_now_requires_content_id_is_null` + negative control; `f9_autobind_no_if_match_no_longer_clobbers_prior_rebind` + negative control | **Fixed** (§5.3) |
+| FS-05 | ordering defect ("second path into F1") | Medium | `multipart_repo.rs:455-472`; `cleanup.rs:151-163` | `f10_expired_session_orphan_reclaimed_by_step2_in_same_sweep_pass`; `sweep_before_complete_wins_cleans_up_expired_session` | **Fixed** (§5.4) |
+| FS-06 | behavioral drift | Medium | `multipart_service.rs:796-833` | `fs06_f4_completed_retry_with_stale_if_match_now_replays_instead_of_failing_precondition` | **Fixed** (§5.5) |
 | FS-07 | contract correction | Low | `handlers.rs:178-188` | verified by code reading (out of this layer's scope — see §1.4) | N/A (doc-only) |
 | FS-08 | contract correction | Low | `handlers.rs:895-922` | verified by code reading (out of this layer's scope) | N/A (doc-only) |
 | FS-09 | contract correction | Low | `multipart_service.rs:479-482`; `in_memory.rs:64-72`; `local_fs.rs:245-251` | `multipart_initiate_capability_reject_leaves_orphan_bare_file` + `negative_control_multipart_native_backend_initiate_succeeds` | N/A (doc-only) |
 | FS-10 | contract correction (documented gap) | Low | `routes.rs:539-564` | verified by code reading | N/A (doc-only / feature gap) |
-| FS-11 | n-plus-one (new) | Low-Medium | `store/metadata.rs::patch_metadata_atomic` — one INSERT/DELETE per patch entry | `scale_metadata_patch_inserts_do_not_grow_with_entry_count` (`#[ignore]`d) | Deferred (§5) |
-| FS-12 | contract-drift (new) | Low (documentation only — see below) | `concurrency-and-failure-model.md`'s Race Catalog item 2 | `fs12_concurrency_doc_race_catalog_item_2_claim_is_falsified_by_pg_suite` | Open — doc fix tracked alongside FS-02 |
+| FS-11 | n-plus-one (new) | Low-Medium | `store/metadata.rs::patch_metadata_atomic` — one INSERT/DELETE per patch entry | `scale_metadata_patch_inserts_do_not_grow_with_entry_count` (no longer `#[ignore]`d) | **Fixed** (§5.6) |
+| FS-12 | contract-drift (new) | Low (documentation only) | `concurrency-and-failure-model.md`'s Race Catalog item 2 | `fs12_concurrency_doc_race_catalog_item_2_claim_holds_after_fs02_fix` | **Resolved** as a side effect of FS-02's fix (§5.2) |
 | FS-13 | mechanical evidence for FS-02 (new) | Low (standalone) | `multipart_repo.rs::acquire_complete_lease`'s CAS runs with `in_tx=false` | `trace_multipart_complete` (pinned, not ignored — this is the intentional shape) | N/A (not a standalone defect — see below) |
-| FS-14 | n-plus-one (new) | Low | `store/files.rs::create_file_with_pending_version{,_with_event,_with_idempotency}` — one `upsert` per initial `custom_metadata` entry, same shape as FS-11 at a sibling call site | not separately tested (bounded by the `metadata-limits` policy's `max_pairs`, same bound FS-11 has — see §5) | Deferred, folded into FS-11's remediation decision |
+| FS-14 | n-plus-one (new) | Low | `store/files.rs::create_file_with_pending_version{,_with_event,_with_idempotency}` — one `upsert` per initial `custom_metadata` entry, same shape as FS-11 at a sibling call site | `scale_create_file_metadata_inserts_do_not_grow_with_entry_count` | **Fixed** (§5.6, same commit as FS-11) |
 
 ### FS-02 in detail (the coordinator's specific focus)
 
@@ -304,8 +321,9 @@ owner-scoped finish step instead of the current unqualified one — better
 (a clean rejection instead of a stranding), but still not "assembly runs at
 most once" (duplicate backend work is still possible), and the *taken-over*
 completer's own error-handling still needs to not release a lease it no
-longer legitimately holds. See §5 for the actual fix and what remains
-deferred.
+longer legitimately holds. §5.2 has the fix actually chosen (converging a
+lost finalize CAS instead of fencing who is allowed to win it) and why it
+was preferred over owner-scoping the finalize CAS itself.
 
 ### FS-13 is not a standalone defect
 
@@ -324,8 +342,222 @@ just inferable from reading the Rust.
 
 ## 5. Part B — Remediation
 
-<!-- REMEDIATION-STATUS-PLACEHOLDER: filled in as fixes land; see commit
-     list in the final report message. -->
+Six of the seven fixable findings were fixed, each its own commit, per the
+"separate commits per class" discipline; FS-03 is deferred (§5.7) for a
+documented reason, matching the same discipline Step 3 used. Every fix was
+verified against the SAME test that demonstrated the defect (renamed once
+fixed, so its name reads as verification rather than reproduction — see §2's
+note) plus a full `cargo test -p cf-gears-file-storage` + `cargo clippy -p
+cf-gears-file-storage --tests -- -D warnings` + `cargo fmt --check` pass
+before the corresponding commit.
+
+### 5.1 FS-01/F1 — compensate the orphan file (Fixed)
+
+**Decision, not `tmp-review0.md`'s literal hint verbatim**: the hint said
+"compensation/cleanup for orphan parent." Verified against the actual
+handler code first: the merged `POST /files` create+plan path
+(`handlers.rs::create_file`'s multipart branch) is the *only* caller that
+creates a bare file and immediately, in the same request, attempts to
+initiate a multipart session for it — the standalone `POST /files/{id}
+/multipart` handler takes an *existing* `file_id` and must never delete it
+on an initiate failure. So the fix is orchestration-layer logic in that one
+handler, not a change to either domain service in isolation: neither
+`FileService::create_file_bare` nor `MultipartService::
+initiate_multipart_upload` can safely assume "this file_id was just created
+together with this call" about a `file_id` it's merely handed.
+
+Added `FileService::compensate_failed_multipart_initiate`, called from the
+handler's error path on an initiate failure with the same `file_id`. Reuses
+`Store::delete_orphan_file_with_event` — the *same* transactionally-guarded
+primitive the background sweep's own orphan reclamation already uses (§5.4)
+— rather than an unconditional delete, so it is safe to call unconditionally
+even though nothing else can legitimately have touched this `file_id` yet.
+Best-effort: a compensation failure is logged, never propagated (the client
+always sees the *original* initiate error); a file this misses is still
+reclaimed eventually by the background sweep. Credits back the `+1` usage
+delta `create_file_bare` reported (currently a no-op — no reporter wired).
+
+Existing FS-01 tests (SQLite + real PG) kept as-is (they exercise the raw,
+un-orchestrated two-call domain sequence, which — correctly — still shows
+the bare file surviving with no compensation invoked) and each gained a
+sibling test exercising the fixed end-to-end flow.
+
+### 5.2 FS-02/F2 — converge instead of stranding on a lost finalize CAS (Fixed)
+
+The chosen fix, and why it beats the alternative `tmp-review0.md`'s hint
+also named ("fence ownership through finalize and finish"): owner-scoping
+the finalize CAS itself would change *who wins* finalize (a bigger,
+riskier behavioral change touching the CAS predicate that decides content
+correctness), for the same practical outcome a narrower fix already
+achieves. Instead: `assemble_and_finish_inner`'s handling of a *lost*
+finalize CAS (`finalized == false`) now re-reads the version first. If it
+is `Available`, someone else already finalized it *correctly* — this
+converges the exact same way the pre-existing takeover fast-path already
+does (re-derive the response via `replay_completed`, call `finish_session`)
+instead of erroring and releasing a lease it should no longer touch. Only a
+genuinely-gone row (concurrent abort/cleanup) still gets the original hard
+error. Extracted into its own method
+(`converge_or_error_after_lost_finalize_cas`) to keep
+`assemble_and_finish_inner`'s cognitive complexity under the workspace's
+lint threshold.
+
+This closes the loop entirely: both completers now separately race to call
+`finish_session` (the actual `state = 'completing' -> 'completed'` CAS,
+left **unchanged** — its own pre-existing "not finished, but state is
+already Completed" branch already converges correctly for whichever side
+loses *that* race). Verified live against real PostgreSQL
+(`f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix`):
+the identical deterministic gate-based interleaving that used to strand the
+session now shows both callers converging to `Ok(Completed(...))`, the
+session reaching `Completed` (not stranded at `in_progress`), and a third
+retry replaying the persisted result — stable across repeated runs.
+
+`finish_complete`'s CAS predicate itself is **unchanged** (still filters on
+`state = 'completing'` only, not `lease_owner`) — `multipart_finish_complete
+_cas_omits_lease_owner` still pins that exact shape, on purpose: it is no
+longer a gap given the finalize-side fix, since nothing can reach a
+finish-CAS race anymore without the version already being legitimately
+`Available`.
+
+FS-12 (§1.4, §8) is resolved as a direct side effect: the concurrency doc's
+Race Catalog item 2 claim ("a lost finish converges via `replay_completed`")
+is true again for the interleaving that used to falsify it.
+
+### 5.3 FS-04/F9 — require `content_id IS NULL` without If-Match (Fixed)
+
+Followed `tmp-review0.md`'s hint closely, choosing the "or require If-Match"
+branch of "restrict to `content_id IS NULL` **or** require If-Match" rather
+than an unconditional `IS NULL` restriction, so a caller that legitimately
+supplied and had validated an `If-Match` keeps today's behavior exactly.
+`complete_multipart_upload` now threads whether the caller supplied *any*
+`If-Match` (`if_match_was_supplied: bool`) down through `assemble_and_finish`
+/`assemble_and_finish_inner` to where `AutoBindOnFinalize` is built: with an
+`If-Match`, the CAS still targets the observed (already-validated) pointer,
+exactly as before; without one, the target is forced to `None`
+(`content_id IS NULL`), so the CAS can no longer clobber existing content it
+never confirmed. A lost CAS is still not an error (`BindState::Conflict`,
+the pre-existing recovery path) — the already-uploaded content stays
+available for an explicit manual rebind.
+
+Verified both directions: `multipart_complete_auto_bind_no_if_match_cas_now
+_requires_content_id_is_null` (SQLite, pins the fixed CAS SQL — now contains
+`IS NULL`) plus a negative control confirming a correctly-supplied
+`If-Match` still wins and still targets the observed pointer; the real-PG
+F9 test confirms a legitimate rebind now survives an auto-bind complete with
+no `If-Match`.
+
+### 5.4 FS-05/F10 — reclaim the orphan from step 2's own cleanup path (Fixed)
+
+Read `cleanup_expired_session_version` (step 2's own version-cleanup helper)
+directly before deciding the fix, since the obvious-looking alternative
+(reorder `run_sweep`'s two steps) turns out **not** to work: that function
+never called the orphan-file check at all, so if step 2 ran first and
+reclaimed the version itself, the orphan-file check would still never run
+for that file, regardless of ordering — the gap is narrower than "wrong
+order," it is "only one of the two paths that can be the last to remove a
+file's last version or its blocking session was wired to the check."
+
+Fix: `cleanup_expired_session_version` now finishes with the same
+`maybe_delete_orphaned_file(file_id)` call `delete_abandoned_pending_version`
+(step 1's own path) already makes. By the time it runs,
+`abort_expired_multipart_session` has already won the session's CAS to
+`aborted`, so `has_in_progress_for_file` no longer blocks it — symmetric
+with step 1's path. Threaded the resulting count up through
+`abort_expired_multipart_session`/`sweep_expired_multipart` (both now return
+`(usize, usize)`) into `SweepResult::abandoned_files_deleted`, matching that
+field's existing meaning.
+
+An existing test, `sweep_before_complete_wins_cleans_up_expired_session`
+(`cleanup_test.rs`), turned out to itself be an F10-shaped scenario (both of
+a file's pending versions reclaimed by one `grace = 0` sweep, leaving a
+genuine zero-version orphan) that had never checked the parent file's fate
+— updated to assert the fix (file reclaimed, a subsequent `complete` now
+gets `FileNotFound` instead of `MultipartUploadNotInProgress`, since
+`require_file` now fails first). The real-PG F10 test confirms the file is
+now gone within the *same* sweep pass that aborts its session.
+
+### 5.5 FS-06/F4 — replay before checking If-Match (Fixed)
+
+Low-risk, surgical: reordered `complete_multipart_upload`'s checks so the
+session-state terminal checks (`Completed` → replay, `Aborted` → reject) run
+**before** the optional `If-Match` precondition check, not after. A replay
+is the recorded outcome of an action that already happened, not a new
+conflicting action against current state, so gating it on a precondition
+meant to protect against a genuinely new action was never correct. The
+precondition check is now only reached for a session that is neither
+`Completed` nor `Aborted` — a real new completion attempt, gated exactly as
+before. Verified: the same stale-`If-Match` retry that used to fail
+precondition now replays; the negative control (no-`If-Match` retry, the
+common case) was already passing and stayed that way; all 41
+`multipart_test.rs` tests (which exercise `If-Match`/replay paths
+extensively) still pass unchanged.
+
+### 5.6 FS-11/FS-14 — batch custom-metadata writes (Fixed)
+
+`patch_metadata_atomic` (FS-11) and `create_file_with_pending_version`'s
+three variants (FS-14, found while fixing FS-11) issued one
+delete-then-insert (or plain delete) per entry — `O(N)` statements for an
+`N`-entry patch/create instead of `O(1)`. toolkit-db had a batch-insert
+primitive for the RG-shaped version of this problem
+(`secure_insert_many`, RG-04/06/07's own fix) but no batch-*delete*
+counterpart for file-storage's delete-then-insert shape — cherry-picked
+`secure_insert_many` (§0) and added `MetadataRepo::delete_keys` (one
+`DELETE ... WHERE key IN (...)` instead of one per key) alongside it.
+
+`patch_metadata_atomic` now: one batched `DELETE` for every key the patch
+touches (both keys being replaced and keys being removed — upsert semantics
+require deleting a key's existing row even when it is being re-set), then
+one batched `INSERT` for every entry with a `Some` value. Two statements
+total regardless of `N`. `create_file_with_pending_version`'s sibling loop
+gets just the batched insert (a brand-new `file_id` can't have pre-existing
+metadata rows, so no delete is needed). Both sites de-duplicate entries
+(last occurrence in the request wins) before batching, since nothing
+upstream (`CustomMetadataPatch`/`NewFile::custom_metadata` are both plain
+`Vec`s) guarantees a client can't list the same key twice in one request —
+the old sequential loops naturally gave "last one wins" for a duplicate,
+while a naive multi-row `INSERT` with the same `(file_id, key)` twice would
+instead violate the primary key and fail the whole write.
+
+`scale_metadata_patch_inserts_do_not_grow_with_entry_count` is no longer
+`#[ignore]`d (now the healthy, asserted invariant); a sibling test,
+`scale_create_file_metadata_inserts_do_not_grow_with_entry_count`, covers
+FS-14. Also verified `cargo test`/`cargo clippy --all-features --tests -- -D
+warnings -p cf-gears-toolkit-db` green after the `secure_insert_many`
+cherry-pick.
+
+### 5.7 FS-03 — deferred
+
+Not fixed: `gear.rs` wires `usage_reporter: None` in the shipped build, so
+there is no live reporter behavior to fix *against* — any fix here would be
+unobservable and untestable until a usage reporter is actually wired, which
+is a separate, materially larger change (a new external client + its own
+wiring/config/error-handling story) well outside this step's scope. Correct
+sequencing is: wire the reporter first (a different piece of work), then
+revisit F3 as a live, testable defect. Documented here, not silently
+dropped, matching Step 3's "overly risky/wide fixes get a documented defer"
+discipline — the risk here is scope creep into unrelated infrastructure
+work, not code risk in the fix itself.
+
+### 5.8 Commit list (this branch, `aba5d9de..HEAD`)
+
+1. `test-support(toolkit-db): expose metric-callback attach + tx-boundary probe` — cherry-pick, mandatory (§0)
+2. `chore(file-storage): establish clean fmt/clippy baseline before Step 4 audit`
+3. `test(file-storage): add DB-behavior audit infrastructure and dynamic trace suite`
+4. `test(file-storage): add PostgreSQL concurrency suite (F1/F2/F9/F10 + invariant checker)`
+5. `test(file-storage): add contract-drift tests (FS-06/F4 and FS-12)`
+6. `docs(file-storage): DB behavior audit report (Part A: audit complete)`
+7. `fix(file-storage): compensate the orphan file left by a failed multipart initiate (FS-01/F1)`
+8. `fix(file-storage): converge instead of stranding on a lost finalize CAS (FS-02/F2)`
+9. `fix(file-storage): require content_id IS NULL for auto-bind without If-Match (FS-04/F9)`
+10. `fix(file-storage): reclaim orphan parent from step 2's own cleanup path (FS-05/F10)`
+11. `fix(file-storage): replay before checking If-Match precondition (FS-06/F4)`
+12. `feat(toolkit-db): add secure_insert_many, the batch-insert counterpart of secure_insert` — cherry-pick, needed for FS-11/FS-14 (§0)
+13. `fix(file-storage): batch custom-metadata writes instead of one-per-entry (FS-11/FS-14)`
+14. This report update (final statuses).
+
+All commits DCO-signed (`git commit -s`); none amend prior history; `cargo
+fmt`/`cargo clippy -p cf-gears-file-storage --tests -- -D warnings`/`cargo
+test -p cf-gears-file-storage` clean after every one.
 
 ## 6. What this method does not cover
 
@@ -447,14 +679,36 @@ review rather than a coordinator's framing):
 4. **No discrepancy found in F1/F3/F4/F5/F6/F7/F8/F10's substance** — all
    verified against the code exactly as described, at the cited lines,
    during this audit's independent read.
+5. **FS-02's actual fix differs from `tmp-review0.md`'s literal hint** — the
+   hint offers "fence ownership through finalize *and* finish (or add
+   explicit convergence when finalize loses the CAS)" as two options; this
+   audit chose the second (convergence) over the first (owner-fencing the
+   finalize CAS itself) specifically because the first would change *which*
+   completer wins finalize — a wider behavioral change to the CAS that
+   decides content correctness — for the same practical outcome the
+   narrower convergence fix already achieves. Not a discrepancy in
+   `tmp-review0.md`'s analysis (it explicitly offers both as valid), just a
+   documented choice between the two it names — see §5.2.
+6. **FS-04's fix followed the hint's second branch, not the first** —
+   "restrict to `content_id IS NULL` **or** require If-Match": this audit
+   implemented the disjunction literally (force `IS NULL` only when no
+   `If-Match` was supplied, otherwise keep today's observed-pointer target),
+   rather than an unconditional `IS NULL` restriction, so a caller that does
+   the careful thing (supply `If-Match`) keeps its exact current behavior.
+   Again not a discrepancy, a documented choice between two options the
+   hint itself names — see §5.3.
 
 ## 9. Self-check against acceptance criteria
 
 - `cargo test -p cf-gears-file-storage`: green (SQLite audit/contract-drift
   tests fast, well under a second per binary; the PG harness binary runs in
-  ~4s when Docker is present, ~0.03s when it gracefully skips).
+  ~4s when Docker is present, ~0.03s when it gracefully skips) — verified
+  after every commit in §5.8's list, and re-verified in full (including a
+  live PostgreSQL run) as the final step of this audit.
 - `cargo fmt --check` / `cargo clippy -p cf-gears-file-storage --tests -- -D
-  warnings`: clean, verified after every commit in §0's list.
+  warnings`: clean, verified after every commit in §5.8's list. Also
+  verified for `libs/toolkit-db` (`--all-features --tests`) after both
+  cherry-picks (§0).
 - 8/10 ground-truth defects rediscovered by general rules (§2); the
   remaining 2 (F3, and F5/F6/F8 collectively) are latent or correctly
   out-of-layer-scope by design, not misses.
@@ -462,9 +716,10 @@ review rather than a coordinator's framing):
   detector (§3) — no class skipped for lack of an injection site.
 - Negative controls against protected operations, read paths, and (real
   PostgreSQL) an SSI-adjacent invariant checker (§3.1).
-- Every known-and-not-yet-fixed defect has a real, currently-failing (or,
-  where non-ignorable/scale-independent, currently-passing-and-pinned)
-  assertion — see §4/§5 for exact test names and statuses.
+- Every known defect has a real, currently-passing, fix-verifying assertion
+  (six of seven; FS-03 deferred with a documented reason) — see §4/§5 for
+  exact test names and statuses. Zero `#[ignore]`d tests remain in this
+  gear's DB-behavior suite.
 - Method boundaries stated plainly (§6), including two gear-specific
   findings (the `no-retry-serializable` non-applicability and the
   `tokio::spawn` boundary actually being exercised here) that
