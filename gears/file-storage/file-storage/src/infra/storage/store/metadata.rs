@@ -87,20 +87,47 @@ impl Store {
                     else {
                         return Ok(false);
                     };
-                    for (key, value) in &patch.entries {
-                        match value {
-                            Some(v) => {
-                                metadata
-                                    .upsert(tx, &AccessScope::allow_all(), file_id, key, v, now)
-                                    .await?;
-                            }
-                            None => {
-                                metadata
-                                    .delete_key(tx, &AccessScope::allow_all(), file_id, key)
-                                    .await?;
-                            }
+                    // FS-11 fix: batch the patch instead of one delete-then-
+                    // insert (or delete) per entry. Every touched key (both
+                    // the ones being replaced and the ones being removed)
+                    // is deleted in a single statement first -- upsert
+                    // semantics, and the pre-existing row for a key being
+                    // *set* must go too, exactly like the old per-entry
+                    // `upsert` did -- then every entry with a `Some` value
+                    // is inserted in a single multi-row statement. Two
+                    // statements total, regardless of the patch's entry
+                    // count (previously one or two per entry).
+                    //
+                    // `patch.entries` is a plain `Vec<(String, Option<String>)>`
+                    // (`file_storage_sdk::CustomMetadataPatch`) -- nothing
+                    // upstream guarantees a client can't send the same key
+                    // twice in one request. The old sequential per-entry
+                    // loop naturally gave "last occurrence in the patch
+                    // wins" for such a duplicate; a single multi-row INSERT
+                    // with the same (file_id, key) twice would instead
+                    // violate the primary key and fail the whole patch. The
+                    // dedup below (last write in iteration order survives)
+                    // preserves the exact old semantics before batching.
+                    let all_keys: Vec<String> =
+                        patch.entries.iter().map(|(k, _)| k.clone()).collect();
+                    metadata
+                        .delete_keys(tx, &AccessScope::allow_all(), file_id, &all_keys)
+                        .await?;
+                    let mut deduped: HashMap<&str, &str> = HashMap::new();
+                    for (k, v) in &patch.entries {
+                        if let Some(v) = v {
+                            deduped.insert(k.as_str(), v.as_str());
+                        } else {
+                            deduped.remove(k.as_str());
                         }
                     }
+                    let inserts: Vec<(String, String)> = deduped
+                        .into_iter()
+                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                        .collect();
+                    metadata
+                        .insert_many(tx, &AccessScope::allow_all(), file_id, &inserts, now)
+                        .await?;
                     // @cpt-cf-file-storage-nfr-audit-completeness
                     audit_repo.insert(tx, &audit).await?;
                     if let Some(mut ev) = event {

@@ -14,6 +14,26 @@ use crate::domain::error::DomainError;
 use crate::infra::storage::db::db_err;
 use crate::infra::storage::store::{IdempotencyInsert, Store, pending_version};
 
+/// FS-14 fix: de-duplicate a new file's initial `custom_metadata` entries
+/// (last occurrence in the request wins) before batching them into one
+/// `MetadataRepo::insert_many` call. Nothing upstream (`NewFile::
+/// custom_metadata: Vec<CustomMetadataEntry>`) guarantees a client can't
+/// list the same key twice in one create request; the pre-fix sequential
+/// per-entry `upsert` loop (delete-then-insert per entry) naturally gave
+/// "last one wins" for such a duplicate, whereas a single multi-row INSERT
+/// with the same `(file_id, key)` twice would instead violate the primary
+/// key and fail the whole create. This preserves the exact old semantics.
+fn dedup_initial_metadata(entries: &[(String, String)]) -> Vec<(String, String)> {
+    let mut deduped: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for (k, v) in entries {
+        deduped.insert(k.as_str(), v.as_str());
+    }
+    deduped
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
+}
+
 impl Store {
     // ── file queries ─────────────────────────────────────────────────────────
 
@@ -145,11 +165,16 @@ impl Store {
                     versions
                         .insert(tx, &AccessScope::allow_all(), &pending)
                         .await?;
-                    for (key, value) in &metadata_entries {
-                        metadata
-                            .upsert(tx, &AccessScope::allow_all(), file_id, key, value, now)
-                            .await?;
-                    }
+                    let deduped_metadata = dedup_initial_metadata(&metadata_entries);
+                    metadata
+                        .insert_many(
+                            tx,
+                            &AccessScope::allow_all(),
+                            file_id,
+                            &deduped_metadata,
+                            now,
+                        )
+                        .await?;
                     // @cpt-cf-file-storage-nfr-audit-completeness
                     audit_repo.insert(tx, &audit).await?;
                     Ok::<(), DomainError>(())
@@ -324,11 +349,16 @@ impl Store {
                     versions
                         .insert(tx, &AccessScope::allow_all(), &pending)
                         .await?;
-                    for (key, value) in &metadata_entries {
-                        metadata
-                            .upsert(tx, &AccessScope::allow_all(), file_id, key, value, now)
-                            .await?;
-                    }
+                    let deduped_metadata = dedup_initial_metadata(&metadata_entries);
+                    metadata
+                        .insert_many(
+                            tx,
+                            &AccessScope::allow_all(),
+                            file_id,
+                            &deduped_metadata,
+                            now,
+                        )
+                        .await?;
                     audit_repo.insert(tx, &audit).await?;
                     if let Some(ev) = event {
                         events_repo.enqueue(tx, &ev).await?;
@@ -399,11 +429,16 @@ impl Store {
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     files.create(tx, &AccessScope::allow_all(), &file).await?;
-                    for (key, value) in &metadata_entries {
-                        metadata
-                            .upsert(tx, &AccessScope::allow_all(), file_id, key, value, now)
-                            .await?;
-                    }
+                    let deduped_metadata = dedup_initial_metadata(&metadata_entries);
+                    metadata
+                        .insert_many(
+                            tx,
+                            &AccessScope::allow_all(),
+                            file_id,
+                            &deduped_metadata,
+                            now,
+                        )
+                        .await?;
                     audit_repo.insert(tx, &audit).await?;
                     if let Some(ev) = event {
                         events_repo.enqueue(tx, &ev).await?;

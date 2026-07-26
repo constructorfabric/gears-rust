@@ -4,7 +4,9 @@ use std::collections::HashMap;
 
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, Set};
 use time::OffsetDateTime;
-use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, secure_insert};
+use toolkit_db::secure::{
+    DBRunner, SecureDeleteExt, SecureEntityExt, secure_insert, secure_insert_many,
+};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -124,5 +126,65 @@ impl MetadataRepo {
             .await
             .map_err(db_err)?;
         Ok(res.rows_affected > 0)
+    }
+
+    /// Batched counterpart of [`Self::delete_key`] (FS-11/FS-14 fix): delete
+    /// every row in `keys` for `file_id` in a single `DELETE ... WHERE key IN
+    /// (...)`, instead of one `DELETE` per key. A no-op (zero statements) for
+    /// an empty `keys` slice. Returns the number of rows removed.
+    pub async fn delete_keys<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+        keys: &[String],
+    ) -> Result<u64, DomainError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let res = Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(Column::FileId.eq(file_id))
+                    .add(Column::Key.is_in(keys.iter().cloned())),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected)
+    }
+
+    /// Batched counterpart of a loop of [`Self::upsert`]'s insert half
+    /// (FS-11/FS-14 fix): insert every `(key, value)` entry in one multi-row
+    /// `INSERT`, instead of one `INSERT` per entry. Callers must have already
+    /// removed any pre-existing rows for these keys (e.g. via
+    /// [`Self::delete_keys`]) -- this method only inserts, it does not
+    /// upsert. A no-op (zero statements) for an empty `entries` slice.
+    pub async fn insert_many<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+        entries: &[(String, String)],
+        now: OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let models: Vec<ActiveModel> = entries
+            .iter()
+            .map(|(key, value)| ActiveModel {
+                file_id: Set(file_id),
+                key: Set(key.clone()),
+                value: Set(value.clone()),
+                set_at: Set(now),
+            })
+            .collect();
+        secure_insert_many::<Entity>(models, scope, conn)
+            .await
+            .map_err(db_err)?;
+        Ok(())
     }
 }
