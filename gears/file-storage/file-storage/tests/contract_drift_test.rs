@@ -12,15 +12,16 @@
 //! - **FS-06 / F4**: a *behavioral* drift -- the documented "every retry is
 //!   safe" property has a real gap, reproduced directly against the domain
 //!   layer.
-//! - **FS-12** (new finding, not in `tmp-review0.md`): a *documentation*
-//!   drift -- `concurrency-and-failure-model.md`'s own Race Catalog item 2
-//!   states an unqualified universal claim that this audit's PostgreSQL
-//!   suite (`tests/pg_concurrency_test.rs::
-//!   f2_stale_completer_strands_session_after_owner_unfenced_release`)
-//!   mechanically falsifies for one specific (and reachable) interleaving.
-//!   Pinned here via `include_str!` so the doc and the falsifying test stay
-//!   linked -- if the doc is ever corrected (or the code fixed so the claim
-//!   becomes true), this test's own assertion needs revisiting too.
+//! - **FS-12** (new finding, not in `tmp-review0.md`, RESOLVED alongside
+//!   FS-02): `concurrency-and-failure-model.md`'s own Race Catalog item 2
+//!   stated a claim that this audit found reachably false for one specific
+//!   interleaving, before FS-02's remediation. The FS-02 fix makes the same
+//!   interleaving converge correctly, so the claim is true again -- pinned
+//!   here (via `include_str!`, cross-referenced to
+//!   `tests/pg_concurrency_test.rs::
+//!   f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix`)
+//!   so a future regression of the FS-02 fix would also show up as a
+//!   doc-vs-code drift here, not just a silent behavior change.
 //!
 //! F5 (`POST /files` rejects `multipart` + `idempotency_key` before any DB
 //! call -- `handlers.rs:178-188`) and F6 (single-part `bind:"manual"` emits
@@ -206,25 +207,27 @@ async fn negative_control_fs06_completed_retry_without_if_match_replays_correctl
 }
 
 // =========================================================================
-// FS-12 (new finding): concurrency-and-failure-model.md's Race Catalog
-// item 2 states an unqualified claim this audit's PostgreSQL suite
-// falsifies for one specific, reachable interleaving.
+// FS-12 (new finding, RESOLVED as a side effect of the FS-02 fix):
+// concurrency-and-failure-model.md's Race Catalog item 2 states a claim
+// that was reachably false before FS-02's remediation, and is true again
+// now -- pinned here so a future regression of FS-02's fix would also be
+// caught as a doc-vs-code drift, not just a silent behavior change.
 // =========================================================================
 
 #[test]
-fn fs12_concurrency_doc_race_catalog_item_2_claim_is_falsified_by_pg_suite() {
+fn fs12_concurrency_doc_race_catalog_item_2_claim_holds_after_fs02_fix() {
     // This is a documentation-comparison pin, not a DB-behavior trace: it
-    // asserts the CONTESTED sentence is still present verbatim in the doc
-    // (so this test fails loudly, not silently, if the doc text drifts out
-    // from under it), and exists specifically to point at the mechanical
-    // falsification living in tests/pg_concurrency_test.rs.
+    // asserts the claim text is still present verbatim in the doc (so this
+    // test fails loudly, not silently, if the doc text drifts out from
+    // under it), and exists specifically to point at the live,
+    // real-PostgreSQL confirmation in tests/pg_concurrency_test.rs.
     let doc = include_str!("../../docs/concurrency-and-failure-model.md");
-    let contested_claim = "finish converges via `replay_completed`";
+    let claim = "finish converges via `replay_completed`";
     assert!(
-        doc.contains(contested_claim),
+        doc.contains(claim),
         "FS-12: expected concurrency-and-failure-model.md's Race Catalog item 2 to still \
-         contain the contested claim ({contested_claim:?}) -- if this doc text changed, re-check \
-         whether FS-12 (and this pin) needs updating instead of just fixing this assertion"
+         contain the claim ({claim:?}) -- if this doc text changed, re-check whether this pin \
+         needs updating instead of just fixing this assertion"
     );
 
     // The claim, in full (Race Catalog item 2): "A slow-but-alive original
@@ -235,31 +238,33 @@ fn fs12_concurrency_doc_race_catalog_item_2_claim_is_falsified_by_pg_suite() {
     // once-only; a lost finish converges via replay_completed
     // (finish_session's not-finished branch)."
     //
-    // This is true for the TWO interleavings the doc's own narrative
-    // considers: (a) the original owner's finish CAS wins outright (no one
-    // else finished), or (b) someone else already reached `completed` (the
-    // not-finished branch's `fresh.state == Completed` check replays it).
-    // It is FALSE for a third, reachable interleaving this audit found by
-    // building the general no-tx-write/CAS-inspection detector and reading
-    // the takeover/release code paths together: a taken-over completer B
-    // can lose its OWN (redundant) finalize attempt to the original owner
-    // A, and B's resulting `release_multipart_complete_lease` (owner-scoped
-    // to B, but the session is still `completing` at that exact moment --
-    // A hasn't reached `finish_session` yet) succeeds, flipping the session
-    // back to `in_progress` *before* A's own finish CAS runs. A's finish CAS
-    // then fails (state is no longer `completing`), and the not-finished
-    // branch's `fresh.state == Completed` check is false too (it's
-    // `in_progress`) -- so A gets a hard error, not a converged replay,
-    // despite having correctly finalized and bound the content. See
-    // `tests/pg_concurrency_test.rs::
-    // f2_stale_completer_strands_session_after_owner_unfenced_release` for
-    // the live, real-PostgreSQL reproduction (asserts both callers observe
-    // an error, and the session is left stranded at `in_progress` with the
-    // version genuinely `available`/bound underneath it) and
-    // `docs/analysis/DB_BEHAVIOR_AUDIT.md` §FS-02/FS-12 for the full
-    // writeup. This is mechanical evidence that Race Catalog item 2's
-    // "cannot corrupt anything" / "a lost finish converges" claim needs a
-    // third bullet, not a rewrite -- the "cannot corrupt anything" half
-    // (the DB stays consistent) still holds; the "always converges" half
-    // does not.
+    // HISTORY: while building this audit's detector (before the FS-02 fix
+    // below existed), this claim was reachably FALSE for a third
+    // interleaving the doc's own two-case narrative didn't consider: a
+    // taken-over completer B could lose its OWN (redundant) finalize
+    // attempt to the original, lease-expired owner A, and B's resulting
+    // `release_multipart_complete_lease` (owner-scoped to B, but the
+    // session was still `completing` at that exact moment -- A hadn't
+    // reached `finish_session` yet) would succeed, flipping the session
+    // back to `in_progress` *before* A's own finish CAS ran. A's finish CAS
+    // then failed (state was no longer `completing`), and the not-finished
+    // branch's `fresh.state == Completed` check was false too (it was
+    // `in_progress`) -- so A got a hard error, not a converged replay,
+    // despite having correctly finalized and bound the content: the session
+    // was left stranded at `in_progress` until `expires_at`.
+    //
+    // FIX (FS-02, `multipart_service.rs::
+    // converge_or_error_after_lost_finalize_cas`): a lost finalize CAS now
+    // checks whether the version is already `Available` and, if so,
+    // converges the SAME way the takeover fast-path already did, instead of
+    // erroring and releasing the lease -- so B never takes the
+    // release-and-strand path in the first place, and the doc's claim is
+    // true again for every reachable interleaving, not just the two the
+    // narrative originally considered. Confirmed live against real
+    // PostgreSQL: `tests/pg_concurrency_test.rs::
+    // f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix`
+    // reproduces the identical deterministic interleaving that used to
+    // strand the session and asserts BOTH completers now converge to
+    // `Ok(Completed(...))`. See `docs/analysis/DB_BEHAVIOR_AUDIT.md` §FS-02
+    // for the full writeup.
 }
