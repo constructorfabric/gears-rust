@@ -154,9 +154,7 @@ pub async fn create_file(
         None | Some("auto") => true,
         Some("manual") => false,
         Some(_) => {
-            return Err(
-                DomainError::validation("bind", "must be 'auto' or 'manual'").into(),
-            );
+            return Err(DomainError::validation("bind", "must be 'auto' or 'manual'").into());
         }
     };
     let new = NewFile {
@@ -189,11 +187,8 @@ pub async fn create_file(
         // Same plan computation the initiate path runs — decides up front
         // whether this is a real (≥2 parts) multipart upload. One-part plans
         // fall through to the ordinary single-part path below.
-        let (_, planned_parts) = crate::domain::multipart::compute_plan(
-            mp.declared_size,
-            mp.preferred_part_size,
-            None,
-        )?;
+        let (_, planned_parts) =
+            crate::domain::multipart::compute_plan(mp.declared_size, mp.preferred_part_size, None)?;
         if planned_parts.len() >= 2 {
             // Create the file row only (no single-part pending version — the
             // multipart initiate registers its own; the old flow's abandoned

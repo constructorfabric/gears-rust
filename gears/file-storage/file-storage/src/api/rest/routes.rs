@@ -503,7 +503,7 @@ pub(crate) fn register_routes(
     .description(
         "Returns the version id, size, ADR-0006 hash (composite root + manifest for plans \
          of two or more parts; plain whole-sha256 with no manifest for a one-part plan), \
-         and the bind outcome (`bind_state`: bound/conflict/manual — auto-bind sessions \
+         and the bind outcome (`bind_state`: bound/conflict/manual \u{2014} auto-bind sessions \
          bind here, in the same transaction as the finalize). Optional If-Match carries \
          the current content ETag; `*`/absent is unconditional, a mismatch is a 400. \
          Idempotent: a retry of an already-completed session replays the stored result; \
