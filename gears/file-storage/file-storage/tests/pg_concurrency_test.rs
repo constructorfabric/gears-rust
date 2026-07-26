@@ -53,21 +53,26 @@
 //!   redundant attempt gets -- but it always fails), and re-strands it --
 //!   this repeats until `expires_at` passes and the background sweep aborts
 //!   the session, permanently, with the content already live underneath it.
-//! - `f9_*` -- known defect FS-04/F9: multipart auto-bind's CAS target is
-//!   whatever `content_id` was observed at the *start* of `complete` (not
-//!   `IS NULL`, unlike the single-part path), so a legitimate rebind that
-//!   happened *before* an auto-bind `complete` with no `If-Match` is silently
-//!   overwritten. This is a **sequential temporal gap** (the exploitable
-//!   window is the ordinary, often long, user-driven span between multipart
-//!   *initiate* and its *complete*, not a tight concurrent race), so unlike
-//!   F2 this scenario does not need barrier/gate synchronization to
-//!   reproduce -- it is deterministic by construction. Included here (run
-//!   against real PostgreSQL, not just the SQLite unit-level pin in
-//!   `db_behavior_audit_test.rs`) for parity with the other scenarios and to
-//!   confirm the same CAS shape holds under the production dialect. A
-//!   negative control shows supplying `If-Match` (the fix already available
-//!   to a careful caller) correctly turns the clobber into a clean
-//!   `PreconditionFailed`.
+//! - `f9_*` -- FS-04/F9 fix verification: multipart auto-bind's CAS target
+//!   used to be whatever `content_id` was observed at the *start* of
+//!   `complete` (not `IS NULL`, unlike the single-part path), so a
+//!   legitimate rebind that happened *before* an auto-bind `complete` with
+//!   no `If-Match` was silently overwritten. Fixed by requiring
+//!   `content_id IS NULL` specifically when no `If-Match` was supplied (a
+//!   caller who *does* supply one already had it validated against the
+//!   observed pointer moments earlier, so proceeding with that pointer as
+//!   the CAS target is still safe). This was a **sequential temporal gap**
+//!   (the exploitable window is the ordinary, often long, user-driven span
+//!   between multipart *initiate* and its *complete*, not a tight
+//!   concurrent race), so unlike F2 this scenario never needed barrier/gate
+//!   synchronization -- deterministic by construction, both before and
+//!   after the fix. Included here (run against real PostgreSQL, not just
+//!   the SQLite unit-level pin in `db_behavior_audit_test.rs`) for parity
+//!   with the other scenarios and to confirm the same CAS shape holds under
+//!   the production dialect. A negative control shows a *stale* `If-Match`
+//!   (captured before the rebind, still supplied on complete) is correctly
+//!   rejected with a clean `PreconditionFailed` -- unrelated to this fix,
+//!   pre-existing precondition-check behavior.
 //! - `f10_*` -- known defect FS-05/F10 ("second path into F1"): within a
 //!   single `run_sweep()` call, step 1 (`sweep_abandoned_pending`) reclaims
 //!   an abandoned pending version whose backing multipart session is
@@ -1148,13 +1153,15 @@ async fn backdate_multipart_expires_at(
 }
 
 // =========================================================================
-// F9 / FS-04: multipart auto-bind clobbers a rebind that happened before
-// complete started, when no If-Match is supplied. Deterministic/sequential
-// by construction (see the module doc) -- no barrier needed.
+// F9 / FS-04 fix verification: multipart auto-bind no longer clobbers a
+// rebind that happened before complete started, when no If-Match is
+// supplied -- the CAS now requires content_id IS NULL in that case.
+// Deterministic/sequential by construction (see the module doc) -- no
+// barrier needed.
 // =========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f9_autobind_no_if_match_clobbers_prior_rebind() {
+async fn f9_autobind_no_if_match_no_longer_clobbers_prior_rebind() {
     let (db, _pg_guard) = pg_db_or_skip!();
     let store = Store::new(Arc::clone(&db));
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
@@ -1240,23 +1247,25 @@ async fn f9_autobind_no_if_match_clobbers_prior_rebind() {
     let completed = msvc
         .complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
         .await
-        .expect("complete_multipart_upload (no If-Match)")
+        .expect("complete_multipart_upload (no If-Match) must still succeed -- only the bind is conditional")
         .unwrap_completed();
 
+    // FS-04/F9 fix: the auto-bind CAS now requires content_id IS NULL when
+    // no If-Match was supplied -- it correctly loses here (content_id is
+    // the legitimate rebind's version, not NULL), leaving that rebind
+    // intact instead of silently clobbering it.
     assert_eq!(
         completed.bind_state,
-        BindState::Bound,
-        "known defect FS-04/F9: the auto-bind must silently win, clobbering the legitimate \
-         rebind that happened before this complete call started, because no If-Match was \
-         supplied"
+        BindState::Conflict,
+        "FS-04/F9 fix: the auto-bind CAS must lose (content_id IS NULL no longer matches) \
+         instead of clobbering the legitimate rebind"
     );
     let file_after = svc.get_file(&ctx, ticket.file_id).await.expect("get_file");
     assert_eq!(
         file_after.content_id,
-        Some(plan.version_id),
-        "known defect FS-04/F9: content_id now points at the multipart upload's version, \
-         silently discarding the legitimate rebind -- no client-supplied CAS token ever \
-         validated this overwrite was intended"
+        Some(second_ticket_version.version_id),
+        "FS-04/F9 fix: the legitimate rebind must survive -- content_id must still point at it, \
+         not at the multipart upload's version"
     );
 }
 
