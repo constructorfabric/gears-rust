@@ -483,17 +483,21 @@ async fn multipart_finish_complete_cas_omits_lease_owner() {
 }
 
 #[tokio::test]
-async fn multipart_complete_auto_bind_cas_targets_observed_pointer_not_null() {
-    // FS-04 / F9 (known defect, MEDIUM -- see docs/analysis/DB_BEHAVIOR_AUDIT.md).
-    // The embedded auto-bind CAS inside finalize_version binds against
+async fn multipart_complete_auto_bind_no_if_match_cas_now_requires_content_id_is_null() {
+    // FS-04 / F9 fix (see docs/analysis/DB_BEHAVIOR_AUDIT.md §5): the
+    // embedded auto-bind CAS inside finalize_version used to bind against
     // `expected_content_id = file.content_id` observed at completion time,
-    // not a forced `IS NULL` -- unlike the single-part finalize path, whose
-    // auto-bind token is minted at brand-new-file create time (so its CAS
-    // target is always `None`). This test creates a file whose content is
+    // unconditionally -- a stale snapshot from the top of
+    // `complete_multipart_upload`, not a caller-confirmed precondition.
+    // With no `If-Match` supplied, the CAS now targets `content_id IS NULL`
+    // instead (mirroring the single-part finalize path's own always-NULL
+    // target for a brand-new file), so it correctly LOSES here instead of
+    // silently clobbering. This test creates a file whose content is
     // already bound via a first single-part upload+bind, then completes an
-    // auto-bind multipart upload for it *without* an If-Match, and inspects
-    // the captured `bind_content_cas` SQL directly: it targets the existing
-    // non-NULL content_id, not `IS NULL`.
+    // auto-bind multipart upload for it *without* an If-Match, and confirms
+    // both the outcome (`Conflict`, not `Bound`) and the captured
+    // `bind_content_cas` SQL shape directly (`IS NULL`, not the observed
+    // non-NULL content_id).
     let (db, rec) = common::test_db_with_recorder().await;
     let s = common::make_services_full(&db);
     let (svc, msvc) = (s.svc.clone(), s.msvc.clone());
@@ -516,14 +520,14 @@ async fn multipart_complete_auto_bind_cas_targets_observed_pointer_not_null() {
     )
     .await
     .expect("put_content");
-    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+    let bound_first = svc
+        .bind(&ctx, ticket.file_id, ticket.version_id, None)
         .await
         .expect("bind first content");
 
     // Now run a multipart upload with auto_bind = true for the SAME file --
-    // its complete has no If-Match, so the auto-bind's CAS target is
-    // whatever content_id was observed when complete started (the version
-    // just bound above), not NULL.
+    // its complete has no If-Match, so the auto-bind CAS must require
+    // content_id IS NULL, which no longer matches (content_id is Some(..)).
     let plan = msvc
         .initiate_multipart_upload(
             &ctx,
@@ -542,18 +546,25 @@ async fn multipart_complete_auto_bind_cas_targets_observed_pointer_not_null() {
     let completed = msvc
         .complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
         .await
-        .expect("complete_multipart_upload (no If-Match)")
+        .expect("complete_multipart_upload (no If-Match) must still succeed -- only the bind is conditional")
         .unwrap_completed();
-    // FS-04: the auto-bind silently won -- the new version is now current,
-    // clobbering the previously-bound content, with no client-supplied CAS
-    // token at all.
+    // FS-04/F9 fix: the auto-bind CAS correctly loses -- the previously
+    // bound content survives, with no client-supplied CAS token needed to
+    // protect it (the protection is now the CAS's own NULL requirement).
     assert_eq!(
         completed.bind_state,
-        file_storage::domain::multipart::BindState::Bound,
-        "known defect FS-04: expected the unconditional auto-bind to win \
-         (no If-Match was supplied), silently replacing the previously \
-         bound content"
+        file_storage::domain::multipart::BindState::Conflict,
+        "FS-04/F9 fix: expected the auto-bind CAS to lose (content_id IS NULL no longer \
+         matches) rather than unconditionally clobbering the previously bound content"
     );
+    let file_after = svc.get_file(&ctx, ticket.file_id).await.expect("get_file");
+    assert_eq!(
+        file_after.content_id,
+        Some(ticket.version_id),
+        "the previously bound content must survive -- the multipart version stays available \
+         and manually rebindable, exactly like any other lost bind CAS"
+    );
+    let _ = bound_first; // (kept for narration; superseded by file_after above)
 
     let bind_updates: Vec<_> = rec
         .events()
@@ -568,10 +579,87 @@ async fn multipart_complete_auto_bind_cas_targets_observed_pointer_not_null() {
     );
     let sql = &bind_updates[0].sql;
     assert!(
+        sql.to_ascii_lowercase().contains("is null"),
+        "FS-04/F9 fix regression: multipart complete's auto-bind CAS (no If-Match supplied) \
+         must target content_id IS NULL, got: {sql}"
+    );
+}
+
+/// Negative control for the FS-04/F9 fix: supplying a correct `If-Match`
+/// (matching the file's current content) is the caller explicitly
+/// confirming the pointer it observed -- the auto-bind CAS then correctly
+/// targets that observed (non-NULL) pointer and wins, exactly as before the
+/// fix. Same call sequence as
+/// `multipart_complete_auto_bind_no_if_match_cas_now_requires_content_id_is_null`,
+/// only the `If-Match` argument differs -- proving the fix narrows the CAS
+/// target specifically for the no-If-Match case, not for every auto-bind
+/// completion.
+#[tokio::test]
+async fn negative_control_multipart_complete_auto_bind_with_if_match_still_binds() {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let s = common::make_services_full(&db);
+    let (svc, msvc) = (s.svc.clone(), s.msvc.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+
+    let ticket = svc
+        .create_file(&ctx, common::new_file(), None, false)
+        .await
+        .expect("create_file");
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        Bytes::from_static(b"first content"),
+    )
+    .await
+    .expect("put_content");
+    let bound_first = svc
+        .bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .expect("bind first content");
+    let etag_first =
+        file_storage::domain::etag::etag_for(&bound_first).expect("bound file must have an etag");
+
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            10,
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("initiate_multipart_upload with auto_bind");
+    common::simulate_all_parts(&s.multipart_store, &s.backend, &plan, ticket.file_id).await;
+
+    rec.clear();
+    let completed = msvc
+        .complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, Some(&etag_first))
+        .await
+        .expect("complete_multipart_upload with a correct If-Match")
+        .unwrap_completed();
+    assert_eq!(
+        completed.bind_state,
+        file_storage::domain::multipart::BindState::Bound,
+        "supplying the correct If-Match must still let the auto-bind win"
+    );
+
+    let bind_updates: Vec<_> = rec
+        .events()
+        .into_iter()
+        .filter(|e| e.kind == QueryKind::Update && e.table.as_deref() == Some("files"))
+        .collect();
+    assert_eq!(bind_updates.len(), 1);
+    let sql = &bind_updates[0].sql;
+    assert!(
         !sql.to_ascii_lowercase().contains("is null"),
-        "known defect FS-04 regression: multipart complete's auto-bind CAS \
-         now targets content_id IS NULL -- FS-04 may be fixed, update the \
-         report. SQL: {sql}"
+        "with a confirmed If-Match, the CAS must target the observed (non-NULL) content_id, \
+         not IS NULL, got: {sql}"
     );
 }
 
