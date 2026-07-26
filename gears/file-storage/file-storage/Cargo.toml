@@ -118,3 +118,22 @@ s3s = "0.14.1"
 s3s-fs = "0.14.1"
 hyper-util = { workspace = true, features = ["server-auto", "tokio"] }
 tempfile = { workspace = true }
+
+# "test-support" enables toolkit_db::connect_db_with_metric_callback and
+# secure::in_transaction_for_testing, used by the DB-behavior audit's
+# QueryRecorder (tests/common/query_recorder.rs). Test-only; never built
+# into the production library (this crate's own [dependencies] above pulls
+# in toolkit-db without this feature).
+# "pg" (on top of the "sqlite" already needed by the SQLite audit tests) lets
+# tests/pg_concurrency_test.rs connect to a real PostgreSQL via connect_db().
+toolkit-db = { workspace = true, features = ["sqlite", "pg", "test-support"] }
+# SQL normalization for the QueryRecorder (tests/common/query_recorder.rs) --
+# already a workspace dependency (see root Cargo.toml), used here as a
+# test-only dev-dependency.
+regex = { workspace = true }
+# PostgreSQL concurrency harness (tests/pg_concurrency_test.rs) -- brings up a
+# real PostgreSQL via Docker, mirroring resource-group's own
+# tests/pg_concurrency_test.rs (audit/rg-db-behavior). Both already workspace
+# dependencies (root Cargo.toml), used here as test-only dev-dependencies.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
