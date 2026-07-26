@@ -886,6 +886,19 @@ impl MultipartService {
         }
         let takeover = session.state == MultipartUploadState::Completing;
 
+        // FS-04/F9 fix: whether the caller supplied ANY If-Match value
+        // (a concrete etag or `*`) -- not whether it was `*` specifically.
+        // Threaded down to the embedded auto-bind CAS below: a caller who
+        // supplied one has already had it validated, moments ago, against
+        // `file.content_id` (the `if let Some(m) = if_match` block above),
+        // so proceeding to target that exact observed pointer is safe --
+        // the client explicitly confirmed it. A caller who supplied
+        // *nothing* gets the pre-3.3 unconditional-complete contract for
+        // *whether complete succeeds*, but must not also get an unconditional
+        // *bind* for free -- see `assemble_and_finish_inner`'s own doc for
+        // why an unqualified observed-pointer CAS target is exactly F9.
+        let if_match_was_supplied = if_match.is_some();
+
         // Winner: run the assembly in a DETACHED task — a client that
         // disconnects (or a request future that is dropped) cannot cancel
         // the work; the result is persisted and any later `complete`
@@ -894,8 +907,15 @@ impl MultipartService {
         let svc = Arc::clone(self);
         let ctx = ctx.clone();
         let handle = tokio::spawn(async move {
-            svc.assemble_and_finish(&ctx, file, session, lease_owner, takeover)
-                .await
+            svc.assemble_and_finish(
+                &ctx,
+                file,
+                session,
+                lease_owner,
+                takeover,
+                if_match_was_supplied,
+            )
+            .await
         });
         match handle.await {
             Ok(result) => result.map(MultipartCompleteOutcome::Completed),
@@ -993,10 +1013,11 @@ impl MultipartService {
         session: MultipartUploadSession,
         lease_owner: String,
         takeover: bool,
+        if_match_was_supplied: bool,
     ) -> Result<CompletedMultipartUpload, DomainError> {
         let upload_id = session.upload_id;
         let result = self
-            .assemble_and_finish_inner(ctx, &file, &session, takeover)
+            .assemble_and_finish_inner(ctx, &file, &session, takeover, if_match_was_supplied)
             .await;
         if result.is_err()
             && let Err(release_err) = self
@@ -1023,6 +1044,7 @@ impl MultipartService {
         file: &file_storage_sdk::File,
         session: &MultipartUploadSession,
         takeover: bool,
+        if_match_was_supplied: bool,
     ) -> Result<CompletedMultipartUpload, DomainError> {
         let file_id = file.file_id;
         let upload_id = session.upload_id;
@@ -1271,14 +1293,39 @@ impl MultipartService {
         );
         // Upload-flow redesign: an `auto_bind` session (merged create+plan
         // with `bind: "auto"`) binds inside this same finalize transaction.
-        // The CAS precondition is the `content_id` observed above — already
-        // validated against the caller's optional `If-Match` (PRD §5.10's
-        // per-bind CAS is preserved; for a brand-new file this is the
-        // `content_id IS NULL` first-content case). A lost CAS is not an
-        // error: complete still succeeds, `bound: false` reports it, and a
-        // manual rebind needs no re-upload.
+        //
+        // FS-04/F9 fix: the CAS precondition used to be `file.content_id`
+        // unconditionally -- a snapshot taken once at the very top of
+        // `complete_multipart_upload`, long before this finalize call. For
+        // the common case (a brand-new file from the merged create+plan
+        // path) that snapshot is `None`, so the CAS already correctly
+        // required `content_id IS NULL`. But if this session's `file_id`
+        // already had content bound by the time `complete` started (e.g. a
+        // legitimate rebind that happened during the -- often long --
+        // window between this multipart upload's *initiate* and its
+        // *complete*) and the caller supplied no `If-Match`, using that
+        // stale non-NULL snapshot as the CAS target let this auto-bind
+        // silently clobber content the caller never confirmed it knew
+        // about: the snapshot merely reflected "whatever was there when
+        // complete started", not a caller-confirmed precondition. A caller
+        // who DID supply an `If-Match` already had it validated against
+        // this exact `content_id` moments ago (the `if let Some(m) =
+        // if_match` block in `complete_multipart_upload`), so proceeding
+        // with that observed pointer is safe -- the client explicitly
+        // confirmed it. A caller who supplied nothing gets the same
+        // guarantee the single-part finalize path already gives a
+        // brand-new file: the auto-bind CAS requires `content_id IS NULL`,
+        // so it can never overwrite content it didn't know about. A lost
+        // CAS is still not an error either way: complete still succeeds,
+        // `bound: false` reports it (`BindState::Conflict` + the current
+        // ETag), and a manual rebind needs no re-upload.
+        let auto_bind_target = if if_match_was_supplied {
+            file.content_id
+        } else {
+            None
+        };
         let auto_bind = session.auto_bind.then(|| AutoBindOnFinalize {
-            expected_content_id: file.content_id,
+            expected_content_id: auto_bind_target,
             audit: Self::audit_ok(
                 ctx,
                 Some(file_id),
