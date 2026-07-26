@@ -297,15 +297,21 @@ async fn make_services_local_fs_only() -> common::Services {
 
 #[tokio::test]
 async fn multipart_initiate_capability_reject_leaves_orphan_bare_file() {
-    // FS-01 / F1 (known defect, HIGH -- see docs/analysis/DB_BEHAVIOR_AUDIT.md):
-    // create_file_bare commits a version-less `files` row *before*
-    // initiation; a capability rejection (local-fs backend, non-
-    // multipart_native) happens before any pending version exists, so
-    // nothing ever triggers the orphan-parent reclamation path
-    // (`delete_abandoned_pending_version` only runs after reclaiming a
-    // *pending version*, and none was ever created here). This test
-    // documents the *current* (defective) outcome directly: the bare file
-    // survives the failed initiate.
+    // FS-01 / F1 -- FIXED at the orchestration layer (see
+    // docs/analysis/DB_BEHAVIOR_AUDIT.md §5): `FileService::
+    // compensate_failed_multipart_initiate` now reclaims this orphan, but
+    // only the merged `POST /files` handler (`api/rest/handlers.rs::
+    // create_file`'s multipart branch) actually calls it -- correctly:
+    // compensation must know "this file was JUST created together with
+    // this specific initiate attempt", which only that orchestrating
+    // caller knows, not either domain service in isolation. This test
+    // calls `create_file_bare` + `initiate_multipart_upload` directly, the
+    // same bare two-call sequence the handler itself makes *before*
+    // reaching its own error-handling branch -- it still (correctly, by
+    // design) shows the bare file surviving, because nothing here has
+    // invoked the compensation yet. See
+    // `multipart_initiate_capability_reject_with_compensation_reclaims_orphan`
+    // immediately below for the fixed end-to-end flow.
     let s = make_services_local_fs_only().await;
     let (svc, msvc) = (s.svc, s.msvc);
     let tenant_id = Uuid::now_v7();
@@ -333,15 +339,51 @@ async fn multipart_initiate_capability_reject_leaves_orphan_bare_file() {
         "expected a clean MultipartNotSupported, got: {err}"
     );
 
-    // FS-01: the bare file survives -- no automatic rollback, no zero-
-    // version sweep trigger. If this starts returning NotFound (i.e. some
-    // compensating delete now runs), FS-01's orphan half is fixed.
+    // Without the handler's compensation call, the bare file survives --
+    // this is the raw two-call sequence's behavior, unchanged by the FS-01
+    // fix (which lives one layer up, in the orchestrating caller).
     let still_there = svc.get_file(&ctx, file_id).await;
     assert!(
         still_there.is_ok(),
-        "known defect FS-01: expected the orphaned bare file to still exist \
-         (no automatic cleanup on a capability-reject initiate failure), got: \
-         {still_there:?}"
+        "the orphaned bare file must still exist after JUST the two raw domain calls, with no \
+         compensation invoked -- got: {still_there:?}"
+    );
+}
+
+#[tokio::test]
+async fn multipart_initiate_capability_reject_with_compensation_reclaims_orphan() {
+    // FS-01 / F1 fix, end-to-end: mirrors exactly what
+    // `api/rest/handlers.rs::create_file`'s multipart branch now does on an
+    // initiate failure -- call `compensate_failed_multipart_initiate` with
+    // the same `file_id`, then confirm the orphan is gone.
+    let s = make_services_local_fs_only().await;
+    let (svc, msvc) = (s.svc, s.msvc);
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let file_id = svc
+        .create_file_bare(&ctx, common::new_file())
+        .await
+        .expect("create_file_bare commits the bare file row");
+    msvc.initiate_multipart_upload(
+        &ctx,
+        file_id,
+        "application/octet-stream",
+        20,
+        Some(10),
+        None,
+        false,
+    )
+    .await
+    .expect_err("local-fs backend does not advertise multipart_native");
+
+    svc.compensate_failed_multipart_initiate(&ctx, file_id)
+        .await;
+
+    let gone = svc.get_file(&ctx, file_id).await;
+    assert!(
+        matches!(gone, Err(DomainError::FileNotFound { .. })),
+        "FS-01/F1 fix: the compensating delete must reclaim the orphan file, got: {gone:?}"
     );
 }
 

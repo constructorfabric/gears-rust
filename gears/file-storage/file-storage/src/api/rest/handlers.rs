@@ -194,7 +194,7 @@ pub async fn create_file(
             // multipart initiate registers its own; the old flow's abandoned
             // presign orphan disappears).
             let file_id = svc.create_file_bare(&ctx, new).await?;
-            let plan = msvc
+            let plan = match msvc
                 .initiate_multipart_upload(
                     &ctx,
                     file_id,
@@ -204,7 +204,23 @@ pub async fn create_file(
                     mp.concurrency,
                     auto_bind,
                 )
-                .await?;
+                .await
+            {
+                Ok(plan) => plan,
+                Err(e) => {
+                    // Known defect FS-01/F1 fix: a capability rejection or
+                    // backend-side initiation error here would otherwise
+                    // leave the bare file just created above as a
+                    // permanent, version-less orphan (nothing else ever
+                    // triggers its reclamation — see
+                    // FileService::compensate_failed_multipart_initiate's
+                    // own doc). Compensate synchronously; the ORIGINAL
+                    // initiate error is still what the caller sees.
+                    svc.compensate_failed_multipart_initiate(&ctx, file_id)
+                        .await;
+                    return Err(e.into());
+                }
+            };
             let id = file_id.to_string();
             let version_id = plan.version_id;
             return Ok(created_json(
