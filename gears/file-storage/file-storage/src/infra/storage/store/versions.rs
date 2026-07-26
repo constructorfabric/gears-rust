@@ -217,7 +217,9 @@ impl Store {
                                 .await?;
                             if swapped {
                                 versions.clear_current(tx, &scope, file_id).await?;
-                                versions.set_current(tx, &scope, file_id, version_id).await?;
+                                versions
+                                    .set_current(tx, &scope, file_id, version_id)
+                                    .await?;
                                 audit_repo.insert(tx, &ab.audit).await?;
                                 if let Some(ev) = ab.event {
                                     events_repo.enqueue(tx, &ev).await?;

@@ -311,9 +311,11 @@ async fn complete_multipart_issues_no_object_reread() {
     // Snapshot the whole-object-read counter, complete, and assert the
     // completion step re-read the assembled object ZERO times.
     let before = reads.load(Ordering::SeqCst);
-    msvc.complete_multipart_upload(&ctx, file_id, upload_id, None)
+    let _completed = msvc
+        .complete_multipart_upload(&ctx, file_id, upload_id, None)
         .await
-        .unwrap().unwrap_completed();
+        .unwrap()
+        .unwrap_completed();
     let during_complete = reads.load(Ordering::SeqCst) - before;
     assert_eq!(
         during_complete, 0,
@@ -350,9 +352,11 @@ async fn client_reverification_succeeds_and_detects_tampering() {
 
     let (file_id, version_id, upload_id, _plan, full) =
         drive_multipart(&svc, &msvc, &store, &backend, &ctx).await;
-    msvc.complete_multipart_upload(&ctx, file_id, upload_id, None)
+    let _completed = msvc
+        .complete_multipart_upload(&ctx, file_id, upload_id, None)
         .await
-        .unwrap().unwrap_completed();
+        .unwrap()
+        .unwrap_completed();
 
     let version = store
         .get_version(file_id, version_id)
@@ -422,9 +426,11 @@ async fn migrate_backend_verifies_multipart_composite_without_parts_rows() {
 
     let (file_id, version_id, upload_id, _plan, _full) =
         drive_multipart(&svc, &msvc, &store, &src, &ctx).await;
-    msvc.complete_multipart_upload(&ctx, file_id, upload_id, None)
+    let _completed = msvc
+        .complete_multipart_upload(&ctx, file_id, upload_id, None)
         .await
-        .unwrap().unwrap_completed();
+        .unwrap()
+        .unwrap_completed();
 
     // Delete the multipart-session part rows: migrate_backend's verification
     // must NOT depend on them (ADR-0006 §4 — the manifest is the durable,
