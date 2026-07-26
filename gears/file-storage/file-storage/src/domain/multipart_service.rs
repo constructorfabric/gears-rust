@@ -782,28 +782,6 @@ impl MultipartService {
             .authorizer
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
             .await?;
-
-        // Optional If-Match precondition (item 3.3): unlike `bind`, `None`
-        // stays unconditional here (backward compatible with the pre-3.3
-        // contract) rather than requiring the header once content exists —
-        // `complete` is keyed by `upload_id`, not by a rebind of already-bound
-        // content, so there is no equivalent "must supply it to rebind"
-        // invariant to enforce. `*` (or omission) matches unconditionally; a
-        // concrete value must match the file's current content ETag. For an
-        // `auto_bind` session this doubles as the PRD §5.10 bind
-        // precondition: the embedded bind's CAS target is the same
-        // `content_id` this check just validated.
-        if let Some(m) = if_match {
-            let m = m.trim();
-            if m != "*" {
-                let current_etag = etag::etag_for(&file);
-                if Some(m) != current_etag.as_deref() {
-                    return Err(DomainError::precondition_failed(
-                        "If-Match does not match the current content ETag",
-                    ));
-                }
-            }
-        }
         // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-request
 
         // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-load-session
@@ -822,9 +800,21 @@ impl MultipartService {
             return Err(DomainError::multipart_upload_not_found(upload_id));
         }
 
-        // Idempotent re-complete: replay the persisted snapshot (or rebuild
-        // from the version row for pre-snapshot sessions). Never a 409 on an
-        // honest retry.
+        // FS-06/F4 fix: idempotent re-complete (replay the persisted snapshot,
+        // or rebuild from the version row for pre-snapshot sessions) is
+        // checked BEFORE the If-Match precondition below now, not after.
+        // This used to run after the precondition check, so a caller
+        // retrying an honest, already-successful complete (its own request
+        // never got a response -- a dropped connection, a timeout) with the
+        // SAME If-Match it originally sent would get PreconditionFailed
+        // instead of the persisted 200: this session's own earlier success
+        // (or, for an auto_bind session, its own embedded bind) had already
+        // moved the file's current ETag past whatever the caller observed
+        // before that first attempt. A replay is not a new conflicting
+        // action against CURRENT state -- it is the recorded outcome of an
+        // action that already happened -- so it must not be gated on a
+        // precondition meant to protect against a NEW one. Never a 409 (or a
+        // stale-precondition 412) on an honest retry.
         if session.state == MultipartUploadState::Completed {
             self.metrics
                 .record_operation("complete_multipart_upload", "replayed");
@@ -837,6 +827,31 @@ impl MultipartService {
                 upload_id,
                 session.state.as_str(),
             ));
+        }
+        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-load-session
+
+        // Optional If-Match precondition (item 3.3): unlike `bind`, `None`
+        // stays unconditional here (backward compatible with the pre-3.3
+        // contract) rather than requiring the header once content exists —
+        // `complete` is keyed by `upload_id`, not by a rebind of already-bound
+        // content, so there is no equivalent "must supply it to rebind"
+        // invariant to enforce. `*` (or omission) matches unconditionally; a
+        // concrete value must match the file's current content ETag. For an
+        // `auto_bind` session this doubles as the PRD §5.10 bind
+        // precondition: the embedded bind's CAS target is the same
+        // `content_id` this check just validated. Only reached for a session
+        // that is NOT already Completed/Aborted (see above) -- a genuinely
+        // new completion attempt, which a precondition can legitimately gate.
+        if let Some(m) = if_match {
+            let m = m.trim();
+            if m != "*" {
+                let current_etag = etag::etag_for(&file);
+                if Some(m) != current_etag.as_deref() {
+                    return Err(DomainError::precondition_failed(
+                        "If-Match does not match the current content ETag",
+                    ));
+                }
+            }
         }
 
         // Defence-in-depth (P2 0.3 step 3): the session may still read as
