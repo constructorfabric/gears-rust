@@ -696,10 +696,13 @@ async fn metadata_upsert_statements_for_patch_size(n: usize) -> usize {
         .sum()
 }
 
+// FS-11 fix: patch_metadata_atomic now batches its DELETE and INSERT into
+// one statement each (Store::metadata's patch_metadata_atomic, via the new
+// MetadataRepo::delete_keys/insert_many, backed by toolkit-db's
+// secure_insert_many -- cherry-picked from fix/rg-db-remediation for this
+// fix). No longer `#[ignore]`d: this is now the healthy invariant, asserted
+// directly.
 #[tokio::test]
-#[ignore = "known defect FS-11: patch_metadata_atomic issues one INSERT/DELETE \
-            per patch entry instead of a single batched statement -- see \
-            docs/analysis/DB_BEHAVIOR_AUDIT.md"]
 async fn scale_metadata_patch_inserts_do_not_grow_with_entry_count() {
     let small = metadata_upsert_statements_for_patch_size(2).await;
     let large = metadata_upsert_statements_for_patch_size(15).await;
@@ -828,4 +831,52 @@ async fn negative_control_multipart_native_backend_initiate_succeeds() {
         .await
         .expect("in-memory backend advertises multipart_native, initiate must succeed");
     assert_eq!(plan.parts.len(), 2);
+}
+
+// =========================================================================
+// Section 7 -- scale-invariance (FS-14 fix, the same n-plus-one shape as
+// FS-11 at create_file's own sibling call site)
+// =========================================================================
+
+async fn create_file_metadata_insert_statements_for_entry_count(n: usize) -> usize {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let (svc, _msvc) = common::make_services(&db);
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+    let mut new = common::new_file();
+    new.custom_metadata = (0..n)
+        .map(|i| file_storage_sdk::CustomMetadataEntry {
+            key: format!("k{i}"),
+            value: format!("v{i}"),
+        })
+        .collect();
+
+    rec.clear();
+    svc.create_file(&ctx, new, None, false)
+        .await
+        .expect("create_file with initial custom_metadata should succeed");
+
+    rec.stats()
+        .into_iter()
+        .filter(|((kind, table), _)| {
+            *kind == common::query_recorder::QueryKind::Insert && table == "custom_metadata"
+        })
+        .map(|(_, count)| count)
+        .sum()
+}
+
+/// FS-14 fix: `create_file_with_pending_version{,_with_event,_with_idempotency}`'s
+/// own initial-`custom_metadata` loop had the exact same n-plus-one shape as
+/// FS-11's `patch_metadata_atomic`, found while fixing that one. Fixed the
+/// same way (batched via `MetadataRepo::insert_many`); asserted directly
+/// (not `#[ignore]`d) since this is the healthy invariant now.
+#[tokio::test]
+async fn scale_create_file_metadata_inserts_do_not_grow_with_entry_count() {
+    let small = create_file_metadata_insert_statements_for_entry_count(2).await;
+    let large = create_file_metadata_insert_statements_for_entry_count(15).await;
+    assert_eq!(
+        small, large,
+        "custom_metadata INSERT count at create_file time must not scale with the initial \
+         entry count (small={small} at N=2, large={large} at N=15)"
+    );
 }
