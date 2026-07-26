@@ -1372,9 +1372,12 @@ async fn negative_control_f9_autobind_with_correct_if_match_rejects_stale_rebind
 }
 
 // =========================================================================
-// F10 / FS-05: expired multipart session blocks parent cleanup on THIS
-// sweep pass, but no later pass ever revisits it either ("second path into
-// F1"). Deterministic by construction -- no barrier needed.
+// F10 / FS-05 fix verification: an expired multipart session used to block
+// parent cleanup on the sweep pass that reclaimed its version, and no later
+// pass ever revisited it either ("second path into F1"). Fixed by also
+// running the orphan-file check from step 2's own cleanup path (which runs
+// after the session is already aborted, so it is no longer blocked).
+// Deterministic by construction -- no barrier needed.
 // =========================================================================
 
 async fn backdate_version_created_at(
@@ -1397,7 +1400,7 @@ async fn backdate_version_created_at(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f10_expired_session_orphans_parent_permanently_across_sweeps() {
+async fn f10_expired_session_orphan_reclaimed_by_step2_in_same_sweep_pass() {
     let (db, _pg_guard) = pg_db_or_skip!();
     let store = Store::new(Arc::clone(&db));
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
@@ -1433,7 +1436,7 @@ async fn f10_expired_session_orphans_parent_permanently_across_sweeps() {
     backdate_multipart_expires_at(&db, plan.upload_id, now - time::Duration::seconds(10)).await;
 
     let result = engine.run_sweep().await;
-    eprintln!("f10: first sweep result = {}", describe_sweep(&result));
+    eprintln!("f10: sweep result = {}", describe_sweep(&result));
     assert_eq!(
         result.abandoned_pending_deleted, 1,
         "the abandoned pending version must be reclaimed in this same pass"
@@ -1443,10 +1446,10 @@ async fn f10_expired_session_orphans_parent_permanently_across_sweeps() {
         "the expired session must also be aborted in this same pass"
     );
     assert_eq!(
-        result.abandoned_files_deleted, 0,
-        "known defect FS-05/F10: the parent file must NOT be reclaimed in this pass -- \
-         has_in_progress_for_file still saw the session as in_progress when step 1 (version \
-         reclamation) ran, since step 2 (session abort) had not run yet"
+        result.abandoned_files_deleted, 1,
+        "FS-05/F10 fix: the parent file must now ALSO be reclaimed in this same pass -- step 2's \
+         own cleanup_expired_session_version runs its own orphan-file check after the session \
+         is already aborted, so has_in_progress_for_file no longer blocks it"
     );
 
     let version_after = store
@@ -1458,29 +1461,11 @@ async fn f10_expired_session_orphans_parent_permanently_across_sweeps() {
         "the pending version row must be gone -- step 1 deletes it regardless of the \
          now-stale has_in_progress_for_file snapshot"
     );
-    let file_after_pass_1 = svc.get_file(&ctx, file_id).await;
+    let file_after = svc.get_file(&ctx, file_id).await;
     assert!(
-        file_after_pass_1.is_ok(),
-        "known defect FS-05/F10: the file must survive this sweep pass as a version-less \
-         orphan -- got: {file_after_pass_1:?}"
-    );
-
-    // The decisive assertion: a SECOND sweep pass never revisits this file
-    // either, because the orphan-file check only ever runs as a side effect
-    // of `delete_abandoned_pending_version`, and there is no version left to
-    // trigger it a second time.
-    let result_2 = engine.run_sweep().await;
-    eprintln!("f10: second sweep result = {}", describe_sweep(&result_2));
-    assert_eq!(
-        result_2.abandoned_files_deleted, 0,
-        "known defect FS-05/F10: a second sweep pass must not reclaim the orphan either -- \
-         there is no pending version left anywhere to trigger the orphan-file check again"
-    );
-    let file_after_pass_2 = svc.get_file(&ctx, file_id).await;
-    assert!(
-        file_after_pass_2.is_ok(),
-        "known defect FS-05/F10: the file remains a permanent version-less orphan across \
-         repeated sweep passes -- got: {file_after_pass_2:?}"
+        matches!(file_after, Err(DomainError::FileNotFound { .. })),
+        "FS-05/F10 fix: the file must be reclaimed within this same sweep pass, not left as a \
+         version-less orphan -- got: {file_after:?}"
     );
 }
 

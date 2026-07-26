@@ -1903,9 +1903,15 @@ async fn sweep_after_complete_wins_does_not_delete_bound_version() {
 }
 
 /// The reverse ordering: the sweep wins the session CAS *before* any
-/// `complete_multipart_upload` call for the same session. The version is
-/// deleted, the session is `aborted`, and a subsequent `complete` attempt is
-/// rejected.
+/// `complete_multipart_upload` call for the same session. Both pending
+/// versions on this file (`create_file`'s own initial one, and the
+/// standalone multipart session's) are reclaimed by the same `grace = 0`
+/// sweep pass, so the file ends up a genuine zero-version, `NULL`-content_id
+/// orphan -- and, since FS-05/F10's fix, is now correctly reclaimed too
+/// (within this same sweep pass, once step 2 aborts the session that had
+/// been blocking step 1's own orphan-file check). A subsequent `complete`
+/// attempt therefore hits `FileNotFound` (the file itself is gone), not
+/// `MultipartUploadNotInProgress`.
 ///
 /// @cpt-cf-file-storage-fr-orphan-reconciliation
 #[tokio::test]
@@ -1946,6 +1952,11 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
         result.expired_multipart_aborted, 1,
         "sweep must win the session CAS and abort the expired session"
     );
+    assert_eq!(
+        result.abandoned_files_deleted, 1,
+        "FS-05/F10 fix: the now-zero-version parent file must also be reclaimed in this same \
+         sweep pass, via step 2's own orphan-file check (cleanup_expired_session_version)"
+    );
 
     // The pending version row must be gone.
     let version = store
@@ -1957,7 +1968,25 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
         "pending version must be deleted once the sweep wins the session CAS"
     );
 
-    // A subsequent complete attempt for the same upload_id must be rejected.
+    // FS-05/F10 fix: the file itself must be gone too -- both of its
+    // versions (create_file's own initial one, and this multipart session's)
+    // were reclaimed by the same grace=0 sweep pass, leaving zero versions
+    // and a NULL content_id, and step 2's own orphan check (unblocked now
+    // that the session is aborted) correctly reclaims it.
+    let file_after = svc.get_file(&ctx, ticket.file_id).await;
+    assert!(
+        matches!(
+            file_after,
+            Err(file_storage::domain::error::DomainError::FileNotFound { .. })
+        ),
+        "FS-05/F10 fix: expected the now-orphaned parent file to be reclaimed by the same sweep \
+         pass, got: {file_after:?}"
+    );
+
+    // A subsequent complete attempt for the same upload_id must be rejected
+    // -- FileNotFound now (the file itself is gone), not
+    // MultipartUploadNotInProgress (which would require the file to still
+    // exist for require_file to get past before reaching the session check).
     let err = msvc
         .complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
         .await
@@ -1965,9 +1994,10 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
     assert!(
         matches!(
             err,
-            file_storage::domain::error::DomainError::MultipartUploadNotInProgress { .. }
+            file_storage::domain::error::DomainError::FileNotFound { .. }
         ),
-        "expected MultipartUploadNotInProgress after the sweep aborted the session, got {err:?}"
+        "expected FileNotFound after the sweep reclaimed both the session and its now-orphaned \
+         parent file, got {err:?}"
     );
 }
 
