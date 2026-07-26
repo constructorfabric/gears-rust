@@ -737,9 +737,7 @@ impl FileService {
         // 409 on an honest retry — but only when the retry reported the same
         // bytes (size+hash match what was verified and stored); a mismatched
         // replay stays rejected.
-        if version.status == file_storage_sdk::VersionStatus::Available
-            && claims.bind_on_finalize
-        {
+        if version.status == file_storage_sdk::VersionStatus::Available && claims.bind_on_finalize {
             if version.size != size || version.hash_value != hash_value {
                 return Err(DomainError::hash_mismatch(
                     hex::encode(&hash_value),

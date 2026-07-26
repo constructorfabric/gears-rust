@@ -1052,7 +1052,7 @@ impl MultipartService {
         // to the coarser residual size check below (item 3.3) — a caller
         // debugging a stalled upload gets an actionable list instead of an
         // opaque size mismatch.
-        let missing = missing_part_numbers(&session, &parts);
+        let missing = missing_part_numbers(session, &parts);
         if !missing.is_empty() {
             return Err(DomainError::multipart_parts_missing(upload_id, missing));
         }
@@ -1165,12 +1165,12 @@ impl MultipartService {
                 }
                 let entries = backend_parts
                     .iter()
-                    .map(|(_, offset, digest, _)| {
-                        crate::infra::content::hash_mode::ManifestEntry {
+                    .map(
+                        |(_, offset, digest, _)| crate::infra::content::hash_mode::ManifestEntry {
                             offset: *offset,
                             digest: *digest,
-                        }
-                    })
+                        },
+                    )
                     .collect();
                 let manifest = crate::infra::content::hash_mode::Manifest::new(entries)?;
                 let root = manifest.root();

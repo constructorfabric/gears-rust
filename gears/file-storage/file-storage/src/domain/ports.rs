@@ -245,10 +245,7 @@ pub trait MultipartStore: Send + Sync {
     /// Fetch the stored `version_hash_manifest` text for a version, if one
     /// exists (`multipart-composite-sha256` versions only). Used by the
     /// idempotent re-complete path to rebuild the original response.
-    async fn get_version_manifest(
-        &self,
-        version_id: Uuid,
-    ) -> Result<Option<String>, DomainError>;
+    async fn get_version_manifest(&self, version_id: Uuid) -> Result<Option<String>, DomainError>;
 
     /// Insert or replace a multipart upload part.
     #[allow(clippy::too_many_arguments)]

@@ -202,10 +202,10 @@ pub struct CompletedMultipartUpload {
     pub manifest: Option<String>,
     /// Bind outcome (upload-flow redesign) — see [`BindState`].
     pub bind_state: BindState,
-    /// The file's content ETag after a successful bind
+    /// The file's content `ETag` after a successful bind
     /// (`bind_state == Bound` only).
     pub etag: Option<String>,
-    /// The file's CURRENT content ETag when the bind CAS was lost
+    /// The file's CURRENT content `ETag` when the bind CAS was lost
     /// (`bind_state == Conflict` only) — the value a manual rebind's
     /// `If-Match` needs, no re-upload required.
     pub current_etag: Option<String>,
@@ -217,10 +217,10 @@ pub struct CompletedMultipartUpload {
 /// same three values.
 ///
 /// * `Bound` — the upload bound its version as the file's current content
-///   (CAS won); the new content ETag accompanies it.
+///   (CAS won); the new content `ETag` accompanies it.
 /// * `Conflict` — an auto-bind was requested but the CAS lost (content moved
 ///   concurrently). The upload itself SUCCEEDED: the version is `available`
-///   and a manual `bind` (with the accompanying current ETag as `If-Match`)
+///   and a manual `bind` (with the accompanying current `ETag` as `If-Match`)
 ///   makes it live without re-uploading a byte.
 /// * `Manual` — no bind was requested (`bind: "manual"` / the standalone
 ///   initiate path); the client binds explicitly, as before the redesign.
