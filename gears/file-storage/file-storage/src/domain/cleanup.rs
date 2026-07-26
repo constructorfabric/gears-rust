@@ -157,9 +157,14 @@ impl CleanupEngine {
         result.abandoned_files_deleted += files_deleted;
         // @cpt-end:cpt-cf-file-storage-algo-run-sweep:p1:inst-sweep-step1
 
-        // Step 2 -- expired multipart sessions.
+        // Step 2 -- expired multipart sessions. FS-05/F10 fix: this can now
+        // ALSO reclaim a zero-version orphan file left behind by step 1
+        // above (step 1's own orphan check runs while this session still
+        // looks in_progress, and correctly declines then).
         // @cpt-begin:cpt-cf-file-storage-algo-run-sweep:p1:inst-sweep-step2
-        result.expired_multipart_aborted += self.sweep_expired_multipart(now).await;
+        let (expired_aborted, files_deleted_by_step2) = self.sweep_expired_multipart(now).await;
+        result.expired_multipart_aborted += expired_aborted;
+        result.abandoned_files_deleted += files_deleted_by_step2;
         // @cpt-end:cpt-cf-file-storage-algo-run-sweep:p1:inst-sweep-step2
 
         // Step 3 -- retention-policy expiry.
@@ -531,8 +536,11 @@ impl CleanupEngine {
     }
 
     /// Abort in-progress multipart sessions whose `expires_at` has passed.
+    /// Returns `(sessions_aborted, orphan_files_reclaimed)` -- the second
+    /// tally is FS-05/F10's fix: an expired session's own cleanup can now
+    /// also reclaim a zero-version parent file, not just step 1's.
     // @cpt-begin:cpt-cf-file-storage-algo-sweep-expired-multipart:p1:inst-sweep-multipart-list
-    async fn sweep_expired_multipart(&self, now: OffsetDateTime) -> usize {
+    async fn sweep_expired_multipart(&self, now: OffsetDateTime) -> (usize, usize) {
         let sessions = match self.store.list_expired_multipart_uploads(now).await {
             Ok(s) => s,
             Err(e) => {
@@ -540,23 +548,27 @@ impl CleanupEngine {
                     error = ?e,
                     "cleanup: failed to list expired multipart uploads"
                 );
-                return 0;
+                return (0, 0);
             }
         };
         // @cpt-end:cpt-cf-file-storage-algo-sweep-expired-multipart:p1:inst-sweep-multipart-list
 
-        let mut count = 0_usize;
+        let mut aborted_count = 0_usize;
+        let mut files_count = 0_usize;
         for session in sessions {
-            count += self.abort_expired_multipart_session(session).await;
+            let (aborted, files) = self.abort_expired_multipart_session(session).await;
+            aborted_count += aborted;
+            files_count += files;
         }
         // @cpt-begin:cpt-cf-file-storage-algo-sweep-expired-multipart:p1:inst-sweep-multipart-return
-        count
+        (aborted_count, files_count)
         // @cpt-end:cpt-cf-file-storage-algo-sweep-expired-multipart:p1:inst-sweep-multipart-return
     }
 
     /// Abort one expired multipart session: win the session's own
     /// `in_progress -> aborted` CAS *first*, and only on success clean up the
-    /// backend upload handle and delete the pending version row.
+    /// backend upload handle and delete the pending version row. Returns
+    /// `(sessions_aborted, orphan_files_reclaimed)`, each `0` or `1`.
     ///
     /// The CAS must run before version cleanup, not after: this is exactly
     /// the CAS-first pattern the user-driven `abort_multipart_upload` path
@@ -568,7 +580,10 @@ impl CleanupEngine {
     ///
     /// @cpt-cf-file-storage-fr-orphan-reconciliation
     /// @cpt-state:cpt-cf-file-storage-state-retention-cleanup-multipart-touch:p1
-    async fn abort_expired_multipart_session(&self, session: MultipartUploadSession) -> usize {
+    async fn abort_expired_multipart_session(
+        &self,
+        session: MultipartUploadSession,
+    ) -> (usize, usize) {
         let audit_tenant_id = self
             .store
             .get_file(session.file_id)
@@ -601,8 +616,8 @@ impl CleanupEngine {
                 // We won the CAS: no concurrent complete can have bound this
                 // version afterward. Safe to clean up the backend handle and
                 // delete the pending version row.
-                self.cleanup_expired_session_version(&session).await;
-                1
+                let files_reclaimed = self.cleanup_expired_session_version(&session).await;
+                (1, files_reclaimed)
             }
             // @cpt-end:cpt-cf-file-storage-algo-sweep-expired-multipart:p1:inst-sweep-multipart-cleanup
             // @cpt-begin:cpt-cf-file-storage-algo-sweep-expired-multipart:p1:inst-sweep-multipart-skip
@@ -615,19 +630,21 @@ impl CleanupEngine {
                     "cleanup: skipping version cleanup, session no longer in_progress \
                      (concurrent complete/abort won the race)"
                 );
-                0
+                (0, 0)
             }
             // @cpt-end:cpt-cf-file-storage-algo-sweep-expired-multipart:p1:inst-sweep-multipart-skip
             Err(e) => {
                 tracing::warn!(error = ?e, upload_id = %session.upload_id,
                     "cleanup: failed to mark expired multipart upload as aborted");
-                0
+                (0, 0)
             }
         }
     }
 
     /// Helper: abort the backend upload and delete the pending version row for
-    /// an expired multipart session. Both operations are best-effort.
+    /// an expired multipart session, then (FS-05/F10 fix) check whether that
+    /// leaves the parent file a permanent zero-version orphan. Returns `1` if
+    /// the orphan file was also reclaimed here, `0` otherwise.
     ///
     /// `pub` (rather than private) solely so the P2 0.3 step-5 unit test can
     /// invoke it directly to exercise the narrow mid-flight interleaving
@@ -647,7 +664,29 @@ impl CleanupEngine {
     /// to the default backend and the deterministic `(file_id, version_id)`
     /// path when it is not (mirrors `MultipartService::abort_multipart_upload`'s
     /// own `version.is_none()` fallback for the same reason).
-    pub async fn cleanup_expired_session_version(&self, session: &MultipartUploadSession) {
+    ///
+    /// FS-05/F10 fix: this method now finishes with the SAME
+    /// `maybe_delete_orphaned_file` check `delete_abandoned_pending_version`
+    /// already runs after its own version delete. Before this fix, the
+    /// orphan-file check only ever ran from step 1's side -- if step 1
+    /// reclaimed this exact version first (this session's `expires_at` had
+    /// passed, but step 2 hadn't aborted it yet), step 1's own
+    /// `has_in_progress_for_file` check still saw the session as
+    /// `in_progress` (step 2 runs after step 1 within one `run_sweep` pass)
+    /// and correctly declined to delete the parent file at that moment --
+    /// but nothing ever re-checked afterward, since the orphan check only
+    /// ever ran as an immediate side effect of a version delete, and there
+    /// was no version left to trigger it a second time. The parent file was
+    /// left a permanent, never-revisited version-less orphan ("a second path
+    /// into F1", `tmp-review0.md`'s F10). Now: whichever of the two cleanup
+    /// paths (step 1's version reclaim, or step 2's own version cleanup
+    /// here) runs last for a given file also gets a fresh chance to notice
+    /// the file has zero versions and a `NULL` `content_id` -- by the time
+    /// THIS method runs, `abort_expired_multipart_session` has already won
+    /// the session's own CAS to `aborted`, so `has_in_progress_for_file` no
+    /// longer sees it as blocking, and the orphan is correctly reclaimed
+    /// within the same sweep pass, symmetric with step 1's own path.
+    pub async fn cleanup_expired_session_version(&self, session: &MultipartUploadSession) -> usize {
         let ver = self
             .store
             .get_version(session.file_id, session.version_id)
@@ -708,6 +747,15 @@ impl CleanupEngine {
                 "cleanup: failed to delete pending version for expired multipart"
             );
         }
+
+        // FS-05/F10 fix: this session is now `aborted` (the caller only
+        // reaches this method after winning that CAS), so
+        // `has_in_progress_for_file` no longer blocks reclaiming a
+        // zero-version, NULL-content_id parent -- whether the version was
+        // just deleted above, or already reclaimed earlier by step 1's own
+        // path (`delete_abandoned_pending_version`, whose own attempt was
+        // correctly blocked while this session still looked in-progress).
+        self.maybe_delete_orphaned_file(session.file_id).await
     }
 
     /// Tell a backend to abort a multipart upload handle; log and ignore errors.
