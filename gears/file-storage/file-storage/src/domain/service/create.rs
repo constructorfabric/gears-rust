@@ -474,6 +474,99 @@ impl FileService {
         Ok(file_id)
     }
 
+    /// Compensating action for the merged `POST /files` create+plan path
+    /// (known defect FS-01/F1): [`Self::create_file_bare`] commits a
+    /// version-less `files` row *before* the multipart plan is initiated;
+    /// if initiation then fails (a capability rejection, a backend-side
+    /// error), nothing else ever triggers the orphan-parent reclamation
+    /// path (`CleanupEngine`'s sweep only reaches
+    /// `delete_orphan_file_with_event` as a side effect of reclaiming an
+    /// abandoned *pending version*, and none was ever created here — the
+    /// multipart initiate registers its own version, which also never
+    /// happened). Call this immediately after an initiate failure, with the
+    /// `file_id` `create_file_bare` just returned, to delete the orphan
+    /// synchronously instead of leaving it as a permanent, unreclaimed row.
+    ///
+    /// Reuses [`crate::infra::storage::store::Store::delete_orphan_file_with_event`]
+    /// — the same transactionally-guarded primitive the background sweep
+    /// uses — rather than an unconditional delete: it re-verifies, inside
+    /// the same transaction as the delete, that the file still has zero
+    /// versions and a `NULL` `content_id` before removing it. This makes
+    /// the call safe to make unconditionally here even though in practice
+    /// nothing else can have touched `file_id` yet (it was never returned
+    /// to any caller before this compensation runs).
+    ///
+    /// Best-effort: a failure here (including the guard correctly declining
+    /// to delete, e.g. because something unexpected already gave this file
+    /// a version) is logged, never propagated — the caller must still
+    /// surface the *original* initiate error, and a file this compensation
+    /// fails to remove is still eventually reclaimed by the background
+    /// sweep once it ages past `orphan_grace_secs` (the same fallback path
+    /// that existed before this fix, now just a backstop instead of the
+    /// only path).
+    ///
+    /// @cpt-cf-file-storage-fr-orphan-reconciliation
+    pub async fn compensate_failed_multipart_initiate(&self, ctx: &SecurityContext, file_id: Uuid) {
+        use toolkit_security::AccessScope;
+        let scope = AccessScope::allow_all();
+        let file = match self.store.get_file(&scope, file_id).await {
+            Ok(Some(f)) => f,
+            Ok(None) => return, // already gone somehow -- nothing to compensate
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    %file_id,
+                    "failed to load file for multipart-initiate compensation"
+                );
+                return;
+            }
+        };
+        let audit = Self::audit_ok(
+            ctx,
+            Some(file_id),
+            AuditOperation::OrphanReconcile,
+            serde_json::json!({ "reason": "multipart_initiate_failed" }),
+        );
+        let event = Some(Self::make_file_event(
+            file.tenant_id,
+            file.owner_id,
+            file_id,
+            "file.deleted",
+            serde_json::json!({ "reason": "multipart_initiate_failed" }),
+        ));
+        match self
+            .store
+            .delete_orphan_file_with_event(file_id, audit, event)
+            .await
+        {
+            Ok(true) => {
+                // @cpt-cf-file-storage-fr-usage-reporting
+                // Credit back the +1 create_file_bare reported -- this file
+                // never got any bytes, so bytes_delta stays 0.
+                self.report_usage(UsageDelta {
+                    tenant_id: file.tenant_id,
+                    owner_id: file.owner_id,
+                    bytes_delta: 0,
+                    file_count_delta: -1,
+                });
+            }
+            Ok(false) => {
+                // Guard declined (a version now exists / content is bound --
+                // should not be reachable in this call's actual use, but the
+                // guard is what makes calling this unconditionally safe) or
+                // a concurrent sweep already removed it. Either way, fine.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    %file_id,
+                    "failed to compensate orphan file after multipart-initiate failure -- \
+                     the background sweep will reclaim it once it ages past orphan_grace_secs"
+                );
+            }
+        }
+    }
+
     /// `POST /files/{id}/versions`: presign a new content version on an existing
     /// file (the upload's bytes will be bound via `bind`).
     pub async fn presign_version(
