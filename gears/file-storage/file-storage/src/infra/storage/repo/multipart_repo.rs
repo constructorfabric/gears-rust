@@ -187,8 +187,14 @@ impl MultipartRepo {
         use sea_orm::sea_query::Expr;
         let res = UploadEntity::update_many()
             .col_expr(UploadColumn::State, Expr::value("in_progress"))
-            .col_expr(UploadColumn::LeaseUntil, Expr::value(Option::<OffsetDateTime>::None))
-            .col_expr(UploadColumn::LeaseOwner, Expr::value(Option::<String>::None))
+            .col_expr(
+                UploadColumn::LeaseUntil,
+                Expr::value(Option::<OffsetDateTime>::None),
+            )
+            .col_expr(
+                UploadColumn::LeaseOwner,
+                Expr::value(Option::<String>::None),
+            )
             .filter(
                 sea_orm::Condition::all()
                     .add(UploadColumn::UploadId.eq(upload_id))
@@ -216,8 +222,14 @@ impl MultipartRepo {
         use sea_orm::sea_query::Expr;
         let res = UploadEntity::update_many()
             .col_expr(UploadColumn::State, Expr::value("aborted"))
-            .col_expr(UploadColumn::LeaseUntil, Expr::value(Option::<OffsetDateTime>::None))
-            .col_expr(UploadColumn::LeaseOwner, Expr::value(Option::<String>::None))
+            .col_expr(
+                UploadColumn::LeaseUntil,
+                Expr::value(Option::<OffsetDateTime>::None),
+            )
+            .col_expr(
+                UploadColumn::LeaseOwner,
+                Expr::value(Option::<String>::None),
+            )
             .filter(
                 sea_orm::Condition::all()
                     .add(UploadColumn::UploadId.eq(upload_id))
@@ -245,8 +257,14 @@ impl MultipartRepo {
             .col_expr(UploadColumn::State, Expr::value("completed"))
             .col_expr(UploadColumn::MimeValidated, Expr::value(true))
             .col_expr(UploadColumn::CompleteResult, Expr::value(result_json))
-            .col_expr(UploadColumn::LeaseUntil, Expr::value(Option::<OffsetDateTime>::None))
-            .col_expr(UploadColumn::LeaseOwner, Expr::value(Option::<String>::None))
+            .col_expr(
+                UploadColumn::LeaseUntil,
+                Expr::value(Option::<OffsetDateTime>::None),
+            )
+            .col_expr(
+                UploadColumn::LeaseOwner,
+                Expr::value(Option::<String>::None),
+            )
             .filter(
                 sea_orm::Condition::all()
                     .add(UploadColumn::UploadId.eq(upload_id))

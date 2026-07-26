@@ -798,16 +798,16 @@ pub struct MultipartCompleteDto {
     /// Bind outcome (upload-flow redesign) — ONE state model shared with the
     /// single-part path's `X-FS-Bound` header: `"bound"` (this complete made
     /// the version the file's current content; `etag` carries the new
-    /// content ETag), `"conflict"` (an auto-bind lost its CAS — the upload
+    /// content `ETag`), `"conflict"` (an auto-bind lost its CAS — the upload
     /// itself succeeded, `current_etag` carries the If-Match a manual rebind
     /// needs, no re-upload), or `"manual"` (`bind: "manual"` / standalone
     /// initiate — the client binds explicitly).
     pub bind_state: String,
-    /// The file's content ETag after a successful bind (`bind_state ==
+    /// The file's content `ETag` after a successful bind (`bind_state ==
     /// "bound"` only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
-    /// The file's CURRENT content ETag when the bind CAS was lost
+    /// The file's CURRENT content `ETag` when the bind CAS was lost
     /// (`bind_state == "conflict"` only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_etag: Option<String>,

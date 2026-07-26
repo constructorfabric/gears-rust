@@ -264,7 +264,10 @@ impl VersionRepo {
             .all(conn)
             .await
             .map_err(db_err)?;
-        Ok(rows.into_iter().map(|m| (m.version_id, m.manifest)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|m| (m.version_id, m.manifest))
+            .collect())
     }
 
     /// Clear the `is_current` flag on all versions of a file (used before
