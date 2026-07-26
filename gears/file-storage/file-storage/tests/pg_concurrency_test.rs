@@ -640,18 +640,18 @@ enum Role {
     B,
 }
 
-/// A `MultipartStore` decorator that pauses at three specific checkpoints
-/// via `tokio::sync::Notify` gates, instead of `sleep`-based timing, to
-/// force the *exact* interleaving `tmp-review0.md`'s F2 stranding
-/// counterexample describes -- deterministically, not "reproduces in N/M
-/// trials" the way a pure wall-clock race would (a real completer's
-/// assembly duration is not something a test can pin down to the
-/// millisecond, and -- confirmed empirically while building this harness --
-/// even gating *when a call starts* is not enough to pin down *which side's
-/// commit lands first*: an already-running task and a freshly-woken one can
-/// race the scheduler in either direction).
+/// A `MultipartStore` decorator that pauses at two specific checkpoints via
+/// `tokio::sync::Notify` gates, instead of `sleep`-based timing, to force
+/// the *exact* interleaving `tmp-review0.md`'s F2 stranding counterexample
+/// describes -- deterministically, not "reproduces in N/M trials" the way a
+/// pure wall-clock race would (a real completer's assembly duration is not
+/// something a test can pin down to the millisecond, and -- confirmed
+/// empirically while building this harness -- even gating *when a call
+/// starts* is not enough to pin down *which side's commit lands first*: an
+/// already-running task and a freshly-woken one can race the scheduler in
+/// either direction).
 ///
-/// Two handles (one per role) share the same three `Notify`s and wrap the
+/// Two handles (one per role) share the same two `Notify`s and wrap the
 /// *same* real, PostgreSQL-backed inner store:
 ///
 /// - Role `B`'s **first** `get_version` call (the takeover fast-path check
@@ -666,19 +666,23 @@ enum Role {
 ///   `acquire_complete_lease` CAS will match) from `B`'s own start -- and
 ///   notifies `a_finalized` right after its own commit *returns*.
 /// - Role `B`'s `finalize_version` call **waits** on `a_finalized` before
-///   even starting its own (redundant, doomed) attempt -- this is the gate
-///   that makes A's *win* deterministic, not just A's *start*: without it,
-///   B's task (already running, several steps into its own reassembly) can
-///   race ahead of A's freshly-woken one and commit first, which is a real,
-///   also-interesting outcome (the stale completer, not the fresh one,
-///   ends up spuriously erroring) but not the specific stranding sequence
-///   this test exists to pin down.
-/// - Role `B`'s `release_multipart_complete_lease` call notifies
-///   `b_released` right after it returns.
-/// - Role `A`'s `complete_multipart_upload` (the finish CAS) call **waits**
-///   on `b_released` before delegating -- guaranteeing `A`'s finish attempt
-///   cannot run before `B`'s release (which only happens after `B`'s own,
-///   now-doomed, `finalize_version` attempt has already lost to `A`'s).
+///   even starting its own (redundant, doomed-to-lose) attempt -- this is
+///   the gate that makes A's *win* deterministic, not just A's *start*:
+///   without it, B's task (already running, several steps into its own
+///   reassembly) can race ahead of A's freshly-woken one and commit first,
+///   which is a real, also-interesting outcome (the stale completer, not
+///   the fresh one, ends up needing to converge instead) but not the
+///   specific interleaving this test exists to pin down.
+///
+/// Post-fix (FS-02 remediation, see `docs/analysis/DB_BEHAVIOR_AUDIT.md`
+/// §5), B's lost `finalize_version` no longer errors-and-releases the
+/// lease -- it converges (re-derives the response and calls
+/// `finish_session` directly, same as the takeover fast path) -- so there
+/// is no third gate here anymore: nothing needs to hold A's own
+/// `finish_session` call back, since the actual race that remains (both A
+/// and B now separately racing to call `finish_session`) is exactly the
+/// race `finish_session`'s own CAS-then-converge logic is designed to
+/// resolve gracefully either way.
 ///
 /// `tokio::sync::Notify::notify_one` buffers a permit if no waiter is
 /// registered yet, so there is no lost-wakeup risk regardless of which side
@@ -692,7 +696,6 @@ struct GatedMultipartStore {
     /// this before even starting, so which side wins the real CAS is
     /// deterministic rather than left to the scheduler.
     a_finalized: Arc<Notify>,
-    b_released: Arc<Notify>,
     b_first_get_version_seen: Arc<AtomicBool>,
 }
 
@@ -868,9 +871,6 @@ impl MultipartStore for GatedMultipartStore {
         result_json: &str,
         audit: file_storage::domain::audit::AuditEntry,
     ) -> Result<bool, DomainError> {
-        if self.role == Role::A {
-            self.b_released.notified().await;
-        }
         self.inner
             .complete_multipart_upload(upload_id, result_json, audit)
             .await
@@ -893,14 +893,9 @@ impl MultipartStore for GatedMultipartStore {
         upload_id: Uuid,
         owner: &str,
     ) -> Result<bool, DomainError> {
-        let result = self
-            .inner
+        self.inner
             .release_multipart_complete_lease(upload_id, owner)
-            .await;
-        if self.role == Role::B {
-            self.b_released.notify_one();
-        }
-        result
+            .await
     }
 
     async fn abort_multipart_upload(
@@ -921,9 +916,18 @@ impl MultipartStore for GatedMultipartStore {
     }
 }
 
-/// Known defect FS-02/F2 -- the audit's single most severe finding, and the
-/// one the coordinator specifically flagged for extra scrutiny ("the earlier
-/// proposed one-line fix is insufficient"). Full mechanism, not a shortcut:
+/// FS-02/F2 fix verification -- the audit's single most severe finding, and
+/// the one the coordinator specifically flagged for extra scrutiny ("the
+/// earlier proposed one-line fix is insufficient"). This test used to
+/// reproduce a genuine stranding (see `docs/analysis/DB_BEHAVIOR_AUDIT.md`
+/// §5 for the full before/after and git history for the original repro);
+/// after the fix (`multipart_service.rs::assemble_and_finish_inner`: a lost
+/// finalize CAS now checks whether the version is `Available` -- i.e.
+/// someone else's finalize already won -- and, if so, converges via the
+/// same `replay_completed` + `finish_session` path the takeover fast-path
+/// already used, instead of unconditionally erroring and releasing the
+/// lease), the exact same deterministic interleaving now converges cleanly
+/// instead. Mechanism:
 ///
 /// 1. A acquires the completion lease (fresh) with a 1-second lease.
 /// 2. The test waits >1s of real wall-clock time -- A's lease genuinely
@@ -940,30 +944,22 @@ impl MultipartStore for GatedMultipartStore {
 ///    (+ bind, for an `auto_bind` session), for real, in PostgreSQL.
 /// 5. B, having finished its own (redundant, slower) reassembly, calls its
 ///    own `finalize_version` -- sees `updated = false` (no longer `pending`)
-///    -- errors, and its `release_multipart_complete_lease` (owner-scoped to
-///    B) succeeds, because the session is *still* `completing` with
-///    `lease_owner = B` at this exact moment (A hasn't reached
-///    `finish_session` yet -- that call is gated on this very release).
-///    Flips the session back to `in_progress`.
-/// 6. A's gated `finish_session` CAS (`complete_multipart_upload`, filtered
-///    on `state = 'completing'` only, not `lease_owner` -- FS-02's core
-///    gap) now runs: it fails, because step 5 just moved the state to
-///    `in_progress`. A's `finish_session` re-reads the session, sees it is
-///    not `Completed`, and returns an error.
+///    -- **post-fix**, checks the version's real status, sees `Available`,
+///    and converges: re-derives the response via `replay_completed` and
+///    calls `finish_session` directly, same as a genuine takeover fast path.
+/// 6. Both A and B now separately race to call `finish_session` (the
+///    `state = 'completing' -> 'completed'` CAS); whichever gets there
+///    first wins, and the other's own `finish_session` sees `finished =
+///    false`, re-reads the session, finds `state == Completed`, and
+///    converges silently too (this is the *pre-existing* convergence branch
+///    `finish_session` already had for "someone else already finished it" --
+///    it did not need to change).
 ///
-/// End state: **both** A's and B's original callers get an error, yet the
-/// version row is, in fact, `available` (and bound, for `auto_bind`) --
-/// finalized correctly underneath two failed-looking calls. The session
-/// itself is stranded at `in_progress` with no live lease: a third complete
-/// attempt (also asserted below) redundantly reassembles from scratch (a
-/// fresh `in_progress -> completing` acquire has `takeover = false`, which
-/// skips the "already finalized" fast path *entirely*, regardless of the
-/// version's real status) and hits the exact same conflict-then-release
-/// cycle, forever, until `expires_at` passes and the background sweep
-/// aborts the session -- with the content having been correctly live and
-/// bound the entire time.
+/// End state: **both** A's and B's original callers get `Ok(Completed(...))`
+/// -- no stranding, no spurious error, exactly once assembly's worth of
+/// content, correctly available and bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f2_stale_completer_strands_session_after_owner_unfenced_release() {
+async fn f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix() {
     let (db, _pg_guard) = pg_db_or_skip!();
     let store = Store::new(Arc::clone(&db));
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
@@ -997,7 +993,6 @@ async fn f2_stale_completer_strands_session_after_owner_unfenced_release() {
 
     let b_checked_pending = Arc::new(Notify::new());
     let a_finalized = Arc::new(Notify::new());
-    let b_released = Arc::new(Notify::new());
     let b_first_get_version_seen = Arc::new(AtomicBool::new(false));
 
     let store_a: Arc<dyn MultipartStore> = Arc::new(GatedMultipartStore {
@@ -1005,7 +1000,6 @@ async fn f2_stale_completer_strands_session_after_owner_unfenced_release() {
         role: Role::A,
         b_checked_pending: Arc::clone(&b_checked_pending),
         a_finalized: Arc::clone(&a_finalized),
-        b_released: Arc::clone(&b_released),
         b_first_get_version_seen: Arc::clone(&b_first_get_version_seen),
     });
     let store_b: Arc<dyn MultipartStore> = Arc::new(GatedMultipartStore {
@@ -1013,7 +1007,6 @@ async fn f2_stale_completer_strands_session_after_owner_unfenced_release() {
         role: Role::B,
         b_checked_pending: Arc::clone(&b_checked_pending),
         a_finalized: Arc::clone(&a_finalized),
-        b_released: Arc::clone(&b_released),
         b_first_get_version_seen: Arc::clone(&b_first_get_version_seen),
     });
 
@@ -1048,7 +1041,7 @@ async fn f2_stale_completer_strands_session_after_owner_unfenced_release() {
     let result_b = result_b.expect("task B join");
 
     eprintln!(
-        "f2_stale_completer_strands_session: A={} B={}",
+        "f2_stale_completer_converges: A={} B={}",
         describe_result(&result_a),
         describe_result(&result_b),
     );
@@ -1060,27 +1053,22 @@ async fn f2_stale_completer_strands_session_after_owner_unfenced_release() {
     }
 
     assert!(
-        result_a.is_err() && result_b.is_err(),
-        "known defect FS-02/F2: expected BOTH completers to observe an error despite the \
-         content having been correctly finalized underneath them -- A={result_a:?} B={result_b:?}"
+        result_a.is_ok() && result_b.is_ok(),
+        "FS-02/F2 fix: both completers must now converge to Ok(Completed(...)) instead of \
+         stranding the session -- A={result_a:?} B={result_b:?}"
     );
-    assert!(
-        matches!(result_b, Err(DomainError::Conflict { .. })),
-        "B's own (redundant, losing) finalize attempt must fail with a conflict, got: {result_b:?}"
+    let completed_a = result_a.expect("checked above").unwrap_completed();
+    let completed_b = result_b.expect("checked above").unwrap_completed();
+    assert_eq!(
+        completed_a.version_id, completed_b.version_id,
+        "both completers must agree on the same finalized version"
     );
-    assert!(
-        matches!(
-            result_a,
-            Err(DomainError::MultipartUploadNotInProgress { .. })
-        ),
-        "A's finish_session must fail because B's release already moved the session off \
-         `completing`, got: {result_a:?}"
+    assert_eq!(
+        completed_a.bind_state,
+        BindState::Bound,
+        "the auto-bind CAS must have won for the winner's caller"
     );
 
-    // The decisive assertion: the version IS available and bound, but the
-    // session row is stranded at `in_progress` with no live lease -- exactly
-    // the inconsistency tmp-review0.md's F2 stranding counterexample
-    // describes, not merely "an error happened".
     let version = store
         .get_version(file_id, plan.version_id)
         .await
@@ -1089,7 +1077,7 @@ async fn f2_stale_completer_strands_session_after_owner_unfenced_release() {
     assert_eq!(
         version.status,
         VersionStatus::Available,
-        "the version was, in fact, correctly finalized by A -- must be Available"
+        "the version must be correctly finalized exactly once"
     );
     let file = svc.get_file(&ctx, file_id).await.expect("get_file");
     assert_eq!(
@@ -1104,92 +1092,36 @@ async fn f2_stale_completer_strands_session_after_owner_unfenced_release() {
         .expect("session row must still exist");
     assert_eq!(
         session.state,
-        file_storage::domain::multipart::MultipartUploadState::InProgress,
-        "known defect FS-02/F2: the session must be stranded back at in_progress -- both \
-         completers' CASes lost, even though the content is already correctly available+bound"
+        file_storage::domain::multipart::MultipartUploadState::Completed,
+        "FS-02/F2 fix: the session must reach Completed, not be stranded at in_progress"
     );
     assert!(
         session.lease_until.is_none(),
-        "a stranded session has no live lease -- got {}",
+        "a completed session has no live lease -- got {}",
         session
             .lease_until
             .as_ref()
             .map_or_else(|| "none".to_owned(), ToString::to_string)
     );
 
-    // A third, honest retry hits the exact same wall -- confirming this is
-    // not a one-shot glitch but a genuinely stuck state: a fresh acquire has
-    // `takeover = false`, which skips the "already finalized" fast path
-    // entirely (it is gated on `takeover`, not on the version's real
-    // status), so the retry redundantly attempts the assembly from scratch.
-    // Which *specific* error it gets depends on how far the redundant
-    // attempt gets before failing (the in-memory backend's multipart
-    // handle is already consumed by A's real completion, so this often
-    // surfaces as a backend "handle not found" error rather than the same
-    // DB-level conflict A/B saw -- both are real, both leave the session
-    // exactly as stranded, and this assertion only requires *an* error).
-
+    // A third, honest retry (the idempotent-replay path) must now succeed
+    // too, replaying the same persisted result -- confirming the fix
+    // didn't just avoid the immediate race, it left the session in a
+    // normally-replayable terminal state.
     let msvc_c = make_multipart_service(Arc::clone(&real_multipart_store), backends.clone(), 120);
     let result_c = msvc_c
         .complete_multipart_upload(&ctx, file_id, upload_id, None)
         .await;
     eprintln!("f2: third retry result = {}", describe_result(&result_c));
-    assert!(
-        result_c.is_err(),
-        "known defect FS-02/F2: a third honest retry must also fail -- the session cannot \
-         self-heal through the normal complete path once stranded, got: {}",
-        describe_result(&result_c)
-    );
-    let session_after_retry = real_multipart_store
-        .get_multipart_upload(upload_id)
-        .await
-        .expect("get_multipart_upload")
-        .expect("session row must still exist");
-    assert_eq!(
-        session_after_retry.state,
-        file_storage::domain::multipart::MultipartUploadState::InProgress,
-        "the third retry must re-strand the session at in_progress, same as the first two"
-    );
-
-    // Finally: confirm the "stranded until expiry" half. Backdate the
-    // session's `expires_at` into the past and run a real sweep -- the
-    // background reconciliation is the *only* thing that ever moves this
-    // session off `in_progress` again, and it does so by aborting it, not
-    // by recognizing the content is already fine.
-    let engine = make_engine(store.clone(), backends, 0);
-    backdate_multipart_expires_at(
-        &db,
-        upload_id,
-        OffsetDateTime::now_utc() - time::Duration::seconds(5),
-    )
-    .await;
-    let sweep_result = engine.run_sweep().await;
-    eprintln!("f2: final sweep result = {}", describe_sweep(&sweep_result));
-    let session_final = real_multipart_store
-        .get_multipart_upload(upload_id)
-        .await
-        .expect("get_multipart_upload")
-        .expect("session row must still exist");
-    assert_eq!(
-        session_final.state,
-        file_storage::domain::multipart::MultipartUploadState::Aborted,
-        "known defect FS-02/F2's terminal state: the sweep eventually aborts the stranded \
-         session -- permanently recording it as failed even though the content underneath it \
-         has been correctly available and bound the whole time"
-    );
-    let version_final = store
-        .get_version(file_id, plan.version_id)
-        .await
-        .expect("get_version")
+    let completed_c = result_c
         .expect(
-            "version row must still exist -- the sweep's abort path only deletes a *pending* \
-                 version, and this one is not pending",
-        );
+            "FS-02/F2 fix: a third retry against an already-Completed session must replay, \
+                 not error",
+        )
+        .unwrap_completed();
     assert_eq!(
-        version_final.status,
-        VersionStatus::Available,
-        "the content stays available and bound forever, contradicting the session's own \
-         permanent \"aborted\" record -- the inconsistency FS-02 describes"
+        completed_c.version_id, completed_a.version_id,
+        "the replayed result must match the original completion"
     );
 }
 
