@@ -1009,7 +1009,14 @@ impl MultipartService {
         result
     }
 
-    #[allow(clippy::too_many_lines)]
+    // A single-owner state machine (assemble -> verify -> finalize ->
+    // finish); deliberately kept as one flat sequence rather than
+    // fragmented across several small methods that would each need the
+    // full context to make sense on their own (extracting
+    // converge_or_error_after_lost_finalize_cas already pulled out the one
+    // piece that had its own independent reasoning worth a doc comment of
+    // its own -- see FS-02/F2).
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     async fn assemble_and_finish_inner(
         &self,
         ctx: &SecurityContext,
@@ -1311,13 +1318,13 @@ impl MultipartService {
         let finalized = finalize_outcome.updated;
         let bound = finalize_outcome.bound;
         if !finalized {
-            // The pending version row disappeared (concurrent abort or cleanup)
-            // after the backend assembled the object. Fail loudly instead of
-            // reporting success with no bound version; the now-orphaned blob at
-            // `backend_path` is reclaimed by the orphan-reconciliation sweep.
-            return Err(DomainError::conflict(format!(
-                "multipart upload {upload_id}: version row was removed before completion"
-            )));
+            // FS-02/F2 fix -- see the helper's own doc for the full
+            // reasoning: a lost finalize CAS can mean either "someone else
+            // already finished this correctly" (converge) or "the row is
+            // genuinely gone" (a real error).
+            return self
+                .converge_or_error_after_lost_finalize_cas(ctx, file_id, session, upload_id)
+                .await;
         }
         // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-finalize-version
 
@@ -1375,6 +1382,60 @@ impl MultipartService {
         self.metrics
             .record_operation("complete_multipart_upload", "ok");
         Ok(result)
+    }
+
+    /// FS-02/F2 fix: `assemble_and_finish_inner`'s finalize CAS
+    /// (`Store::finalize_version`, fenced only by `status = 'pending'`, not
+    /// by lease ownership) can lose for two genuinely different reasons
+    /// that a blanket hard error used to conflate:
+    ///
+    /// (a) A stale, lease-expired completer that was taken over by another
+    /// caller can still reach this point and lose the race to that other
+    /// caller's own finalize -- the version is already `available`
+    /// (possibly bound), finalized *correctly*, just not by this call.
+    /// Erroring here (the pre-fix behavior) made this caller's own
+    /// `finish_session` fail too (its expected `completing` state can have
+    /// already moved on), and if the *other* completer's redundant loss
+    /// happened to reach its own error-recovery
+    /// `release_multipart_complete_lease` first, the session could be
+    /// knocked back to `in_progress` and left stranded there indefinitely
+    /// -- see `docs/analysis/DB_BEHAVIOR_AUDIT.md` FS-02 for the full
+    /// mechanism this was reproducing (and its real-PostgreSQL repro,
+    /// `tests/pg_concurrency_test.rs::
+    /// f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix`).
+    ///
+    /// (b) The pending version row genuinely disappeared (a concurrent
+    /// abort or cleanup sweep) -- there is nothing to converge to, and this
+    /// really is an error.
+    ///
+    /// Distinguish them by re-reading the version: `Available` means (a) --
+    /// converge exactly like the takeover fast-path in
+    /// `assemble_and_finish_inner` does (re-derive the response, finish the
+    /// session's own state machine, whose CAS is itself safe to race: it is
+    /// filtered on `state = 'completing'` only, and a second, redundant
+    /// caller reaching it after the first already succeeded simply finds
+    /// `state` no longer `completing` and converges silently too, via
+    /// `finish_session`'s own pre-existing not-finished branch below --
+    /// that branch did not need to change). Anything else (row gone, or
+    /// genuinely still `pending`) keeps the original hard error.
+    async fn converge_or_error_after_lost_finalize_cas(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        session: &MultipartUploadSession,
+        upload_id: Uuid,
+    ) -> Result<CompletedMultipartUpload, DomainError> {
+        let converged_version = self.store.get_version(file_id, session.version_id).await?;
+        if let Some(v) = converged_version
+            && v.status == file_storage_sdk::VersionStatus::Available
+        {
+            let completed = self.replay_completed(file_id, session).await?;
+            self.finish_session(ctx, session, &completed).await?;
+            return Ok(completed);
+        }
+        Err(DomainError::conflict(format!(
+            "multipart upload {upload_id}: version row was removed before completion"
+        )))
     }
 
     /// Terminal `completing → completed` transition, persisting the response
