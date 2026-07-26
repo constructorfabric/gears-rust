@@ -9,9 +9,12 @@
 //! describing intended behavior) does not match what the code actually
 //! does. Two shapes are covered:
 //!
-//! - **FS-06 / F4**: a *behavioral* drift -- the documented "every retry is
-//!   safe" property has a real gap, reproduced directly against the domain
-//!   layer.
+//! - **FS-06 / F4** (RESOLVED): a *behavioral* drift -- the documented
+//!   "every retry is safe" property had a real gap (a stale If-Match could
+//!   fail-precondition an otherwise-honest retry of an already-Completed
+//!   session instead of replaying it), reproduced directly against the
+//!   domain layer, then fixed by reordering the session-state replay check
+//!   ahead of the If-Match precondition check.
 //! - **FS-12** (new finding, not in `tmp-review0.md`, RESOLVED alongside
 //!   FS-02): `concurrency-and-failure-model.md`'s own Race Catalog item 2
 //!   stated a claim that this audit found reachably false for one specific
@@ -44,21 +47,21 @@
 
 mod common;
 
-use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart::BindState;
 use uuid::Uuid;
 
 // =========================================================================
-// FS-06 / F4: a completed multipart upload's exact retry is not always
-// replayed -- a stale If-Match (valid at request time, no longer valid
-// after the completion's own auto-bind moved the pointer) is rejected with
-// PreconditionFailed *before* the session-state check that would otherwise
-// recognize "this exact session is already Completed -- replay it" ever
-// runs (`multipart_service.rs:796-806` runs before `:809-833`).
+// FS-06 / F4 fix verification: a completed multipart upload's exact retry
+// used to not always be replayed -- a stale If-Match (valid at request
+// time, no longer valid after the completion's own auto-bind moved the
+// pointer) was rejected with PreconditionFailed *before* the session-state
+// check that would otherwise recognize "this exact session is already
+// Completed -- replay it" ever ran. Fixed by moving the session-state
+// replay check before the If-Match precondition check.
 // =========================================================================
 
 #[tokio::test]
-async fn fs06_f4_completed_retry_with_stale_if_match_precondition_fails_instead_of_replaying() {
+async fn fs06_f4_completed_retry_with_stale_if_match_now_replays_instead_of_failing_precondition() {
     let (db, _rec) = common::test_db_with_recorder().await;
     let s = common::make_services_full(&db);
     let dp = file_storage::domain::data_plane::DataPlaneService::new(std::sync::Arc::clone(&s.svc)
@@ -134,7 +137,9 @@ async fn fs06_f4_completed_retry_with_stale_if_match_precondition_fails_instead_
     // failure-model.md's Ground Rule 2 ("Every retry is safe by
     // construction... `complete` replays its persisted result") and
     // Invariants ("Every retry is safe: ... `complete` (persisted-result
-    // replay)"), this should replay the stored 200. It does not:
+    // replay)"), this must replay the stored 200 -- FS-06/F4 fix: the
+    // session-state replay check now runs before the If-Match precondition
+    // check, so this no longer fails.
     let retry = s
         .msvc
         .complete_multipart_upload(
@@ -143,14 +148,15 @@ async fn fs06_f4_completed_retry_with_stale_if_match_precondition_fails_instead_
             plan.upload_id,
             Some(&etag_of_initial_content),
         )
-        .await;
-    assert!(
-        matches!(retry, Err(DomainError::PreconditionFailed { .. })),
-        "known defect FS-06/F4: expected the documented-as-safe retry to be rejected with a \
-         stale PreconditionFailed instead of replaying the persisted Completed result (the \
-         If-Match check at the top of complete_multipart_upload runs against the file's \
-         CURRENT etag, before the session-state replay branch ever gets a chance to recognize \
-         this exact upload_id is already Completed) -- got: {retry:?}"
+        .await
+        .expect(
+            "FS-06/F4 fix: a retry against an already-Completed session must replay, not \
+                 fail a stale precondition check",
+        )
+        .unwrap_completed();
+    assert_eq!(
+        retry.version_id, completed_first.version_id,
+        "the replayed result must match the original completion"
     );
 }
 
