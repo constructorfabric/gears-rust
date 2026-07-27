@@ -15,7 +15,7 @@
 //!   session instead of replaying it), reproduced directly against the
 //!   domain layer, then fixed by reordering the session-state replay check
 //!   ahead of the If-Match precondition check.
-//! - **FS-12** (new finding, not in `tmp-review0.md`, RESOLVED alongside
+//! - **FS-12** (new finding, not in `upload-flow-review.md`, RESOLVED alongside
 //!   FS-02): `concurrency-and-failure-model.md`'s own Race Catalog item 2
 //!   stated a claim that this audit found reachably false for one specific
 //!   interleaving, before FS-02's remediation. The FS-02 fix makes the same

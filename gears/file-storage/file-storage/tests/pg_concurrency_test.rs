@@ -39,7 +39,7 @@
 //!   completion is not owner-fenced end-to-end. Two completers, A and B, race
 //!   the same session's lease; deterministic checkpoints (`tokio::sync::
 //!   Notify` gates threaded through a `MultipartStore` decorator, not
-//!   `sleep`-based timing) force the exact interleaving `tmp-review0.md`
+//!   `sleep`-based timing) force the exact interleaving `upload-flow-review.md`
 //!   describes: stale A wins the version-finalize CAS, B's own (redundant)
 //!   finalize attempt then fails and releases B's *own* lease (owner-scoped,
 //!   but the session is still `completing` at that moment) back to
@@ -95,7 +95,7 @@
 //!   session. Usage-invariants are out of scope for an executable check --
 //!   see the module doc's own note below.
 //!
-//! ## Usage-invariant note (Runtime Caveat, mirrored from `tmp-review0.md`)
+//! ## Usage-invariant note (Runtime Caveat, mirrored from `upload-flow-review.md`)
 //!
 //! `gear.rs` wires `FileService`/`MultipartService`/`CleanupEngine` with
 //! `usage_reporter: None` in the shipped build (`gear.rs:189-217,230,236,264`,
@@ -103,7 +103,7 @@
 //! today. There is therefore no live usage-invariant to *check* against a
 //! real reporter in this suite; the accounting defects this would otherwise
 //! surface (F1/F3/F10's overcounts/undercounts) are latent until a reporter
-//! is wired, exactly as `tmp-review0.md` notes. This suite does not simulate
+//! is wired, exactly as `upload-flow-review.md` notes. This suite does not simulate
 //! a reporter or assert on `report_usage`'s fire-and-forget calls -- doing so
 //! would test a code path with no observable effect in production today and
 //! risks masking the real gap (documented as latent, not "checked and fine").
@@ -505,7 +505,7 @@ async fn f1_capability_reject_with_compensation_reclaims_orphan() {
 /// A `StorageBackend` decorator whose `initiate_multipart` always fails,
 /// even though `capabilities()` (delegated to the inner backend) genuinely
 /// advertises `multipart_native: true` -- the *other* half of F1
-/// (`tmp-review0.md`: "capability rejection... or backend-initiation
+/// (`upload-flow-review.md`: "capability rejection... or backend-initiation
 /// failure"), distinct from the capability-reject half above.
 struct FailingInitiateBackend {
     inner: Arc<dyn StorageBackend>,
@@ -647,7 +647,7 @@ enum Role {
 
 /// A `MultipartStore` decorator that pauses at two specific checkpoints via
 /// `tokio::sync::Notify` gates, instead of `sleep`-based timing, to force
-/// the *exact* interleaving `tmp-review0.md`'s F2 stranding counterexample
+/// the *exact* interleaving `upload-flow-review.md`'s F2 stranding counterexample
 /// describes -- deterministically, not "reproduces in N/M trials" the way a
 /// pure wall-clock race would (a real completer's assembly duration is not
 /// something a test can pin down to the millisecond, and -- confirmed
