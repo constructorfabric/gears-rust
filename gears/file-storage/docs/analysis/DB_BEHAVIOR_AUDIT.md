@@ -4,8 +4,8 @@
 
 Step 4 of the DB-behavior audit program: build a defect-detection system for
 `gears/file-storage/file-storage/`, validate it against ground truth (an
-independent review, `tmp-review0.md`, findings F1–F10), and produce a full
-inventory + remediation. Methodology:
+independent review, [`upload-flow-review.md`](./upload-flow-review.md), findings
+F1–F10), and produce a full inventory + remediation. Methodology:
 [`14_db_behavior_testing.md`](../../../../docs/toolkit_unified_system/14_db_behavior_testing.md)
 (branch `docs/db-behavior-testing`); reference implementation:
 [resource-group's own Step 1 audit](../../../system/resource-group/docs/analysis/DB_BEHAVIOR_AUDIT.md)
@@ -179,7 +179,7 @@ New for this gear (the coordinator's own instruction: "check
   itself, cross-referenced to the PostgreSQL test that used to falsify it
   and now confirms the claim holds.
 
-F5–F8 (also contract corrections, all in `tmp-review0.md`'s ground truth)
+F5–F8 (also contract corrections, all in `upload-flow-review.md`'s ground truth)
 were verified by direct code reading against the doc/PRD claims they
 correct, but were **not** given new tests: F5 (multipart+idempotency_key
 rejected pre-DB) and F6 (manual bind emits no header) are request-
@@ -193,7 +193,7 @@ route, verified by reading `routes.rs`, not a DB-behavior defect.
 
 ## 2. Validation matrix — ground-truth defects × general rule
 
-**8/10** of `tmp-review0.md`'s F1–F10 are rediscovered by a general,
+**8/10** of `upload-flow-review.md`'s F1–F10 are rediscovered by a general,
 class-level rule (F3 is latent per the Runtime Caveat — see below; F5/F6/F8
 are contract corrections outside this layer's scope by design, see §1.4).
 Every F-number maps to an FS-ID (§4 has the full inventory including new
@@ -279,7 +279,7 @@ repo layer has several genuinely redundant-io-free write paths, e.g.
 
 ## 4. Full findings inventory
 
-FS-01 through FS-10 map onto `tmp-review0.md`'s F1–F10 (§2's table has the
+FS-01 through FS-10 map onto `upload-flow-review.md`'s F1–F10 (§2's table has the
 exact mapping and rule); FS-11 onward are new, found during this audit's
 own code reading and test construction, mirroring how RG's own audit
 surfaced RG-11 through RG-16 beyond its ground truth. Severity is this
@@ -308,7 +308,7 @@ this audit (§5, final): `Fixed` (remediated in this branch, own commit),
 
 ### FS-02 in detail (the coordinator's specific focus)
 
-`tmp-review0.md` explicitly flags "the earlier proposed one-line fix is
+`upload-flow-review.md` explicitly flags "the earlier proposed one-line fix is
 insufficient," and this audit's own reading confirms why: `finish_complete`
 filtering on `lease_owner` alone (the "one-line fix") does not close the
 gap, because the *decisive* gate is the version-finalize CAS three steps
@@ -353,7 +353,7 @@ before the corresponding commit.
 
 ### 5.1 FS-01/F1 — compensate the orphan file (Fixed)
 
-**Decision, not `tmp-review0.md`'s literal hint verbatim**: the hint said
+**Decision, not `upload-flow-review.md`'s literal hint verbatim**: the hint said
 "compensation/cleanup for orphan parent." Verified against the actual
 handler code first: the merged `POST /files` create+plan path
 (`handlers.rs::create_file`'s multipart branch) is the *only* caller that
@@ -384,7 +384,7 @@ sibling test exercising the fixed end-to-end flow.
 
 ### 5.2 FS-02/F2 — converge instead of stranding on a lost finalize CAS (Fixed)
 
-The chosen fix, and why it beats the alternative `tmp-review0.md`'s hint
+The chosen fix, and why it beats the alternative `upload-flow-review.md`'s hint
 also named ("fence ownership through finalize and finish"): owner-scoping
 the finalize CAS itself would change *who wins* finalize (a bigger,
 riskier behavioral change touching the CAS predicate that decides content
@@ -425,7 +425,7 @@ is true again for the interleaving that used to falsify it.
 
 ### 5.3 FS-04/F9 — require `content_id IS NULL` without If-Match (Fixed)
 
-Followed `tmp-review0.md`'s hint closely, choosing the "or require If-Match"
+Followed `upload-flow-review.md`'s hint closely, choosing the "or require If-Match"
 branch of "restrict to `content_id IS NULL` **or** require If-Match" rather
 than an unconditional `IS NULL` restriction, so a caller that legitimately
 supplied and had validated an `If-Match` keeps today's behavior exactly.
@@ -642,11 +642,13 @@ specific to this gear:
 - [`gears/file-storage/docs/concurrency-and-failure-model.md`](../concurrency-and-failure-model.md)
   — the doc FS-06/F4 and FS-12 correct; both discrepancies are pinned as
   executable tests (`contract_drift_test.rs`) rather than left as prose.
-- `tmp-review0.md` (repo root, not committed) — the ground truth this audit
-  validated against; read in full once, findings transcribed as FS-IDs
-  throughout this report and the test suites.
+- [`upload-flow-review.md`](./upload-flow-review.md) — the ground truth this
+  audit validated against; read in full once, findings transcribed as FS-IDs
+  throughout this report and the test suites. Imported into the repository
+  alongside this report so every `F<n>` citation here and in the test suites
+  resolves; previously it lived as an untracked scratch file outside the tree.
 
-## 8. Discrepancies found versus `tmp-review0.md`
+## 8. Discrepancies found versus `upload-flow-review.md`
 
 Listed honestly, per this program's own discipline (Step 3's practice of
 correcting an assumption when the code disagrees, applied here to a written
@@ -656,8 +658,8 @@ review rather than a coordinator's framing):
    be "probably the biggest finding class" for this gear, by analogy with
    RG-09.** It is not — see §1.2. This is the single most consequential
    correction this audit makes to the *framing* it started from (not to
-   `tmp-review0.md` itself, which does not make this claim).
-2. **`tmp-review0.md`'s F2 write-up says the earlier proposed one-line fix
+   `upload-flow-review.md` itself, which does not make this claim).
+2. **`upload-flow-review.md`'s F2 write-up says the earlier proposed one-line fix
    ("filter `finish_complete` on `lease_owner`") is insufficient, without
    fully spelling out the mechanism** — this audit's own PostgreSQL
    reproduction (§2, §4) traces the exact three-step interleaving that
@@ -667,19 +669,19 @@ review rather than a coordinator's framing):
    original completer's finish CAS then fails against a state that is no
    longer `completing` *and* is not yet `Completed` either) and additionally
    discovered (FS-12) that this same interleaving falsifies a documentation
-   claim `tmp-review0.md` does not itself cite (Race Catalog item 2).
+   claim `upload-flow-review.md` does not itself cite (Race Catalog item 2).
 3. **F9's exact mechanism is a temporal gap, not F9's own text
-   mischaracterizing it as one** — `tmp-review0.md`'s F9 write-up already
+   mischaracterizing it as one** — `upload-flow-review.md`'s F9 write-up already
    correctly describes this as "content was (re)bound between the multipart
    create and its complete," which this audit confirms precisely (§2);
    noted here only because this audit's own PostgreSQL test for F9
    deliberately does *not* use barrier gating (unlike F2), and that design
-   choice is explained in §2/§1.3 as following directly from `tmp-review0
-   .md`'s own correct framing, not as a discrepancy from it.
+   choice is explained in §2/§1.3 as following directly from
+   `upload-flow-review.md`'s own correct framing, not as a discrepancy from it.
 4. **No discrepancy found in F1/F3/F4/F5/F6/F7/F8/F10's substance** — all
    verified against the code exactly as described, at the cited lines,
    during this audit's independent read.
-5. **FS-02's actual fix differs from `tmp-review0.md`'s literal hint** — the
+5. **FS-02's actual fix differs from `upload-flow-review.md`'s literal hint** — the
    hint offers "fence ownership through finalize *and* finish (or add
    explicit convergence when finalize loses the CAS)" as two options; this
    audit chose the second (convergence) over the first (owner-fencing the
@@ -687,7 +689,7 @@ review rather than a coordinator's framing):
    completer wins finalize — a wider behavioral change to the CAS that
    decides content correctness — for the same practical outcome the
    narrower convergence fix already achieves. Not a discrepancy in
-   `tmp-review0.md`'s analysis (it explicitly offers both as valid), just a
+   `upload-flow-review.md`'s analysis (it explicitly offers both as valid), just a
    documented choice between the two it names — see §5.2.
 6. **FS-04's fix followed the hint's second branch, not the first** —
    "restrict to `content_id IS NULL` **or** require If-Match": this audit

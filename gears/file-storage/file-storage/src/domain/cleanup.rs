@@ -678,7 +678,7 @@ impl CleanupEngine {
     /// ever ran as an immediate side effect of a version delete, and there
     /// was no version left to trigger it a second time. The parent file was
     /// left a permanent, never-revisited version-less orphan ("a second path
-    /// into F1", `tmp-review0.md`'s F10). Now: whichever of the two cleanup
+    /// into F1", `upload-flow-review.md`'s F10). Now: whichever of the two cleanup
     /// paths (step 1's version reclaim, or step 2's own version cleanup
     /// here) runs last for a given file also gets a fresh chance to notice
     /// the file has zero versions and a `NULL` `content_id` -- by the time
