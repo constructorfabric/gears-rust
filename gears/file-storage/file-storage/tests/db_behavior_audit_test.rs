@@ -10,7 +10,7 @@
 //! methodology validated against `resource-group`'s Step 1-3 audit).
 //!
 //! Ground truth for this module comes from an independent review
-//! (`tmp-review0.md` at the repo root, not committed -- read once, findings
+//! (`docs/analysis/upload-flow-review.md` -- read once, findings
 //! transcribed here as FS-IDs) verified directly against this branch's code
 //! during this audit (see `docs/analysis/DB_BEHAVIOR_AUDIT.md` for the full
 //! inventory and validation matrix). F1/F2/F3/F4/F9/F10 map to FS-01/02/03/06/
