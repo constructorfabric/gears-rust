@@ -123,13 +123,18 @@ static RE_STRING_LIT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"'(?:[^']|'')*'").expect("valid regex"));
 static RE_NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d+\b").expect("valid regex"));
 static RE_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("valid regex"));
-// Collapse a run of 2+ `?` placeholders (SQLite/MySQL style) or `$1, $2, ...`
-// (Postgres style) into a single canonical marker, so an `IN (...)` list or a
-// multi-row `INSERT ... VALUES` batch normalizes the same way regardless of N.
+// Postgres numbers its placeholders (`$1`, `$2`, ...) where SQLite/MySQL use a
+// bare `?`. Rewrite them to `?` so the same logical statement normalizes
+// identically on either backend — and so the list collapse below needs only one
+// pattern. This has to run *before* `RE_NUMBER`, which would otherwise turn
+// `$1` into `$?` and leave nothing for this to match.
+static RE_PG_PLACEHOLDER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$\d+").expect("valid regex"));
+// Collapse a run of 2+ `?` placeholders into a single marker, so an `IN (...)`
+// list or a multi-row `INSERT ... VALUES` batch normalizes the same way
+// regardless of N.
 static RE_PLACEHOLDER_LIST: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\?(?:\s*,\s*\?)+").expect("valid regex"));
-static RE_PG_PLACEHOLDER_LIST: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\$\d+(?:\s*,\s*\$\d+)+").expect("valid regex"));
 
 static RE_INSERT_TABLE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)^insert\s+into\s+"?([a-zA-Z_][a-zA-Z0-9_]*)"?"#).expect("valid regex")
@@ -154,9 +159,11 @@ static RE_FROM_TABLE: LazyLock<Regex> = LazyLock::new(|| {
 #[must_use]
 pub fn normalize_sql(sql: &str) -> String {
     let s = RE_STRING_LIT.replace_all(sql, "'?'");
+    // Order matters: Postgres placeholders before numeric literals, and the
+    // list collapse last, once every placeholder is a bare `?`.
+    let s = RE_PG_PLACEHOLDER.replace_all(&s, "?");
     let s = RE_NUMBER.replace_all(&s, "?");
     let s = RE_PLACEHOLDER_LIST.replace_all(&s, "?");
-    let s = RE_PG_PLACEHOLDER_LIST.replace_all(&s, "$1");
     let s = RE_WHITESPACE.replace_all(&s, " ");
     s.trim().to_owned()
 }
@@ -514,10 +521,53 @@ mod tests {
                 r#"SELECT * FROM "gts_type" WHERE "id" IN (?, ?, ?)"#,
                 r#"SELECT * FROM "gts_type" WHERE "id" IN (?)"#,
             ),
+            // Postgres numbers its placeholders; a single one normalizes to the
+            // same bare `?` SQLite produces.
+            (
+                r#"SELECT * FROM "gts_type" WHERE "id" = $1"#,
+                r#"SELECT * FROM "gts_type" WHERE "id" = ?"#,
+            ),
+            // ...and a Postgres list collapses like a SQLite one, rather than
+            // being deleted or left with per-index numbering.
+            (
+                r#"SELECT * FROM "gts_type" WHERE "id" IN ($1, $2, $3)"#,
+                r#"SELECT * FROM "gts_type" WHERE "id" IN (?)"#,
+            ),
+            (
+                r#"INSERT INTO "resource_group_closure" VALUES ($1, $2), ($3, $4)"#,
+                r#"INSERT INTO "resource_group_closure" VALUES (?), (?)"#,
+            ),
         ];
         for (input, expected) in cases {
             assert_eq!(super::normalize_sql(input), expected, "input: {input}");
         }
+    }
+
+    #[test]
+    fn normalize_sql_pg_and_sqlite_placeholders_agree() {
+        // The same logical statement issued against either backend must land on
+        // one signature, or per-(kind, table) stats would split in two on
+        // Postgres and the scale-invariance rules would compare nothing.
+        assert_eq!(
+            super::normalize_sql(r#"SELECT * FROM "gts_type" WHERE "id" IN ($1, $2, $3)"#),
+            super::normalize_sql(r#"SELECT * FROM "gts_type" WHERE "id" IN (?, ?, ?)"#),
+        );
+    }
+
+    #[test]
+    fn normalize_sql_pg_placeholder_list_length_does_not_change_shape() {
+        let three = super::normalize_sql(r#"SELECT * FROM "gts_type" WHERE "id" IN ($1, $2, $3)"#);
+        let thirty = super::normalize_sql(&format!(
+            r#"SELECT * FROM "gts_type" WHERE "id" IN ({})"#,
+            (1..=30)
+                .map(|i| format!("${i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        assert_eq!(
+            three, thirty,
+            "Postgres IN-list length must not change the normalized shape"
+        );
     }
 
     #[test]
