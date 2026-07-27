@@ -666,7 +666,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-fs-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -714,6 +714,10 @@ test-db: test-sqlite test-pg test-mysql
 test-users-info-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p users-info --features "integration"
+
+## Run file-storage gear PostgreSQL concurrency tests
+test-fs-pg: install-tools
+	cargo nextest run -p cf-gears-file-storage --features integration
 
 ## Run TimescaleDB usage-collector plugin integration tests (Docker required;
 ## the suite spins up its own timescale/timescaledb container via testcontainers)

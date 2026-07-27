@@ -29,6 +29,12 @@ workspace = true
 [features]
 default = []
 
+# Gates the Postgres-backed real-DB concurrency suite
+# (tests/pg_concurrency_test.rs). Disabled by default because it spins up a
+# `testcontainers` Docker container; enable with `--features integration`
+# when Docker is available locally or in CI.
+integration = []
+
 [dependencies]
 # SDK - public API, models, and errors
 cf-gears-file-storage-sdk = { version = "0.1.0", path = "../file-storage-sdk" }

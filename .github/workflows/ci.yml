@@ -402,6 +402,9 @@ jobs:
       - name: Test toolkit-db (mysql integration)
         run: make test-mysql
 
+      - name: Test file-storage (pg concurrency, integration)
+        run: make test-fs-pg
+
   test-fips:
     name: FIPS verification (${{ matrix.os }})
     needs: changes

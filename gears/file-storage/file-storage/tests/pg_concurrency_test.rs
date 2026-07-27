@@ -1,3 +1,4 @@
+#![cfg(feature = "integration")]
 // Created: 2026-07-27 by Constructor Tech
 #![allow(
     clippy::expect_used,
