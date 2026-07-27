@@ -174,9 +174,11 @@ fn assistant_content_is_plain_string() {
 }
 
 #[test]
-fn tools_are_omitted_even_when_set() {
+fn provider_hosted_tools_are_omitted() {
     use crate::domain::llm::{LlmTool, WebSearchContextSize};
 
+    // vLLM doesn't host file_search/web_search/code_interpreter — these must
+    // be dropped so the upstream doesn't reject unknown tool types.
     let request = llm_request("test-model")
         .message(LlmMessage::user("Search"))
         .tool(LlmTool::WebSearch {
@@ -190,7 +192,71 @@ fn tools_are_omitted_even_when_set() {
         .build_streaming();
 
     let body = build_request_body(&request, true);
+    // No function tools present → `tools` omitted entirely.
     assert!(body.get("tools").is_none());
+}
+
+#[test]
+fn function_tools_are_serialized() {
+    use crate::domain::llm::LlmTool;
+
+    // Regression guard: function tools (e.g. `exa_search`) MUST reach the
+    // model, otherwise it can never call them.
+    let request = llm_request("test-model")
+        .message(LlmMessage::user("weather in Istanbul"))
+        .tool(LlmTool::Function {
+            name: "exa_search".into(),
+            description: "Search the web.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"]
+            }),
+        })
+        // Provider-hosted tool alongside — must be filtered out.
+        .tool(LlmTool::WebSearch {
+            search_context_size: crate::domain::llm::WebSearchContextSize::Low,
+        })
+        .build_streaming();
+
+    let body = build_request_body(&request, true);
+    let tools = body["tools"].as_array().expect("tools array present");
+    assert_eq!(tools.len(), 1, "only the function tool should be serialized");
+    assert_eq!(tools[0]["type"], "function");
+    assert_eq!(tools[0]["name"], "exa_search");
+    assert_eq!(tools[0]["description"], "Search the web.");
+    assert_eq!(tools[0]["parameters"]["required"][0], "query");
+}
+
+#[test]
+fn raw_input_items_are_appended_to_input() {
+    // Agentic-loop replay: function_call / function_call_output items must be
+    // forwarded so the model sees its prior tool call and the result.
+    let request = llm_request("test-model")
+        .message(LlmMessage::user("weather in Istanbul"))
+        .raw_input_items(vec![
+            serde_json::json!({
+                "type": "function_call",
+                "name": "exa_search",
+                "arguments": "{\"query\":\"weather Istanbul\"}",
+                "call_id": "call_1"
+            }),
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "Sunny, 28°C"
+            }),
+        ])
+        .build_streaming();
+
+    let body = build_request_body(&request, true);
+    let input = body["input"].as_array().unwrap();
+    // 1 user message + 2 replay items.
+    assert_eq!(input.len(), 3);
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["name"], "exa_search");
+    assert_eq!(input[2]["type"], "function_call_output");
+    assert_eq!(input[2]["output"], "Sunny, 28°C");
 }
 
 #[test]
@@ -243,4 +309,94 @@ fn additional_params_are_merged() {
     let body = build_request_body(&request, true);
     assert_eq!(body["temperature"], 0.5);
     assert_eq!(body["top_p"], 0.9);
+}
+
+// ── VllmProviderEvent: event type carried in JSON `type` ──────────────
+// vLLM omits the SSE `event:` line and puts the type only inside the JSON
+// payload. The wrapper must recover it so events are recognised; otherwise
+// the stream ends without a terminal event.
+
+#[test]
+fn vllm_event_resolves_text_delta_from_payload_type() {
+    let event = ServerEvent {
+        event: None,
+        data: r#"{"type":"response.output_text.delta","delta":"Hello","item_id":"msg_1","sequence_number":4}"#.to_string(),
+        id: None,
+        retry: None,
+    };
+    let VllmProviderEvent::Shared(result) = VllmProviderEvent::from_server_event(event).unwrap()
+    else {
+        panic!("expected a shared ProviderEvent");
+    };
+    assert!(
+        matches!(result, ProviderEvent::ResponseOutputTextDelta { delta } if delta == "Hello"),
+        "payload `type` should be honoured when the SSE `event:` field is absent"
+    );
+}
+
+#[test]
+fn vllm_event_resolves_completed_from_payload_type() {
+    let event = ServerEvent {
+        event: None,
+        data: r#"{"type":"response.completed","sequence_number":10,"response":{"id":"resp_1","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#.to_string(),
+        id: None,
+        retry: None,
+    };
+    let VllmProviderEvent::Shared(result) = VllmProviderEvent::from_server_event(event).unwrap()
+    else {
+        panic!("expected a shared ProviderEvent");
+    };
+    assert!(
+        matches!(result, ProviderEvent::ResponseCompleted { response } if response.id == "resp_1"),
+        "terminal event must be recognised from the JSON `type` field"
+    );
+}
+
+#[test]
+fn vllm_event_prefers_sse_event_field_when_present() {
+    // If the upstream does send `event:` (OpenAI shape), it wins.
+    let event = ServerEvent {
+        event: Some("response.output_text.delta".to_string()),
+        data: r#"{"type":"response.completed","delta":"Hi"}"#.to_string(),
+        id: None,
+        retry: None,
+    };
+    let VllmProviderEvent::Shared(result) = VllmProviderEvent::from_server_event(event).unwrap()
+    else {
+        panic!("expected a shared ProviderEvent");
+    };
+    assert!(matches!(result, ProviderEvent::ResponseOutputTextDelta { delta } if delta == "Hi"));
+}
+
+#[test]
+fn vllm_event_captures_reasoning_delta() {
+    // gpt-oss streams chain-of-thought as `response.reasoning_text.delta`.
+    let event = ServerEvent {
+        event: None,
+        data: r#"{"type":"response.reasoning_text.delta","content_index":0,"delta":"thinking…","item_id":"msg_1"}"#.to_string(),
+        id: None,
+        retry: None,
+    };
+    let result = VllmProviderEvent::from_server_event(event).unwrap();
+    assert!(
+        matches!(result, VllmProviderEvent::ReasoningDelta { delta } if delta == "thinking…"),
+        "reasoning deltas must be captured as a dedicated variant"
+    );
+}
+
+#[test]
+fn vllm_event_unmodelled_lifecycle_resolves_to_unknown() {
+    // A lifecycle event vLLM emits but the adapter doesn't model must parse
+    // cleanly as Unknown, not error the stream.
+    let event = ServerEvent {
+        event: None,
+        data: r#"{"type":"response.reasoning_part.added","content_index":0}"#.to_string(),
+        id: None,
+        retry: None,
+    };
+    let VllmProviderEvent::Shared(result) = VllmProviderEvent::from_server_event(event).unwrap()
+    else {
+        panic!("expected a shared ProviderEvent");
+    };
+    assert!(matches!(result, ProviderEvent::Unknown { .. }));
 }

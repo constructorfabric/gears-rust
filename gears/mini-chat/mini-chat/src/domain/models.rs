@@ -176,6 +176,9 @@ pub struct ResolvedModel {
     pub thread_summary_prompt: String,
     /// Maximum output tokens for this model.
     pub max_output_tokens: u32,
+    /// Names of custom function tools enabled for this model (e.g.
+    /// `["exa_search"]`). Resolved against the gear's function-tool registry.
+    pub enabled_function_tools: Vec<String>,
 }
 
 impl From<&mini_chat_sdk::ModelCatalogEntry> for ResolvedModel {
@@ -202,6 +205,7 @@ impl From<&mini_chat_sdk::ModelCatalogEntry> for ResolvedModel {
             tool_support: e.general_config.tool_support.clone(),
             thread_summary_prompt: e.thread_summary_prompt.clone(),
             max_output_tokens: e.max_output_tokens,
+            enabled_function_tools: e.enabled_function_tools.clone(),
         }
     }
 }

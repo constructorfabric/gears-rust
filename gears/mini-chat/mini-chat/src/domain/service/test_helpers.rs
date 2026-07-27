@@ -502,6 +502,7 @@ pub fn test_catalog_entry(params: TestCatalogEntryParams) -> ModelCatalogEntry {
         }),
         system_prompt: String::new(),
         thread_summary_prompt: String::new(),
+        enabled_function_tools: Vec::new(),
     }
 }
 

@@ -77,6 +77,9 @@ struct OagwDeferred {
     authn: Arc<dyn AuthNResolverClient>,
     client_credentials: crate::config::ClientCredentialsConfig,
     providers: std::collections::HashMap<String, ProviderEntry>,
+    /// Exa search config — registers its own OAGW upstream + `/search` route
+    /// in `start()` when enabled.
+    exa_search: crate::config::ExaSearchConfig,
 }
 
 /// State needed to build + start the outbox pipeline in `start()`.
@@ -166,6 +169,9 @@ impl Gear for MiniChatGear {
         cfg.knowledge_search
             .validate()
             .map_err(|e| anyhow::anyhow!("knowledge_search config: {e}"))?;
+        cfg.exa_search
+            .validate()
+            .map_err(|e| anyhow::anyhow!("exa_search config: {e}"))?;
 
         let vendor = cfg.vendor.trim().to_owned();
         if vendor.is_empty() {
@@ -226,6 +232,11 @@ impl Gear for MiniChatGear {
                 }
             }
         }
+        // Same host-as-alias fallback for the exa upstream (OAGW derives the
+        // alias from the hostname; real registration is deferred to start()).
+        if cfg.exa_search.enabled && cfg.exa_search.upstream_alias.is_none() {
+            cfg.exa_search.upstream_alias = Some(cfg.exa_search.host.clone());
+        }
 
         // Save a copy for deferred OAGW registration in start().
         // Ignore the result: if already set, we keep the first value.
@@ -234,6 +245,7 @@ impl Gear for MiniChatGear {
             authn: Arc::clone(&authn_client),
             client_credentials: cfg.client_credentials.clone(),
             providers: cfg.providers.clone(),
+            exa_search: cfg.exa_search.clone(),
         }));
 
         let provider_resolver = Arc::new(ProviderResolver::new(&gateway, cfg.providers));
@@ -411,6 +423,34 @@ impl Gear for MiniChatGear {
             anthropic_files_client: anthropic_files_client.clone(),
         }));
 
+        // ── Custom function-tool registry ───────────────────────────────────
+        //
+        // Each enabled tool is registered by name; per-model enablement is
+        // resolved per-request in StreamService against `enabled_function_tools`.
+        let mut function_tools: std::collections::HashMap<
+            String,
+            Arc<dyn crate::domain::ports::FunctionTool>,
+        > = std::collections::HashMap::new();
+        if cfg.exa_search.enabled {
+            let alias = cfg
+                .exa_search
+                .upstream_alias
+                .clone()
+                .unwrap_or_else(|| cfg.exa_search.host.clone());
+            let exa: Arc<dyn crate::domain::ports::FunctionTool> = Arc::new(
+                crate::infra::llm::providers::exa_search_tool::ExaSearchTool::new(
+                    Arc::clone(&rag_client),
+                    alias,
+                    cfg.exa_search.search_type.clone(),
+                    cfg.exa_search.num_results,
+                    cfg.exa_search.max_calls_per_message,
+                    cfg.exa_search.max_chars,
+                    cfg.exa_search.guard.clone(),
+                ),
+            );
+            function_tools.insert(exa.name().to_owned(), exa);
+        }
+
         // ── Services ────────────────────────────────────────────────────────
 
         let services = Arc::new(AppServices::new(
@@ -434,6 +474,7 @@ impl Gear for MiniChatGear {
             cfg.thread_summary_worker,
             cfg.knowledge_search,
             knowledge_retriever,
+            function_tools,
             anthropic_files_client,
         ));
 
@@ -511,6 +552,16 @@ impl RunnableCapability for MiniChatGear {
                 &mut providers,
             )
             .await?;
+
+            // Register the exa upstream + /search route when enabled.
+            if deferred.exa_search.enabled {
+                crate::infra::oagw_provisioning::register_exa_upstream(
+                    &deferred.gateway,
+                    &ctx,
+                    &deferred.exa_search,
+                )
+                .await?;
+            }
         }
 
         // Start the outbox pipeline now that OAGW upstreams are registered.

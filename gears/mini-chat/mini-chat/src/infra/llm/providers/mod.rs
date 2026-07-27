@@ -10,6 +10,7 @@ pub mod azure_file_storage;
 pub mod azure_knowledge_retriever;
 pub mod azure_vector_store;
 pub mod dispatching_storage;
+pub mod exa_search_tool;
 pub mod openai_chat;
 pub mod openai_file_storage;
 pub mod openai_responses;

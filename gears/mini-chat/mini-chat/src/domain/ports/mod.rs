@@ -25,10 +25,12 @@ use super::error::DomainError;
 pub type FileStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>>;
 
+pub(crate) mod function_tool;
 pub(crate) mod knowledge_retriever;
 pub(crate) mod metric_labels;
 pub(crate) mod metrics;
 
+pub(crate) use function_tool::{FunctionTool, FunctionToolError};
 pub(crate) use knowledge_retriever::KnowledgeRetriever;
 pub(crate) use metrics::MiniChatMetricsPort;
 

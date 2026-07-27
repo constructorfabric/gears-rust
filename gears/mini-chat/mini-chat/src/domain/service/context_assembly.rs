@@ -79,6 +79,13 @@ pub struct ContextInput<'a> {
     pub token_budget: Option<TokenBudget>,
     /// Provider file IDs for image attachments on the current user message.
     pub image_file_ids: &'a [String],
+    /// Extra custom function-tool descriptors (e.g. `exa_search`) enabled for
+    /// this request. Appended verbatim to the tool list. Each is a
+    /// [`LlmTool::Function`] resolved from the gear's function-tool registry.
+    pub extra_function_tools: Vec<LlmTool>,
+    /// System-prompt guards for the enabled custom function tools, appended to
+    /// the system instructions (parallel to `extra_function_tools`).
+    pub extra_function_guards: Vec<String>,
 }
 
 /// Output of context assembly — ready to feed into `LlmRequestBuilder`.
@@ -219,6 +226,7 @@ pub fn assemble_context(
         input.file_search_guard,
         input.knowledge_search_enabled,
         input.knowledge_search_guard,
+        &input.extra_function_guards,
     );
 
     // ── Tools ──
@@ -265,6 +273,9 @@ pub fn assemble_context(
             }),
         });
     }
+
+    // Custom function tools (e.g. exa_search) resolved per-model from the registry.
+    tools.extend(input.extra_function_tools.iter().cloned());
 
     // ── Truncation ──
     if let Some(ref budget) = input.token_budget {
@@ -380,6 +391,7 @@ pub fn assemble_context(
 
 /// Build system instructions from base prompt + conditional guard strings.
 /// Returns `None` if the result would be empty.
+#[allow(clippy::too_many_arguments)]
 fn build_system_instructions(
     system_prompt: &str,
     web_search_enabled: bool,
@@ -388,6 +400,7 @@ fn build_system_instructions(
     file_search_guard: &str,
     knowledge_search_enabled: bool,
     knowledge_search_guard: &str,
+    extra_function_guards: &[String],
 ) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
 
@@ -402,6 +415,12 @@ fn build_system_instructions(
     }
     if knowledge_search_enabled && !knowledge_search_guard.is_empty() {
         parts.push(knowledge_search_guard);
+    }
+    // Guards for enabled custom function tools (e.g. exa_search).
+    for guard in extra_function_guards {
+        if !guard.is_empty() {
+            parts.push(guard);
+        }
     }
 
     if parts.is_empty() {
@@ -443,11 +462,56 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         assert!(result.system_instructions.is_none());
         assert!(result.tools.is_empty());
         assert_eq!(result.messages.len(), 1);
+    }
+
+    // Custom function tools are appended to the tool list, and their guards
+    // are appended to the system instructions.
+    #[test]
+    fn extra_function_tools_and_guards_are_appended() {
+        let exa_tool = LlmTool::Function {
+            name: "exa_search".to_owned(),
+            description: "Search the web.".to_owned(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+        let result = assemble_context(&ContextInput {
+            system_prompt: "You are helpful.",
+            web_search_guard: "",
+            file_search_guard: "",
+            thread_summary: None,
+            recent_messages: &[],
+            user_message: "hello",
+            web_search_enabled: false,
+            file_search_enabled: false,
+            vector_store_ids: &[],
+            file_search_filters: None,
+            web_search_context_size: crate::domain::llm::WebSearchContextSize::Low,
+            file_search_max_num_results: 5,
+            code_interpreter_file_ids: vec![],
+            token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
+            image_file_ids: &[],
+            extra_function_tools: vec![exa_tool],
+            extra_function_guards: vec!["Use exa_search for fresh facts.".to_owned()],
+        })
+        .unwrap();
+
+        assert!(
+            result
+                .tools
+                .iter()
+                .any(|t| matches!(t, LlmTool::Function { name, .. } if name == "exa_search")),
+            "exa_search tool should be present"
+        );
+        let sys = result.system_instructions.expect("system instructions");
+        assert!(sys.contains("Use exa_search for fresh facts."));
     }
 
     // 5.7: system prompt + web_search enabled → guard appended
@@ -471,6 +535,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         let instructions = result.system_instructions.unwrap();
@@ -499,6 +565,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         let instructions = result.system_instructions.unwrap();
@@ -527,6 +595,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         let instructions = result.system_instructions.unwrap();
@@ -556,6 +626,8 @@ mod tests {
             knowledge_search_enabled: true,
             knowledge_search_guard: "Use search_knowledge for internal docs.",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         let instructions = result.system_instructions.unwrap();
@@ -595,6 +667,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "Use search_knowledge for internal docs.",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         let instructions = result.system_instructions.unwrap();
@@ -631,6 +705,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         // First message should be the thread summary
@@ -672,6 +748,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         assert_eq!(result.messages.len(), 3); // 2 recent + current
@@ -703,6 +781,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         // system message skipped: 2 recent (user+assistant) + 1 current = 3
@@ -731,6 +811,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         let last = result.messages.last().unwrap();
@@ -766,6 +848,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         assert_eq!(result.tools.len(), 2);
@@ -802,6 +886,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         assert!(result.tools.is_empty());
@@ -825,6 +911,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         assert_eq!(result.tools.len(), 1);
@@ -943,6 +1031,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
 
@@ -985,6 +1075,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
 
@@ -1037,6 +1129,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
 
@@ -1066,6 +1160,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         });
 
         assert!(matches!(
@@ -1100,6 +1196,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
 
@@ -1142,6 +1240,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         assert_eq!(result.tools.len(), 1);
@@ -1172,6 +1272,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         assert!(result.tools.is_empty());
@@ -1216,6 +1318,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &images,
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         assert_eq!(result.messages.len(), 1);
@@ -1246,6 +1350,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &images,
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         let msg = &result.messages[0];
@@ -1274,6 +1380,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         })
         .unwrap();
         let msg = &result.messages[0];
@@ -1302,6 +1410,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &images,
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         });
         assert!(result.is_ok());
     }
@@ -1327,6 +1437,8 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &images,
+            extra_function_tools: Vec::new(),
+            extra_function_guards: Vec::new(),
         });
         assert!(matches!(
             result,

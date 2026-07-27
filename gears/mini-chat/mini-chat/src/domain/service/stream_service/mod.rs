@@ -39,6 +39,42 @@ use types::{
 // StreamService
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Resolved custom function tools for a request: `(dispatch map keyed by name,
+/// tool descriptors for the LLM request, system-prompt guards)`.
+type ResolvedFunctionTools = (
+    std::collections::HashMap<String, Arc<dyn crate::domain::ports::FunctionTool>>,
+    Vec<crate::domain::llm::LlmTool>,
+    Vec<String>,
+);
+
+/// Pure resolution of enabled custom function tools against a registry.
+///
+/// Unknown tool names are silently ignored. Extracted as a free function so it
+/// can be unit-tested without constructing a `StreamService`.
+fn resolve_function_tools_from(
+    registry: &std::collections::HashMap<String, Arc<dyn crate::domain::ports::FunctionTool>>,
+    enabled: &[String],
+) -> ResolvedFunctionTools {
+    let mut map = std::collections::HashMap::new();
+    let mut tools = Vec::new();
+    let mut guards = Vec::new();
+    for name in enabled {
+        if let Some(tool) = registry.get(name) {
+            let def = tool.definition();
+            tools.push(crate::domain::llm::LlmTool::Function {
+                name: def.name,
+                description: def.description,
+                parameters: def.parameters,
+            });
+            if let Some(guard) = tool.system_prompt_guard() {
+                guards.push(guard);
+            }
+            map.insert(name.clone(), Arc::clone(tool));
+        }
+    }
+    (map, tools, guards)
+}
+
 /// Service handling SSE streaming and turn orchestration.
 ///
 /// In P1 this is a stateless proxy: it builds an LLM request, streams
@@ -74,6 +110,10 @@ pub struct StreamService<
     metrics: Arc<dyn MiniChatMetricsPort>,
     knowledge_search_config: crate::config::KnowledgeSearchConfig,
     knowledge_retriever: Option<Arc<dyn crate::domain::ports::KnowledgeRetriever>>,
+    /// Custom function-tool registry, keyed by tool name. Resolved per-request
+    /// against the model's `enabled_function_tools`.
+    function_tools:
+        std::collections::HashMap<String, Arc<dyn crate::domain::ports::FunctionTool>>,
 }
 
 impl<
@@ -109,6 +149,10 @@ impl<
         metrics: Arc<dyn MiniChatMetricsPort>,
         knowledge_search_config: crate::config::KnowledgeSearchConfig,
         knowledge_retriever: Option<Arc<dyn crate::domain::ports::KnowledgeRetriever>>,
+        function_tools: std::collections::HashMap<
+            String,
+            Arc<dyn crate::domain::ports::FunctionTool>,
+        >,
     ) -> Self {
         Self {
             db,
@@ -129,7 +173,15 @@ impl<
             metrics,
             knowledge_search_config,
             knowledge_retriever,
+            function_tools,
         }
+    }
+
+    /// Resolve the custom function tools enabled for a model against the
+    /// registry. Returns `(dispatch map, tool descriptors, system-prompt guards)`.
+    /// Unknown tool names are silently ignored.
+    fn resolve_function_tools(&self, enabled: &[String]) -> ResolvedFunctionTools {
+        resolve_function_tools_from(&self.function_tools, enabled)
     }
 
     /// The configured channel capacity for the provider->writer mpsc channel.
@@ -279,6 +331,9 @@ impl<
             .multimodal_capabilities
             .iter()
             .any(|c| c == "VISION_INPUT");
+        // Resolve custom function tools enabled for this model against the registry.
+        let (function_tools, extra_function_tools, extra_function_guards) =
+            self.resolve_function_tools(&resolved_model.enabled_function_tools);
         let ResolvedModel {
             model_id: model,
             provider_id,
@@ -613,7 +668,8 @@ impl<
             context_window: pf.context_window,
             max_output_tokens_applied: pf.max_output_tokens_applied,
             budgets: pf.estimation_budgets,
-            tools_enabled: file_search_enabled,
+            // Custom function tools also incur the flat tool surcharge (Q1).
+            tools_enabled: file_search_enabled || !function_tools.is_empty(),
             web_search_enabled,
             code_interpreter_enabled,
         });
@@ -641,6 +697,8 @@ impl<
                 ci_file_ids,
                 token_budget,
                 &image_file_ids,
+                extra_function_tools,
+                extra_function_guards,
             )
             .await?;
 
@@ -686,6 +744,7 @@ impl<
                 provider_file_id_map,
                 anthropic_file_ids,
                 knowledge_search: self.build_knowledge_search_params(&tenant_id_str),
+                function_tools,
             },
             cancel,
             tx,
@@ -930,6 +989,8 @@ impl<
         code_interpreter_file_ids: Vec<String>,
         token_budget: Option<super::context_assembly::TokenBudget>,
         image_file_ids: &[String],
+        extra_function_tools: Vec<crate::domain::llm::LlmTool>,
+        extra_function_guards: Vec<String>,
     ) -> Result<
         (
             super::context_assembly::AssembledContext,
@@ -1021,6 +1082,8 @@ impl<
                 code_interpreter_file_ids,
                 token_budget,
                 image_file_ids,
+                extra_function_tools,
+                extra_function_guards,
             })
             .map_err(|e| StreamError::ContextBudgetExceeded {
                 required_tokens: match &e {
@@ -1065,6 +1128,9 @@ impl<
         cancel: CancellationToken,
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<tokio::task::JoinHandle<StreamOutcome>, StreamError> {
+        // Resolve custom function tools enabled for this model against the registry.
+        let (function_tools, extra_function_tools, extra_function_guards) =
+            self.resolve_function_tools(&resolved_model.enabled_function_tools);
         let model = resolved_model.model_id;
         let provider_id = resolved_model.provider_id;
         let tenant_id = ctx.subject_tenant_id();
@@ -1356,7 +1422,8 @@ impl<
             context_window: pf.context_window,
             max_output_tokens_applied: pf.max_output_tokens_applied,
             budgets: pf.estimation_budgets,
-            tools_enabled: file_search_enabled,
+            // Custom function tools also incur the flat tool surcharge (Q1).
+            tools_enabled: file_search_enabled || !function_tools.is_empty(),
             web_search_enabled,
             code_interpreter_enabled,
         });
@@ -1381,6 +1448,8 @@ impl<
                 ci_file_ids,
                 token_budget,
                 &[], // retry/edit: no new image attachments
+                extra_function_tools,
+                extra_function_guards,
             )
             .await?;
 
@@ -1420,6 +1489,7 @@ impl<
                 provider_file_id_map,
                 anthropic_file_ids,
                 knowledge_search: self.build_knowledge_search_params(&tenant_id_str),
+                function_tools,
             },
             cancel,
             tx,
@@ -1848,6 +1918,7 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                function_tools: std::collections::HashMap::new(),
             },
             cancel,
             tx,
@@ -1913,6 +1984,7 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                function_tools: std::collections::HashMap::new(),
             },
             cancel,
             tx,
@@ -1971,6 +2043,7 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                function_tools: std::collections::HashMap::new(),
             },
             cancel,
             tx,
@@ -2078,6 +2151,7 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                function_tools: std::collections::HashMap::new(),
             },
             cancel.clone(),
             tx,
@@ -2255,6 +2329,7 @@ mod tests {
             metrics,
             crate::config::KnowledgeSearchConfig::default(),
             None,
+            std::collections::HashMap::new(),
         )
     }
 
@@ -2305,6 +2380,7 @@ mod tests {
             },
             thread_summary_prompt: String::new(),
             max_output_tokens: 16_384,
+            enabled_function_tools: Vec::new(),
         }
     }
 
@@ -2998,6 +3074,7 @@ mod tests {
             metrics,
             crate::config::KnowledgeSearchConfig::default(),
             None,
+            std::collections::HashMap::new(),
         )
     }
 
@@ -3431,6 +3508,7 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                function_tools: std::collections::HashMap::new(),
             },
             cancel,
             tx,
@@ -3611,6 +3689,7 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                function_tools: std::collections::HashMap::new(),
             },
             cancel,
             tx,
@@ -3790,6 +3869,7 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                function_tools: std::collections::HashMap::new(),
             },
             cancel,
             tx,
@@ -3951,6 +4031,7 @@ mod tests {
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
             crate::config::KnowledgeSearchConfig::default(),
             None,
+            std::collections::HashMap::new(),
         )
     }
 
@@ -4173,6 +4254,7 @@ mod tests {
                     },
                     thread_summary_prompt: String::new(),
                     max_output_tokens: 16_384,
+                    enabled_function_tools: Vec::new(),
                 },
                 false,
                 Vec::new(),
@@ -4337,6 +4419,7 @@ mod tests {
                     },
                     thread_summary_prompt: String::new(),
                     max_output_tokens: 16_384,
+                    enabled_function_tools: Vec::new(),
                 },
                 false,
                 Vec::new(),
@@ -4561,6 +4644,7 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                function_tools: std::collections::HashMap::new(),
             },
             cancel,
             tx,
@@ -4620,6 +4704,7 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                function_tools: std::collections::HashMap::new(),
             },
             cancel,
             tx,
@@ -4689,6 +4774,7 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                function_tools: std::collections::HashMap::new(),
             },
             cancel,
             tx,
@@ -4745,6 +4831,7 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                function_tools: std::collections::HashMap::new(),
             },
             cancel,
             tx,
@@ -4803,6 +4890,7 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                function_tools: std::collections::HashMap::new(),
             },
             cancel,
             tx,
@@ -4872,6 +4960,7 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                function_tools: std::collections::HashMap::new(),
             },
             cancel,
             tx,
@@ -5614,6 +5703,7 @@ mod tests {
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
             crate::config::KnowledgeSearchConfig::default(),
             None,
+            std::collections::HashMap::new(),
         )
     }
 
@@ -6278,5 +6368,89 @@ mod tests {
             Some("input_too_long"),
             "error_code should be set to input_too_long"
         );
+    }
+}
+
+#[cfg(test)]
+mod function_tool_resolution_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+
+    use super::resolve_function_tools_from;
+    use crate::domain::llm::{LlmFunctionDef, LlmTool};
+    use crate::domain::ports::{FunctionTool, FunctionToolError};
+
+    struct MockTool {
+        name: &'static str,
+        guard: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl FunctionTool for MockTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn definition(&self) -> LlmFunctionDef {
+            LlmFunctionDef {
+                name: self.name.to_owned(),
+                description: "mock".to_owned(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        fn system_prompt_guard(&self) -> Option<String> {
+            self.guard.map(ToOwned::to_owned)
+        }
+        fn max_calls(&self) -> u32 {
+            3
+        }
+        async fn execute(
+            &self,
+            _ctx: toolkit_security::SecurityContext,
+            _input: serde_json::Value,
+        ) -> Result<String, FunctionToolError> {
+            Ok("ok".to_owned())
+        }
+    }
+
+    fn registry() -> std::collections::HashMap<String, Arc<dyn FunctionTool>> {
+        let mut m: std::collections::HashMap<String, Arc<dyn FunctionTool>> =
+            std::collections::HashMap::new();
+        m.insert(
+            "exa_search".to_owned(),
+            Arc::new(MockTool {
+                name: "exa_search",
+                guard: Some("exa guard"),
+            }),
+        );
+        m
+    }
+
+    #[test]
+    fn resolves_enabled_tool_with_def_and_guard() {
+        let (map, tools, guards) =
+            resolve_function_tools_from(&registry(), &["exa_search".to_owned()]);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("exa_search"));
+        assert!(
+            matches!(&tools[..], [LlmTool::Function { name, .. }] if name == "exa_search"),
+            "should produce one exa_search Function tool"
+        );
+        assert_eq!(guards, vec!["exa guard".to_owned()]);
+    }
+
+    #[test]
+    fn ignores_unknown_tool_names() {
+        let (map, tools, guards) =
+            resolve_function_tools_from(&registry(), &["nonexistent".to_owned()]);
+        assert!(map.is_empty());
+        assert!(tools.is_empty());
+        assert!(guards.is_empty());
+    }
+
+    #[test]
+    fn empty_enabled_resolves_to_empty() {
+        let (map, tools, guards) = resolve_function_tools_from(&registry(), &[]);
+        assert!(map.is_empty() && tools.is_empty() && guards.is_empty());
     }
 }

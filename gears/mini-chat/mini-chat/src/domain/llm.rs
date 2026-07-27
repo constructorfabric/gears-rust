@@ -123,6 +123,20 @@ impl FileSearchFilter {
     }
 }
 
+/// A provider-agnostic function-tool descriptor (name + description + JSON-schema).
+///
+/// This is the function-only authoring type returned by
+/// [`crate::domain::ports::FunctionTool::definition`]. `assemble_context` wraps
+/// it into [`LlmTool::Function`] for the request. (Phase 2 will collapse the
+/// enum variant to hold this struct directly.)
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct LlmFunctionDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
 /// A provider-agnostic tool descriptor.
 ///
 /// Each adapter maps supported tools to its wire format and silently drops

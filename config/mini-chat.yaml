@@ -105,7 +105,13 @@ gears:
     config:
       secrets:
         - key: "azure-openai-key"
-          value: "${AZURE_OPENAI_API_KEY}"
+          value: "${AZURE_OPENAI_API_KEY:-}"
+        # Local H200 vLLM (gpt-oss). Add the value yourself.
+        - key: "vllm-h200-key"
+          value: "${VLLM_H200_API_KEY}"
+        # exa.ai web search. Add the value yourself.
+        - key: "exa-api-key"
+          value: "${EXA_API_KEY}"
 
   file-parser:
     config:
@@ -135,7 +141,7 @@ gears:
       # `upstream_alias` is optional — defaults to `host` when omitted.
       thread_summary_worker:
         enabled: true
-        summary_model_id: "gpt-4.1-mini"
+        summary_model_id: "gpt-oss-120b"
         compression_threshold_pct: 80
         summary_system_prompt: "You are a conversation summarizer. Given a conversation (and optionally an existing summary), produce a detailed structured summary. Respond with an <analysis> block (your reasoning) followed by a <summary> block (the final summary). Only the <summary> content will be stored. Do not invent information not present in the conversation."
       providers:
@@ -151,6 +157,38 @@ gears:
             header: "api-key"
             prefix: ""
             secret_ref: "azure-openai-key"
+
+        # ── Local H200 vLLM (gpt-oss via the Responses API) ───────────────
+        # https://local-llm.adc.corp.acronis.com  →  POST /v1/responses
+        # (If this endpoint speaks Chat Completions instead, switch to
+        #  kind: openai_chat_completions and api_path: /v1/chat/completions.)
+        vllm_h200:
+          kind: vllm_responses          # vLLM omits the SSE `event:` field; its adapter compensates
+          storage_kind: openai          # required; no RAG used for this model
+          host: "local-llm.adc.corp.acronis.com"
+          api_path: "/v1/responses"
+          supports_file_search_filters: false
+          auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
+          auth_config:
+            header: "Authorization"
+            prefix: "Bearer "
+            secret_ref: "vllm-h200-key"
+
+      # exa.ai web-search function tool. Models opt in via
+      # `enabled_function_tools: ["exa_search"]` in the model catalog below.
+      # Egress goes through OAGW (apikey auth injects the x-api-key header).
+      exa_search:
+        enabled: true
+        host: "api.exa.ai"
+        search_type: "auto"
+        num_results: 10
+        max_calls_per_message: 3
+        max_chars: 2000
+        auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
+        auth_config:
+          header: "x-api-key"
+          prefix: ""
+          secret_ref: "exa-api-key"
 
       # ── Azure OpenAI example (uncomment and set your endpoint) ──────────
       #   azure_openai:
@@ -210,8 +248,8 @@ gears:
           provider_model_id: "gpt-4.1"
           display_name: "GPT-4.1"
           description: "Most capable model"
-          provider_id: "azure_openai"
-          provider_display_name: "Azure OpenAI"
+          provider_id: "vllm_h200"
+          provider_display_name: "Local H200 (vLLM)"
           icon: ""
           tier: Premium
           enabled: true
@@ -272,8 +310,8 @@ gears:
           provider_model_id: "gpt-4.1-mini"
           display_name: "GPT-4.1 Mini"
           description: "Fast and efficient model"
-          provider_id: "azure_openai"
-          provider_display_name: "Azure OpenAI"
+          provider_id: "vllm_h200"
+          provider_display_name: "Local H200 (vLLM)"
           icon: ""
           tier: Standard
           enabled: true
@@ -336,8 +374,8 @@ gears:
           provider_model_id: "gpt-4.1-mini"
           display_name: "GPT-4.1 Mini (Tiny Context - E2E)"
           description: "E2E testing model with small context for thread summary trigger"
-          provider_id: "azure_openai"
-          provider_display_name: "Azure OpenAI"
+          provider_id: "vllm_h200"
+          provider_display_name: "Local H200 (vLLM)"
           icon: ""
           tier: Standard
           enabled: true
@@ -392,6 +430,71 @@ gears:
           preference:
             is_default: false
             sort_order: 99
+
+        # ── GPT-OSS 120B on local H200 (vLLM) with exa.ai web search ──
+        - id: "gpt-oss-120b"
+          provider_model_id: "h200/gpt-oss-120b"
+          display_name: "GPT-OSS 120B (H200)"
+          description: "Local gpt-oss-120b served by vLLM on the H200, with web search via exa.ai"
+          provider_id: "vllm_h200"
+          provider_display_name: "Local H200 (vLLM)"
+          icon: ""
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful, concise assistant. Answer clearly and directly."
+          thread_summary_prompt: ""
+          multimodal_capabilities: []
+          context_window: 131072
+          max_output_tokens: 32768
+          max_input_tokens: 131072
+          input_tokens_credit_multiplier_micro: 1000000
+          output_tokens_credit_multiplier_micro: 3000000
+          multiplier_display: "1x"
+          # Custom function tools enabled for this model (resolved against the
+          # gear's function-tool registry; `exa_search` is configured above).
+          enabled_function_tools: ["exa_search"]
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 100
+            safety_margin_pct: 10
+            image_token_budget: 1000
+            tool_surcharge_tokens: 500
+            web_search_surcharge_tokens: 500
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 50
+          max_num_results: 5
+          web_search_context_size: low
+          max_tool_calls: 10
+          general_config:
+            type: ""
+            available_from: "1970-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              structured_output: true
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: false
+              mcp: false
+            supported_endpoints:
+              chat_completions: true
+              responses: true
+              embeddings: false
+              image_generation: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+          preference:
+            is_default: false
+            sort_order: 2
 
   oagw:
     config:
