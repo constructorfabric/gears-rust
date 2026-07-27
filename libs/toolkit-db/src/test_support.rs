@@ -117,6 +117,39 @@ pub struct RecordedQuery {
     pub failed: bool,
 }
 
+fn is_write(kind: QueryKind) -> bool {
+    matches!(
+        kind,
+        QueryKind::Insert | QueryKind::Update | QueryKind::Delete
+    )
+}
+
+/// Render captured statements one per line, for an assertion message.
+///
+/// The advisory signals ([`QueryRecorder::untransacted_write_runs`],
+/// [`QueryRecorder::untransacted_read_modify_write`]) return the statements they
+/// flagged precisely so a failing assertion can show them — otherwise whoever
+/// reads the failure has to re-run with `DB_AUDIT_TRACE_DIR` set before they can
+/// judge anything.
+#[must_use]
+pub fn format_trace(queries: &[RecordedQuery]) -> String {
+    let mut out = String::new();
+    for q in queries {
+        writeln!(
+            out,
+            "{:>3}  {:<7} {:<32} in_tx={:<5} params={:<3} {}",
+            q.seq,
+            q.kind,
+            q.table.as_deref().unwrap_or("-"),
+            q.in_tx,
+            q.param_count,
+            q.sql,
+        )
+        .expect("String Write is infallible");
+    }
+    out
+}
+
 // -- SQL normalization -------------------------------------------------
 
 static RE_STRING_LIT: LazyLock<Regex> =
@@ -300,22 +333,104 @@ impl QueryRecorder {
         out
     }
 
-    /// Writes (`INSERT`/`UPDATE`/`DELETE`) that ran while the transaction
-    /// guard was *not* armed — i.e. issued on a bare connection outside any
-    /// `Db::transaction*` closure. A non-empty result is the `no-tx-write`
-    /// defect class: a check-then-write sequence with no atomicity guarantee.
+    /// Every `INSERT`/`UPDATE`/`DELETE` that ran while the transaction guard
+    /// was *not* armed — i.e. on a bare connection, outside any
+    /// `Db::transaction*` closure.
+    ///
+    /// **This is a primitive, not a verdict.** A lone self-contained write
+    /// outside a transaction is perfectly fine: PostgreSQL already runs every
+    /// statement in its own implicit transaction, so wrapping one statement in
+    /// `BEGIN`/`COMMIT` buys no atomicity and costs two extra round trips (three
+    /// under `SERIALIZABLE`, which also has to set the isolation level). Do not
+    /// assert this is empty across the board — you would be demanding a
+    /// pessimization.
+    ///
+    /// Use it when you know a *particular* operation must be transactional and
+    /// want that pinned. For finding the operations that *should* be
+    /// transactional and aren't, use [`Self::untransacted_write_runs`] and
+    /// [`Self::untransacted_read_modify_write`], which narrow this set to the
+    /// two shapes that are actually suspicious.
     #[must_use]
     pub fn writes_outside_tx(&self) -> Vec<RecordedQuery> {
         self.events()
             .into_iter()
-            .filter(|e| {
-                matches!(
-                    e.kind,
-                    QueryKind::Insert | QueryKind::Update | QueryKind::Delete
-                )
-            })
+            .filter(|e| is_write(e.kind))
             .filter(|e| !e.in_tx)
             .collect()
+    }
+
+    /// Runs of two or more writes that executed outside a transaction with no
+    /// transaction boundary between them — several mutations that nothing binds
+    /// into one atomic unit, so a crash or an error part-way through leaves the
+    /// earlier ones committed.
+    ///
+    /// **Advisory: this marks a place to read by eye, not a proven defect.**
+    /// Independent writes that genuinely need no mutual atomicity (appending to
+    /// a log, bumping unrelated counters) land here too. The question to ask of
+    /// each run is whether a caller could observe the intermediate state, and
+    /// whether that state is legal.
+    ///
+    /// Reads between the writes do **not** split a run: a `SELECT` doesn't make
+    /// the writes around it atomic. What splits a run is a statement that *did*
+    /// run inside a transaction, since the writes on either side of it are then
+    /// separated by a real boundary.
+    ///
+    /// Each returned `Vec` is one run, in execution order, so it can be printed
+    /// with [`format_trace`] in the assertion message.
+    #[must_use]
+    pub fn untransacted_write_runs(&self) -> Vec<Vec<RecordedQuery>> {
+        let mut runs = Vec::new();
+        let mut current: Vec<RecordedQuery> = Vec::new();
+        for e in self.events() {
+            if e.in_tx {
+                // A real transaction boundary: whatever follows is no longer
+                // adjacent to what came before.
+                if current.len() >= 2 {
+                    runs.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+            } else if is_write(e.kind) {
+                current.push(e);
+            }
+        }
+        if current.len() >= 2 {
+            runs.push(current);
+        }
+        runs
+    }
+
+    /// Writes that executed outside a transaction against a table this trace
+    /// had already *read* outside a transaction — the check-then-act (or
+    /// read-modify-write) shape, where a concurrent caller can interleave
+    /// between the read and the write and invalidate what the read established.
+    ///
+    /// This is the signal [`Self::untransacted_write_runs`] cannot give: the
+    /// classic case is many reads and a *single* write, which is not a run of
+    /// anything.
+    ///
+    /// **Advisory, same as above.** It fires on benign races too — re-deleting
+    /// a row that a competitor already deleted reaches the same end state, so
+    /// the interleaving is harmless there. What makes a hit real is an invariant
+    /// that the read established and the write relies on.
+    #[must_use]
+    pub fn untransacted_read_modify_write(&self) -> Vec<RecordedQuery> {
+        let mut read_tables: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for e in self.events() {
+            let Some(table) = e.table.clone() else {
+                continue;
+            };
+            if e.in_tx {
+                continue;
+            }
+            if e.kind == QueryKind::Select {
+                read_tables.insert(table);
+            } else if is_write(e.kind) && read_tables.contains(&table) {
+                out.push(e);
+            }
+        }
+        out
     }
 
     /// Best-effort `redundant-io` detector: an `INSERT`/`UPDATE` on table `T`
@@ -629,6 +744,149 @@ mod tests {
             Some(&1)
         );
         assert_eq!(rec.total(), 4);
+    }
+
+    // -- untransacted_write_runs: >=2 adjacent writes with no tx between --
+
+    #[test]
+    fn write_runs_flags_two_adjacent_untransacted_writes() {
+        let rec = super::QueryRecorder::from_events_for_testing(vec![
+            make(0, QueryKind::Insert, Some("resource_group"), false),
+            make(1, QueryKind::Insert, Some("resource_group_closure"), false),
+        ]);
+        let runs = rec.untransacted_write_runs();
+        assert_eq!(
+            runs.len(),
+            1,
+            "two adjacent untransacted writes are one run"
+        );
+        assert_eq!(runs[0].len(), 2);
+    }
+
+    #[test]
+    fn write_runs_ignores_a_lone_untransacted_write() {
+        // The whole point of this signal over `writes_outside_tx`: one
+        // self-contained write outside a transaction is already atomic in
+        // PostgreSQL and must not be reported.
+        let rec = super::QueryRecorder::from_events_for_testing(vec![
+            make(0, QueryKind::Select, Some("gts_type"), false),
+            make(1, QueryKind::Insert, Some("audit_log"), false),
+        ]);
+        assert!(
+            rec.untransacted_write_runs().is_empty(),
+            "a single untransacted write is not a run and is not a defect"
+        );
+    }
+
+    #[test]
+    fn write_runs_are_not_split_by_reads() {
+        // A SELECT between two writes does not make them atomic, so it must not
+        // break the run.
+        let rec = super::QueryRecorder::from_events_for_testing(vec![
+            make(0, QueryKind::Insert, Some("resource_group"), false),
+            make(1, QueryKind::Select, Some("gts_type"), false),
+            make(2, QueryKind::Delete, Some("resource_group_closure"), false),
+        ]);
+        let runs = rec.untransacted_write_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len(), 2, "the read is not part of the run itself");
+    }
+
+    #[test]
+    fn write_runs_are_split_by_a_transaction() {
+        // Writes on either side of a transacted statement are separated by a
+        // real boundary, so neither side reaches two.
+        let rec = super::QueryRecorder::from_events_for_testing(vec![
+            make(0, QueryKind::Insert, Some("resource_group"), false),
+            make(1, QueryKind::Insert, Some("resource_group"), true),
+            make(2, QueryKind::Insert, Some("resource_group"), false),
+        ]);
+        assert!(rec.untransacted_write_runs().is_empty());
+    }
+
+    #[test]
+    fn write_runs_ignores_transacted_writes() {
+        let rec = super::QueryRecorder::from_events_for_testing(vec![
+            make(0, QueryKind::Insert, Some("resource_group"), true),
+            make(1, QueryKind::Insert, Some("resource_group_closure"), true),
+            make(2, QueryKind::Delete, Some("resource_group_closure"), true),
+        ]);
+        assert!(rec.untransacted_write_runs().is_empty());
+    }
+
+    // -- untransacted_read_modify_write: check-then-act --
+
+    #[test]
+    fn read_modify_write_flags_write_after_read_of_the_same_table() {
+        // Many reads and a *single* write: the shape `untransacted_write_runs`
+        // cannot see, and the one that broke a real invariant.
+        let rec = super::QueryRecorder::from_events_for_testing(vec![
+            make(0, QueryKind::Select, Some("resource_group"), false),
+            make(
+                1,
+                QueryKind::Select,
+                Some("resource_group_membership"),
+                false,
+            ),
+            make(
+                2,
+                QueryKind::Insert,
+                Some("resource_group_membership"),
+                false,
+            ),
+        ]);
+        let flagged = rec.untransacted_read_modify_write();
+        assert_eq!(flagged.len(), 1, "check-then-act on the membership table");
+        assert_eq!(flagged[0].seq, 2);
+    }
+
+    #[test]
+    fn read_modify_write_ignores_an_unrelated_table() {
+        let rec = super::QueryRecorder::from_events_for_testing(vec![
+            make(0, QueryKind::Select, Some("gts_type"), false),
+            make(1, QueryKind::Insert, Some("audit_log"), false),
+        ]);
+        assert!(rec.untransacted_read_modify_write().is_empty());
+    }
+
+    #[test]
+    fn read_modify_write_requires_the_read_to_come_first() {
+        // Insert then re-read is the `redundant-io` shape, not check-then-act.
+        let rec = super::QueryRecorder::from_events_for_testing(vec![
+            make(0, QueryKind::Insert, Some("resource_group"), false),
+            make(1, QueryKind::Select, Some("resource_group"), false),
+        ]);
+        assert!(rec.untransacted_read_modify_write().is_empty());
+    }
+
+    #[test]
+    fn read_modify_write_ignores_the_same_shape_inside_a_transaction() {
+        let rec = super::QueryRecorder::from_events_for_testing(vec![
+            make(
+                0,
+                QueryKind::Select,
+                Some("resource_group_membership"),
+                true,
+            ),
+            make(
+                1,
+                QueryKind::Insert,
+                Some("resource_group_membership"),
+                true,
+            ),
+        ]);
+        assert!(rec.untransacted_read_modify_write().is_empty());
+    }
+
+    #[test]
+    fn format_trace_renders_one_line_per_statement() {
+        let rec = super::QueryRecorder::from_events_for_testing(vec![
+            make(0, QueryKind::Insert, Some("resource_group"), false),
+            make(1, QueryKind::Delete, Some("resource_group"), false),
+        ]);
+        let rendered = super::format_trace(&rec.untransacted_write_runs()[0]);
+        assert_eq!(rendered.lines().count(), 2);
+        assert!(rendered.contains("resource_group"));
     }
 
     #[test]
