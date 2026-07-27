@@ -538,6 +538,35 @@ dropped, matching Step 3's "overly risky/wide fixes get a documented defer"
 discipline — the risk here is scope creep into unrelated infrastructure
 work, not code risk in the fix itself.
 
+### 5.7a Open items carried over from the earlier branch review
+
+Out of scope for this step — none of these is a DB-behavior class — but
+recorded here because until now they existed only in an untracked pair of
+scratch files (an external review of this branch against `main` and the
+triage response to it), which meant three still-open items had no home in the
+repository at all. Verified against this branch's code while importing them:
+
+- **Cleanup sweep does not follow the ToolKit lifecycle model.** `cleanup.rs`
+  still starts the sweep with a bare `tokio::spawn` and no
+  `CancellationToken`, so the loop is not tied to gear start/stop. It was the
+  top-priority item of that triage and its only substantive code fix. The
+  idiom to copy already exists elsewhere in this repository (mini-chat,
+  grpc-hub). Effort: medium, code.
+- **Orphan-reconcile audit rows carry a nil tenant id.** `cleanup.rs` falls
+  back to `Uuid::nil` for both `tenant_id` and `actor_id` when the file row is
+  already gone, so reconciliation audit entries are not attributable to a
+  tenant. Effort: small.
+- **S3 dependency security gate is still open as process, not code.**
+  ADR-0006's predecessor ADR covering the S3 backend remains in `status:
+  proposed` while the dependencies are already in the build. Honestly tracked
+  rather than overlooked, but it is a release gate someone has to close
+  deliberately.
+
+Two further items from that review were checked and are already fixed: the
+README no longer claims the S3 backend is absent from the code, and PRD.md /
+DESIGN.md no longer specify `412` for precondition failures (zero occurrences
+in either, matching `api.md`/`routes.rs`).
+
 ### 5.8 Commit list (this branch, `aba5d9de..HEAD`)
 
 1. `test-support(toolkit-db): expose metric-callback attach + tx-boundary probe` — cherry-pick, mandatory (§0)
