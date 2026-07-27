@@ -58,7 +58,17 @@ integration = []
 # Transactional outbox pipeline (preview — API may change)
 preview-outbox = ["dep:tokio-util", "dep:futures-util"]
 
+# Test-only surface for external integration-test suites that need to observe
+# transaction boundaries or attach a SeaORM query-metric callback (e.g. the
+# resource-group DB-behavior audit's `QueryRecorder`). Not used by production
+# code paths; see `connect_db_with_metric_callback` and
+# `secure::in_transaction_for_testing`.
+test-support = ["dep:regex"]
+
 [dependencies]
+# Only used by the `test-support` module's SQL normalizer; optional so a
+# production build never pulls it in.
+regex = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }

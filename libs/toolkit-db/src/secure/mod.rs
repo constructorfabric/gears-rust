@@ -140,6 +140,8 @@ pub use runner::DBRunner;
 pub(crate) use runner::{DBRunnerInternal, SeaOrmRunner};
 
 // Primary database types (new secure API)
+#[cfg(feature = "test-support")]
+pub use db::in_transaction_for_testing;
 pub use db::{DEFAULT_TX_RETRY_ATTEMPTS, Db, DbConn, DbTx};
 
 // Transaction error types (no SeaORM types leaked)

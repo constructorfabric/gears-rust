@@ -83,6 +83,24 @@ fn is_in_transaction() -> bool {
     IN_TX.try_with(Cell::get).unwrap_or(false)
 }
 
+/// **Test-only**: report whether the current async task is inside a
+/// `Db::transaction*` closure (i.e. the transaction-bypass guard above is
+/// armed).
+///
+/// Exists so integration-test query recorders (e.g. the resource-group
+/// DB-behavior audit) can tag each captured SQL statement as in-tx /
+/// out-of-tx without weakening the guard itself — it reads the exact same
+/// task-local the guard enforces. Since a `SeaORM` metric callback fires
+/// synchronously from within the same async task that issued the query (no
+/// `tokio::spawn` in between), this is precise, not a heuristic.
+///
+/// Gated behind the `test-support` feature; never used by production code.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn in_transaction_for_testing() -> bool {
+    is_in_transaction()
+}
+
 /// Execute a closure with the transaction guard set.
 ///
 /// This sets `IN_TX = true` for the duration of the closure, ensuring
