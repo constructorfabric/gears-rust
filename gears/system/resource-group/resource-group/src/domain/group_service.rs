@@ -137,11 +137,21 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 .map_err(DomainError::from)?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-1
 
+        // Validate metadata against the GTS type schema before opening the
+        // transaction: a cross-gear `ClientHub` call with nothing to gain in-tx (RG-09).
+        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
+        validation::validate_metadata_via_gts(
+            req.metadata.as_ref(),
+            &req.code,
+            &*self.types_registry,
+        )
+        .await?;
+        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
+
         let profile = self.profile.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
-        let types_registry = self.types_registry.clone();
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-2
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-10
@@ -152,18 +162,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             let profile = profile.clone();
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
-            let types_registry = types_registry.clone();
             Box::pin(async move {
-                Self::create_group_inner(
-                    &*group_repo,
-                    &*type_repo,
-                    tx,
-                    &req,
-                    tenant_id,
-                    &profile,
-                    &*types_registry,
-                )
-                .await
+                Self::create_group_inner(&*group_repo, &*type_repo, tx, &req, tenant_id, &profile)
+                    .await
             })
         })
         .await
@@ -254,11 +255,29 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         Self::validate_name(&req.name)?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-1
 
+        // Validate metadata against the GTS type schema before opening the
+        // transaction: same rationale as `create_group` (RG-09).
+        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
+        {
+            let conn = self.db.conn()?;
+            let existing = self
+                .group_repo
+                .find_by_id(&conn, &scope, group_id)
+                .await?
+                .ok_or_else(|| DomainError::group_not_found(group_id))?;
+            validation::validate_metadata_via_gts(
+                req.metadata.as_ref(),
+                &existing.code,
+                &*self.types_registry,
+            )
+            .await?;
+        }
+        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
+
         let profile = self.profile.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
-        let types_registry = self.types_registry.clone();
 
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
             let req = req.clone();
@@ -266,7 +285,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             let profile = profile.clone();
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
-            let types_registry = types_registry.clone();
             Box::pin(async move {
                 Self::update_group_inner(
                     &*group_repo,
@@ -276,7 +294,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     group_id,
                     &req,
                     &profile,
-                    &*types_registry,
                 )
                 .await
             })
@@ -502,29 +519,29 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         validation::validate_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
 
+        // Same RG-09 fix as `create_group`: validate metadata against the
+        // GTS type schema (a cross-gear ClientHub call) before opening the
+        // transaction.
+        validation::validate_metadata_via_gts(
+            req.metadata.as_ref(),
+            &req.code,
+            &*self.types_registry,
+        )
+        .await?;
+
         let profile = self.profile.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
-        let types_registry = self.types_registry.clone();
 
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
             let req = req.clone();
             let profile = profile.clone();
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
-            let types_registry = types_registry.clone();
             Box::pin(async move {
-                Self::create_group_inner(
-                    &*group_repo,
-                    &*type_repo,
-                    tx,
-                    &req,
-                    tenant_id,
-                    &profile,
-                    &*types_registry,
-                )
-                .await
+                Self::create_group_inner(&*group_repo, &*type_repo, tx, &req, tenant_id, &profile)
+                    .await
             })
         })
         .await
@@ -533,6 +550,10 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     // -- Transaction-inner implementations --
 
     /// Inner logic for `create_group`, runs inside a SERIALIZABLE transaction.
+    ///
+    /// **Metadata schema validation.** `create_group` already ran
+    /// `validate_metadata_via_gts` before opening this transaction (RG-09):
+    /// it's a cross-gear `ClientHub` call, not a DB read to make atomic.
     #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
     async fn create_group_inner(
         group_repo: &GR,
@@ -541,26 +562,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         req: &CreateGroupRequest,
         tenant_id: Uuid,
         profile: &QueryProfile,
-        types_registry: &dyn types_registry_sdk::TypesRegistryClient,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
-        // Resolve type GTS path to surrogate ID; verify type exists
-        let type_id = type_repo
-            .resolve_id(tx, &req.code)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(&req.code))?;
-
-        let rg_type = type_repo
-            .find_by_code(tx, &req.code)
+        // Resolve type GTS path to surrogate ID; verify type exists.
+        // find_by_code_with_id fetches id + type together in one query (RG-11).
+        let (type_id, rg_type) = type_repo
+            .find_by_code_with_id(tx, &req.code)
             .await?
             .ok_or_else(|| DomainError::type_not_found(&req.code))?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
-
-        // Validate metadata against GTS type schema (applies to both root and child groups)
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
-        validation::validate_metadata_via_gts(req.metadata.as_ref(), &req.code, types_registry)
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
 
         // Determine effective tenant_id by code-prefix rule:
         // - code starts with TENANT_RG_TYPE_PATH → tenant_id = group.id (new scope)
@@ -754,6 +764,10 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// rule `create_group_inner` uses for non-tenant children. Tenant-type
     /// roots already have `tenant_id = group_id`, so the same equality check
     /// trivially holds for them as well.
+    ///
+    /// **Metadata schema validation.** `update_group` already ran
+    /// `validate_metadata_via_gts` before opening this transaction (RG-09);
+    /// see `create_group_inner`'s doc comment for why.
     #[allow(clippy::too_many_arguments)]
     async fn update_group_inner(
         group_repo: &GR,
@@ -763,7 +777,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         req: &UpdateGroupRequest,
         profile: &QueryProfile,
-        types_registry: &dyn types_registry_sdk::TypesRegistryClient,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-2
         // DB: SELECT FROM resource_group WHERE id = {group_id} -- load existing group
@@ -798,21 +811,17 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // (or the new type allows root if no parent). For the immutable-type
         // case this collapses into `move_group_internal_impl` running the
         // `rg_type.allowed_parent_types` check on a parent change.
-        let existing_type_path = Self::resolve_type_path_from_id(tx, existing.gts_type_id).await?;
+        //
+        // load_full_type_by_id fetches the type definition by id in a
+        // single query, not a separate resolve-then-find-by-code round trip (RG-11).
         let rg_type = type_repo
-            .find_by_code(tx, &existing_type_path)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(&existing_type_path))?;
+            .load_full_type_by_id(tx, existing.gts_type_id)
+            .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4a
 
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
-        validation::validate_metadata_via_gts(
-            req.metadata.as_ref(),
-            &existing_type_path,
-            types_registry,
-        )
-        .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
+        // Metadata-vs-schema validation (step 4e) already ran in
+        // `update_group`, before this transaction opened -- see this
+        // function's doc comment (RG-09 fix).
 
         // Cross-tenant parent change is forbidden. `tenant_id` is established
         // at creation and never rewritten — see the function-level doc above
