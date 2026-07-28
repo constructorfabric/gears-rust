@@ -202,6 +202,105 @@ where
     }
 }
 
+/// Secure batch-insert helper for `Scopable` entities -- the multi-row
+/// counterpart of [`secure_insert`], issuing one `INSERT ... VALUES (r1),
+/// (r2), ...` instead of one `INSERT` per model.
+///
+/// # Security
+///
+/// Every model is validated against `scope` individually, in memory, before
+/// any row reaches the database: if any model fails, nothing is inserted --
+/// stronger than looping `secure_insert`, which can leave earlier rows committed.
+///
+/// # Batching
+///
+/// A multi-row insert binds one parameter per column per row, and each
+/// backend caps that count (see [`max_bind_params`]); the batch is split
+/// into as many statements as needed, one statement when it fits.
+///
+/// **A split batch is not atomic on its own** -- wrap the call in a
+/// transaction if a partial commit across split statements is unacceptable.
+///
+/// # Errors
+///
+/// - `ScopeError::Invalid` if a tenant-scoped model is missing `tenant_id`.
+/// - `ScopeError::Denied` if a model's values do not satisfy the scope.
+/// - `ScopeError::Db` if the database insert fails.
+pub async fn secure_insert_many<E>(
+    models: Vec<E::ActiveModel>,
+    scope: &AccessScope,
+    runner: &impl DBRunner,
+) -> Result<(), ScopeError>
+where
+    E: ScopableEntity + EntityTrait,
+    E::Column: ColumnTrait + Copy,
+    E::ActiveModel: ActiveModelTrait<Entity = E> + Send,
+{
+    if models.is_empty() {
+        return Ok(());
+    }
+
+    // Validate every row before sending anything, so a scope violation anywhere
+    // in the batch inserts nothing at all -- including when the batch is about
+    // to be split into several statements below.
+    for am in &models {
+        if let Some(tenant_col) = E::tenant_col()
+            && let sea_orm::ActiveValue::NotSet = am.get(tenant_col)
+        {
+            return Err(ScopeError::Invalid("tenant_id is required"));
+        }
+        validate_insert_scope(am, scope)?;
+    }
+
+    let backend = match DBRunnerInternal::as_seaorm(runner) {
+        SeaOrmRunner::Conn(db) => sea_orm::ConnectionTrait::get_database_backend(db),
+        SeaOrmRunner::Tx(tx) => sea_orm::ConnectionTrait::get_database_backend(tx),
+    };
+    let rows_per_statement = rows_per_insert::<E>(backend);
+
+    let mut rest = models;
+    while !rest.is_empty() {
+        let take = rows_per_statement.min(rest.len());
+        let chunk: Vec<E::ActiveModel> = rest.drain(..take).collect();
+        match DBRunnerInternal::as_seaorm(runner) {
+            SeaOrmRunner::Conn(db) => {
+                E::insert_many(chunk).exec(db).await?;
+            }
+            SeaOrmRunner::Tx(tx) => {
+                E::insert_many(chunk).exec(tx).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bind-parameter budget for one statement, per backend.
+///
+/// Deliberately below each backend's hard ceiling, since the count here is
+/// derived from the entity's declared columns and a builder may bind extras:
+///
+/// - `PostgreSQL`/`MySQL`: `u16` wire-protocol limit, 65535.
+/// - `SQLite`: `SQLITE_MAX_VARIABLE_NUMBER`, 32766 on modern builds.
+#[must_use]
+const fn max_bind_params(backend: sea_orm::DbBackend) -> usize {
+    match backend {
+        sea_orm::DbBackend::Postgres | sea_orm::DbBackend::MySql => 60_000,
+        sea_orm::DbBackend::Sqlite => 30_000,
+    }
+}
+
+/// How many rows of `E` fit in one multi-row insert on `backend`.
+///
+/// Uses the entity's full column count as the per-row cost, an upper bound
+/// since a row with `NotSet` columns binds fewer. Truncates on purpose --
+/// rounding up could push a statement past the limit -- and floors at 1.
+#[allow(clippy::integer_division)]
+fn rows_per_insert<E: EntityTrait>(backend: sea_orm::DbBackend) -> usize {
+    use sea_orm::Iterable as _;
+    let columns_per_row = E::Column::iter().count().max(1);
+    (max_bind_params(backend) / columns_per_row).max(1)
+}
+
 /// Secure update helper for updating a single entity by ID inside a scope.
 ///
 /// # Security
@@ -1414,5 +1513,44 @@ mod tests {
             validate_insert_scope(&am, &scope).is_err(),
             "Unknown property must cause constraint to fail (fail-closed)"
         );
+    }
+    // -- batch-insert chunk sizing --
+
+    #[test]
+    fn rows_per_insert_stays_under_each_backend_hard_limit() {
+        // 4 columns on the test entity. The product of rows and columns must
+        // stay under the real wire limit, not just under our own budget:
+        // 65535 for Postgres/MySQL, 32766 for modern SQLite.
+        let columns = <test_entity::Column as sea_orm::Iterable>::iter().count();
+        for (backend, hard_limit) in [
+            (sea_orm::DbBackend::Postgres, 65_535),
+            (sea_orm::DbBackend::MySql, 65_535),
+            (sea_orm::DbBackend::Sqlite, 32_766),
+        ] {
+            let rows = rows_per_insert::<test_entity::Entity>(backend);
+            assert!(
+                rows * columns < hard_limit,
+                "{backend:?}: {rows} rows x {columns} cols exceeds {hard_limit}"
+            );
+            assert!(
+                rows > 1,
+                "{backend:?}: a 4-column entity should batch freely"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_per_insert_never_returns_zero() {
+        // Guards the division: an entity wider than the whole budget must still
+        // make progress, one row per statement, rather than looping forever on a
+        // chunk size of zero.
+        assert!(rows_per_insert::<test_entity::Entity>(sea_orm::DbBackend::Sqlite) >= 1);
+        for backend in [
+            sea_orm::DbBackend::Postgres,
+            sea_orm::DbBackend::MySql,
+            sea_orm::DbBackend::Sqlite,
+        ] {
+            assert!(max_bind_params(backend) > 0);
+        }
     }
 }

@@ -1121,21 +1121,17 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             if let Some(max_depth) = profile.max_depth {
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 let parent_depth = group_repo.get_depth(conn, new_pid).await?;
-                // Check depth of deepest descendant of moved node
-                let subtree_descendants = group_repo.get_descendant_ids(conn, group_id).await?;
-                let mut max_subtree_depth = 0i32;
-                for desc_id in &subtree_descendants {
-                    // Internal depth within the subtree
-                    let is_desc_result = group_repo.is_descendant(conn, group_id, *desc_id).await?;
-                    if is_desc_result {
-                        // Get the depth of this descendant relative to the moved group
-                        // by looking at the closure table
-                        let depth = Self::get_relative_depth(conn, group_id, *desc_id).await?;
-                        if depth > max_subtree_depth {
-                            max_subtree_depth = depth;
-                        }
-                    }
-                }
+                // Check depth of deepest descendant of moved node.
+                // get_descendant_ids_with_depth returns id and depth
+                // together, so the max is taken in memory over one query (RG-05).
+                let subtree_descendants = group_repo
+                    .get_descendant_ids_with_depth(conn, group_id)
+                    .await?;
+                let max_subtree_depth = subtree_descendants
+                    .iter()
+                    .map(|(_id, depth)| *depth)
+                    .max()
+                    .unwrap_or(0);
                 let new_deepest = parent_depth + 1 + max_subtree_depth;
                 // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2b
@@ -1207,27 +1203,42 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     }
 
     /// Force-delete an entire subtree (group + descendants + memberships + closure).
+    ///
+    /// Memberships and closure rows are deleted for the whole subtree in
+    /// one batched call each, safe since every node in the batch is removed
+    /// together, not partially.
+    ///
+    /// Groups are deleted depth-level by depth-level, deepest first, since
+    /// `parent_id` is `ON DELETE RESTRICT` -- a parent's row is never
+    /// removed while a not-yet-removed child still references it (RG-10).
     async fn force_delete_subtree(
         group_repo: &GR,
         conn: &impl DBRunner,
         root_id: Uuid,
     ) -> Result<(), DomainError> {
-        // Get all descendants
-        let descendant_ids = group_repo.get_descendant_ids(conn, root_id).await?;
+        let descendants_with_depth = group_repo
+            .get_descendant_ids_with_depth(conn, root_id)
+            .await?;
 
-        // Delete in reverse order (leaves first)
-        let mut all_ids = vec![root_id];
-        all_ids.extend(descendant_ids);
+        let all_ids: Vec<Uuid> = std::iter::once(root_id)
+            .chain(descendants_with_depth.iter().map(|(id, _depth)| *id))
+            .collect();
 
-        // Delete memberships and closure rows for all nodes
-        for &gid in all_ids.iter().rev() {
-            group_repo.delete_memberships(conn, gid).await?;
-            group_repo.delete_all_closure_rows(conn, gid).await?;
+        group_repo.delete_memberships_many(conn, &all_ids).await?;
+        group_repo
+            .delete_all_closure_rows_many(conn, &all_ids)
+            .await?;
+
+        // Group ids by their depth relative to root_id (root itself is
+        // depth 0), then delete depth levels from deepest to shallowest.
+        let mut ids_by_depth: std::collections::BTreeMap<i32, Vec<Uuid>> =
+            std::collections::BTreeMap::new();
+        ids_by_depth.entry(0).or_default().push(root_id);
+        for (id, depth) in descendants_with_depth {
+            ids_by_depth.entry(depth).or_default().push(id);
         }
-
-        // Delete group entities in reverse order (leaves first)
-        for &gid in all_ids.iter().rev() {
-            group_repo.delete_by_id(conn, gid).await?;
+        for ids in ids_by_depth.into_values().rev() {
+            group_repo.delete_by_id_many(conn, &ids).await?;
         }
 
         Ok(())
@@ -1249,34 +1260,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .all(conn)
             .await
             .map_err(|e| DomainError::database(e.to_string()))
-    }
-
-    /// Get relative depth between an ancestor and descendant via closure table.
-    async fn get_relative_depth(
-        conn: &impl DBRunner,
-        ancestor_id: Uuid,
-        descendant_id: Uuid,
-    ) -> Result<i32, DomainError> {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        use toolkit_db::secure::SecureEntityExt;
-
-        let scope = toolkit_security::AccessScope::allow_all();
-        let row = crate::infra::storage::entity::resource_group_closure::Entity::find()
-            .filter(
-                crate::infra::storage::entity::resource_group_closure::Column::AncestorId
-                    .eq(ancestor_id),
-            )
-            .filter(
-                crate::infra::storage::entity::resource_group_closure::Column::DescendantId
-                    .eq(descendant_id),
-            )
-            .secure()
-            .scope_with(&scope)
-            .one(conn)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        Ok(row.map_or(0, |r| r.depth))
     }
 
     /// Resolve a type ID to its GTS path.

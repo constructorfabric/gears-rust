@@ -94,7 +94,11 @@ impl MembershipRepositoryTrait for MembershipRepository {
         })
     }
 
-    /// Insert a membership. Returns the created membership with resolved type path.
+    /// Insert a membership. Returns the created membership.
+    ///
+    /// `secure_insert` already returns the fully-populated `Model` --
+    /// every column here was explicitly `Set()`, so there's no DB-generated
+    /// value left to recover with a separate re-read (RG-08).
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
@@ -125,12 +129,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
                 } else {
                     DomainError::database(msg)
                 }
-            })?;
-
-        // Read back the inserted model
-        self.find_by_composite_key(db, group_id, gts_type_id, resource_id)
-            .await?
-            .ok_or_else(|| DomainError::database("Insert succeeded but membership not found"))
+            })
     }
 
     /// Delete a membership by its composite key. Returns the number of affected rows.
