@@ -133,16 +133,9 @@ pub async fn build_db(cfg: DbConnConfig, global: Option<&GlobalDatabaseConfig>) 
 /// **Test-only**: connect and attach a `SeaORM` metric callback before the
 /// connection is wrapped into `Db`.
 ///
-/// `Db`/`DBProvider` intentionally do not expose the inner `SeaORM`
-/// `DatabaseConnection`, so an external crate cannot call
-/// `DatabaseConnection::set_metric_callback` after the fact — every
-/// `DbConn`/`DbTx` borrow is taken from the single connection stored inside
-/// `DbHandle`, and `SeaORM` captures the callback by value at the point
-/// `.execute()`/`.query_one()`/`.query_all()`/`.begin()` run. This constructor
-/// exists so integration-test suites (e.g. the resource-group DB-behavior
-/// audit's `QueryRecorder`) can observe every SQL statement a service issues
-/// — including ones inside a transaction, since `Db::transaction*` clones the
-/// callback from this same connection when it begins.
+/// `Db`/`DBProvider` never expose the inner `SeaORM` connection, and
+/// `SeaORM` captures the callback by value at connect time, so it can't be
+/// attached later. Lets suites like `QueryRecorder` observe every statement.
 ///
 /// Gated behind the `test-support` feature; never used by production code.
 ///

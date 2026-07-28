@@ -3,38 +3,34 @@
 //! Test-only support for DB-behavior audits: a SQL query recorder.
 //!
 //! Gated behind the `test-support` feature; never compiled into production
-//! builds. Nothing here is gear-specific — any crate that wants to audit its
-//! own database behavior enables the feature as a dev-dependency and uses
-//! these types directly, rather than copying them.
+//! builds. Not gear-specific: any crate enables the feature as a
+//! dev-dependency and uses these types directly.
 //!
 //! [`QueryRecorder`] attaches a `SeaORM` metric callback to a connection
 //! *before* it is wrapped into a [`crate::DBProvider`] (see
-//! [`connect_with_recorder`]), so every statement the service layer issues is
-//! captured: normalized SQL text (literals redacted, variadic placeholder
-//! lists collapsed so batch size doesn't change the "shape"), statement kind,
-//! a best-effort target table, bound-parameter count, and whether it executed
-//! while the transaction-bypass guard was armed (i.e. inside a
-//! `Db::transaction*` closure).
+//! [`connect_with_recorder`]) so every statement is captured.
+//!
+//! Captured per statement: normalized SQL (literals redacted, placeholder
+//! lists collapsed so batch size doesn't change the "shape"), kind, target
+//! table, parameter count, and whether the transaction-bypass guard was armed.
 //!
 //! # Why not observe literal BEGIN/COMMIT/ROLLBACK?
 //!
-//! `SeaORM`'s SQLite and Postgres drivers issue transaction-boundary SQL
-//! through a lower-level path — `sqlx`'s `TransactionManager`, which for
-//! SQLite talks to the connection's dedicated worker thread directly — that
-//! bypasses the `Statement`/metric-callback machinery entirely. There is no
-//! `Info` event for `BEGIN`/`COMMIT`/`ROLLBACK`. Transaction membership is
-//! therefore inferred from the transaction-bypass guard, exposed as
-//! [`crate::secure::in_transaction_for_testing`]. That guard is armed for
-//! exactly the scope of a `Db::transaction*` closure — the same task-local the
-//! production bypass guard enforces — and since a metric callback fires
-//! synchronously on the same async task that issued the query (no
-//! `tokio::spawn` in between), reading it from inside the callback is exact,
-//! not a heuristic. Its one structural blind spot is a detached
-//! `tokio::spawn`, whose task does not inherit the task-local.
+//! `SeaORM`'s drivers issue transaction-boundary SQL through `sqlx`'s
+//! `TransactionManager`, bypassing the metric-callback machinery -- there is
+//! no `Info` event for `BEGIN`/`COMMIT`/`ROLLBACK`.
 //!
-//! The worked example this was extracted from, including what the method does
-//! and does not cover, is `gears/system/resource-group/docs/db-behavior-audit.md`;
-//! the method itself is `docs/toolkit_unified_system/14_db_behavior_testing.md`.
+//! Transaction membership is instead read from the transaction-bypass guard
+//! ([`crate::secure::in_transaction_for_testing`]), the same task-local the
+//! production guard enforces.
+//!
+//! The callback fires synchronously on the task that issued the query, so
+//! reading the guard is exact, not a heuristic; its only blind spot is a
+//! detached `tokio::spawn`, whose task doesn't inherit the task-local.
+//!
+//! Full method and worked example:
+//! `gears/system/resource-group/docs/db-behavior-audit.md`,
+//! `docs/toolkit_unified_system/14_db_behavior_testing.md`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -104,14 +100,9 @@ pub struct RecordedQuery {
     /// Whether this statement executed while the transaction-bypass guard
     /// was armed (i.e. inside a `Db::transaction*` closure).
     pub in_tx: bool,
-    /// Number of bound parameter values in this statement (e.g. an `IN (?,
-    /// ?, ?)` list of 3 contributes 3). Statement *count* is scale-invariant
-    /// for a well-batched query (one `IN (...)` regardless of N), but the
-    /// parameter count still grows with N -- this exists so scale-invariance
-    /// checks can budget for that separately from statement count. See the
-    /// audit report's "what this method does not cover" section: this
-    /// doesn't capture the cost of a single huge statement (e.g. a 10,000-
-    /// value `IN` list), only that it has 10,000 parameters.
+    /// Number of bound parameters (an `IN (?, ?, ?)` list of 3 contributes
+    /// 3). Statement count stays flat for a batched query as N grows, but
+    /// parameter count doesn't -- this lets scale checks budget separately.
     pub param_count: usize,
     pub elapsed: Duration,
     pub failed: bool,
@@ -127,10 +118,8 @@ fn is_write(kind: QueryKind) -> bool {
 /// Render captured statements one per line, for an assertion message.
 ///
 /// The advisory signals ([`QueryRecorder::untransacted_write_runs`],
-/// [`QueryRecorder::untransacted_read_modify_write`]) return the statements they
-/// flagged precisely so a failing assertion can show them — otherwise whoever
-/// reads the failure has to re-run with `DB_AUDIT_TRACE_DIR` set before they can
-/// judge anything.
+/// [`QueryRecorder::untransacted_read_modify_write`]) return the flagged
+/// statements precisely so a failing assertion can show them directly.
 #[must_use]
 pub fn format_trace(queries: &[RecordedQuery]) -> String {
     let mut out = String::new();
@@ -156,11 +145,9 @@ static RE_STRING_LIT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"'(?:[^']|'')*'").expect("valid regex"));
 static RE_NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d+\b").expect("valid regex"));
 static RE_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("valid regex"));
-// Postgres numbers its placeholders (`$1`, `$2`, ...) where SQLite/MySQL use a
-// bare `?`. Rewrite them to `?` so the same logical statement normalizes
-// identically on either backend — and so the list collapse below needs only one
-// pattern. This has to run *before* `RE_NUMBER`, which would otherwise turn
-// `$1` into `$?` and leave nothing for this to match.
+// Postgres numbers placeholders (`$1`, `$2`, ...); rewrite to bare `?` so
+// both backends normalize identically and the list-collapse regex below
+// needs only one pattern. Must run before RE_NUMBER, or `$1` becomes `$?`.
 static RE_PG_PLACEHOLDER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\$\d+").expect("valid regex"));
 // Collapse a run of 2+ `?` placeholders into a single marker, so an `IN (...)`
@@ -184,11 +171,9 @@ static RE_FROM_TABLE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Normalize raw SQL text into a scale/literal-independent signature.
 ///
-/// This is deliberately a *class*-level signature, not per-line matching: it
-/// groups statements by "what shape of query is this", which is what the
-/// scale-invariance and stats-by-`(kind, table)` rules need. It is a
-/// best-effort heuristic (regex over text, not a SQL parser) — documented as
-/// such in `docs/db-behavior-audit.md`.
+/// A class-level signature grouping statements by "what shape of query is
+/// this", which scale-invariance and stats-by-`(kind, table)` rules need.
+/// A best-effort heuristic (regex, not a SQL parser).
 #[must_use]
 pub fn normalize_sql(sql: &str) -> String {
     let s = RE_STRING_LIT.replace_all(sql, "'?'");
@@ -223,9 +208,7 @@ pub struct QueryRecorder {
 
 impl QueryRecorder {
     /// Test-only: build a recorder pre-loaded with a fixed trace, so the
-    /// aggregation methods (`stats`, `writes_outside_tx`,
-    /// `redundant_reads_after_write`, `dump`) can be unit-tested without a
-    /// live DB connection.
+    /// aggregation methods can be unit-tested without a live DB connection.
     #[cfg(test)]
     fn from_events_for_testing(events: Vec<RecordedQuery>) -> Self {
         Self {
@@ -235,11 +218,9 @@ impl QueryRecorder {
 
     /// Build a fresh recorder and the `SeaORM` metric callback that feeds it.
     ///
-    /// Callers normally don't build this directly — use
-    /// [`connect_with_recorder`], which attaches the callback to a
-    /// connection *before* wrapping it in a `DBProvider` (required: `SeaORM`
-    /// captures the callback by value at query time, so attaching after
-    /// construction would miss every statement).
+    /// Callers normally use [`connect_with_recorder`] instead: `SeaORM`
+    /// captures the callback by value at query time, so it must attach
+    /// before the connection is wrapped in a `DBProvider`, not after.
     #[must_use = "the recorder observes nothing unless its callback is passed to \
                   connect_db_with_metric_callback before the connection is wrapped"]
     pub fn attach() -> (
@@ -302,10 +283,9 @@ impl QueryRecorder {
             .len()
     }
 
-    /// Sum of `param_count` across every captured statement. A companion
-    /// budget to `total()`/`stats()`: a batched query (single `IN (...)`
-    /// regardless of N) keeps statement *count* flat as N grows, but its
-    /// parameter count still scales with N -- this catches that dimension.
+    /// Sum of `param_count` across every statement -- companion to
+    /// `total()`/`stats()`, since a batched query keeps statement count flat
+    /// as N grows even though its parameter count still scales with N.
     #[must_use]
     pub fn total_params(&self) -> usize {
         self.events().iter().map(|e| e.param_count).sum()
@@ -334,22 +314,16 @@ impl QueryRecorder {
     }
 
     /// Every `INSERT`/`UPDATE`/`DELETE` that ran while the transaction guard
-    /// was *not* armed — i.e. on a bare connection, outside any
+    /// was not armed -- i.e. on a bare connection, outside any
     /// `Db::transaction*` closure.
     ///
-    /// **This is a primitive, not a verdict.** A lone self-contained write
-    /// outside a transaction is perfectly fine: PostgreSQL already runs every
-    /// statement in its own implicit transaction, so wrapping one statement in
-    /// `BEGIN`/`COMMIT` buys no atomicity and costs two extra round trips (three
-    /// under `SERIALIZABLE`, which also has to set the isolation level). Do not
-    /// assert this is empty across the board — you would be demanding a
-    /// pessimization.
+    /// **Not a verdict on its own.** A lone self-contained write is fine:
+    /// PostgreSQL already runs it in an implicit transaction, so wrapping it
+    /// in `BEGIN`/`COMMIT` buys nothing. Don't assert this is empty overall.
     ///
-    /// Use it when you know a *particular* operation must be transactional and
-    /// want that pinned. For finding the operations that *should* be
-    /// transactional and aren't, use [`Self::untransacted_write_runs`] and
-    /// [`Self::untransacted_read_modify_write`], which narrow this set to the
-    /// two shapes that are actually suspicious.
+    /// Use it to pin a *particular* operation as transactional. To find
+    /// operations that *should* be transactional and aren't, use
+    /// [`Self::untransacted_write_runs`] and [`Self::untransacted_read_modify_write`].
     #[must_use]
     pub fn writes_outside_tx(&self) -> Vec<RecordedQuery> {
         self.events()
@@ -359,24 +333,19 @@ impl QueryRecorder {
             .collect()
     }
 
-    /// Runs of two or more writes that executed outside a transaction with no
-    /// transaction boundary between them — several mutations that nothing binds
-    /// into one atomic unit, so a crash or an error part-way through leaves the
-    /// earlier ones committed.
+    /// Runs of two or more untransacted writes with no transaction boundary
+    /// between them -- mutations nothing binds into one atomic unit, so a
+    /// crash part-way through leaves the earlier ones committed.
     ///
-    /// **Advisory: this marks a place to read by eye, not a proven defect.**
-    /// Independent writes that genuinely need no mutual atomicity (appending to
-    /// a log, bumping unrelated counters) land here too. The question to ask of
-    /// each run is whether a caller could observe the intermediate state, and
-    /// whether that state is legal.
+    /// **Advisory, not a proven defect.** Independent writes needing no
+    /// mutual atomicity (log appends, unrelated counters) land here too; ask
+    /// whether a caller could observe the intermediate state, and if it's legal.
     ///
-    /// Reads between the writes do **not** split a run: a `SELECT` doesn't make
-    /// the writes around it atomic. What splits a run is a statement that *did*
-    /// run inside a transaction, since the writes on either side of it are then
-    /// separated by a real boundary.
+    /// A `SELECT` between writes does not split a run; only a statement that
+    /// ran inside a transaction does, since that's a real boundary.
     ///
-    /// Each returned `Vec` is one run, in execution order, so it can be printed
-    /// with [`format_trace`] in the assertion message.
+    /// Each `Vec` is one run, in order -- pass it to [`format_trace`] for the
+    /// assertion message.
     #[must_use]
     pub fn untransacted_write_runs(&self) -> Vec<Vec<RecordedQuery>> {
         let mut runs = Vec::new();
@@ -400,19 +369,16 @@ impl QueryRecorder {
         runs
     }
 
-    /// Writes that executed outside a transaction against a table this trace
-    /// had already *read* outside a transaction — the check-then-act (or
-    /// read-modify-write) shape, where a concurrent caller can interleave
-    /// between the read and the write and invalidate what the read established.
+    /// Writes outside a transaction against a table this trace already read
+    /// outside a transaction -- the check-then-act shape, where a concurrent
+    /// caller can interleave and invalidate what the read established.
     ///
-    /// This is the signal [`Self::untransacted_write_runs`] cannot give: the
-    /// classic case is many reads and a *single* write, which is not a run of
-    /// anything.
+    /// Catches what [`Self::untransacted_write_runs`] cannot: many reads and
+    /// a single write, which is not a run of anything.
     ///
-    /// **Advisory, same as above.** It fires on benign races too — re-deleting
-    /// a row that a competitor already deleted reaches the same end state, so
-    /// the interleaving is harmless there. What makes a hit real is an invariant
-    /// that the read established and the write relies on.
+    /// **Advisory, same as above.** Fires on benign races too (e.g.
+    /// re-deleting an already-deleted row); a hit is real only when the
+    /// write relies on an invariant the read established.
     #[must_use]
     pub fn untransacted_read_modify_write(&self) -> Vec<RecordedQuery> {
         let mut read_tables: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -434,9 +400,8 @@ impl QueryRecorder {
     }
 
     /// Best-effort `redundant-io` detector: an `INSERT`/`UPDATE` on table `T`
-    /// followed — before any other statement touches `T` again — by a
-    /// `SELECT` on the same table `T`. Matches the "insert/update, discard
-    /// the returned model, re-read by id" pattern.
+    /// immediately followed by a `SELECT` on `T` -- the "insert, discard the
+    /// model, re-read by id" pattern.
     #[must_use]
     pub fn redundant_reads_after_write(&self) -> Vec<(RecordedQuery, RecordedQuery)> {
         let events = self.events();
@@ -495,36 +460,25 @@ impl QueryRecorder {
 
 /// Dump a recorded trace to a file, for reading a write path's SQL by eye.
 ///
-/// **Opt-in and module-agnostic.** Writes nothing unless `DB_AUDIT_TRACE_DIR`
-/// is set, so an ordinary test run never touches the filesystem, and the
-/// destination comes entirely from that variable — nothing here knows or cares
-/// which crate it is running in:
+/// Writes nothing unless `DB_AUDIT_TRACE_DIR` is set, so an ordinary test
+/// run never touches the filesystem:
 ///
 /// ```sh
-/// DB_AUDIT_TRACE_DIR=target/db-behavior-traces \
-///     cargo nextest run -p <gear> --test db_behavior_audit_test
+/// DB_AUDIT_TRACE_DIR=target/db-behavior-traces cargo nextest run -p <gear> --test db_behavior_audit_test
 /// ```
 ///
-/// Note the absence of `--run-ignored`: any `#[ignore]`d assertion in the
-/// suite is one that asserts behavior the code does *not* yet have, so forcing
-/// those to run fails the command before the trace tests get their turn.
+/// Omit `--run-ignored`: a `#[ignore]`d assertion documents behavior the
+/// code does not yet have, so forcing it to run fails before the trace
+/// tests get their turn.
 ///
-/// Reading these dumps once, before writing a single assertion, is the highest
-/// yield step of a DB-behavior audit: most findings are visible as soon as an
-/// operation's statement sequence is laid out in order. The resource-group
-/// audit that produced this tooling is the worked example — see "Running this
-/// audit on another module" in
-/// `gears/system/resource-group/docs/db-behavior-audit.md` — and the method is
-/// `docs/toolkit_unified_system/14_db_behavior_testing.md`.
-///
-/// `name` becomes `<DB_AUDIT_TRACE_DIR>/<name>.txt`; use the operation's name.
+/// `name` becomes `<DB_AUDIT_TRACE_DIR>/<name>.txt`. Reading a dump once,
+/// before writing an assertion, is usually the highest-yield step of an
+/// audit; see `gears/system/resource-group/docs/db-behavior-audit.md`.
 ///
 /// # Panics
 ///
-/// Panics if `DB_AUDIT_TRACE_DIR` is set but the directory cannot be created
-/// or the file cannot be written. That is deliberate: the variable is only ever
-/// set by someone who asked for a trace dump, so silently producing nothing
-/// would be worse than failing the test run.
+/// Panics if `DB_AUDIT_TRACE_DIR` is set but the file can't be written --
+/// silently producing nothing would be worse than failing the test run.
 pub fn snapshot_trace(name: &str, rec: &QueryRecorder) {
     let Some(dir) = std::env::var_os("DB_AUDIT_TRACE_DIR") else {
         return;
@@ -537,16 +491,9 @@ pub fn snapshot_trace(name: &str, rec: &QueryRecorder) {
 
 /// Connect and return a [`Db`] with a [`QueryRecorder`] already attached.
 ///
-/// The callback has to be installed before the connection is wrapped, which is
-/// why this pairs the two steps. Migrations and any `DBProvider` wrapping stay
-/// with the caller, since those are schema-specific; a typical fixture is:
-///
-/// ```ignore
-/// let (db, recorder) = connect_with_recorder("sqlite::memory:", opts).await?;
-/// run_migrations_for_testing(&db, Migrator::migrations()).await?;
-/// recorder.clear(); // migrations ran through the same callback
-/// (Arc::new(DBProvider::new(db)), recorder)
-/// ```
+/// The callback must be installed before the connection is wrapped, hence
+/// this pairs the two steps. Migrations run through the same callback, so
+/// `clear()` the recorder after running them and before handing it to callers.
 ///
 /// # Errors
 ///
@@ -561,14 +508,10 @@ pub async fn connect_with_recorder(
     Ok((db, recorder))
 }
 
-// -- Unit tests for the recorder's own classification helpers --
+// Unit tests for the recorder's own classification helpers.
 //
-// `from_sql`/`extract_table` are private to this module, so they're tested
-// here rather than from an integration test (which can only see `pub`
-// items). `normalize_sql`'s table-driven cases and the aggregation
-// methods (`stats`, `writes_outside_tx`, `redundant_reads_after_write`,
-// `dump`) are public, and each consuming crate additionally proves the live
-// wiring end to end.
+// `from_sql`/`extract_table` are private, so they're tested here rather
+// than from an integration test, which can only see `pub` items.
 #[cfg(test)]
 mod tests {
     use super::{QueryKind, extract_table};
