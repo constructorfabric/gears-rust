@@ -443,7 +443,7 @@ dev: dev-fmt dev-clippy dev-test
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-rg-pg test-fips
 
 # Run all tests
 test: install-tools
@@ -475,6 +475,10 @@ test-db: test-sqlite test-pg test-mysql
 ## Run users-info gear integration tests
 test-users-info-pg: install-tools
 	cargo nextest run -p users-info --features "integration"
+
+## Run resource-group gear PostgreSQL concurrency tests
+test-rg-pg: install-tools
+	cargo nextest run -p cf-gears-resource-group --features integration
 
 ## Run FIPS-mode integration tests (requires Go for aws-lc-fips-sys).
 ## Covers:

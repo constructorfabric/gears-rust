@@ -24,6 +24,8 @@ use toolkit_db::{
 };
 use toolkit_security::{SecurityContext, pep_properties};
 
+use toolkit_db::test_support::QueryRecorder;
+
 use resource_group::domain::group_service::{GroupService, QueryProfile};
 use resource_group::domain::membership_service::MembershipService;
 use resource_group::domain::type_service::TypeService;
@@ -263,6 +265,33 @@ pub async fn test_db() -> Arc<DBProvider<DbError>> {
         .expect("run migrations");
 
     Arc::new(DBProvider::new(db))
+}
+
+/// Create an in-memory SQLite database with migrations applied, and attach a
+/// [`QueryRecorder`] to it for the DB-behavior audit.
+///
+/// Attaches the metric callback before wrapping the connection, unlike
+/// [`test_db`]: `DBProvider`/`Db` never expose the inner `SeaORM`
+/// connection, and attaching after wrapping would miss every statement.
+pub async fn test_db_with_recorder() -> (Arc<DBProvider<DbError>>, QueryRecorder) {
+    let opts = ConnectOpts {
+        max_conns: Some(1),
+        min_conns: Some(1),
+        ..Default::default()
+    };
+    let (db, recorder) = toolkit_db::test_support::connect_with_recorder("sqlite::memory:", opts)
+        .await
+        .expect("connect to in-memory SQLite with recorder");
+
+    run_migrations_for_testing(&db, Migrator::migrations())
+        .await
+        .expect("run migrations");
+
+    // Migrations run their own DDL through the same connection/callback --
+    // start each test's trace from a clean slate.
+    recorder.clear();
+
+    (Arc::new(DBProvider::new(db)), recorder)
 }
 
 // -- Security context --

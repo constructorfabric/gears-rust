@@ -22,6 +22,12 @@ workspace = true
 default = ["odata"]
 odata = []
 
+# Gates the Postgres-backed real-DB concurrency suite
+# (tests/pg_concurrency_test.rs). Disabled by default because it spins up a
+# `testcontainers` Docker container; enable with `--features integration`
+# when Docker is available locally or in CI.
+integration = []
+
 [dependencies]
 # SDK - public API, models, and errors
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.1", path = "../resource-group-sdk", features = ["odata"] }
@@ -76,7 +82,24 @@ toolkit-macros = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-toolkit-db = { workspace = true, features = ["sqlite"] }
+# "test-support" enables toolkit_db::connect_db_with_metric_callback and
+# secure::in_transaction_for_testing, used by the DB-behavior audit's
+# QueryRecorder (tests/common/query_recorder.rs). Test-only; never built
+# into the production library (this crate's own [dependencies] above pulls
+# in toolkit-db without this feature).
+# "pg" (on top of the "sqlite" already needed by the SQLite audit tests) lets
+# tests/pg_concurrency_test.rs connect to a real PostgreSQL via connect_db().
+toolkit-db = { workspace = true, features = ["sqlite", "pg", "test-support"] }
+# SQL normalization for the QueryRecorder (tests/common/query_recorder.rs) --
+# already a workspace dependency (see root Cargo.toml), used here as a
+# test-only dev-dependency.
+regex = { workspace = true }
+# PostgreSQL concurrency harness (tests/pg_concurrency_test.rs) -- brings up a
+# real PostgreSQL via Docker, mirroring account-management's
+# tests/common/mod.rs::pg::bring_up_postgres(). Both already workspace
+# dependencies (root Cargo.toml), used here as test-only dev-dependencies.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
 tower = { workspace = true }
 http-body-util = { workspace = true }
 # Enable the SDK `test-util` feature so integration-test fakes can build the
