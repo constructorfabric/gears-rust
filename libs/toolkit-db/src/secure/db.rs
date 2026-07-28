@@ -83,6 +83,20 @@ fn is_in_transaction() -> bool {
     IN_TX.try_with(Cell::get).unwrap_or(false)
 }
 
+/// **Test-only**: report whether the current async task is inside a
+/// `Db::transaction*` closure, i.e. whether the guard above is armed.
+///
+/// Reads the exact same task-local the guard enforces, so query recorders
+/// can tag captured SQL as in-tx/out-of-tx. Precise, not a heuristic: a
+/// `SeaORM` metric callback fires synchronously on the issuing task.
+///
+/// Gated behind the `test-support` feature; never used by production code.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn in_transaction_for_testing() -> bool {
+    is_in_transaction()
+}
+
 /// Execute a closure with the transaction guard set.
 ///
 /// This sets `IN_TX = true` for the duration of the closure, ensuring
