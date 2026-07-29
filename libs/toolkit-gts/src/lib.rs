@@ -43,6 +43,9 @@ pub use gts::{GTS_ID_PREFIX, GTS_ID_URI_PREFIX, GtsId, GtsInstanceId, GtsSchema}
 // `inventory` as a direct dep.
 #[doc(hidden)]
 pub use inventory;
+// Re-exported for `#[gts_type_schema(open_payload = true)]`-generated code,
+// which post-processes the upstream schema JSON before inventory submission.
+pub use serde_json;
 
 // Re-export the companion proc-macros so consumers need only one crate dep.
 pub use gts_macros::GtsTraitsSchema;
