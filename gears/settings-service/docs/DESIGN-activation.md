@@ -208,7 +208,7 @@ C4Container
 - **Back-response contract** — consumers emit `apply_success` (or `apply_failed { detail }`) **per changed setting** after reacting, echoing the `tenant` and **the value they applied (a hash for secret-valued settings)**, so the Settings Service tracks activation **per await-record** and verifies the applied value against the expected value **snapshotted at apply time** (§4.2 *Apply Publisher*). A `success` back-response carrying a value that does **not** match is treated as a **failure**.
 - **Settings Service apply-outcome visibility** — the Settings Service tracks and exposes via API the state of each apply: a **wait-for-all** overall status `awaiting` → `success` / `failed` / `superseded` / `cancelled`, plus **succeeded / failed / superseded / cancelled / awaiting counts** over the await-records.
 - **Consumer re-read-and-react** obligation: on an `apply_notification` the consumer re-reads the affected keys and applies them. A restart-only consumer is handled by **re-publish on re-subscribe** (§4.2 *Apply Outcome Tracker*) — no missed activation is stranded.
-- **Event Broker transport only** — durable pub/sub via the the platform event broker broker. At-least-once delivery with consumer-side idempotency by `apply_id`.
+- **Event Broker transport only** — durable pub/sub via the platform event broker. At-least-once delivery with consumer-side idempotency by `apply_id`.
 
 ### 2.2 Non-Goals
 
@@ -258,7 +258,7 @@ A bundle stays open until every await-record is terminal. There is no automatic 
 | Constraint/Assumption | Description |
 |----------------------|-------------|
 | Delivered as part of the Settings Service Gear | Settings Activation is a mechanism **inside** the Settings Service; the publisher and state tables ship in the Settings Service Cyber Fabric Gear (ToolKit runtime); consumers reach the subscription contract through the settings SDK registered in `ClientHub`. |
-| Event Broker transport only | Durable pub/sub via the the platform event broker broker. No broker-less fallback — the broker is a platform dependency. |
+| Event Broker transport only | Durable pub/sub via the platform event broker. No broker-less fallback — the broker is a platform dependency. |
 | Two events per apply | Each apply emits (1) a `cache_invalidate` broadcast to all replicas (published inline at apply, best-effort, cache-TTL backstop) and (2) one filtered `apply_notification` per subscriber (delivered from the durable await-records until acked). Both come from the same settled apply (§4.2 *Apply Publisher*). |
 | Consumer notification is filtered | An `apply_notification` carries **only the subscriber's own subscribed changed keys** — never the full apply. This is **key-scoped, best-effort least-privilege** (§4.8), **not** a cross-tenant isolation guarantee: filtering has no tenant dimension, so a subscriber to key K is notified of K's change in **any** tenant (the notification carries which). |
 | Tenant in payload | Both events include the `tenant` the change applies to (absent ⇒ platform-wide), so consumers can correctly resolve tenant lineage if they care about cascading, and replicas evict the right scope. |
@@ -654,7 +654,7 @@ Per-apply metadata only. **No stored counters and no stored `overall_status`**: 
 
 #### Table: `apply_await_records`
 
-The load-bearing per-`(apply_id, subscriber, key)` state. Created at publish for every await-record the apply must hear back on; it holds the value **snapshot** and the terminal outcome, and absorbs the received back-response. It is **also the delivery queue** : rows with `status = 'awaiting'` are exactly what the delivery loop (§4.2 *Event Broker Client*) publishes and re-publishes until acked — there is no separate outbox. `GET /v1/applies/{apply_id}/activation/responses` reads the rows with `received_at IS NOT NULL`.
+The load-bearing per-`(apply_id, subscriber, key)` state. Created at publish for every await-record the apply must hear back on; it holds the value **snapshot** and the terminal outcome, and absorbs the received back-response. It is **also the delivery queue**: rows with `status = 'awaiting'` are exactly what the delivery loop (§4.2 *Event Broker Client*) publishes and re-publishes until acked — there is no separate outbox. `GET /v1/applies/{apply_id}/activation/responses` reads the rows with `received_at IS NOT NULL`.
 
 | Column | Type | Nullable | Default | Constraints |
 |--------|------|----------|---------|-------------|
@@ -720,7 +720,7 @@ Decisions taken during design, with the alternative rejected and the residual co
 - **Event Broker required.** No broker-less fallback. *Mitigation:* Event Broker is a platform dependency; at-least-once durability with consumer-side dedup by `apply_id` is the contract. `cache_ttl_seconds` backstop handles a missed `cache_invalidate`.
 - **Bundle dedup.** Consumers MUST dedup on `apply_id` to handle at-least-once delivery (the delivery loop re-publishes an `awaiting` record until acked). *Mitigation:* SDK enforces this; `redeliver_interval_seconds` backoff bounds re-notify volume; testing covers redelivery.
 - **Restart handling.** A restart-only consumer leaves its await-records `awaiting`; on re-subscribe the service re-publishes the notification and the consumer acks after boot (§4.2 *Subscription Manager*, §4.2 *Apply Outcome Tracker*).
-- **Hierarchy-change invalidation is not covered by the broadcast** — a tenant re-parent or mid-chain insert changes a `cascading` effective value with no apply to broadcast about (§4.2 *Cache Invalidation Broadcast*). The eviction trigger belongs to the settings-service cache, but the Tenant Resolver publishes no hierarchy-change signal today, so after a re-parent a replica may serve the pre-move value for up to `cache_ttl_seconds`. *Mitigation:* the TTL backstop; the durable fix is an the Tenant Resolver hierarchy-change event (§4.2 *Cache & Invalidation* / §4.4/DESIGN.md §6).
+- **Hierarchy-change invalidation is not covered by the broadcast** — a tenant re-parent or mid-chain insert changes a `cascading` effective value with no apply to broadcast about (§4.2 *Cache Invalidation Broadcast*). The eviction trigger belongs to the settings-service cache, but the Tenant Resolver publishes no hierarchy-change signal today, so after a re-parent a replica may serve the pre-move value for up to `cache_ttl_seconds`. *Mitigation:* the TTL backstop; the durable fix is a Tenant Resolver hierarchy-change event (§4.2 *Cache & Invalidation* / §4.4/DESIGN.md §6).
 
 ## 6. Open Questions
 
@@ -732,7 +732,7 @@ No PRD open question is owned by this design. The activation-relevant items are 
 
 - **Unbounded wait / stuck bundle (OPEN).** With wait-for-all and no deadline, a bundle with a permanently unresponsive await-record never reaches a terminal outcome — it stays `awaiting` until an administrator stops waiting. There is **no automatic timeout** (by design). A clean **gear retire** is already handled deterministically — its await-records resolve to `cancelled` (§4.2 *Subscription Manager*) — so this open question covers **only** a consumer that vanishes **without** retiring. **Open:** should there be an **admin-initiated** "give up / close as failed" action for such a consumer (and how is one that is gone-for-good distinguished from a slow/restarting one)?
 - **Replica registration (OPEN).** A consumer with a unique identity is straightforward; a consumer running as **several replicas** is unclear — how are replicas registered and accounted for so acknowledgement is tracked correctly per await-record? (Note: this concerns *acking consumers* running as replicas — Settings Service cache-invalidation replicas need no registration, §4.2 *Cache Invalidation Broadcast*.)
-- **Planned ADR.** The activation-model decision (notify-and-react vs central execution; two-event split for isolation; Event Broker durability; wait-for-all + unbounded wait; restart handling; subscriber discovery) SHOULD be captured in a dedicated ADR referenced from both this design and the Settings Service design.
+- **Activation-model rationale is recorded in this design.** The decisions behind the model — notify-and-react vs central execution, the two-event split for isolation, Event Broker durability, wait-for-all with an unbounded wait, restart handling, and subscriber discovery — are stated in §3.1 *Design Principles*, §3.2 *Constraints*, and §5.1 *Architectural Trade-offs*.
 
 ## 7. Additional context
 
@@ -860,5 +860,4 @@ Concurrent applies and concurrent back-responses exist. Test: seed N applies, sp
 
 - **PRD**: [PRD.md](./PRD.md)
 - **Settings Service design**: [DESIGN.md](./DESIGN.md) — storage, resolution, the pull reader, and the apply commit this design publishes from
-- **ADRs**: [ADR/](./ADR/) — activation-model ADR planned (DESIGN.md §6.2)
-- **Features**: [features/](./features/)
+- **Features**: [features/](./features/) — TBD, not yet authored for this gear
