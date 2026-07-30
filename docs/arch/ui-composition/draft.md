@@ -77,9 +77,12 @@ whatever is registered in the *screen* domain.
 Navigation is **not** URL-driven. `presentation.route` exists in the schema but the shell does not
 consume it — switching screens is a mount action against a domain, not a route transition.
 
-One caveat worth knowing: a project scaffolded with `frontx create` gets a **static** `Menu.tsx`
-with a single hardcoded `Home` entry and no registry lookup. The registry-driven menu currently
-lives only in the monorepo shell. Template and monorepo have drifted apart here.
+One caveat that applies to `910a4ca4` specifically: a project scaffolded with `frontx create` got a
+**static** `Menu.tsx` with a single hardcoded `Home` entry and no registry lookup. The CLI's
+template (`packages/cli/template-sources/project/src/app/layout/Menu.tsx`) had simply fallen behind
+the shell it was supposed to mirror — both files exist in that same commit, one registry-driven and
+one not. Resolved upstream since: `develop` keeps a single registry-driven `Menu.tsx` under
+`template-standard/src-app/`, with no separate shell to drift from.
 
 ### 3.2 Where the menu instances live
 
@@ -276,13 +279,20 @@ pins via `extensionsTypeId` — the same validation the frontend does locally to
 
 ### 4.2 Gaps in the current schemas
 
-| Gap | Detail |
-|---|---|
-| No i18n for labels | `presentation.label` is a raw string, not a dictionary key. Localized menus are not expressible today. |
-| No audience / device / scenario targeting | Nothing in the schemas expresses "admin only", "teacher", "mobile", "tv". The only available filter is which instances reached the registry at all. |
-| `route` is declared but unused | The shell mounts by action, not by URL. Deep links, browser history and bookmarking are therefore not supported by the current shell. |
-| Ordering is a flat number | `order` is a global integer per domain; no grouping, sections or nesting. A gear cannot say "put me under Administration". |
-| Menu source drift | The registry-driven menu exists in the monorepo shell, while `frontx create` scaffolds a static one. A generated project does not inherit the behaviour documented here. |
+| Gap | Detail | Disposition |
+|---|---|---|
+| No i18n for labels | `presentation.label` is a raw string, not a dictionary key. Localized menus are not expressible today. | Runtime transformation — out of scope for this phase (see below) |
+| No audience / device / scenario targeting | Nothing in the schemas expresses "admin only", "teacher", "mobile", "tv". The only available filter is which instances reached the registry at all. | Runtime transformation — out of scope for this phase (see below) |
+| `route` is declared but unused | The shell mounts by action, not by URL. Deep links, browser history and bookmarking are therefore not supported by the current shell. | Open |
+| Ordering is a flat number | `order` is a global integer per domain; no grouping, sections or nesting. A gear cannot say "put me under Administration". | Open |
+| Template lagged behind the shell | On `910a4ca4` the registry-driven `Menu.tsx` lived in the monorepo shell (`src/app/`) while the CLI's own template shipped a static one (`packages/cli/template-sources/project/src/app/layout/Menu.tsx`, hardcoded `Home`) — two implementations in the same commit, so a scaffolded project did not inherit the documented behaviour. | Resolved upstream: in `develop` there is a single, registry-driven `Menu.tsx` under `template-standard/src-app/`, and the separate shell is gone |
+
+**Localization and filtering are deliberately not schema concerns.** Both are runtime
+transformations over the instance set, and they belong to a *serverless runtime* — a function
+resolver that evaluates transformation functions, on the server or on the client, before the shell
+sees the result. Baking them into the navigation schemas would push per-tenant, per-role and
+per-locale logic into static declarations. Out of scope for this phase; it does, however, mean the
+navigation API must stay a *computed* surface rather than a straight dump of stored instances.
 
 ### 4.3 Composition model worth reusing
 
