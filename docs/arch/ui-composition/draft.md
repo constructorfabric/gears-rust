@@ -211,10 +211,16 @@ extension type it accepts (line 12):
 "extensionsTypeId": "gts.frontx.mfes.ext.extension.v1~frontx.screensets.layout.screen.v1~"
 ```
 
-So an extension without `presentation` is rejected at registration time by schema validation —
-not silently ignored later in the UI. The domain instance also declares its shared properties
-(`theme`, `language`), the actions it accepts (`load_ext`, `mount_ext`), a `defaultActionTimeout`
-of 30 s, and the lifecycle stages it drives.
+So an extension that targets the screen domain but omits `presentation` is rejected at registration
+time by schema validation — not silently ignored later in the UI. That is distinct from an
+extension targeting a domain this registry does not own (e.g. the `widgets` domain owned by
+`demo-mfe`'s child app): those are skipped deliberately, without validation, and delivered to the
+owning runtime instead — `bootstrap.ts:283`, the recursive-composition path from §3.2. Rejection
+means "malformed contribution to my slot"; skipping means "not my slot".
+
+The domain instance also declares its shared properties (`theme`, `language`), the actions it
+accepts (`load_ext`, `mount_ext`), a `defaultActionTimeout` of 30 s, and the lifecycle stages it
+drives.
 
 ### 3.5 ID notation
 
