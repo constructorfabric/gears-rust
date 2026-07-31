@@ -212,10 +212,17 @@ pub struct OperationSpec {
     pub responses: Vec<ResponseSpec>,
     /// Internal handler id; can be used by registry/generator to map a handler identity
     pub handler_id: String,
-    /// Whether this operation requires authentication.
-    /// `true` = authenticated endpoint, `false` = public endpoint.
+    /// Auth axis: whether this operation requires a validated tenant JWT.
+    /// `true` = authenticated (bearer required); `false` = anonymous (a missing
+    /// bearer is allowed — a present bearer is still always re-validated).
+    /// Independent of [`is_public`](Self::is_public); maps 1:1 to the
+    /// `PublicRoute` marker in the `OoP` per-gear middleware (`!authenticated`).
     pub authenticated: bool,
-    /// Explicitly mark route as public (no auth required)
+    /// Visibility axis: whether this route is registered in the gateway for
+    /// external access (`true`) or is internal-only, reachable only via
+    /// inter-gear communication (`false`). Defaults to `false` (internal).
+    /// Independent of [`authenticated`](Self::authenticated) — an exposed route
+    /// may still require a JWT.
     pub is_public: bool,
     /// Optional rate & concurrency limits for this operation
     pub rate_limit: Option<RateLimitSpec>,
@@ -694,7 +701,7 @@ where
     ///     .operation_id("upload_file")
     ///     .summary("Upload a file")
     ///     .multipart_file_request("file", Some("File to upload"))
-    ///     .public()
+    ///     .anonymous()
     ///     .handler(upload_handler)
     ///     .json_response(StatusCode::OK, "Upload successful")
     ///     .register(router, &registry);
@@ -755,7 +762,7 @@ where
     ///     .operation_id("upload_file")
     ///     .summary("Upload a file")
     ///     .octet_stream_request(Some("Raw file bytes to parse"))
-    ///     .public()
+    ///     .anonymous()
     ///     .handler(upload_handler)
     ///     .json_response(StatusCode::OK, "Upload successful")
     ///     .register(router, &registry);
@@ -798,7 +805,7 @@ where
     /// let router = OperationBuilder::post("/files/v1/upload")
     ///     .operation_id("upload_file")
     ///     .allow_content_types(&["multipart/form-data", "application/pdf"])
-    ///     .public()
+    ///     .anonymous()
     ///     .handler(upload_handler)
     ///     .json_response(StatusCode::OK, "Upload successful")
     ///     .register(router, &registry);
@@ -806,6 +813,18 @@ where
     /// ```
     pub fn allow_content_types(mut self, types: &[&'static str]) -> Self {
         self.spec.allowed_request_content_types = Some(types.to_vec());
+        self
+    }
+
+    /// Mark this route as **publicly visible** — registered in the gateway for
+    /// external access (the *visibility* axis).
+    ///
+    /// This is independent of authentication (`.authenticated()` /
+    /// `.anonymous()`): an exposed route may still require a JWT. Routes are
+    /// **internal by default** (not registered in the gateway). Available at any
+    /// stage of the builder.
+    pub fn exposed(mut self) -> Self {
+        self.spec.is_public = true;
         self
     }
 }
@@ -932,7 +951,6 @@ where
     /// ```
     pub fn authenticated(mut self) -> OperationBuilder<H, R, S, AuthSet, L> {
         self.spec.authenticated = true;
-        self.spec.is_public = false;
         OperationBuilder {
             spec: self.spec,
             method_router: self.method_router,
@@ -944,9 +962,14 @@ where
         }
     }
 
-    /// Mark this route as public (no authentication required).
+    /// Mark this route as **anonymous** — no authentication required (the *auth*
+    /// axis).
     ///
-    /// This explicitly opts out of the `require_auth_by_default` setting.
+    /// A missing `Authorization: Bearer` header is allowed; a present bearer is
+    /// still always re-validated. This explicitly opts out of the
+    /// `require_auth_by_default` setting and maps to the `PublicRoute` marker in
+    /// the `OoP` per-gear middleware. It is independent of visibility — use
+    /// [`exposed`](Self::exposed) to also register the route in the gateway.
     /// This method transitions from `AuthNotSet` to `AuthSet` state.
     ///
     /// # Example
@@ -961,14 +984,13 @@ where
     /// # let registry = OpenApiRegistryImpl::new();
     /// # let router: Router<()> = Router::new();
     /// let router = OperationBuilder::get("/users-info/v1/health")
-    ///     .public()
+    ///     .anonymous()
     ///     .handler(health_check)
     ///     .json_response(StatusCode::OK, "OK")
     ///     .register(router, &registry);
     /// # let _ = router;
     /// ```
-    pub fn public(mut self) -> OperationBuilder<H, R, S, AuthSet, LicenseSet> {
-        self.spec.is_public = true;
+    pub fn anonymous(mut self) -> OperationBuilder<H, R, S, AuthSet, LicenseSet> {
         self.spec.authenticated = false;
         OperationBuilder {
             spec: self.spec,
@@ -1406,7 +1428,7 @@ where
     /// # let registry = OpenApiRegistryImpl::new();
     /// # let router: Router<()> = Router::new();
     /// let op = OperationBuilder::get("/user-info/v1/users")
-    ///     .public()
+    ///     .anonymous()
     ///     .handler(list_users)
     ///     .json_response(StatusCode::OK, "List of users")
     ///     .standard_errors(&registry);
@@ -1482,7 +1504,7 @@ where
     /// # let registry = OpenApiRegistryImpl::new();
     /// # let router: Router<()> = Router::new();
     /// let op = OperationBuilder::post("/users-info/v1/users")
-    ///     .public()
+    ///     .anonymous()
     ///     .handler(create_user)
     ///     .json_request::<CreateUserRequest>(&registry, "User data")
     ///     .json_response(StatusCode::CREATED, "User created")
@@ -1742,7 +1764,7 @@ mod tests {
         let _router = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/test")
             .summary("Test endpoint")
             .json_request::<SampleDtoRequest>(&registry, "optional body") // registers schema
-            .public()
+            .anonymous()
             .handler(test_handler)
             .json_response_with_schema::<SampleDtoResponse>(
                 &registry,
@@ -1862,7 +1884,7 @@ mod tests {
     fn standard_errors() {
         let registry = MockRegistry::new();
         let builder = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/test")
-            .public()
+            .anonymous()
             .handler(test_handler)
             .json_response(http::StatusCode::OK, "Success")
             .standard_errors(&registry);
@@ -1909,6 +1931,38 @@ mod tests {
 
         assert!(builder.spec.authenticated);
         assert!(!builder.spec.is_public);
+    }
+
+    #[test]
+    fn anonymous_is_internal_by_default() {
+        let builder = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/test")
+            .anonymous()
+            .handler(test_handler)
+            .json_response(http::StatusCode::OK, "Success");
+
+        assert!(!builder.spec.authenticated);
+        assert!(!builder.spec.is_public);
+    }
+
+    #[test]
+    fn exposed_is_independent_of_auth() {
+        // Visibility (`is_public`) and auth (`authenticated`) are orthogonal:
+        // an exposed route may be authenticated or anonymous.
+        let authed = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/a")
+            .exposed()
+            .authenticated()
+            .handler(test_handler)
+            .json_response(http::StatusCode::OK, "OK");
+        assert!(authed.spec.authenticated);
+        assert!(authed.spec.is_public);
+
+        let anon = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/b")
+            .exposed()
+            .anonymous()
+            .handler(test_handler)
+            .json_response(http::StatusCode::OK, "OK");
+        assert!(!anon.spec.authenticated);
+        assert!(anon.spec.is_public);
     }
 
     #[test]
@@ -1980,7 +2034,7 @@ mod tests {
         let router = Router::new();
 
         let _router = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/test")
-            .public()
+            .anonymous()
             .handler(test_handler)
             .json_response(http::StatusCode::OK, "Success")
             .register(router, &registry);
@@ -1994,7 +2048,7 @@ mod tests {
     fn with_400_validation_error() {
         let registry = MockRegistry::new();
         let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/test")
-            .public()
+            .anonymous()
             .handler(test_handler)
             .json_response(http::StatusCode::CREATED, "Created")
             .with_400_validation_error(&registry);
@@ -2023,7 +2077,7 @@ mod tests {
         let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/test")
             .json_request::<SampleDtoRequest>(&registry, "Test request")
             .allow_content_types(&["application/json", "application/xml"])
-            .public()
+            .anonymous()
             .handler(test_handler)
             .json_response(http::StatusCode::OK, "Success");
 
@@ -2040,7 +2094,7 @@ mod tests {
     fn allow_content_types_without_existing_request_body() {
         let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/test")
             .allow_content_types(&["multipart/form-data"])
-            .public()
+            .anonymous()
             .handler(test_handler)
             .json_response(http::StatusCode::OK, "Success");
 
@@ -2060,7 +2114,7 @@ mod tests {
             .summary("Test endpoint")
             .json_request::<SampleDtoRequest>(&registry, "Test request")
             .allow_content_types(&["application/json"])
-            .public()
+            .anonymous()
             .handler(test_handler)
             .json_response(http::StatusCode::OK, "Success")
             .problem_response(
@@ -2081,7 +2135,7 @@ mod tests {
             .operation_id("test.upload")
             .summary("Upload file")
             .multipart_file_request("file", Some("Upload a file"))
-            .public()
+            .anonymous()
             .handler(test_handler)
             .json_response(http::StatusCode::OK, "Success");
 
@@ -2112,7 +2166,7 @@ mod tests {
     fn multipart_file_request_without_description() {
         let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/upload")
             .multipart_file_request("file", None)
-            .public()
+            .anonymous()
             .handler(test_handler)
             .json_response(http::StatusCode::OK, "Success");
 
@@ -2134,7 +2188,7 @@ mod tests {
             .operation_id("test.upload")
             .summary("Upload raw file")
             .octet_stream_request(Some("Raw file bytes"))
-            .public()
+            .anonymous()
             .handler(test_handler)
             .json_response(http::StatusCode::OK, "Success");
 
@@ -2159,7 +2213,7 @@ mod tests {
     fn octet_stream_request_without_description() {
         let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/upload")
             .octet_stream_request(None)
-            .public()
+            .anonymous()
             .handler(test_handler)
             .json_response(http::StatusCode::OK, "Success");
 
@@ -2175,7 +2229,7 @@ mod tests {
         let registry = MockRegistry::new();
         let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/test")
             .json_request::<SampleDtoRequest>(&registry, "Test request body")
-            .public()
+            .anonymous()
             .handler(test_handler)
             .json_response(http::StatusCode::OK, "Success");
 
@@ -2201,7 +2255,7 @@ mod tests {
             .operation_id("test.content_type_purity")
             .summary("Test response content types")
             .json_request::<SampleDtoRequest>(&registry, "Test")
-            .public()
+            .anonymous()
             .handler(test_handler)
             .text_response(http::StatusCode::OK, "Text", "text/plain")
             .text_response(http::StatusCode::OK, "Markdown", "text/markdown")

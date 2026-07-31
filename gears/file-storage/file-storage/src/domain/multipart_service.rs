@@ -622,7 +622,7 @@ impl MultipartService {
         let part_number = i32::try_from(claims.multipart.part_number)
             .map_err(|_| DomainError::validation("part_number", "part_number overflows i32"))?;
 
-        // Security: this callback is `.public()` + token-authenticated, so a
+        // Security: this callback is `.anonymous()` + token-authenticated, so a
         // holder of the signed part token could otherwise report an arbitrary
         // `size` that `complete_multipart_upload` later sums into
         // `version.size` unchecked. `claims.multipart.size` is the exact

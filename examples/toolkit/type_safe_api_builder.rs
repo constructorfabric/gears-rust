@@ -99,7 +99,7 @@ async fn main() {
         .tag("users")
         .query_param("limit", false, "Maximum number of users to return")
         .query_param("offset", false, "Number of users to skip for pagination")
-        .public() // <- Required: must explicitly set auth requirement
+        .anonymous() // <- Required: must explicitly set auth requirement
         .json_response(http::StatusCode::OK, "Successfully retrieved user list")
         .json_response(
             http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -114,7 +114,7 @@ async fn main() {
         .summary("Create a new user")
         .description("Creates a new user account in the system")
         .tag("users")
-        .public() // <- Required: must explicitly set auth requirement
+        .anonymous() // <- Required: must explicitly set auth requirement
         .json_response(http::StatusCode::CREATED, "User created successfully") // <- Required: at least one response
         .json_response(http::StatusCode::BAD_REQUEST, "Invalid user data")
         .json_response(http::StatusCode::CONFLICT, "User already exists")
@@ -132,7 +132,7 @@ async fn main() {
         .description("Retrieves detailed information about a specific user")
         .tag("users")
         .path_param("id", "Unique identifier for the user")
-        .public() // <- Required: must explicitly set auth requirement
+        .anonymous() // <- Required: must explicitly set auth requirement
         .json_response(http::StatusCode::OK, "User details retrieved successfully")
         .json_response(http::StatusCode::NOT_FOUND, "User not found")
         .json_response(

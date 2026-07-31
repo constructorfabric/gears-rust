@@ -156,6 +156,17 @@ impl OpenApiRegistryImpl {
                 ext.insert("x-odata-orderby".to_owned(), value);
             }
 
+            // Visibility axis (`OperationSpec.is_public`): mark routes that are
+            // registered in the gateway for external access. The `GatewayProvider`
+            // reads this vendor extension to select which routes to reverse-proxy.
+            // The key is mirrored as a constant in `cf-gears-toolkit-gateway`.
+            if spec.is_public {
+                ext.insert(
+                    "x-cf-api-visibility".to_owned(),
+                    serde_json::Value::String("public".to_owned()),
+                );
+            }
+
             if !ext.is_empty() {
                 op = op.extensions(Some(ext));
             }

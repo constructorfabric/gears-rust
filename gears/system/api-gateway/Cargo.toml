@@ -21,8 +21,11 @@ workspace = true
 [dependencies]
 toolkit = { workspace = true }
 toolkit-http = { workspace = true }
+toolkit-gateway = { workspace = true }
 toolkit-security = { workspace = true }
+toolkit-transport-grpc = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
+cf-gears-system-sdks = { workspace = true, features = ["directory_grpc"] }
 authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.22", path = "../authn-resolver/authn-resolver-sdk" }
 toolkit-gts = { workspace = true }
 grpc_hub = { workspace = true }

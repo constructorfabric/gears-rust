@@ -1775,7 +1775,7 @@ async fn multipart_complete_uses_reported_parts_not_empty_list() {
     );
 }
 
-/// CodeRabbit (Major): the report-part callback is `.public()` +
+/// CodeRabbit (Major): the report-part callback is `.anonymous()` +
 /// token-authenticated, so a holder of the signed part token could otherwise
 /// report an arbitrary `size` in the JSON body. `complete_multipart_upload`
 /// sums stored part sizes into `version.size` unchecked, so a forged size

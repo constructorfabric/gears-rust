@@ -1525,12 +1525,15 @@ dependencies = [
  "cf-gears-authn-resolver",
  "cf-gears-authn-resolver-sdk",
  "cf-gears-grpc-hub",
+ "cf-gears-system-sdks",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gateway",
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-http",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
+ "cf-gears-toolkit-transport-grpc",
  "chrono",
  "dashmap",
  "futures-core",
@@ -1568,6 +1571,7 @@ dependencies = [
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
  "inventory",
@@ -1927,8 +1931,12 @@ dependencies = [
  "cf-gears-api-gateway",
  "cf-gears-system-sdks",
  "cf-gears-toolkit",
+ "cf-gears-toolkit-k8s-auth",
  "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-toolkit-transport-grpc",
  "inventory",
+ "secrecy",
  "serde",
  "serde_json",
  "tokio",
@@ -2657,6 +2665,7 @@ dependencies = [
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-sdk",
  "cf-gears-toolkit-security",
+ "cf-gears-toolkit-transport-grpc",
  "cf-gears-toolkit-utils",
  "chrono",
  "dashmap",
@@ -2811,6 +2820,27 @@ dependencies = [
  "quote",
  "syn 2.0.117",
  "trybuild",
+]
+
+[[package]]
+name = "cf-gears-toolkit-gateway"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-http",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "matchit 0.9.2",
+ "parking_lot",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "utoipa",
 ]
 
 [[package]]
@@ -3003,6 +3033,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "trybuild",
  "uuid",
 ]
@@ -3017,6 +3048,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "cf-gears-toolkit-security",
+ "parking_lot",
  "secrecy",
  "tokio",
  "tokio-retry",

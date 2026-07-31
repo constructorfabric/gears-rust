@@ -13,6 +13,7 @@ mod assets;
 mod config;
 mod cors;
 pub mod middleware;
+mod proxy;
 mod router_cache;
 mod web;
 

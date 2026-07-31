@@ -13,8 +13,11 @@
 //! `toolkit-security` has no dependency on any transport crate.
 
 use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::context::SecurityContext;
+use crate::internal_auth::{InternalAuthNError, InternalAuthenticator, PlatformIdentity};
 
 /// Neutral authentication error returned by a [`BearerAuthenticator`].
 ///
@@ -58,4 +61,125 @@ pub trait BearerAuthenticator: Send + Sync {
         &self,
         token: &str,
     ) -> impl Future<Output = Result<SecurityContext, AuthNError>> + Send;
+}
+
+type BearerFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<SecurityContext, AuthNError>> + Send + 'a>>;
+
+/// Object-safe erasure of [`BearerAuthenticator`].
+///
+/// [`BearerAuthenticator::authenticate`] returns `impl Future`, so the trait is
+/// not `dyn`-compatible. This trait boxes the future so a concrete authenticator
+/// can be stored behind an `Arc` and shared/injected as a trait object.
+trait ErasedBearer: Send + Sync {
+    fn authenticate<'a>(&'a self, token: &'a str) -> BearerFuture<'a>;
+}
+
+impl<A: BearerAuthenticator> ErasedBearer for A {
+    fn authenticate<'a>(&'a self, token: &'a str) -> BearerFuture<'a> {
+        Box::pin(BearerAuthenticator::authenticate(self, token))
+    }
+}
+
+/// Injectable, object-safe tenant-plane authenticator.
+///
+/// Wraps a concrete [`BearerAuthenticator`] (e.g. an `AuthNResolverClient`
+/// adapter) so it can be stored behind an `Arc` and registered in a
+/// `ClientHub` / handed to the `OoP` HTTP runtime. Lives in `toolkit-security`
+/// (a leaf crate, always available) so any gear can register the bridge without
+/// depending on the bootstrap-gated `toolkit` runtime.
+#[derive(Clone)]
+pub struct DynBearerAuthenticator(Arc<dyn ErasedBearer>);
+
+impl DynBearerAuthenticator {
+    /// Wrap a concrete [`BearerAuthenticator`] in the object-safe adapter.
+    #[must_use]
+    pub fn new<A: BearerAuthenticator + 'static>(authenticator: A) -> Self {
+        Self(Arc::new(authenticator))
+    }
+
+    /// Wrap an already-`Arc`'d [`BearerAuthenticator`] in the object-safe adapter.
+    #[must_use]
+    pub fn from_arc<A: BearerAuthenticator + 'static>(authenticator: Arc<A>) -> Self {
+        // Adapt Arc<A> to Arc<dyn ErasedBearer> via a thin wrapper.
+        struct W<A>(Arc<A>);
+        impl<A: BearerAuthenticator> ErasedBearer for W<A> {
+            fn authenticate<'a>(&'a self, token: &'a str) -> BearerFuture<'a> {
+                Box::pin(BearerAuthenticator::authenticate(&*self.0, token))
+            }
+        }
+        Self(Arc::new(W(authenticator)))
+    }
+}
+
+impl std::fmt::Debug for DynBearerAuthenticator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynBearerAuthenticator")
+            .finish_non_exhaustive()
+    }
+}
+
+impl BearerAuthenticator for DynBearerAuthenticator {
+    async fn authenticate(&self, token: &str) -> Result<SecurityContext, AuthNError> {
+        self.0.authenticate(token).await
+    }
+}
+
+type InternalFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<PlatformIdentity, InternalAuthNError>> + Send + 'a>>;
+
+/// Object-safe erasure of [`InternalAuthenticator`] (same rationale as
+/// [`ErasedBearer`]).
+trait ErasedInternal: Send + Sync {
+    fn authenticate<'a>(&'a self, token: &'a str) -> InternalFuture<'a>;
+}
+
+impl<A: InternalAuthenticator> ErasedInternal for A {
+    fn authenticate<'a>(&'a self, token: &'a str) -> InternalFuture<'a> {
+        Box::pin(InternalAuthenticator::authenticate(self, token))
+    }
+}
+
+/// Injectable, object-safe platform-plane authenticator.
+///
+/// Wraps a concrete [`InternalAuthenticator`] (e.g. the K8s `TokenReview`
+/// validator) so it can be stored behind an `Arc` and registered in a
+/// `ClientHub` / handed to the `OoP` HTTP runtime. Lives in `toolkit-security`
+/// (a leaf crate, always available) so any gear can register the bridge without
+/// depending on the bootstrap-gated `toolkit` runtime — the platform-plane
+/// mirror of [`DynBearerAuthenticator`].
+#[derive(Clone)]
+pub struct DynInternalAuthenticator(Arc<dyn ErasedInternal>);
+
+impl DynInternalAuthenticator {
+    /// Wrap a concrete [`InternalAuthenticator`] in the object-safe adapter.
+    #[must_use]
+    pub fn new<A: InternalAuthenticator + 'static>(authenticator: A) -> Self {
+        Self(Arc::new(authenticator))
+    }
+
+    /// Wrap an already-`Arc`'d [`InternalAuthenticator`] in the object-safe adapter.
+    #[must_use]
+    pub fn from_arc<A: InternalAuthenticator + 'static>(authenticator: Arc<A>) -> Self {
+        struct W<A>(Arc<A>);
+        impl<A: InternalAuthenticator> ErasedInternal for W<A> {
+            fn authenticate<'a>(&'a self, token: &'a str) -> InternalFuture<'a> {
+                Box::pin(InternalAuthenticator::authenticate(&*self.0, token))
+            }
+        }
+        Self(Arc::new(W(authenticator)))
+    }
+}
+
+impl std::fmt::Debug for DynInternalAuthenticator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynInternalAuthenticator")
+            .finish_non_exhaustive()
+    }
+}
+
+impl InternalAuthenticator for DynInternalAuthenticator {
+    async fn authenticate(&self, token: &str) -> Result<PlatformIdentity, InternalAuthNError> {
+        self.0.authenticate(token).await
+    }
 }

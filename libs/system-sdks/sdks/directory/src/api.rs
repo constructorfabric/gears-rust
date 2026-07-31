@@ -51,6 +51,8 @@ pub struct ServiceInstanceInfo {
     /// Optional REST endpoint (HTTP base URL) for this instance.
     /// Not all gears expose a REST API.
     pub rest_endpoint: Option<ServiceEndpoint>,
+    /// Optional `OpenAPI` spec (JSON) this instance published, if any.
+    pub openapi_spec: Option<String>,
 }
 
 /// Information for registering a new gear instance
@@ -92,6 +94,19 @@ pub trait DirectoryClient: Send + Sync {
 
     /// List all service instances for a given gear
     async fn list_instances(&self, gear: &str) -> Result<Vec<ServiceInstanceInfo>>;
+
+    /// List every service instance across all registered gears.
+    ///
+    /// Used by the edge gateway to discover which gears (and their REST
+    /// endpoints) to reverse-proxy. This is a lightweight discovery snapshot:
+    /// the returned instances do **not** carry `openapi_spec` — the edge fetches
+    /// a gear's document once, on first discovery, via
+    /// [`get_openapi_spec`](Self::get_openapi_spec). The default returns an empty
+    /// list so lightweight/mock implementations need not support it; the real
+    /// local and gRPC clients override it.
+    async fn list_all_instances(&self) -> Result<Vec<ServiceInstanceInfo>> {
+        Ok(Vec::new())
+    }
 
     /// Register a new gear instance with the directory
     async fn register_instance(&self, info: RegisterInstanceInfo) -> Result<()>;
