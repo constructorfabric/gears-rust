@@ -305,6 +305,8 @@ A bundle stays open until every await-record is terminal. There is no automatic 
 
 **Verification is tenant-scoped:** the system verifies an acknowledgement against the expected value **snapshotted for that await-record at apply time** (§4.2 *Apply Publisher*) — the tenant-scoped effective value captured for the acknowledged `tenant`, not a single global value, and **not** a value recomputed at receive. For secret-valued settings the consumer returns a **hash** of the applied value rather than the plaintext, and the system compares hashes. A mismatch (or a `failed` status) resolves the record as **failed**.
 
+**Canonical value encoding (normative).** A settings value is typed JSON — scalar or structured (DESIGN.md §4.1: `value` is `JSONB`, validated against JSON Schema 2020-12) — so comparing two independently produced serializations as raw text is **not** sound: member order, whitespace, number formatting and Unicode escaping all differ without the value differing, and the two sides are serialized by different code (the service writes the snapshot at publish, the SDK builds `applied_value` at the consumer). `expected_value` and `applied_value` therefore carry the value canonicalized per **RFC 8785 (JSON Canonicalization Scheme)**, and are compared byte-for-byte in that form. For secret-valued settings the hash is taken over those same canonical bytes, never over an ad-hoc serialization. A payload that is not valid canonical JSON resolves the record **failed**. Because both sides must produce identical bytes for the same value, agreement between the service-side and SDK-side canonicalizers is a **conformance requirement**, not an implementation detail (§7 *Testing Architecture*).
+
 #### Entity: `AwaitRecord` (per-(apply, subscription) tracking state — the load-bearing state)
 
 One row per **(apply, subscriber, key)** the apply must hear back on. Its tenant is **not stored here** — it is an attribute of the apply, read via `apply_id` from the per-apply row (`apply_bundle_tracker.tenant`). Created at publish (§4.2 *Apply Publisher*), the record holds the value **snapshot** the back-response is verified against and the per-record terminal outcome. Verification and supersession are scoped to `(subscriber, key, tenant)` — the same key in a different tenant (a different apply's scope) is an independent record. Persisted as `apply_await_records` (§4.7); the `ApplyOutcomeTracker` counts are **computed on demand** from these rows (count by status), never stored, incremented, or decremented.
@@ -314,7 +316,7 @@ One row per **(apply, subscriber, key)** the apply must hear back on. Its tenant
 | `apply_id` | UUID | Yes | The apply this record belongs to. `(apply_id, subscriber, key)` is the record's **unique identity** — `tenant` is **not** in the key (it is determined by the apply). Applies are **totally ordered by `apply_id`** (settle-ordered UUIDv7), so "older / newer" within a `(subscriber, key, tenant)` supersession group is a comparison of `apply_id`. |
 | `subscriber` | string | Yes | Consumer identity that owes an acknowledgement. |
 | `key` | string | Yes | The changed setting (GTS instance id). |
-| `expected_value` | string | Yes | The **snapshot fixed at apply time** (§4.2 *Apply Publisher*) — the tenant-scoped effective value, or a **hash** for secret-valued settings. The back-response's applied value is compared against this snapshot, never a recomputed value. |
+| `expected_value` | string | Yes | The **snapshot fixed at apply time** (§4.2 *Apply Publisher*) — the tenant-scoped effective value in the canonical encoding (§4.1 *Canonical value encoding*), or a **hash** over those canonical bytes for secret-valued settings. The back-response's applied value is compared against this snapshot, never a recomputed value. |
 | `status` | `RecordStatus` | Yes | `awaiting` → `succeeded` / `failed` / `superseded` / `cancelled` (§4.2 *Apply Outcome Tracker*; `cancelled` = the owing consumer retired, §4.2 *Subscription Manager*). Terminal states are **immutable**, so redelivered acks are idempotent no-ops. |
 | `answered_at` | `timestamptz` | No | When the record reached a terminal state; `NULL` while `awaiting`. |
 
@@ -662,9 +664,9 @@ The load-bearing per-`(apply_id, subscriber, key)` state. Created at publish for
 | `apply_id` | UUID | No | — | Correlation id → settings apply (no DB FK) |
 | `subscriber` | text | No | — | Owing consumer identity |
 | `key` | text | No | — | Changed setting (GTS instance id) |
-| `expected_value` | text | No | — | Snapshot of the tenant-scoped effective value at publish (a **hash** for secret-valued settings); the applied value is compared against this (§4.2 *Apply Publisher*/§4.2 *Apply Outcome Tracker*) |
+| `expected_value` | text | No | — | Snapshot of the tenant-scoped effective value at publish, canonically encoded (§4.1 *Canonical value encoding*; a **hash** over those bytes for secret-valued settings); the applied value is compared against this (§4.2 *Apply Publisher*/§4.2 *Apply Outcome Tracker*) |
 | `status` | text | No | `'awaiting'` | Check: `awaiting`, `succeeded`, `failed`, `superseded`, `cancelled` |
-| `applied_value` | text | Yes | — | The received back-response value (plaintext for non-secret, hash for secret); `NULL` until a response arrives (and for `superseded`, which resolves without one) |
+| `applied_value` | text | Yes | — | The received back-response value in the same canonical encoding as `expected_value` (§4.1 *Canonical value encoding*; plaintext for non-secret, hash for secret); `NULL` until a response arrives (and for `superseded`, which resolves without one) |
 | `detail` | text | Yes | — | Failure detail when the response is `failed` |
 | `received_at` | timestamptz | Yes | — | When the back-response was received; `NULL` while `awaiting` or when `superseded` without a response |
 | `answered_at` | timestamptz | Yes | — | When the record reached a terminal state; `NULL` while `awaiting` |
@@ -791,6 +793,7 @@ All metrics exposed as Prometheus scrape targets.
 | Outcome status — supersession | repo | a later confirmed apply for a key → older `awaiting` records for `(subscriber, key, tenant)` `superseded`; a **failed** later apply supersedes nothing |
 | Outcome status — response for a terminal record | repo | A redelivered or late response whose named record is already terminal is ignored: no record transitions and nothing is superseded — **including** when a still-`awaiting` record in the group holds the same snapshot (a re-apply of an identical value) |
 | Outcome status — secret hash compare | repo | Hash of applied value compared to hash of expected value; match → succeeded, mismatch → failed |
+| Canonical encoding — serialization-independent match | repo | A structured value re-serialized with different member order, whitespace, number formatting or Unicode escaping canonicalizes to the same bytes and matches its snapshot (§4.1 *Canonical value encoding*); service-side and SDK-side canonicalizers agree on the same corpus |
 | Delivery loop re-publish | `MockEventBrokerClient` | The delivery loop re-publishes `awaiting` records (respecting `last_notified_at` / `redeliver_interval_seconds` backoff); terminal records are not re-sent |
 | Subscription exact-key matching | repo | Correct subscribers resolved for a key; non-subscribed keys excluded |
 | Error mapping — all domain → API variants | none | 100% variant coverage |
