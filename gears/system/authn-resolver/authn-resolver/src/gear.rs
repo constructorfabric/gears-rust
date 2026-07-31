@@ -3,10 +3,11 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use authn_resolver_sdk::AuthNResolverClient;
+use authn_resolver_sdk::{AuthNResolverBearerAuthenticator, AuthNResolverClient};
 use toolkit::Gear;
 use toolkit::context::GearCtx;
 use toolkit::contracts::SystemCapability;
+use toolkit_security::DynBearerAuthenticator;
 use tracing::info;
 
 use crate::config::AuthNResolverConfig;
@@ -54,14 +55,21 @@ impl Gear for AuthNResolver {
 
         // Create service
         let hub = ctx.client_hub();
-        let svc = Arc::new(Service::new(hub, cfg.vendor));
+        let svc = Arc::new(Service::new(Arc::clone(&hub), cfg.vendor));
         self.service
             .set(svc.clone())
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
         // Register client in ClientHub
         let api: Arc<dyn AuthNResolverClient> = Arc::new(AuthNResolverLocalClient::new(svc));
-        ctx.client_hub().register::<dyn AuthNResolverClient>(api);
+        hub.register::<dyn AuthNResolverClient>(Arc::clone(&api));
+
+        // Register the tenant-plane bearer bridge for the OoP runtime to pick up
+        // (if-absent, so an explicitly-supplied authenticator wins).
+        if hub.get::<DynBearerAuthenticator>().is_err() {
+            let bridge = DynBearerAuthenticator::new(AuthNResolverBearerAuthenticator::new(api));
+            hub.register::<DynBearerAuthenticator>(Arc::new(bridge));
+        }
 
         Ok(())
     }

@@ -6,6 +6,7 @@ use crate::middleware::common;
 
 use authn_resolver_sdk::{AuthNResolverClient, AuthNResolverError};
 use toolkit_canonical_errors::CanonicalError;
+use toolkit_gateway::ProxyRegistry;
 use toolkit_security::SecurityContext;
 
 /// Route matcher for a specific HTTP method (authenticated routes).
@@ -30,13 +31,17 @@ impl RouteMatcher {
     }
 }
 
-/// Public route matcher for explicitly public routes
+/// Route matcher for anonymous (unauthenticated) routes.
+///
+/// "Anonymous" is the auth axis, distinct from external *visibility*: a route
+/// in here requires no bearer token. Do not conflate with `is_public`
+/// (visibility) elsewhere in the codebase.
 #[derive(Clone)]
-pub struct PublicRouteMatcher {
+pub struct AnonymousRouteMatcher {
     matcher: matchit::Router<()>,
 }
 
-impl PublicRouteMatcher {
+impl AnonymousRouteMatcher {
     fn new() -> Self {
         Self {
             matcher: matchit::Router::new(),
@@ -65,21 +70,27 @@ pub enum AuthRequirement {
 #[derive(Clone)]
 pub struct GatewayRoutePolicy {
     route_matchers: Arc<HashMap<Method, RouteMatcher>>,
-    public_matchers: Arc<HashMap<Method, PublicRouteMatcher>>,
+    anonymous_matchers: Arc<HashMap<Method, AnonymousRouteMatcher>>,
     require_auth_by_default: bool,
+    /// Reverse-proxy route table (embedded edge). When set, dynamically-
+    /// registered proxy routes are resolved against it so each is enforced
+    /// exactly as the owning gear declared. `None` when the proxy is disabled.
+    proxy_registry: Option<Arc<ProxyRegistry>>,
 }
 
 impl GatewayRoutePolicy {
     #[must_use]
     pub fn new(
         route_matchers: Arc<HashMap<Method, RouteMatcher>>,
-        public_matchers: Arc<HashMap<Method, PublicRouteMatcher>>,
+        anonymous_matchers: Arc<HashMap<Method, AnonymousRouteMatcher>>,
         require_auth_by_default: bool,
+        proxy_registry: Option<Arc<ProxyRegistry>>,
     ) -> Self {
         Self {
             route_matchers,
-            public_matchers,
+            anonymous_matchers,
             require_auth_by_default,
+            proxy_registry,
         }
     }
 
@@ -92,17 +103,32 @@ impl GatewayRoutePolicy {
             .get(method)
             .is_some_and(|matcher| matcher.find(path));
 
-        // Check if route is explicitly public using pattern matching
-        let is_public = self
-            .public_matchers
+        // Check if the route is explicitly anonymous (no auth) using pattern
+        // matching. This is the auth axis, not external visibility.
+        let is_anonymous = self
+            .anonymous_matchers
             .get(method)
             .is_some_and(|matcher| matcher.find(path));
 
-        // Public routes should not be forced to auth by default
-        if is_public {
+        // Anonymous routes should not be forced to auth by default
+        if is_anonymous {
             return AuthRequirement::None;
         }
 
+        // Dynamically-registered proxy routes are not in the static matchers.
+        // Consult the reverse-proxy registry so each proxied route is enforced
+        // exactly as the owning gear declared (authenticated vs anonymous).
+        if let Some(registry) = &self.proxy_registry
+            && let Some(authenticated) = registry.requires_auth(method, path)
+        {
+            return if authenticated {
+                AuthRequirement::Required
+            } else {
+                AuthRequirement::None
+            };
+        }
+
+        // Statically-registered routes are the fallback when no proxy entry exists.
         if is_authenticated {
             return AuthRequirement::Required;
         }
@@ -131,7 +157,8 @@ pub struct AuthState {
 pub fn build_route_policy(
     cfg: &crate::config::ApiGatewayConfig,
     authenticated_routes: std::collections::HashSet<(Method, String)>,
-    public_routes: std::collections::HashSet<(Method, String)>,
+    anonymous_routes: std::collections::HashSet<(Method, String)>,
+    proxy_registry: Option<Arc<ProxyRegistry>>,
 ) -> Result<GatewayRoutePolicy, anyhow::Error> {
     // Build route matchers per HTTP method (authenticated routes)
     let mut route_matchers_map: HashMap<Method, RouteMatcher> = HashMap::new();
@@ -145,22 +172,23 @@ pub fn build_route_policy(
             .map_err(|e| anyhow::anyhow!("Failed to insert route pattern '{path}': {e}"))?;
     }
 
-    // Build public matchers per HTTP method
-    let mut public_matchers_map: HashMap<Method, PublicRouteMatcher> = HashMap::new();
+    // Build anonymous matchers per HTTP method
+    let mut anonymous_matchers_map: HashMap<Method, AnonymousRouteMatcher> = HashMap::new();
 
-    for (method, path) in public_routes {
-        let matcher = public_matchers_map
+    for (method, path) in anonymous_routes {
+        let matcher = anonymous_matchers_map
             .entry(method)
-            .or_insert_with(PublicRouteMatcher::new);
-        matcher
-            .insert(&path)
-            .map_err(|e| anyhow::anyhow!("Failed to insert public route pattern '{path}': {e}"))?;
+            .or_insert_with(AnonymousRouteMatcher::new);
+        matcher.insert(&path).map_err(|e| {
+            anyhow::anyhow!("Failed to insert anonymous route pattern '{path}': {e}")
+        })?;
     }
 
     Ok(GatewayRoutePolicy::new(
         Arc::new(route_matchers_map),
-        Arc::new(public_matchers_map),
+        Arc::new(anonymous_matchers_map),
         cfg.require_auth_by_default,
+        proxy_registry,
     ))
 }
 
@@ -322,14 +350,53 @@ mod tests {
     /// Helper to build `GatewayRoutePolicy` with given matchers
     fn build_test_policy(
         route_matchers: HashMap<Method, RouteMatcher>,
-        public_matchers: HashMap<Method, PublicRouteMatcher>,
+        anonymous_matchers: HashMap<Method, AnonymousRouteMatcher>,
         require_auth_by_default: bool,
     ) -> GatewayRoutePolicy {
         GatewayRoutePolicy::new(
             Arc::new(route_matchers),
-            Arc::new(public_matchers),
+            Arc::new(anonymous_matchers),
             require_auth_by_default,
+            None,
         )
+    }
+
+    #[test]
+    fn resolve_consults_proxy_registry_for_dynamic_routes() {
+        use toolkit_gateway::{Endpoint, GearName, RouteTemplate};
+
+        let registry = Arc::new(ProxyRegistry::new());
+        registry.register(
+            GearName::from("calc"),
+            "calc-1",
+            Endpoint::parse("http://calc:8080").unwrap(),
+            vec![
+                RouteTemplate::new(Method::GET, "/calc/v1/pub", false),
+                RouteTemplate::new(Method::POST, "/calc/v1/secure", true),
+            ],
+        );
+
+        // `require_auth_by_default = true`, but the proxy registry overrides per route.
+        let policy = GatewayRoutePolicy::new(
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            true,
+            Some(registry),
+        );
+
+        assert_eq!(
+            policy.resolve(&Method::GET, "/calc/v1/pub"),
+            AuthRequirement::None
+        );
+        assert_eq!(
+            policy.resolve(&Method::POST, "/calc/v1/secure"),
+            AuthRequirement::Required
+        );
+        // A path not in the proxy registry falls back to `require_auth_by_default`.
+        assert_eq!(
+            policy.resolve(&Method::GET, "/unknown"),
+            AuthRequirement::Required
+        );
     }
 
     #[test]
@@ -353,22 +420,25 @@ mod tests {
             (Method::GET, "events:stream".to_owned()),
         ]);
 
-        if let Err(err) =
-            build_route_policy(&cfg, authenticated_routes, std::collections::HashSet::new())
-        {
+        if let Err(err) = build_route_policy(
+            &cfg,
+            authenticated_routes,
+            std::collections::HashSet::new(),
+            None,
+        ) {
             panic!("literal colon route paths must not be interpreted as path parameters: {err}");
         }
     }
 
     #[test]
     fn explicit_public_route_with_path_params_returns_none() {
-        let mut public_matchers = HashMap::new();
-        let mut matcher = PublicRouteMatcher::new();
+        let mut anonymous_matchers = HashMap::new();
+        let mut matcher = AnonymousRouteMatcher::new();
         matcher.insert("/users/{id}").unwrap();
 
-        public_matchers.insert(Method::GET, matcher);
+        anonymous_matchers.insert(Method::GET, matcher);
 
-        let policy = build_test_policy(HashMap::new(), public_matchers, true);
+        let policy = build_test_policy(HashMap::new(), anonymous_matchers, true);
 
         // Path parameters should match concrete values
         let result = policy.resolve(&Method::GET, "/users/42");
@@ -377,12 +447,12 @@ mod tests {
 
     #[test]
     fn explicit_public_route_exact_match_returns_none() {
-        let mut public_matchers = HashMap::new();
-        let mut matcher = PublicRouteMatcher::new();
+        let mut anonymous_matchers = HashMap::new();
+        let mut matcher = AnonymousRouteMatcher::new();
         matcher.insert("/health").unwrap();
-        public_matchers.insert(Method::GET, matcher);
+        anonymous_matchers.insert(Method::GET, matcher);
 
-        let policy = build_test_policy(HashMap::new(), public_matchers, true);
+        let policy = build_test_policy(HashMap::new(), anonymous_matchers, true);
 
         let result = policy.resolve(&Method::GET, "/health");
         assert_eq!(result, AuthRequirement::None);
@@ -435,12 +505,12 @@ mod tests {
 
     #[test]
     fn public_route_overrides_require_auth_by_default() {
-        let mut public_matchers = HashMap::new();
-        let mut matcher = PublicRouteMatcher::new();
+        let mut anonymous_matchers = HashMap::new();
+        let mut matcher = AnonymousRouteMatcher::new();
         matcher.insert("/public").unwrap();
-        public_matchers.insert(Method::GET, matcher);
+        anonymous_matchers.insert(Method::GET, matcher);
 
-        let policy = build_test_policy(HashMap::new(), public_matchers, true);
+        let policy = build_test_policy(HashMap::new(), anonymous_matchers, true);
 
         let result = policy.resolve(&Method::GET, "/public");
         assert_eq!(result, AuthRequirement::None);
@@ -460,21 +530,21 @@ mod tests {
     }
 
     #[test]
-    fn explicit_public_overrides_wildcard_authenticated_fallback() {
+    fn explicit_anonymous_overrides_wildcard_authenticated_fallback() {
         // When a gateway registers a wildcard authenticated 404 the fallback
         // like `/{*rest}` (used to convert anonymous 404s to 401s),
-        // grabs the public routes too, causing 401 on them
-        let mut public_matchers = HashMap::new();
-        let mut public_matcher = PublicRouteMatcher::new();
-        public_matcher.insert("/v1/auth/config").unwrap();
-        public_matchers.insert(Method::GET, public_matcher);
+        // grabs the anonymous routes too, causing 401 on them
+        let mut anonymous_matchers = HashMap::new();
+        let mut anonymous_matcher = AnonymousRouteMatcher::new();
+        anonymous_matcher.insert("/v1/auth/config").unwrap();
+        anonymous_matchers.insert(Method::GET, anonymous_matcher);
 
         let mut route_matchers = HashMap::new();
         let mut auth_matcher = RouteMatcher::new();
         auth_matcher.insert("/{*rest}").unwrap();
         route_matchers.insert(Method::GET, auth_matcher);
 
-        let policy = build_test_policy(route_matchers, public_matchers, true);
+        let policy = build_test_policy(route_matchers, anonymous_matchers, true);
 
         assert_eq!(
             policy.resolve(&Method::GET, "/v1/auth/config"),

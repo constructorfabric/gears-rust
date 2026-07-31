@@ -78,7 +78,7 @@ pub struct ChatEngineServices {
 /// - `OperationBuilder::<verb>(path)` chain per endpoint.
 /// - `.authenticated()` + `.require_license_features([&ChatEngineLicense])`
 ///   on every protected route (the only public route is
-///   `POST /chat-engine/v1/shared/{share_token}` which uses `.public()`).
+///   `POST /chat-engine/v1/shared/{share_token}` which uses `.anonymous()`).
 /// - `.json_response_with_schema::<…>(openapi, status, desc)` for typed
 ///   responses; `.json_request::<…>(openapi, desc)` for typed bodies.
 /// - `.standard_errors(openapi)` registers the RFC-9457 error variants.
@@ -253,7 +253,7 @@ pub fn register_routes(
         .operation_id("chat_engine.session.access_shared")
         .summary("Access a session via a public share token")
         .tag(API_TAG)
-        .public()
+        .anonymous()
         .path_param("share_token", "Opaque share token (bearer secret)")
         .handler(handlers::export::access_shared)
         .json_response_with_schema::<SharedSessionDto>(

@@ -25,7 +25,10 @@ use secrecy::{ExposeSecret, SecretString};
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
+use toolkit_security::InternalAuthConfig;
 use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
+
+use crate::sa_token::ServiceAccountTokenReader;
 
 /// Attach a platform-plane internal `token` to outgoing gRPC metadata under the
 /// `x-toolkit-internal-token` key.
@@ -116,6 +119,41 @@ impl InternalAuthInterceptor {
     }
 }
 
+/// Build the **outbound** platform-plane interceptor from an
+/// [`InternalAuthConfig`].
+///
+/// - [`InternalAuthConfig::SharedSecret`] → a static interceptor attaching the
+///   shared secret ([`InternalAuthInterceptor::from_token`]).
+/// - [`InternalAuthConfig::Kube`] with a `token_path` → a rotating interceptor
+///   backed by a [`ServiceAccountTokenReader`] (re-reads the projected token on
+///   its refresh cadence, so rotation is transparent).
+/// - [`InternalAuthConfig::Kube`] without a `token_path` → a
+///   [`disabled`](InternalAuthInterceptor::disabled) interceptor (inbound-only
+///   deployment: this participant validates but never calls out).
+///
+/// # Errors
+/// Returns an error only when a configured Kubernetes `token_path` cannot be
+/// read on the initial load.
+pub async fn build_internal_auth_interceptor(
+    cfg: &InternalAuthConfig,
+) -> anyhow::Result<InternalAuthInterceptor> {
+    match cfg {
+        InternalAuthConfig::SharedSecret { secret, .. } => Ok(InternalAuthInterceptor::from_token(
+            SecretString::from(secret.clone()),
+        )),
+        InternalAuthConfig::Kube {
+            token_path: Some(path),
+            ..
+        } => {
+            let reader = ServiceAccountTokenReader::new(path).await?;
+            Ok(reader.interceptor())
+        }
+        InternalAuthConfig::Kube {
+            token_path: None, ..
+        } => Ok(InternalAuthInterceptor::disabled()),
+    }
+}
+
 impl Interceptor for InternalAuthInterceptor {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
         if let Some(token) = (self.token_provider)() {
@@ -186,6 +224,82 @@ mod tests {
             .call(Request::new(()))
             .expect("interceptor succeeds");
         assert!(request.metadata().get(INTERNAL_TOKEN_HEADER).is_none());
+    }
+
+    #[tokio::test]
+    async fn build_from_shared_secret_attaches_static_token() {
+        let cfg = InternalAuthConfig::SharedSecret {
+            secret: "shared-tok".to_owned(),
+            peer_name: "toolkit-internal".to_owned(),
+        };
+        let mut interceptor = build_internal_auth_interceptor(&cfg)
+            .await
+            .expect("builds shared-secret interceptor");
+        let request = interceptor
+            .call(Request::new(()))
+            .expect("interceptor runs");
+        assert_eq!(
+            extract_internal_token_grpc(request.metadata())
+                .unwrap()
+                .expose_secret(),
+            "shared-tok"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_from_kube_without_token_path_is_disabled() {
+        // A Kube participant that only validates inbound tokens (no outbound
+        // credential) yields a disabled interceptor that attaches nothing.
+        let cfg = InternalAuthConfig::Kube {
+            audiences: vec!["toolkit-internal".to_owned()],
+            token_path: None,
+        };
+        let mut interceptor = build_internal_auth_interceptor(&cfg)
+            .await
+            .expect("builds disabled interceptor");
+        let request = interceptor
+            .call(Request::new(()))
+            .expect("interceptor runs");
+        assert!(request.metadata().get(INTERNAL_TOKEN_HEADER).is_none());
+    }
+
+    #[tokio::test]
+    async fn build_from_kube_with_token_path_reads_projected_token() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("ia-kube-{}-{n}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+        let path = dir.join("token");
+        tokio::fs::write(&path, "kube.sa.jwt").await.expect("write");
+
+        let cfg = InternalAuthConfig::Kube {
+            audiences: vec!["toolkit-internal".to_owned()],
+            token_path: Some(path),
+        };
+        let mut interceptor = build_internal_auth_interceptor(&cfg)
+            .await
+            .expect("builds rotating interceptor");
+        let request = interceptor
+            .call(Request::new(()))
+            .expect("interceptor runs");
+        assert_eq!(
+            extract_internal_token_grpc(request.metadata())
+                .unwrap()
+                .expose_secret(),
+            "kube.sa.jwt"
+        );
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn build_from_kube_with_unreadable_token_path_errors() {
+        let cfg = InternalAuthConfig::Kube {
+            audiences: vec!["toolkit-internal".to_owned()],
+            token_path: Some(std::path::PathBuf::from("/nonexistent/toolkit/token")),
+        };
+        assert!(build_internal_auth_interceptor(&cfg).await.is_err());
     }
 
     #[test]

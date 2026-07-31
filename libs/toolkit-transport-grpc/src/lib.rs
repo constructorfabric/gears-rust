@@ -2,6 +2,7 @@
 pub mod client;
 pub mod internal_auth;
 pub mod rpc_retry;
+pub mod sa_token;
 
 #[cfg(windows)]
 pub mod windows_named_pipe;
@@ -10,8 +11,10 @@ pub mod windows_named_pipe;
 pub use windows_named_pipe::{NamedPipeConnection, NamedPipeIncoming, create_named_pipe_incoming};
 
 pub use internal_auth::{
-    InternalAuthInterceptor, attach_internal_token_grpc, extract_internal_token_grpc,
+    InternalAuthInterceptor, attach_internal_token_grpc, build_internal_auth_interceptor,
+    extract_internal_token_grpc,
 };
+pub use sa_token::{DEFAULT_REFRESH_INTERVAL, ServiceAccountTokenReader};
 
 pub const SECCTX_METADATA_KEY: &str = "x-secctx-bin";
 

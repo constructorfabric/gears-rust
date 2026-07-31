@@ -19,6 +19,15 @@ service DirectoryService {
   // List all instances of a specific gear
   rpc ListInstances(ListInstancesRequest) returns (ListInstancesResponse);
 
+  // List all instances across every registered gear (edge/gateway discovery).
+  //
+  // This response is a lightweight discovery snapshot: instances carry their
+  // identity and REST endpoint but NOT the full `openapi_spec` (see
+  // InstanceInfo), so the aggregated payload stays small and bounded even with
+  // many gears. The edge fetches a gear's document once, on first discovery,
+  // via `GetOpenApiSpec`.
+  rpc ListAllInstances(ListAllInstancesRequest) returns (ListAllInstancesResponse);
+
   // Register a new gear instance with the directory
   rpc RegisterInstance(RegisterInstanceRequest) returns (google.protobuf.Empty);
 
@@ -63,9 +72,16 @@ message InstanceInfo {
   string endpoint_uri = 3;
   string version = 4;
   optional string rest_endpoint_uri = 5;
+  optional string openapi_spec = 6;
 }
 
 message ListInstancesResponse {
+  repeated InstanceInfo instances = 1;
+}
+
+message ListAllInstancesRequest {}
+
+message ListAllInstancesResponse {
   repeated InstanceInfo instances = 1;
 }
 

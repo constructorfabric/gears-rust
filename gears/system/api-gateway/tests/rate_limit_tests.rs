@@ -96,7 +96,7 @@ impl RestApiCapability for RateLimitedGear {
         let router = builder
             .operation_id("test:limited")
             .summary("Strictly rate-limited endpoint")
-            .public()
+            .anonymous()
             .json_response(http::StatusCode::OK, "Success")
             .handler(get(limited_handler))
             .register(router, openapi);
@@ -107,7 +107,7 @@ impl RestApiCapability for RateLimitedGear {
         let router = builder
             .operation_id("test:slow")
             .summary("Slow endpoint with low in-flight limit")
-            .public()
+            .anonymous()
             .json_response(http::StatusCode::OK, "Success")
             .handler(get(slow_handler))
             .register(router, openapi);
@@ -116,7 +116,7 @@ impl RestApiCapability for RateLimitedGear {
         let router = OperationBuilder::get("/tests/v1/normal")
             .operation_id("test:normal")
             .summary("Normal endpoint")
-            .public()
+            .anonymous()
             .json_response(http::StatusCode::OK, "Success")
             .handler(get(normal_handler))
             .register(router, openapi);
@@ -252,7 +252,7 @@ async fn test_rate_limit_metadata_stored() {
     // Register and verify it's stored
     let _router = builder
         .operation_id("test")
-        .public()
+        .anonymous()
         .json_response(http::StatusCode::OK, "OK")
         .handler(get(normal_handler))
         .register(router, &api_gateway);
@@ -391,7 +391,7 @@ async fn test_in_flight_limit_returns_canonical_service_unavailable() {
     let router = OperationBuilder::get("/tests/v1/inflight")
         .operation_id("test:inflight")
         .summary("In-flight cap test endpoint")
-        .public()
+        .anonymous()
         .json_response(http::StatusCode::OK, "Success")
         .handler(get(slow_handler))
         .register(Router::new(), &api_gateway);

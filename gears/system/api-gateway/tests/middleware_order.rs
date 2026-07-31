@@ -77,7 +77,7 @@ async fn real_middlewares_observe_documented_order() -> Result<()> {
     router = builder
         .operation_id("test:middleware-order")
         .summary("Middleware order test endpoint")
-        .public()
+        .anonymous()
         .allow_content_types(&["application/json"]) // turns on MIME validation
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::post(handler))
@@ -200,7 +200,7 @@ async fn real_middlewares_observe_documented_order_with_prefix() -> Result<()> {
     router = builder
         .operation_id("test:middleware-order")
         .summary("Middleware order test endpoint")
-        .public()
+        .anonymous()
         .allow_content_types(&["application/json"]) // turns on MIME validation
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::post(handler))

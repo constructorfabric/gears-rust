@@ -87,6 +87,9 @@ impl DirectoryClient for RecordingDirectory {
     async fn list_instances(&self, _gear: &str) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
         Ok(vec![])
     }
+    async fn list_all_instances(&self) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
+        Ok(vec![])
+    }
     async fn register_instance(&self, info: RegisterInstanceInfo) -> anyhow::Result<()> {
         if let Some(ep) = &info.rest_endpoint {
             *self.registered_endpoint.lock() = Some(ep.uri.clone());

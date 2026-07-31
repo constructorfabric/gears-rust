@@ -12,6 +12,10 @@ fn default_healthcheck_timeout_ms() -> u64 {
     500
 }
 
+fn default_gateway_sync_interval_secs() -> u64 {
+    10
+}
+
 /// API gateway configuration - reused from `api_gateway` gear
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +73,50 @@ pub struct ApiGatewayConfig {
     /// Health-probe serving configuration (listener placement, bind address).
     #[serde(default)]
     pub health: HealthConfig,
+
+    /// Reverse-proxy (embedded edge) configuration. When enabled, the gateway
+    /// discovers out-of-process gears via the `DirectoryService` and
+    /// reverse-proxies their public routes. Default: disabled (Profile 1
+    /// monolith is unaffected).
+    #[serde(default)]
+    pub gateway_proxy: GatewayProxyConfig,
+}
+
+/// Reverse-proxy (embedded edge) configuration.
+///
+/// When [`enabled`](Self::enabled), a background task polls the
+/// `DirectoryService` at [`directory_endpoint`](Self::directory_endpoint) and
+/// keeps a reverse-proxy route table in sync, so requests for out-of-process
+/// gears' public routes are forwarded to the owning gear pod.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GatewayProxyConfig {
+    /// Enable the directory-driven reverse proxy.
+    pub enabled: bool,
+    /// gRPC endpoint of the `DirectoryService` (e.g. the grpc-hub endpoint,
+    /// `http://gear-orchestrator:50051`). Required when `enabled` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory_endpoint: Option<String>,
+    /// Interval (seconds) between directory polls that refresh the proxy route
+    /// table.
+    pub sync_interval_secs: u64,
+    /// Platform-plane credential attached to the edge's `DirectoryService`
+    /// polls (`x-toolkit-internal-token`). Required when the directory host
+    /// enforces the platform plane; the `secret` must match the host's
+    /// `gear-orchestrator.internal_auth`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_auth: Option<toolkit_security::InternalAuthConfig>,
+}
+
+impl Default for GatewayProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory_endpoint: None,
+            sync_interval_secs: default_gateway_sync_interval_secs(),
+            internal_auth: None,
+        }
+    }
 }
 
 /// Which listener(s) serve the health-probe endpoints (`/healthz`, `/readyz`, `/health`).
@@ -124,6 +172,7 @@ impl Default for ApiGatewayConfig {
             metrics: MetricsConfig::default(),
             healthcheck_timeout_ms: default_healthcheck_timeout_ms(),
             health: HealthConfig::default(),
+            gateway_proxy: GatewayProxyConfig::default(),
         }
     }
 }

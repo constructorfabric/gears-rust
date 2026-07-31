@@ -44,7 +44,7 @@ pub(crate) fn register_routes(
     // This endpoint is NOT authenticated via the end-user JWT middleware; the
     // signed upload token is the sole authorization.
     //
-    // Registered as `.public()` so the api-gateway's route-policy does NOT
+    // Registered as `.anonymous()` so the api-gateway's route-policy does NOT
     // require a user JWT for this path (the fs-token carries the authorization).
     // The Verifier extension is added to the whole router at the bottom.
     //
@@ -56,7 +56,7 @@ pub(crate) fn register_routes(
         "{BASE}/files/{{file_id}}/versions/{{version_id}}/finalize"
     ))
     .operation_id("file_storage.finalize_version")
-    .public()
+    .anonymous()
     .summary("Finalize a pending version (token-authenticated, sidecar s2s callback)")
     .description(
         "Called by the sidecar after a successful PUT to mark the version `available`. \
@@ -82,7 +82,7 @@ pub(crate) fn register_routes(
         "{BASE}/files/{{file_id}}/versions/{{version_id}}/multipart/{{upload_id}}/parts/{{part_number}}/report"
     ))
     .operation_id("file_storage.report_multipart_part")
-    .public()
+    .anonymous()
     .summary("Report a successfully-written multipart part (token-authenticated, sidecar s2s callback)")
     .description(
         "Called by the sidecar after a successful part write to record the part's backend \

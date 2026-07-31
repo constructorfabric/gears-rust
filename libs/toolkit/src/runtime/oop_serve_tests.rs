@@ -7,6 +7,10 @@ use serde_json::Value;
 use tower::ServiceExt; // for `oneshot`
 
 use crate::healthcheck::RestHealthcheckRegistry;
+use toolkit_security::{
+    AuthNError, BearerAuthenticator, DynBearerAuthenticator, DynInternalAuthenticator,
+    InternalAuthNError, InternalAuthenticator, PlatformIdentity, SecurityContext,
+};
 
 /// Build a readiness state with an empty healthcheck registry (no gear checks).
 fn readiness<I, S>(deps: I) -> Arc<ReadinessState>
@@ -288,6 +292,9 @@ impl DirectoryClient for E2eDirectory {
         Ok(String::new())
     }
     async fn list_instances(&self, _g: &str) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
+        Ok(vec![])
+    }
+    async fn list_all_instances(&self) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
         Ok(vec![])
     }
     async fn register_instance(&self, _i: RegisterInstanceInfo) -> anyhow::Result<()> {

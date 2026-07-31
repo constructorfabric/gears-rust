@@ -48,6 +48,10 @@ impl DirectoryClient for StubDirectory {
         Ok(vec![])
     }
 
+    async fn list_all_instances(&self) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
+        Ok(vec![])
+    }
+
     async fn register_instance(&self, _info: RegisterInstanceInfo) -> anyhow::Result<()> {
         self.register_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_register.load(Ordering::SeqCst) > 0 {

@@ -4,16 +4,25 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
 use crate::api::{DirectoryClient, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo};
+use toolkit_transport_grpc::InternalAuthInterceptor;
 use toolkit_transport_grpc::client::{GrpcClientConfig, connect_with_retry};
 
 use crate::{
     DeregisterInstanceRequest, DirectoryServiceClient, GetOpenApiSpecRequest, GrpcServiceEndpoint,
-    HeartbeatRequest, ListInstancesRequest, RegisterInstanceRequest, ResolveGrpcServiceRequest,
-    ResolveRestServiceRequest,
+    HeartbeatRequest, InstanceInfo, ListAllInstancesRequest, ListInstancesRequest,
+    RegisterInstanceRequest, ResolveGrpcServiceRequest, ResolveRestServiceRequest,
 };
+
+/// The directory channel wrapped with the platform-plane
+/// [`InternalAuthInterceptor`], which attaches the gear's internal token
+/// (`x-toolkit-internal-token`) to every outbound system call. A
+/// [`disabled`](InternalAuthInterceptor::disabled) interceptor attaches
+/// nothing (Profile 1 / no platform-plane credential).
+type AuthedChannel = InterceptedService<Channel, InternalAuthInterceptor>;
 
 /// gRPC client for Directory API
 ///
@@ -22,8 +31,11 @@ use crate::{
 /// - Configurable timeouts and retries via transport stack
 /// - Automatic proto ↔ domain type conversions
 /// - Distributed tracing and metrics
+/// - Platform-plane credential attachment via an [`InternalAuthInterceptor`]
+///   (defaults to attaching nothing; supply one via the `*_with_interceptor`
+///   constructors for Profile-3 / shared-secret deployments)
 pub struct DirectoryGrpcClient {
-    inner: DirectoryServiceClient<Channel>,
+    inner: DirectoryServiceClient<AuthedChannel>,
 }
 
 impl DirectoryGrpcClient {
@@ -39,6 +51,26 @@ impl DirectoryGrpcClient {
         Self::connect_with_retry(uri, &cfg).await
     }
 
+    /// Connect with default configuration + retries, attaching `interceptor`'s
+    /// platform-plane credential to every outbound call.
+    ///
+    /// This is the Profile-3 / shared-secret entry point: the interceptor is
+    /// typically built from a
+    /// [`ServiceAccountTokenReader`](toolkit_transport_grpc::ServiceAccountTokenReader)
+    /// (rotating SA token) or
+    /// [`InternalAuthInterceptor::from_token`] (static shared secret).
+    ///
+    /// # Errors
+    /// It will return an error when it fails
+    pub async fn connect_with_interceptor(
+        uri: impl Into<String>,
+        interceptor: InternalAuthInterceptor,
+    ) -> Result<Self> {
+        let cfg = GrpcClientConfig::new("directory");
+        let channel: Channel = connect_with_retry(uri, &cfg).await?;
+        Ok(Self::from_channel_with_interceptor(channel, interceptor))
+    }
+
     /// Connect to a directory service with custom configuration and retry logic.
     ///
     /// Uses exponential backoff based on `cfg.max_retries`, `cfg.base_backoff`,
@@ -51,9 +83,7 @@ impl DirectoryGrpcClient {
         cfg: &GrpcClientConfig,
     ) -> Result<Self> {
         let channel: Channel = connect_with_retry(uri, cfg).await?;
-        Ok(Self {
-            inner: DirectoryServiceClient::new(channel),
-        })
+        Ok(Self::from_channel(channel))
     }
 
     /// Connect to a directory service without retry logic.
@@ -83,16 +113,28 @@ impl DirectoryGrpcClient {
             );
         }
 
-        Ok(Self {
-            inner: DirectoryServiceClient::new(channel),
-        })
+        Ok(Self::from_channel(channel))
     }
 
-    /// Create from an existing channel (useful for testing or custom setup)
+    /// Create from an existing channel (useful for testing or custom setup).
+    ///
+    /// Attaches no platform-plane credential; use
+    /// [`from_channel_with_interceptor`](Self::from_channel_with_interceptor)
+    /// to attach one.
     #[must_use]
     pub fn from_channel(channel: Channel) -> Self {
+        Self::from_channel_with_interceptor(channel, InternalAuthInterceptor::disabled())
+    }
+
+    /// Create from an existing channel, attaching `interceptor`'s platform-plane
+    /// credential to every outbound call.
+    #[must_use]
+    pub fn from_channel_with_interceptor(
+        channel: Channel,
+        interceptor: InternalAuthInterceptor,
+    ) -> Self {
         Self {
-            inner: DirectoryServiceClient::new(channel),
+            inner: DirectoryServiceClient::with_interceptor(channel, interceptor),
         }
     }
 }
@@ -154,22 +196,31 @@ impl DirectoryClient for DirectoryGrpcClient {
             .await
             .map_err(|e| anyhow::anyhow!("gRPC call failed: {e}"))?;
 
-        let proto_response = response.into_inner();
-
-        // Convert proto instances to domain types
-        let instances = proto_response
+        let instances = response
+            .into_inner()
             .instances
             .into_iter()
-            .map(|proto_inst| ServiceInstanceInfo {
-                gear: proto_inst.gear_name,
-                instance_id: proto_inst.instance_id,
-                endpoint: ServiceEndpoint::new(proto_inst.endpoint_uri),
-                version: if proto_inst.version.is_empty() {
-                    None
-                } else {
-                    Some(proto_inst.version)
-                },
-                rest_endpoint: proto_inst.rest_endpoint_uri.map(ServiceEndpoint::new),
+            .map(proto_instance_to_domain)
+            .collect();
+
+        Ok(instances)
+    }
+
+    async fn list_all_instances(&self) -> Result<Vec<ServiceInstanceInfo>> {
+        let mut client = self.inner.clone();
+        let response = client
+            .list_all_instances(tonic::Request::new(ListAllInstancesRequest {}))
+            .await
+            .map_err(|e| anyhow::anyhow!("gRPC call failed: {e}"))?;
+
+        let instances = response
+            .into_inner()
+            .instances
+            .into_iter()
+            .map(|proto| {
+                let mut info = proto_instance_to_domain(proto);
+                info.openapi_spec = None;
+                info
             })
             .collect();
 
@@ -239,6 +290,22 @@ impl DirectoryClient for DirectoryGrpcClient {
     }
 }
 
+/// Convert a proto `InstanceInfo` into the domain [`ServiceInstanceInfo`].
+fn proto_instance_to_domain(proto: InstanceInfo) -> ServiceInstanceInfo {
+    ServiceInstanceInfo {
+        gear: proto.gear_name,
+        instance_id: proto.instance_id,
+        endpoint: ServiceEndpoint::new(proto.endpoint_uri),
+        version: if proto.version.is_empty() {
+            None
+        } else {
+            Some(proto.version)
+        },
+        rest_endpoint: proto.rest_endpoint_uri.map(ServiceEndpoint::new),
+        openapi_spec: proto.openapi_spec,
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -257,5 +324,57 @@ mod tests {
         if let Ok(channel) = channel_result {
             let _client = DirectoryGrpcClient::from_channel(channel);
         }
+    }
+
+    #[tokio::test]
+    async fn from_channel_constructs_without_connecting() {
+        // `connect_lazy` yields a Channel without a live server, so both the
+        // default (no-credential) and interceptor-bearing constructors can be
+        // exercised offline.
+        let channel = Channel::from_static("http://[::1]:50051").connect_lazy();
+        let _default = DirectoryGrpcClient::from_channel(channel.clone());
+        let _authed = DirectoryGrpcClient::from_channel_with_interceptor(
+            channel,
+            InternalAuthInterceptor::disabled(),
+        );
+    }
+
+    #[test]
+    fn proto_instance_maps_all_fields_to_domain() {
+        let proto = InstanceInfo {
+            gear_name: "calc".to_owned(),
+            instance_id: "calc-1".to_owned(),
+            endpoint_uri: "http://calc:8080".to_owned(),
+            version: "1.2.3".to_owned(),
+            rest_endpoint_uri: Some("http://calc:8080".to_owned()),
+            openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
+        };
+        let domain = proto_instance_to_domain(proto);
+        assert_eq!(domain.gear, "calc");
+        assert_eq!(domain.instance_id, "calc-1");
+        assert_eq!(domain.endpoint.uri, "http://calc:8080");
+        assert_eq!(domain.version.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            domain.rest_endpoint.map(|e| e.uri),
+            Some("http://calc:8080".to_owned())
+        );
+        assert!(domain.openapi_spec.is_some());
+    }
+
+    #[test]
+    fn proto_instance_maps_empty_version_to_none() {
+        let proto = InstanceInfo {
+            gear_name: "worker".to_owned(),
+            instance_id: "worker-1".to_owned(),
+            endpoint_uri: "http://worker:7000".to_owned(),
+            version: String::new(),
+            rest_endpoint_uri: None,
+            openapi_spec: None,
+        };
+        let domain = proto_instance_to_domain(proto);
+        // An empty proto version string maps to `None` rather than an empty string.
+        assert!(domain.version.is_none());
+        assert!(domain.rest_endpoint.is_none());
+        assert!(domain.openapi_spec.is_none());
     }
 }

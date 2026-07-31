@@ -85,7 +85,7 @@ impl RestApiCapability for TestUsersGear {
             .tag("Users")
             .query_param("limit", false, "Maximum number of users to return")
             .query_param("offset", false, "Number of users to skip")
-            .public()
+            .anonymous()
             .json_array_response_with_schema::<User>(
                 openapi,
                 http::StatusCode::OK,
@@ -105,7 +105,7 @@ impl RestApiCapability for TestUsersGear {
             .description("Retrieve a specific user by their ID")
             .tag("Users")
             .path_param("id", "User ID")
-            .public()
+            .anonymous()
             .json_response_with_schema::<User>(openapi, http::StatusCode::OK, "User found")
             .json_response(http::StatusCode::NOT_FOUND, "User not found")
             .json_response(
@@ -122,7 +122,7 @@ impl RestApiCapability for TestUsersGear {
             .description("Create a new user with the provided data")
             .tag("Users")
             .json_request::<CreateUserRequest>(openapi, "User creation data")
-            .public()
+            .anonymous()
             .json_response_with_schema::<User>(
                 openapi,
                 http::StatusCode::CREATED,
