@@ -140,7 +140,7 @@ This design owns the **signal** and the **reaction contract**. It does not own v
 │  │ Apply Outcome Tracker · Cache Invalidation Broadcast │   │
 │  └──────────────────────────────────────────────────────┘   │
 ├─────────────────────────────────────────────────────────────┤
-│  Transport │ Event Broker (at-least-once, consumer dedup)   │
+│  Transport │ Event Broker (at-least-once, repeat-safe)      │
 ├─────────────────────────────────────────────────────────────┤
 │  Storage   │ PostgreSQL (await-records, subscriptions)      │
 └─────────────────────────────────────────────────────────────┘
@@ -150,7 +150,7 @@ This design owns the **signal** and the **reaction contract**. It does not own v
 |-------|---------------|------------|
 | Consumer SDK | Subscribe to exact setting keys, receive the change signal, report the applied outcome | Rust trait in `settings-service-sdk` |
 | Activation | Publish the two signals, track one await-record per `(apply, subscriber, key)`, resolve bundle outcome | In-process Rust modules in the `settings-service` gear |
-| Transport | At-least-once event delivery with consumer-side dedup by `apply_id` | Event Broker |
+| Transport | At-least-once event delivery; a repeated notification is re-applied and re-acknowledged | Event Broker |
 | Storage | Durable await-records and the subscription registry | PostgreSQL via `toolkit-db` |
 
 #### Context View
@@ -208,13 +208,13 @@ C4Container
 - **Back-response contract** — consumers emit `apply_success` (or `apply_failed { detail }`) **per changed setting** after reacting, echoing the `tenant` and **the value they applied (a hash for secret-valued settings)**, so the Settings Service tracks activation **per await-record** and verifies the applied value against the expected value **snapshotted at apply time** (§4.2 *Apply Publisher*). A `success` back-response carrying a value that does **not** match is treated as a **failure**.
 - **Settings Service apply-outcome visibility** — the Settings Service tracks and exposes via API the state of each apply: a **wait-for-all** overall status `awaiting` → `success` / `failed` / `superseded` / `cancelled`, plus **succeeded / failed / superseded / cancelled / awaiting counts** over the await-records.
 - **Consumer re-read-and-react** obligation: on an `apply_notification` the consumer re-reads the affected keys and applies them. A restart-only consumer is handled by **re-publish on re-subscribe** (§4.2 *Apply Outcome Tracker*) — no missed activation is stranded.
-- **Event Broker transport only** — durable pub/sub via the platform event broker. At-least-once delivery with consumer-side idempotency by `apply_id`.
+- **Event Broker transport only** — durable pub/sub via the platform event broker. At-least-once delivery; the consumer's reaction is idempotent, so a repeated notification is re-applied and re-acknowledged.
 
 ### 2.2 Non-Goals
 
 - **Setting storage, effective-value resolution, validation, staging, and the apply commit** — owned by the [Settings Service](./DESIGN.md) value path. Settings Activation is triggered *by* that apply, and does not duplicate it.
 - **Carrying the value in a notification** — neither **notification** event (`apply_notification` / `cache_invalidate`) contains the value or a secret (§4.1); consumers re-read. (Back-responses **do** echo the applied value — a hash for secrets — §4.1/§4.4.)
-- **Exactly-once delivery** — the model tolerates at-least-once (Event Broker durability). Consumer idempotency by `apply_id` and dedup per setting list. No global ordering guarantee across applies.
+- **Exactly-once delivery** — the model tolerates at-least-once (Event Broker durability): on every notification the consumer re-reads the effective value and converges to it, so a repeat is **re-applied and re-acknowledged**, never suppressed (§4.2 *Consumer Activation SDK*). No global ordering guarantee across applies.
 - **Central execution of heavier reactions — not in the model.** Activation never centrally reloads/restarts a consumer, nor classifies a per-setting "effect." Heavier reactions (rebuild a pool, re-render a config file, restart) are the consumer's **own**, done in its handler on the signal — a consumer that cannot apply in place restarts itself (exit → supervisor restarts it → reads the current value on boot, §4.6). See §4.2 *Heavier consumer reactions*. (Coordinated **rolling** restart across replicas is a deployment/rollout concern — RMS — not activation.)
 - **A response deadline / time-boxed wait** — the Settings Service does **not** impose a deadline on a bundle; it waits **unboundedly** for every await-record to resolve (how long to keep waiting is an administrator decision, §6). A restart-only consumer leaves its await-records **unanswered**; on **re-subscribe after boot** the service **re-publishes** the notification and the consumer acknowledges then (§4.2 *Apply Outcome Tracker*).
 - **Namespace/prefix subscriptions** — not supported. Subscription (and the consumer-facing `watch`, DESIGN.md §4.5) is per **exact** setting key (§4.2 *Subscription Manager*), never a namespace prefix or category.
@@ -462,7 +462,7 @@ The consumer-facing contract. Subscribes to specific setting keys, receives filt
 | `subscribe` | `keys`, handler | subscription handle | Subscribe to the **specific setting keys** the consumer must actively activate — **any keys it can read**, not tied to ownership (§4.2 *Subscription Manager*). On each apply, the SDK **receives a bundle of only those keys that changed** (+ the `tenant`) and **re-reads** their effective values (`SettingsReaderClient.get_effective`) for that `tenant`. Invokes the handler with the bundle + fresh values. Handler decides *how* to apply. |
 | `report_outcome` | `apply_id`, `tenant`, `key`, `status`, `applied_value`, `detail?` | — | After reacting to a change, emit `BackResponse` (success/failed) **for the given `key`** (and `tenant`), carrying the **value applied** (a **hash** for secret-valued settings), so the Settings Service resolves the await-record and verifies against the expected value **snapshotted at apply time** (§4.2 *Apply Publisher*). Idempotent per `(apply_id, subscriber, key)`. |
 
-**Consumer obligation (normative):** a consumer that materializes settings at startup (connection pool, listener socket, rendered file) and needs *active* re-application MUST `subscribe` to those setting keys, re-read on signal, and emit a per-setting back-response. A consumer that reads settings fresh on every use needs no subscription — the pull path already gives it the current value. On boot a consumer reads current values via the pull path, and any activation left pending across a restart is re-published on re-subscribe (§4.2 *Apply Outcome Tracker*).
+**Consumer obligation (normative):** a consumer that materializes settings at startup (connection pool, listener socket, rendered file) and needs *active* re-application MUST `subscribe` to those setting keys, re-read on signal, and emit a per-setting back-response — **on every delivery, including a repeat of one already handled**. Re-reading is what makes the reaction idempotent: a consumer already at the current value reports `success` with that value and does no further work. A repeat MUST NOT be suppressed — suppressing it withholds its acknowledgement and leaves the await-record `awaiting` (§4.2 *Apply Outcome Tracker*). A consumer that reads settings fresh on every use needs no subscription — the pull path already gives it the current value. On boot a consumer reads current values via the pull path, and any activation left pending across a restart is re-published on re-subscribe (§4.2 *Apply Outcome Tracker*).
 
 #### Component: Apply Outcome Tracker
 
@@ -689,7 +689,7 @@ Mirrors the Settings Service model (design DESIGN.md §4.7); enforced server-sid
 - **Subscription is trusted-caller, not ownership-bound:** any trusted in-platform consumer may subscribe to any setting key it can read — subscription is **decoupled from contribution/ownership** (§4.2 *Subscription Manager*), so shared and admin-authored keys (owned by no module) are subscribable. Subscriber identity is **caller-supplied and trusted, not verified** (DESIGN.md §6); there is **no ownership/namespace reject**. **Revisit if consumers are ever exposed as untrusted** — verified subscriber identity + per-key read-entitlement would then be required.
 - **No sensitive data in the notification stream:** the two **notification** events (`apply_notification`, `cache_invalidate`) carry **identifiers only** — no value, no secret. Back-responses (`apply_success` / `apply_failed`) deliberately echo the **applied value** — plaintext for non-secret settings, a **hash** for secret-valued ones (plaintext never leaves the consumer); tenant scope resolves on re-read under the consumer's own identity.
 - **Reaction acks** are attributed to the subscriber identity (`Context`) and are not privileged operations on the value.
-- **At-least-once delivery:** Event Broker guarantees at-least-once, so consumer-side idempotency by `apply_id` is required. Cache TTL bounds staleness. No security decision depends on delivery.
+- **At-least-once delivery:** Event Broker guarantees at-least-once, so the consumer's reaction must be idempotent — a repeat is re-applied and re-acknowledged. Cache TTL bounds staleness. No security decision depends on delivery.
 - **Audit & correlation:** `apply_id` propagates from the Settings Service apply through both events and the reaction report for end-to-end correlation.
 
 ### 4.9 Technology Stack
@@ -697,7 +697,7 @@ Mirrors the Settings Service model (design DESIGN.md §4.7); enforced server-sid
 | Concern | Choice | Notes |
 |---------|--------|-------|
 | Runtime | Part of the `settings-service` ToolKit gear | Not a separate gear; it shares the gear's process, database, and lifecycle |
-| Transport | Event Broker | At-least-once; consumers dedup by `apply_id`; no broker-less fallback |
+| Transport | Event Broker | At-least-once; consumers re-apply and re-acknowledge a repeat; no broker-less fallback |
 | Durability | PostgreSQL via `toolkit-db` | Await-records double as the delivery queue — no separate outbox |
 | Consumer contract | Rust trait in `settings-service-sdk` | `subscribe(keys)` plus `report_outcome(...)`; exact keys only, no prefix subscriptions |
 | Observability | Prometheus scrape targets | Metrics enumerated in §7 *Feature Metrics* |
@@ -717,8 +717,8 @@ Decisions taken during design, with the alternative rejected and the residual co
 ### 5.2 Security and Performance Risks
 
 - **Consumer discipline.** Reaction depends on the consumer subscribing and reacting. *Mitigation:* consumers **explicitly** subscribe to every setting they must actively activate (§4.2 *Subscription Manager*); authoring guidance; a **seam test** asserting a subscription exists for every setting declared as requiring active activation.
-- **Event Broker required.** No broker-less fallback. *Mitigation:* Event Broker is a platform dependency; at-least-once durability with consumer-side dedup by `apply_id` is the contract. `cache_ttl_seconds` backstop handles a missed `cache_invalidate`.
-- **Bundle dedup.** Consumers MUST dedup on `apply_id` to handle at-least-once delivery (the delivery loop re-publishes an `awaiting` record until acked). *Mitigation:* SDK enforces this; `redeliver_interval_seconds` backoff bounds re-notify volume; testing covers redelivery.
+- **Event Broker required.** No broker-less fallback. *Mitigation:* Event Broker is a platform dependency; at-least-once durability with an idempotent consumer reaction is the contract. `cache_ttl_seconds` backstop handles a missed `cache_invalidate`.
+- **Repeated delivery.** At-least-once means a consumer may receive the same `(apply_id, key)` more than once (the delivery loop re-publishes an `awaiting` record until acked). It MUST re-apply and re-acknowledge the repeat rather than suppress it — a suppressed repeat withholds its acknowledgement and strands the await-record. *Mitigation:* the reaction is idempotent by construction (re-read → converge → ack, §4.2 *Consumer Activation SDK*); the delivery loop rebuilds each bundle from still-`awaiting` records, so a repeat carries only unacked keys; `redeliver_interval_seconds` backoff bounds re-notify volume; testing covers redelivery.
 - **Restart handling.** A restart-only consumer leaves its await-records `awaiting`; on re-subscribe the service re-publishes the notification and the consumer acks after boot (§4.2 *Subscription Manager*, §4.2 *Apply Outcome Tracker*).
 - **Hierarchy-change invalidation is not covered by the broadcast** — a tenant re-parent or mid-chain insert changes a `cascading` effective value with no apply to broadcast about (§4.2 *Cache Invalidation Broadcast*). The eviction trigger belongs to the settings-service cache, but the Tenant Resolver publishes no hierarchy-change signal today, so after a re-parent a replica may serve the pre-move value for up to `cache_ttl_seconds`. *Mitigation:* the TTL backstop; the durable fix is a Tenant Resolver hierarchy-change event (§4.2 *Cache & Invalidation* / §4.4/DESIGN.md §6).
 
@@ -837,14 +837,14 @@ All metrics exposed as Prometheus scrape targets.
 | Component | Why |
 |---|---|
 | Await-record co-commit + delivery (integration + E2E) | Correctness depends on the real transactional co-commit of await-records and deliver-until-ack from them |
-| Event Broker at-least-once behavior | At-least-once redelivery semantics must be tested; consumer-side dedup by `apply_id` is required |
+| Event Broker at-least-once behavior | At-least-once redelivery semantics must be tested; a repeated notification must be re-applied and re-acknowledged |
 | Per-subscriber filtering on real broker (E2E) | Key-scoped least-privilege (best-effort, §4.8): a subscriber receives only its own keys — must be proven against real delivery |
 | Unique indexes (await-record, subscription, tracker) | DB-level at-most-once for await-records (`uq_await_record` on `(apply_id, subscriber, key)`) |
 | Replica cache eviction on real Event Broker (E2E) | Multi-replica coherence is the headline guarantee |
 
 #### Concurrency Testing
 
-Concurrent applies and concurrent back-responses exist. Test: seed N applies, spawn back-responses with barrier-synchronized start, assert a single `apply_await_records` row per `(apply_id, subscriber, key)` (via `uq_await_record`) and a deterministic final `overall_status` (wait-for-all). Assert that under concurrent applies each apply's `cache_invalidate` is published once and its `apply_notification`s are delivered at-least-once (consumer-deduped).
+Concurrent applies and concurrent back-responses exist. Test: seed N applies, spawn back-responses with barrier-synchronized start, assert a single `apply_await_records` row per `(apply_id, subscriber, key)` (via `uq_await_record`) and a deterministic final `overall_status` (wait-for-all). Assert that under concurrent applies each apply's `cache_invalidate` is published once and its `apply_notification`s are delivered at-least-once (each delivery re-applied and re-acked by the consumer).
 
 #### NFR Verification Mapping
 
