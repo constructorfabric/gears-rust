@@ -44,7 +44,7 @@ Apply **only** to files listed in `toolkit_owned_files`, and apply **only** thes
 
 4. **TOOLKIT-REST-001** — All REST endpoints must use `OperationBuilder` to define routes, handlers, and metadata. Check that endpoint definitions use the OperationBuilder pattern, not manual route registration.
 
-5. **TOOLKIT-REST-002** — Every endpoint handler must declare authentication requirements explicitly via `.authenticated()` or `.public()`. Check that the OperationBuilder call includes one of these methods.
+5. **TOOLKIT-REST-002** — Every endpoint handler must declare authentication requirements explicitly via `.authenticated()` or `.anonymous()`. Check that the OperationBuilder call includes one of these methods.
 
 6. **TOOLKIT-REST-003** — `SecurityContext` must be passed via Axum extension only, never as a parameter or global. Check that SecurityContext is extracted from the extension, not passed directly.
 

@@ -7,6 +7,10 @@ use serde_json::Value;
 use tower::ServiceExt; // for `oneshot`
 
 use crate::healthcheck::RestHealthcheckRegistry;
+use toolkit_security::{
+    AuthNError, BearerAuthenticator, DynBearerAuthenticator, DynInternalAuthenticator,
+    InternalAuthNError, InternalAuthenticator, PlatformIdentity, SecurityContext,
+};
 
 /// Build a readiness state with an empty healthcheck registry (no gear checks).
 fn readiness<I, S>(deps: I) -> Arc<ReadinessState>

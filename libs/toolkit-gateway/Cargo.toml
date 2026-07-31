@@ -1,0 +1,47 @@
+[package]
+name = "cf-gears-toolkit-gateway"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ToolKit GatewayProvider abstraction for OoP edge route registration and reverse-proxying"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "cf-gears-toolkit"]
+categories = ["web-programming"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "toolkit_gateway"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Object-safe async trait so the OoP bootstrap can hold `Arc<dyn GatewayProvider>`.
+async-trait = { workspace = true }
+# Pre-serialized OpenAPI JSON variant of `OpenApiSpec`.
+bytes = { workspace = true }
+# `Uri` / `Scheme` / `Authority` parsing for `Endpoint`.
+http = { workspace = true }
+thiserror = { workspace = true }
+# `OpenApi` document type accepted by `register_routes`.
+utoipa = { workspace = true }
+
+# Forwarder: axum extractors/response types for the reverse-proxy fallback.
+axum = { workspace = true }
+# Path-template routing for the reverse-proxy route table.
+matchit = { workspace = true }
+# Synchronous RwLock guarding the route table.
+parking_lot = { workspace = true }
+# JSON walking of the OpenAPI document + problem+json bodies.
+serde_json = { workspace = true }
+# RFC 9457 problem+json error responses from the forwarder.
+toolkit-canonical-errors = { workspace = true, features = ["axum"] }
+# Outbound HTTP client used to forward proxied requests.
+toolkit-http = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

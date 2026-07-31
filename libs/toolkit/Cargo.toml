@@ -88,6 +88,8 @@ bootstrap = [
     # OoP HTTP server: two-plane auth middleware + security primitives
     "dep:toolkit-security",
     "dep:toolkit-http-middleware",
+    # OoP outbound platform-plane credential (InternalAuthInterceptor + SA reader)
+    "dep:toolkit-transport-grpc",
 ]
 
 [dependencies]
@@ -103,6 +105,8 @@ cf-gears-system-sdks = { workspace = true, features = ["directory"] }
 # OoP HTTP server (bootstrap feature): two-plane auth middleware + primitives
 toolkit-security = { workspace = true, optional = true }
 toolkit-http-middleware = { workspace = true, optional = true }
+# OoP outbound platform-plane credential attachment (bootstrap feature).
+toolkit-transport-grpc = { workspace = true, optional = true }
 # Concrete K8s TokenReview InternalAuthenticator (k8s-auth feature).
 toolkit-k8s-auth = { workspace = true, optional = true }
 

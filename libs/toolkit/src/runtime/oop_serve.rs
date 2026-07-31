@@ -28,9 +28,7 @@
 //! gear routes. Self-registration and dependency resolution live in
 //! [`super::oop_registration`].
 
-use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -51,10 +49,7 @@ use url::Url;
 use cf_system_sdks::directory::{DirectoryClient, RegisterInstanceInfo, ServiceEndpoint};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_http_middleware::{internal_auth_middleware, security_context_middleware};
-use toolkit_security::{
-    AuthNError, BearerAuthenticator, InternalAuthNError, InternalAuthenticator, PlatformIdentity,
-    SecurityContext,
-};
+use toolkit_security::{DynBearerAuthenticator, DynInternalAuthenticator};
 
 use super::readiness::ReadinessState;
 use crate::api::canonical_error_middleware;
@@ -65,111 +60,6 @@ const DRAIN_RETRY_AFTER_SECONDS: u64 = 5;
 /// `Retry-After` (seconds) advertised for gear routes before the gear has
 /// finished starting (probes are already live; routes come up shortly).
 const STARTING_RETRY_AFTER_SECONDS: u64 = 1;
-
-// ---------------------------------------------------------------------------
-// Object-safe authenticator adapters
-// ---------------------------------------------------------------------------
-
-type BearerFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<SecurityContext, AuthNError>> + Send + 'a>>;
-type InternalFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<PlatformIdentity, InternalAuthNError>> + Send + 'a>>;
-
-/// Object-safe erasure of [`BearerAuthenticator`].
-///
-/// [`BearerAuthenticator::authenticate`] returns `impl Future`, so the trait is
-/// not `dyn`-compatible. This trait boxes the future so a concrete authenticator
-/// can be stored behind an `Arc` and injected at the bootstrap layer.
-trait ErasedBearer: Send + Sync {
-    fn authenticate<'a>(&'a self, token: &'a str) -> BearerFuture<'a>;
-}
-
-impl<A: BearerAuthenticator> ErasedBearer for A {
-    fn authenticate<'a>(&'a self, token: &'a str) -> BearerFuture<'a> {
-        Box::pin(BearerAuthenticator::authenticate(self, token))
-    }
-}
-
-/// Injectable, object-safe tenant-plane authenticator.
-///
-/// Wrap a concrete [`BearerAuthenticator`] (e.g. an `AuthNResolverClient`
-/// adapter supplied by the app/gear binary) with [`DynBearerAuthenticator::new`]
-/// and hand it to [`OopServeOptions::bearer_authenticator`].
-#[derive(Clone)]
-pub struct DynBearerAuthenticator(Arc<dyn ErasedBearer>);
-
-impl DynBearerAuthenticator {
-    /// Wrap a concrete [`BearerAuthenticator`] in the object-safe adapter.
-    #[must_use]
-    pub fn new<A: BearerAuthenticator + 'static>(authenticator: A) -> Self {
-        Self(Arc::new(authenticator))
-    }
-
-    /// Wrap an already-`Arc`'d [`BearerAuthenticator`] in the object-safe adapter.
-    #[must_use]
-    pub fn from_arc<A: BearerAuthenticator + 'static>(authenticator: Arc<A>) -> Self {
-        // Adapt Arc<A> to Arc<dyn ErasedBearer> via a thin wrapper.
-        struct W<A>(Arc<A>);
-        impl<A: BearerAuthenticator> ErasedBearer for W<A> {
-            fn authenticate<'a>(&'a self, token: &'a str) -> BearerFuture<'a> {
-                Box::pin(BearerAuthenticator::authenticate(&*self.0, token))
-            }
-        }
-        Self(Arc::new(W(authenticator)))
-    }
-}
-
-impl BearerAuthenticator for DynBearerAuthenticator {
-    async fn authenticate(&self, token: &str) -> Result<SecurityContext, AuthNError> {
-        self.0.authenticate(token).await
-    }
-}
-
-/// Object-safe erasure of [`InternalAuthenticator`] (same rationale as
-/// [`ErasedBearer`]).
-trait ErasedInternal: Send + Sync {
-    fn authenticate<'a>(&'a self, token: &'a str) -> InternalFuture<'a>;
-}
-
-impl<A: InternalAuthenticator> ErasedInternal for A {
-    fn authenticate<'a>(&'a self, token: &'a str) -> InternalFuture<'a> {
-        Box::pin(InternalAuthenticator::authenticate(self, token))
-    }
-}
-
-/// Injectable, object-safe platform-plane authenticator.
-///
-/// Wrap a concrete [`InternalAuthenticator`] (e.g. the K8s `TokenReview`
-/// validator) with [`DynInternalAuthenticator::new`] and hand it to
-/// [`OopServeOptions::internal_authenticator`].
-#[derive(Clone)]
-pub struct DynInternalAuthenticator(Arc<dyn ErasedInternal>);
-
-impl DynInternalAuthenticator {
-    /// Wrap a concrete [`InternalAuthenticator`] in the object-safe adapter.
-    #[must_use]
-    pub fn new<A: InternalAuthenticator + 'static>(authenticator: A) -> Self {
-        Self(Arc::new(authenticator))
-    }
-
-    /// Wrap an already-`Arc`'d [`InternalAuthenticator`] in the object-safe adapter.
-    #[must_use]
-    pub fn from_arc<A: InternalAuthenticator + 'static>(authenticator: Arc<A>) -> Self {
-        struct W<A>(Arc<A>);
-        impl<A: InternalAuthenticator> ErasedInternal for W<A> {
-            fn authenticate<'a>(&'a self, token: &'a str) -> InternalFuture<'a> {
-                Box::pin(InternalAuthenticator::authenticate(&*self.0, token))
-            }
-        }
-        Self(Arc::new(W(authenticator)))
-    }
-}
-
-impl InternalAuthenticator for DynInternalAuthenticator {
-    async fn authenticate(&self, token: &str) -> Result<PlatformIdentity, InternalAuthNError> {
-        self.0.authenticate(token).await
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Serve options
@@ -700,6 +590,33 @@ impl OopHttpServer {
     /// The serve options (used by the caller to compose the `OpenAPI` document).
     pub(super) fn options(&self) -> &OopServeOptions {
         &self.options
+    }
+
+    /// Resolve the tenant-plane authenticator from the populated `ClientHub`.
+    ///
+    /// Called by the `OoP` serving path after the gear lifecycle's `start`
+    /// phase and before [`attach`](Self::attach) layers the middleware. When an
+    /// in-process authn stack (e.g. the `authn-resolver` gear) is linked into
+    /// the binary it registers a [`DynBearerAuthenticator`] bridge during
+    /// `init`; picking it up here installs `security_context_middleware` on the
+    /// gear routes. A no-op if an authenticator was already supplied directly or
+    /// none is registered in the hub.
+    pub(super) fn resolve_bearer_authenticator(&mut self, hub: &crate::ClientHub) {
+        if self.options.bearer_authenticator.is_some() {
+            return;
+        }
+        if let Ok(auth) = hub.get::<DynBearerAuthenticator>() {
+            self.options.bearer_authenticator = Some((*auth).clone());
+            tracing::info!(
+                gear = %self.options.gear_name,
+                "tenant-plane authenticator installed (security_context_middleware enabled)"
+            );
+        } else {
+            tracing::debug!(
+                gear = %self.options.gear_name,
+                "no tenant-plane authenticator registered in ClientHub; tenant plane not installed"
+            );
+        }
     }
 
     /// Publish the composed gear routes (they go live atomically) and start

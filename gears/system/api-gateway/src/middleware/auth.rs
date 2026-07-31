@@ -6,6 +6,7 @@ use crate::middleware::common;
 
 use authn_resolver_sdk::{AuthNResolverClient, AuthNResolverError};
 use toolkit_canonical_errors::CanonicalError;
+use toolkit_gateway::ProxyRegistry;
 use toolkit_security::SecurityContext;
 
 /// Route matcher for a specific HTTP method (authenticated routes).
@@ -67,6 +68,10 @@ pub struct GatewayRoutePolicy {
     route_matchers: Arc<HashMap<Method, RouteMatcher>>,
     public_matchers: Arc<HashMap<Method, PublicRouteMatcher>>,
     require_auth_by_default: bool,
+    /// Reverse-proxy route table (embedded edge). When set, dynamically-
+    /// registered proxy routes are resolved against it so each is enforced
+    /// exactly as the owning gear declared. `None` when the proxy is disabled.
+    proxy_registry: Option<Arc<ProxyRegistry>>,
 }
 
 impl GatewayRoutePolicy {
@@ -75,11 +80,13 @@ impl GatewayRoutePolicy {
         route_matchers: Arc<HashMap<Method, RouteMatcher>>,
         public_matchers: Arc<HashMap<Method, PublicRouteMatcher>>,
         require_auth_by_default: bool,
+        proxy_registry: Option<Arc<ProxyRegistry>>,
     ) -> Self {
         Self {
             route_matchers,
             public_matchers,
             require_auth_by_default,
+            proxy_registry,
         }
     }
 
@@ -107,6 +114,19 @@ impl GatewayRoutePolicy {
             return AuthRequirement::Required;
         }
 
+        // Dynamically-registered proxy routes are not in the static matchers.
+        // Consult the reverse-proxy registry so each proxied route is enforced
+        // exactly as the owning gear declared (authenticated vs anonymous).
+        if let Some(registry) = &self.proxy_registry
+            && let Some(authenticated) = registry.requires_auth(method, path)
+        {
+            return if authenticated {
+                AuthRequirement::Required
+            } else {
+                AuthRequirement::None
+            };
+        }
+
         if self.require_auth_by_default {
             AuthRequirement::Required
         } else {
@@ -132,6 +152,7 @@ pub fn build_route_policy(
     cfg: &crate::config::ApiGatewayConfig,
     authenticated_routes: std::collections::HashSet<(Method, String)>,
     public_routes: std::collections::HashSet<(Method, String)>,
+    proxy_registry: Option<Arc<ProxyRegistry>>,
 ) -> Result<GatewayRoutePolicy, anyhow::Error> {
     // Build route matchers per HTTP method (authenticated routes)
     let mut route_matchers_map: HashMap<Method, RouteMatcher> = HashMap::new();
@@ -161,6 +182,7 @@ pub fn build_route_policy(
         Arc::new(route_matchers_map),
         Arc::new(public_matchers_map),
         cfg.require_auth_by_default,
+        proxy_registry,
     ))
 }
 
@@ -329,7 +351,45 @@ mod tests {
             Arc::new(route_matchers),
             Arc::new(public_matchers),
             require_auth_by_default,
+            None,
         )
+    }
+
+    #[test]
+    fn resolve_consults_proxy_registry_for_dynamic_routes() {
+        use toolkit_gateway::{Endpoint, GearName, RouteTemplate};
+
+        let registry = Arc::new(ProxyRegistry::new());
+        registry.register(
+            GearName::from("calc"),
+            Endpoint::parse("http://calc:8080").unwrap(),
+            vec![
+                RouteTemplate::new(Method::GET, "/calc/v1/pub", false),
+                RouteTemplate::new(Method::POST, "/calc/v1/secure", true),
+            ],
+        );
+
+        // `require_auth_by_default = true`, but the proxy registry overrides per route.
+        let policy = GatewayRoutePolicy::new(
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            true,
+            Some(registry),
+        );
+
+        assert_eq!(
+            policy.resolve(&Method::GET, "/calc/v1/pub"),
+            AuthRequirement::None
+        );
+        assert_eq!(
+            policy.resolve(&Method::POST, "/calc/v1/secure"),
+            AuthRequirement::Required
+        );
+        // A path not in the proxy registry falls back to `require_auth_by_default`.
+        assert_eq!(
+            policy.resolve(&Method::GET, "/unknown"),
+            AuthRequirement::Required
+        );
     }
 
     #[test]
@@ -353,9 +413,12 @@ mod tests {
             (Method::GET, "events:stream".to_owned()),
         ]);
 
-        if let Err(err) =
-            build_route_policy(&cfg, authenticated_routes, std::collections::HashSet::new())
-        {
+        if let Err(err) = build_route_policy(
+            &cfg,
+            authenticated_routes,
+            std::collections::HashSet::new(),
+            None,
+        ) {
             panic!("literal colon route paths must not be interpreted as path parameters: {err}");
         }
     }

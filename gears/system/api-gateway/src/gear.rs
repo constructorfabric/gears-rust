@@ -49,6 +49,8 @@ async fn timeout_to_canonical(err: BoxError) -> axum::response::Response {
 
 use authn_resolver_sdk::AuthNResolverClient;
 
+use cf_system_sdks::directory::{DirectoryClient, DirectoryGrpcClient};
+
 use crate::config::{ApiGatewayConfig, HealthServeMode};
 use crate::middleware::auth;
 use toolkit_security::SecurityContext;
@@ -87,6 +89,11 @@ pub struct ApiGateway {
     // Duplicate detection (per (method, path) and per handler id)
     pub(crate) registered_routes: DashMap<(Method, String), ()>,
     pub(crate) registered_handlers: DashMap<String, ()>,
+
+    // Reverse-proxy route table (embedded edge). Populated by the directory-sync
+    // task and read by the Forwarder fallback; empty/unused when
+    // `gateway_proxy` is disabled.
+    pub(crate) proxy_registry: Arc<toolkit_gateway::ProxyRegistry>,
 }
 
 impl Default for ApiGateway {
@@ -102,6 +109,7 @@ impl Default for ApiGateway {
             health_router: OnceLock::new(),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
+            proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
         }
     }
 }
@@ -192,6 +200,7 @@ impl ApiGateway {
             health_router: OnceLock::new(),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
+            proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
         }
     }
 
@@ -247,11 +256,15 @@ impl ApiGateway {
 
             let route_key = (spec.method.clone(), spec.path.clone());
 
+            // Auth axis: `authenticated` requires a JWT; `!authenticated` is
+            // anonymous (auth-skip). Visibility (`is_public`) is a *separate*
+            // axis (gateway registration) and does NOT affect the auth decision.
+            // The builder typestate forces an explicit choice, so every spec'd
+            // route lands in exactly one set; `require_auth_by_default` remains
+            // the fallback for paths with no matching spec.
             if spec.authenticated {
-                authenticated_routes.insert(route_key.clone());
-            }
-
-            if spec.is_public {
+                authenticated_routes.insert(route_key);
+            } else {
                 public_routes.insert(route_key);
             }
         }
@@ -259,7 +272,16 @@ impl ApiGateway {
         let requirements_count = authenticated_routes.len();
         let public_routes_count = public_routes.len();
 
-        let route_policy = auth::build_route_policy(&config, authenticated_routes, public_routes)?;
+        // When the embedded-edge reverse proxy is enabled, hand the auth policy the
+        // shared proxy registry so dynamically-registered proxy routes are enforced
+        // per-route (authenticated vs anonymous) instead of falling back to the
+        // `require_auth_by_default` global.
+        let proxy_registry = config
+            .gateway_proxy
+            .enabled
+            .then(|| Arc::clone(&self.proxy_registry));
+        let route_policy =
+            auth::build_route_policy(&config, authenticated_routes, public_routes, proxy_registry)?;
 
         tracing::info!(
             auth_disabled = config.auth_disabled,
@@ -660,6 +682,13 @@ impl ApiGateway {
         // ready, so readiness reflects every listener the pod must accept traffic on.
         let health_bound = self.bind_health_listener(&cfg).await?;
 
+        // Embedded-edge reverse proxy: start the directory-sync task that keeps the
+        // proxy route table current. Non-fatal — the gateway still serves native routes
+        // if the directory is unavailable.
+        if cfg.gateway_proxy.enabled {
+            self.start_proxy_sync(&cfg, cancel.clone()).await;
+        }
+
         ready.notify(); // Starting -> Running
 
         let main_server = axum::serve(
@@ -680,6 +709,71 @@ impl ApiGateway {
         } else {
             main_server.await.map_err(|e| anyhow::anyhow!(e))
         }
+    }
+
+    /// Connect to the `DirectoryService` and start the embedded-edge reverse-proxy
+    /// directory-sync task. Connect failures are logged and non-fatal: the gateway
+    /// keeps serving its native routes and simply proxies nothing until a later run.
+    async fn start_proxy_sync(&self, cfg: &ApiGatewayConfig, cancel: CancellationToken) {
+        if let Err(err) = self.try_start_proxy_sync(cfg, cancel).await {
+            tracing::warn!(error = %err, "reverse proxy inactive: directory-sync did not start");
+        }
+    }
+
+    /// Connect to the `DirectoryService` and spawn the directory-sync task.
+    ///
+    /// # Errors
+    /// Returns an error if `directory_endpoint` is unset or the connection fails.
+    async fn try_start_proxy_sync(
+        &self,
+        cfg: &ApiGatewayConfig,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let endpoint = cfg
+            .gateway_proxy
+            .directory_endpoint
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!("gateway_proxy.enabled but directory_endpoint is unset")
+            })?;
+
+        let client = if let Some(internal_auth) = &cfg.gateway_proxy.internal_auth {
+            let interceptor =
+                toolkit_transport_grpc::build_internal_auth_interceptor(internal_auth).await?;
+            tracing::info!("attaching platform-plane credential to edge DirectoryService polls");
+            DirectoryGrpcClient::connect_with_interceptor(endpoint.clone(), interceptor).await?
+        } else {
+            DirectoryGrpcClient::connect(endpoint.clone()).await?
+        };
+        let directory: Arc<dyn DirectoryClient> = Arc::new(client);
+        let interval = Duration::from_secs(cfg.gateway_proxy.sync_interval_secs);
+        crate::proxy::spawn_directory_sync(
+            Arc::clone(&self.proxy_registry),
+            directory,
+            interval,
+            cancel,
+        );
+        tracing::info!(%endpoint, "reverse-proxy directory-sync started");
+        Ok(())
+    }
+
+    /// Mount the reverse-proxy [`Forwarder`](toolkit_gateway::Forwarder) as the
+    /// router fallback, so any request not matched by a gateway-owned route is
+    /// proxied to the owning out-of-process gear pod.
+    ///
+    /// # Errors
+    /// Returns an error if the outbound HTTP client cannot be constructed.
+    fn mount_proxy_fallback(&self, router: Router) -> Result<Router> {
+        let forwarder = toolkit_gateway::Forwarder::new(
+            Arc::clone(&self.proxy_registry),
+            toolkit_http::HttpClient::new()?,
+        );
+        let router = router.fallback(move |req: axum::extract::Request| {
+            let forwarder = forwarder.clone();
+            async move { forwarder.forward(req).await }
+        });
+        tracing::info!("reverse-proxy fallback mounted (gateway_proxy enabled)");
+        Ok(router)
     }
 
     /// Bind the separate health listener when `serve` = separate|both, else `None`.
@@ -880,6 +974,15 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
                 Duration::from_millis(config.healthcheck_timeout_ms),
             );
             router = router.merge(health);
+        }
+
+        // Embedded-edge reverse proxy: mount the Forwarder as the router fallback so any
+        // request that doesn't match a gateway-owned route is proxied to the owning OoP
+        // gear pod. The route table is kept current by the directory-sync task started in
+        // `serve()`. Mounted BEFORE the middleware stack so proxied requests traverse the
+        // same auth / tracing / error-mapping layers as native routes.
+        if config.gateway_proxy.enabled {
+            router = self.mount_proxy_fallback(router)?;
         }
 
         // Middleware on the main router before nesting (auth matching keyed on
@@ -1133,7 +1236,7 @@ mod problem_openapi_tests {
 
         // Build a route with a problem+json response
         let _router = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/problem-demo")
-            .public()
+            .anonymous()
             .summary("Problem demo")
             .problem_response(&api, http::StatusCode::BAD_REQUEST, "Bad Request") // <-- registers Problem + sets content type
             .handler(dummy_handler)
@@ -1206,7 +1309,7 @@ mod sse_openapi_tests {
         let _router = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/demo/sse")
             .summary("Demo SSE")
             .handler(sse_handler)
-            .public()
+            .anonymous()
             .sse_json::<UserEvent>(&api, "SSE of UserEvent")
             .register(router, &api);
 
@@ -1238,7 +1341,7 @@ mod sse_openapi_tests {
 
         let _router = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/demo/mixed")
             .summary("Mixed responses")
-            .public()
+            .anonymous()
             .handler(mixed_handler)
             .json_response(http::StatusCode::OK, "Success response")
             .sse_json::<UserEvent>(&api, "Additional SSE stream")
@@ -1278,7 +1381,7 @@ mod sse_openapi_tests {
 
         let _router = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/users/{id}")
             .summary("Get user by ID")
-            .public()
+            .anonymous()
             .path_param("id", "User ID")
             .handler(user_handler)
             .json_response(http::StatusCode::OK, "User details")
@@ -1318,7 +1421,7 @@ mod sse_openapi_tests {
             "/tests/v1/projects/{project_id}/items/{item_id}",
         )
         .summary("Get project item")
-        .public()
+        .anonymous()
         .path_param("project_id", "Project ID")
         .path_param("item_id", "Item ID")
         .handler(item_handler)
@@ -1359,7 +1462,7 @@ mod sse_openapi_tests {
         // Axum 0.8 uses {*path} for wildcards
         let _router = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/static/{*path}")
             .summary("Serve static files")
-            .public()
+            .anonymous()
             .handler(static_handler)
             .json_response(http::StatusCode::OK, "File content")
             .register(router, &api);
@@ -1398,7 +1501,7 @@ mod sse_openapi_tests {
 
         let _router = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/files/upload")
             .operation_id("upload_file")
-            .public()
+            .anonymous()
             .summary("Upload a file")
             .multipart_file_request("file", Some("File to upload"))
             .handler(upload_handler)

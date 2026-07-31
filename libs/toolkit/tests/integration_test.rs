@@ -83,7 +83,7 @@ async fn test_complete_api_builder_flow() {
     // Test GET endpoint with all features
     router = OperationBuilder::<Missing, Missing, ()>::get("/users-info/v1/users")
         .operation_id("users.list")
-        .public()
+        .anonymous()
         .summary("List all users")
         .description("Returns a paginated list of users in the system")
         .tag("users")

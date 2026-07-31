@@ -19,6 +19,9 @@ service DirectoryService {
   // List all instances of a specific gear
   rpc ListInstances(ListInstancesRequest) returns (ListInstancesResponse);
 
+  // List all instances across every registered gear (edge/gateway discovery)
+  rpc ListAllInstances(ListAllInstancesRequest) returns (ListAllInstancesResponse);
+
   // Register a new gear instance with the directory
   rpc RegisterInstance(RegisterInstanceRequest) returns (google.protobuf.Empty);
 
@@ -63,9 +66,16 @@ message InstanceInfo {
   string endpoint_uri = 3;
   string version = 4;
   optional string rest_endpoint_uri = 5;
+  optional string openapi_spec = 6;
 }
 
 message ListInstancesResponse {
+  repeated InstanceInfo instances = 1;
+}
+
+message ListAllInstancesRequest {}
+
+message ListAllInstancesResponse {
   repeated InstanceInfo instances = 1;
 }
 

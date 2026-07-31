@@ -65,9 +65,44 @@ impl DirectoryClient for LocalDirectoryClient {
                         .rest_endpoint
                         .as_ref()
                         .map(|ep| ServiceEndpoint::new(ep.uri.clone())),
+                    openapi_spec: inst.openapi_spec.clone(),
                 });
             }
         }
+
+        Ok(result)
+    }
+
+    async fn list_all_instances(&self) -> Result<Vec<ServiceInstanceInfo>> {
+        let result = self
+            .mgr
+            .all_instances()
+            .into_iter()
+            .map(|inst| {
+                // Prefer a gRPC endpoint for the primary `endpoint`; fall back to
+                // the REST endpoint (OoP gears often register REST-only).
+                let endpoint = inst
+                    .grpc_services
+                    .values()
+                    .next()
+                    .or(inst.rest_endpoint.as_ref())
+                    .map_or_else(
+                        || ServiceEndpoint::new(String::new()),
+                        |ep| ServiceEndpoint::new(ep.uri.clone()),
+                    );
+                ServiceInstanceInfo {
+                    gear: inst.gear.clone(),
+                    instance_id: inst.instance_id.to_string(),
+                    endpoint,
+                    version: inst.version.clone(),
+                    rest_endpoint: inst
+                        .rest_endpoint
+                        .as_ref()
+                        .map(|ep| ServiceEndpoint::new(ep.uri.clone())),
+                    openapi_spec: inst.openapi_spec.clone(),
+                }
+            })
+            .collect();
 
         Ok(result)
     }
@@ -246,5 +281,41 @@ mod tests {
         // Verify state transitioned to Healthy
         let instances = dir.instances_of("test_gear");
         assert_eq!(instances[0].state(), InstanceState::Healthy);
+    }
+
+    #[tokio::test]
+    async fn test_list_all_instances_across_gears() {
+        let dir = Arc::new(GearManager::new());
+        let api = LocalDirectoryClient::new(Arc::clone(&dir));
+
+        // Two REST-only OoP gears (no gRPC services) + one gRPC-only gear.
+        for (gear, port) in [("billing", 8080u16), ("catalog", 8081u16)] {
+            api.register_instance(RegisterInstanceInfo {
+                gear: gear.to_owned(),
+                instance_id: Uuid::new_v4().to_string(),
+                grpc_services: vec![],
+                version: Some("1.0.0".to_owned()),
+                rest_endpoint: Some(ServiceEndpoint::http(gear, port)),
+                openapi_spec: Some(format!("{{\"openapi\":\"3.1.0\",\"x\":\"{gear}\"}}")),
+            })
+            .await
+            .unwrap();
+        }
+
+        let all = api.list_all_instances().await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        let billing = all.iter().find(|i| i.gear == "billing").expect("billing");
+        assert_eq!(
+            billing.rest_endpoint.as_ref().map(|e| e.uri.as_str()),
+            Some("http://billing:8080")
+        );
+        assert!(
+            billing
+                .openapi_spec
+                .as_deref()
+                .unwrap_or_default()
+                .contains("billing")
+        );
     }
 }

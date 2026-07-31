@@ -534,12 +534,24 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
         return Ok(());
     }
 
-    // Connect to DirectoryService
+    // Connect to DirectoryService. When the gear configures a platform-plane
+    // credential, attach it (as `x-toolkit-internal-token`) to every outbound
+    // system call via an InternalAuthInterceptor (`cpt-cf-adr-two-plane-auth`).
     info!(
         "Connecting to directory service at {}",
         opts.directory_endpoint
     );
-    let directory_client = DirectoryGrpcClient::connect(&opts.directory_endpoint).await?;
+    let internal_auth_cfg = final_config
+        .oop_http
+        .as_ref()
+        .and_then(|h| h.internal_auth.as_ref());
+    let directory_client = if let Some(cfg) = internal_auth_cfg {
+        let interceptor = toolkit_transport_grpc::build_internal_auth_interceptor(cfg).await?;
+        info!("Attaching platform-plane credential to outbound DirectoryService calls");
+        DirectoryGrpcClient::connect_with_interceptor(&opts.directory_endpoint, interceptor).await?
+    } else {
+        DirectoryGrpcClient::connect(&opts.directory_endpoint).await?
+    };
     let directory_api: Arc<dyn DirectoryClient> = Arc::new(directory_client);
 
     info!("Successfully connected to directory service");
@@ -671,40 +683,49 @@ async fn build_oop_serve_options(
     })
 }
 
-/// Construct the platform-plane authenticator from configuration.
+/// Construct the inbound platform-plane authenticator from configuration.
 ///
-/// With the `k8s-auth` feature enabled and `internal_auth` configured, this
-/// initializes the Kubernetes `TokenReview` authenticator. Without the feature,
-/// a configured `internal_auth` is an error; `Ok(None)` is returned only when no
-/// `internal_auth` is configured.
+/// The `shared_secret` provider is built here directly (no external backend).
+/// The `kube` provider initializes the Kubernetes `TokenReview` authenticator
+/// and requires the `k8s-auth` feature; without it, `provider: kube` is an
+/// error rather than a silent enforcement downgrade. `Ok(None)` is returned
+/// only when no `internal_auth` is configured.
 #[cfg_attr(not(feature = "k8s-auth"), allow(clippy::unused_async))]
 async fn build_internal_authenticator(
-    cfg: Option<&super::config::InternalAuthConfig>,
-) -> Result<Option<crate::runtime::DynInternalAuthenticator>> {
+    cfg: Option<&toolkit_security::InternalAuthConfig>,
+) -> Result<Option<toolkit_security::DynInternalAuthenticator>> {
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+
+    // Dependency-light providers (shared-secret) build directly here.
+    if let Some(authenticator) = cfg.build_authenticator() {
+        info!("Initializing shared-secret platform-plane authenticator");
+        return Ok(Some(authenticator));
+    }
+
     #[cfg(feature = "k8s-auth")]
     {
-        if let Some(internal_auth) = cfg {
+        if cfg.is_kube() {
             info!("Initializing Kubernetes TokenReview platform-plane authenticator");
-            let authenticator = toolkit_k8s_auth::K8sTokenReviewAuthenticator::try_default(
-                internal_auth.audiences.clone(),
-            )
-            .await
-            .context("failed to initialize Kubernetes TokenReview authenticator")?;
-            return Ok(Some(crate::runtime::DynInternalAuthenticator::new(
+            let audiences = cfg.kube_audiences().unwrap_or_default().to_vec();
+            let authenticator =
+                toolkit_k8s_auth::K8sTokenReviewAuthenticator::try_default(audiences)
+                    .await
+                    .context("failed to initialize Kubernetes TokenReview authenticator")?;
+            return Ok(Some(toolkit_security::DynInternalAuthenticator::new(
                 authenticator,
             )));
         }
-        Ok(None)
     }
     #[cfg(not(feature = "k8s-auth"))]
     {
-        if cfg.is_some() {
-            anyhow::bail!(
-                "oop_http.internal_auth is configured but the `k8s-auth` feature is disabled"
-            );
+        if cfg.is_kube() {
+            anyhow::bail!("oop_http.internal_auth provider=kube requires the `k8s-auth` feature");
         }
-        Ok(None)
     }
+
+    Ok(None)
 }
 
 /// Derive a default advertise URI from the bind address. Unspecified hosts

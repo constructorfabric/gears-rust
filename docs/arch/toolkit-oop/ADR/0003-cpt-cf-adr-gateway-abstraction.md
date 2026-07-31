@@ -48,37 +48,45 @@ surface minimal and allowing new implementations to be added without framework c
 
 ### Consequences
 
-* A `GatewayProvider` trait must be defined with three methods: `register_routes`, `deregister_routes`, and
-  `health_check`.
+* A `GatewayProvider` trait must be defined with two methods: `register_routes` and `deregister_routes`.
+  (`health_check` was considered but dropped — gateway liveness is an operational probe concern, not part of the
+  registration contract; see DESIGN.md § `cpt-cf-interface-gateway-trait`.)
+* The trait and its typed wrappers live in a dedicated `libs/toolkit-gateway` crate (not in core `toolkit`) so the
+  reverse-proxy `Forwarder`'s `toolkit-http` (HTTP client) dependency is not forced onto every gear that links `toolkit`.
 * `ToolKitGatewayProvider` must be implemented as the first provider. It adds reverse-proxy routes to the built-in
   api-gateway, using `toolkit-http` to forward requests to OoP Workers.
-* The OoP bootstrap must accept a `GatewayProvider` instance (injected at startup based on config/profile) and call
-  `register_routes` after the HTTP server starts.
+* Discovery for the built-in edge is **directory-driven**: the OoP bootstrap registers each instance's REST endpoint +
+  OpenAPI spec with the `DirectoryService` (existing self-registration, `cpt-cf-component-oop-bootstrap`), and the
+  api-gateway polls `ListAllInstances` and drives `register_routes` / `deregister_routes` on its
+  `ToolKitGatewayProvider`. (An external provider such as Kong may instead be driven directly by a provider adapter.)
 * In Profile 3, the operator configures a `KongGatewayProvider` (or similar) via the platform config. The framework
   provides the trait; the k8s-specific adapter is a separate crate.
 * Gears that only expose internal APIs (no public routes) skip gateway registration entirely. The `OperationSpec.is_public`
-  flag (set via `OperationBuilder::public()`) on each route determines this.
+  flag (the **visibility** axis, set via `OperationBuilder::exposed()`; default internal) on each route determines this.
+  Visibility is orthogonal to authentication (`OperationBuilder::authenticated()` / `::anonymous()`): an exposed route may
+  still require a JWT. The provider selects routes via the `x-cf-api-visibility: public` OpenAPI vendor extension emitted
+  from `is_public`.
 * The `GatewayProvider` trait is async (network I/O is required for external gateway admin APIs), which constrains it to
   be used via `Box<dyn GatewayProvider>` or `Arc<dyn GatewayProvider>` rather than static dispatch.
 
 ### Confirmation
 
-* Code review: verify that `GatewayProvider` trait exists and is used in OoP bootstrap instead of direct api-gateway
-  calls.
-* Integration test (Profile 2): OoP gear registers routes via `ToolKitGatewayProvider`; requests through api-gateway
-  reach the OoP gear.
+* Code review: verify that the `GatewayProvider` trait exists and that the built-in edge drives it via directory-sync
+  (no gear imports api-gateway internals, and no bespoke gateway admin API is introduced).
+* Integration test (embedded edge): an OoP gear self-registers its REST endpoint + OpenAPI spec with the
+  `DirectoryService`; the api-gateway discovers it via `ListAllInstances` and reverse-proxies requests to it.
 * Architecture review: verify that no gear directly imports api-gateway internals for route registration.
 
 ## Pros and Cons of the Options
 
 ### Option A: Abstract Trait with Pluggable Implementations
 
-`GatewayProvider` trait with `register_routes`, `deregister_routes`, `health_check`. Implementations per gateway.
+`GatewayProvider` trait with `register_routes` and `deregister_routes`. Implementations per gateway.
 
 * Good, because clean separation of concern — gears declare intent, providers execute.
 * Good, because adding a new gateway (Kong, Tyk, Envoy) requires only a new trait implementation, not framework changes.
 * Good, because gear code is identical across profiles — no `#[cfg]` for gateway type.
-* Good, because the trait surface is minimal (3 methods), keeping implementation cost low.
+* Good, because the trait surface is minimal (2 methods), keeping implementation cost low.
 * Neutral, because the trait must be async (required for network I/O to external gateways), adding some complexity.
 * Bad, because the abstraction adds a layer of indirection that may not be needed until Profile 3 is implemented.
 

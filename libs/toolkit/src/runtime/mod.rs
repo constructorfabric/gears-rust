@@ -24,7 +24,7 @@ pub use host_runtime::{
 #[cfg(feature = "bootstrap")]
 pub use oop_registration::ResolvedRestEndpoints;
 #[cfg(feature = "bootstrap")]
-pub use oop_serve::{DynBearerAuthenticator, DynInternalAuthenticator, OopServeOptions};
+pub use oop_serve::OopServeOptions;
 pub use readiness::{
     DEFAULT_HEALTHCHECK_TIMEOUT, ReadinessLifecycle, ReadinessReport, ReadinessState,
 };

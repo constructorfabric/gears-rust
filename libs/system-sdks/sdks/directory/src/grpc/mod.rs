@@ -5,7 +5,13 @@
 mod client;
 
 // Generated protobuf types for DirectoryService
-#[allow(clippy::all, clippy::pedantic, clippy::nursery, warnings)] // protoc problem
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::empty_structs_with_brackets,
+    warnings
+)] // protoc problem
 pub mod directory {
     tonic::include_proto!("gear_orchestrator.v1.directory");
 }
@@ -15,9 +21,10 @@ pub use directory::directory_service_client::DirectoryServiceClient;
 pub use directory::directory_service_server::{DirectoryService, DirectoryServiceServer};
 pub use directory::{
     DeregisterInstanceRequest, GetOpenApiSpecRequest, GetOpenApiSpecResponse, GrpcServiceEndpoint,
-    HeartbeatRequest, InstanceInfo, ListInstancesRequest, ListInstancesResponse,
-    RegisterInstanceRequest, ResolveGrpcServiceRequest, ResolveGrpcServiceResponse,
-    ResolveRestServiceRequest, ResolveRestServiceResponse,
+    HeartbeatRequest, InstanceInfo, ListAllInstancesRequest, ListAllInstancesResponse,
+    ListInstancesRequest, ListInstancesResponse, RegisterInstanceRequest,
+    ResolveGrpcServiceRequest, ResolveGrpcServiceResponse, ResolveRestServiceRequest,
+    ResolveRestServiceResponse,
 };
 
 // Re-export the gRPC client implementation

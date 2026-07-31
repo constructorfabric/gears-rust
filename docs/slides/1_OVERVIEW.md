@@ -434,7 +434,7 @@ Gears Toolkit is the **central framework** that turns the gear architecture into
 `OperationBuilder` is the authoritative route-registration mechanism — one place declares:
 
 - HTTP method + **versioned path** (`/resource-group/v1/groups`)
-- **Auth posture** (`.authenticated()` / `.public()`) + **license posture**
+- **Auth posture** (`.authenticated()` / `.anonymous()`) + **license posture**
 - Request/response schemas, tags, summary, registered error responses
 
 Result:
