@@ -4958,6 +4958,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hello"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-macros",
+ "clap",
+ "http",
+ "inventory",
+ "serde",
+ "tokio",
+ "tracing",
+ "utoipa",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9161,6 +9179,28 @@ checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
 dependencies = [
  "serde",
  "zeroize",
+]
+
+[[package]]
+name = "secure"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "cf-gears-authn-resolver",
+ "cf-gears-static-authn-plugin",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "clap",
+ "http",
+ "inventory",
+ "serde",
+ "tokio",
+ "tracing",
+ "utoipa",
 ]
 
 [[package]]

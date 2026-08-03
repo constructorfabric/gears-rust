@@ -1,0 +1,39 @@
+# Out-of-process `hello` gear for the embedded-edge reverse-proxy demo
+# (`cpt-cf-component-gateway-provider`).
+#
+# The presence of the top-level `oop_http:` block switches the OoP bootstrap
+# into its HTTP-serving lifecycle: it serves the gear's Axum REST router on
+# `listen_addr` and self-registers its REST endpoint + OpenAPI spec with the
+# DirectoryService (so the api-gateway edge can discover and proxy it).
+#
+# Run with (after starting the host):
+#   export TOOLKIT_DIRECTORY_ENDPOINT=http://127.0.0.1:50051
+#   cargo run --bin hello-oop -p hello --features oop_module -- \
+#     --config config/oop-gateway-demo-hello.yaml
+
+server:
+  home_dir: "~/.cf-gears"
+
+# Serve REST over HTTP and self-register with the directory.
+oop_http:
+  listen_addr: "127.0.0.1:9091"
+  # Base URL the edge uses to reach this pod (registered as the REST endpoint).
+  advertise_uri: "http://127.0.0.1:9091"
+  # Platform-plane credential (cpt-cf-adr-platform-plane-auth). The host's
+  # DirectoryService enforces the platform plane, so this gear must attach the
+  # shared internal token to its outbound register/heartbeat/resolve calls, or
+  # registration is rejected and the edge never proxies it. The secret matches
+  # the host. This also installs the inbound internal-auth middleware on the
+  # pod's routes (permissive here: `hello` is `.anonymous()`).
+  internal_auth:
+    provider: shared_secret
+    secret: "dev-internal-token"
+    peer_name: "hello"
+
+gears:
+  hello:
+    config: {}
+
+logging:
+  default:
+    console_level: debug

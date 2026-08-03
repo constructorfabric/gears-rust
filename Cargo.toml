@@ -80,6 +80,8 @@ members = [
     "examples/oop-gears/calculator-gateway/calculator-gateway",
     "examples/oop-gears/calculator/calculator-sdk",
     "examples/oop-gears/calculator/calculator",
+    "examples/oop-gears/hello/hello",
+    "examples/oop-gears/secure/secure",
     "examples/cf-gears-fips-probe",
     "gears/system/types-registry/types-registry-sdk",
     "gears/system/types-registry/types-registry",

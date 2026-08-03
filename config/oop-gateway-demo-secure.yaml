@@ -1,0 +1,55 @@
+# Out-of-process `secure` gear for the two-plane-authentication demo
+# (`cpt-cf-adr-two-plane-auth`).
+#
+# Like the `hello` OoP pod, the top-level `oop_http:` block switches the OoP
+# bootstrap into its HTTP-serving lifecycle: it serves the gear's Axum REST
+# router on `listen_addr` and self-registers with the DirectoryService so the
+# api-gateway edge can discover and reverse-proxy it.
+#
+# Unlike `hello`, the `secure` binary also links an in-process AuthN stack
+# (authn-resolver + static-authn-plugin, backed by types-registry). The gear's
+# only route — `GET /secure/v1/whoami` — is `.authenticated()`, so the bearer
+# forwarded by the edge is RE-VALIDATED inside this pod (zero-trust) before the
+# handler runs. `static-authn-plugin` in `accept_all` mode validates any
+# non-empty token and yields the default subject/tenant identity.
+#
+# Run with (after starting the host):
+#   export TOOLKIT_DIRECTORY_ENDPOINT=http://127.0.0.1:50051
+#   cargo run --bin secure-oop -p secure --features oop_module -- \
+#     --config config/oop-gateway-demo-secure.yaml
+
+server:
+  home_dir: "~/.cf-gears"
+
+# Serve REST over HTTP and self-register with the directory.
+oop_http:
+  listen_addr: "127.0.0.1:9092"
+  # Base URL the edge uses to reach this pod (registered as the REST endpoint).
+  advertise_uri: "http://127.0.0.1:9092"
+  # Platform-plane credential (cpt-cf-adr-platform-plane-auth) attached to this
+  # gear's outbound DirectoryService calls (register/heartbeat), matching the
+  # host's shared secret so the enforcing DirectoryService accepts them.
+  internal_auth:
+    provider: shared_secret
+    secret: "dev-internal-token"
+    peer_name: "secure"
+
+gears:
+  secure:
+    config: {}
+
+  # In-process AuthN stack — enables the tenant plane inside this pod.
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      # Accept any non-empty bearer token and map it to the default identity.
+      mode: accept_all
+
+logging:
+  default:
+    console_level: debug
