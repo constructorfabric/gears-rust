@@ -220,6 +220,27 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
     })?;
 
     let params = parse_params(method)?;
+
+    // DESIGN §2.2 (`cpt-cf-binding-constraint-security-context`): every method
+    // on a remote-capable contract MUST take a security-plane context as its
+    // first non-self argument — tenant `SecurityContext` (→ `Authorization`) or
+    // platform `PlatformSecurityContext` (→ transport-injected internal token),
+    // in value or reference form. A REST projection is always remote-capable
+    // (its base ends in `Api`/`Backend`, enforced above), so a missing context
+    // is a hard error rather than a silently-unauthenticated call.
+    match params.first() {
+        Some(first) if crate::projection::is_security_context_type(&first.ty) => {}
+        _ => {
+            return Err(syn::Error::new(
+                method.sig.ident.span(),
+                "remote contract method must take a security-plane context as its first \
+                 argument: `SecurityContext` (tenant plane) or `PlatformSecurityContext` \
+                 (platform plane), by value or by reference \
+                 (DESIGN §2.2 cpt-cf-binding-constraint-security-context)",
+            ));
+        }
+    }
+
     // Both unary and streaming methods declare their return types as
     // `Result<T, E>`. For streaming methods the macro rewrites the emitted
     // signature to `Pin<Box<dyn Stream<Item = Result<T, E>>>>`.

@@ -25,6 +25,10 @@ pub enum TransportError {
         status: u16,
         /// Body excerpt suitable for diagnostics. Truncated at the call site.
         body: String,
+        /// Server-advised minimum wait before retry, parsed from the
+        /// `Retry-After` response header (delta-seconds), when present. The
+        /// retry loop honors this in preference to computed backoff.
+        retry_after: Option<std::time::Duration>,
     },
 
     /// The gRPC server returned a non-OK status. Preserves the original
@@ -104,6 +108,18 @@ impl TransportError {
         Self::Unresolved { gear: gear.into() }
     }
 
+    /// Server-advised retry delay (`Retry-After`), when the error carries one.
+    ///
+    /// Only [`TransportError::HttpStatus`] carries it today (parsed from the
+    /// header on non-`Problem` responses). Returns `None` otherwise.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            TransportError::HttpStatus { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
     /// Whether this error class is generally safe to retry without a higher-level
     /// idempotency strategy. Used by [`crate::runtime::retry`] when a method is
     /// declared `#[retryable]`.
@@ -132,7 +148,11 @@ impl TransportError {
 }
 
 fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+    // PRD §5.7 retryable set: throttling + gateway/upstream transient failures.
+    // Deliberately excludes 408 and 500 — a bare 500 is often a deterministic
+    // server-side failure and blindly retrying it (especially a write) risks
+    // duplicate side effects.
+    matches!(status, 429 | 502 | 503 | 504)
 }
 
 #[cfg(test)]
@@ -199,6 +219,7 @@ mod tests {
             TransportError::HttpStatus {
                 status: 503,
                 body: String::new(),
+                retry_after: None,
             }
             .is_transient()
         );
@@ -206,6 +227,7 @@ mod tests {
             !TransportError::HttpStatus {
                 status: 404,
                 body: String::new(),
+                retry_after: None,
             }
             .is_transient()
         );
@@ -213,8 +235,36 @@ mod tests {
             TransportError::HttpStatus {
                 status: 429,
                 body: String::new(),
+                retry_after: None,
             }
             .is_transient()
         );
+    }
+
+    #[test]
+    fn bare_500_and_408_are_not_retried() {
+        // PRD §5.7: 500 and 408 are deliberately excluded from the retryable set.
+        for status in [500u16, 408] {
+            assert!(
+                !TransportError::HttpStatus {
+                    status,
+                    body: String::new(),
+                    retry_after: None,
+                }
+                .is_transient(),
+                "status {status} must not be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_accessor_reads_http_status_field() {
+        let err = TransportError::HttpStatus {
+            status: 429,
+            body: String::new(),
+            retry_after: Some(std::time::Duration::from_secs(2)),
+        };
+        assert_eq!(err.retry_after(), Some(std::time::Duration::from_secs(2)));
+        assert_eq!(TransportError::network("x").retry_after(), None);
     }
 }

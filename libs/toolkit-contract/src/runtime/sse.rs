@@ -245,28 +245,19 @@ fn drain_remaining<T: DeserializeOwned + 'static>(
     buf: &mut BytesMut,
     event_kind: &mut Option<String>,
     event_data: &mut String,
-    event_id: &mut Option<String>,
-    out: &mut VecDeque<Result<T, TransportError>>,
-    last_event_id: &LastEventId,
+    _event_id: &mut Option<String>,
+    _out: &mut VecDeque<Result<T, TransportError>>,
+    _last_event_id: &LastEventId,
 ) {
-    if !buf.is_empty() {
-        match std::str::from_utf8(buf) {
-            Ok(s) => {
-                let owned = s.to_owned();
-                process_line(&owned, event_kind, event_data, event_id, out, last_event_id);
-            }
-            Err(e) => {
-                out.push_back(Err(TransportError::sse(format!(
-                    "invalid UTF-8 in SSE frame: {e}"
-                ))));
-            }
-        }
-        buf.clear();
-    }
-    // EOS is an implicit event boundary for any partially accumulated event.
-    if !event_data.is_empty() || event_kind.is_some() {
-        dispatch_event(event_kind, event_data, event_id, out, last_event_id);
-    }
+    // Per the W3C EventSource spec, an event that is not terminated by a blank
+    // line before end-of-stream is INCOMPLETE and MUST be discarded. Forcing a
+    // dispatch here would surface a truncated final frame as a (non-transient)
+    // `Serialization` error — both a spec violation and a defeat of reconnect.
+    // A properly framed final event was already dispatched on its blank line,
+    // so anything left in the buffers is a partial event: drop it.
+    buf.clear();
+    event_kind.take();
+    event_data.clear();
 }
 
 /// Process a single (trailing-CR/LF-stripped) SSE line. Returns `true` iff
@@ -351,13 +342,19 @@ fn dispatch_event<T: DeserializeOwned + 'static>(
             out.push_back(Err(parse_problem(&payload)));
             false
         }
-        _ => {
+        // The implicit default channel carries the typed payload. An event with
+        // no `event:` field defaults to `"message"` here.
+        "message" => {
             match serde_json::from_str::<T>(&payload) {
                 Ok(v) => out.push_back(Ok(v)),
                 Err(e) => out.push_back(Err(TransportError::serialization(e))),
             }
             false
         }
+        // Named control events (`heartbeat`, `ping`, custom kinds) are not the
+        // typed data channel — ignore them rather than trying to decode `T`
+        // (which would yield spurious items or serialization errors).
+        _ => false,
     }
 }
 
@@ -455,6 +452,29 @@ mod tests {
         let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
         let parsed: Vec<Item> = parsed.into_iter().map(|r| r.unwrap()).collect();
         assert_eq!(parsed, vec![Item { id: 3 }]);
+    }
+
+    #[tokio::test]
+    async fn ignores_named_control_events() {
+        // A named event (`ping`) with a JSON body must NOT be decoded as the
+        // typed item; only the implicit `message` channel yields items.
+        let s = chunks(&[
+            "event: ping\ndata: {\"id\":9}\n\n",
+            "data: {\"id\":1}\n\n",
+            "event: done\n\n",
+        ]);
+        let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
+        let parsed: Vec<Item> = parsed.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(parsed, vec![Item { id: 1 }]);
+    }
+
+    #[tokio::test]
+    async fn discards_truncated_trailing_event_at_eof() {
+        // Stream ends mid-event (no terminating blank line): the incomplete
+        // event is discarded per spec — no item and no serialization error.
+        let s = chunks(&["data: {\"id\":", "5"]);
+        let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
+        assert!(parsed.is_empty(), "expected no items, got {parsed:?}");
     }
 
     #[tokio::test]

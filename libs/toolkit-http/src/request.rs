@@ -176,6 +176,31 @@ impl RequestBuilder {
         self
     }
 
+    /// Attach a tenant-plane bearer token as a **sensitive** `Authorization`
+    /// header (`Authorization: Bearer <token>`).
+    ///
+    /// The header value is marked sensitive (`HeaderValue::set_sensitive(true)`)
+    /// so header-logging / redaction layers never emit it — the same guarantee
+    /// as [`crate::security::attach_bearer_http`]. Prefer this over
+    /// `.header("authorization", ..)` for credentials, which cannot mark the
+    /// value sensitive. `token` is the raw credential; the `Bearer ` scheme is
+    /// prepended here.
+    pub fn bearer_auth(mut self, token: &str) -> Self {
+        if self.error.is_some() {
+            return self;
+        }
+        match http::header::HeaderValue::try_from(format!("Bearer {token}")) {
+            Ok(mut value) => {
+                value.set_sensitive(true);
+                self.headers.push((http::header::AUTHORIZATION, value));
+            }
+            Err(e) => {
+                self.error = Some(HttpError::InvalidHeaderValue(e));
+            }
+        }
+        self
+    }
+
     /// Add multiple headers to the request
     ///
     /// # Example
@@ -464,5 +489,31 @@ impl RequestBuilder {
             inner,
             max_body_size: self.max_body_size,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::HttpClient;
+
+    #[tokio::test]
+    async fn bearer_auth_sets_sensitive_authorization_header() {
+        let client = HttpClient::new().expect("default toolkit-http build");
+        let builder = client
+            .get("https://example.invalid/x")
+            .bearer_auth("secret-token");
+
+        let value = builder
+            .headers
+            .iter()
+            .find(|(name, _)| *name == http::header::AUTHORIZATION)
+            .map(|(_, value)| value)
+            .expect("authorization header present");
+
+        assert_eq!(value.to_str().unwrap(), "Bearer secret-token");
+        assert!(
+            value.is_sensitive(),
+            "bearer Authorization header must be marked sensitive"
+        );
     }
 }

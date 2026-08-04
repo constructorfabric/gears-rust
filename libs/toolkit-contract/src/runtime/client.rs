@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::runtime::config::ReconnectConfig;
-use crate::runtime::http::{body_to_byte_stream, map_http_error};
+use crate::runtime::http::{body_to_byte_stream, map_http_error, parse_retry_after};
 use crate::runtime::sse::{LastEventId, parse_sse_stream_with_id};
 use crate::runtime::transport_error::TransportError;
 
@@ -39,27 +39,44 @@ pub enum UnaryBody<'a, T: ?Sized + Serialize> {
 /// `build` is a closure returning a `RequestBuilder` configured with method,
 /// URL, headers, and any auth state. It is invoked once per attempt.
 ///
+/// `timeout` bounds the **whole** attempt — connection, response headers, and
+/// reading the response body — as a per-attempt deadline (mirroring the
+/// streaming path). Elapse maps to [`TransportError::Timeout`], which is
+/// transient, so a `#[retryable]` method retries a timed-out attempt. `None`
+/// leaves the deadline to the underlying transport.
+///
 /// # Errors
-/// Returns [`TransportError`] when the builder closure fails, the network call fails,
-/// the response body cannot be read, JSON deserialization of a success body fails, or the
-/// server returns a non-success HTTP status (mapped via [`map_http_error`]).
-pub async fn send_unary<F, R>(build: F) -> Result<R, TransportError>
+/// Returns [`TransportError`] when the builder closure fails, the deadline elapses,
+/// the network call fails, the response body cannot be read, JSON deserialization of a
+/// success body fails, or the server returns a non-success HTTP status (mapped via
+/// [`map_http_error`]).
+pub async fn send_unary<F, R>(build: F, timeout: Option<Duration>) -> Result<R, TransportError>
 where
     F: FnOnce() -> Result<RequestBuilder, TransportError>,
     R: DeserializeOwned,
 {
-    let response = build()?.send().await.map_err(TransportError::network)?;
-    let status = response.status();
-    if status.is_success() {
-        // `HttpResponse::bytes` does NOT enforce status check; we already did.
-        // Avoiding `.json()` here because it would re-check status and
-        // duplicate work on the success path.
-        let bytes = response.bytes().await.map_err(TransportError::network)?;
-        serde_json::from_slice::<R>(&bytes).map_err(TransportError::serialization)
-    } else {
-        let bytes = response.bytes().await.map_err(TransportError::network)?;
-        let body = String::from_utf8_lossy(&bytes).into_owned();
-        Err(map_http_error(status.as_u16(), body))
+    let builder = build()?;
+    let op = async move {
+        let response = builder.send().await.map_err(TransportError::network)?;
+        let status = response.status();
+        if status.is_success() {
+            // `HttpResponse::bytes` does NOT enforce status check; we already did.
+            // Avoiding `.json()` here because it would re-check status and
+            // duplicate work on the success path.
+            let bytes = response.bytes().await.map_err(TransportError::network)?;
+            serde_json::from_slice::<R>(&bytes).map_err(TransportError::serialization)
+        } else {
+            let retry_after = parse_retry_after(response.headers());
+            let bytes = response.bytes().await.map_err(TransportError::network)?;
+            let body = String::from_utf8_lossy(&bytes).into_owned();
+            Err(map_http_error(status.as_u16(), body, retry_after))
+        }
+    };
+    match timeout {
+        Some(d) => tokio::time::timeout(d, op)
+            .await
+            .map_err(|_| TransportError::Timeout(d))?,
+        None => op.await,
     }
 }
 
@@ -211,12 +228,19 @@ where
             let status = response.status();
             if !status.is_success() {
                 let status_code = status.as_u16();
+                let retry_after = parse_retry_after(response.headers());
                 let bytes = response.bytes().await.map_err(TransportError::network)?;
                 let body = String::from_utf8_lossy(&bytes).into_owned();
-                let err = map_http_error(status_code, body);
-                // Non-success responses are typically domain errors —
-                // bubble straight through without reconnect (server
-                // explicitly told us "no").
+                let err = map_http_error(status_code, body, retry_after);
+                // A transient status (e.g. 503 during a rolling deploy) on the
+                // initial connect is reconnect-eligible, consistent with the
+                // pre-flight failure branch above; other statuses are domain
+                // errors and bubble straight through.
+                if attempt < reconnect.max_attempts && err.is_transient() {
+                    attempt += 1;
+                    sleep_backoff(&reconnect, attempt).await;
+                    continue;
+                }
                 Err(err)?;
                 return;
             }

@@ -94,9 +94,17 @@ pub trait DemoApiRest: DemoApi {
 #[derive(Clone, Default)]
 struct ServerState {
     flaky_attempts: Arc<AtomicU32>,
+    /// Records the `Accept` header seen by the streaming handler, so tests can
+    /// assert the client advertised `text/event-stream`.
+    last_accept: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 async fn echo_get_handler(Path(id): Path<String>) -> Json<EchoResponse> {
+    // `id == "slow"` sleeps past a tight client timeout, exercising the
+    // per-attempt unary deadline.
+    if id == "slow" {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     Json(EchoResponse {
         echoed: format!("get:{id}"),
     })
@@ -125,8 +133,16 @@ async fn flaky_handler(
 }
 
 async fn ticks_handler(
+    State(state): State<ServerState>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<TicksParams>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    if let Some(v) = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|h| h.to_str().ok())
+    {
+        *state.last_accept.lock().unwrap() = Some(v.to_owned());
+    }
     let count = params.count;
     let stream = futures_util::stream::iter(0..count)
         .map(|seq| {
@@ -154,7 +170,10 @@ async fn start_server() -> (String, ServerState) {
             "/api/demo/v1/flaky/{id}",
             get(flaky_handler).with_state(state.clone()),
         )
-        .route("/api/demo/v1/ticks", get(ticks_handler));
+        .route(
+            "/api/demo/v1/ticks",
+            get(ticks_handler).with_state(state.clone()),
+        );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -233,6 +252,34 @@ async fn retryable_recovers_after_transient_failure() {
         .unwrap();
     assert_eq!(resp.echoed, "flaky:xyz");
     assert!(state.flaky_attempts.load(Ordering::SeqCst) >= 2);
+}
+
+#[tokio::test]
+async fn unary_timeout_is_enforced() {
+    // A tight `ClientConfig::timeout` must bound the unary call; the slow
+    // handler sleeps 500ms while the client deadline is 50ms.
+    let (base_url, _) = start_server().await;
+    let cfg = ClientConfig::new(base_url).with_timeout(Duration::from_millis(50));
+    let client = DemoApiRestClient::new(cfg).unwrap();
+    let err = DemoApi::echo_get(&client, anonymous_ctx(), "slow".to_owned())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DemoError::Transport(TransportError::Timeout(_))),
+        "expected a timeout, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_sends_accept_event_stream_header() {
+    // PRD §5.6: the generated streaming client must advertise the SSE media
+    // type on the connect request.
+    let (base_url, state) = start_server().await;
+    let client = DemoApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let stream = DemoApi::ticks(&client, anonymous_ctx(), 1);
+    let _items: Vec<_> = stream.collect().await;
+    let accept = state.last_accept.lock().unwrap().clone();
+    assert_eq!(accept.as_deref(), Some("text/event-stream"));
 }
 
 #[tokio::test]

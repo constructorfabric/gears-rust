@@ -122,7 +122,10 @@ pub fn build_request_url(
             if i > 0 {
                 url.push('&');
             }
-            url.push_str(key);
+            // Encode BOTH key and value: object/map-typed query params derive
+            // their keys from runtime JSON, so an unencoded `&`/`=` in a key
+            // would smuggle extra query parameters.
+            url.push_str(&urlencoded(key));
             url.push('=');
             url.push_str(&urlencoded(value));
         }
@@ -147,15 +150,36 @@ pub fn to_http_method(method: HttpMethod) -> http::Method {
 /// Tries to parse the body as an RFC 9457 [`Problem`] envelope first,
 /// falling back to [`TransportError::HttpStatus`] with a truncated body
 /// excerpt for peers that don't speak the canonical-errors envelope.
+///
+/// `retry_after` is the parsed `Retry-After` header (see [`parse_retry_after`]);
+/// it is attached to the [`TransportError::HttpStatus`] fallback so the retry
+/// loop can honor it. (Canonical `Problem` responses do not carry it here.)
 #[must_use]
-pub fn map_http_error(status: u16, body: String) -> TransportError {
+pub fn map_http_error(
+    status: u16,
+    body: String,
+    retry_after: Option<std::time::Duration>,
+) -> TransportError {
     if let Ok(problem) = serde_json::from_str::<Problem>(&body) {
         return TransportError::Problem(problem);
     }
     TransportError::HttpStatus {
         status,
         body: truncate(body, 256),
+        retry_after,
     }
+}
+
+/// Parse a `Retry-After` response header as a delta-seconds [`Duration`].
+///
+/// Only the numeric delta-seconds form is supported (the common case for
+/// `429`/`503`); the HTTP-date form is ignored (returns `None`), as is a
+/// missing or malformed header.
+#[must_use]
+pub fn parse_retry_after(headers: &http::HeaderMap) -> Option<std::time::Duration> {
+    let raw = headers.get(http::header::RETRY_AFTER)?;
+    let secs: u64 = raw.to_str().ok()?.trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(secs))
 }
 
 fn field_as_string(
@@ -269,6 +293,31 @@ mod tests {
     }
 
     #[test]
+    fn encodes_query_parameter_names() {
+        // An object-typed query field whose inner key contains `&`/`=` must be
+        // percent-encoded so it cannot smuggle extra query parameters.
+        let b = binding(
+            "/list",
+            vec![HttpFieldBinding::Query {
+                field: "filter".into(),
+                param: "filter".into(),
+            }],
+        );
+        let url = build_request_url(
+            "https://x.example",
+            "/api",
+            &b,
+            &serde_json::json!({ "filter": { "a=1&b": "x" } }),
+        )
+        .unwrap();
+        assert!(url.contains("a%3D1%26b=x"), "unexpected url: {url}");
+        assert!(
+            !url.contains("a=1&b=x"),
+            "raw key must not smuggle params: {url}"
+        );
+    }
+
+    #[test]
     fn maps_problem_envelope() {
         // Canonical RFC 9457 Problem (per docs/arch/errors/DESIGN.md §3.3).
         let body = serde_json::json!({
@@ -279,7 +328,7 @@ mod tests {
             "context": {}
         })
         .to_string();
-        let err = map_http_error(500, body);
+        let err = map_http_error(500, body, None);
         match err {
             TransportError::Problem(p) => {
                 assert_eq!(p.status, 500);
@@ -292,14 +341,33 @@ mod tests {
 
     #[test]
     fn falls_back_to_http_status_for_non_problem_body() {
-        let err = map_http_error(503, "service unavailable".into());
+        let err = map_http_error(503, "service unavailable".into(), None);
         match err {
-            TransportError::HttpStatus { status, body } => {
+            TransportError::HttpStatus { status, body, .. } => {
                 assert_eq!(status, 503);
                 assert!(body.contains("service unavailable"));
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_retry_after_delta_seconds() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, "2".parse().unwrap());
+        assert_eq!(
+            parse_retry_after(&headers),
+            Some(std::time::Duration::from_secs(2))
+        );
+
+        // HTTP-date form is ignored (unsupported), as is a missing header.
+        let mut date = http::HeaderMap::new();
+        date.insert(
+            http::header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after(&date), None);
+        assert_eq!(parse_retry_after(&http::HeaderMap::new()), None);
     }
 
     #[test]

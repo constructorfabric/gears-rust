@@ -249,11 +249,24 @@ Consumer code never knows or cares whether the underlying implementation is a co
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-constraint-signature-checking`
 
-Every method redeclared in a transport projection must match the corresponding method in the base trait. Enforcement is two-tiered:
+Every method redeclared in a transport projection must match the corresponding method in the base trait.
 
-1. **Delegation-time check** (automatic): the macro generates a default method body `Base::method(self, params).await`. If the projection's signature diverges from the base, this delegation fails to type-check and the code does not compile. This catches most drift.
+> **Implementation status.** Only tier 1 (delegation-time checking) is emitted
+> today. The tier-2 `const _` **witness blocks** described below are **not**
+> generated, and ADR-0003's compile-time base↔projection parity check and
+> `require_full_coverage` opt-in remain **deferred** (see ADR-0003 §"Not yet
+> implemented"). A separate runtime coverage check runs at startup via
+> `#[toolkit::provides]` (`validate_http_binding`). Tier 1 already catches
+> parameter/return/error-type drift on redeclared methods and rejects extra
+> projection methods absent from the base; the remaining gap is a base method
+> silently omitted from the projection (surfaces only as a generic `E0046` under
+> the client feature, not a targeted diagnostic).
 
-2. **Witness functions** (macro-generated, explicit): the macro also emits `const _` witness blocks that assert exact signature equality between projection and base methods. A witness block looks like:
+Enforcement is two-tiered (target design):
+
+1. **Delegation-time check** (automatic, implemented): the macro generates a default method body `Base::method(self, params).await`. If the projection's signature diverges from the base, this delegation fails to type-check and the code does not compile. This catches most drift.
+
+2. **Witness functions** (macro-generated, explicit — *not yet implemented*): the macro would also emit `const _` witness blocks that assert exact signature equality between projection and base methods. A witness block looks like:
 
 ```rust
 const _: () = {
@@ -286,6 +299,14 @@ All error responses from generated REST clients use RFC 9457 Problem Details wit
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-constraint-no-server-gen`
 
+> **OBSOLETE / SUPERSEDED (do not treat as current).** This constraint is
+> superseded by decision **D7** (`cpt-cf-binding-decision-server-codegen`) and
+> **ADR-0003** (`cpt-cf-binding-adr-projection-server-gen`): the macro now *does*
+> generate a server-side `register_<trait>_routes()` function from the same
+> binding IR. The paragraph below is retained only for historical context.
+> Remote services in other languages may still implement the contract manually —
+> server generation is additive and per-method opt-out via `#[server_manual]`.
+
 Only the client is generated from the transport projection. Remote services implement their REST endpoints independently. The generated OpenAPI spec serves as the conformance contract validated by the directory. This preserves server flexibility -- services may extend the API, support version coexistence, and use any HTTP framework.
 
 #### Async Trait Strategy
@@ -304,7 +325,12 @@ The cost is one `Box<dyn Future>` allocation per async method call — negligibl
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-constraint-security-context`
 
-Every method on a remote-capable contract (Api, Backend, and their `*Rest`/`*Grpc` projections) MUST accept a **plane context** as its first non-self argument — either `&SecurityContext` (tenant plane) or `&PlatformSecurityContext` (platform plane). This is a hard rule enforced by convention and validated by the macro and by CI.
+Every method on a remote-capable contract (Api, Backend, and their `*Rest`/`*Grpc` projections) MUST accept a **plane context** as its first non-self argument — either `SecurityContext` (tenant plane) or `PlatformSecurityContext` (platform plane). This is a hard rule enforced by the `#[toolkit::rest_contract]` macro.
+
+> **Implementation status.**
+> - The REST macro accepts the context **by value or by reference** (`SecurityContext` and `&SecurityContext` are equivalent; detection is reference-transparent). A remote projection method whose first non-self argument is *not* a plane context is a **compile error**.
+> - **Tenant plane** (`SecurityContext`) is fully wired: the client forwards the raw bearer token as a *sensitive* `Authorization: Bearer` header, and the full context is never serialized onto the wire.
+> - **Platform plane** (`PlatformSecurityContext` → `X-ToolKit-Internal-Token`) over REST is **deferred**: `PlatformSecurityContext` is recognized as a plane marker and excluded from the wire payload, but the generated REST client does not yet inject the internal token (that carrier is transport-injected below the contract layer). Platform-plane system contracts are served today over gRPC via `InternalAuthInterceptor`, or by a manual client. See ADR-0004 / the two-plane model.
 
 **The context type is the plane marker.** `SecurityContext` and `PlatformSecurityContext` are distinct types (per the [two-plane model](../toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md)), so plane selection is a compile-time property of the signature. The macro maps the type to its carrier: `&SecurityContext` → `Authorization: Bearer <jwt>`; `&PlatformSecurityContext` → `X-ToolKit-Internal-Token` (mTLS+SPIFFE next phase, [ADR-0006](../toolkit-oop/ADR/0006-cpt-cf-adr-platform-plane-auth.md)). A method takes exactly one. The client forwards the tenant bearer token but does **not** source the platform secret — the runtime injects that below the contract layer.
 
@@ -566,7 +592,7 @@ Generated `error_code` values: `NOTIFICATION_NOT_FOUND`, `DELIVERY_UNAVAILABLE`,
 
 **Rationale**: The name IS the operational contract. A developer reading `fn process(backend: &dyn NotificationBackend)` knows immediately: this can timeout, this can fail independently, this needs retry logic, this cannot participate in my transaction. No need to open another file, check a configuration, or read documentation. The naming convention eliminates an entire class of architectural misunderstandings.
 
-**Enforcement**: Currently by convention. Future work may add an architecture lint (via `cargo gears lint`) that rejects traits with incorrect suffixes or transport projections on Extension/Embedded types.
+**Enforcement**: Implemented at macro-expansion time (stronger than the original "by convention"). `#[toolkit::contract]` rejects any trait whose name does not end in `Api`/`Embedded`/`Backend`/`Extension`; `#[toolkit::rest_contract]` requires the projection be named `{Base}Rest` and rejects a REST projection on an `Embedded`/`Extension` base (only `Api`/`Backend` are remote-capable). A Dylint lint could still add coverage for *plain* (non-`#[toolkit::contract]`) trait declarations.
 
 ### D7: Server-Side Route Registration via OperationBuilder
 

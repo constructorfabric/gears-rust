@@ -39,7 +39,12 @@ use toolkit::{ClientHub, DbOptions, DirectoryClient, GearCtx, GearManager, Local
 use toolkit_security::SecurityContext;
 
 use cf_api_contracts::ApiContracts;
+use cf_api_contracts::api::rest::routes::register_routes;
+use cf_api_contracts::client::local::PaymentLocalClient;
+use cf_api_contracts::domain::service::PaymentDomainService;
 use cf_api_contracts_consumer::{ApiContractsConsumer, ChargeProxyService};
+use toolkit_canonical_errors::CanonicalError;
+use toolkit_contract::policy::PolicyStack;
 
 const PROVIDER_GEAR: &str = "api-contracts";
 
@@ -209,6 +214,112 @@ async fn consumer_resolves_provider_local_impl_through_the_hub() {
         .await
         .expect("consumer should resolve the provider's local PaymentApi and charge");
 
+    assert_eq!(resp.status, PaymentStatus::Pending);
+    assert!(!resp.payment_id.is_nil());
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}
+
+// ----- OoP path: the consumer uses the *generated* REST client ---------------
+
+/// A provider that serves the SDK's **generated** `PaymentApi` REST routes
+/// (`register_payment_api_rest_routes`, via `cf_api_contracts`'s `register_routes`)
+/// but registers **no** local `PaymentApi` in the hub — forcing the consumer
+/// through the auto-generated `PaymentApiRestResolvingClient`.
+struct RestOnlyProvider {
+    svc: Arc<PaymentDomainService>,
+}
+
+#[async_trait]
+impl Gear for RestOnlyProvider {
+    async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl RestApiCapability for RestOnlyProvider {
+    fn register_rest(
+        &self,
+        _ctx: &GearCtx,
+        router: Router,
+        openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<Router> {
+        // Backs the generated server routes with the real domain impl, but does
+        // NOT put a `PaymentApi` into the ClientHub.
+        let service: Arc<dyn PaymentApi> = Arc::new(PaymentLocalClient::new(
+            Arc::clone(&self.svc),
+            Arc::new(PolicyStack::new()),
+        ));
+        Ok(register_routes(router, openapi, service))
+    }
+}
+
+#[tokio::test]
+async fn consumer_resolves_provider_via_generated_rest_client() {
+    // Keep the consumer's ConsumerRegistration linked into the binary.
+    let _ = ApiContractsConsumer;
+
+    let provider = Arc::new(RestOnlyProvider {
+        svc: Arc::new(PaymentDomainService::new()),
+    });
+    let consumer = Arc::new(ApiContractsConsumer);
+    let gateway = Arc::new(MockGateway::new());
+
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta(PROVIDER_GEAR, &[], provider.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta(PROVIDER_GEAR, provider as Arc<dyn RestApiCapability>);
+    builder.register_core_with_meta(
+        "api-contracts-consumer",
+        &[],
+        consumer.clone() as Arc<dyn Gear>,
+    );
+    builder
+        .register_rest_with_meta("api-contracts-consumer", consumer as Arc<dyn RestApiCapability>);
+    builder.register_core_with_meta("mock-gateway", &[], gateway.clone() as Arc<dyn Gear>);
+    builder
+        .register_rest_host_with_meta("mock-gateway", gateway.clone() as Arc<dyn ApiGatewayCapability>);
+    builder.register_stateful_with_meta("mock-gateway", gateway as Arc<dyn RunnableCapability>);
+    let registry = builder.build_topo_sorted().expect("registry build");
+
+    let gear_mgr = Arc::new(GearManager::new());
+    let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(gear_mgr));
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<dyn DirectoryClient>(dir);
+
+    let cancel = CancellationToken::new();
+    let runtime = HostRuntime::new(
+        registry,
+        Arc::new(EmptyConfig),
+        DbOptions::None,
+        Arc::clone(&hub),
+        cancel.clone(),
+        Uuid::new_v4(),
+        None,
+    );
+    let run = tokio::spawn(async move { runtime.run_gear_phases().await });
+
+    // No local `PaymentApi` exists, so proxy-wiring registers the generated
+    // `PaymentApiRestResolvingClient`. directory-register (after the gateway
+    // binds) advertises the provider; the resolving client then reaches it over
+    // real HTTP. Poll the consumer's charge until eventual readiness converges.
+    let proxy = ChargeProxyService::new(Arc::clone(&hub));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let resp = loop {
+        assert!(Instant::now() < deadline, "eventual readiness did not converge");
+        match proxy
+            .place_charge(SecurityContext::anonymous(), charge_req())
+            .await
+        {
+            Ok(resp) => break resp,
+            Err(CanonicalError::ServiceUnavailable { .. }) => { /* not ready yet */ }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    // The charge round-tripped: consumer → generated resolving REST client →
+    // HTTP → gateway → provider's generated routes → domain impl.
     assert_eq!(resp.status, PaymentStatus::Pending);
     assert!(!resp.payment_id.is_nil());
 

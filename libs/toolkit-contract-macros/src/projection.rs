@@ -23,13 +23,31 @@ pub fn client_struct_ident(trait_ident: &Ident) -> Ident {
 /// Returns `true` when the type path ends in a segment named `name`.
 /// Used to detect `SecurityContext` and similar marker parameters whose
 /// type may be re-exported under different paths.
+///
+/// References are transparent: `&SecurityContext` (and `&mut`) match the same
+/// as the by-value form, so authors may use either the DESIGN §2.2 reference
+/// form or the by-value form the examples use.
 pub fn type_path_ends_with(ty: &Type, name: &str) -> bool {
-    if let Type::Path(p) = ty
-        && let Some(last) = p.path.segments.last()
-    {
-        return last.ident == name;
+    match ty {
+        Type::Reference(r) => type_path_ends_with(&r.elem, name),
+        Type::Path(p) => p
+            .path
+            .segments
+            .last()
+            .is_some_and(|last| last.ident == name),
+        _ => false,
     }
-    false
+}
+
+/// Returns `true` when `ty` is a security-plane context — the tenant
+/// [`SecurityContext`] or the platform [`PlatformSecurityContext`] — in either
+/// by-value or reference form. Such parameters are the plane marker on a
+/// remote-capable method: they are excluded from the wire payload and carry
+/// authorization out-of-band (tenant → `Authorization: Bearer`; platform →
+/// transport-injected `X-ToolKit-Internal-Token`).
+pub fn is_security_context_type(ty: &Type) -> bool {
+    type_path_ends_with(ty, "SecurityContext")
+        || type_path_ends_with(ty, "PlatformSecurityContext")
 }
 
 /// Strip method-level helper attributes by ident name (e.g. `get`, `post`,

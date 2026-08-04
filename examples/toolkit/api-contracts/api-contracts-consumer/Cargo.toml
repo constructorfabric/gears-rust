@@ -49,3 +49,6 @@ uuid.workspace = true
 parking_lot.workspace = true
 toolkit-http.workspace = true
 serde_json.workspace = true
+# Used by the OoP test's REST-only provider (PolicyStack behind PaymentLocalClient).
+toolkit-contract.workspace = true
+toolkit-canonical-errors.workspace = true

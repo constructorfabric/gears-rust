@@ -327,6 +327,31 @@ Endpoints marked as optional (description contains "MAY omit") SHALL NOT cause r
 
 ### 5.5 Error Mapping
 
+> **Implementation note (supersedes the FR wording below).** The error model was
+> consolidated onto the platform canonical-error system (`docs/arch/errors`)
+> rather than a bespoke `ProblemDetails`. Concretely:
+> - `#[derive(ContractError)]` uses per-variant `#[error_code("…")]` (explicit,
+>   not auto-derived from the variant name — this is rename-stable),
+>   `#[error_domain("…")]` (enum-level default or per-variant), and
+>   `#[canonical(<ProblemCategory>)]` (one of the 16 AIP-193 categories, which
+>   determines HTTP status, GTS `type`, and title). There is no
+>   `#[contract_error(domain=…)]` or `#[error(status=…, problem_type=…)]`.
+> - It generates `From<MyError> for Problem` (server side) and
+>   `TryFrom<Problem> for MyError` (client side) — not `to_problem_details()` /
+>   `from_problem_details()`. The wire envelope type is
+>   `toolkit_canonical_errors::Problem`, not a `ProblemDetails` struct.
+> - **Unknown-error fallback:** an unrecognized `(error_domain, error_code)`
+>   round-trips back the **original `Problem`** (via `TryFrom`'s `Err`), rather
+>   than collapsing to an `Internal` variant — no information loss, never panics.
+> - Opting a variant into `#[contract_error(fallback)]` additionally generates a
+>   total `From<TransportError> for MyError` (gated on `rest-client`) so the
+>   generated client reconstructs typed variants and routes un-reconstructable
+>   transport/protocol failures into the fallback variant.
+> - Duplicate `(error_domain, error_code)` pairs are a compile error.
+>
+> The requirement text below is retained for intent; treat the note above as the
+> current contract.
+
 #### ContractError Derive Macro
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-contract-error-derive`

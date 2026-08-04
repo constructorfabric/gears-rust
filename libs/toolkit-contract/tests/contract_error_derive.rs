@@ -161,3 +161,54 @@ fn round_trip_survives_json_serialization() {
     let recovered = BillingError::try_from(parsed).expect("round trip");
     assert_eq!(recovered, original);
 }
+
+// --- Client-side total reconstruction via the fallback bridge ---------------
+// `#[contract_error(fallback)]` generates `From<TransportError> for MyError`
+// (gated on `rest-client`): a `Problem` is offered to `TryFrom` first, and any
+// un-reconstructable transport/protocol error lands in the fallback variant.
+#[cfg(feature = "rest-client")]
+mod transport_fallback {
+    use super::*;
+    use toolkit_contract::runtime::transport_error::TransportError;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, ContractError)]
+    #[error_domain("orders.v1")]
+    #[non_exhaustive]
+    pub enum OrderError {
+        #[error_code("NOT_FOUND")]
+        #[canonical(NotFound)]
+        NotFound { id: String },
+
+        #[error_code("UNKNOWN")]
+        #[canonical(Internal)]
+        #[contract_error(fallback)]
+        Unknown { problem: Problem },
+    }
+
+    #[test]
+    fn reconstructs_typed_variant_from_problem() {
+        let problem: Problem = OrderError::NotFound { id: "abc".into() }.into();
+        let via_transport: OrderError = TransportError::Problem(problem).into();
+        match via_transport {
+            OrderError::NotFound { id } => assert_eq!(id, "abc"),
+            other => panic!("expected typed NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_problem_routes_to_fallback() {
+        // A foreign Problem (billing.v1 / MAINTENANCE) unknown to OrderError.
+        let foreign: Problem = BillingError::Maintenance.into();
+        let err: OrderError = TransportError::Problem(foreign).into();
+        assert!(matches!(err, OrderError::Unknown { .. }));
+    }
+
+    #[test]
+    fn non_problem_transport_error_routes_to_fallback() {
+        let err: OrderError = TransportError::network("dns fail").into();
+        match err {
+            OrderError::Unknown { problem } => assert!(problem.status >= 500),
+            other => panic!("expected fallback Unknown, got {other:?}"),
+        }
+    }
+}

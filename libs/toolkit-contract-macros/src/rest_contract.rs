@@ -12,7 +12,7 @@ use syn::{TraitItem, Type};
 
 use crate::projection::{
     build_delegation_body, client_struct_ident, generate_projection_impl_for_client,
-    rewrite_streaming_signature, strip_method_attrs, type_path_ends_with,
+    is_security_context_type, rewrite_streaming_signature, strip_method_attrs, type_path_ends_with,
 };
 use crate::rest_contract_parse::{HttpVerb, RestContractModel, RestMethodModel, RestParam};
 use crate::support::contract_support_path;
@@ -216,10 +216,21 @@ fn is_skip_param(param: &RestParam) -> bool {
     if ident == "self" {
         return true;
     }
-    // Heuristic: parameters whose type ends in `SecurityContext` are not part
-    // of the wire payload — they are populated by the server via Axum
-    // extractors and by the client via per-request headers.
-    type_path_ends_with(&param.ty, "SecurityContext")
+    // Security-plane context params (tenant `SecurityContext` or platform
+    // `PlatformSecurityContext`, value or reference) are not part of the wire
+    // payload — they are populated by the server via Axum extractors and carry
+    // authorization out-of-band (per-request headers / transport injection).
+    is_security_context_type(&param.ty)
+}
+
+/// Strip leading `&`/`&mut` from a type, returning the owned inner type. Axum
+/// extension extractors own their value, so the server handler extracts the
+/// owned context type even when the trait method takes it by reference.
+fn strip_reference(ty: &Type) -> &Type {
+    match ty {
+        Type::Reference(r) => strip_reference(&r.elem),
+        other => other,
+    }
 }
 
 fn extract_path_param_names(template: &str) -> Vec<String> {
@@ -568,21 +579,23 @@ fn generate_client_method(
                 #bearer_capture
 
                 let __attempt = || async {
-                    // `toolkit-http` has no `.bearer_auth()` helper — use the
-                    // `authorization` header directly.
+                    // Tenant bearer forwarded via a sensitive `Authorization`
+                    // header (never logged); see `RequestBuilder::bearer_auth`.
                     let mut __builder = self.http.#verb_call(&__url);
                     if let Some(ref __t) = __bearer {
-                        __builder = __builder.header(
-                            "authorization",
-                            &::std::format!("Bearer {}", __t),
-                        );
+                        __builder = __builder.bearer_auth(__t);
                     }
                     #body_apply
                     let __build_result: ::std::result::Result<
                         ::toolkit_http::RequestBuilder,
                         #support::runtime::transport_error::TransportError,
                     > = ::std::result::Result::Ok(__builder);
-                    #support::runtime::client::send_unary::<_, #response_ty>(|| __build_result).await
+                    // Per-attempt deadline from `ClientConfig::timeout` (mirrors
+                    // the streaming path); elapse → transient `Timeout`.
+                    #support::runtime::client::send_unary::<_, #response_ty>(
+                        || __build_result,
+                        ::std::option::Option::Some(self.config.timeout),
+                    ).await
                 };
 
                 let __result: ::std::result::Result<#response_ty, #support::runtime::transport_error::TransportError> =
@@ -667,20 +680,21 @@ fn generate_streaming_method_body(
             let __reconnect = self.config.sse_reconnect.clone();
             // Factory: invoked once per attempt with the latest seen
             // `Last-Event-ID`. On the first attempt `last` is `None`.
-            // `toolkit-http` has no `.bearer_auth()` helper — use the
-            // `authorization` header directly.
             let __factory = move |last: ::std::option::Option<&str>|
                 -> ::std::result::Result<
                     ::toolkit_http::RequestBuilder,
                     #support::runtime::transport_error::TransportError,
                 >
             {
-                let mut __builder = __http.#verb_call(&__url);
+                // SSE clients MUST advertise the event-stream media type
+                // (PRD §5.6) so content-negotiating servers/gateways return the
+                // stream rather than JSON.
+                let mut __builder = __http
+                    .#verb_call(&__url)
+                    .header("accept", "text/event-stream");
+                // Tenant bearer via a sensitive `Authorization` header.
                 if let Some(ref __t) = __bearer {
-                    __builder = __builder.header(
-                        "authorization",
-                        &::std::format!("Bearer {}", __t),
-                    );
+                    __builder = __builder.bearer_auth(__t);
                 }
                 if let Some(__id) = last {
                     __builder = __builder.header("Last-Event-ID", __id);
@@ -695,6 +709,9 @@ fn generate_streaming_method_body(
             ::std::boxed::Box::pin(__stream.map(move |r| {
                 let __enter = __span.enter();
                 let __mapped = r.map_err(|e| __convert(e));
+                if __mapped.is_err() {
+                    #support::__tracing::Span::current().record("error", true);
+                }
                 ::std::mem::drop(__enter);
                 __mapped
             }))
@@ -769,7 +786,7 @@ fn build_fields_json(method: &RestMethodModel, support: &TokenStream) -> TokenSt
         if p.ident == "self" {
             return None;
         }
-        if type_path_ends_with(&p.ty, "SecurityContext") {
+        if is_security_context_type(&p.ty) {
             return None;
         }
         let key = p.ident.to_string();
@@ -836,7 +853,7 @@ fn capture_body_param(method: &RestMethodModel) -> Option<syn::Ident> {
             if p.ident == "self" {
                 return false;
             }
-            if type_path_ends_with(&p.ty, "SecurityContext") {
+            if is_security_context_type(&p.ty) {
                 return false;
             }
             !path_params.iter().any(|pp| p.ident == pp)
@@ -952,7 +969,7 @@ fn body_param_type(method: &RestMethodModel, path_param_names: &[String]) -> Opt
     }
     for param in &method.params {
         let name = param.ident.to_string();
-        if name == "self" || type_path_ends_with(&param.ty, "SecurityContext") {
+        if name == "self" || is_security_context_type(&param.ty) {
             continue;
         }
         if path_param_names.contains(&name) {
@@ -966,18 +983,49 @@ fn body_param_type(method: &RestMethodModel, path_param_names: &[String]) -> Opt
 fn generate_unary_handler(method: &RestMethodModel, path_param_names: &[String]) -> TokenStream {
     let method_ident = &method.ident;
 
-    // Build parameter extractors and the corresponding service-call arguments.
-    // SecurityContext is always first (populated by gateway auth middleware
-    // into Axum extensions), then path params, then body, then query params.
-    let mut extractors = vec![quote! {
-        ::axum::Extension(ctx): ::axum::Extension<::toolkit_security::SecurityContext>
-    }];
-    let mut call_args = vec![quote! { ctx }];
+    // The security-plane context is always first (populated by gateway auth
+    // middleware into Axum extensions). Drive the extractor's type from the
+    // actual context parameter (`SecurityContext` / `PlatformSecurityContext`,
+    // value or reference) rather than hardcoding it, and forward it to the
+    // service call by value or by reference to match the trait signature.
+    let ctx_param = method
+        .params
+        .iter()
+        .find(|p| p.ident != "self" && is_security_context_type(&p.ty));
+
+    let (ctx_extractor, ctx_call_arg) = match ctx_param {
+        Some(p) => {
+            let owned_ty = strip_reference(&p.ty);
+            let is_ref = matches!(&p.ty, Type::Reference(_));
+            let call = if is_ref {
+                quote! { &ctx }
+            } else {
+                quote! { ctx }
+            };
+            (
+                quote! { ::axum::Extension(ctx): ::axum::Extension<#owned_ty> },
+                call,
+            )
+        }
+        // Enforced upstream (`parse_method` rejects a remote method without a
+        // plane context), but keep a sane fallback for robustness.
+        None => (
+            quote! { ::axum::Extension(ctx): ::axum::Extension<::toolkit_security::SecurityContext> },
+            quote! { ctx },
+        ),
+    };
+
+    let mut extractors = vec![ctx_extractor];
+    let mut call_args = vec![ctx_call_arg];
+    // Emit path/query extractors first; the body-consuming `Json` extractor
+    // must be LAST (axum requires the single `FromRequest` extractor to be the
+    // final handler argument), so defer it and push it after the loop.
+    let mut body_extractor: Option<TokenStream> = None;
     let mut body_taken = false;
 
     for param in &method.params {
         let param_name = &param.ident;
-        if param_name == "self" || type_path_ends_with(&param.ty, "SecurityContext") {
+        if param_name == "self" || is_security_context_type(&param.ty) {
             continue;
         }
         let param_ty = &param.ty;
@@ -987,7 +1035,7 @@ fn generate_unary_handler(method: &RestMethodModel, path_param_names: &[String])
                 ::axum::extract::Path(#param_name): ::axum::extract::Path<#param_ty>
             });
         } else if method.http_method.allows_body() && !body_taken {
-            extractors.push(quote! {
+            body_extractor = Some(quote! {
                 ::axum::Json(#param_name): ::axum::Json<#param_ty>
             });
             body_taken = true;
@@ -997,6 +1045,11 @@ fn generate_unary_handler(method: &RestMethodModel, path_param_names: &[String])
             });
         }
         call_args.push(quote! { #param_name });
+    }
+
+    // Body extractor goes last so it is the final handler argument.
+    if let Some(body) = body_extractor {
+        extractors.push(body);
     }
 
     let extractor_list = quote! { #(#extractors),* };

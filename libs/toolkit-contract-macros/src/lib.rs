@@ -108,7 +108,17 @@ pub fn derive_proto_bridge(input: TokenStream) -> TokenStream {
 /// `TryFrom<Problem> for MyError` (client-side); unknown
 /// `error_code`/`error_domain` pairs round-trip back as the original
 /// `Problem` so callers can still handle them as generic envelopes.
-#[proc_macro_derive(ContractError, attributes(error_code, error_domain, canonical))]
+///
+/// Mark exactly one variant `#[contract_error(fallback)]` (unit, or a single
+/// named field receiving the original `Problem`) to additionally generate a
+/// **total** `From<TransportError> for MyError` (gated on the SDK `rest-client`
+/// feature). The generated REST client uses it to reconstruct typed variants
+/// from an RFC 9457 response and to route un-reconstructable transport/protocol
+/// failures into the fallback variant.
+#[proc_macro_derive(
+    ContractError,
+    attributes(error_code, error_domain, canonical, contract_error)
+)]
 pub fn derive_contract_error(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);
     match contract_error::generate(input) {

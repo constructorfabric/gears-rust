@@ -34,14 +34,22 @@ where
             Ok(v) => return Ok(v),
             Err(err) if attempt >= max => return Err(err),
             Err(err) if !err.is_transient() => return Err(err),
-            Err(_) => {
-                let delay = compute_delay(config, attempt);
+            Err(err) => {
+                let delay = next_delay(config, attempt, &err);
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
             }
         }
     }
+}
+
+/// Delay before the next retry: a server-advised `Retry-After` when the error
+/// carries one, otherwise computed exponential backoff. The number of retries
+/// is bounded by `max_attempts` regardless of this value.
+fn next_delay(config: &RetryConfig, attempt: u32, err: &TransportError) -> Duration {
+    err.retry_after()
+        .unwrap_or_else(|| compute_delay(config, attempt))
 }
 
 fn compute_delay(config: &RetryConfig, attempt: u32) -> Duration {
@@ -150,6 +158,28 @@ mod tests {
             multiplier: f64::INFINITY,
         };
         let _ = compute_delay(&cfg_inf, 2);
+    }
+
+    #[test]
+    fn next_delay_prefers_retry_after() {
+        let cfg = RetryConfig {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_secs(30),
+            multiplier: 2.0,
+        };
+        // Server-advised Retry-After wins over computed backoff.
+        let err = TransportError::HttpStatus {
+            status: 429,
+            body: String::new(),
+            retry_after: Some(Duration::from_secs(2)),
+        };
+        assert_eq!(next_delay(&cfg, 1, &err), Duration::from_secs(2));
+
+        // Without Retry-After, falls back to computed backoff (bounded range).
+        let err = TransportError::network("boom");
+        let d = next_delay(&cfg, 1, &err);
+        assert!(d <= cfg.max_delay);
     }
 
     #[tokio::test]

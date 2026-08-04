@@ -11,7 +11,6 @@ warning: unexpected `cfg` condition value: `grpc-client`
    = note: no expected values for `feature`
    = note: using a cfg inside a attribute macro will use the cfgs from the destination crate and not the ones from the defining crate
    = help: try referring to `grpc_contract` crate for guidance on how handle this unexpected cfg
-   = help: the attribute macro `grpc_contract` may come from an old version of the `toolkit_contract_macros` crate, try updating your dependency with `cargo update -p toolkit_contract_macros`
    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
    = note: `#[warn(unexpected_cfgs)]` on by default
    = note: this warning originates in the attribute macro `grpc_contract` (in Nightly builds, run with -Z macro-backtrace for more info)

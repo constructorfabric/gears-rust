@@ -233,12 +233,17 @@ fn determine_param_role(name: &syn::Ident, ty: &Type, attrs: &[syn::Attribute]) 
 }
 
 fn type_last_segment_is(ty: &Type, name: &str) -> bool {
-    if let Type::Path(p) = ty
-        && let Some(last) = p.path.segments.last()
-    {
-        return last.ident == name;
+    // Reference-transparent: `&SecurityContext` classifies the same as the
+    // by-value form (DESIGN §2.2 permits either).
+    match ty {
+        Type::Reference(r) => type_last_segment_is(&r.elem, name),
+        Type::Path(p) => p
+            .path
+            .segments
+            .last()
+            .is_some_and(|last| last.ident == name),
+        _ => false,
     }
-    false
 }
 
 fn parse_return_type(

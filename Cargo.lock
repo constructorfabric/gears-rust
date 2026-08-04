@@ -1423,6 +1423,7 @@ dependencies = [
  "cf-api-contracts-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
  "cf-gears-toolkit-http",
  "cf-gears-toolkit-security",
  "parking_lot",

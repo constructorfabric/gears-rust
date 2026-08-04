@@ -33,7 +33,9 @@ impl From<TransportError> for CanonicalError {
     fn from(err: TransportError) -> Self {
         match err {
             TransportError::Problem(problem) => problem_to_canonical(problem),
-            TransportError::HttpStatus { status, body } => http_status_to_canonical(status, &body),
+            TransportError::HttpStatus { status, body, .. } => {
+                http_status_to_canonical(status, &body)
+            }
             #[cfg(feature = "grpc-client")]
             TransportError::Grpc { code, message } => grpc_code_to_canonical(code, message),
             TransportError::Network(_msg) => CanonicalError::service_unavailable().create(),
@@ -152,6 +154,7 @@ mod tests {
         let err: CanonicalError = TransportError::HttpStatus {
             status: 404,
             body: "missing".into(),
+            retry_after: None,
         }
         .into();
         assert!(matches!(err, CanonicalError::NotFound { .. }));
@@ -162,6 +165,7 @@ mod tests {
         let err: CanonicalError = TransportError::HttpStatus {
             status: 403,
             body: "nope".into(),
+            retry_after: None,
         }
         .into();
         assert!(matches!(err, CanonicalError::PermissionDenied { .. }));
@@ -172,6 +176,7 @@ mod tests {
         let err: CanonicalError = TransportError::HttpStatus {
             status: 409,
             body: "dup".into(),
+            retry_after: None,
         }
         .into();
         assert!(matches!(err, CanonicalError::AlreadyExists { .. }));
