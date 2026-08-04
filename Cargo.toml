@@ -39,6 +39,7 @@ members = [
     "libs/toolkit-gts-macros",
     "libs/toolkit-http",
     "libs/toolkit-http-middleware",
+    "libs/toolkit-gateway",
     "libs/toolkit-k8s-auth",
     "libs/toolkit-sdk",
     "libs/toolkit-odata-macros",
@@ -79,6 +80,8 @@ members = [
     "examples/oop-gears/calculator-gateway/calculator-gateway",
     "examples/oop-gears/calculator/calculator-sdk",
     "examples/oop-gears/calculator/calculator",
+    "examples/oop-gears/hello/hello",
+    "examples/oop-gears/secure/secure",
     "examples/cf-gears-fips-probe",
     "gears/system/types-registry/types-registry-sdk",
     "gears/system/types-registry/types-registry",
@@ -246,6 +249,7 @@ verbose_file_reads = "deny"
 toolkit = { package = "cf-gears-toolkit", version = "0.6.17", path = "libs/toolkit" }
 toolkit-http = { package = "cf-gears-toolkit-http", version = "0.6.9", path = "libs/toolkit-http" }
 toolkit-http-middleware = { package = "cf-gears-toolkit-http-middleware", version = "0.1.0", path = "libs/toolkit-http-middleware" }
+toolkit-gateway = { package = "cf-gears-toolkit-gateway", version = "0.1.0", path = "libs/toolkit-gateway" }
 toolkit-k8s-auth = { package = "cf-gears-toolkit-k8s-auth", version = "0.1.0", path = "libs/toolkit-k8s-auth" }
 toolkit-auth = { package = "cf-gears-toolkit-auth", version = "0.7.3", path = "libs/toolkit-auth" }
 toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", version = "0.7.6", path = "libs/toolkit-canonical-errors" }

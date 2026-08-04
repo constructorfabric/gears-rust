@@ -146,7 +146,7 @@ Every endpoint must declare its auth posture.
 Check:
 
 - `.authenticated()` for protected routes
-- `.public()` for open routes
+- `.anonymous()` for open routes
 
 Why it matters:
 

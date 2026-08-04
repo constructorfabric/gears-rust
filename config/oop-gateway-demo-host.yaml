@@ -1,0 +1,122 @@
+# Platform-host for the embedded-edge reverse-proxy demo
+# (`cpt-cf-component-gateway-provider`).
+#
+# Runs (in one process):
+#   - grpc-hub          : hosts the DirectoryService gRPC transport on :50051
+#   - gear-orchestrator : the DirectoryService implementation (registry)
+#   - api-gateway       : the edge on :8087, with the reverse proxy ENABLED
+#
+# The api-gateway polls the DirectoryService for out-of-process gears and
+# reverse-proxies their public routes. Run an OoP gear separately (see
+# `config/oop-gateway-demo-hello.yaml`) and it will be proxied automatically.
+#
+# Run with:
+#   cargo run --bin cf-gears-example-server \
+#     --features oop-example,single-tenant,static-authn -- \
+#     --config config/oop-gateway-demo-host.yaml run
+#
+# Auth is ENABLED at the edge (see api-gateway.auth_disabled: false). The edge
+# validates the tenant-plane bearer for `.authenticated()` routes (e.g. the
+# `secure` gear's `GET /secure/v1/whoami`) and forwards it; `.anonymous()`
+# routes (e.g. `GET /hello/v1/ping`) need no token. The `secure` OoP pod then
+# RE-VALIDATES the forwarded bearer in-process (two-plane auth).
+
+server:
+  home_dir: "~/.cf-gears"
+
+# The example server links a few system gears unconditionally (credstore,
+# resource-group) that are DB-backed, so a SQLite server template is required
+# even though this demo only exercises the gateway/directory/orchestrator path.
+database:
+  servers:
+    sqlite_users:
+      engine: "sqlite"
+      params:
+        WAL: "true"
+        synchronous: "NORMAL"
+        busy_timeout: "5000"
+      pool:
+        max_conns: 5
+        acquire_timeout: "30s"
+
+gears:
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8087"
+      enable_docs: true
+      cors_enabled: false
+      # Auth is ENABLED so the edge enforces the tenant-plane bearer on
+      # `.authenticated()` routes. `.anonymous()` routes still need no token.
+      auth_disabled: false
+      # Directory-driven embedded reverse proxy (cpt-cf-component-gateway-provider).
+      gateway_proxy:
+        enabled: true
+        directory_endpoint: "http://127.0.0.1:50051"
+        sync_interval_secs: 5
+        # Platform-plane credential (cpt-cf-adr-platform-plane-auth). The
+        # DirectoryService enforces the platform plane, so the edge attaches the
+        # shared internal token on its directory polls (`list_all_instances`).
+        # The secret matches gear-orchestrator below.
+        internal_auth:
+          provider: shared_secret
+          secret: "dev-internal-token"
+          peer_name: "api-gateway"
+
+  grpc-hub:
+    config:
+      # Fixed port so OoP gears and the edge can find the DirectoryService.
+      listen_addr: "127.0.0.1:50051"
+
+  gear-orchestrator:
+    config:
+      # Enforce the platform plane on every DirectoryService gRPC RPC
+      # (cpt-cf-adr-platform-plane-auth). Remote callers (OoP gears, the edge)
+      # must present a valid `x-toolkit-internal-token`; in-process callers use
+      # the local client and bypass gRPC entirely. This demo uses the
+      # dependency-free shared-secret provider (no Kubernetes needed); in a real
+      # cluster this would be `provider: kube` (TokenReview), which requires the
+      # `k8s-auth` feature.
+      internal_auth:
+        provider: shared_secret
+        secret: "dev-internal-token"
+        peer_name: "toolkit-host"
+
+  # Always-linked DB-backed system gears (not exercised by the demo, but they
+  # must initialize for the host to start).
+  credstore:
+    database:
+      server: "sqlite_users"
+      file: "credstore.db"
+    config:
+      vendor: "constructorfabric"
+
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
+    config: {}
+
+  # A tenant-resolver plugin is required: always-linked gears (oagw) resolve the
+  # root tenant during post-init. `single-tenant-tr-plugin` (feature
+  # `single-tenant`) provides the default single/root tenant with no tree config.
+  single-tenant-tr-plugin:
+    config:
+      vendor: "constructorfabric"
+
+  # Edge AuthN: the api-gateway validates the tenant-plane bearer via the
+  # authn-resolver, which delegates to static-authn-plugin. `accept_all` accepts
+  # any non-empty token and maps it to the default identity (feature
+  # `static-authn` links the plugin).
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: accept_all
+
+logging:
+  default:
+    console_level: debug

@@ -1038,6 +1038,12 @@ impl HostRuntime {
             self.run_grpc_phase().await?;
             self.run_start_phase().await?;
             started = true;
+            // The gear lifecycle has populated the ClientHub. If an in-process
+            // authn stack (e.g. a linked authn-resolver gear) registered a
+            // DynBearerAuthenticator bridge, install the tenant plane now —
+            // before `attach` layers security_context_middleware. (The platform
+            // plane is built eagerly at bootstrap from `oop_http.internal_auth`.)
+            server.resolve_bearer_authenticator(&self.client_hub);
             self.compose_oop_router(server.options(), &hc_registry)
                 .await
         }

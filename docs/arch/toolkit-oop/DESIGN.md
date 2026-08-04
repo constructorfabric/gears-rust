@@ -58,7 +58,7 @@ OoP gear lifecycle, discovery coordination, and gateway registration. The archit
 | `cpt-cf-fr-rest-primary`           | Each OoP gear runs Axum with full ToolKit middleware. No gRPC bridge or transcoding layer.                                                                                              |
 | `cpt-cf-fr-direct-communication`   | Generated REST clients resolve target endpoints via DirectoryService (or k8s DNS) and call directly. Gateway is not in the inter-gear path.                                            |
 | `cpt-cf-fr-secctx-propagation`     | `toolkit-http` forwards `Authorization: Bearer <jwt>`; OoP `security_context_middleware` re-validates it via AuthN Resolver and reconstructs SecurityContext (cpt-cf-adr-two-plane-auth). No `x-secctx-bin` over HTTP.                                                          |
-| `cpt-cf-fr-gateway-registration`   | OoP bootstrap calls `GatewayProvider::register_routes()` after HTTP server starts.                                                                                                       |
+| `cpt-cf-fr-gateway-registration`   | OoP bootstrap self-registers its REST endpoint + OpenAPI spec with `DirectoryService` after the HTTP server starts; the built-in edge discovers gears via `ListAllInstances` and drives `GatewayProvider::register_routes()`. (External providers may instead be driven directly by an adapter.) |
 | `cpt-cf-fr-gateway-abstraction`    | `GatewayProvider` trait with `ToolKitGatewayProvider` as first implementation.                                                                                                            |
 | `cpt-cf-fr-rest-client-gen`        | Trait-first codegen: `#[toolkit::rest_contract]` emits `RestXxxClient` from the SDK trait (`openapi.json` is a published output, not a codegen input).                                     |
 | `cpt-cf-fr-k8s-native`             | K8s profile uses k8s DNS for discovery. DirectoryService is optional. GatewayProvider handles external gateway registration.                                                             |
@@ -364,7 +364,9 @@ What is **missing** and needs to be added:
   registration, periodic heartbeats, and idempotent self-heal re-registration — one writer per instance record, so
   heartbeat and re-registration can never race to conflicting liveness state.
 - Deregister from DirectoryService on graceful shutdown.
-- Call GatewayProvider to register/deregister public routes.
+- The OoP gear does **not** call `GatewayProvider` itself; edge registration is directory-driven. The built-in edge
+  discovers instances via `ListAllInstances` and invokes `GatewayProvider::register_routes()` on their behalf. (An
+  external-provider adapter may instead call `GatewayProvider` directly to register/deregister public routes.)
 
 ##### Drain order on graceful shutdown
 
@@ -533,8 +535,9 @@ gears, the gateway needs to reverse-proxy requests to remote OoP gears.
 
 ##### Related components (by ID)
 
-- `cpt-cf-component-oop-bootstrap` — calls `register_routes` / `deregister_routes`
-- `cpt-cf-component-directory-rest` — may query for gear endpoints
+- `cpt-cf-component-oop-bootstrap` — self-registers REST endpoint + OpenAPI spec with `DirectoryService` (the
+  built-in edge then drives `register_routes` / `deregister_routes` from that; external adapters may call them directly)
+- `cpt-cf-component-directory-rest` — enumerates gear endpoints (`ListAllInstances`) for edge discovery; the OpenAPI document is fetched per gear via `GetOpenApiSpec`
 
 #### REST Client Codegen
 
@@ -993,17 +996,20 @@ Key design decisions:
 | `RegisterInstance`   | `RegisterInstanceInfo` (extended) | `RegisterResult`                    | Register gear with REST endpoint + OpenAPI |
 | `ResolveRestService` | `ResolveRequest { gear_name }`  | `ServiceEndpoint` (with `rest_url`) | Resolve a gear's REST base URL             |
 | `GetOpenApiSpec`     | `SpecRequest { gear_name }`     | `SpecResponse { openapi_json }`     | Retrieve a gear's OpenAPI spec             |
+| `ListAllInstances`   | `ListAllInstancesRequest {}`      | `ListAllInstancesResponse { instances[] }` | Enumerate every registered instance (gear + REST endpoint) for edge discovery — a spec-less snapshot; the OpenAPI document is fetched per gear via `GetOpenApiSpec` |
 
 #### GatewayProvider Trait
 
 - [ ] `p1` - **ID**: `cpt-cf-interface-gateway-trait`
 
 - **Technology**: Rust async trait
-- **Location**: `libs/toolkit/src/gateway/`
+- **Location**: dedicated crate `libs/toolkit-gateway/` (`cf-gears-toolkit-gateway`)
 
 Typed wrappers (`GearName`, `OpenApiSpec`, `Endpoint`) make argument swaps a compile-time error and give an explicit
 `GatewayError`. `health_check()` is not on the trait — gateway liveness is an operational probe concern, not part of
-the registration contract.
+the registration contract. The trait, wrappers, `ProxyRegistry`, and `Forwarder` live in a dedicated crate rather than
+in core `toolkit` so the `Forwarder`'s `toolkit-http` (HTTP client) dependency is not forced onto every gear that
+links `toolkit`; only the api-gateway (and future provider adapters) depend on it.
 
 ```rust
 #[async_trait]
@@ -1020,6 +1026,24 @@ pub trait GatewayProvider: Send + Sync {
     async fn deregister_routes(&self, gear: &GearName) -> Result<(), GatewayError>;
 }
 ```
+
+**Built-in edge (embedded, K8s with embedded edge).** The api-gateway hosts a `ProxyRegistry` + `Forwarder` (mounted
+as the router fallback, inside the auth/tracing middleware stack) plus a background task that polls
+`DirectoryService.ListAllInstances` on a fixed interval and drives `ToolKitGatewayProvider::register_routes` /
+`deregister_routes` to keep the route table current. This is **directory-driven** — the OoP bootstrap already
+self-registers each instance's REST endpoint + OpenAPI spec, so no gear calls the provider (or the gateway) directly
+and no bespoke gateway admin API is needed. Notes:
+
+- **Per-route auth**: each route's `authenticated` flag is derived from its OpenAPI `security` requirement and stored
+  in the `ProxyRegistry`; the gateway's auth middleware consults it so proxied routes are enforced exactly as the
+  owning gear declared (an exposed-but-anonymous route needs no JWT).
+- **Single endpoint per gear**: a gear collapses to one upstream endpoint (last-writer-wins across instances);
+  cross-replica load balancing is delegated to the gear's stable k8s Service DNS rather than balanced in the proxy.
+- **Gated + disabled by default** (`gateway_proxy.enabled`), so the Profile 1 in-process monolith is unaffected.
+- **Spec-less discovery snapshot**: `ListAllInstances` returns only instance identity + REST endpoint, not the full
+  OpenAPI document, so the poll response stays small and bounded regardless of gear count or spec size. The edge fetches
+  a gear's document once, on first discovery, via `GetOpenApiSpec`; an already-registered gear is left untouched and an
+  updated spec is picked up when the gear next churns out of and back into the directory.
 
 ### 3.4 Internal Dependencies
 
@@ -1129,8 +1153,8 @@ transparently.
 sequenceDiagram
     participant Host as Platform Host
     participant Worker as OoP Gear (ToolKit Runtime)
-    participant Dir as DirectoryService<br/>(Flight Control)
-    participant GWP as GatewayProvider
+    participant Dir as DirectoryService<br/>(gear-orchestrator)
+    participant Edge as api-gateway edge<br/>(GatewayProvider)
 
     Host->>Worker: spawn process (config: listen addr, directory endpoint)
     Worker->>Worker: init gear, build Axum router
@@ -1145,7 +1169,6 @@ sequenceDiagram
                 Worker->>Worker: backoff, retry
             else registered
                 Dir-->>Worker: OK
-                Worker->>GWP: register_routes(gear, openapi, endpoint)
             end
         end
     and Background: resolve deps
@@ -1166,16 +1189,28 @@ sequenceDiagram
         end
     end
 
+    Note over Edge: Directory-sync (every sync_interval)
+    loop Periodic
+        Edge->>Dir: ListAllInstances()
+        Dir-->>Edge: instances[] (gear, rest_endpoint) — spec-less snapshot
+        Edge->>Dir: GetOpenApiSpec(gear) [only for newly discovered gears]
+        Dir-->>Edge: openapi_spec
+        Edge->>Edge: register_routes / prune on ProxyRegistry
+    end
+
     Note over Worker: Serving requests...
-    Worker->>GWP: deregister_routes(gear)
     Worker->>Dir: DeregisterInstance(instance_id)
+    Note over Edge: next poll prunes the gear's routes
 ```
 
 **Description**: The Platform Host spawns an OoP gear. The ToolKit runtime starts the HTTP server immediately (liveness
-OK), then runs three background tasks managed entirely by the runtime: (1) self-registration with Flight Control via
-retry with exponential backoff, (2) dependency resolution by polling DirectoryService for each `deps` entry and wiring
-REST clients into ClientHub as they appear, (3) heartbeat. Readiness becomes OK only when all deps are resolved. Gear
-code does not participate in any of this — the developer only declares `deps` in the macro.
+OK), then runs three background tasks managed entirely by the runtime: (1) self-registration with the DirectoryService
+(REST endpoint + OpenAPI spec) via retry with exponential backoff, (2) dependency resolution by polling DirectoryService
+for each `deps` entry and wiring REST clients into ClientHub as they appear, (3) heartbeat. Readiness becomes OK only
+when all deps are resolved. Gear code does not participate in any of this — the developer only declares `deps` in the
+macro. **Route exposure is decoupled from the worker**: the api-gateway edge independently polls `ListAllInstances` and
+drives its `GatewayProvider` to register/prune reverse-proxy routes, so a worker never calls the gateway directly and
+route withdrawal happens on the edge's next poll after `DeregisterInstance`.
 
 #### OoP gear Startup (K8s)
 
@@ -1221,6 +1256,12 @@ sequenceDiagram
 resolution in the background. K8s DNS provides base service discovery; DirectoryService adds gear metadata (REST
 endpoints, OpenAPI specs). The pod starts receiving traffic only after readiness passes. No init containers, no
 deployment ordering — all pods can be scheduled simultaneously.
+
+> **Variant shown: external gateway (Kong, P2).** This diagram illustrates the *external-gateway* path, where a
+> `KongGatewayProvider` adapter is driven directly to push routes to the Kong Admin API. For the **embedded-edge**
+> deployment actually implemented (built-in api-gateway as the k8s edge), route exposure is **directory-driven** exactly
+> as in the on-premise sequence above: the pod only self-registers with the DirectoryService, and the api-gateway edge
+> polls `ListAllInstances` to register/prune proxy routes. The pod never calls the provider in that model.
 
 #### OoP Plugin Call (P2)
 

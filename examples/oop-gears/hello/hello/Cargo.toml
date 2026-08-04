@@ -1,0 +1,44 @@
+[package]
+name = "hello"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Minimal out-of-process REST gear example (edge reverse-proxy demo)"
+
+[features]
+default = []
+oop_module = ["tokio"]
+oop_example = ["oop_module"]
+
+[[bin]]
+name = "hello-oop"
+path = "src/main.rs"
+required-features = ["oop_module"]
+
+[dependencies]
+# ToolKit
+toolkit = { workspace = true, features = ["bootstrap"] }
+toolkit-macros = { workspace = true }
+
+# Axum & HTTP
+axum = { workspace = true }
+http = { workspace = true }
+
+# Serialization (for REST DTOs)
+serde = { workspace = true }
+utoipa = { workspace = true }
+
+# Async & concurrency
+async-trait = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+# Error handling / utils
+anyhow = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+inventory = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }

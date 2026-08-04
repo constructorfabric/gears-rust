@@ -1,0 +1,59 @@
+[package]
+name = "secure"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Out-of-process REST gear demonstrating two-plane authentication (edge + in-process re-validation)"
+
+[features]
+default = []
+# `oop_module` links the in-process AuthN stack (authn-resolver +
+# static-authn-plugin + types-registry) needed to re-validate bearer tokens
+# inside the OoP pod, and pulls in the tokio runtime for the binary.
+oop_module = [
+    "tokio",
+    "dep:authn-resolver",
+    "dep:static-authn-plugin",
+    "dep:types-registry",
+]
+oop_example = ["oop_module"]
+
+[[bin]]
+name = "secure-oop"
+path = "src/main.rs"
+required-features = ["oop_module"]
+
+[dependencies]
+# ToolKit
+toolkit = { workspace = true, features = ["bootstrap"] }
+toolkit-macros = { workspace = true }
+# SecurityContext extractor for the authenticated handler.
+toolkit-security = { workspace = true }
+
+# Axum & HTTP
+axum = { workspace = true }
+http = { workspace = true }
+
+# Serialization (for REST DTOs)
+serde = { workspace = true }
+utoipa = { workspace = true }
+
+# Async & concurrency
+async-trait = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+# Error handling / utils
+anyhow = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+inventory = { workspace = true }
+
+# In-process AuthN stack (linked into the OoP binary only).
+authn-resolver = { workspace = true, optional = true }
+static-authn-plugin = { package = "cf-gears-static-authn-plugin", path = "../../../../gears/system/authn-resolver/plugins/static-authn-plugin", optional = true }
+types-registry = { workspace = true, optional = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }

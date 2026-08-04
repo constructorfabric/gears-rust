@@ -189,7 +189,7 @@ impl RestApiCapability for TestAuthGear {
         // Public route with explicit public marking
         let router = OperationBuilder::get("/tests/v1/api/public")
             .operation_id("test.public")
-            .public()
+            .anonymous()
             .summary("Public endpoint")
             .handler(public_handler)
             .json_response_with_schema::<TestResponse>(openapi, http::StatusCode::OK, "Success")
@@ -740,7 +740,7 @@ impl RestApiCapability for TestAuthEnabledGear {
         // Public route that extracts SecurityContext so tests can verify anonymous ctx
         let router = OperationBuilder::get("/tests/v1/api/public-ctx")
             .operation_id("test_auth.public_ctx")
-            .public()
+            .anonymous()
             .summary("Public endpoint with security context")
             .handler(protected_handler) // reuse: extracts SecurityContext
             .json_response_with_schema::<TestResponse>(openapi, http::StatusCode::OK, "Success")

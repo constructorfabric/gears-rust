@@ -25,7 +25,10 @@ use secrecy::{ExposeSecret, SecretString};
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
+use toolkit_security::InternalAuthConfig;
 use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
+
+use crate::sa_token::ServiceAccountTokenReader;
 
 /// Attach a platform-plane internal `token` to outgoing gRPC metadata under the
 /// `x-toolkit-internal-token` key.
@@ -113,6 +116,41 @@ impl InternalAuthInterceptor {
     #[must_use]
     pub fn disabled() -> Self {
         Self::new(|| None)
+    }
+}
+
+/// Build the **outbound** platform-plane interceptor from an
+/// [`InternalAuthConfig`].
+///
+/// - [`InternalAuthConfig::SharedSecret`] → a static interceptor attaching the
+///   shared secret ([`InternalAuthInterceptor::from_token`]).
+/// - [`InternalAuthConfig::Kube`] with a `token_path` → a rotating interceptor
+///   backed by a [`ServiceAccountTokenReader`] (re-reads the projected token on
+///   its refresh cadence, so rotation is transparent).
+/// - [`InternalAuthConfig::Kube`] without a `token_path` → a
+///   [`disabled`](InternalAuthInterceptor::disabled) interceptor (inbound-only
+///   deployment: this participant validates but never calls out).
+///
+/// # Errors
+/// Returns an error only when a configured Kubernetes `token_path` cannot be
+/// read on the initial load.
+pub async fn build_internal_auth_interceptor(
+    cfg: &InternalAuthConfig,
+) -> anyhow::Result<InternalAuthInterceptor> {
+    match cfg {
+        InternalAuthConfig::SharedSecret { secret, .. } => Ok(InternalAuthInterceptor::from_token(
+            SecretString::from(secret.clone()),
+        )),
+        InternalAuthConfig::Kube {
+            token_path: Some(path),
+            ..
+        } => {
+            let reader = ServiceAccountTokenReader::new(path).await?;
+            Ok(reader.interceptor())
+        }
+        InternalAuthConfig::Kube {
+            token_path: None, ..
+        } => Ok(InternalAuthInterceptor::disabled()),
     }
 }
 

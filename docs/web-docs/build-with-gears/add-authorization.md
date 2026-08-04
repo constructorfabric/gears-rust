@@ -13,7 +13,7 @@ Authentication happens at the edge (the API Gateway validates the token and inje
 ## Declare the route's auth posture
 
 Every route states whether it requires a token. `OperationBuilder::authenticated()` requires
-a valid bearer token; `.public()` opts out (rare):
+a valid bearer token; `.anonymous()` opts out (rare):
 
 ```rust
 OperationBuilder::get("/users-info/v1/users")
