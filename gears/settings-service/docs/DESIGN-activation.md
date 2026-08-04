@@ -201,7 +201,7 @@ C4Container
 
 ### 2.1 Goals
 
-- **Consumer notification per apply (filtered)** — `apply_notification { apply_id, tenant, changed_keys: [key] }`, delivered **per subscriber**, carrying **only the changed keys that subscriber is subscribed to** (never the full apply). One message per apply per subscriber, so a consumer batch-reacts without re-subscribing or polling. `tenant` absent ⇒ platform-wide. Keys are the settings' GTS **instance** ids `<value-type>~<instance-id>` — referenceable by construction; **only the value type (left half) is registered**, the setting itself is not (DESIGN.md §4.6). No `change_kind` — consumers re-read anyway.
+- **Consumer notification per apply (filtered)** — `apply_notification { apply_id, tenant, changed_keys: [key] }`, delivered **per subscriber**, carrying **only the changed keys that subscriber is subscribed to** (never the full apply). One message per apply per subscriber, so a consumer batch-reacts without re-subscribing or polling. `tenant` absent ⇒ platform-wide. Keys are the settings' GTS **instance** ids `<value-type>~<instance-id>` — referenceable by construction; **only the value type (left half) is registered**, the setting itself is not (DESIGN.md §4.7). No `change_kind` — consumers re-read anyway.
 - **Replica cache invalidation (broadcast)** — `cache_invalidate { apply_id, tenant, changed_keys: [key] }`, published once per apply to **all** Settings Service replicas (no subscription, no ack), carrying the full changed-key set so every replica evicts its cached `(key, tenant)` entries (§4.2 *Cache Invalidation Broadcast*).
 - **Immutable change bundle** — the set of settings changed by a single apply is written to the DB immediately (effective on read) and then reconciled as one unit. The bundle's expected values are **fixed at apply time**; to change a value the administrator applies again, producing a **new** apply/bundle.
 - **Per-setting subscription** — a consumer subscribes, in its own name, to the **specific setting keys** it must actively activate (not merely pull). Subscription implies **acknowledged delivery** for those keys (§4.2 *Subscription Manager*).
@@ -255,16 +255,53 @@ A bundle stays open until every await-record is terminal. There is no automatic 
 
 ### 3.2 Constraints
 
-| Constraint/Assumption | Description |
-|----------------------|-------------|
-| Delivered as part of the Settings Service Gear | Settings Activation is a mechanism **inside** the Settings Service; the publisher and state tables ship in the Settings Service Cyber Fabric Gear (ToolKit runtime); consumers reach the subscription contract through the settings SDK registered in `ClientHub`. |
-| Event Broker transport only | Durable pub/sub via the platform event broker. No broker-less fallback — the broker is a platform dependency. |
-| Two events per apply | Each apply emits (1) a `cache_invalidate` broadcast to all replicas (published inline at apply, best-effort, cache-TTL backstop) and (2) one filtered `apply_notification` per subscriber (delivered from the durable await-records until acked). Both come from the same settled apply (§4.2 *Apply Publisher*). |
-| Consumer notification is filtered | An `apply_notification` carries **only the subscriber's own subscribed changed keys** — never the full apply. This is **key-scoped, best-effort least-privilege** (§4.8), **not** a cross-tenant isolation guarantee: filtering has no tenant dimension, so a subscriber to key K is notified of K's change in **any** tenant (the notification carries which). |
-| Tenant in payload | Both events include the `tenant` the change applies to (absent ⇒ platform-wide), so consumers can correctly resolve tenant lineage if they care about cascading, and replicas evict the right scope. |
-| No settings value in a notification payload | The two **notification** events (`apply_notification`, `cache_invalidate`) carry **identifiers only** (`changed_keys`, `tenant`) — no settings value, no secret; the tenant-scoped effective value resolves correctly on re-read. The **back-responses** (`apply_success` / `apply_failed`) are the deliberate exception: they carry the **applied value** — plaintext for a non-secret setting, a **hash** for a secret value (the secret plaintext never enters the stream); see §4.8, §4.1/§4.4. |
-| Consumers read effective values on demand, respond with outcomes | The pull path (`SettingsReaderClient`, DESIGN.md §4.5) is the source of truth; this system signals *which* of a subscriber's keys changed and tracks *what* happened via back-response (`apply_success` / `apply_failed`, per setting, carrying the applied value or a secret hash). |
-| Wait-for-all, unbounded (restart scenario) | Reconciliation waits until **every** await-record resolves; there is **no TTL**. A restart-only consumer does not acknowledge before rebooting; its await-records stay **awaiting**. On **re-subscribe after boot**, the Settings Service **re-publishes** the notification for the unanswered await-records and the consumer acknowledges then (§4.2 *Apply Outcome Tracker*, §6). |
+#### Delivered as part of the Settings Service Gear
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-activation-in-settings-gear`
+
+Settings Activation is a mechanism **inside** the Settings Service; the publisher and state tables ship in the Settings Service Cyber Fabric Gear (ToolKit runtime); consumers reach the subscription contract through the settings SDK registered in `ClientHub`.
+
+#### Event Broker transport only
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-activation-broker-only`
+
+Durable pub/sub via the platform event broker. No broker-less fallback — the broker is a platform dependency.
+
+#### Two events per apply
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-activation-two-events-per-apply`
+
+Each apply emits (1) a `cache_invalidate` broadcast to all replicas (published inline at apply, best-effort, cache-TTL backstop) and (2) one filtered `apply_notification` per subscriber (delivered from the durable await-records until acked). Both come from the same settled apply (§4.2 *Apply Publisher*).
+
+#### Consumer notification is filtered
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-activation-filtered-notification`
+
+An `apply_notification` carries **only the subscriber's own subscribed changed keys** — never the full apply. This is **key-scoped, best-effort least-privilege** (§4.8), **not** a cross-tenant isolation guarantee: filtering has no tenant dimension, so a subscriber to key K is notified of K's change in **any** tenant (the notification carries which).
+
+#### Tenant in payload
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-activation-tenant-in-payload`
+
+Both events include the `tenant` the change applies to (absent ⇒ platform-wide), so consumers can correctly resolve tenant lineage if they care about cascading, and replicas evict the right scope.
+
+#### No settings value in a notification payload
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-activation-identifiers-only-payload`
+
+The two **notification** events (`apply_notification`, `cache_invalidate`) carry **identifiers only** (`changed_keys`, `tenant`) — no settings value, no secret; the tenant-scoped effective value resolves correctly on re-read. The **back-responses** (`apply_success` / `apply_failed`) are the deliberate exception: they carry the **applied value** — plaintext for a non-secret setting, a **hash** for a secret value (the secret plaintext never enters the stream); see §4.8, §4.1/§4.4.
+
+#### Consumers read effective values on demand, respond with outcomes
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-activation-pull-plus-back-response`
+
+The pull path (`SettingsReaderClient`, DESIGN.md §4.5) is the source of truth; this system signals *which* of a subscriber's keys changed and tracks *what* happened via back-response (`apply_success` / `apply_failed`, per setting, carrying the applied value or a secret hash).
+
+#### Wait-for-all, unbounded (restart scenario)
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-activation-wait-for-all-unbounded`
+
+Reconciliation waits until **every** await-record resolves; there is **no TTL**. A restart-only consumer does not acknowledge before rebooting; its await-records stay **awaiting**. On **re-subscribe after boot**, the Settings Service **re-publishes** the notification for the unanswered await-records and the consumer acknowledges then (§4.2 *Apply Outcome Tracker*, §6).
 
 ## 4. Technical Architecture
 
@@ -536,7 +573,7 @@ Most of this system is an in-process SDK contract. The **only** REST surface is 
 | `GET` | `/v1/applies/{apply_id}/activation` | Activation-facet state: `overall_status` (`awaiting`/`success`/`failed`/`superseded`/`cancelled`), `expected_records`, `succeeded_records`/`failed_records`/`superseded_records`/`cancelled_records`/awaiting counts, per-subscriber responses, per-setting confirmation | Yes |
 | `GET` | `/v1/applies/{apply_id}/activation/responses` | List all `BackResponse` entries for this apply (who responded, for which key, when, what status) | Yes |
 
-**The `activation` facet of `/v1/applies/{apply_id}`.** This lives at **`/v1/applies/{apply_id}/activation`** — a facet of the apply namespace, keyed by `apply_id` (a **correlation id**, §4.7), **beside** the settings execution facet `GET /v1/applies/{apply_id}/commit` (the apply **execution** record, `value.v1~`, **deleted on settle** — §4.3 / §4.2 *Apply Orchestrator*/DESIGN.md §4.6). Two facets, **opposite lifecycles**: `commit` answers "did the values commit" and self-deletes on settle; `activation` answers "did consumers activate" and **outlives** the apply (unbounded wait, §4.2 *Apply Outcome Tracker*). Both hang off the **neutral `apply_id` namespace** — the activation facet is **not** nested under the delete-on-settle execution record — which is what avoids the orphaned-sub-resource trap (the `commit` facet 404s independently while this `activation` facet lives on). One gear serves both (Settings Activation is part of the Settings Service, §1).
+**The `activation` facet of `/v1/applies/{apply_id}`.** This lives at **`/v1/applies/{apply_id}/activation`** — a facet of the apply namespace, keyed by `apply_id` (a **correlation id**, §4.7), **beside** the settings execution facet `GET /v1/applies/{apply_id}/commit` (the apply **execution** record, `value.v1~`, **deleted on settle** — §4.3 / §4.2 *Apply Orchestrator*/DESIGN.md §4.7). Two facets, **opposite lifecycles**: `commit` answers "did the values commit" and self-deletes on settle; `activation` answers "did consumers activate" and **outlives** the apply (unbounded wait, §4.2 *Apply Outcome Tracker*). Both hang off the **neutral `apply_id` namespace** — the activation facet is **not** nested under the delete-on-settle execution record — which is what avoids the orphaned-sub-resource trap (the `commit` facet 404s independently while this `activation` facet lives on). One gear serves both (Settings Activation is part of the Settings Service, §1).
 
 **Pagination.** `GET /v1/applies/{apply_id}/activation/responses` uses **cursor pagination** (`cursor`/`limit` → `{ items, page_info }`, no `total_count`) per the shared REST DNA (DESIGN.md §4.3 / guideline §5) — its row count is **changed-keys × subscribers**, unbounded for a platform-wide apply, so it MUST paginate. The `activation` bundle read itself (`/activation`) is a single resource, not a list.
 
@@ -571,6 +608,10 @@ Canonical definitions; the [Settings Service](./DESIGN.md) publishes and consume
 The two sequences below are the authoritative activation protocol, expressed in this design's terms (per-subscriber filtered `apply_notification`, broadcast `cache_invalidate`, per-await-record tracking, wait-for-all outcome). All service-side actions originate from the **Settings Service** — Settings Activation is part of it, not a separate component.
 
 #### Main interaction protocol
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-seq-activation-apply-notify`
+
+Apply settles, await-records are co-committed, the `cache_invalidate` broadcast goes to every replica, and one filtered `apply_notification` per subscriber is delivered from the durable await-records until acknowledged.
 
 ```mermaid
 sequenceDiagram
@@ -612,6 +653,10 @@ sequenceDiagram
 ```
 
 #### Apply via consumer restart
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-seq-activation-restart-resubscribe`
+
+A restart-only consumer never acknowledges before rebooting, so its await-records stay awaiting; on re-subscribe after boot the notification is re-published for the unanswered records and acknowledged then.
 
 ```mermaid
 sequenceDiagram
@@ -689,7 +734,7 @@ The load-bearing per-`(apply_id, subscriber, key)` state. Created at publish for
 
 #### Authorization model
 
-Mirrors the Settings Service model (design DESIGN.md §4.7); enforced server-side via the RBAC `PolicyEnforcer` (fail-closed). Activation is part of the Settings Service, so its control-plane resources sit under `gts.cf.toolkit.settings.*`.
+Mirrors the Settings Service model (design DESIGN.md §4.8); enforced server-side via the RBAC `PolicyEnforcer` (fail-closed). Activation is part of the Settings Service, so its control-plane resources sit under `gts.cf.toolkit.settings.*`.
 
 | Operation | Required permission | Scope | Unauthorized |
 |-----------|---------------------|-------|--------------|
