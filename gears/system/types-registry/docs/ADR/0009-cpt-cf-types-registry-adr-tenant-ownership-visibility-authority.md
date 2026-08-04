@@ -20,6 +20,7 @@ date: 2026-07-26
   - [Visibility is directed down the tenant tree](#visibility-is-directed-down-the-tenant-tree)
   - [Version-family ownership versus derivation](#version-family-ownership-versus-derivation)
   - [Identifier uniqueness and the disclosure boundary](#identifier-uniqueness-and-the-disclosure-boundary)
+  - [A shared namespace is not a hole in tenant isolation](#a-shared-namespace-is-not-a-hole-in-tenant-isolation)
   - [The contract exposes whether the caller owns an entity, not who does](#the-contract-exposes-whether-the-caller-owns-an-entity-not-who-does)
   - [Deletion blocked by an invisible dependent](#deletion-blocked-by-an-invisible-dependent)
   - [Ownership is immutable, and a mistake is repaired by purge](#ownership-is-immutable-and-a-mistake-is-repaired-by-purge)
@@ -127,6 +128,16 @@ Therefore:
 * discovery, search, exact resolution, batch resolution, and query assistance disclose nothing about entities outside the caller's visible scope — not existence, not metadata, not a distinguishable error. Reverse resolution of a Registry Reference for an entity outside the caller's scope returns the same result as one that was never issued.
 
 This narrows the PRD rule against disclosing existence: it holds absolutely for the read and discovery surface, and is bounded to name-availability on the registration surface.
+
+### A shared namespace is not a hole in tenant isolation
+
+The objection is worth answering directly, because a namespace two tenants draw from looks at first like exactly the thing tenant isolation exists to prevent. It conflates two different properties.
+
+**Data isolation** is the property that one tenant cannot read or change another's. It is intact and nothing above weakens it: visibility is the directed descendant relation, a conflict response carries only that the name is unavailable, an out-of-scope reverse resolution is indistinguishable from an unissued reference, and no read result carries an owning tenant identifier on either plane. **Namespace partitioning** — whether the space of *names* is per-tenant — is a separate question, and the answer here is deliberately no.
+
+What crosses the boundary is therefore one bit: *this identifier is unavailable*. And `cpt-cf-types-registry-fr-registration-authority` narrows even that, by requiring the grant check to run **before** the identifier-availability check. A caller with no grant covering the region receives one response whether the name is free, held by a visible entity, held by an invisible one, or held by a tombstone or a Source Claim reservation, so the bit is legible only to a subject that already holds authority over that part of the namespace — in practice, the vendor whose prefix it is. That is a stronger position than the public analogues below, where anyone who can reach the API can probe.
+
+Per-tenant namespaces are not an alternative that was passed over; they are incompatible with three decisions this gear rests on. A chained identifier would stop being unambiguous, since `A~B~` would denote different types depending on whose context resolved it, and a `$ref` would need a tenant to resolve at all. ADR-0001 derives the Registry Reference deterministically from the identifier, so two tenants holding one string would derive one reference — repairable only by folding the tenant into the derivation, which destroys the portability that made it deterministic. And the reseller topology this ADR is built around requires a descendant to derive from a contract an ancestor published, which presupposes one namespace for both.
 
 ### The contract exposes whether the caller owns an entity, not who does
 
@@ -256,6 +267,9 @@ This decision is confirmed when:
 * [Microsoft Dataverse](https://learn.microsoft.com/en-us/power-apps/developer/data-platform/introduction-entities) separates system (platform-owned) from custom (tenant-authored) metadata, with distinct authority over each — the same split as global versus tenant-owned here.
 * [Kubernetes RBAC](https://kubernetes.io/docs/reference/access-authn-authz/rbac/) distinguishes cluster-scoped from namespaced resources, and cluster-scoped definitions such as CRDs are visible to all namespaces while being modifiable only with cluster authority.
 * [AWS Organizations](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies.html) applies policy downward through an organizational hierarchy, with the parent's declarations binding descendants and no reverse flow — the same directionality adopted here.
+* [Amazon S3 general purpose buckets](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html) are the closest large-scale precedent for a name space shared across tenant boundaries: they "exist in a global namespace, which means that each bucket name must be unique across all AWS accounts in all the AWS Regions within a partition", and a name taken by one account is unavailable to every other. AWS accepts the same one-bit disclosure this ADR accepts, and without the grant-ordering rule that narrows it here.
+
+  Two details make the comparison more useful than a coincidence of shape. On releasing a name, AWS says a deleted bucket's name "might become available again in the global namespace for anyone to re-create", but "might not become available immediately, and in some cases might not become available again at all" — an unresolved hazard stated as vagueness. Types Registry faces the same hazard in a sharper form, because a deterministic Registry Reference reproduces itself when a name is reused, and answers it explicitly instead: an identifier is never rebound, the tombstone is permanent, and ADR-0013's purge is the single named exception, disabled by default. And AWS is under visible counter-pressure — general purpose buckets have acquired an account-scoped naming form, and directory buckets never used the global namespace — which is a reminder that a global namespace is a cost accepted for a reason rather than a free property. Here the reason is that GTS identifiers are meaningful across vendors by design, and the vendor-structured prefix plus the grant model of `cpt-cf-types-registry-fr-registration-authority` is what keeps the space governed rather than first-come-first-served.
 
 ## Traceability
 
