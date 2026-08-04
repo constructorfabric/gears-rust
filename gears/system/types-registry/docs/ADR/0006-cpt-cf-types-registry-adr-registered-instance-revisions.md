@@ -81,7 +81,7 @@ Chosen option: a managed registered GTS Instance is a mutable logical entity who
 An admission candidate becomes an admitted Instance revision and current only when:
 
 1. its GTS ID and instance envelope are valid;
-2. its referenced logical Type Schema is visible, lifecycle-usable, and tenant-available under the applicable registration policy;
+2. its referenced logical Type Schema is visible, lifecycle-usable, tenant-available under the applicable registration policy, and not in the unstable profile of ADR-0015 — a schema exempt from evolution checks cannot carry an Instance, because the rule below that forbids a schema revision from becoming current while an affected Instance would break is exactly what that profile exists to remove;
 3. the candidate content validates against the current admitted Type Schema revision selected at validation time;
 4. every GTS and JSON Schema reference in the candidate is resolvable and valid;
 5. ownership, lifecycle, dependency, and alias rules pass;
@@ -227,6 +227,7 @@ This decision is confirmed when:
 - **ADR-0008**: [0008-cpt-cf-types-registry-adr-managed-version-family-lifecycle.md](./0008-cpt-cf-types-registry-adr-managed-version-family-lifecycle.md) — decides that admitting a higher-major Version Successor changes no other member of the family, so it creates no Instance revision anywhere else.
 - **ADR-0012**: [0012-cpt-cf-types-registry-adr-write-path-admission-protocol.md](./0012-cpt-cf-types-registry-adr-write-path-admission-protocol.md) — decides the write-path contract the optimistic-concurrency section rests on: `resource_version` preconditions rather than a revision token, per-candidate outcomes, and request-key replay.
 - **ADR-0013**: [0013-cpt-cf-types-registry-adr-platform-purge-of-deleted-entities.md](./0013-cpt-cf-types-registry-adr-platform-purge-of-deleted-entities.md) — decides the only mechanism that physically removes a retained revision, and keeps it out of every retention policy.
+- **ADR-0015**: [0015-cpt-cf-types-registry-adr-major-zero-unstable-profile.md](./0015-cpt-cf-types-registry-adr-major-zero-unstable-profile.md) — refuses an Instance of an unstable Type Schema, and refuses major 0 on an Instance identifier, because successive Instance values have no compatibility relation for the profile to exempt.
 
 This decision directly addresses:
 

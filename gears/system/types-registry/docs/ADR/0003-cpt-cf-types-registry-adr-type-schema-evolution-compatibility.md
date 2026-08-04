@@ -73,6 +73,8 @@ A candidate is admissible only when `Valid(current) ⊆ Valid(candidate)` under 
 
 This is exactly the guarantee the architecture requires. Because a domain object carries no revision and a `$ref` floats, the current revision is validated against payloads and references created under any earlier revision. Backward compatibility is the property that makes that safe.
 
+One profile is exempt, and it is exempt rather than weaker. ADR-0015 gives major version 0 the meaning of an unstable Type Schema: no mode is enforced for it, the freeze machinery below does not apply to it because it carries no whole-history guarantee to protect, and a revalidation pass after a semantic change of the relation skips it. That exemption is safe for everything decided here only because the same ADR forbids any entity outside the profile from referencing or deriving from one — without that rule a floating reference would carry the exemption upward into a chain this ADR does guarantee.
+
 `FULL` is not enforced. Under GTS 0.13 full compatibility requires the accepted-instance sets to be equal, so the only admissible in-place changes would be annotations such as `description`, `examples`, and `default`. That would make ADR-0004's mutable logical entity inert: no content update could ever preserve the GTS ID, and every change would require a new major identity.
 
 `FORWARD` is not enforced. Types Registry has no platform requirement to guarantee that an older reader accepts a newer payload, and it has no mechanism to establish which readers exist.
@@ -150,7 +152,7 @@ A managed Type Schema cannot reference an externally managed one. ADR-0011 prohi
 
 ### Consequences
 
-* Every managed Type Schema follows the same backward-compatible evolution rule.
+* Every managed Type Schema whose major version is 1 or higher follows the same backward-compatible evolution rule. Major 0 is the single exemption, quarantined from the rest by ADR-0015.
 * Admission cost is independent of retained history, so retention growth is a storage question only.
 * An open effective level is admitted normally, but cannot later gain properties in place; a change at that level requires a new major identity. Types Registry reports this per level up front rather than at the first failed update.
 * Generated Type Schemas are evolvable in place at the levels that carry their own properties, so ADR-0004's mutable logical entity is the normal case for platform gears rather than an exception. Object levels the toolchain does not own are the residual hazard and are addressed by an authoring convention, not by a registry rule.
@@ -230,6 +232,7 @@ It declines one part of that latitude deliberately. §4.3 permits an implementat
 - **ADR-0005**: [0005-cpt-cf-types-registry-adr-type-schema-revisions.md](./0005-cpt-cf-types-registry-adr-type-schema-revisions.md)
 - **ADR-0014**: [0014-cpt-cf-types-registry-adr-managed-type-schema-dialect-profile.md](./0014-cpt-cf-types-registry-adr-managed-type-schema-dialect-profile.md)
 - **ADR-0011**: [0011-cpt-cf-types-registry-adr-managed-external-boundary.md](./0011-cpt-cf-types-registry-adr-managed-external-boundary.md) — forbids a managed Type Schema from referencing an externally managed one, so the guarantee defined here applies to a reference closure that is entirely managed.
+- **ADR-0015**: [0015-cpt-cf-types-registry-adr-major-zero-unstable-profile.md](./0015-cpt-cf-types-registry-adr-major-zero-unstable-profile.md) — exempts major 0 from the mode enforced here, and quarantines it so the exemption cannot reach a chain this ADR guarantees.
 - **GTS specification**: [Global Type System](https://github.com/globaltypesystem/gts-spec) §4.1–§4.5, §5.3, §6
 
 This decision directly addresses:
