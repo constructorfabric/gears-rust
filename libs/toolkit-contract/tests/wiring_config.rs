@@ -54,10 +54,8 @@ fn rest_with_endpoint_only() {
 
 #[test]
 fn rest_with_humantime_timeout() {
-    let w = parse(
-        r#"{"transport": "rest", "endpoint": "https://x", "timeout": "5s"}"#,
-    )
-    .expect("humantime timeout parses");
+    let w = parse(r#"{"transport": "rest", "endpoint": "https://x", "timeout": "5s"}"#)
+        .expect("humantime timeout parses");
     let ClientWiring::Rest { tuning, .. } = w else {
         unreachable!()
     };

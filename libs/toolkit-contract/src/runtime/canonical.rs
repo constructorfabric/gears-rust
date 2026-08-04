@@ -8,7 +8,7 @@
 //!
 //! When the peer participates in the canonical-errors envelope (RFC 9457
 //! `Problem` with a `gts://...` `type` URI, either inline on the HTTP
-//! response body or attached as the `x-modkit-problem-bin` gRPC trailer),
+//! response body or attached as the `x-toolkit-problem-bin` gRPC trailer),
 //! the typed `CanonicalError::*` variant is recovered via
 //! [`toolkit_canonical_errors::CanonicalError::try_from(Problem)`]. Resource
 //! info (`resource_type`, `resource_name`) is pulled out of
@@ -32,7 +32,7 @@ use crate::runtime::transport_error::TransportError;
 impl From<TransportError> for CanonicalError {
     fn from(err: TransportError) -> Self {
         match err {
-            TransportError::Problem(problem) => problem_to_canonical(problem),
+            TransportError::Problem { problem, .. } => problem_to_canonical(*problem),
             TransportError::HttpStatus { status, body, .. } => {
                 http_status_to_canonical(status, &body)
             }
@@ -106,7 +106,18 @@ fn synth_to_canonical(category: ProblemCategory, detail: &str) -> CanonicalError
 }
 
 fn http_status_to_canonical(status: u16, body: &str) -> CanonicalError {
-    let preview: &str = if body.len() > 200 { &body[..200] } else { body };
+    // `body` is peer-controlled (arbitrary UTF-8); a raw `&body[..200]` byte
+    // slice panics if 200 lands inside a multi-byte character. Floor to the
+    // nearest char boundary at or below 200.
+    let preview: &str = if body.len() > 200 {
+        let cut = (0..=200)
+            .rev()
+            .find(|&i| body.is_char_boundary(i))
+            .unwrap_or(0);
+        &body[..cut]
+    } else {
+        body
+    };
     match status {
         401 => CanonicalError::unauthenticated()
             .with_reason(preview.to_owned())
@@ -145,7 +156,7 @@ mod tests {
             &CanonicalError::try_from(synth_problem(ProblemCategory::NotFound, "missing")).unwrap(),
         )
         .unwrap();
-        let err: CanonicalError = TransportError::Problem(original).into();
+        let err: CanonicalError = TransportError::problem(original).into();
         assert!(matches!(err, CanonicalError::NotFound { .. }));
     }
 
@@ -158,6 +169,21 @@ mod tests {
         }
         .into();
         assert!(matches!(err, CanonicalError::NotFound { .. }));
+    }
+
+    #[test]
+    fn http_status_to_canonical_does_not_panic_on_multibyte_char_at_boundary() {
+        // 199 ASCII bytes + a 3-byte UTF-8 char straddling byte 200 — a raw
+        // `&body[..200]` slice would panic since byte 200 falls inside it.
+        let body = format!("{}€", "a".repeat(199));
+        assert_eq!(body.len(), 202);
+        let err: CanonicalError = TransportError::HttpStatus {
+            status: 403,
+            body,
+            retry_after: None,
+        }
+        .into();
+        assert!(matches!(err, CanonicalError::PermissionDenied { .. }));
     }
 
     #[test]

@@ -68,6 +68,24 @@ pub const DEFAULT_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::
 /// `HostRuntime` owns the lifecycle orchestration for `ToolKit`.
 ///
 /// It encapsulates all runtime state and drives gears through the full lifecycle (see gear docs).
+/// Read a consumer's ADR-0004 static-endpoint override for `dep_gear` from
+/// `gears.<owner_gear>.config.consumer_wiring.<dep_gear>` (a base endpoint URI
+/// string). This is the dev/test escape hatch that bypasses service discovery;
+/// returns `None` when unset.
+#[cfg(feature = "contract-directory-rest-client")]
+fn static_endpoint_override(
+    cfg: &dyn ConfigProvider,
+    owner_gear: &str,
+    dep_gear: &str,
+) -> Option<String> {
+    cfg.get_gear_config(owner_gear)?
+        .get("config")?
+        .get("consumer_wiring")?
+        .get(dep_gear)?
+        .as_str()
+        .map(str::to_owned)
+}
+
 pub struct HostRuntime {
     registry: GearRegistry,
     ctx_builder: GearContextBuilder,
@@ -75,6 +93,11 @@ pub struct HostRuntime {
     gear_manager: Arc<GearManager>,
     grpc_installers: Arc<GrpcInstallerStore>,
     client_hub: Arc<ClientHub>,
+    /// Per-gear config, retained for the proxy-wiring phase to read a consumer's
+    /// static-endpoint override (dev/test escape hatch, ADR-0004). Only read
+    /// under `contract-directory-rest-client`.
+    #[cfg_attr(not(feature = "contract-directory-rest-client"), allow(dead_code))]
+    gears_cfg: Arc<dyn ConfigProvider>,
     /// Process-level readiness, published in `client_hub` for the `/readyz`
     /// probe and updated by the proxy-wiring readiness loop + draining watcher.
     readiness: Arc<crate::ReadinessState>,
@@ -110,8 +133,12 @@ impl HostRuntime {
         client_hub.register::<crate::ReadinessState>(readiness.clone());
 
         // Build the context builder that will resolve per-gear DbHandles
-        let ctx_builder =
-            GearContextBuilder::new(instance_id, gears_cfg, client_hub.clone(), cancel.clone());
+        let ctx_builder = GearContextBuilder::new(
+            instance_id,
+            gears_cfg.clone(),
+            client_hub.clone(),
+            cancel.clone(),
+        );
         #[cfg(feature = "db")]
         let ctx_builder = match &db_options {
             DbOptions::Manager(mgr) => ctx_builder.with_db_manager(mgr.clone()),
@@ -125,6 +152,7 @@ impl HostRuntime {
             gear_manager,
             grpc_installers,
             client_hub,
+            gears_cfg,
             readiness,
             cancel,
             db_options,
@@ -378,49 +406,114 @@ impl HostRuntime {
         reason = "kept async for symmetry with the other `run_*_phase` steps awaited in sequence by `run_gear_phases`; the awaited work runs in a spawned readiness-probe task"
     )]
     async fn run_proxy_wiring_phase(&self) -> Result<(), RegistryError> {
-        use crate::discovery::{ConsumerRegistration, DirectoryEndpointResolver};
+        use crate::discovery::{
+            ConsumerRegistration, DirectoryEndpointResolver, NullEndpointResolver,
+        };
         use toolkit_contract::runtime::resolving::EndpointResolver;
 
-        let regs: Vec<&ConsumerRegistration> =
-            inventory::iter::<ConsumerRegistration>.into_iter().collect();
+        let regs: Vec<&ConsumerRegistration> = inventory::iter::<ConsumerRegistration>
+            .into_iter()
+            .collect();
         if regs.is_empty() {
             return Ok(());
         }
-        tracing::info!(count = regs.len(), "Phase: proxy-wiring (consumer discovery)");
+        tracing::info!(
+            count = regs.len(),
+            "Phase: proxy-wiring (consumer discovery)"
+        );
 
-        let Ok(dir) = self.client_hub.get::<dyn crate::DirectoryClient>() else {
-            tracing::warn!(
-                consumers = regs.len(),
-                "proxy-wiring: no DirectoryClient in ClientHub; skipping consumer discovery wiring"
-            );
-            return Ok(());
-        };
-        let resolver: Arc<dyn EndpointResolver> = Arc::new(DirectoryEndpointResolver(dir));
+        // Without a DirectoryClient we cannot resolve *remote* providers, but we
+        // must NOT silently skip wiring: co-located consumers still short-circuit
+        // to their local impl, and remote consumers must register as unresolved
+        // readiness gates so `/readyz` stays 503 (a misconfigured consumer must
+        // not report Ready). A null resolver makes every remote lookup `Ok(None)`
+        // so the loop below classifies deps correctly without a directory.
+        let (resolver, have_directory): (Arc<dyn EndpointResolver>, bool) =
+            if let Ok(dir) = self.client_hub.get::<dyn crate::DirectoryClient>() {
+                (Arc::new(DirectoryEndpointResolver::new(dir)), true)
+            } else {
+                tracing::error!(
+                    consumers = regs.len(),
+                    "proxy-wiring: no DirectoryClient in ClientHub; remote consumer \
+                     dependencies cannot be resolved and will gate /readyz (503). \
+                     Co-located (local) dependencies are unaffected."
+                );
+                (Arc::new(NullEndpointResolver), false)
+            };
 
+        // Wire each consumer contract. The outcome distinguishes a co-located
+        // local impl (hub short-circuit) from a directory-resolving REST client.
+        // Every dep is registered as a readiness gate; local ones are marked
+        // resolved immediately, and only remote ones gate readiness + get the
+        // background directory-resolve loop (ADR-0007: startup-gating + sticky).
+        let mut remote_deps: Vec<String> = Vec::new();
         for reg in &regs {
-            (reg.wire)(&self.client_hub, Arc::clone(&resolver)).map_err(|source| {
+            // ADR-0004 static-endpoint override (dev/test escape hatch): if the
+            // consumer's config declares a fixed endpoint for this dep, wire it
+            // directly (bypassing discovery) via a `StaticEndpointResolver`. A
+            // fixed endpoint needs no probe loop, so it is readiness-resolved
+            // immediately. Emitted at `warn!` — it must not be used in production.
+            let static_override =
+                static_endpoint_override(self.gears_cfg.as_ref(), reg.owner_gear, reg.dep_gear);
+            let (reg_resolver, is_static): (Arc<dyn EndpointResolver>, bool) =
+                if let Some(endpoint) = &static_override {
+                    tracing::warn!(
+                        owner = reg.owner_gear,
+                        dep = reg.dep_gear,
+                        endpoint = %endpoint,
+                        "proxy-wiring: STATIC endpoint override in use (ADR-0004 dev/test \
+                         escape hatch) - bypasses service discovery; MUST NOT be used in \
+                         production"
+                    );
+                    (
+                        Arc::new(crate::discovery::StaticEndpointResolver::new(
+                            endpoint.clone(),
+                        )),
+                        true,
+                    )
+                } else {
+                    (Arc::clone(&resolver), false)
+                };
+
+            let outcome = (reg.wire)(&self.client_hub, reg_resolver).map_err(|source| {
                 RegistryError::ProxyWiring {
                     gear: reg.owner_gear,
                     source,
                 }
             })?;
-            tracing::debug!(owner = reg.owner_gear, dep = reg.dep_gear, "wired consumer contract");
+            self.readiness.register_dep(reg.dep_gear.to_owned());
+            match outcome {
+                // Local impl won the hub short-circuit — resolved.
+                crate::discovery::WireOutcome::Local => self.readiness.mark_resolved(reg.dep_gear),
+                // Static override → fixed endpoint, always resolvable — no probe.
+                crate::discovery::WireOutcome::Remote if is_static => {
+                    self.readiness.mark_resolved(reg.dep_gear);
+                }
+                // Directory-resolved remote → gate readiness + background probe.
+                crate::discovery::WireOutcome::Remote => remote_deps.push(reg.dep_gear.to_owned()),
+            }
+            tracing::debug!(
+                owner = reg.owner_gear,
+                dep = reg.dep_gear,
+                outcome = ?outcome,
+                static_override = is_static,
+                "wired consumer contract"
+            );
         }
 
-        // Register consumed deps as readiness gates and spawn a background probe
-        // loop that flips each to resolved once the directory can resolve it.
-        // Readiness is startup-gating + sticky (ADR-0007): /readyz reports
-        // Starting until every consumed dependency resolves, then Ready.
-        let deps: Vec<String> = regs.iter().map(|r| r.dep_gear.to_owned()).collect();
-        for dep in &deps {
-            self.readiness.register_dep(dep.clone());
+        // Only remote deps need directory resolution; local wins are already
+        // resolved above. Without a directory the null resolver can never resolve
+        // them, so skip the probe entirely and leave those deps gating /readyz.
+        if !have_directory || remote_deps.is_empty() {
+            return Ok(());
         }
+
         let readiness = Arc::clone(&self.readiness);
         let cancel = self.cancel.clone();
         tokio::spawn(async move {
             const BASE: std::time::Duration = std::time::Duration::from_millis(100);
             const MAX: std::time::Duration = std::time::Duration::from_secs(30);
-            let mut pending = deps;
+            let mut pending = remote_deps;
             let mut backoff = BASE;
             while !pending.is_empty() {
                 let mut still_pending = Vec::new();
@@ -549,6 +642,18 @@ impl HostRuntime {
             crate::healthcheck::RestHealthcheckRegistry::with_cancellation(
                 host_ctx.cancellation_token().clone(),
             ),
+        );
+
+        // Bridge the process-level eventual-readiness state into the served
+        // probe: while any consumed dependency is unresolved (or the process is
+        // draining) this synthetic check reports Unhealthy, so the gateway's
+        // `/readyz` returns 503 until all `#[toolkit::consumes]` deps are wired.
+        // (`/healthz` is a static liveness handler and is unaffected.)
+        hc_registry.register(
+            "readiness",
+            Arc::new(crate::readiness::ReadinessHealthcheck::new(
+                self.readiness.clone(),
+            )),
         );
 
         // 1) Host prepare: base Router / global middlewares / basic OAS meta
@@ -1519,6 +1624,44 @@ mod tests {
         fn get_gear_config(&self, _gear_name: &str) -> Option<&serde_json::Value> {
             None
         }
+    }
+
+    #[cfg(feature = "contract-directory-rest-client")]
+    #[test]
+    fn static_endpoint_override_reads_nested_consumer_wiring_key() {
+        struct MapCfg(std::collections::HashMap<String, serde_json::Value>);
+        impl ConfigProvider for MapCfg {
+            fn get_gear_config(&self, gear: &str) -> Option<&serde_json::Value> {
+                self.0.get(gear)
+            }
+        }
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "orders".to_owned(),
+            serde_json::json!({
+                "config": { "consumer_wiring": { "billing": "http://localhost:8081" } }
+            }),
+        );
+        let cfg = MapCfg(map);
+
+        // Present override is read from `config.consumer_wiring.<dep>`.
+        assert_eq!(
+            super::static_endpoint_override(&cfg, "orders", "billing").as_deref(),
+            Some("http://localhost:8081")
+        );
+        // Absent dep / owner → None (falls through to directory resolution).
+        assert_eq!(
+            super::static_endpoint_override(&cfg, "orders", "inventory"),
+            None
+        );
+        assert_eq!(
+            super::static_endpoint_override(&cfg, "warehouse", "billing"),
+            None
+        );
+        assert_eq!(
+            super::static_endpoint_override(&EmptyConfigProvider, "orders", "billing"),
+            None
+        );
     }
 
     #[tokio::test]

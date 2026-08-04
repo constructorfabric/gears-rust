@@ -15,8 +15,20 @@ use toolkit_canonical_errors::Problem;
 pub enum TransportError {
     /// The server returned a structured RFC 9457 `Problem` payload.
     #[cfg(feature = "canonical-errors")]
-    #[error("server returned problem: {} ({})", .0.title, .0.status)]
-    Problem(Problem),
+    #[error("server returned problem: {} ({})", .problem.title, .problem.status)]
+    Problem {
+        /// The structured RFC 9457 problem payload. Boxed: `Problem` itself is
+        /// large enough (several `String`/`Value` fields) that an unboxed copy
+        /// here would make `TransportError` — and therefore every
+        /// `Result<_, TransportError>` return type across the crate — bloat
+        /// past clippy's `result_large_err` threshold.
+        problem: Box<Problem>,
+        /// Server-advised minimum wait before retry, parsed from the
+        /// `Retry-After` response header (delta-seconds), when present. Carried
+        /// alongside the `Problem` so in-mesh peers that speak canonical errors
+        /// still get their advised backoff honored by the retry loop.
+        retry_after: Option<std::time::Duration>,
+    },
 
     /// The server returned a non-success status with a non-Problem body.
     #[error("HTTP {status}: {body}")]
@@ -108,14 +120,28 @@ impl TransportError {
         Self::Unresolved { gear: gear.into() }
     }
 
+    /// Convenience constructor for [`TransportError::Problem`] with no
+    /// server-advised `Retry-After`.
+    #[cfg(feature = "canonical-errors")]
+    #[must_use]
+    pub fn problem(problem: Problem) -> Self {
+        Self::Problem {
+            problem: Box::new(problem),
+            retry_after: None,
+        }
+    }
+
     /// Server-advised retry delay (`Retry-After`), when the error carries one.
     ///
-    /// Only [`TransportError::HttpStatus`] carries it today (parsed from the
-    /// header on non-`Problem` responses). Returns `None` otherwise.
+    /// Carried by both [`TransportError::HttpStatus`] (non-`Problem` peers) and
+    /// [`TransportError::Problem`] (canonical-error peers), parsed from the
+    /// response header. Returns `None` for all other error classes.
     #[must_use]
     pub fn retry_after(&self) -> Option<std::time::Duration> {
         match self {
             TransportError::HttpStatus { retry_after, .. } => *retry_after,
+            #[cfg(feature = "canonical-errors")]
+            TransportError::Problem { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
@@ -132,7 +158,7 @@ impl TransportError {
             | TransportError::Unresolved { .. } => true,
             TransportError::HttpStatus { status, .. } => is_retryable_status(*status),
             #[cfg(feature = "canonical-errors")]
-            TransportError::Problem(p) => is_retryable_status(p.status),
+            TransportError::Problem { problem, .. } => is_retryable_status(problem.status),
             #[cfg(feature = "grpc-client")]
             TransportError::Grpc { code, .. } => matches!(
                 code,

@@ -83,6 +83,10 @@ fn diagnostic_returns_none_for_other_categories() {
 // from_error_debug() — non-production path
 // =========================================================================
 
+// `from_error_debug` is gated behind the `debug-problem` feature, so the tests
+// that exercise it must be too — otherwise `cargo test` (default features) fails
+// to compile with an unresolved-method error.
+#[cfg(feature = "debug-problem")]
 #[test]
 fn from_error_debug_includes_description_for_internal() {
     let err = CanonicalError::internal("db pool exhausted").create();
@@ -90,6 +94,7 @@ fn from_error_debug_includes_description_for_internal() {
     assert_eq!(problem.context["description"], "db pool exhausted");
 }
 
+#[cfg(feature = "debug-problem")]
 #[test]
 fn from_error_debug_includes_description_for_unknown() {
     let err = TestR::unknown("unexpected upstream response").create();
@@ -114,6 +119,7 @@ fn from_error_does_not_include_description_for_unknown() {
     assert!(problem.context.get("description").is_none());
 }
 
+#[cfg(feature = "debug-problem")]
 #[test]
 fn from_error_debug_no_op_for_other_categories() {
     let err = TestR::not_found("gone").with_resource("x").create();
@@ -474,6 +480,8 @@ fn try_from_unknown_problem_type_returns_error() {
         instance: None,
         trace_id: None,
         context: serde_json::json!({}),
+        error_code: None,
+        error_domain: None,
     };
     let result = CanonicalError::try_from(problem);
     match result {
@@ -494,6 +502,8 @@ fn try_from_unprefixed_problem_type_returns_error() {
         instance: None,
         trace_id: None,
         context: serde_json::json!({}),
+        error_code: None,
+        error_domain: None,
     };
     assert!(matches!(
         CanonicalError::try_from(problem),
@@ -515,6 +525,8 @@ fn try_from_malformed_context_returns_error() {
         instance: None,
         trace_id: None,
         context: serde_json::json!({ "violations": 42 }),
+        error_code: None,
+        error_domain: None,
     };
     match CanonicalError::try_from(problem) {
         Err(ProblemConversionError::InvalidContext { category, .. }) => {

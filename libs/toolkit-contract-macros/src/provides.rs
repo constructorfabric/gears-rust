@@ -58,8 +58,7 @@ impl Parse for ProvidesAttr {
         let mut config_key: Option<String> = None;
         let mut policies: Option<Vec<Expr>> = None;
 
-        let items: Punctuated<KeyValue, Token![,]> =
-            Punctuated::parse_terminated(input)?;
+        let items: Punctuated<KeyValue, Token![,]> = Punctuated::parse_terminated(input)?;
         for kv in items {
             let KeyValue { key, value } = kv;
             let name = key.to_string();
@@ -224,16 +223,10 @@ pub fn generate(attr: &ProvidesAttr, item: &ItemStruct) -> SynResult<TokenStream
         .unwrap_or_else(|| append_segment(&parent_mod, &format_ident!("{}_ir", contract_snake)));
 
     let rest_client_path = attr.rest_client.clone().unwrap_or_else(|| {
-        append_segment(
-            &parent_mod,
-            &format_ident!("{}RestClient", contract_ident),
-        )
+        append_segment(&parent_mod, &format_ident!("{}RestClient", contract_ident))
     });
     let grpc_client_path = attr.grpc_client.clone().unwrap_or_else(|| {
-        append_segment(
-            &parent_mod,
-            &format_ident!("{}GrpcClient", contract_ident),
-        )
+        append_segment(&parent_mod, &format_ident!("{}GrpcClient", contract_ident))
     });
     let rest_binding_fn_path = attr.rest_binding_fn.clone().unwrap_or_else(|| {
         append_segment(
@@ -259,7 +252,9 @@ pub fn generate(attr: &ProvidesAttr, item: &ItemStruct) -> SynResult<TokenStream
     // and feed into `policy_stack_from`.
     let policy_stack_expr = match &attr.policies {
         None => quote! { ::toolkit::wiring::default_policy_stack() },
-        Some(list) if list.is_empty() => quote! { ::std::sync::Arc::new(::toolkit_contract::policy::PolicyStack::new()) },
+        Some(list) if list.is_empty() => {
+            quote! { ::std::sync::Arc::new(::toolkit_contract::policy::PolicyStack::new()) }
+        }
         Some(list) => {
             let items = list.iter().map(|e| quote!(::std::sync::Arc::new(#e) as ::std::sync::Arc<dyn ::toolkit_contract::policy::Policy>));
             quote! { ::toolkit::wiring::policy_stack_from(vec![#(#items),*]) }

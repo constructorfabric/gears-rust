@@ -85,3 +85,11 @@ tonic-prost-build = { workspace = true, optional = true }
 [dev-dependencies]
 toolkit-contract-protogen.workspace = true
 anyhow.workspace = true
+
+# The proto-regen example imports the `grpc-client`-gated `grpc` module
+# (`payment_api_grpc_binding`), so it only compiles with that feature. Without
+# `required-features`, `cargo test --workspace` (default features) tries to
+# build it and fails on the missing module.
+[[example]]
+name = "gen_grpc_proto"
+required-features = ["grpc-client"]

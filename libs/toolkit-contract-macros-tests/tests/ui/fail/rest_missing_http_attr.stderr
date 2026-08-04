@@ -1,4 +1,4 @@
-error: rest_contract method requires one of `#[get("...")]`, `#[post("...")]`, `#[put("...")]`, or `#[delete("...")]`
+error: rest_contract method requires one of `#[get("...")]`, `#[post("...")]`, `#[put("...")]`, `#[patch("...")]`, or `#[delete("...")]`
   --> tests/ui/fail/rest_missing_http_attr.rs:13:5
    |
 13 |     async fn naked(&self, body: String) -> Result<u32, std::io::Error>;

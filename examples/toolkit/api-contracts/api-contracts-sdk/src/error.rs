@@ -1,8 +1,8 @@
 //! Error types for the `PaymentService` contract.
 
+use serde::{Deserialize, Serialize};
 use toolkit_canonical_errors_macro::resource_error;
 use toolkit_contract::ContractError;
-use serde::{Deserialize, Serialize};
 
 /// Resource error constructors for payment operations.
 ///

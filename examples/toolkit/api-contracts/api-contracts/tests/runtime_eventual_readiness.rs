@@ -166,9 +166,10 @@ impl RunnableCapability for MockGateway {
 
         let shutdown = async move { cancel.cancelled().await };
         tokio::spawn(async move {
-            let _ = axum::serve(listener, router)
+            axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown)
-                .await;
+                .await
+                .ok();
         });
         Ok(())
     }
@@ -207,8 +208,10 @@ async fn consumer_resolves_provider_through_runtime_phases() {
     builder.register_core_with_meta(PROVIDER_GEAR, &[], provider.clone() as Arc<dyn Gear>);
     builder.register_rest_with_meta(PROVIDER_GEAR, provider as Arc<dyn RestApiCapability>);
     builder.register_core_with_meta("mock-gateway", &[], gateway.clone() as Arc<dyn Gear>);
-    builder
-        .register_rest_host_with_meta("mock-gateway", gateway.clone() as Arc<dyn ApiGatewayCapability>);
+    builder.register_rest_host_with_meta(
+        "mock-gateway",
+        gateway.clone() as Arc<dyn ApiGatewayCapability>,
+    );
     builder.register_stateful_with_meta("mock-gateway", gateway as Arc<dyn RunnableCapability>);
     let registry = builder.build_topo_sorted().expect("registry build");
 
@@ -237,9 +240,15 @@ async fn consumer_resolves_provider_through_runtime_phases() {
     // provider. Poll a charge call until eventual readiness converges.
     let deadline = Instant::now() + Duration::from_secs(15);
     let resp = loop {
-        assert!(Instant::now() < deadline, "eventual readiness did not converge");
+        assert!(
+            Instant::now() < deadline,
+            "eventual readiness did not converge"
+        );
         if let Ok(client) = hub.get::<dyn PaymentApi>() {
-            match client.charge(SecurityContext::anonymous(), charge_req()).await {
+            match client
+                .charge(SecurityContext::anonymous(), charge_req())
+                .await
+            {
                 Ok(resp) => break resp,
                 Err(CanonicalError::ServiceUnavailable { .. }) => { /* not ready yet */ }
                 Err(other) => panic!("unexpected error: {other:?}"),
@@ -272,9 +281,12 @@ async fn consumer_resolves_provider_through_runtime_phases() {
     cancel.cancel();
     let drain_deadline = Instant::now() + Duration::from_secs(5);
     while readiness.report().phase != ReadinessPhase::Draining {
-        assert!(Instant::now() < drain_deadline, "readiness did not reach Draining");
+        assert!(
+            Instant::now() < drain_deadline,
+            "readiness did not reach Draining"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+    tokio::time::timeout(Duration::from_secs(5), run).await.ok();
 }

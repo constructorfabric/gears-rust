@@ -140,7 +140,7 @@ pub mod readiness;
 pub mod runtime;
 pub mod wiring;
 
-pub use readiness::{ReadinessPhase, ReadinessReport, ReadinessState};
+pub use readiness::{ReadinessHealthcheck, ReadinessPhase, ReadinessReport, ReadinessState};
 
 // Domain layer marker traits for DDD enforcement
 pub mod domain;

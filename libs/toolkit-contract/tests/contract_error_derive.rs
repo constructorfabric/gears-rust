@@ -6,8 +6,8 @@
 //!   variant; unknown codes round-trip back as the original `Problem`.
 //! - Round-trip across JSON serialization.
 
-use toolkit_contract::{ContractError, Problem};
 use serde::{Deserialize, Serialize};
+use toolkit_contract::{ContractError, Problem};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ContractError)]
 #[error_domain("billing.v1")]
@@ -162,6 +162,64 @@ fn round_trip_survives_json_serialization() {
     assert_eq!(recovered, original);
 }
 
+// --- Forward/interop tolerance: absent optional vs required fields (M-5) -----
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ContractError)]
+#[error_domain("orders.v1")]
+#[non_exhaustive]
+pub enum OrderRejection {
+    #[error_code("REJECTED")]
+    #[canonical(FailedPrecondition)]
+    Rejected {
+        reason: String,
+        hint: Option<String>,
+    },
+}
+
+#[test]
+fn try_from_tolerates_absent_optional_field() {
+    // A peer (or older/newer variant) that OMITS an optional field entirely must
+    // still reconstruct the typed variant with `None` — not bounce to the
+    // generic envelope (M-5). Absent key is treated as JSON null.
+    let mut problem: Problem = OrderRejection::Rejected {
+        reason: "declined".into(),
+        hint: Some("retry later".into()),
+    }
+    .into();
+    problem
+        .context
+        .get_mut("data")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("data object")
+        .remove("hint");
+    let back = OrderRejection::try_from(problem).expect("typed reconstruction");
+    assert_eq!(
+        back,
+        OrderRejection::Rejected {
+            reason: "declined".into(),
+            hint: None,
+        }
+    );
+}
+
+#[test]
+fn try_from_bounces_when_required_field_absent() {
+    // A missing REQUIRED field must still fail and bounce the original Problem —
+    // strictness is preserved for non-optional data.
+    let mut problem: Problem = OrderRejection::Rejected {
+        reason: "declined".into(),
+        hint: None,
+    }
+    .into();
+    problem
+        .context
+        .get_mut("data")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("data object")
+        .remove("reason");
+    assert!(OrderRejection::try_from(problem).is_err());
+}
+
 // --- Client-side total reconstruction via the fallback bridge ---------------
 // `#[contract_error(fallback)]` generates `From<TransportError> for MyError`
 // (gated on `rest-client`): a `Problem` is offered to `TryFrom` first, and any
@@ -171,9 +229,14 @@ mod transport_fallback {
     use super::*;
     use toolkit_contract::runtime::transport_error::TransportError;
 
+    // The `#[contract_error(fallback)]` variant holds a full `Problem` by value
+    // (the derive constructs it unboxed), which trips `large_enum_variant` under
+    // `-D clippy::perf`. That's inherent to the fallback pattern being tested;
+    // enum size is irrelevant in a test, so allow it here.
     #[derive(Debug, Clone, Serialize, Deserialize, ContractError)]
     #[error_domain("orders.v1")]
     #[non_exhaustive]
+    #[allow(clippy::large_enum_variant)]
     pub enum OrderError {
         #[error_code("NOT_FOUND")]
         #[canonical(NotFound)]
@@ -188,7 +251,7 @@ mod transport_fallback {
     #[test]
     fn reconstructs_typed_variant_from_problem() {
         let problem: Problem = OrderError::NotFound { id: "abc".into() }.into();
-        let via_transport: OrderError = TransportError::Problem(problem).into();
+        let via_transport: OrderError = TransportError::problem(problem).into();
         match via_transport {
             OrderError::NotFound { id } => assert_eq!(id, "abc"),
             other => panic!("expected typed NotFound, got {other:?}"),
@@ -199,7 +262,7 @@ mod transport_fallback {
     fn unknown_problem_routes_to_fallback() {
         // A foreign Problem (billing.v1 / MAINTENANCE) unknown to OrderError.
         let foreign: Problem = BillingError::Maintenance.into();
-        let err: OrderError = TransportError::Problem(foreign).into();
+        let err: OrderError = TransportError::problem(foreign).into();
         assert!(matches!(err, OrderError::Unknown { .. }));
     }
 

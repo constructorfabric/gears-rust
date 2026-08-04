@@ -14,6 +14,10 @@ use syn::{Ident, ItemTrait, ReturnType, TraitItem, TraitItemFn, Type};
 
 pub struct RestContractAttr {
     pub base_path: String,
+    /// `#[toolkit::rest_contract(base_path = "...", require_full_coverage)]`
+    /// (ADR-0003): opt into a generated coverage assertion that every base-trait
+    /// method has a REST binding (and vice-versa).
+    pub require_full_coverage: bool,
 }
 
 pub struct RestContractModel {
@@ -21,6 +25,7 @@ pub struct RestContractModel {
     pub trait_ident: Ident,
     pub base_trait: syn::Path,
     pub base_path: String,
+    pub require_full_coverage: bool,
     pub methods: Vec<RestMethodModel>,
 }
 
@@ -35,8 +40,10 @@ pub struct RestMethodModel {
     pub retryable: bool,
     pub streaming: bool,
     pub params: Vec<RestParam>,
-    /// `Some((ok_ty, err_ty))` for unary methods returning `Result<T, E>`.
-    /// `None` for streaming methods or otherwise non-`Result` returns.
+    /// `Some((ok_ty, err_ty))` extracted from the method's `Result<T, E>`
+    /// return type. Populated for **both** unary and streaming methods (a
+    /// streaming method is authored as `Result<Item, E>` and the macro rewrites
+    /// the emitted signature to `Pin<Box<dyn Stream<Item = Result<Item, E>>>>`).
     pub result_types: Option<(Type, Type)>,
     /// `true` when the projection method declares a default body — peers
     /// MAY omit this endpoint (mirrored into `HttpMethodBindingIr.optional`).
@@ -58,11 +65,13 @@ pub enum HttpVerb {
     Get,
     Post,
     Put,
+    Patch,
     Delete,
 }
 
 mod kw {
     syn::custom_keyword!(base_path);
+    syn::custom_keyword!(require_full_coverage);
 }
 
 impl syn::parse::Parse for RestContractAttr {
@@ -70,9 +79,11 @@ impl syn::parse::Parse for RestContractAttr {
         if input.is_empty() {
             return Ok(Self {
                 base_path: String::new(),
+                require_full_coverage: false,
             });
         }
         let mut base_path = None;
+        let mut require_full_coverage = false;
         while !input.is_empty() {
             let lookahead = input.lookahead1();
             if lookahead.peek(kw::base_path) {
@@ -83,6 +94,15 @@ impl syn::parse::Parse for RestContractAttr {
                     return Err(syn::Error::new(lit.span(), "duplicate `base_path`"));
                 }
                 base_path = Some(lit.value());
+            } else if lookahead.peek(kw::require_full_coverage) {
+                let kw: kw::require_full_coverage = input.parse()?;
+                if require_full_coverage {
+                    return Err(syn::Error::new(
+                        kw.span,
+                        "duplicate `require_full_coverage`",
+                    ));
+                }
+                require_full_coverage = true;
             } else {
                 return Err(lookahead.error());
             }
@@ -92,6 +112,7 @@ impl syn::parse::Parse for RestContractAttr {
         }
         Ok(Self {
             base_path: base_path.unwrap_or_default(),
+            require_full_coverage,
         })
     }
 }
@@ -167,6 +188,7 @@ pub fn parse(attr: RestContractAttr, item: ItemTrait) -> syn::Result<RestContrac
         trait_ident,
         base_trait,
         base_path: attr.base_path,
+        require_full_coverage: attr.require_full_coverage,
         methods,
     })
 }
@@ -194,14 +216,33 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
 
     for attr in &method.attrs {
         let path = attr.path();
-        if path.is_ident("get") {
-            http = Some((HttpVerb::Get, parse_path_lit(attr)?, attr.span()));
+        // Recognize the verb (if any) on this attribute, then reject a SECOND
+        // verb on the same method (`#[get(..)] #[post(..)]`) — silently letting
+        // the last one win would change the wire contract with no signal (M-11).
+        let verb = if path.is_ident("get") {
+            Some(HttpVerb::Get)
         } else if path.is_ident("post") {
-            http = Some((HttpVerb::Post, parse_path_lit(attr)?, attr.span()));
+            Some(HttpVerb::Post)
         } else if path.is_ident("put") {
-            http = Some((HttpVerb::Put, parse_path_lit(attr)?, attr.span()));
+            Some(HttpVerb::Put)
+        } else if path.is_ident("patch") {
+            Some(HttpVerb::Patch)
         } else if path.is_ident("delete") {
-            http = Some((HttpVerb::Delete, parse_path_lit(attr)?, attr.span()));
+            Some(HttpVerb::Delete)
+        } else {
+            None
+        };
+        if let Some(verb) = verb {
+            if http.is_some() {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "duplicate HTTP method annotation: a projection method must declare \
+                     exactly one of `#[get]`/`#[post]`/`#[put]`/`#[patch]`/`#[delete]`",
+                ));
+            }
+            let path_lit = parse_path_lit(attr)?;
+            validate_path_template(&path_lit, attr.span())?;
+            http = Some((verb, path_lit, attr.span()));
         } else if path.is_ident("retryable") {
             retryable = true;
         } else if path.is_ident("streaming") {
@@ -215,7 +256,7 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
         syn::Error::new(
             method.span(),
             "rest_contract method requires one of `#[get(\"...\")]`, `#[post(\"...\")]`, \
-             `#[put(\"...\")]`, or `#[delete(\"...\")]`",
+             `#[put(\"...\")]`, `#[patch(\"...\")]`, or `#[delete(\"...\")]`",
         )
     })?;
 
@@ -229,6 +270,23 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
     // (its base ends in `Api`/`Backend`, enforced above), so a missing context
     // is a hard error rather than a silently-unauthenticated call.
     match params.first() {
+        // Platform-plane REST is deferred: the client does not yet source the
+        // internal token (`X-ToolKit-Internal-Token`), so a generated client for
+        // such a method would emit an *unauthenticated* request. Reject it at
+        // compile time (rather than silently shipping a broken client) until the
+        // token carrier is wired below the contract layer. Platform-plane system
+        // contracts are served today over gRPC (`InternalAuthInterceptor`) or by
+        // a manual client. See DESIGN §2.2 "Security Context on Remote Contracts".
+        Some(first) if crate::projection::is_platform_security_context_type(&first.ty) => {
+            return Err(syn::Error::new_spanned(
+                &first.ty,
+                "platform-plane REST projections are not supported yet: the generated \
+                 client cannot source the internal token, so it would emit an \
+                 unauthenticated request. Serve this contract over gRPC \
+                 (`#[toolkit::grpc_contract]` + `InternalAuthInterceptor`) or write a \
+                 manual client. See DESIGN section 2.2 (cpt-cf-binding-constraint-security-context)",
+            ));
+        }
         Some(first) if crate::projection::is_security_context_type(&first.ty) => {}
         _ => {
             return Err(syn::Error::new(
@@ -236,7 +294,7 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
                 "remote contract method must take a security-plane context as its first \
                  argument: `SecurityContext` (tenant plane) or `PlatformSecurityContext` \
                  (platform plane), by value or by reference \
-                 (DESIGN §2.2 cpt-cf-binding-constraint-security-context)",
+                 (DESIGN section 2.2 cpt-cf-binding-constraint-security-context)",
             ));
         }
     }
@@ -266,6 +324,51 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
 fn parse_path_lit(attr: &syn::Attribute) -> syn::Result<String> {
     let lit: syn::LitStr = attr.parse_args()?;
     Ok(lit.value())
+}
+
+/// Validate a path template at macro-expansion time (M-12) so malformed routes
+/// (`"/a/{"`, `"/a/{}"`, `"/a/{x}}"`, nested `"{{x}}"`) are a clear compile
+/// error at the attribute span rather than surfacing far away (or only at
+/// `validate_http_binding` test/`provides` time). Each `{...}` segment must be
+/// a non-empty balanced placeholder with a valid Rust-ish identifier inside.
+fn validate_path_template(path: &str, span: Span) -> syn::Result<()> {
+    let err = |msg: &str| {
+        Err(syn::Error::new(
+            span,
+            format!("malformed path template `{path}`: {msg}"),
+        ))
+    };
+    let mut chars = path.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        match c {
+            '}' => return err("unmatched `}`"),
+            '{' => {
+                let mut name = String::new();
+                let mut closed = false;
+                for (_, cc) in chars.by_ref() {
+                    match cc {
+                        '}' => {
+                            closed = true;
+                            break;
+                        }
+                        '{' => return err("nested `{` in a path parameter"),
+                        _ => name.push(cc),
+                    }
+                }
+                if !closed {
+                    return err("unterminated `{` (missing `}`)");
+                }
+                if name.is_empty() {
+                    return err("empty path parameter `{}`");
+                }
+                if !name.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
+                    return err("path parameter must be an identifier (alphanumeric/underscore)");
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn parse_params(method: &TraitItemFn) -> syn::Result<Vec<RestParam>> {
@@ -342,11 +445,12 @@ impl HttpVerb {
             HttpVerb::Get => "Get",
             HttpVerb::Post => "Post",
             HttpVerb::Put => "Put",
+            HttpVerb::Patch => "Patch",
             HttpVerb::Delete => "Delete",
         }
     }
 
     pub fn allows_body(self) -> bool {
-        matches!(self, HttpVerb::Post | HttpVerb::Put)
+        matches!(self, HttpVerb::Post | HttpVerb::Put | HttpVerb::Patch)
     }
 }

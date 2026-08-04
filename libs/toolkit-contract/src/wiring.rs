@@ -83,10 +83,7 @@ pub enum ClientWiring {
 impl ClientTuning {
     /// Apply tuning overrides onto a fresh [`ClientConfig`] built from `endpoint`.
     #[must_use]
-    pub fn apply_to(
-        &self,
-        endpoint: impl Into<String>,
-    ) -> crate::runtime::config::ClientConfig {
+    pub fn apply_to(&self, endpoint: impl Into<String>) -> crate::runtime::config::ClientConfig {
         use crate::runtime::config::{ClientConfig, ReconnectConfig, RetryConfig};
 
         let mut cfg = ClientConfig::new(endpoint);

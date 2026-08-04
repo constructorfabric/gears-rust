@@ -36,6 +36,18 @@ where
             Err(err) if !err.is_transient() => return Err(err),
             Err(err) => {
                 let delay = next_delay(config, attempt, &err);
+                // Retry is unusual control flow that hides latency and repeated
+                // upstream failures from the caller; without this, operators
+                // have no visibility into attempt counts or backoff. Emitted
+                // under whatever span is current (the generated client's
+                // per-method span), so it's attributed to the right call.
+                tracing::warn!(
+                    attempt,
+                    max_attempts = max,
+                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    error = %err,
+                    "retrying transient error with backoff"
+                );
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
@@ -47,9 +59,17 @@ where
 /// Delay before the next retry: a server-advised `Retry-After` when the error
 /// carries one, otherwise computed exponential backoff. The number of retries
 /// is bounded by `max_attempts` regardless of this value.
+///
+/// A server-advised `Retry-After` is **clamped to `max_delay`** so a hostile or
+/// misconfigured peer cannot stall the client for an unbounded time (e.g.
+/// `Retry-After: 86400`). `max_delay` is the client's own ceiling on how long a
+/// single backoff may last, and it applies to both the computed and the
+/// server-advised paths.
 fn next_delay(config: &RetryConfig, attempt: u32, err: &TransportError) -> Duration {
-    err.retry_after()
-        .unwrap_or_else(|| compute_delay(config, attempt))
+    match err.retry_after() {
+        Some(advised) => advised.min(config.max_delay),
+        None => compute_delay(config, attempt),
+    }
 }
 
 fn compute_delay(config: &RetryConfig, attempt: u32) -> Duration {
@@ -143,13 +163,29 @@ mod tests {
         // exercise the NaN-guard path indirectly by feeding a NaN
         // `multiplier`. With the guard in place, `compute_delay` must
         // not panic regardless of the (non-finite) arithmetic.
+        // NOTE: `f64::min` treats NaN as "ignore me, return the other operand"
+        // (IEEE 754 minNum semantics) — so `NaN.min(max_secs)` yields the
+        // FINITE `max_secs`, not NaN, and the guard's own dedicated
+        // non-finite fallback branch is not even reached for this multiplier.
+        // The guarantee this test verifies is therefore "the result stays
+        // finite and within [0, max_delay]" — not a specific fallback value —
+        // which is exactly the bounded, sane result the `#20` fix requires
+        // instead of merely "did not panic".
         let cfg = RetryConfig {
             max_attempts: 3,
             base_delay: Duration::from_millis(100),
             max_delay: Duration::from_secs(2),
             multiplier: f64::NAN,
         };
-        let _ = compute_delay(&cfg, 2);
+        let delay = compute_delay(&cfg, 2);
+        assert!(
+            delay.as_secs_f64().is_finite(),
+            "delay must be finite, got {delay:?}"
+        );
+        assert!(
+            delay <= cfg.max_delay,
+            "delay must be bounded by max_delay, got {delay:?}"
+        );
 
         let cfg_inf = RetryConfig {
             max_attempts: 3,
@@ -157,7 +193,15 @@ mod tests {
             max_delay: Duration::from_secs(1),
             multiplier: f64::INFINITY,
         };
-        let _ = compute_delay(&cfg_inf, 2);
+        let delay_inf = compute_delay(&cfg_inf, 2);
+        assert!(
+            delay_inf.as_secs_f64().is_finite(),
+            "delay must be finite, got {delay_inf:?}"
+        );
+        assert!(
+            delay_inf <= cfg_inf.max_delay,
+            "delay must be bounded by max_delay, got {delay_inf:?}"
+        );
     }
 
     #[test]
@@ -180,6 +224,24 @@ mod tests {
         let err = TransportError::network("boom");
         let d = next_delay(&cfg, 1, &err);
         assert!(d <= cfg.max_delay);
+    }
+
+    #[test]
+    fn next_delay_caps_retry_after_at_max_delay() {
+        // A hostile/misconfigured peer advising a huge Retry-After must not
+        // stall the client beyond its own `max_delay` ceiling (M-2).
+        let cfg = RetryConfig {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_secs(2),
+            multiplier: 2.0,
+        };
+        let err = TransportError::HttpStatus {
+            status: 503,
+            body: String::new(),
+            retry_after: Some(Duration::from_hours(24)),
+        };
+        assert_eq!(next_delay(&cfg, 1, &err), Duration::from_secs(2));
     }
 
     #[tokio::test]

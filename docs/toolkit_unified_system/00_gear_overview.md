@@ -4,7 +4,7 @@
 
 > **Terminology**: A **Gear** is the new name for a **gear**. The two terms are
 > interchangeable across the codebase and docs: the directory is still
-> `gears/<name>/`, the macro is still `#[modkit::gear]`, and the runtime
+> `gears/<name>/`, the macro is still `#[toolkit::gear]`, and the runtime
 > still discovers "gears". Conceptually, a Gear is a self-contained,
 > composable unit of business capability that plugs into the Cyber Fabric / Rust
 > (CF/Rust) platform.

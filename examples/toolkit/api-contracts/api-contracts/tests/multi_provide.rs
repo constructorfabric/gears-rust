@@ -16,12 +16,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 use toolkit::config::ConfigProvider;
 use toolkit::{ClientHub, GearCtx};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_contract::policy::PolicyStack;
 use toolkit_security::SecurityContext;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 // ----- Contract A ------------------------------------------------------
@@ -73,17 +73,16 @@ impl BarApi for BarLocal {
 pub struct MultiProvider;
 
 impl MultiProvider {
-    fn build_foo(
-        _ctx: &GearCtx,
-        _policies: Arc<PolicyStack>,
-    ) -> anyhow::Result<Arc<dyn FooApi>> {
+    // `#[toolkit::provides]` applies `?` to the `local` factory's return
+    // value, so `Result` is a required part of the macro's calling
+    // convention, not incidental — these always succeed.
+    #[allow(clippy::unnecessary_wraps)]
+    fn build_foo(_ctx: &GearCtx, _policies: Arc<PolicyStack>) -> anyhow::Result<Arc<dyn FooApi>> {
         Ok(Arc::new(FooLocal))
     }
 
-    fn build_bar(
-        _ctx: &GearCtx,
-        _policies: Arc<PolicyStack>,
-    ) -> anyhow::Result<Arc<dyn BarApi>> {
+    #[allow(clippy::unnecessary_wraps)]
+    fn build_bar(_ctx: &GearCtx, _policies: Arc<PolicyStack>) -> anyhow::Result<Arc<dyn BarApi>> {
         Ok(Arc::new(BarLocal))
     }
 }
@@ -122,7 +121,10 @@ async fn both_wire_methods_register_independently() {
     let bar = ctx.client_hub().get::<dyn BarApi>().unwrap();
 
     assert_eq!(foo.ping(SecurityContext::anonymous()).await.unwrap(), 42);
-    assert_eq!(bar.pong(SecurityContext::anonymous()).await.unwrap(), "pong");
+    assert_eq!(
+        bar.pong(SecurityContext::anonymous()).await.unwrap(),
+        "pong"
+    );
 }
 
 #[tokio::test]

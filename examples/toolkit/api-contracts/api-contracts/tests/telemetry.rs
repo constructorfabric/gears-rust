@@ -2,7 +2,7 @@
 //! method opens a `tracing` client span named `{Trait}.{method}` carrying the
 //! OTel-semantic fields (`otel.kind`, `rpc.system`, `rpc.service`, `rpc.method`,
 //! `http.method`, `http.route`). That span is what makes `toolkit-http`'s
-//! OtelLayer inject the correct W3C `traceparent` downstream — see ADR-0006.
+//! `OtelLayer` inject the correct W3C `traceparent` downstream — see ADR-0006.
 //!
 //! We capture spans with a minimal `tracing_subscriber` layer rather than a
 //! live collector: this asserts the *client-side* instrumentation exists and is
@@ -133,11 +133,26 @@ async fn generated_client_emits_named_contract_span() {
             )
         });
 
-    assert_eq!(charge_span.fields.get("otel.kind").map(String::as_str), Some("client"));
-    assert_eq!(charge_span.fields.get("rpc.system").map(String::as_str), Some("rest"));
-    assert_eq!(charge_span.fields.get("rpc.service").map(String::as_str), Some("PaymentApiRest"));
-    assert_eq!(charge_span.fields.get("rpc.method").map(String::as_str), Some("charge"));
-    assert_eq!(charge_span.fields.get("http.method").map(String::as_str), Some("POST"));
+    assert_eq!(
+        charge_span.fields.get("otel.kind").map(String::as_str),
+        Some("client")
+    );
+    assert_eq!(
+        charge_span.fields.get("rpc.system").map(String::as_str),
+        Some("rest")
+    );
+    assert_eq!(
+        charge_span.fields.get("rpc.service").map(String::as_str),
+        Some("PaymentApiRest")
+    );
+    assert_eq!(
+        charge_span.fields.get("rpc.method").map(String::as_str),
+        Some("charge")
+    );
+    assert_eq!(
+        charge_span.fields.get("http.method").map(String::as_str),
+        Some("POST")
+    );
     assert_eq!(
         charge_span.fields.get("http.route").map(String::as_str),
         Some("/payments/charge"),

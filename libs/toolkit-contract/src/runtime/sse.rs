@@ -8,10 +8,17 @@
 //!
 //! All other event types are ignored. Comments (lines starting with `:`) and
 //! blank lines are stripped per the SSE spec.
+//!
+//! Accumulated per-line and per-event buffers are bounded by
+//! [`MAX_ACCUMULATED_BYTES`] to protect against a peer that streams an
+//! unbounded line (no terminating `\n`) or an unbounded run of `data:` lines
+//! with no dispatching blank line — otherwise the buffer would grow without
+//! limit for the lifetime of a self-healing, indefinitely-reconnecting client.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
@@ -66,6 +73,44 @@ impl LastEventId {
     }
 }
 
+/// Maximum bytes the parser accumulates for a not-yet-terminated line ([`SseStream::buf`])
+/// or for a not-yet-dispatched event's `data:` payload ([`SseStream::event_data`])
+/// before treating the peer as protocol-violating and terminating the stream
+/// with [`TransportError::sse`]. Generous enough for any realistic single
+/// event; guards against unbounded memory growth from a misbehaving peer.
+const MAX_ACCUMULATED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Shared monotonic counter bumped every time the parser receives a byte chunk
+/// from the wire — **including** chunks that carry only keepalive comments or
+/// other non-dispatching frames. Streaming clients snapshot it around an idle
+/// wait so a low-data-rate stream kept alive purely by `:keepalive` comments is
+/// recognised as *active* rather than *idle* (the idle timeout must be idle).
+///
+/// Wraps `Arc<AtomicU64>` as a newtype so the atomic choice isn't part of the
+/// public surface.
+#[derive(Clone, Debug, Default)]
+pub struct SseActivity(Arc<AtomicU64>);
+
+impl SseActivity {
+    /// Create a fresh activity counter at generation 0.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Current activity generation. Compare two snapshots to detect whether any
+    /// wire chunk arrived in between.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Record that a wire chunk arrived.
+    fn bump(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Parse an SSE byte stream into a stream of typed events.
 ///
 /// `bytes` is typically the byte-stream view of
@@ -98,12 +143,15 @@ where
     SseStream {
         inner: bytes,
         buf: BytesMut::with_capacity(4 * 1024),
+        scan_from: 0,
         pending: VecDeque::new(),
         event_kind: None,
         event_data: String::new(),
         event_id: None,
         done: false,
+        explicit_done: false,
         last_event_id,
+        activity: SseActivity::new(),
         _marker: std::marker::PhantomData,
     }
 }
@@ -112,6 +160,12 @@ where
 pub struct SseStream<T, S> {
     inner: S,
     buf: BytesMut,
+    /// Prefix length of `buf`, in bytes, already confirmed to contain no
+    /// unconsumed `\n`. Lets [`find_line_end`] resume scanning from here
+    /// instead of rescanning the whole buffer on every poll — without this, a
+    /// single long unterminated line delivered over many small chunks costs
+    /// `O(total_length²)` instead of `O(total_length)`.
+    scan_from: usize,
     pending: VecDeque<Result<T, TransportError>>,
     /// Last `event:` value seen since the previous dispatch. `None` means
     /// the implicit default `"message"`.
@@ -124,7 +178,15 @@ pub struct SseStream<T, S> {
     /// per-event scratch used to update [`LastEventId`] on dispatch.
     event_id: Option<String>,
     done: bool,
+    /// `true` only when the stream ended because an `event: done` frame was
+    /// actually dispatched — as opposed to `done` being set because the
+    /// underlying byte stream simply closed (peer disconnect, proxy timeout,
+    /// etc.). The streaming client uses this to tell "the peer said it's
+    /// finished" apart from "the connection just ended", so it can treat the
+    /// latter as reconnect-eligible instead of a silent success.
+    explicit_done: bool,
     last_event_id: LastEventId,
+    activity: SseActivity,
     _marker: std::marker::PhantomData<fn() -> T>,
 }
 
@@ -135,6 +197,23 @@ impl<T, S> SseStream<T, S> {
     #[must_use]
     pub fn last_event_id_handle(&self) -> LastEventId {
         self.last_event_id.clone()
+    }
+
+    /// `true` iff the stream ended because the peer explicitly dispatched an
+    /// `event: done` frame. `false` if the stream ended for any other reason
+    /// (byte stream closed, error) — including while still in progress, so
+    /// callers should only consult this after the stream has yielded `None`.
+    #[must_use]
+    pub fn saw_done_event(&self) -> bool {
+        self.explicit_done
+    }
+
+    /// Returns a clone of the shared wire-activity counter. The streaming client
+    /// snapshots it around an idle-timeout wait so keepalive-only traffic keeps
+    /// the stream alive (see [`SseActivity`]).
+    #[must_use]
+    pub fn activity_handle(&self) -> SseActivity {
+        self.activity.clone()
     }
 }
 
@@ -186,9 +265,15 @@ where
                     )))));
                 }
                 Poll::Ready(Some(Ok(chunk))) => {
+                    // Any wire chunk counts as activity — even one carrying only
+                    // keepalive comments that dispatch no item — so the idle
+                    // timeout in the streaming driver can tell "quiet but alive"
+                    // from "truly idle".
+                    this.activity.bump();
                     this.buf.extend_from_slice(&chunk);
                     let saw_done = drain_buffer(
                         &mut this.buf,
+                        &mut this.scan_from,
                         &mut this.event_kind,
                         &mut this.event_data,
                         &mut this.event_id,
@@ -197,6 +282,20 @@ where
                     );
                     if saw_done {
                         this.done = true;
+                        this.explicit_done = true;
+                    }
+                    // Guard against unbounded memory growth: a peer streaming a
+                    // line with no terminating `\n`, or a run of `data:` lines
+                    // with no dispatching blank line, would otherwise grow
+                    // `buf`/`event_data` without limit for the life of a
+                    // self-healing, indefinitely-reconnecting client.
+                    if this.buf.len() > MAX_ACCUMULATED_BYTES
+                        || this.event_data.len() > MAX_ACCUMULATED_BYTES
+                    {
+                        this.done = true;
+                        return Poll::Ready(Some(Err(TransportError::sse(
+                            "SSE frame exceeds maximum accumulated size; aborting stream",
+                        ))));
                     }
                 }
             }
@@ -209,6 +308,7 @@ where
 /// `done` event was dispatched (caller terminates the stream).
 fn drain_buffer<T: DeserializeOwned + 'static>(
     buf: &mut BytesMut,
+    scan_from: &mut usize,
     event_kind: &mut Option<String>,
     event_data: &mut String,
     event_id: &mut Option<String>,
@@ -216,8 +316,11 @@ fn drain_buffer<T: DeserializeOwned + 'static>(
     last_event_id: &LastEventId,
 ) -> bool {
     let mut saw_done = false;
-    while let Some(line_end) = find_line_end(buf) {
+    while let Some(line_end) = find_line_end(buf, *scan_from) {
         let line_bytes = buf.split_to(line_end.consumed);
+        // Bytes after the found `\n` were never examined by this call (the
+        // scan stops at the first match) — resume from scratch for them.
+        *scan_from = 0;
         // SSE wire format mandates UTF-8 (RFC 8259 § 8.1, EventSource spec).
         // Surface non-conforming server output as a typed transport error
         // instead of silently dropping the line — invisible data loss is
@@ -235,6 +338,10 @@ fn drain_buffer<T: DeserializeOwned + 'static>(
             }
         }
     }
+    // Nothing left to find: everything currently in `buf` is confirmed
+    // newline-free. Remember that so the next poll's `extend_from_slice` only
+    // needs `find_line_end` to scan the newly appended tail.
+    *scan_from = buf.len();
     saw_done
 }
 
@@ -258,6 +365,9 @@ fn drain_remaining<T: DeserializeOwned + 'static>(
     buf.clear();
     event_kind.take();
     event_data.clear();
+    // Note: `scan_from` is intentionally left untouched here — the stream is
+    // marked `done` by the caller right after this returns, so it is never
+    // consulted again.
 }
 
 /// Process a single (trailing-CR/LF-stripped) SSE line. Returns `true` iff
@@ -360,7 +470,7 @@ fn dispatch_event<T: DeserializeOwned + 'static>(
 
 fn parse_problem(payload: &str) -> TransportError {
     match serde_json::from_str::<Problem>(payload) {
-        Ok(p) => TransportError::Problem(p),
+        Ok(p) => TransportError::problem(p),
         Err(e) => TransportError::sse(format!("malformed error event: {e}")),
     }
 }
@@ -370,12 +480,16 @@ struct LineEnd {
     line_len: usize,
 }
 
-fn find_line_end(buf: &[u8]) -> Option<LineEnd> {
-    for (i, b) in buf.iter().enumerate() {
+/// Scan for the next `\n`, starting from byte offset `start` (bytes before
+/// `start` are assumed already confirmed newline-free by the caller — see
+/// [`SseStream::scan_from`]).
+fn find_line_end(buf: &[u8], start: usize) -> Option<LineEnd> {
+    for (i, b) in buf[start..].iter().enumerate() {
         if *b == b'\n' {
+            let abs = start + i;
             return Some(LineEnd {
-                consumed: i + 1,
-                line_len: i,
+                consumed: abs + 1,
+                line_len: abs,
             });
         }
     }
@@ -424,6 +538,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finds_newline_after_many_chunks_with_none() {
+        // Regression test for the incremental `scan_from` optimization (#15):
+        // several chunks arrive with NO newline at all before one finally
+        // completes the line. If `scan_from` bookkeeping were wrong (e.g.
+        // never advanced, or advanced past the eventual `\n`), this would
+        // either loop scanning the same bytes forever or miss the newline.
+        let s = chunks(&["data: {\"i", "d\"", ":", "9", "}", "\n\nevent: done\n\n"]);
+        let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
+        let parsed: Vec<Item> = parsed.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(parsed, vec![Item { id: 9 }]);
+    }
+
+    #[tokio::test]
+    async fn finds_multiple_newlines_within_one_chunk_after_split() {
+        // After a successful split, `scan_from` must reset to 0 for the
+        // remainder — otherwise a `\n` arriving in the SAME chunk as the one
+        // that completed the prior event would be missed until a later poll
+        // (or never, if no more chunks arrive). Two full events delivered in
+        // ONE chunk exercises exactly that: both must be found and dispatched
+        // within this single `drain_buffer` call.
+        let s = chunks(&["data: {\"id\":1}\n\ndata: {\"id\":2}\n\nevent: done\n\n"]);
+        let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
+        let parsed: Vec<Item> = parsed.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(parsed, vec![Item { id: 1 }, Item { id: 2 }]);
+    }
+
+    #[tokio::test]
+    async fn aborts_on_unterminated_line_exceeding_max_size() {
+        // A single line with no terminating `\n` that exceeds the cap must
+        // abort the stream with a typed error rather than growing `buf`
+        // without bound (#3 — OOM/DoS guard).
+        let huge = "a".repeat(MAX_ACCUMULATED_BYTES + 1);
+        let s = chunks(&[huge.as_str()]);
+        let parsed: Vec<Result<Item, TransportError>> =
+            parse_sse_stream::<Item, _, _>(s).collect().await;
+        assert_eq!(parsed.len(), 1, "expected exactly one terminal error item");
+        assert!(
+            matches!(parsed[0], Err(TransportError::Sse(_))),
+            "expected TransportError::Sse, got {:?}",
+            parsed[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn saw_done_event_is_false_when_stream_ends_without_done() {
+        // The stream ends cleanly (no error) but WITHOUT an `event: done`
+        // frame — the streaming client relies on `saw_done_event()` to tell
+        // this apart from an explicit done so it can reconnect instead of
+        // silently treating a bare disconnect as success.
+        let s = chunks(&["data: {\"id\":1}\n\n"]);
+        let mut stream = parse_sse_stream::<Item, _, _>(s);
+        let first = stream.next().await;
+        assert!(matches!(first, Some(Ok(Item { id: 1 }))));
+        let second = stream.next().await;
+        assert!(second.is_none(), "expected clean end, got {second:?}");
+        assert!(
+            !stream.saw_done_event(),
+            "stream ended without an explicit `done` event"
+        );
+    }
+
+    #[tokio::test]
+    async fn saw_done_event_is_true_when_done_dispatched() {
+        let s = chunks(&["data: {\"id\":1}\n\n", "event: done\n\n"]);
+        let mut stream = parse_sse_stream::<Item, _, _>(s);
+        assert!(matches!(stream.next().await, Some(Ok(Item { id: 1 }))));
+        assert!(stream.next().await.is_none());
+        assert!(stream.saw_done_event());
+    }
+
+    #[tokio::test]
     async fn surfaces_error_event_as_problem() {
         // Canonical RFC 9457 Problem on the `event: error` channel.
         let problem = serde_json::json!({
@@ -438,7 +623,7 @@ mod tests {
         let parsed: Vec<_> = parse_sse_stream::<Item, _, _>(s).collect().await;
         assert_eq!(parsed.len(), 1);
         match parsed.into_iter().next().unwrap() {
-            Err(TransportError::Problem(p)) => {
+            Err(TransportError::Problem { problem: p, .. }) => {
                 assert_eq!(p.detail, "broke");
                 assert!(p.problem_type.contains("internal"));
             }

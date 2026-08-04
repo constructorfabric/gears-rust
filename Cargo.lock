@@ -2879,6 +2879,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-contract-macros",
  "cf-gears-toolkit-http",
@@ -2890,6 +2891,8 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "parking_lot",
  "percent-encoding",
  "rand 0.10.1",
@@ -2901,6 +2904,9 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "utoipa",
  "uuid",
 ]
 

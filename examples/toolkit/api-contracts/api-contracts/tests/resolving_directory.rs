@@ -1,6 +1,6 @@
-//! End-to-end proof of the directory-resolving REST client (eventual readiness
-//! + churn), exercised against the real `GearManager` directory and a live
-//! Axum server serving the `PaymentApi` routes.
+//! End-to-end proof of the directory-resolving REST client (eventual
+//! readiness and churn), exercised against the real `GearManager` directory
+//! and a live `Axum` server serving the `PaymentApi` routes.
 //!
 //! Covers the three consumer-side requirements:
 //! 1. **Provider registers its REST endpoint** in the directory (via
@@ -52,7 +52,12 @@ impl EndpointResolver for DirectoryResolver {
         // live instance is registered, so map that to `Ok(None)` (not-ready)
         // rather than a directory-backend failure. A real out-of-process
         // adapter would distinguish "not found" from transport errors here.
-        Ok(self.0.resolve_rest_service(gear).await.ok().map(|ep| ep.uri))
+        Ok(self
+            .0
+            .resolve_rest_service(gear)
+            .await
+            .ok()
+            .map(|ep| ep.uri))
     }
 }
 

@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 /// HTTP binding projection for a contract.
+///
+/// Deliberately NOT `#[non_exhaustive]` (see [`super::contract::ContractIr`]'s
+/// doc): `#[toolkit::rest_contract]` emits a struct-literal `HttpBindingIr { .. }`
+/// into the SDK crate's generated `<trait>_http_binding()` function.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpBindingIr {
     /// Base path prefix.
@@ -44,6 +48,7 @@ pub struct HttpMethodBindingIr {
 
 /// HTTP method verb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum HttpMethod {
     /// HTTP GET.
     Get,
@@ -51,12 +56,21 @@ pub enum HttpMethod {
     Post,
     /// HTTP PUT.
     Put,
+    /// HTTP PATCH.
+    Patch,
     /// HTTP DELETE.
     Delete,
 }
 
 /// How an input field is bound to the HTTP request.
+///
+/// `#[non_exhaustive]` at the enum level only: codegen only ever constructs
+/// the variants that exist today (`Path`/`Query`/`Body`), so this doesn't
+/// block macro-generated construction — it only forces downstream `match`
+/// arms to include a wildcard, so adding a future binding kind isn't a
+/// breaking change for crates that match on this type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum HttpFieldBinding {
     /// Field value goes into a URL path parameter.
     Path {
@@ -74,11 +88,4 @@ pub enum HttpFieldBinding {
     },
     /// Field value goes into the request body.
     Body,
-    /// Field value goes into an HTTP header.
-    Header {
-        /// Name of the field in `InputShape`.
-        field: String,
-        /// Name of the HTTP header.
-        header: String,
-    },
 }

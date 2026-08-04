@@ -101,6 +101,13 @@ pub struct DirectoryResolvingClient<C> {
     build: Box<ClientBuilder<C>>,
     /// Cached `(endpoint, client)` reused while the resolved endpoint is stable.
     cache: RwLock<Option<(String, Arc<C>)>>,
+    /// Serializes the build step. Without this, N callers that concurrently
+    /// observe the same stale/absent cache entry (first call, or immediately
+    /// after an endpoint change) would each construct a redundant client —
+    /// only the guard is held, never across an `.await` (the directory lookup
+    /// has already completed by the time this lock is taken; `build` itself
+    /// is synchronous).
+    build_lock: std::sync::Mutex<()>,
 }
 
 impl<C: Send + Sync + 'static> DirectoryResolvingClient<C> {
@@ -124,6 +131,7 @@ impl<C: Send + Sync + 'static> DirectoryResolvingClient<C> {
             tuning,
             build: Box::new(build),
             cache: RwLock::new(None),
+            build_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -159,15 +167,22 @@ impl<C: Send + Sync + 'static> DirectoryResolvingClient<C> {
         };
 
         // Fast path: endpoint unchanged → reuse the cached client.
-        if let Ok(r) = self.cache.read() {
-            if let Some((cached_uri, client)) = r.as_ref() {
-                if *cached_uri == uri {
-                    return Ok(Arc::clone(client));
-                }
-            }
+        if let Some(client) = self.cached_for(&uri) {
+            return Ok(client);
         }
 
-        // First call, or the endpoint changed: build and cache.
+        // First call, or the endpoint changed: build and cache. Single-flight
+        // via `build_lock` so a thundering herd of concurrent callers that all
+        // missed the fast path above builds the client ONCE, not N times.
+        let _build_guard = self
+            .build_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Re-check under the lock: another caller may have just finished
+        // building for this exact endpoint while we were waiting for it.
+        if let Some(client) = self.cached_for(&uri) {
+            return Ok(client);
+        }
         debug!(gear = %self.from_gear, endpoint = %uri, "building REST client for resolved endpoint");
         let cfg = self.tuning.apply_to(&uri);
         let client = Arc::new((self.build)(cfg)?);
@@ -175,6 +190,13 @@ impl<C: Send + Sync + 'static> DirectoryResolvingClient<C> {
             *w = Some((uri, Arc::clone(&client)));
         }
         Ok(client)
+    }
+
+    /// Returns the cached client if it is present and was built for `uri`.
+    fn cached_for(&self, uri: &str) -> Option<Arc<C>> {
+        let r = self.cache.read().ok()?;
+        let (cached_uri, client) = r.as_ref()?;
+        (cached_uri == uri).then(|| Arc::clone(client))
     }
 
     /// Drop any cached client so a now-absent or moved provider isn't masked
@@ -261,7 +283,11 @@ mod tests {
         let (c, builds) = resolving(vec![Step::Fail]);
         let err = c.resolved().await.unwrap_err();
         assert!(matches!(err, TransportError::Unresolved { .. }));
-        assert_eq!(builds.load(Ordering::SeqCst), 0, "must not build a client on directory failure");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            0,
+            "must not build a client on directory failure"
+        );
     }
 
     #[tokio::test]
@@ -276,11 +302,48 @@ mod tests {
         assert_eq!(c1.base_url, "http://a:8080");
         let c2 = c.resolved().await.unwrap();
         assert_eq!(c2.base_url, "http://a:8080");
-        assert_eq!(builds.load(Ordering::SeqCst), 1, "stable endpoint reuses client");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "stable endpoint reuses client"
+        );
 
         let c3 = c.resolved().await.unwrap();
         assert_eq!(c3.base_url, "http://b:9090");
-        assert_eq!(builds.load(Ordering::SeqCst), 2, "endpoint change rebuilds client");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "endpoint change rebuilds client"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_resolves_build_client_only_once() {
+        // Real OS-thread concurrency (not single-threaded cooperative
+        // interleaving): N callers all resolving to the same first-seen
+        // endpoint race to build. Without single-flight (`build_lock`), each
+        // one that misses the cache before any write lands would construct
+        // its own redundant client.
+        const N: usize = 16;
+        let (c, builds) = resolving(vec![Step::Found("http://a:8080".into()); N]);
+        let c = Arc::new(c);
+
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let c = Arc::clone(&c);
+                tokio::spawn(async move { c.resolved().await.unwrap() })
+            })
+            .collect();
+
+        for h in handles {
+            let client = h.await.unwrap();
+            assert_eq!(client.base_url, "http://a:8080");
+        }
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "single-flight: exactly one build for {N} concurrent resolves to the same endpoint"
+        );
     }
 
     #[tokio::test]

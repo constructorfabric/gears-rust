@@ -8,14 +8,35 @@ pub struct ClientConfig {
     /// Base URL prefix (e.g., `https://billing.internal`).
     /// Combined with the base path declared in the projection trait.
     pub base_url: String,
-    /// Total request deadline applied per call (single attempt).
+    /// Deadline applied to a **single** unary attempt — NOT to the whole logical
+    /// call. A `#[retryable]` method may make up to `retry.max_attempts` attempts,
+    /// so the worst-case wall-clock for a logical call is bounded by
+    /// `max_attempts × (timeout + retry.max_delay)` (the per-retry backoff is
+    /// itself clamped to [`RetryConfig::max_delay`], including a server-advised
+    /// `Retry-After`). There is deliberately no separate whole-call budget field.
     pub timeout: Duration,
+    /// Per-**event** idle deadline for SSE streams: the maximum gap between two
+    /// received stream events before the stream is treated as timed out. A
+    /// long-lived stream is NOT bounded by [`timeout`](Self::timeout) (which
+    /// would kill a healthy slow stream); it is bounded by this larger idle
+    /// deadline instead. Defaults to 60s (> the unary default).
+    pub sse_idle_timeout: Duration,
     /// Retry policy applied to methods marked `#[retryable]`.
     pub retry: RetryConfig,
     /// SSE-stream reconnect policy. By default `max_attempts: 0` — stream
     /// failures bubble up unchanged. Set explicitly to opt into HTML5
     /// EventSource-style `Last-Event-ID` reconnect.
     pub sse_reconnect: ReconnectConfig,
+    /// When `true`, the generated client refuses plaintext `http://` and
+    /// requires TLS (`toolkit_http::TransportSecurity::TlsOnly`) for every
+    /// request — including the bearer-carrying `Authorization` header, which
+    /// otherwise would ride whatever scheme `base_url` uses. Defaults to
+    /// `false`, preserving the platform's existing in-mesh
+    /// service-to-service convention where plaintext HTTP inside a secured
+    /// network boundary is an accepted, deliberate choice (see
+    /// [`build_default_http_client`](crate::runtime::client::build_default_http_client)).
+    /// Set this when a resolved endpoint may cross an untrusted network.
+    pub require_tls: bool,
 }
 
 impl ClientConfig {
@@ -25,15 +46,24 @@ impl ClientConfig {
         Self {
             base_url: base_url.into(),
             timeout: Duration::from_secs(30),
+            sse_idle_timeout: Duration::from_mins(1),
             retry: RetryConfig::default(),
             sse_reconnect: ReconnectConfig::default(),
+            require_tls: false,
         }
     }
 
-    /// Override the per-call timeout.
+    /// Override the per-call (unary) timeout.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Override the SSE per-event idle deadline (max gap between stream events).
+    #[must_use]
+    pub fn with_sse_idle_timeout(mut self, idle: Duration) -> Self {
+        self.sse_idle_timeout = idle;
         self
     }
 
@@ -50,6 +80,14 @@ impl ClientConfig {
     #[must_use]
     pub fn with_sse_reconnect(mut self, sse_reconnect: ReconnectConfig) -> Self {
         self.sse_reconnect = sse_reconnect;
+        self
+    }
+
+    /// Require TLS (reject plaintext `http://`) for this client. See
+    /// [`Self::require_tls`].
+    #[must_use]
+    pub fn with_require_tls(mut self, require_tls: bool) -> Self {
+        self.require_tls = require_tls;
         self
     }
 }

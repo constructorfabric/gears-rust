@@ -4,14 +4,10 @@ pub mod contract;
 pub mod descriptor;
 pub mod error;
 pub mod grpc_repr;
-pub mod http;
 pub mod ir;
 pub mod policy;
 pub mod runtime;
 pub mod wiring;
-
-#[cfg(feature = "openapi")]
-pub mod openapi;
 
 #[cfg(feature = "grpc-client")]
 pub mod grpc;
@@ -29,10 +25,10 @@ pub use ir::{
     MethodIr, MethodKind, PrimitiveType, ServiceIr, TypeRef, ValidationError, validate_contract,
     validate_grpc_binding, validate_http_binding,
 };
+pub use policy::{Policy, PolicyContext, PolicyStack, TracingPolicy};
 pub use toolkit_contract_macros::{
     ContractError, ProtoBridge, consumes, contract, grpc_contract, provides, rest_contract,
 };
-pub use policy::{Policy, PolicyContext, PolicyStack, TracingPolicy};
 pub use wiring::{ClientTuning, ClientWiring, ReconnectSettings, RetrySettings};
 
 /// Re-export of `tracing` for macro-generated client code.

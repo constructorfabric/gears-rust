@@ -172,10 +172,12 @@ pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream
         fn #wire_fn(
             __hub: &::toolkit::ClientHub,
             __resolver: ::std::sync::Arc<dyn ::toolkit::discovery::EndpointResolver>,
-        ) -> ::anyhow::Result<()> {
+        ) -> ::anyhow::Result<::toolkit::discovery::WireOutcome> {
             // A compile-time (local) impl already registered wins — Profile 1.
+            // Report `Local` so the runtime treats the dep as readiness-resolved
+            // without a directory lookup.
             if __hub.try_get::<dyn #contract_path>().is_some() {
-                return ::std::result::Result::Ok(());
+                return ::std::result::Result::Ok(::toolkit::discovery::WireOutcome::Local);
             }
             // Otherwise register the directory-resolving REST client. `tuning`
             // is `Default::default()` (inferred as `ClientTuning`).
@@ -185,7 +187,7 @@ pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream
                 ::core::default::Default::default(),
             );
             __hub.register::<dyn #contract_path>(::std::sync::Arc::new(__client));
-            ::std::result::Result::Ok(())
+            ::std::result::Result::Ok(::toolkit::discovery::WireOutcome::Remote)
         }
 
         #[cfg(feature = "directory-rest-client")]

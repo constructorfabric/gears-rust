@@ -1,0 +1,5 @@
+error: malformed path template `/thing/{id`: unterminated `{` (missing `}`)
+  --> tests/ui/fail/rest_malformed_path.rs:14:5
+   |
+14 |     #[get("/thing/{id")]
+   |     ^

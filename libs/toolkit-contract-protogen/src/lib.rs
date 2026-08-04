@@ -36,11 +36,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use heck::{ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
+use serde_json::Value;
 use toolkit_contract::ir::contract::{
     ContractIr, FieldIr, FieldRole, MethodIr, PrimitiveType, TypeRef,
 };
 use toolkit_contract::ir::grpc::{GrpcBindingIr, GrpcIdempotency};
-use serde_json::Value;
 
 /// Strongly-typed taxonomy of features the generator does not (yet) support.
 /// Replaces the previous `&'static str` `feature` field — variants are
@@ -113,6 +113,12 @@ pub enum ProtoGenFeature {
     // --- oneof payloads --------------------------------------------------
     /// `oneof` variant payload tries to be repeated/map/optional.
     OneofVariantPayloadInvalid,
+
+    // --- Forward-compat guard ----------------------------------------------
+    /// `contract::ir::{TypeRef, PrimitiveType}` are `#[non_exhaustive]` and
+    /// gained a variant this generator predates. Carries the offending
+    /// variant's `Debug` output.
+    UnknownIrVariant(String),
 }
 
 impl std::fmt::Display for ProtoGenFeature {
@@ -160,6 +166,12 @@ impl std::fmt::Display for ProtoGenFeature {
             ProtoGenFeature::EmptyInlineEnum => f.write_str("empty inline enum"),
             ProtoGenFeature::OneofVariantPayloadInvalid => {
                 f.write_str("oneof variant payload cannot be repeated/map/optional")
+            }
+            ProtoGenFeature::UnknownIrVariant(variant) => {
+                write!(
+                    f,
+                    "unknown contract-IR variant `{variant}` (generator predates it)"
+                )
             }
         }
     }
@@ -511,6 +523,10 @@ fn method_output_type(method: &MethodIr) -> Result<ProtoTypeName, ProtoGenError>
                 feature: ProtoGenFeature::NonNamedMethodReturn,
             })
         }
+        other => Err(ProtoGenError::UnsupportedSchemaFeature {
+            schema_name: method.name.clone(),
+            feature: ProtoGenFeature::UnknownIrVariant(format!("{other:?}")),
+        }),
     }
 }
 
@@ -519,7 +535,7 @@ fn method_output_type(method: &MethodIr) -> Result<ProtoTypeName, ProtoGenError>
 /// renderer must suppress `repeated`/`optional` modifiers.
 fn type_ref_to_proto(ty: &TypeRef) -> Result<(String, bool, bool, bool), ProtoGenError> {
     match ty {
-        TypeRef::Primitive(p) => Ok((primitive_proto(*p).to_owned(), false, false, false)),
+        TypeRef::Primitive(p) => Ok((primitive_proto(*p)?.to_owned(), false, false, false)),
         TypeRef::Named(name) => Ok((name.clone(), false, false, false)),
         TypeRef::Optional(inner) => {
             let (t, repeated, _, is_map) = type_ref_to_proto(inner)?;
@@ -574,11 +590,15 @@ fn type_ref_to_proto(ty: &TypeRef) -> Result<(String, bool, bool, bool), ProtoGe
             }
             Ok((format!("map<{key_proto}, {val_proto}>"), false, false, true))
         }
+        other => Err(ProtoGenError::UnsupportedSchemaFeature {
+            schema_name: format!("{other:?}"),
+            feature: ProtoGenFeature::UnknownIrVariant(format!("{other:?}")),
+        }),
     }
 }
 
-fn primitive_proto(p: PrimitiveType) -> &'static str {
-    match p {
+fn primitive_proto(p: PrimitiveType) -> Result<&'static str, ProtoGenError> {
+    Ok(match p {
         PrimitiveType::String | PrimitiveType::Uuid => "string",
         PrimitiveType::I32 => "int32",
         PrimitiveType::I64 => "int64",
@@ -586,7 +606,13 @@ fn primitive_proto(p: PrimitiveType) -> &'static str {
         PrimitiveType::F64 => "double",
         PrimitiveType::Bool => "bool",
         PrimitiveType::Bytes => "bytes",
-    }
+        other => {
+            return Err(ProtoGenError::UnsupportedSchemaFeature {
+                schema_name: format!("{other:?}"),
+                feature: ProtoGenFeature::UnknownIrVariant(format!("{other:?}")),
+            });
+        }
+    })
 }
 
 // --- schemars Schema → MessageDef / EnumDef --------------------------------
@@ -1820,10 +1846,8 @@ mod tests {
             .expect("input type resolved");
         // Single Wire field of TypeRef::Named → reused directly, no
         // synthesized request type emitted.
-        match resolved {
-            ProtoTypeName::Message(name) => assert_eq!(name, "ChargeRequest"),
-            other => panic!("unexpected ProtoTypeName: {other:?}"),
-        }
+        let ProtoTypeName::Message(name) = resolved;
+        assert_eq!(name, "ChargeRequest");
         assert!(
             !messages.contains_key("ChargeRequest"),
             "no synthesized type expected; existing Named type is reused"
@@ -1869,10 +1893,8 @@ mod tests {
         let schema_map: BTreeMap<&str, &schemars::Schema> = BTreeMap::new();
         let resolved = method_input_type(&method, &mut messages, &mut lock, &schema_map)
             .expect("input type resolved");
-        match resolved {
-            ProtoTypeName::Message(name) => assert_eq!(name, "SearchRequest"),
-            other => panic!("unexpected ProtoTypeName: {other:?}"),
-        }
+        let ProtoTypeName::Message(name) = resolved;
+        assert_eq!(name, "SearchRequest");
         let req = messages
             .get("SearchRequest")
             .expect("synthesized SearchRequest message");

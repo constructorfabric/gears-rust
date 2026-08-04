@@ -56,7 +56,9 @@ pub fn default_policy_stack() -> Arc<PolicyStack> {
 /// instances (the macro emits `Box::new(Policy::default())` per entry
 /// when the user passes `policies = [...]`).
 #[must_use]
-pub fn policy_stack_from(policies: Vec<Arc<dyn toolkit_contract::policy::Policy>>) -> Arc<PolicyStack> {
+pub fn policy_stack_from(
+    policies: Vec<Arc<dyn toolkit_contract::policy::Policy>>,
+) -> Arc<PolicyStack> {
     let mut s = PolicyStack::new();
     for p in policies {
         s.push(p);

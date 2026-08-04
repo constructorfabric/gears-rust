@@ -7,9 +7,9 @@ use api_contracts_sdk::error::PaymentResourceError;
 use api_contracts_sdk::models::{
     ChargeRequest, ChargeResponse, Invoice, ListPaymentsFilter, PaymentStatus, PaymentSummary,
 };
+use parking_lot::RwLock;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
-use parking_lot::RwLock;
 use uuid::Uuid;
 
 /// In-memory payment record.

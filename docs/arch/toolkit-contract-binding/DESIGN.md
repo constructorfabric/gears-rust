@@ -251,16 +251,21 @@ Consumer code never knows or cares whether the underlying implementation is a co
 
 Every method redeclared in a transport projection must match the corresponding method in the base trait.
 
-> **Implementation status.** Only tier 1 (delegation-time checking) is emitted
-> today. The tier-2 `const _` **witness blocks** described below are **not**
-> generated, and ADR-0003's compile-time base↔projection parity check and
-> `require_full_coverage` opt-in remain **deferred** (see ADR-0003 §"Not yet
-> implemented"). A separate runtime coverage check runs at startup via
-> `#[toolkit::provides]` (`validate_http_binding`). Tier 1 already catches
-> parameter/return/error-type drift on redeclared methods and rejects extra
-> projection methods absent from the base; the remaining gap is a base method
-> silently omitted from the projection (surfaces only as a generic `E0046` under
-> the client feature, not a targeted diagnostic).
+> **Implementation status.** Tier 1 (delegation-time checking) is emitted today
+> and already catches parameter/return/error-type drift on redeclared methods
+> and rejects extra projection methods absent from the base — feature-
+> independently, since the delegating default bodies are type-checked when the
+> projection trait compiles. The tier-2 `const _` **witness blocks** sketched
+> below are **not** generated (they would be redundant with delegation, which
+> achieves the same outcome). For the remaining direction — a base method with
+> no projection binding — coverage is enforced three ways: the generated client
+> `impl` (`E0046`, names the method) under `rest-client`; a startup
+> `validate_http_binding` check via `#[toolkit::provides]`; and, when the
+> projection opts in with `#[toolkit::rest_contract(require_full_coverage)]`, a
+> macro-generated `cargo test`-time assertion that names any mismatched method.
+> A purely `cargo check`-time, feature-independent, method-named full-coverage
+> check is not achievable from the projection macro alone (it cannot see the
+> base trait's method set at expansion time).
 
 Enforcement is two-tiered (target design):
 
@@ -829,6 +834,13 @@ There is **no** `ContractObservability` trait and **no** `parent_span`/`metrics`
 fields on `ClientConfig` — so the client's public surface does not change and there is nothing new
 for consumers to implement.
 
+**Streaming (partial).** For unary methods the span is `Instrument`-ed across the whole awaited
+dispatch, so it parents `toolkit-http`'s `outgoing_http` span and its `traceparent` is injected. For
+`#[streaming]` methods the span is currently entered only per yielded item — the initial SSE connect
+and inter-event polling are **not** yet parented by the contract span (so the connect's
+`outgoing_http` span is not a child of it). Full poll-time parenting of the SSE connection is a
+follow-up (ADR-0006).
+
 **gRPC.** The gRPC projection currently propagates no trace context; a `TraceContextInterceptor` in
 `toolkit-transport-grpc` plus per-method spans in the gRPC codegen are a follow-up that mirrors this
 REST design (see ADR-0006).
@@ -877,7 +889,15 @@ Circuit breakers, fallback methods, and degraded-mode behavior when remote plugi
 
 ### Complex REST Annotations
 
-Path variables (`#[path]`), query parameters (`#[query]`), header injection (`#[header]`), and multi-part request bodies are supported in the annotation vocabulary but their full semantics need implementation-phase design. The PoC covers `#[post]` and `#[get]` with JSON body; path variable extraction and query parameter mapping are deferred.
+Path variables and query parameters are **implemented**: a method parameter whose name matches a
+`{param}` in the path template binds as a path parameter (client percent-encodes it; the generated
+server route emits the corresponding OpenAPI path parameter and a `Path<..>` extractor), the first
+remaining parameter on a body-carrying verb (`POST`/`PUT`/`PATCH`) is the JSON body, and any other
+parameter binds as a query parameter (single flat-struct form; the generated server route rejects
+more than one query parameter at compile time). Verb coverage is `#[get]`/`#[post]`/`#[put]`/
+`#[patch]`/`#[delete]`. Still deferred: explicit parameter-level `#[path]`/`#[query]` annotations
+(classification is by-convention today), header injection (`#[header]`), and multi-part request
+bodies — these fall to a manual `impl Base for MyClient` (ADR-0002 escape hatch).
 
 ### Method Annotation Naming Collision
 

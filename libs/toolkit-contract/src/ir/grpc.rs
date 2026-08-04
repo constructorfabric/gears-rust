@@ -12,6 +12,11 @@ use super::contract::ContractIr;
 use super::validation::ValidationError;
 
 /// gRPC binding projection for a contract.
+///
+/// Deliberately NOT `#[non_exhaustive]` (see
+/// [`super::contract::ContractIr`]'s doc): `#[toolkit::grpc_contract]` emits a
+/// struct-literal `GrpcBindingIr { .. }` into the SDK crate's generated
+/// binding function.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrpcBindingIr {
     /// Proto package, e.g. `service_hub_demo.payment.v1`.
@@ -60,6 +65,7 @@ pub struct GrpcMethodBindingIr {
 
 /// proto3 `idempotency_level` values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum GrpcIdempotency {
     /// `NO_SIDE_EFFECTS` — safe read.
     NoSideEffects,

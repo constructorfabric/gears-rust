@@ -289,6 +289,29 @@ The transport projection trait MAY add methods with default implementations that
 
 ### 5.4 OpenAPI Generation
 
+> **Implementation note (current behavior).**
+> - The served OpenAPI document is produced by the framework `OperationBuilder`
+>   → `OpenApiRegistry` (utoipa) path: the macro-generated
+>   `register_<trait>_routes()` registers routes/schemas (including path
+>   parameters) into the shared registry. The OoP runtime serves it at
+>   **`/.well-known/openapi.json`** (`libs/toolkit/src/runtime/oop_serve.rs`, with
+>   coverage in `oop_serve_tests.rs` / `host_runtime_oop_tests.rs`), matching
+>   DESIGN/ADR-0002. The document now carries the
+>   `x-toolkit-spec-scope: minimum-conformance` vendor extension (ADR-0002),
+>   emitted at document level by `OpenApiRegistryImpl::build_openapi`.
+> - There is a single OpenAPI producer: the standalone
+>   `toolkit_contract::openapi::generator` module (a second, unwired generator
+>   that risked drift, ADR-0003 "Gap 2") has been **removed**; the utoipa /
+>   `OperationBuilder` path is the sole source (it already renders SSE via
+>   `OperationBuilder::sse_json` and carries `x-*` vendor extensions).
+> - **Registration-time OpenAPI conformance validation** (below) is **deferred
+>   together with the service-directory implementation** (which §4.2/§7.1 place
+>   out of scope). The in-tree `ir::validation` performs structural IR validation
+>   only, not remote-spec conformance. Treat the p1 "validation at registration"
+>   requirement as deferred until the directory workstream lands; it matters only
+>   for polyglot / independently-released providers (Rust gears built from the
+>   same SDK conform by construction).
+
 #### OpenAPI 3.1 Spec Generation
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-openapi-generation`
@@ -421,6 +444,22 @@ Methods annotated with `#[retryable]` SHALL generate retry logic with exponentia
 
 ### 5.8 Runtime Support
 
+> **Implementation naming note (supersedes the identifiers used below).**
+> - Client construction is `FooApiRestClient::new(config) -> Result<Self, HttpError>`
+>   (plus `with_http_client`), not `from_config`.
+> - The retry helper is `retry_with_backoff(&RetryConfig, f)`, not `with_retry()`.
+> - The macro attribute is `#[toolkit::rest_contract]` (namespaced), not
+>   `#[toolkit_rest_contract]`.
+> - The generated per-trait `*_openapi_spec()` function is **not** emitted; the
+>   OpenAPI document is assembled by the framework `OperationBuilder` →
+>   `OpenApiRegistry` (utoipa) path as `register_<trait>_routes()` registers
+>   routes, and served at `/.well-known/openapi.json` (see §5.4 note). The
+>   previously-unwired standalone `toolkit_contract::openapi::generator` module
+>   has been removed (single OpenAPI source of truth, ADR-0003).
+> - Feature-gated HTTP/schema deps are `toolkit-http` (hyper/rustls, not
+>   `reqwest`) and `utoipa` (not `openapiv3`); `schemars` is used for
+>   JSON-schema derivation on request/response DTOs.
+
 #### ProblemDetails Type
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-problem-details-type`
@@ -485,6 +524,16 @@ When no compile-time plugin AND no service directory entry exist for a required 
 
 - **Rationale**: Fail-fast prevents runtime surprises from unsatisfied dependencies.
 - **Actors**: `cpt-cf-binding-actor-host-runtime`
+
+> **Supersession note (governed by ADR-0004 + ADR-0007 eventual readiness).** For
+> **remote-capable** `Backend`/`Api` dependencies the runtime does **not**
+> fail-fast: the proxy-wiring phase registers a directory-resolving client and
+> gates `/readyz` (503) until the provider resolves, self-healing when it appears
+> (a remote provider is frequently a separate OoP process absent at local boot).
+> Fail-fast still applies to always-local `Extension`/`Embedded` contracts. This
+> FR is retained for intent; the eventual-readiness model in ADR-0004/0007
+> governs. (Edge case fixed: with no `DirectoryClient` present at all, remote deps
+> are registered **unresolved** so `/readyz` stays 503 rather than falsely Ready.)
 
 #### Proxy Wiring Lifecycle Phase
 

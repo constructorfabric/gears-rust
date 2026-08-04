@@ -46,8 +46,16 @@ pub fn type_path_ends_with(ty: &Type, name: &str) -> bool {
 /// authorization out-of-band (tenant → `Authorization: Bearer`; platform →
 /// transport-injected `X-ToolKit-Internal-Token`).
 pub fn is_security_context_type(ty: &Type) -> bool {
-    type_path_ends_with(ty, "SecurityContext")
-        || type_path_ends_with(ty, "PlatformSecurityContext")
+    type_path_ends_with(ty, "SecurityContext") || type_path_ends_with(ty, "PlatformSecurityContext")
+}
+
+/// Returns `true` when `ty` is the *platform*-plane context
+/// [`PlatformSecurityContext`], in value or reference form. The tenant
+/// [`SecurityContext`] is **not** matched. Used to reject platform-plane
+/// methods from the REST projection while internal-token injection is deferred
+/// (see `rest_contract_parse::parse_method`).
+pub fn is_platform_security_context_type(ty: &Type) -> bool {
+    type_path_ends_with(ty, "PlatformSecurityContext")
 }
 
 /// Strip method-level helper attributes by ident name (e.g. `get`, `post`,

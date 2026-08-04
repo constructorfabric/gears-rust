@@ -18,13 +18,13 @@ pub const SECCTX_METADATA_KEY: &str = "x-secctx-bin";
 /// Binary gRPC trailer carrying an RFC 9457 problem envelope. The `-bin`
 /// suffix is the gRPC convention for binary-valued metadata: tonic handles
 /// base64 transport encoding for us.
-pub const PROBLEM_METADATA_KEY: &str = "x-modkit-problem-bin";
+pub const PROBLEM_METADATA_KEY: &str = "x-toolkit-problem-bin";
 
 /// ASCII-text metadata header signalling that the problem envelope attached
 /// under [`PROBLEM_METADATA_KEY`] was truncated to fit the per-trailer
 /// HTTP/2 frame budget. Clients should treat missing `context`/`detail`
 /// fields as expected rather than a deserialization bug.
-pub const PROBLEM_TRUNCATED_HEADER: &str = "x-modkit-problem-truncated";
+pub const PROBLEM_TRUNCATED_HEADER: &str = "x-toolkit-problem-truncated";
 
 /// Conservative per-trailer payload cap for the problem envelope.
 ///

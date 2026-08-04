@@ -7,10 +7,10 @@
 //! [`map_tonic_status`] which classifies a `tonic::Status` into the
 //! `TransportError` taxonomy used by the rest of the contract runtime.
 
-use toolkit_canonical_errors::Problem;
 use tonic::Code;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
+use toolkit_canonical_errors::Problem;
 
 use crate::runtime::transport_error::TransportError;
 
@@ -27,7 +27,7 @@ impl crate::grpc_repr::SecurityContextMarker for toolkit_security::SecurityConte
 /// Map a [`tonic::Status`] into a [`TransportError`].
 ///
 /// - If the server attached a [`Problem`] payload via the
-///   `x-modkit-problem-bin` binary trailer, surface it as
+///   `x-toolkit-problem-bin` binary trailer, surface it as
 ///   [`TransportError::Problem`].
 /// - `Code::Ok` is unexpected here; mapped to [`TransportError::Network`].
 /// - Every other code is preserved verbatim as [`TransportError::Grpc`].
@@ -37,7 +37,7 @@ impl crate::grpc_repr::SecurityContextMarker for toolkit_security::SecurityConte
 #[must_use]
 pub fn map_tonic_status(status: &Status) -> TransportError {
     match toolkit_transport_grpc::extract_problem::<Problem>(status.metadata()) {
-        Ok(Some(problem)) => return TransportError::Problem(problem),
+        Ok(Some(problem)) => return TransportError::problem(problem),
         Ok(None) => {}
         Err(problem_decode_err) => {
             tracing::warn!(
@@ -137,7 +137,7 @@ mod tests {
         let mut status = Status::internal("something bad");
         *status.metadata_mut() = metadata;
         match map_tonic_status(&status) {
-            TransportError::Problem(p) => {
+            TransportError::Problem { problem: p, .. } => {
                 assert_eq!(p.title, "Internal");
                 assert_eq!(p.status, 500);
                 assert!(

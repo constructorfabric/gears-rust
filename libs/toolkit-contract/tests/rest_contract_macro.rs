@@ -72,9 +72,15 @@ pub trait BillingApi: Send + Sync {
     ) -> Result<fakes::Invoice, FakeError>;
 }
 
+// This file tests IR/binding behavior, not server-route codegen (covered by
+// `rest_client_codegen.rs` / `otel_propagation.rs`). The fake DTOs/errors here
+// don't implement the server bounds (`IntoResponse`, `ResponseApiDto`), so all
+// projection methods are `#[server_manual]` — they stay in the client + IR +
+// binding (so every assertion below is unaffected) and generate no server route.
 #[rest_contract(base_path = "/api/billing/v1")]
 pub trait BillingApiRest: BillingApi {
     #[post("/charge")]
+    #[server_manual]
     async fn charge(
         &self,
         ctx: SecurityContext,
@@ -83,6 +89,7 @@ pub trait BillingApiRest: BillingApi {
 
     #[get("/invoices/{invoice_id}")]
     #[retryable]
+    #[server_manual]
     async fn get_invoice(
         &self,
         ctx: SecurityContext,
@@ -135,12 +142,13 @@ fn get_with_path_param_emits_path_binding() {
 fn security_context_is_skipped_from_field_bindings() {
     let binding = billing_api_rest_http_binding();
     let charge = binding.find_method("charge").expect("present");
-    // No Header / Path / Query binding for `ctx`.
+    // No Path / Query binding for `ctx`.
     let has_ctx_binding = charge.field_bindings.iter().any(|fb| match fb {
-        HttpFieldBinding::Path { field, .. }
-        | HttpFieldBinding::Query { field, .. }
-        | HttpFieldBinding::Header { field, .. } => field == "ctx",
-        HttpFieldBinding::Body => false,
+        HttpFieldBinding::Path { field, .. } | HttpFieldBinding::Query { field, .. } => {
+            field == "ctx"
+        }
+        // `Body` plus any future non-exhaustive variant.
+        _ => false,
     });
     assert!(!has_ctx_binding);
 }
@@ -167,6 +175,7 @@ pub trait StreamSvcBackend: Send + Sync {
 pub trait StreamSvcBackendRest: StreamSvcBackend {
     #[get("/ticks")]
     #[streaming]
+    #[server_manual]
     fn ticks(&self, ctx: SecurityContext) -> Result<u64, FakeError>;
 }
 
@@ -176,6 +185,39 @@ fn streaming_method_marks_streaming_flag() {
     let ticks = binding.find_method("ticks").expect("present");
     assert!(ticks.streaming);
     assert_eq!(ticks.http_method, HttpMethod::Get);
+}
+
+// `require_full_coverage` (ADR-0003): the projection covers every base method,
+// so the macro-generated `__cov_api_rest_require_full_coverage` test (emitted
+// only under this flag) compiles and passes as part of this test binary.
+#[contract(gear = "cov", version = "v1")]
+pub trait CovApi: Send + Sync {
+    #[idempotency(SafeRead)]
+    async fn get_a(&self, ctx: SecurityContext, id: String) -> Result<u64, FakeError>;
+
+    #[idempotency(SafeRead)]
+    async fn get_b(&self, ctx: SecurityContext, id: String) -> Result<u64, FakeError>;
+}
+
+#[rest_contract(base_path = "/api/cov/v1", require_full_coverage)]
+pub trait CovApiRest: CovApi {
+    #[get("/a/{id}")]
+    #[server_manual]
+    async fn get_a(&self, ctx: SecurityContext, id: String) -> Result<u64, FakeError>;
+
+    #[get("/b/{id}")]
+    #[server_manual]
+    async fn get_b(&self, ctx: SecurityContext, id: String) -> Result<u64, FakeError>;
+}
+
+#[test]
+fn require_full_coverage_binding_covers_all_base_methods() {
+    // Direct assertion mirroring the generated coverage test, so intent is
+    // visible even to readers who don't know the macro emits its own test.
+    let ir = <dyn CovApi as toolkit_contract::Contract>::contract_ir();
+    let binding = cov_api_rest_http_binding();
+    toolkit_contract::ir::validate_http_binding(&ir, &binding)
+        .expect("projection must cover all base methods");
 }
 
 // Make sure the projection trait is implementable — i.e. it survives the

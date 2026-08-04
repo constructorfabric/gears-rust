@@ -18,9 +18,9 @@ use std::sync::Arc;
 use api_contracts_sdk::grpc::stubs;
 use api_contracts_sdk::grpc::stubs::payment_api_server::{PaymentApi, PaymentApiServer};
 use futures_core::Stream;
+use tonic::{Code, Request, Response, Status};
 use toolkit_canonical_errors::{CanonicalError, Problem};
 use toolkit_security::SecurityContext;
-use tonic::{Code, Request, Response, Status};
 
 use crate::domain::service::PaymentDomainService;
 
@@ -154,7 +154,7 @@ fn require_security_context(
 
 /// Map a [`CanonicalError`] onto a [`tonic::Status`] **with** the canonical
 /// [`Problem`] envelope attached as a binary trailer
-/// (`x-modkit-problem-bin`, per [`toolkit_transport_grpc::attach_problem`]).
+/// (`x-toolkit-problem-bin`, per [`toolkit_transport_grpc::attach_problem`]).
 ///
 /// Direct variant→[`Code`] mapping — not via HTTP status codes — so we
 /// don't lose the canonical category through a lossy intermediate

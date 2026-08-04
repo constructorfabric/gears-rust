@@ -1,6 +1,17 @@
 use serde::{Deserialize, Serialize};
 
 /// Intermediate representation of a complete contract.
+///
+/// Deliberately NOT `#[non_exhaustive]`: `#[toolkit::contract]` emits a
+/// struct-literal `ContractIr { .. }` directly into the SDK crate's generated
+/// `contract_ir()` function (see `toolkit-contract-macros/src/codegen.rs`).
+/// `#[non_exhaustive]` on a struct blocks ALL external struct-literal
+/// construction (even with every field listed), which would break every
+/// downstream SDK crate at macro-expansion time. The same applies to
+/// [`MethodIr`], [`InputShape`], [`FieldIr`] below, and to
+/// [`super::binding::HttpBindingIr`] / [`super::binding::HttpMethodBindingIr`].
+/// Additive evolution here must go through a constructor fn, not new pub
+/// fields, or accept a semver-breaking release for the IR structs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractIr {
     /// Contract name, usually the SDK trait name.
@@ -35,7 +46,13 @@ pub struct MethodIr {
 }
 
 /// Whether a method returns a single value or a stream.
+///
+/// `#[non_exhaustive]`: this enum evolves (new method shapes). Only bare
+/// variants are ever emitted by codegen, so external construction of existing
+/// variants remains unaffected — only exhaustive `match` without a wildcard is
+/// blocked, which is the intended forward-compat guarantee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum MethodKind {
     /// Request -> Response.
     Unary,
@@ -69,6 +86,7 @@ pub struct FieldIr {
 /// across the transport boundary). `SecurityContext` is server-injected and
 /// must NOT appear in proto wire schemas or in `OpenAPI` request bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum FieldRole {
     #[default]
     Wire,
@@ -77,6 +95,7 @@ pub enum FieldRole {
 
 /// Reference to a type used in method signatures.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TypeRef {
     /// A primitive scalar type.
     Primitive(PrimitiveType),
@@ -92,6 +111,7 @@ pub enum TypeRef {
 
 /// Primitive scalar types supported in contracts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum PrimitiveType {
     /// UTF-8 string.
     String,
@@ -113,6 +133,7 @@ pub enum PrimitiveType {
 
 /// Idempotency classification for retry policy decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Idempotency {
     /// Safe read operation — always retriable.
     SafeRead,

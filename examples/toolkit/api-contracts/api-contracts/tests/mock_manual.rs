@@ -19,10 +19,10 @@ use api_contracts_sdk::models::{
     ChargeRequest, ChargeResponse, Invoice, ListPaymentsFilter, PaymentStatus, PaymentSummary,
 };
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use toolkit::ClientHub;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
-use parking_lot::Mutex;
 use uuid::Uuid;
 
 /// Manual mock for [`PaymentApi`] that records charge calls and returns

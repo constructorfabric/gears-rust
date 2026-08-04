@@ -10,4 +10,4 @@ use serde::Deserialize;
 /// Gear configuration. Empty for now — kept for parity with the rest of
 /// the example and for future gear-level (non-wiring) knobs.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct ApiContractsConfig {}
+pub struct ApiContractsConfig;

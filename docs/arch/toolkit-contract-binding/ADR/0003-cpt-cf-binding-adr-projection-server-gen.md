@@ -7,6 +7,21 @@ date: 2026-06-02
 
 **ID**: `cpt-cf-binding-adr-projection-server-gen`
 
+> **Naming/status banner.** Historical `#[modkit::…]` / `libs/modkit/…` names in
+> this ADR are `#[toolkit::…]` / `libs/toolkit-contract…` in the code. The
+> worked example and the metadata-resolution table describe the **target state**;
+> the authoritative "as-built" surface is the *Implementation status (PoC)*
+> section below — server route generation and `#[server_manual]` are shipped,
+> while doc-comment→summary, `#[rest(...)]` grouped attributes,
+> `<module>.<method>` operation IDs, and streaming-server generation remain
+> deferred. **`require_full_coverage` is now implemented** — but as a generated
+> `cargo test`-time coverage assertion (via `validate_http_binding` against the
+> base `Contract` IR), not a `cargo check`-time compile error: the projection
+> macro cannot see the base trait's method set at expansion time. The
+> signature / no-extra-method parity direction is enforced feature-independently
+> by the delegating default methods (the compile-time "witness" outcome, via
+> delegation rather than the separate `const _` blocks the DESIGN sketched).
+
 ## Table of Contents
 
 1. [Context and Problem Statement](#context-and-problem-statement)
@@ -20,7 +35,7 @@ date: 2026-06-02
 
 ADR-0001 introduced a two-layer architecture: a clean **base trait** (zero transport annotations)
 and a **projection trait** (`*Rest`, `*Grpc`) that carries transport annotations and is processed
-by `#[modkit_rest_contract]`. The macro currently generates a REST client struct from the
+by `#[toolkit_rest_contract]`. The macro currently generates a REST client struct from the
 projection. Two gaps remain unfixed.
 
 **Gap 1 — no parity enforcement.** There is no compile-time guarantee that the projection trait
@@ -56,11 +71,11 @@ This ADR decides how to close both gaps while keeping the two-layer design intac
 
 ## Considered Options
 
-* **Option A**: Extend the `#[modkit::rest_contract]` projection macro to (a) enforce method-set
+* **Option A**: Extend the `#[toolkit::rest_contract]` projection macro to (a) enforce method-set
   parity against the base at compile time and (b) additionally generate a server-side
   `register_<name>_routes()` function alongside the existing client struct.
 * **Option B**: Collapse HTTP annotations onto the base trait; remove projection traits; a single
-  `#[modkit::contract]` macro generates client, server routes, and OpenAPI in one pass.
+  `#[toolkit::contract]` macro generates client, server routes, and OpenAPI in one pass.
 * **Option C**: Retain projection traits unchanged; commit an `openapi.json` per SDK crate; add a
   CI diff check that regenerates and compares it on every PR.
 
@@ -68,7 +83,7 @@ This ADR decides how to close both gaps while keeping the two-layer design intac
 
 Chosen option: **Option A — Extended projection macro.**
 
-The `#[modkit::rest_contract]` macro gains two new responsibilities while leaving the two-layer
+The `#[toolkit::rest_contract]` macro gains two new responsibilities while leaving the two-layer
 design and the base trait untouched.
 
 ### 1. Compile-time base-projection parity check
@@ -94,7 +109,7 @@ From the same IR pass that builds `HttpBindingIr` for the client, the macro addi
 /// Register all `BillingApi` REST routes on the given router.
 pub fn register_billing_api_routes(
     router: axum::Router,
-    openapi: &dyn modkit::openapi::OpenApiRegistry,
+    openapi: &dyn toolkit::openapi::OpenApiRegistry,
     service: std::sync::Arc<dyn BillingApi>,
 ) -> axum::Router { /* generated OperationBuilder calls */ }
 ```
@@ -108,7 +123,7 @@ produces the client's URL template and method verb drives the `OperationBuilder`
 
 ```rust
 // base trait — clean; zero annotations
-#[modkit::contract(module = "billing", version = "v1")]
+#[toolkit::contract(module = "billing", version = "v1")]
 pub trait BillingApi: Send + Sync {
     /// Charge a payment method.
     #[idempotency(NonIdempotentWrite)]
@@ -118,7 +133,7 @@ pub trait BillingApi: Send + Sync {
 }
 
 // projection — generates client only; no parity check; no server routes
-#[modkit::rest_contract(base_path = "/api/billing/v1")]
+#[toolkit::rest_contract(base_path = "/api/billing/v1")]
 pub trait BillingApiRest: BillingApi {
     #[post("/payments/charge")]
     async fn charge(
@@ -140,7 +155,7 @@ pub fn routes(service: Arc<dyn BillingApi>) -> Router {
 
 ```rust
 // base trait — UNCHANGED; still zero transport annotations
-#[modkit::contract(module = "billing", version = "v1")]
+#[toolkit::contract(module = "billing", version = "v1")]
 pub trait BillingApi: Send + Sync {
     /// Charge a payment method.
     #[idempotency(NonIdempotentWrite)]
@@ -151,7 +166,7 @@ pub trait BillingApi: Send + Sync {
 
 // projection — generates client AND register_billing_api_routes()
 // compile error if method absent from base or signature mismatches
-#[modkit::rest_contract(base_path = "/api/billing/v1", require_full_coverage)]
+#[toolkit::rest_contract(base_path = "/api/billing/v1", require_full_coverage)]
 pub trait BillingApiRest: BillingApi {
     /// Charge a payment method.
     /// Creates a new payment in `pending` status and returns its identifier.
@@ -190,12 +205,12 @@ which remain the canonical domain documentation.
 ### gRPC projection — unchanged, still additive
 
 Adding gRPC means adding a separate `BillingApiGrpc` projection processed by
-`#[modkit::grpc_contract]`. Each projection is a self-contained file with only its own transport's
+`#[toolkit::grpc_contract]`. Each projection is a self-contained file with only its own transport's
 annotations. No method accumulates annotations from multiple transports in one place.
 
 ```rust
 // grpc/mod.rs — independent from rest/mod.rs
-#[modkit::grpc_contract(package = "billing.v1")]
+#[toolkit::grpc_contract(package = "billing.v1")]
 pub trait BillingApiGrpc: BillingApi {
     #[grpc(name = "ChargePayment")]   // optional; defaults to PascalCase of method name
     async fn charge(
@@ -283,7 +298,7 @@ actually builds (the macro crate is `toolkit-contract-macros`, attribute `#[tool
 ### Confirmation
 
 * Unit tests: each projection annotation → `OperationBuilder` emission mapping covered by
-  `cargo expand`-based macro expansion tests in `libs/modkit-contract-macros/tests/`.
+  `cargo expand`-based macro expansion tests in `libs/toolkit-contract-macros/tests/`.
 * Parity test: projection with a method absent from the base emits a compile error naming the
   offending method.
 * Coverage test: `require_full_coverage` on a projection that omits a base method emits a compile
@@ -297,7 +312,7 @@ actually builds (the macro crate is `toolkit-contract-macros`, attribute `#[tool
 
 ### Option A: Extended Projection Macro (chosen)
 
-Extend `#[modkit::rest_contract]` to enforce parity and emit server routes from the same IR.
+Extend `#[toolkit::rest_contract]` to enforce parity and emit server routes from the same IR.
 
 * Good, because base trait stays clean — zero transport annotations, unchanged from ADR-0001.
 * Good, because each transport's projection is a self-contained file; adding gRPC does not add
@@ -351,5 +366,5 @@ Commit `openapi.json` per SDK crate; CI regenerates and diffs on every PR.
   satisfies that requirement.
 * Vision ADR-0004 (PR #1957) `cpt-cf-adr-rest-client-generation` — Phase 2 (proc-macro from
   annotated trait) is implemented here via the extended projection macro.
-* Current PoC: `libs/modkit-contract-macros/src/rest_contract.rs` (client generation);
-  `examples/modkit/api-contracts/src/api/rest/routes.rs` (hand-written routes to be replaced).
+* Current PoC: `libs/toolkit-contract-macros/src/rest_contract.rs` (client generation);
+  `examples/toolkit/api-contracts/api-contracts/src/api/rest/routes.rs` (hand-written routes to be replaced).

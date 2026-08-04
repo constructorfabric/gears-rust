@@ -7,8 +7,8 @@ use bytes::Bytes;
 use futures_core::Stream;
 use http_body::Body;
 use http_body_util::BodyStream;
-use toolkit_canonical_errors::Problem;
 use percent_encoding::{AsciiSet, CONTROLS, NON_ALPHANUMERIC, utf8_percent_encode};
+use toolkit_canonical_errors::Problem;
 
 use crate::ir::binding::{HttpFieldBinding, HttpMethod, HttpMethodBindingIr};
 use crate::runtime::transport_error::TransportError;
@@ -67,8 +67,7 @@ where
 }
 
 /// Build a fully-qualified URL by substituting path parameters and appending
-/// query parameters. Mirrors [`crate::http::dispatch::build_url`] but emits
-/// [`TransportError`] instead of the historical `ContractError` type.
+/// query parameters, returning [`TransportError`] on failure.
 ///
 /// `fields` is expected to be a JSON object whose keys correspond to the
 /// `field` names referenced by `method_binding.field_bindings`. Missing path
@@ -108,7 +107,7 @@ pub fn build_request_url(
                 }
                 _ => {}
             },
-            HttpFieldBinding::Body | HttpFieldBinding::Header { .. } => {}
+            HttpFieldBinding::Body => {}
         }
     }
 
@@ -141,6 +140,7 @@ pub fn to_http_method(method: HttpMethod) -> http::Method {
         HttpMethod::Get => http::Method::GET,
         HttpMethod::Post => http::Method::POST,
         HttpMethod::Put => http::Method::PUT,
+        HttpMethod::Patch => http::Method::PATCH,
         HttpMethod::Delete => http::Method::DELETE,
     }
 }
@@ -152,8 +152,10 @@ pub fn to_http_method(method: HttpMethod) -> http::Method {
 /// excerpt for peers that don't speak the canonical-errors envelope.
 ///
 /// `retry_after` is the parsed `Retry-After` header (see [`parse_retry_after`]);
-/// it is attached to the [`TransportError::HttpStatus`] fallback so the retry
-/// loop can honor it. (Canonical `Problem` responses do not carry it here.)
+/// it is attached to both the [`TransportError::Problem`] and the
+/// [`TransportError::HttpStatus`] fallback so the retry loop honors a
+/// server-advised backoff regardless of whether the peer speaks canonical
+/// errors.
 #[must_use]
 pub fn map_http_error(
     status: u16,
@@ -161,7 +163,10 @@ pub fn map_http_error(
     retry_after: Option<std::time::Duration>,
 ) -> TransportError {
     if let Ok(problem) = serde_json::from_str::<Problem>(&body) {
-        return TransportError::Problem(problem);
+        return TransportError::Problem {
+            problem: Box::new(problem),
+            retry_after,
+        };
     }
     TransportError::HttpStatus {
         status,
@@ -227,7 +232,14 @@ fn urlencoded(value: &str) -> String {
 
 fn truncate(mut s: String, max: usize) -> String {
     if s.len() > max {
-        s.truncate(max);
+        // `s` is a peer-controlled response body (arbitrary UTF-8); truncating
+        // at a raw byte offset panics if `max` lands inside a multi-byte
+        // character. Floor to the nearest char boundary at or below `max`.
+        let cut = (0..=max)
+            .rev()
+            .find(|&i| s.is_char_boundary(i))
+            .unwrap_or(0);
+        s.truncate(cut);
         s.push('\u{2026}');
     }
     s
@@ -330,13 +342,44 @@ mod tests {
         .to_string();
         let err = map_http_error(500, body, None);
         match err {
-            TransportError::Problem(p) => {
+            TransportError::Problem { problem: p, .. } => {
                 assert_eq!(p.status, 500);
                 assert_eq!(p.detail, "broke");
                 assert!(p.problem_type.contains("internal"));
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn problem_envelope_carries_retry_after() {
+        // A canonical `Problem` peer that also sends `Retry-After` must have the
+        // advised delay threaded onto the `Problem` variant so the retry loop
+        // honors it (M-16) — not just the non-canonical `HttpStatus` fallback.
+        let body = serde_json::json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
+            "title": "Service unavailable",
+            "status": 503,
+            "detail": "draining",
+            "context": {}
+        })
+        .to_string();
+        let err = map_http_error(503, body, Some(std::time::Duration::from_secs(2)));
+        assert_eq!(err.retry_after(), Some(std::time::Duration::from_secs(2)));
+        assert!(matches!(err, TransportError::Problem { .. }));
+    }
+
+    #[test]
+    fn truncate_does_not_panic_on_multibyte_char_at_boundary() {
+        // 255 ASCII bytes + a 3-byte UTF-8 char (é is 2 bytes; use a 3-byte
+        // char to straddle byte 256 exactly) — a raw `s.truncate(256)` would
+        // panic because byte 256 falls inside the multi-byte character.
+        let body = format!("{}€", "a".repeat(255)); // '€' is 3 bytes (U+20AC)
+        assert_eq!(body.len(), 258);
+        let out = truncate(body, 256);
+        // Truncated to the last valid boundary at or below 256 (255, since the
+        // '€' starts at byte 255), with the ellipsis marker appended.
+        assert_eq!(out, format!("{}\u{2026}", "a".repeat(255)));
     }
 
     #[test]

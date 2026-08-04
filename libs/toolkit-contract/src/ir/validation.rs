@@ -183,6 +183,7 @@ fn validate_body_constraint(
             HttpMethod::Get => "GET",
             HttpMethod::Post => "POST",
             HttpMethod::Put => "PUT",
+            HttpMethod::Patch => "PATCH",
             HttpMethod::Delete => "DELETE",
         };
         errors.push(ValidationError {
@@ -247,7 +248,6 @@ fn validate_field_references(
         let (kind, field) = match fb {
             HttpFieldBinding::Path { field, .. } => ("Path", field),
             HttpFieldBinding::Query { field, .. } => ("Query", field),
-            HttpFieldBinding::Header { field, .. } => ("Header", field),
             HttpFieldBinding::Body => continue,
         };
         if !input_field_names.contains(field.as_str()) {
@@ -439,32 +439,6 @@ mod tests {
                 .message
                 .contains("Query binding references field 'missing'")),
             "expected query field-ref error, got: {errs:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_header_binding_to_unknown_field() {
-        let contract = one_method_contract();
-        let binding = HttpBindingIr {
-            base_path: "/api".into(),
-            methods: vec![HttpMethodBindingIr {
-                method_name: "do_thing".into(),
-                http_method: HttpMethod::Get,
-                path_template: "/things".into(),
-                field_bindings: vec![HttpFieldBinding::Header {
-                    field: "nope".into(),
-                    header: "X-Nope".into(),
-                }],
-                retryable: false,
-                streaming: false,
-                optional: false,
-            }],
-        };
-        let errs = validate_http_binding(&contract, &binding).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|e| e.message.contains("Header binding references field 'nope'")),
-            "expected header field-ref error, got: {errs:?}"
         );
     }
 

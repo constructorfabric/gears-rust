@@ -760,7 +760,9 @@ async fn wait_for_completion(state: &BenchState, timeout: Duration) {
                 state.expected_total - got
             );
         }
-        let _ = tokio::time::timeout(remaining, state.notify.notified()).await;
+        tokio::time::timeout(remaining, state.notify.notified())
+            .await
+            .ok();
     }
 }
 

@@ -3,9 +3,22 @@ status: proposed
 date: 2026-06-02
 ---
 
-# Discovery-Driven Consumer Wiring via `#[modkit::consumes]`
+# Discovery-Driven Consumer Wiring via `#[toolkit::consumes]`
 
 **ID**: `cpt-cf-binding-adr-consumer-wiring`
+
+> **Implementation reconciliation (current code).** Historical `modkit`
+> names in this ADR map to `toolkit`: the macro is `#[toolkit::consumes]`
+> (`libs/toolkit-contract-macros/src/consumes.rs`), the runtime lives under
+> `libs/toolkit/…`, and `ConsumerRegistration`/`EndpointResolver` are in
+> `toolkit::discovery`. The shipped `/readyz` body shape is
+> `{"state": "starting"|"ready"|"draining", "unresolved_deps": [..]}` (per the
+> normative section of the accepted eventual-readiness ADR), **not**
+> `{"status", "deps": {..}}` as illustrated below. The wiring closure now
+> returns a `WireOutcome::{Local,Remote}`: a co-located local impl (hub
+> short-circuit) is marked readiness-resolved immediately and spawns no
+> directory probe; only `Remote` deps gate `/readyz` and get the background
+> resolve loop.
 
 ## Table of Contents
 
@@ -18,7 +31,7 @@ date: 2026-06-02
 
 ## Context and Problem Statement
 
-ADR-0001 defines how a module *provides* a contract to its consumers via `#[modkit::provides]`. There
+ADR-0001 defines how a module *provides* a contract to its consumers via `#[toolkit::provides]`. There
 is no symmetric consumer-side counterpart. In the current PoC (`c280de1`), a consumer that needs a
 remote implementation must either:
 
@@ -33,7 +46,7 @@ PR #1957) specifies that the OoP runtime should poll `DirectoryService.ResolveRe
 each declared dependency and wire the resulting endpoint into `ClientHub`, gating `/readyz` until all
 critical dependencies are resolved. No developer-facing API for that polling loop was defined.
 
-This ADR introduces `#[modkit::consumes]` as that developer-facing API and specifies how it integrates
+This ADR introduces `#[toolkit::consumes]` as that developer-facing API and specifies how it integrates
 with the OoP bootstrap and the embedded (in-process) runtime.
 
 ## Decision Drivers
@@ -58,7 +71,7 @@ with the OoP bootstrap and the embedded (in-process) runtime.
 * **Option A**: Convention-based auto-wiring — the bootstrap scans every `deps` entry, calls
   `resolve_rest_service(dep)` for each, and attempts to match a registered SDK-trait factory by
   name. No new macro required on the consumer side.
-* **Option B**: `#[modkit::consumes]` explicit macro — consumers declare the contract trait type and the
+* **Option B**: `#[toolkit::consumes]` explicit macro — consumers declare the contract trait type and the
   logical dep name; the macro registers a typed `ConsumerRegistration`; the bootstrap calls its `wire`
   closure after discovery.
 * **Option C**: Retain `ClientWiring::Rest { endpoint }` as the primary wiring path; document it as
@@ -66,7 +79,7 @@ with the OoP bootstrap and the embedded (in-process) runtime.
 
 ## Decision Outcome
 
-Chosen option: **Option B — `#[modkit::consumes]` explicit macro.**
+Chosen option: **Option B — `#[toolkit::consumes]` explicit macro.**
 
 Option A requires the framework to infer, for every module name, which Rust trait `TypeId` to wire.
 There is no static mapping — a module may provide multiple contracts — and a convention-based
@@ -77,23 +90,23 @@ it does not satisfy the SDK-only or discovery requirements.
 ### Macro shape
 
 ```rust
-#[modkit::module(name = "orders")]
-#[modkit::consumes(contract = billing_sdk::BillingApi, from = "billing")]
-#[modkit::consumes(contract = inventory_sdk::InventoryApi, from = "inventory")]
+#[toolkit::module(name = "orders")]
+#[toolkit::consumes(contract = billing_sdk::BillingApi, from = "billing")]
+#[toolkit::consumes(contract = inventory_sdk::InventoryApi, from = "inventory")]
 pub struct OrdersModule { … }
 ```
 
-Multiple `#[modkit::consumes]` attributes are allowed on the same struct, one per dependency trait.
+Multiple `#[toolkit::consumes]` attributes are allowed on the same struct, one per dependency trait.
 Each is independent; they may name the same or different provider modules.
 
 ### What the macro generates
 
-For each `#[modkit::consumes(contract = C, from = "name")]` the macro emits an `inventory::submit!`
+For each `#[toolkit::consumes(contract = C, from = "name")]` the macro emits an `inventory::submit!`
 of a `ConsumerRegistration`:
 
 ```rust
 inventory::submit! {
-    modkit::contract::ConsumerRegistration {
+    toolkit::contract::ConsumerRegistration {
         owner_module: "orders",
         dep_module:   "billing",
         wire: |hub: &ClientHub, endpoint: &str| -> anyhow::Result<()> {
@@ -157,6 +170,24 @@ When this key is present the bootstrap skips `resolve_rest_service` and calls
 `wire(hub, static_endpoint)` directly at startup. The key is validated at boot time; its presence
 in a production configuration is a fatal startup error.
 
+> **Implementation note (as-built).** The static override IS implemented, but at
+> the per-gear config key `gears.<owner>.config.consumer_wiring.<dep> =
+> "http://host:port"` (consistent with the existing `client_wiring` provider-side
+> schema), **not** the illustrative `modules.<owner>.wiring.<dep>`. The
+> proxy-wiring phase (`host_runtime::run_proxy_wiring_phase`) reads it via
+> `static_endpoint_override(...)` and, when present, wires the dep through a
+> `StaticEndpointResolver` (`toolkit::discovery`) that bypasses the directory and
+> is readiness-resolved immediately (no probe loop). Its use is logged at
+> `warn!`.
+>
+> **The production fatal-guard is deferred.** The runtime has no
+> deployment-profile / environment concept (`AppConfig` carries no `profile`
+> field), so "presence in a production configuration is a fatal startup error"
+> has nothing to key on. Introducing that guard requires first adding a
+> deployment-profile notion to `AppConfig` — a separate, deliberate config-schema
+> change. Until then the `warn!` on every static-override use is the safety
+> signal.
+
 ### Readiness response shape
 
 `/readyz` is managed by the OoP bootstrap. While wiring is in progress:
@@ -175,10 +206,10 @@ HTTP 200
 
 This response shape is the same format specified in vision ADR-0007.
 
-### Relationship to `#[modkit::provides]`
+### Relationship to `#[toolkit::provides]`
 
-`#[modkit::provides]` (ADR-0001, producer side) generates a `wire_<contract>()` method on the
-module struct. `ClientWiring::Rest { endpoint }` within `#[modkit::provides]` remains valid as a
+`#[toolkit::provides]` (ADR-0001, producer side) generates a `wire_<contract>()` method on the
+module struct. `ClientWiring::Rest { endpoint }` within `#[toolkit::provides]` remains valid as a
 standalone-mode override for provider modules that also act as self-contained OoP processes
 (e.g., the `api-contracts` example with `transport = rest`). It is not the primary wiring path for
 consumers in a multi-module topology. The `wire_*` methods are not removed; they remain usable in
@@ -189,8 +220,8 @@ unit tests and manual integration setups.
 * Consumers depend only on the `*-sdk` crate (e.g., `billing-sdk`). The provider's implementation
   crate (`billing`) is never a direct or transitive dependency of the consumer binary.
 * `ConsumerRegistration` and its `inventory::submit!` become part of the public API surface of
-  `modkit-contract`; changes to its fields are semver breaking changes.
-* Modules declaring `#[modkit::consumes]` that are built as in-process libraries still compile; the
+  `toolkit` (`toolkit::discovery`); changes to its fields are semver breaking changes.
+* Modules declaring `#[toolkit::consumes]` that are built as in-process libraries still compile; the
   generated `inventory::submit!` is emitted unconditionally. In Profile 1 builds the bootstrap
   iterates the registrations and the `try_get` short-circuit fires for all of them.
 * Init cycle detection: because `"billing"` is added to `deps` by the macro, a dependency cycle
@@ -203,7 +234,7 @@ unit tests and manual integration setups.
 
 ### Confirmation
 
-* Unit test: macro expansion for `#[modkit::consumes(contract = BillingApi, from = "billing")]`
+* Unit test: macro expansion for `#[toolkit::consumes(contract = BillingApi, from = "billing")]`
   produces a `ConsumerRegistration` with the correct `owner_module`, `dep_module`, and a `wire`
   closure that compiles against `billing_sdk` alone (no `billing` impl crate in scope).
 * Unit test: `wire` closure short-circuits when `hub.try_get::<dyn BillingApi>().is_some()`.
@@ -231,7 +262,7 @@ name → `TypeId` registry to find the matching factory.
 * Bad, because convention-based name→type mapping is fragile across rename refactors; the framework
   cannot distinguish a missing dep from a misspelled dep name until runtime.
 
-### Option B: `#[modkit::consumes]` Explicit Macro (chosen)
+### Option B: `#[toolkit::consumes]` Explicit Macro (chosen)
 
 Consumer declares the contract type and dep name explicitly. Macro generates a typed factory owned
 by the consumer binary. No inference, no provider linkage.
@@ -243,7 +274,7 @@ by the consumer binary. No inference, no provider linkage.
   of module dependencies.
 * Neutral, because requires a new macro attribute; adds a small amount of syntax to learn.
 * Neutral, because adding a consumed contract requires both a `Cargo.toml` dep on the SDK crate and
-  a `#[modkit::consumes]` attribute — two places. Mitigated: omitting either produces a loud
+  a `#[toolkit::consumes]` attribute — two places. Mitigated: omitting either produces a loud
   compiler error before any tests run.
 
 ### Option C: Static `ClientWiring::Rest { endpoint }` as Primary Path
@@ -263,7 +294,7 @@ Document the current pattern; require authors to configure static endpoints.
 
 * ADR-0001 — contract source of truth:
   [`0001-cpt-cf-binding-adr-contract-source-of-truth.md`](./0001-cpt-cf-binding-adr-contract-source-of-truth.md)
-  — `#[modkit::provides]` (producer side); this ADR adds the symmetric consumer-side counterpart.
+  — `#[toolkit::provides]` (producer side); this ADR adds the symmetric consumer-side counterpart.
 * Vision ADR-0007 (PR #1957) `cpt-cf-adr-eventual-readiness` — specifies the background dependency
   resolution loop and readiness gating model; this ADR implements the developer-facing API for that
   mechanism.
@@ -275,12 +306,12 @@ Document the current pattern; require authors to configure static endpoints.
   the generated REST client must conform to this protocol.
 * Directory SDK extension: `libs/system-sdks/sdks/directory/src/api.rs` — `resolve_rest_service`
   added in `c280de1`; this ADR depends on that method being present.
-* Topo-sort entry point: `libs/modkit/src/registry.rs` — `build_topo_sorted`; the `deps` injection
-  from `#[modkit::consumes]` plugs into this existing mechanism.
-* `ClientHub`: `libs/modkit/src/client_hub.rs` — `try_get`, `register`, `get` are the three methods
+* Topo-sort entry point: `libs/toolkit/src/registry.rs` — `build_topo_sorted`; the `deps` injection
+  from `#[toolkit::consumes]` plugs into this existing mechanism.
+* `ClientHub`: `libs/toolkit/src/client_hub.rs` — `try_get`, `register`, `get` are the three methods
   used by the generated `wire` closure.
-* OoP bootstrap integration point: `libs/modkit/src/bootstrap/oop.rs:533–598` — the background
-  wiring task is inserted here, after `DirectoryClient` is connected and before `module.run()`.
+* OoP bootstrap integration point: `libs/toolkit/src/bootstrap/oop.rs` — the background
+  wiring task is inserted here, after `DirectoryClient` is connected and before `gear.run()`.
 
 ## Implementation note (toolkit) — deliberate deviation: no topo-dep injection
 

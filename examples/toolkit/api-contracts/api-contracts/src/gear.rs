@@ -41,6 +41,11 @@ impl ApiContracts {
     /// Factory invoked by `#[toolkit::provides]` when wiring resolves to
     /// `ClientWiring::Local`. Signature matches the macro's contract:
     /// `fn(&GearCtx, Arc<PolicyStack>) -> anyhow::Result<Arc<dyn Contract>>`.
+    // `#[toolkit::provides]` applies `?` to this factory's return value
+    // (`#local_path(ctx, __policies)?`), so `Result` is a required part of
+    // the macro's calling convention, not incidental — this example's local
+    // path just happens to always succeed.
+    #[allow(clippy::unnecessary_wraps)]
     fn build_local(
         _ctx: &GearCtx,
         policies: Arc<PolicyStack>,

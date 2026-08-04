@@ -160,6 +160,57 @@ impl ReadinessState {
     }
 }
 
+/// Bridges the process-level [`ReadinessState`] into the
+/// [`RestHealthcheckRegistry`](crate::healthcheck::RestHealthcheckRegistry) so
+/// the served `/readyz` (and `/health`) reflect consumed-dependency readiness.
+///
+/// The in-process gateway `/readyz` reports 503 whenever any registered check is
+/// `Unhealthy`, so mapping `Starting`/`Draining` → `Unhealthy` (and
+/// `Ready`/`Degraded` → `Healthy`) gates the probe exactly as ADR-0007 intends.
+/// `/healthz` (liveness) is a static handler and is unaffected. Note the
+/// registry caches reports for `~2s`, so a readiness/drain transition surfaces
+/// on `/readyz` with up to that lag.
+pub struct ReadinessHealthcheck {
+    state: std::sync::Arc<ReadinessState>,
+}
+
+impl ReadinessHealthcheck {
+    /// Wrap the shared process-level readiness state.
+    #[must_use]
+    pub fn new(state: std::sync::Arc<ReadinessState>) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::healthcheck::Healthcheck for ReadinessHealthcheck {
+    fn name(&self) -> &'static str {
+        "readiness"
+    }
+
+    async fn check(&self) -> crate::healthcheck::HealthcheckResult {
+        use crate::healthcheck::HealthcheckResult;
+        let report = self.state.report();
+        match report.phase {
+            ReadinessPhase::Ready | ReadinessPhase::Degraded => HealthcheckResult::healthy(),
+            ReadinessPhase::Draining => {
+                HealthcheckResult::unhealthy("draining").with_code("draining")
+            }
+            ReadinessPhase::Starting => {
+                let msg = if report.unresolved_deps.is_empty() {
+                    "starting".to_owned()
+                } else {
+                    format!(
+                        "unresolved dependencies: {}",
+                        report.unresolved_deps.join(", ")
+                    )
+                };
+                HealthcheckResult::unhealthy(msg).with_code("deps_unresolved")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -175,6 +226,33 @@ mod tests {
         assert!(s.is_ready());
     }
 
+    #[tokio::test]
+    async fn readiness_healthcheck_maps_phase_to_status() {
+        use crate::healthcheck::{Healthcheck, HealthcheckStatus};
+
+        let state = std::sync::Arc::new(ReadinessState::new());
+        state.register_dep("billing");
+        let hc = ReadinessHealthcheck::new(state.clone());
+        assert_eq!(hc.name(), "readiness");
+
+        // Unresolved dep → Unhealthy (503 on /readyz), with a stable code and
+        // the dep listed.
+        let starting = hc.check().await;
+        assert_eq!(starting.status, HealthcheckStatus::Unhealthy);
+        assert_eq!(starting.code.as_deref(), Some("deps_unresolved"));
+        assert!(starting.message.unwrap().contains("billing"));
+
+        // Resolved → Healthy (200).
+        state.mark_resolved("billing");
+        assert_eq!(hc.check().await.status, HealthcheckStatus::Healthy);
+
+        // Draining wins regardless of deps.
+        state.set_draining();
+        let draining = hc.check().await;
+        assert_eq!(draining.status, HealthcheckStatus::Unhealthy);
+        assert_eq!(draining.code.as_deref(), Some("draining"));
+    }
+
     #[test]
     fn unresolved_dep_is_starting_with_list() {
         let s = ReadinessState::new();
@@ -182,7 +260,10 @@ mod tests {
         s.register_dep("inventory");
         let r = s.report();
         assert_eq!(r.phase, ReadinessPhase::Starting);
-        assert_eq!(r.unresolved_deps, vec!["billing".to_owned(), "inventory".to_owned()]);
+        assert_eq!(
+            r.unresolved_deps,
+            vec!["billing".to_owned(), "inventory".to_owned()]
+        );
         assert_eq!(r.http_status(), 503);
         assert!(!s.is_ready());
     }

@@ -3,10 +3,12 @@
 //! PRD #1536 RFC 9457 envelope via the `error_code` + `error_domain`
 //! extension fields.
 //!
-//! Variant payload (named fields or single-tuple-field struct) is placed
-//! at `context["data"]`. The canonical AIP-193 category is selected per
-//! variant via `#[canonical(Category)]` and determines GTS URI, HTTP
-//! status, and title.
+//! Variant payload — **named fields only** (unit variants and tuple/unnamed
+//! variants are rejected) — is placed at `context["data"]`. The canonical
+//! AIP-193 category is selected per variant via `#[canonical(Category)]` and
+//! determines GTS URI, HTTP status, and title. Mark one variant
+//! `#[contract_error(fallback)]` to also emit a total `From<TransportError>`
+//! (see the derive docs in `lib.rs`).
 
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
@@ -156,10 +158,10 @@ fn emit_from_transport(enum_ident: &Ident, fb: &ParsedVariant) -> syn::Result<To
             ) -> #enum_ident {
                 use #support::runtime::transport_error::TransportError as __TE;
                 let __problem: ::toolkit_canonical_errors::Problem = match __err {
-                    __TE::Problem(__p) => {
+                    __TE::Problem { problem: __p, .. } => {
                         match <#enum_ident as ::std::convert::TryFrom<
                             ::toolkit_canonical_errors::Problem,
-                        >>::try_from(__p)
+                        >>::try_from(*__p)
                         {
                             ::std::result::Result::Ok(__typed) => return __typed,
                             ::std::result::Result::Err(__p) => __p,
@@ -376,22 +378,30 @@ fn emit_from_arm(enum_ident: &Ident, v: &ParsedVariant) -> TokenStream {
             }
         }
         VariantFields::Named(fields) => {
-            // Each field must round-trip as JSON. Missing keys make this
-            // arm error out and bounce the original Problem back to the
-            // caller — typed reconstruction failure is preferable to a
-            // half-populated variant.
+            // Each field is deserialized from `context.data.<field>`. An ABSENT
+            // key is treated as JSON `null` (not an immediate failure) so that:
+            //   - `Option<_>` fields reconstruct as `None` — tolerating a
+            //     cross-language/hand-written peer, or a newer/older variant,
+            //     that omits an optional field (serde's field-level `Option`
+            //     semantics);
+            //   - required fields still fail (`null` is not a valid
+            //     `String`/number/struct) and bounce the ORIGINAL `Problem`
+            //     back to the caller — a typed reconstruction failure is
+            //     preferable to a half-populated variant.
             let field_reads = fields.iter().map(|f| {
                 let key = f.to_string();
                 let var = format_ident!("__f_{}", f);
                 quote_spanned_eq(
                     span,
                     quote! {
-                        let #var = match __data.get(#key) {
-                            Some(__v) => match ::serde_json::from_value(__v.clone()) {
-                                Ok(__x) => __x,
-                                Err(_) => return ::std::result::Result::Err(__problem),
-                            },
-                            None => return ::std::result::Result::Err(__problem),
+                        let #var = match ::serde_json::from_value(
+                            __data
+                                .get(#key)
+                                .cloned()
+                                .unwrap_or(::serde_json::Value::Null),
+                        ) {
+                            Ok(__x) => __x,
+                            Err(_) => return ::std::result::Result::Err(__problem),
                         };
                     },
                 )

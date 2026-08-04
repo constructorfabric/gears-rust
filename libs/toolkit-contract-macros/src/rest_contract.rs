@@ -8,7 +8,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{TraitItem, Type};
+use syn::{Ident, TraitItem, Type};
 
 use crate::projection::{
     build_delegation_body, client_struct_ident, generate_projection_impl_for_client,
@@ -21,6 +21,7 @@ const HTTP_ATTRS: &[&str] = &[
     "get",
     "post",
     "put",
+    "patch",
     "delete",
     "retryable",
     "streaming",
@@ -45,6 +46,7 @@ pub fn generate(model: &RestContractModel) -> TokenStream {
     let resolving_impl = generate_resolving_client_impl(model, &support);
     let projection_impl = generate_projection_impl(model);
     let server_registration = generate_server_registration(model);
+    let coverage_check = generate_full_coverage_check(model, &support);
 
     quote! {
         #cleaned_trait
@@ -55,6 +57,48 @@ pub fn generate(model: &RestContractModel) -> TokenStream {
         #resolving_impl
         #projection_impl
         #server_registration
+        #coverage_check
+    }
+}
+
+/// When `require_full_coverage` (ADR-0003) is set, emit a generated test that
+/// asserts the base contract and the REST projection cover exactly the same
+/// method set (both directions), naming any offending method.
+///
+/// This runs under `cargo test`, is feature-independent (does not need
+/// `rest-client`), and reuses the runtime coverage validator
+/// [`validate_http_binding`]. It requires the base trait to be
+/// `#[toolkit::contract]`-annotated (so it implements `Contract`). A purely
+/// compile-time, feature-independent, method-named check is not achievable from
+/// the projection macro alone, because it cannot see the base trait's method
+/// set at macro-expansion time (the base lives behind an imported path); the
+/// signature / no-extra-method direction is already enforced feature-
+/// independently by the delegating default methods, and the missing-method
+/// direction is also caught by the generated client `impl` (E0046) under
+/// `rest-client`.
+fn generate_full_coverage_check(model: &RestContractModel, support: &TokenStream) -> TokenStream {
+    if !model.require_full_coverage {
+        return TokenStream::new();
+    }
+    let base_trait = &model.base_trait;
+    let trait_snake = to_snake_case(&model.trait_ident.to_string());
+    let binding_fn = format_ident!("{}_http_binding", trait_snake);
+    let test_fn = format_ident!("__{}_require_full_coverage", trait_snake);
+    quote! {
+        #[cfg(test)]
+        #[test]
+        fn #test_fn() {
+            let __ir = <dyn #base_trait as #support::Contract>::contract_ir();
+            let __binding = #binding_fn();
+            if let ::std::result::Result::Err(__errs) =
+                #support::ir::validate_http_binding(&__ir, &__binding)
+            {
+                ::std::panic!(
+                    "require_full_coverage: base/projection method-set mismatch: {:?}",
+                    __errs
+                );
+            }
+        }
     }
 }
 
@@ -147,9 +191,7 @@ fn build_method_binding(method: &RestMethodModel, support: &TokenStream) -> Toke
     let streaming = method.streaming;
     let optional = method.optional;
 
-    let path_param_names = extract_path_param_names(path);
-
-    let field_bindings = build_field_bindings(method, &path_param_names, support);
+    let field_bindings = build_field_bindings(method, support);
 
     quote! {
         #support::ir::binding::HttpMethodBindingIr {
@@ -169,58 +211,69 @@ fn http_method_tokens(verb: HttpVerb, support: &TokenStream) -> TokenStream {
     quote! { #support::ir::binding::HttpMethod::#variant }
 }
 
-fn build_field_bindings(
-    method: &RestMethodModel,
-    path_params: &[String],
-    support: &TokenStream,
-) -> Vec<TokenStream> {
-    let mut bindings = Vec::new();
-    let mut body_assigned = false;
+/// Where a method parameter is carried in the HTTP request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldClass {
+    Path,
+    Body,
+    Query,
+}
 
+/// Classify each non-`self`, non-security-context parameter of a method into its
+/// HTTP carrier. This is the **single source of truth** for path/body/query
+/// binding: the client IR ([`build_field_bindings`]) and the server route
+/// generator ([`body_param_type`], [`generate_unary_handler`]) both consume it,
+/// so they can never disagree on the wire shape (ADR-0003 single-IR intent).
+///
+/// Rule: a param whose name matches a `{param}` in the path template is `Path`;
+/// otherwise the first remaining param on a body-carrying verb (POST/PUT) is the
+/// `Body`; all others are `Query`.
+fn classify_params(method: &RestMethodModel) -> Vec<(&RestParam, FieldClass)> {
+    let path_params = extract_path_param_names(&method.path_template);
+    let mut out = Vec::new();
+    let mut body_assigned = false;
     for param in &method.params {
-        if is_skip_param(param) {
+        if param.ident == "self" || is_security_context_type(&param.ty) {
             continue;
         }
         let name = param.ident.to_string();
-
-        if path_params.iter().any(|p| p == &name) {
-            bindings.push(quote! {
-                #support::ir::binding::HttpFieldBinding::Path {
-                    field: #name.to_owned(),
-                    param: #name.to_owned(),
-                }
-            });
-            continue;
-        }
-
-        if method.http_method.allows_body() && !body_assigned {
-            bindings.push(quote! { #support::ir::binding::HttpFieldBinding::Body });
+        let class = if path_params.iter().any(|p| p == &name) {
+            FieldClass::Path
+        } else if method.http_method.allows_body() && !body_assigned {
             body_assigned = true;
-            continue;
-        }
-
-        // GET/DELETE remaining parameters, or extra POST/PUT params after body.
-        bindings.push(quote! {
-            #support::ir::binding::HttpFieldBinding::Query {
-                field: #name.to_owned(),
-                param: #name.to_owned(),
-            }
-        });
+            FieldClass::Body
+        } else {
+            FieldClass::Query
+        };
+        out.push((param, class));
     }
-
-    bindings
+    out
 }
 
-fn is_skip_param(param: &RestParam) -> bool {
-    let ident = param.ident.to_string();
-    if ident == "self" {
-        return true;
-    }
-    // Security-plane context params (tenant `SecurityContext` or platform
-    // `PlatformSecurityContext`, value or reference) are not part of the wire
-    // payload — they are populated by the server via Axum extractors and carry
-    // authorization out-of-band (per-request headers / transport injection).
-    is_security_context_type(&param.ty)
+fn build_field_bindings(method: &RestMethodModel, support: &TokenStream) -> Vec<TokenStream> {
+    classify_params(method)
+        .into_iter()
+        .map(|(param, class)| {
+            let name = param.ident.to_string();
+            match class {
+                FieldClass::Path => quote! {
+                    #support::ir::binding::HttpFieldBinding::Path {
+                        field: #name.to_owned(),
+                        param: #name.to_owned(),
+                    }
+                },
+                FieldClass::Body => {
+                    quote! { #support::ir::binding::HttpFieldBinding::Body }
+                }
+                FieldClass::Query => quote! {
+                    #support::ir::binding::HttpFieldBinding::Query {
+                        field: #name.to_owned(),
+                        param: #name.to_owned(),
+                    }
+                },
+            }
+        })
+        .collect()
 }
 
 /// Strip leading `&`/`&mut` from a type, returning the owned inner type. Axum
@@ -274,10 +327,11 @@ fn generate_client_struct(model: &RestContractModel, support: &TokenStream) -> T
             /// The transport is built by
             /// [`build_default_http_client`](#support::runtime::client::build_default_http_client):
             /// transport-layer retry disabled (the SDK retries itself), plaintext
-            /// `http://` allowed, and — when the `otel` feature is enabled — W3C
-            /// `traceparent` propagation plus RED client metrics labeled with this
-            /// projection trait name. For caller-controlled HTTP client
-            /// construction use [`Self::with_http_client`].
+            /// `http://` allowed unless `config.require_tls` is set, and — when
+            /// the `otel` feature is enabled — W3C `traceparent` propagation plus
+            /// RED client metrics labeled with this projection trait name. For
+            /// caller-controlled HTTP client construction use
+            /// [`Self::with_http_client`].
             ///
             /// Fallible because the underlying `toolkit-http` builder can fail
             /// under non-default cryptographic backends (FIPS, custom TLS).
@@ -287,7 +341,10 @@ fn generate_client_struct(model: &RestContractModel, support: &TokenStream) -> T
             pub fn new(
                 config: #support::runtime::config::ClientConfig,
             ) -> ::std::result::Result<Self, ::toolkit_http::HttpError> {
-                let http = #support::runtime::client::build_default_http_client(#metrics_label)?;
+                let http = #support::runtime::client::build_default_http_client(
+                    #metrics_label,
+                    config.require_tls,
+                )?;
                 Ok(Self { http, config })
             }
 
@@ -328,7 +385,10 @@ fn generate_client_impl(model: &RestContractModel, support: &TokenStream) -> Tok
 /// delegates each base-trait method through it (see
 /// [`generate_resolving_client_impl`]). Gated behind `directory-rest-client`
 /// (which enables `rest-client`, so `XxxRestClient` exists).
-fn generate_resolving_client_struct(model: &RestContractModel, support: &TokenStream) -> TokenStream {
+fn generate_resolving_client_struct(
+    model: &RestContractModel,
+    support: &TokenStream,
+) -> TokenStream {
     let resolving_ident = resolving_struct_ident(&model.trait_ident);
     let client_ident = client_struct_ident(&model.trait_ident);
     let doc = format!(
@@ -562,9 +622,24 @@ fn generate_client_method(
             // W3C `traceparent` on the outbound request.
             #support::__tracing::Instrument::instrument(async move {
                 let __binding = #binding_fn();
-                let __m = __binding
-                    .find_method(#method_name_str)
-                    .expect(concat!("missing HTTP binding for method '", #method_name_str, "'"));
+                // The binding is generated from the same trait model, so this is
+                // unreachable in practice — but return a typed error rather than
+                // panicking inside generated library code (no panic paths).
+                let __m = match __binding.find_method(#method_name_str) {
+                    ::std::option::Option::Some(__m) => __m,
+                    ::std::option::Option::None => {
+                        return ::std::result::Result::Err((#convert_err)(
+                            #support::runtime::transport_error::TransportError::UrlBuild(
+                                concat!(
+                                    "missing HTTP binding for method '",
+                                    #method_name_str,
+                                    "'",
+                                )
+                                .to_owned(),
+                            ),
+                        ));
+                    }
+                };
 
                 #fields_init
                 let __fields = __fields_result.map_err(#convert_err)?;
@@ -638,10 +713,27 @@ fn generate_streaming_method_body(
             let __span = #span_ctor;
 
             let __binding = #binding_fn();
-            let __m = __binding
-                .find_method(#method_name)
-                .expect(concat!("missing HTTP binding for method '", #method_name, "'"))
-                .clone();
+            // The binding is generated from the same trait model, so this is
+            // unreachable in practice — but return a typed error rather than
+            // panicking inside generated library code (mirrors the unary path).
+            let __m = match __binding.find_method(#method_name) {
+                ::std::option::Option::Some(__m) => __m.clone(),
+                ::std::option::Option::None => {
+                    let __err = (#convert_err)(
+                        #support::runtime::transport_error::TransportError::UrlBuild(
+                            concat!(
+                                "missing HTTP binding for method '",
+                                #method_name,
+                                "'",
+                            )
+                            .to_owned(),
+                        ),
+                    );
+                    return ::std::boxed::Box::pin(::futures_util::stream::once(async move {
+                        ::std::result::Result::Err(__err)
+                    }));
+                }
+            };
             let __base_path = __binding.base_path.clone();
             let __base_url = self.config.base_url.clone();
             let __http = self.http.clone();
@@ -702,7 +794,9 @@ fn generate_streaming_method_body(
                 ::std::result::Result::Ok(__builder)
             };
 
-            let __timeout = ::std::option::Option::Some(self.config.timeout);
+            // SSE uses the per-event idle deadline (NOT the unary `timeout`),
+            // so a healthy slow stream is not killed between events.
+            let __timeout = ::std::option::Option::Some(self.config.sse_idle_timeout);
             let __stream = #support::runtime::client::send_streaming::<_, #item_ty>(
                 __factory, __reconnect, __timeout,
             );
@@ -777,32 +871,35 @@ fn http_verb_call(verb: HttpVerb) -> syn::Ident {
         HttpVerb::Get => format_ident!("get"),
         HttpVerb::Post => format_ident!("post"),
         HttpVerb::Put => format_ident!("put"),
+        HttpVerb::Patch => format_ident!("patch"),
         HttpVerb::Delete => format_ident!("delete"),
     }
 }
 
 fn build_fields_json(method: &RestMethodModel, support: &TokenStream) -> TokenStream {
-    let entries = method.params.iter().filter_map(|p| {
-        if p.ident == "self" {
-            return None;
-        }
-        if is_security_context_type(&p.ty) {
-            return None;
-        }
-        let key = p.ident.to_string();
-        let ident = &p.ident;
-        Some(quote! {
-            __obj.insert(
-                #key.to_owned(),
-                match ::serde_json::to_value(&#ident) {
-                    ::std::result::Result::Ok(__v) => __v,
-                    ::std::result::Result::Err(__e) => return ::std::result::Result::Err(
-                        #support::runtime::transport_error::TransportError::serialization(__e),
-                    ),
-                },
-            );
-        })
-    });
+    // Only path/query fields go into `__fields` (consumed by URL building); the
+    // body param is applied separately via `with_json_body`, so excluding it
+    // here avoids serializing it twice. Uses the shared `classify_params`.
+    let entries = classify_params(method)
+        .into_iter()
+        .filter_map(|(p, class)| {
+            if class == FieldClass::Body {
+                return None;
+            }
+            let key = p.ident.to_string();
+            let ident = &p.ident;
+            Some(quote! {
+                __obj.insert(
+                    #key.to_owned(),
+                    match ::serde_json::to_value(&#ident) {
+                        ::std::result::Result::Ok(__v) => __v,
+                        ::std::result::Result::Err(__e) => return ::std::result::Result::Err(
+                            #support::runtime::transport_error::TransportError::serialization(__e),
+                        ),
+                    },
+                );
+            })
+        });
 
     quote! {
         let __fields_result: ::std::result::Result<
@@ -862,7 +959,10 @@ fn capture_body_param(method: &RestMethodModel) -> Option<syn::Ident> {
 }
 
 fn generate_server_registration(model: &RestContractModel) -> TokenStream {
-    let fn_name = format_ident!("register_{}_routes", to_snake_case(&model.trait_ident.to_string()));
+    let fn_name = format_ident!(
+        "register_{}_routes",
+        to_snake_case(&model.trait_ident.to_string())
+    );
     let base_trait = &model.base_trait;
     let doc = format!(
         "Register the macro-generated REST routes for [`{}`] on the given router.\n\n\
@@ -922,29 +1022,77 @@ fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) ->
         HttpVerb::Get => quote! { get },
         HttpVerb::Post => quote! { post },
         HttpVerb::Put => quote! { put },
+        HttpVerb::Patch => quote! { patch },
         HttpVerb::Delete => quote! { delete },
     };
 
-    let path_param_names = extract_path_param_names(&method.path_template);
+    // axum permits a single `Query` extractor per handler, so >1 query-classified
+    // param cannot be aggregated automatically (their fields would have to be
+    // merged into one type). Reject it loudly here — a silent extractor mismatch
+    // (server decodes only one, client sends several) is far worse. Authors
+    // combine query params into one flat struct (ADR-0002 flat-struct form).
+    let query_count = classify_params(method)
+        .into_iter()
+        .filter(|(_, class)| *class == FieldClass::Query)
+        .count();
+    if query_count > 1 {
+        let msg = format!(
+            "rest_contract: method `{method_name}` has {query_count} query parameters; the \
+             generated server route supports at most one (axum allows a single `Query` \
+             extractor). Combine them into one flat struct query parameter, or mark the \
+             method `#[server_manual]` and register it by hand."
+        );
+        return quote! { ::std::compile_error!(#msg); };
+    }
 
-    // Detect the request-body parameter type (for OpenAPI request schema).
-    let body_ty = body_param_type(method, &path_param_names);
+    // OpenAPI path parameters — one per `{param}` in the template.
+    let path_param_registrations = classify_params(method)
+        .into_iter()
+        .filter(|(_, class)| *class == FieldClass::Path)
+        .map(|(param, _)| {
+            let name = param.ident.to_string();
+            quote! { .path_param(#name, "") }
+        });
+
+    // OpenAPI query parameter — registered only when the (single, per the
+    // `query_count > 1` guard above) query param is a scalar type, so its name
+    // and required-ness in the spec genuinely match the wire. A flat-struct
+    // query param's individual fields aren't visible at macro-expansion time
+    // (the macro doesn't parse the struct definition), so registering it under
+    // the Rust parameter's own name would document a parameter shape the
+    // client never sends — worse than omitting it. That case remains a known,
+    // documented gap; authors needing an accurate spec use `#[server_manual]`.
+    let query_param_registration = classify_params(method)
+        .into_iter()
+        .find(|(_, class)| *class == FieldClass::Query)
+        .and_then(|(param, _)| {
+            let (openapi_ty, required) = scalar_openapi_type(&param.ty)?;
+            let name = param.ident.to_string();
+            Some(quote! { .query_param_typed(#name, #required, "", #openapi_ty) })
+        })
+        .unwrap_or_default();
+
+    // Request-body param type (for OpenAPI request schema) — from the shared
+    // classifier, so it matches the client IR and the handler below.
+    let body_ty = body_param_type(method);
     let request_registration = match body_ty {
         Some(ty) => quote! { .json_request::<#ty>(openapi, "") },
         None => quote! {},
     };
 
-    let handler = generate_unary_handler(method, &path_param_names);
+    let handler = generate_unary_handler(method);
 
-    // Response schema: derive from the `Ok` type of `Result<Ok, Err>`.
-    let response_registration = if let Some((ok_ty, _)) = &method.result_types {
-        quote! {
+    // Response schema: derive from the `Ok` type of `Result<Ok, Err>`. A unit
+    // `Ok` type (`Result<(), E>`) has no schema and is not a `ResponseApiDto`,
+    // so it uses the schema-less `.json_response(..)` — matching the generated
+    // handler, which wraps the unit value in `Json(())` (200 + `null` body).
+    let response_registration = match &method.result_types {
+        Some((ok_ty, _)) if !is_unit_type(ok_ty) => quote! {
             .json_response_with_schema::<#ok_ty>(openapi, ::axum::http::StatusCode::OK, "")
-        }
-    } else {
-        quote! {
+        },
+        _ => quote! {
             .json_response(::axum::http::StatusCode::OK, "")
-        }
+        },
     };
 
     quote! {
@@ -952,6 +1100,8 @@ fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) ->
             .operation_id(#operation_id)
             .authenticated()
             .no_license_required()
+            #(#path_param_registrations)*
+            #query_param_registration
             #request_registration
             .handler(#handler)
             #response_registration
@@ -960,27 +1110,64 @@ fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) ->
     }
 }
 
-/// Returns the type of the request-body parameter for body-carrying verbs
-/// (POST/PUT): the first parameter that is not `self`, not `SecurityContext`,
-/// and not a path parameter. `None` for GET/DELETE or bodyless methods.
-fn body_param_type(method: &RestMethodModel, path_param_names: &[String]) -> Option<Type> {
-    if !method.http_method.allows_body() {
-        return None;
-    }
-    for param in &method.params {
-        let name = param.ident.to_string();
-        if name == "self" || is_security_context_type(&param.ty) {
-            continue;
+/// Recognizes a "scalar-like" Rust type usable as a single `OpenAPI` query
+/// parameter — `String`/`&str`/numeric/`bool`, or `Option<...>` of one of
+/// those (peeled once). Returns `(openapi_type, required)`. Returns `None` for
+/// anything else (flat-struct query params), since the macro cannot see a
+/// struct's field definitions at expansion time and registering it under the
+/// Rust parameter's own name would document a parameter shape that does not
+/// match what actually goes on the wire.
+fn scalar_openapi_type(ty: &Type) -> Option<(&'static str, bool)> {
+    fn leaf_ident(ty: &Type) -> Option<&syn::Ident> {
+        match ty {
+            Type::Reference(r) => leaf_ident(&r.elem),
+            Type::Path(p) => p.path.segments.last().map(|s| &s.ident),
+            _ => None,
         }
-        if path_param_names.contains(&name) {
-            continue;
-        }
-        return Some(param.ty.clone());
     }
-    None
+    fn openapi_type_for(ident: &syn::Ident) -> Option<&'static str> {
+        match ident.to_string().as_str() {
+            "String" | "str" => Some("string"),
+            "bool" => Some("boolean"),
+            "f32" | "f64" => Some("number"),
+            "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
+            | "u128" | "usize" => Some("integer"),
+            _ => None,
+        }
+    }
+
+    // Peel one layer of `Option<...>` (by reference, so `&Option<T>` also
+    // works) to determine both the leaf type and required-ness.
+    if let Type::Path(p) = strip_reference(ty)
+        && let Some(seg) = p.path.segments.last()
+        && seg.ident == "Option"
+        && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+    {
+        return leaf_ident(inner)
+            .and_then(openapi_type_for)
+            .map(|t| (t, false));
+    }
+
+    leaf_ident(ty).and_then(openapi_type_for).map(|t| (t, true))
 }
 
-fn generate_unary_handler(method: &RestMethodModel, path_param_names: &[String]) -> TokenStream {
+/// True for the unit type `()`. Server response codegen uses this to pick the
+/// schema-less `.json_response(..)` (the unit type is not a `ResponseApiDto`).
+fn is_unit_type(ty: &Type) -> bool {
+    matches!(ty, Type::Tuple(t) if t.elems.is_empty())
+}
+
+/// Returns the type of the request-body parameter (the `Body`-classified param),
+/// via the shared [`classify_params`]. `None` for GET/DELETE or bodyless methods.
+fn body_param_type(method: &RestMethodModel) -> Option<Type> {
+    classify_params(method)
+        .into_iter()
+        .find(|(_, class)| *class == FieldClass::Body)
+        .map(|(param, _)| param.ty.clone())
+}
+
+fn generate_unary_handler(method: &RestMethodModel) -> TokenStream {
     let method_ident = &method.ident;
 
     // The security-plane context is always first (populated by gateway auth
@@ -1015,39 +1202,68 @@ fn generate_unary_handler(method: &RestMethodModel, path_param_names: &[String])
         ),
     };
 
-    let mut extractors = vec![ctx_extractor];
+    // Collect params by carrier, preserving the trait's declaration order for
+    // `call_args` (the service is invoked as `svc.method(ctx, a, b, ..)`).
+    // Classification is shared with the client IR via `classify_params`.
     let mut call_args = vec![ctx_call_arg];
-    // Emit path/query extractors first; the body-consuming `Json` extractor
-    // must be LAST (axum requires the single `FromRequest` extractor to be the
-    // final handler argument), so defer it and push it after the loop.
+    let mut path_idents: Vec<&Ident> = Vec::new();
+    let mut path_tys: Vec<&Type> = Vec::new();
+    let mut query_extractor: Option<TokenStream> = None;
     let mut body_extractor: Option<TokenStream> = None;
-    let mut body_taken = false;
 
-    for param in &method.params {
+    for (param, class) in classify_params(method) {
         let param_name = &param.ident;
-        if param_name == "self" || is_security_context_type(&param.ty) {
-            continue;
-        }
         let param_ty = &param.ty;
-
-        if path_param_names.contains(&param_name.to_string()) {
-            extractors.push(quote! {
-                ::axum::extract::Path(#param_name): ::axum::extract::Path<#param_ty>
-            });
-        } else if method.http_method.allows_body() && !body_taken {
-            body_extractor = Some(quote! {
-                ::axum::Json(#param_name): ::axum::Json<#param_ty>
-            });
-            body_taken = true;
-        } else {
-            extractors.push(quote! {
-                ::axum::extract::Query(#param_name): ::axum::extract::Query<#param_ty>
-            });
+        match class {
+            FieldClass::Path => {
+                path_idents.push(param_name);
+                path_tys.push(param_ty);
+            }
+            FieldClass::Body => {
+                body_extractor = Some(quote! {
+                    ::axum::Json(#param_name): ::axum::Json<#param_ty>
+                });
+            }
+            // At most one query param reaches here — `generate_method_route`
+            // emits a `compile_error!` for >1 (axum allows a single `Query`
+            // extractor; multiple scalar query params must be combined into one
+            // flat struct). A single flat-struct/scalar query param works.
+            FieldClass::Query => {
+                query_extractor = Some(quote! {
+                    ::axum::extract::Query(#param_name): ::axum::extract::Query<#param_ty>
+                });
+            }
         }
         call_args.push(quote! { #param_name });
     }
 
-    // Body extractor goes last so it is the final handler argument.
+    // Aggregate path params into a SINGLE extractor: axum deserializes ALL path
+    // segments through one `Path<_>`, so multiple path params must be one
+    // `Path<(T0, T1, ..)>` tuple (individual `Path<T>` extractors each try to
+    // decode the whole tuple and fail at runtime — the bug this fixes).
+    let path_extractor: Option<TokenStream> = match path_idents.len() {
+        0 => None,
+        1 => {
+            let i = path_idents[0];
+            let t = path_tys[0];
+            Some(quote! { ::axum::extract::Path(#i): ::axum::extract::Path<#t> })
+        }
+        _ => Some(quote! {
+            ::axum::extract::Path((#(#path_idents),*)): ::axum::extract::Path<(#(#path_tys),*)>
+        }),
+    };
+
+    // Order: ctx (Extension) → path → query → body. The body-consuming `Json`
+    // extractor MUST be last (axum requires the single `FromRequest` extractor to
+    // be the final handler argument); `Extension`/`Path`/`Query` are
+    // `FromRequestParts` and may precede it in any order.
+    let mut extractors = vec![ctx_extractor];
+    if let Some(p) = path_extractor {
+        extractors.push(p);
+    }
+    if let Some(q) = query_extractor {
+        extractors.push(q);
+    }
     if let Some(body) = body_extractor {
         extractors.push(body);
     }
@@ -1071,17 +1287,72 @@ fn generate_unary_handler(method: &RestMethodModel, path_param_names: &[String])
     }
 }
 
+/// Snake-case a trait ident. Delegates to `heck::ToSnakeCase` — the SAME
+/// converter used by `#[toolkit::provides]` (`provides.rs`) and `codegen.rs` —
+/// so the generated `<trait_snake>_http_binding` symbol name always matches the
+/// name `provides` reconstructs, including for acronym/adjacent-capital trait
+/// names (e.g. `HttpGatewayApi` → `http_gateway_api`, not `h_t_t_p_...`). A
+/// hand-rolled converter here previously diverged on such names and broke the
+/// `provides`↔REST wiring with an `E0425 cannot find function`.
 fn to_snake_case(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 4);
-    for (i, ch) in s.chars().enumerate() {
-        if ch.is_ascii_uppercase() {
-            if i > 0 {
-                out.push('_');
-            }
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push(ch);
-        }
+    use heck::ToSnakeCase as _;
+    s.to_snake_case()
+}
+
+#[cfg(test)]
+mod scalar_openapi_type_tests {
+    use super::scalar_openapi_type;
+    use syn::parse_quote;
+
+    #[test]
+    fn recognizes_scalar_types_as_required() {
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(String)),
+            Some(("string", true))
+        );
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(&str)),
+            Some(("string", true))
+        );
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(bool)),
+            Some(("boolean", true))
+        );
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(u64)),
+            Some(("integer", true))
+        );
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(i32)),
+            Some(("integer", true))
+        );
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(f64)),
+            Some(("number", true))
+        );
     }
-    out
+
+    #[test]
+    fn recognizes_optional_scalars_as_not_required() {
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(Option<String>)),
+            Some(("string", false))
+        );
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(Option<u32>)),
+            Some(("integer", false))
+        );
+    }
+
+    #[test]
+    fn rejects_struct_types() {
+        // A flat-struct query param's fields aren't visible at macro-expansion
+        // time, so it must NOT be registered as a scalar (that would document a
+        // wrong parameter shape) — see the `#11` fix rationale.
+        assert_eq!(scalar_openapi_type(&parse_quote!(ListPaymentsFilter)), None);
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(Option<ListPaymentsFilter>)),
+            None
+        );
+    }
 }

@@ -502,3 +502,44 @@ async fn health_endpoints_absent_from_openapi() {
         );
     }
 }
+
+// ---------- process-level ReadinessState → /readyz ----------
+
+/// The runtime registers a synthetic `readiness` healthcheck backed by the
+/// process-level `ReadinessState`. While a consumed dependency is unresolved
+/// the standalone `/readyz` must report 503; once resolved it must report 200.
+/// Liveness (`/healthz`) is a static handler and must stay 200 throughout.
+#[tokio::test]
+async fn readyz_reflects_process_readiness_state() {
+    use toolkit::{ReadinessHealthcheck, ReadinessState};
+
+    // Unresolved dependency → Starting → 503, but /healthz stays 200.
+    let starting = Arc::new(ReadinessState::new());
+    starting.register_dep("billing");
+    let router = build_standalone_health_router(|reg| {
+        reg.register(
+            "readiness",
+            Arc::new(ReadinessHealthcheck::new(starting.clone())),
+        );
+    })
+    .await;
+    assert_eq!(
+        get(router.clone(), "/readyz").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(get(router, "/healthz").await.status(), StatusCode::OK);
+
+    // Fresh router with a resolved state → Ready → 200. (A fresh registry
+    // avoids the ~2s report cache from the previous instance.)
+    let ready = Arc::new(ReadinessState::new());
+    ready.register_dep("billing");
+    ready.mark_resolved("billing");
+    let router = build_standalone_health_router(|reg| {
+        reg.register(
+            "readiness",
+            Arc::new(ReadinessHealthcheck::new(ready.clone())),
+        );
+    })
+    .await;
+    assert_eq!(get(router, "/readyz").await.status(), StatusCode::OK);
+}

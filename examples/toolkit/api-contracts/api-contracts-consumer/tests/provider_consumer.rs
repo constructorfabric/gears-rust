@@ -126,9 +126,10 @@ impl RunnableCapability for MockGateway {
 
         let shutdown = async move { cancel.cancelled().await };
         tokio::spawn(async move {
-            let _ = axum::serve(listener, router)
+            axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown)
-                .await;
+                .await
+                .ok();
         });
         Ok(())
     }
@@ -169,11 +170,15 @@ async fn consumer_resolves_provider_local_impl_through_the_hub() {
         &[],
         consumer.clone() as Arc<dyn Gear>,
     );
-    builder
-        .register_rest_with_meta("api-contracts-consumer", consumer as Arc<dyn RestApiCapability>);
+    builder.register_rest_with_meta(
+        "api-contracts-consumer",
+        consumer as Arc<dyn RestApiCapability>,
+    );
     builder.register_core_with_meta("mock-gateway", &[], gateway.clone() as Arc<dyn Gear>);
-    builder
-        .register_rest_host_with_meta("mock-gateway", gateway.clone() as Arc<dyn ApiGatewayCapability>);
+    builder.register_rest_host_with_meta(
+        "mock-gateway",
+        gateway.clone() as Arc<dyn ApiGatewayCapability>,
+    );
     builder.register_stateful_with_meta("mock-gateway", gateway as Arc<dyn RunnableCapability>);
     let registry = builder.build_topo_sorted().expect("registry build");
 
@@ -199,7 +204,10 @@ async fn consumer_resolves_provider_local_impl_through_the_hub() {
     // The provider's init registers a local `PaymentApi` in the hub; wait for it.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(Instant::now() < deadline, "provider never registered PaymentApi");
+        assert!(
+            Instant::now() < deadline,
+            "provider never registered PaymentApi"
+        );
         if hub.get::<dyn PaymentApi>().is_ok() {
             break;
         }
@@ -218,7 +226,7 @@ async fn consumer_resolves_provider_local_impl_through_the_hub() {
     assert!(!resp.payment_id.is_nil());
 
     cancel.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+    tokio::time::timeout(Duration::from_secs(5), run).await.ok();
 }
 
 // ----- OoP path: the consumer uses the *generated* REST client ---------------
@@ -274,11 +282,15 @@ async fn consumer_resolves_provider_via_generated_rest_client() {
         &[],
         consumer.clone() as Arc<dyn Gear>,
     );
-    builder
-        .register_rest_with_meta("api-contracts-consumer", consumer as Arc<dyn RestApiCapability>);
+    builder.register_rest_with_meta(
+        "api-contracts-consumer",
+        consumer as Arc<dyn RestApiCapability>,
+    );
     builder.register_core_with_meta("mock-gateway", &[], gateway.clone() as Arc<dyn Gear>);
-    builder
-        .register_rest_host_with_meta("mock-gateway", gateway.clone() as Arc<dyn ApiGatewayCapability>);
+    builder.register_rest_host_with_meta(
+        "mock-gateway",
+        gateway.clone() as Arc<dyn ApiGatewayCapability>,
+    );
     builder.register_stateful_with_meta("mock-gateway", gateway as Arc<dyn RunnableCapability>);
     let registry = builder.build_topo_sorted().expect("registry build");
 
@@ -306,7 +318,10 @@ async fn consumer_resolves_provider_via_generated_rest_client() {
     let proxy = ChargeProxyService::new(Arc::clone(&hub));
     let deadline = Instant::now() + Duration::from_secs(15);
     let resp = loop {
-        assert!(Instant::now() < deadline, "eventual readiness did not converge");
+        assert!(
+            Instant::now() < deadline,
+            "eventual readiness did not converge"
+        );
         match proxy
             .place_charge(SecurityContext::anonymous(), charge_req())
             .await
@@ -324,5 +339,5 @@ async fn consumer_resolves_provider_via_generated_rest_client() {
     assert!(!resp.payment_id.is_nil());
 
     cancel.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+    tokio::time::timeout(Duration::from_secs(5), run).await.ok();
 }
