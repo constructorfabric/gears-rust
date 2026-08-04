@@ -7,6 +7,8 @@ date: 2026-07-26
 
 **ID**: `cpt-cf-types-registry-adr-write-path-admission-protocol`
 
+## Table of Contents
+
 <!-- toc -->
 
 - [Context and Problem Statement](#context-and-problem-statement)

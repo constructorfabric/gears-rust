@@ -149,18 +149,11 @@ CREATE TABLE types_registry__version_family (
 );
 
 
--- Request identity and client-visible workflow state are one row. The relation
--- was strictly one-to-one on the operation side and one-to-zero-or-one on the
--- request side, the optional half existing only for a synchronous `unchanged`
--- acceptance; with that path removed the two are the same record.
---
--- No synchronous acceptance path exists because an all-equal batch is
--- unreachable for a caller that honours its own preconditions:
--- an absent `expected_resource_version` fails once the entity exists, and a
--- present one fails once the content the caller read has moved. A caller that reconciled
--- before writing simply sends no POST. `outcome = 'unchanged'` therefore
--- survives only as the guarantee that a redundant submission creates no
--- revision and does not advance resource_version - not as a hot path.
+-- Request identity and client-visible workflow state are one row: ADR-0012
+-- admits no synchronous acceptance path, so there is no request without an
+-- operation and nothing left for a second table to hold. `unchanged` survives
+-- as the guarantee that a redundant submission creates no revision and does not
+-- advance resource_version, not as a path a correct caller takes.
 --
 -- `idempotency_scope_hash` is a digest over (plane, tenant_id, principal_id).
 -- The principal participates so that one
@@ -179,9 +172,7 @@ CREATE TABLE types_registry__version_family (
 -- (ADR-0013). Additions extend the CHECK rather than bypassing it.
 --
 -- `dry_run` is orthogonal to `kind`, not a member of it: all three kinds have
--- the mode, and folding it in would double the vocabulary and let a reader
--- believe a dry run is a different sort of work rather than the same work with
--- the commit suppressed.
+-- the mode, and folding it in would double the vocabulary.
 --
 -- It is part of `request_fingerprint`, which is what keeps a dry run and the
 -- real submission that follows it distinct requests under one Idempotency-Key.
@@ -194,10 +185,8 @@ CREATE TABLE types_registry__version_family (
 -- dry run produces no revision and therefore no such reference. Whether that
 -- makes it separately expirable is the retention half of PRD open question 10.
 --
--- There is no ownership correction. A mis-assigned owner is repaired by delete,
--- purge, re-register: purge releases the identifier, so the repair does not
--- strand it, which is the only reason a dedicated operation would exist
--- (ADR-0009). Ownership is therefore immutable for the life of an entity.
+-- There is no ownership-correction kind: ADR-0009 repairs a mis-assigned owner
+-- by delete, purge, re-register, so ownership is immutable for an entity's life.
 --
 -- Worker leases, attempts, retries, and dead letters belong to the ToolKit
 -- outbox processor tables and are not duplicated here.
@@ -270,24 +259,15 @@ CREATE INDEX idx_tr_operation_status
 --
 -- The optimistic precondition is one column, not a kind plus a value. Zero means
 -- `must_not_exist`; any other value is the entity resource version to match. The
--- sentinel is injective because ck_tr_entity_resource_version requires a real
--- version to be at least 1 - permitting version 0 there would break this
--- encoding silently, which is why the two constraints belong together in the
--- reader's mind. Splitting it in two would make `must_not_exist` with a version,
--- and a match with none, representable states that a constraint then has to
--- forbid. The vocabulary is closed at two by ADR-0012, and closed is what makes
--- a sentinel safe: "must exist at any version" is meaningless for a caller that
--- has just read the entity, and upsert is refused deliberately. etcd encodes
--- absence the same way, as `mod_revision == 0`.
+-- sentinel is injective only because ck_tr_entity_resource_version requires a
+-- real version to be at least 1 - permitting 0 there would break this encoding
+-- silently, so the two constraints belong together in the reader's mind.
+-- Splitting it in two would make "must not exist, at version 7" representable
+-- and then need a constraint to forbid it. ADR-0012 closes the vocabulary at
+-- two, which is what makes a sentinel safe.
 --
--- The contract encodes it the same way, as one optional value: present means
--- the version to match, absent means the entity must not exist. That is not the
--- header rule leaking - `resource_version` is a number the public payload
--- carries anyway, unlike the smallint enumerations - it is the same argument as
--- above, that two fields make "must not exist, at version 7" representable. The
--- one difference is the spelling of absence: the wire omits the field and
--- rejects a literal 0, since absence already carries that meaning and no entity
--- ever holds version 0.
+-- The contract carries the same value as one optional field, differing only in
+-- the spelling of absence: the wire omits the field and rejects a literal 0.
 --
 -- `dry_run` is copied from the parent operation and is the one denormalized
 -- column in this table. It exists because ck_tr_operation_item_state has to
@@ -419,18 +399,11 @@ CREATE TABLE types_registry__operation_item (
 --     an option - UUIDv5 over a namespace is not portable across the three
 --     backends.
 --
---     This column is what PRD and the ADRs call a Registry Reference, and the
---     two are one name: the SDK and REST contracts expose it as `gts_uuid` as
---     well, so nothing is translated at the boundary and there is one public
---     vocabulary for one value.
---
---     What that costs is the discouragement the old contract name carried.
---     ADR-0001 still forbids a gear to derive the value, read its version bits,
---     or reconstruct the allocation algorithm - the derivation is a long-lived
---     compatibility invariant, and a gear computing it locally would silently
---     break if it ever changed. A name saying `uuid` invites exactly that, so
---     the prohibition now rests on SDK documentation and review rather than on
---     a name that hid what the value is.
+--     This column is what PRD and the ADRs call a Registry Reference. The SDK
+--     and REST contracts expose it under this same name, so nothing is
+--     translated at the boundary. ADR-0001 still forbids a gear to derive the
+--     value locally; that prohibition now rests on SDK documentation and review
+--     rather than on a name that concealed the value's shape.
 --   * `entity_kind` follows from the trailing `~`, but a suffix predicate is
 --     not portably indexable, and the column also carries the kind-conditional
 --     constraints.
@@ -510,36 +483,19 @@ CREATE INDEX idx_tr_entity_visibility
 
 
 -- Immutable admission snapshot: the authored document exactly as admitted, its
--- hash, and the provenance needed to explain the verdict it was admitted under.
+-- hash, and the provenance needed to scope a later repair.
 --
--- Neither the effective artifacts nor the dependency revisions they were
--- resolved against are kept here, and the reason is the same for both: nothing
--- reads the admission-time resolution.
+-- Neither the effective artifacts nor the dependency revision vector are kept,
+-- for the same reason: nothing reads the admission-time resolution.
+-- Compatibility compares a candidate against the current revision, and the one
+-- backward-looking operation - ADR-0003's repair after the compatibility
+-- relation changes meaning - resolves both sides against the dependencies
+-- current at repair time. `gts_spec_version` and `gts_impl_version` are what
+-- scope that repair to the chains admitted under superseded rules.
 --
--- Compatibility compares a candidate against the current revision, never against
--- history, and the per-level evolvability of ADR-0003 is reported to the caller
--- in the operation result rather than read back later. The one operation that
--- does look backwards is the repair after the compatibility relation changes
--- meaning, and it does not want the historical resolution either. What the
--- registry promises a consumer is that the current revision accepts everything
--- an earlier one accepted, so the repair check is `Valid(rev_k) ⊆
--- Valid(current)` with both sides resolved against the dependencies that are
--- current now. That is sufficient rather than approximate: each dependency
--- evolved backward compatibly on its own chain, so
--- `Effective(rev_k)@D_then ⊆ Effective(rev_k)@D_now` by monotonicity of
--- conjunction, and composing gives exactly the promised guarantee. Resolving
--- rev_k against its historical dependencies would reconstruct a form no consumer
--- ever validated against.
---
--- What survives is therefore the authored document, its hash, and enough
--- provenance to scope that repair: `gts_spec_version` and `gts_impl_version`
--- identify the revisions admitted under superseded rules, so the repair runs
--- over those chains instead of the whole registry.
---
--- The vector still exists at admission time as concurrency control - validation
--- happens outside a transaction and the commit re-checks that no dependency
--- moved - but it lives in the worker for the duration of one attempt. It need
--- not survive: a redelivered outbox message revalidates from scratch.
+-- The dependency vector does exist during validation, as the concurrency
+-- control the commit re-checks, but it lives in the worker for one attempt: a
+-- redelivered outbox message revalidates from scratch.
 --
 -- The admitting principal is not duplicated: `operation_item_id` is NOT NULL and
 -- its foreign key is RESTRICT, so the operation and its principal are always
@@ -585,14 +541,10 @@ CREATE TABLE types_registry__type_schema_revision (
 -- type_schema_revision: nothing reads the admission-time resolution, and the
 -- principal is reachable through operation_item_id.
 --
--- The Type Schema revision that validated this value is referenced as an
--- (entity, revision_no) pair,
--- the same shape the current-state table uses. A single pointer to
--- type_schema_revision.id would fit this table's access pattern slightly better,
--- since the reference here is only ever traversed forwards, but it would save one
--- integer per row on a table holding one row per admitted Instance value while
--- costing a shape difference between two neighbouring tables. `instance`
--- genuinely needs the pair, so uniformity is worth more than the column.
+-- The validating Type Schema revision is referenced as an (entity, revision_no)
+-- pair rather than by surrogate id, matching `instance`, which genuinely needs
+-- the pair. One integer per row is worth keeping the two neighbouring tables
+-- the same shape.
 --
 -- `type_schema_entity_id` is also derivable from the Instance identifier -
 -- the chain up to and including the last `~`, normative per GTS spec 11.1 - and
@@ -664,15 +616,13 @@ CREATE TABLE types_registry__instance_revision (
 -- only operation defined on it - it carries no order and must never be read as
 -- newer or older.
 --
--- Two reasons it exists, and both are needed to justify the column. Read
--- freshness and write concurrency are different axes: `entity.resource_version`
--- guards writes, and bumping it when a base advances would reject writers whose
--- authored content is unaffected, yet a consumer holding a resolved schema still
--- has to learn that the registry would now answer differently. And a conditional
--- read must be able to answer "is your validator current" without fetching and
--- hashing a large document, which is what storing the digest buys. It
--- participates in the resolution validator alongside `entity.resource_version`
--- and the tenant ancestor-chain version, and never in optimistic concurrency.
+-- It exists because read freshness and write concurrency are different axes:
+-- `entity.resource_version` guards writes and must not move when only a base
+-- advanced, yet a consumer holding a resolved schema still has to learn that the
+-- registry would now answer differently - and a conditional read must answer
+-- that without fetching and hashing a large document. It participates in the
+-- resolution validator alongside `entity.resource_version` and the tenant
+-- ancestor-chain version, and never in optimistic concurrency.
 --
 -- The digest input must be canonical and independent of the serializer's map
 -- iteration order, or the value flaps without the artifacts changing.
@@ -814,16 +764,12 @@ CREATE INDEX idx_tr_instance_schema
 -- rather than the base's content. The traversal reaches the subject anyway,
 -- recomputes it, finds an identical digest, and stops there.
 --
--- A materialized transitive closure was considered and rejected. It answered the
+-- A materialized transitive closure was considered and rejected: it answers the
 -- same question in the same number of round trips, since a CTE loops inside the
--- engine, while costing cross-product maintenance whenever an entity's authored
--- references changed or a new entity fell under a stored pattern, both of which
--- required walking every ancestor. Its failure mode decided it: a maintenance bug
--- makes the closure under-report, revalidation is skipped, an incompatible change
--- is admitted, and nothing notices until a consumer breaks - landing on the one
--- decision that cannot be repaired afterwards. If measurement shows the CTE is
--- too slow on MySQL, whose recursive-CTE implementation is the weakest of the
--- three, a closure can be reintroduced as a cache over these same rows.
+-- engine, and its failure mode is a silent under-report that skips revalidation
+-- and admits an incompatible change. If measurement shows the CTE is too slow on
+-- MySQL, whose recursive-CTE implementation is the weakest of the three, a
+-- closure may return as a cache over these rows - never as a replacement.
 CREATE TABLE types_registry__dependency (
     from_entity_id bigint      NOT NULL,
     -- 1 schema_ref ($ref), 2 gts_ref (x-gts-ref target), 3 derivation
@@ -913,11 +859,10 @@ CREATE TABLE types_registry__routing_config (
 -- retirement. Both transitions change routing and so bump
 -- routing_config.generation under its lock.
 --
--- Retirement is never an observation of liveness. A plugin that is temporarily
--- unreachable keeps its claims: releasing them would make the claimed identifier
--- space flicker, and unreachability is already handled by failing the request
--- closed. This matters little while plugins are compiled into the same binary,
--- and a great deal once they can run out of process.
+-- Retirement is never an observation of liveness: an unreachable plugin keeps
+-- its claims, and the request fails closed instead (ADR-0011). There is
+-- therefore no health or last-seen column here, and nothing writes `retired_at`
+-- except the deletion of the plugin Instance.
 --
 -- `priority` is a property of the plugin, not of the claim: PluginV1 carries one
 -- value, and ADR-0007 orders plugins rather than claims. A plugin declaring

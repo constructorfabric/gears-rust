@@ -7,6 +7,8 @@ date: 2026-07-26
 
 **ID**: `cpt-cf-types-registry-adr-tenant-ownership-visibility-authority`
 
+## Table of Contents
+
 <!-- toc -->
 
 - [Context and Problem Statement](#context-and-problem-statement)
@@ -146,7 +148,9 @@ An ancestor may be unable to delete its own contract because a descendant regist
 
 This is correct behaviour, not a defect. The ancestor published a contract into its subtree and something took a dependency on it; unilateral deletion would break that dependent whether or not the ancestor can see it. The registry is enforcing the contract, not obstructing the owner.
 
-The disclosure boundary still holds. A blocked deletion reports the number of blocking dependents and nothing that identifies them, their owners, or their content. That leaves the owner unable to resolve the block alone, which is deliberate: resolution requires either the dependents' owners to remove them or a platform-authority operation that can see across the boundary. Types Registry exposes the count so the owner can distinguish "blocked" from "failed", and platform operators retain an authorized path to enumerate the dependents.
+The disclosure boundary still holds. A blocked deletion reports the number of blocking dependents and nothing that identifies them, their owners, or their content. That leaves the owner unable to resolve the block alone, which is deliberate: resolution requires either the dependents' owners to remove them or a platform-authority operation that can see across the boundary. Types Registry exposes the count so the owner can distinguish "blocked" from "failed", and platform operators retain an authorized path to enumerate the dependents: a Dry Run deletion on the platform plane, which runs the same check and is not bound by this disclosure rule. There is no separate enumeration operation.
+
+The same restraint governs **Dry Run diagnostics**, and it has to be said explicitly because the temptation runs the other way. A Dry Run exists to tell a caller precisely what would go wrong, so its natural instinct is to name the offending dependent — but a tenant-plane Dry Run refused by a dependent the caller cannot see must report a count and no identity, exactly as the real deletion does. A rehearsal that discloses more than the act it rehearses would make the disclosure boundary optional.
 
 ### Ownership is immutable, and a mistake is repaired by purge
 

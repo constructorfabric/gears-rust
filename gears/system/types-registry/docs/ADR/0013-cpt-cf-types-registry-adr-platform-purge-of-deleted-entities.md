@@ -7,6 +7,8 @@ date: 2026-07-27
 
 **ID**: `cpt-cf-types-registry-adr-platform-purge-of-deleted-entities`
 
+## Table of Contents
+
 <!-- toc -->
 
 - [Context and Problem Statement](#context-and-problem-statement)

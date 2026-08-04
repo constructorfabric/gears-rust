@@ -2,6 +2,8 @@
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-design-types-registry`
 
+## Table of Contents
+
 <!-- toc -->
 
 - [1. Architecture Overview](#1-architecture-overview)
@@ -295,7 +297,7 @@ The model has an unusual shape for a registry, and the shape is the decision rat
 
 - [ ] `p2` - **ID**: `cpt-cf-types-registry-entity-model`
 
-| Entity | What it is | Stored as |
+| Entity | Description | Schema |
 |---|---|---|
 | Registry Entity | One admitted managed GTS Identifier, of kind Type Schema or registered Instance. Carries identity, ownership, lifecycle, and the `resource_version` that write preconditions test. Survives deletion as the tombstone that keeps a previously issued reference resolvable | `entity`, plus the kind-specific current-state row `type_schema` or `instance` |
 | Revision | One immutable admitted definition or value, with the content hash and the specification and implementation versions its verdict was computed under | `type_schema_revision`, `instance_revision` |
@@ -593,7 +595,7 @@ Deleting a contract that something still depends on is the one registry mistake 
 
 ##### Responsibility scope
 
-Maintains one dependency relation holding every direct managed-to-managed dependency: `$ref` targets, `x-gts-ref` targets, an Instance's conforming Type Schema, and an entity's immediate derivation base. An `x-gts-ref` contributes an edge to the entity it **names** — the identifier itself when exact, otherwise the longest prefix of the pattern that is a valid identifier, and nothing at all when the pattern names nothing valid — so no dependency is ever on the open set a pattern matches, and registering a new entity under an existing pattern requires no re-expansion. Every dependency has a Managed Entity at both ends, so the set is complete by construction rather than by a counterparty's cooperation. Decides deletion admissibility from the direct rows alone, and answers transitive questions — the reverse impact set when a target advances a revision — with a recursive CTE over the same rows, followed by a second read of the edges among the affected set for the strongly-connected-component condensation and topological sort the worker already performs for a candidate batch. The component also produces advisory federated reverse-impact reports.
+Maintains one dependency relation holding every direct managed-to-managed dependency: `$ref` targets, `x-gts-ref` targets, an Instance's conforming Type Schema, and an entity's immediate derivation base. An `x-gts-ref` contributes an edge to the entity it **names** — the identifier itself when exact, otherwise the longest prefix of the pattern that is a valid identifier, and nothing at all when the pattern names nothing valid — so no dependency is ever on the open set a pattern matches, and registering a new entity under an existing pattern requires no re-expansion. Every dependency has a Managed Entity at both ends, so the set is complete by construction rather than by a counterparty's cooperation. Decides deletion admissibility from the direct rows alone, and answers transitive questions — the reverse impact set when a target advances a revision — with a recursive CTE over the same rows, followed by a second read of the edges among the affected set for the strongly-connected-component condensation and topological sort the worker already performs for a candidate batch. It exposes none of this as a client operation: what a caller wants to know — whether a deletion or a revision would be refused, and by what — is answered by the Dry Run of that mutation, which runs the same dependent revalidation.
 
 ##### Responsibility boundaries
 
@@ -603,7 +605,7 @@ It materializes no transitive relation. Derivation and Instance conformance are 
 
 - `cpt-cf-types-registry-component-availability-evaluator` — owns data for
 - `cpt-cf-types-registry-component-admission-pipeline` — called by
-- `cpt-cf-types-registry-component-federation-router` — requests advisory reverse-impact reports through
+- `cpt-cf-types-registry-component-federation-router` — may request a source's own advisory reverse-impact report through, for diagnostics that inform no decision
 
 #### Federation Router
 
@@ -694,6 +696,8 @@ This settles the federation half of PRD open question 9 — which platform-defin
 
 These are thin adapters and one maintenance job. They hold no policy.
 
+**The table below is where these six component IDs are defined**, in place of the six four-heading blocks the template asks for. That is deliberate: "why this component exists" and "related components" carry no information for a repository wrapper or a scoped-ClientHub adapter, and twenty-four headings of boilerplate would bury the nine components that do hold responsibilities. The IDs are referenced from the *Related components* lists above and resolve here.
+
 | Component | ID | Responsibility | Boundary |
 |---|---|---|---|
 | GTS Engine Adapter | `cpt-cf-types-registry-component-gts-engine-adapter` | Sole access to `gts-rust`: parsing, canonicalization, chain derivation, pattern matching and coverage with registry-side anchoring, reference extraction, schema resolution and trait merging, content-model classification, compatibility, casting | Holds no registry state and no policy; wraps behaviour the library lacks rather than reimplementing behaviour it has |
@@ -711,7 +715,7 @@ These are thin adapters and one maintenance job. They hold no policy.
 - **Technology**: REST/OpenAPI over Axum through the ToolKit `OperationBuilder`; transport-agnostic Rust SDK trait resolved through the typed ClientHub
 - **Location**: generated from the route registrations; no checked-in API specification file yet
 
-This section covers the registration and read surface. Deletion and purge are P1 and decided — deletion by `cpt-cf-types-registry-fr-lifecycle` and ADR-0008, purge by ADR-0013 — but neither has a described route or SDK method yet. Both are mutations and therefore go through the write path of ADR-0012, producing an operation and carrying an `Idempotency-Key` like any other. Purge is a platform maintenance job rather than tenant-facing surface, so it may need no REST route at all, but it does need an entry point.
+This section covers the whole surface: registration, deletion, purge, the read and discovery operations, type filter expansion, and operation polling. Deletion and purge are mutations like any other and go through the write path of ADR-0012, producing an operation and carrying an `Idempotency-Key`; purge is platform-plane only, and only where deployment policy enables it.
 
 #### Tenant REST contract
 
@@ -737,6 +741,8 @@ The expansion maximum stays **server-enforced** rather than becoming a client co
 One consequence to state rather than leave to be discovered: the completeness contract now lives in the SDK. A caller that goes to REST directly receives pages and accumulates them itself.
 
 Deletion is a custom action rather than `DELETE /entities/{entity_key}` because its precondition cannot be carried by `If-Match` — see the parameter table for that operation. Once the precondition is in the body, deletion is shaped like registration in every other respect: batch, asynchronous, one durable outcome per identifier, an `Idempotency-Key`.
+
+**There is no operation for enumerating what depends on an entity,** and the Dry Run is why. A caller asking *what breaks if I change or remove this* is asking whether the mutation would be refused and by what — which the Dry Run of that very mutation answers, running the same dependent revalidation admission runs and committing nothing. The operator path ADR-0009 promises for a deletion blocked by dependents a tenant cannot see is a Dry Run deletion on the platform plane, where the disclosure boundary does not apply. What a separate query would add beyond that is the list of dependents that would *not* break, and no requirement, actor, or use case asks for it.
 
 `GET /entities` is discovery, filtered on what the identifier and the entity's own state can answer without touching content. Every parameter is in its own table below.
 
@@ -793,7 +799,7 @@ The `Location` header on `202` points to the operation resource. `Retry-After` i
 
 #### Platform REST contract
 
-Served on the platform listener under `cpt-cf-adr-platform-plane-auth`, with `PlatformIdentity` in place of a tenant token. Its callers are gears in other processes and maintenance jobs — there is no human actor here, so nothing on this surface is shaped for interactive use.
+Served on the platform listener under [`cpt-cf-adr-platform-plane-auth`](../../../../docs/arch/toolkit-oop/ADR/0006-cpt-cf-adr-platform-plane-auth.md), with `PlatformIdentity` in place of a tenant token. Its callers are gears in other processes and maintenance jobs — there is no human actor here, so nothing on this surface is shaped for interactive use.
 
 | Method | Path | Description | Success | Stability |
 |---|---|---|---|---|
@@ -857,7 +863,13 @@ Two things are common to every mutation and stated once: `Idempotency-Key` is a 
 
 Deleted entities never appear. Ordering is by canonical identifier.
 
-There is no filter by exact identifier, and a pattern is not a substitute for one: under GTS §3.6 a bare type identifier used as a pattern implicitly covers the chains derived from it, so it selects a subtree rather than a single entity. Exact keys belong to `:batchGet`, which takes an arbitrary list, answers per key, and does not paginate — strictly better for the purpose than a filter would be, and the only shape that fits, since a repeatable query parameter cannot carry identifiers of up to 1024 characters. A caller wanting a pattern *and* a few named extras issues both and unions the results, which for sets costs nothing.
+`fr-type-query-assistance` names four kinds of user-facing filter — exact identifiers, compatible versions, derivation hierarchy constraints, and wildcard patterns — and they land on two parameters rather than four, which is worth spelling out so the shortfall is not rediscovered as a gap.
+
+A **derivation hierarchy constraint** is `pattern` with `depth`: under GTS §3.6 a bare type identifier implicitly covers what is derived from it, and depth bounds how far. The other direction — *give me this type's bases* — is not a query at all, since the chain is encoded in the identifier and `chain_ids()` reconstructs it in the caller.
+
+A **compatible-version constraint** is nearly empty under our own version model and is otherwise the same two parameters. ADR-0004 leaves managed identifiers with majors only, and ADR-0003 defines compatibility *within* one major's revision chain — a new major being precisely how an incompatible change is published. So "versions compatible with X" is either X itself or nothing. What a caller usually means is *all members of the version family*, which is again pattern plus depth. Minor versions exist only on the external side, where a pattern without a minor already matches any minor by GTS §10, and where ADR-0004 forbids us from interpreting a source's version ordering — so a minor range is not ours to offer.
+
+**Exact identifiers** are the one kind that does not land here. There is no filter by exact identifier, and a pattern is not a substitute for one: under GTS §3.6 a bare type identifier used as a pattern implicitly covers the chains derived from it, so it selects a subtree rather than a single entity. Exact keys belong to `:batchGet`, which takes an arbitrary list, answers per key, and does not paginate — strictly better for the purpose than a filter would be, and the only shape that fits, since a repeatable query parameter cannot carry identifiers of up to 1024 characters. A caller wanting a pattern *and* a few named extras issues both and unions the results, which for sets costs nothing.
 
 ##### `POST /entities`
 
@@ -1112,9 +1124,7 @@ pub struct EntityFilter {
     pub origin: Option<OriginFilter>,        // Managed | External
     pub availability: Option<AvailabilityState>,
     pub scope: OwnershipScopeFilter,         // Mine | All
-    // Missing: the compatible-version and derivation-hierarchy constraints
-    // that fr-type-query-assistance also requires. Unmodelled, not omitted.
-}
+  }
 
 pub struct EntityQuery {
     pub filter: EntityFilter,
@@ -1168,7 +1178,9 @@ pub struct RegistrationItemResult {
 
 One shape in there is load-bearing rather than incidental: `Origin` is a variant and not a pair of `Option` fields, so that asking an externally managed entity for a write precondition fails to compile instead of yielding a `None` a caller talks itself into treating as `1`.
 
-*The method set is not yet complete either. Deletion, purge, discovery, query assistance, and the dependency query are all missing from both traits; each is decided as a capability and unwritten as a contract. The operator path that ADR-0009 promises for enumerating a blocked deletion's dependents belongs to that dependency query, invoked on this plane in its direct-only mode, rather than being a method of its own — "who depends on this" is one question with a scope parameter, not two operations.*
+One asymmetry between the traits is deliberate rather than an omission: `expand_type_filter` exists only on the tenant trait. Type filter expansion is a tenant-plane operation under `cpt-cf-types-registry-fr-type-query-assistance` — it narrows the set to what is available to the requesting tenant, and the platform plane has no requesting tenant to narrow against. A platform caller that wants references pages `list_entities` itself.
+
+There is no method for enumerating what depends on an entity, on either trait, and none is coming. The operator path ADR-0009 promises for a deletion blocked by invisible dependents is a Dry Run deletion on the platform plane, which runs the same dependent revalidation and commits nothing.
 
 ##### The two planes are not mirrors
 
@@ -1311,7 +1323,7 @@ Each is required for every entity kind a plugin claims, and absence of any of th
 | Reverse resolve | `gts_uuid`s → results | Batch. Must keep answering after the source deletes an entity, since a domain row may still hold the reference |
 | Candidate query | pattern + source cursor → page + next cursor | Complete for the pattern, no false negatives. The plugin may over-return for Types Registry to filter |
 | Tenant state | tenant + identifiers → enablement | May instead be folded into the entity results of the calls above |
-| Reverse dependency impact | identifier → dependents | **Optional and advisory** under ADR-0011. Its absence must not block activation, and an unavailable source degrades the report rather than any decision |
+| Reverse dependency impact | identifier → dependents | **Optional and near-empty.** The closed boundary means it can only report external dependents of an externally managed entity, never anything about a Managed Entity, so no platform decision reads it. Its absence blocks nothing and costs nothing |
 
 ##### What a call carries
 
@@ -1447,7 +1459,99 @@ sequenceDiagram
 
 **Description**: The read/reconcile/conditional-write protocol of ADR-0012 end to end. The caller reconciles before writing and sends no request when nothing differs, so the no-op costs one batch read. Acceptance has exactly one successful shape — `202` with an operation UUID — and the operation row carries the scoped `Idempotency-Key`, so a replay returns the stored operation without consulting current entity state. The worker performs dependency-aware partial admission outside a long transaction and commits each admission unit in a short one.
 
-*Pending — the resolution and federation sequences have no diagram yet: exact and reverse resolution through the ordered plugin chain (`cpt-cf-types-registry-usecase-use-externally-managed-entity`) and type filter expansion into a Concrete Reference Set (`cpt-cf-types-registry-usecase-resolve-type-filter`).*
+#### Federated resolution
+
+- [ ] `p2` - **ID**: `cpt-cf-types-registry-seq-federated-resolution`
+
+**Use cases**: `cpt-cf-types-registry-usecase-use-externally-managed-entity`
+
+**Actors**: `cpt-cf-types-registry-actor-domain-gear`, `cpt-cf-types-registry-actor-platform-gear`, `cpt-cf-types-registry-actor-registry-source-plugin`
+
+```mermaid
+sequenceDiagram
+    participant C as Client (SDK)
+    participant A as Types Registry read path
+    participant G as gts-rust
+    participant D as Database
+    participant T as tenant-resolver
+    participant R as Federation router
+    participant P as Registry Source Plugin
+
+    C->>A: batch_get_entities(keys, $select, per-key validators)
+    A->>G: Canonicalize; derive gts_uuid for every GTS Identifier key
+    A->>T: Ancestor chain of the subject tenant (cached)
+    A->>D: One keyed read per entity, no history scan
+    Note over A,D: Visibility and availability decided in SQL from the<br/>entity's own state plus the ancestor chain
+    opt keys not held locally
+        A->>R: Unresolved keys
+        alt key is a GTS Identifier
+            R->>R: Match its first segment against active Source Claims
+            Note over R: At most one owning claim.<br/>No match is authoritative NOT_FOUND
+        else key is a gts_uuid
+            R->>R: Order plugins by (priority, plugin Instance identifier)
+            Note over R: A reference encodes no source, so the chain is walked<br/>until one answers or all answer NOT_FOUND
+        end
+        R->>P: One batch call per plugin, never one per key
+        P-->>R: Authored + effective content, ownership scope,<br/>lifecycle, external_revision, content hash
+        R->>G: Derive gts_uuid from the returned identifier
+        R->>R: Validate reference equality, claim conformance, entity kind,<br/>ownership scope, revision/hash consistency
+        alt SOURCE_UNAVAILABLE or INVALID_SOURCE_RESPONSE
+            R-->>A: Failure bound to that key alone
+            Note over R,A: Never converted into not_found
+        else
+            R-->>A: Live result, nothing persisted
+        end
+    end
+    A-->>C: found / unchanged / not_found / failed per key, each with a validator
+```
+
+**Description**: One read answers forward and reverse resolution, because `EntityKey` accepts either kind. Managed storage is consulted first and answers without any plugin call — ADR-0011 admits no edge across the boundary, so a managed key can never reach a plugin, which is what keeps the 10 ms budget free of plugin latency. Only unresolved keys reach the router, and the two key kinds route differently: an identifier selects one owning claim from its first segment, while a reference encodes no source and walks the ordered chain. Every plugin response is checked against platform invariants before it is exposed, and a source that cannot answer degrades exactly one key rather than the batch.
+
+#### Type filter expansion
+
+- [ ] `p2` - **ID**: `cpt-cf-types-registry-seq-type-filter-expansion`
+
+**Use cases**: `cpt-cf-types-registry-usecase-resolve-type-filter`
+
+**Actors**: `cpt-cf-types-registry-actor-domain-gear`
+
+```mermaid
+sequenceDiagram
+    participant DG as Domain gear
+    participant S as Types Registry SDK
+    participant A as Types Registry read path
+    participant G as gts-rust
+    participant D as Database
+    participant R as Federation router
+    participant P as Registry Source Plugin
+
+    DG->>S: expand_type_filter(pattern, depth, kind, origin)
+    loop until the traversal ends or the registry refuses
+        S->>A: GET /entities, $select=gts_uuid, availability=available, cursor
+        A->>G: Compile the pattern to explicit identifier bounds
+        A->>D: Index range scan; visibility and availability in one predicate
+        A->>G: Confirm each candidate with the GTS matcher
+        Note over A,G: The range is a pre-filter — matching is segment-wise,<br/>so the matcher decides
+        opt managed rows exhausted and a claim intersects the pattern
+            A->>R: Continue source-major, next plugin in priority order
+            R->>P: Candidate query (pattern, source cursor)
+            P-->>R: Bounded page, next source cursor, explicit exhaustion
+            R->>R: Validate and re-filter under platform semantics
+        end
+        alt this page would take the running total past the maximum
+            A-->>S: QUERY_EXPANSION_LIMIT_EXCEEDED
+        else a selected source cannot establish its contribution
+            A-->>S: Source failure and no page at all
+        else
+            A-->>S: Page + cursor binding query, routing generation,<br/>current source, source cursor, running count
+        end
+    end
+    S->>S: Accumulate and deduplicate
+    S-->>DG: ConcreteReferenceSet
+    DG->>DG: Apply as a chunked gts_uuid set against its own storage
+```
+
+**Description**: The expansion is a paged traversal that the SDK accumulates, not one operation that returns a set — pagination is what keeps a deduplicated set from having to be held whole server-side, and the atomicity given up for that is the trade `cpt-cf-types-registry-fr-type-query-assistance` and ADR-0001 were amended to stop promising. Two properties are load-bearing and neither is visible from the loop alone. The maximum stays server-enforced, because the cursor carries the running count and the page that would exceed it fails rather than truncating. And completeness is all-or-nothing per traversal: a source that cannot answer fails the operation instead of contributing a short page, since a partial set applied as a query constraint silently returns wrong rows.
 
 ### 3.7 Database schemas & tables
 
@@ -1471,7 +1575,7 @@ The P1 reference schema is a PostgreSQL document, not a migration; backend migra
 | `routing_config` | Singleton row serializing claim mutation and carrying the routing generation |
 | `source_claim` | Active claims and permanent retired reservations |
 
-*Pending — per-table column, constraint, and index detail in the template's `#### Table: {name}` form. `database.sql` carries it today, together with the invariants a reader would otherwise violate.*
+**`database.sql` is the normative schema, and this section deliberately does not restate it.** The DESIGN template asks for a `#### Table: {name}` block per table carrying columns, types, PK, constraints, and indexes. Reproducing that here would duplicate a file that is already the source the migrations are written from, in a form that cannot be diffed against it and would diverge at the first column change — and the invariants a reader would otherwise violate live in that file's comments beside the columns they constrain, not in a column list. The deviation from the template is the whole of it: the inventory above says what each table is for, and `database.sql` says what it holds.
 
 #### Persistence alignment
 

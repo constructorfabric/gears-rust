@@ -7,6 +7,8 @@ date: 2026-07-23
 
 **ID**: `cpt-cf-types-registry-adr-storage-identity-query-model`
 
+## Table of Contents
+
 <!-- toc -->
 
 - [Context and Problem Statement](#context-and-problem-statement)

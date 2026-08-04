@@ -1,5 +1,7 @@
 # PRD - Types Registry
 
+## Table of Contents
+
 <!-- toc -->
 
 - [1. Overview](#1-overview)
@@ -266,7 +268,7 @@ The system **MUST** check every derived GTS Type Schema against its immediate ba
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-fr-ref-tracking`
 
-The system **MUST** track dependencies between Managed Entities. Under ADR-0011 every tracked dependency has a Managed Entity at both ends, so the tracked set is authoritative for deletion safety and that decision is reached from local state without plugin availability, plugin cooperation, or plugin-supplied data of any kind. Live reverse dependency-impact lookup from a plugin is advisory and **MUST** be used only for informational blast-radius analysis before an incompatible change, where an unavailable source degrades the report rather than the decision. Any visible and tenant-available entity **MUST** remain a valid target for both existing and newly admitted GTS and JSON Schema references; only deletion removes a target from that set. In P1 there is no lifecycle status between `ACTIVE` and `DELETED`, so no additional exclusion applies.
+The system **MUST** track dependencies between Managed Entities. Under ADR-0011 every tracked dependency has a Managed Entity at both ends, so the tracked set is authoritative for deletion safety and that decision is reached from local state without plugin availability, plugin cooperation, or plugin-supplied data of any kind. Live reverse dependency-impact lookup from a plugin is advisory, optional, and narrower than it appears: because no Externally Managed Entity may depend on a Managed one, it can only report external dependents of an externally managed entity, so it informs no platform decision and an unavailable source degrades a diagnostic rather than anything else. Types Registry **MUST NOT** expose a client-facing operation for enumerating dependents; what a caller needs — whether a deletion or a revision would be refused, and by what — is answered by the Dry Run of that same mutation. Any visible and tenant-available entity **MUST** remain a valid target for both existing and newly admitted GTS and JSON Schema references; only deletion removes a target from that set. In P1 there is no lifecycle status between `ACTIVE` and `DELETED`, so no additional exclusion applies.
 
 - **Rationale**: Platform teams need predictable blast-radius analysis for type changes.
 - **Actors**: `cpt-cf-types-registry-actor-gears-developer`, `cpt-cf-types-registry-actor-xaas-vendor-architect`, `cpt-cf-types-registry-actor-xaas-vendor-developer`, `cpt-cf-types-registry-actor-ci-pipeline`
@@ -290,7 +292,7 @@ The owning claim of an identifier is therefore selected from its **first segment
 
 For every claimed entity kind, an active P1 plugin **MUST** support batch forward and reverse resolution, complete bounded candidate queries with opaque pagination, lifecycle and ownership/visibility assertions, tenant state, revision/hash and conditional-read semantics, retained reverse resolution after deletion, and structured source-failure outcomes. For a claimed Type Schema kind it **MUST** additionally produce the resolved effective schema and the effective trait artifacts, since Types Registry never resolves source-owned content and a consumer therefore has no other way to obtain them. Reverse dependency-impact lookup is an optional advisory capability under ADR-0011 and its absence **MUST NOT** block Source Claim activation. Dependency registration is not part of the profile at all, because the closed boundary leaves no cross-boundary dependency to register.
 
-Candidate query results **MUST NOT** have false negatives, and an advisory reverse dependency-impact report **MUST NOT** omit a true dependent, though completeness of an advisory report is not a correctness precondition for any authoritative decision. A plugin **MAY** return a broader candidate set for Types Registry to filter under normalized platform semantics. A plugin configuration **MUST NOT** become active for a Source Claim and entity kind when an applicable mandatory capability is absent; inability to establish a complete result at runtime **MUST** fail closed.
+Candidate query results **MUST NOT** have false negatives. An advisory reverse dependency-impact report **MUST NOT** omit a true dependent, though its completeness is a precondition for nothing: no authoritative decision reads it, and under the closed boundary it can name only entities the source itself owns. A plugin **MAY** return a broader candidate set for Types Registry to filter under normalized platform semantics. A plugin configuration **MUST NOT** become active for a Source Claim and entity kind when an applicable mandatory capability is absent; inability to establish a complete result at runtime **MUST** fail closed.
 
 P1 Source Claims **MUST NOT** overlap each other or the identifier space of existing Managed Entities. Because a claim covers every identifier chained beneath it, an external claim and managed identifiers **MUST NOT** nest: a vendor integrating an External Registry Source partitions its identifier prefixes between served-externally and registered-as-managed rather than placing the latter beneath the former. Managed storage **MUST** be consulted before plugins, and plugins **MUST** be consulted in deterministic priority order.
 
@@ -708,7 +710,7 @@ The system **MUST** prevent SDK clients from treating invalidated registry looku
 1. CI submits the proposed Type Schemas as a Dry Run of the ordinary registration operation.
 2. Types Registry performs the complete admission check sequence and commits nothing.
 3. CI polls the operation and reads the per-GTS-ID outcome: the compatibility verdict against the current revision, the enforced mode, per-level evolvability, derivation results against every base in the chain, and any lifecycle or dependency conflict, together with the unproven-chain state when the entity is frozen.
-4. CI optionally requests the advisory reverse dependency-impact report to size the blast radius of a change it is considering.
+4. CI reads the per-candidate diagnostics, which name the dependents a change would break; the Dry Run performs the same dependent revalidation admission does, so nothing further needs asking.
 5. CI accepts or blocks the deployment based on those results.
 
 **Postconditions**:
