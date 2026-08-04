@@ -1,6 +1,6 @@
 <!--
 Created:  2026-04-20 by Constructor Tech
-Updated:  2026-04-20 by Constructor Tech
+Updated:  2026-07-30 by Constructor Tech
 -->
 ---
 status: accepted
@@ -79,14 +79,22 @@ Chosen option: **"Option C: Thin host, fat runtime plugin"**, because the backen
 
 ### Consequences
 
-* The serverless-runtime area collapses back to **one module**: `gears/serverless-runtime/` with `serverless-runtime-sdk/` (contract crate) and `serverless-runtime/` (host implementation crate). The `sless-runtime` gear introduced by PR 1279 is not retained as a separate gear.
+> **Amendment (2026-07-30).** The single contract crate described below has since been split in
+> two — `serverless-runtime-sdk` (consumer contract) and `serverless-runtime-plugin-sdk` (plugin
+> contract) — so that a gear which merely invokes a callable does not compile plugin machinery.
+> This refines how the decision is *packaged*; it does not change the decision itself. The
+> bullets and acceptance criteria below are updated accordingly: the plugin trait, the
+> plugin → host event port, and the conformance harness live in the plugin SDK, while the
+> consumer client trait lives in the consumer SDK.
+
+* The serverless-runtime area collapses back to **one module**: `gears/serverless-runtime/` with `serverless-runtime-sdk/` and `serverless-runtime-plugin-sdk/` (contract crates) and `serverless-runtime/` (host implementation crate). The `sless-runtime` gear introduced by PR 1279 is not retained as a separate gear.
 * Runtime plugins live at `gears/serverless-runtime/plugins/<backend>-plugin/` as standalone crates. Host crate **must not** depend on any plugin crate at compile time; plugins are resolved at runtime through ClientHub scoped registration keyed by GTS adapter type.
-* The `RuntimeAdapter` trait, declared in `serverless-runtime-sdk`, becomes the primary plugin contract and includes the invocation, control, schedule, and event-trigger methods. Each plugin implements the trait; the host dispatches to the plugin through `dyn RuntimeAdapter`. The plugin emits index updates back to the host through a thin event port on the host client (`ServerlessRuntimeClient`, exported from `serverless-runtime-sdk`), not through a general-purpose callback surface.
+* The `RuntimeAdapter` trait, declared in `serverless-runtime-plugin-sdk`, becomes the primary plugin contract and includes the invocation, control, schedule, and event-trigger methods. Each plugin implements the trait; the host dispatches to the plugin through `dyn RuntimeAdapter`. The plugin emits index updates back to the host through a thin event port, also declared in `serverless-runtime-plugin-sdk`, not through a general-purpose callback surface. The event port is **not** carried on the consumer client trait: a gear that invokes callables has no business seeing it. (The plugin trait's final name is settled in the plugin SDK's own docs, where the ToolKit `<Gear>PluginClientV1` convention applies.)
 * `JobTransport` and `ExecutionContext` abstractions from PR 1279 will be removed from the SDK. The `AdapterCapabilities::autonomous` flag will no longer be meaningful because every plugin is autonomous by design.
 * The host does not ship a `Job Worker`, checkpoint store, timer wheel, or event-matching engine. Each plugin implements these using its backend's native primitives (Temporal's Schedule API and signals, EventBridge Scheduler and SQS for Lambda, Azure Durable's native timers, etc.).
 * Invocation records use a **host-indexed, plugin-detailed** split: the host persists a lightweight, queryable index (id, function_id, adapter, tenant, owner, status, timestamps, error summary) populated from plugin-emitted events. The plugin owns the full `InvocationRecord`, the timeline, and any internal execution state. Aggregate queries and tenant-wide listings read the host index; deep fetches (timeline, payloads) delegate to the plugin.
 * In-process runtimes that lack native durability (such as the planned Starlark backend, or a potential WASM backend) consume a shared Rust helper crate that provides those primitives at the plugin level. This scopes the complexity to the plugins that need it, rather than pushing it into the host for every plugin to route through.
-* Adapter conformance test suites in `serverless-runtime-sdk` become load-bearing for ensuring uniform user-visible semantics across plugins (status transitions, retry contract, compensation triggering, suspension visibility).
+* Adapter conformance test suites in `serverless-runtime-plugin-sdk` become load-bearing for ensuring uniform user-visible semantics across plugins (status transitions, retry contract, compensation triggering, suspension visibility).
 * DESIGN.md sections written by PR 1279 that depend on Option B (`§1.4.1`–`§1.4.5`: gear split, `JobTransport`, `ExecutionContext`, capability-based dispatch) will be rewritten in a follow-up PR to reflect this decision. That follow-up PR is out of scope of this ADR.
 
 ### Confirmation
@@ -94,10 +102,11 @@ Chosen option: **"Option C: Thin host, fat runtime plugin"**, because the backen
 Acceptance criteria to apply once the host and plugin crates are in place:
 
 * Ensure the follow-up DESIGN.md rewrite enumerates host-owned components as: Function Registry, Tenant Policy, REST façade, GTS validation, audit, plugin dispatch, and the lightweight invocation index — and that `sless-runtime` is not reintroduced as a separate gear, and `JobTransport`, `ExecutionContext`, and host-owned durability primitives are not reintroduced
-* Ensure the `RuntimeAdapter` trait, declared in `serverless-runtime-sdk`, includes invocation, control, schedule, and event-trigger methods, and that `JobTransport` and `ExecutionContext` types are not present in the SDK
+* Ensure the `RuntimeAdapter` trait, declared in `serverless-runtime-plugin-sdk`, includes invocation, control, schedule, and event-trigger methods, and that `JobTransport` and `ExecutionContext` types are not present in either SDK
+* Ensure `serverless-runtime-sdk` (the consumer contract) declares no plugin-facing surface — no plugin trait, no event port, no conformance harness — and does not depend on `serverless-runtime-plugin-sdk`
 * Ensure no host crate (`serverless-runtime/serverless-runtime`) depends on any plugin crate — verify with `cargo tree`
-* Ensure the host crate source tree contains no `job_worker`, `timer_wheel`, `checkpoint_store`, or `event_matcher` gears — verify via directory listing
-* Add adapter conformance tests in `serverless-runtime-sdk` covering: invocation status transitions, retry semantics, compensation triggering, suspension/resume visibility, error taxonomy
+* Ensure the host crate source tree contains no `job_worker`, `timer_wheel`, `checkpoint_store`, or `event_matcher` modules — verify via directory listing
+* Add adapter conformance tests in `serverless-runtime-plugin-sdk` covering: invocation status transitions, retry semantics, compensation triggering, suspension/resume visibility, error taxonomy
 * During code review, confirm that each plugin crate implements scheduling and event-trigger handling inside the plugin itself and does not call into host durability APIs
 
 ## Pros and Cons of the Options
@@ -110,8 +119,10 @@ The host owns only genuinely cross-cutting concerns. Each runtime plugin is a se
 
 ```
 gears/serverless-runtime/
-├── serverless-runtime-sdk/        # Contract crate — RuntimeAdapter, ServerlessRuntimeClient,
-│                                  # domain types, error taxonomy, conformance harness hooks
+├── serverless-runtime-sdk/        # Consumer contract — client trait, invocation value
+│                                  # types, error taxonomy
+├── serverless-runtime-plugin-sdk/ # Plugin contract — RuntimeAdapter, event port, domain
+│                                  # types, conformance harness hooks
 ├── serverless-runtime/            # Host impl — Registry, Tenant Policy, REST, GTS validation,
 │                                  # audit, plugin dispatch
 └── plugins/

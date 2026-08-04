@@ -200,13 +200,13 @@ The execution mode (sync vs async) and invocation role (direct target vs helper 
 
 The sibling model has a direct implication for how "any callable" references work at the code level in ToolKit. `ClientHub` resolves dependencies by trait type, not by GTS type — so there is no single `hub.get::<dyn CallableClient>()` that returns both functions and workflows.
 
-**Chosen approach:** The SDK defines a single `ServerlessRuntimeClient` trait (see [DESIGN.md, section 1.4.3](../DESIGN.md#143-sdk-crate)) whose methods accept callable references by GTS ID string. The client implementation resolves internally whether the ID refers to a function or workflow by inspecting the GTS type prefix (`function.v1~` vs `workflow.v1~`). This avoids requiring callers to make two separate `hub.get_scoped::<dyn ...>()` calls or to know the callable type in advance.
+**Chosen approach:** The consumer SDK defines a single `ServerlessRuntimeClientV1` trait (see [DESIGN.md, section 1.4.3](../DESIGN.md#143-sdk-crates)) whose methods accept callable references by GTS ID string. The gear resolves internally whether the ID refers to a function or workflow by inspecting the GTS type prefix (`function.v1~` vs `workflow.v1~`). This avoids requiring callers to make two separate `hub.get_scoped::<dyn ...>()` calls or to know the callable type in advance.
 
 ```rust
 // Caller does not need to know if the target is a function or workflow:
-let sless = hub.get::<dyn ServerlessRuntimeClient>()?;
-let record = sless.invoke(ctx, InvokeRequest {
-    function_id: "gts.cf.core.sless.workflow.v1~vendor.app.orders.process_order.v1~".into(),
+let sless = hub.get::<dyn ServerlessRuntimeClientV1>()?;
+let outcome = sless.invoke(ctx, InvokeRequest {
+    callable_id: "gts.cf.core.sless.workflow.v1~vendor.app.orders.process_order.v1~".into(),
     mode: InvocationMode::Async,
     params: serde_json::json!({ "order_id": "ORD-123" }),
     ..Default::default()
