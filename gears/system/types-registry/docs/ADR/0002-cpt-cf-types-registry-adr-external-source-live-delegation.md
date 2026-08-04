@@ -82,7 +82,6 @@ Every live external entity result must include at least:
 * an opaque `external_revision`;
 * a canonical `content_hash`;
 * the ownership scope: platform-wide, or the identifier of the one tenant that owns the entity. This is mandatory, so there is no default to get wrong; an absent scope, or one naming a tenant the platform does not know, is an `INVALID_SOURCE_RESPONSE`. The plugin states this flat fact only — Types Registry expands it into the descendant-visibility relation itself, and the assertion confers no authority, since no write path reaches an external entity (ADR-0009);
-* source validation and compatibility assertions required by the use site;
 * tenant enablement state when the operation requires tenant-specific availability.
 
 ### The plugin resolves its own type chains
@@ -115,7 +114,7 @@ Revision and hash are protocol metadata. Types Registry validates the returned h
 
 ### Platform admission
 
-The External Registry Source remains responsible for source-owned schema, instance, evolution, and derivation validation. Types Registry validates every live result's GTS envelope, Registry Reference mapping, source-pattern claim, authorization, tenant visibility, lifecycle exposure, and use-site requirements before returning it as usable.
+The External Registry Source remains responsible for source-owned schema, instance, evolution, and derivation validation. Types Registry validates every live result's GTS envelope, Registry Reference mapping, source-pattern claim, authorization, tenant visibility, and lifecycle exposure before returning it as usable. It validates nothing about the content, and there is no further platform check a result must satisfy: ADR-0011 closes the boundary, so no Managed Entity can depend on an external one, and a consumer reading an external entity directly decides for itself what it needs of it.
 
 Any source assertion used for admission must be bound to the returned `external_revision` and `content_hash`. P1 does not persist external admission receipts. A stateful admission mechanism for external entities requires a future ADR.
 
@@ -137,7 +136,7 @@ Types Registry obtains externally managed Tenant Enablement State from the ownin
 
 Registry Source Plugins must provide efficient batch tenant-state lookup or include authoritative tenant state in batch entity results. If a plugin cannot confirm the required state, enabled-only operations fail closed.
 
-Lifecycle Status and Tenant Enablement State remain separate dimensions. Types Registry computes the platform-facing Tenant Availability State after applying source state, lifecycle, dependencies, visibility, and use-site policy.
+Lifecycle Status and Tenant Enablement State remain separate dimensions. Types Registry computes the platform-facing Tenant Availability State after applying source state, lifecycle, dependencies, and visibility.
 
 ### Source failures
 

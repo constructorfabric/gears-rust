@@ -23,6 +23,7 @@
   - [3.7 Database schemas & tables](#37-database-schemas--tables)
   - [3.8 Deployment Topology](#38-deployment-topology)
 - [4. Additional context](#4-additional-context)
+  - [Open questions](#open-questions)
   - [Benchmark profile](#benchmark-profile)
   - [Implementation prerequisites](#implementation-prerequisites)
 - [5. Traceability](#5-traceability)
@@ -302,7 +303,7 @@ The model has an unusual shape for a registry, and the shape is the decision rat
 
 | Entity | Description | Schema |
 |---|---|---|
-| Registry Entity | One admitted managed GTS Identifier, of kind Type Schema or registered Instance. Carries identity, ownership, lifecycle, and the `resource_version` that write preconditions test. Survives deletion as the tombstone that keeps a previously issued reference resolvable | `entity`, plus the kind-specific current-state row `type_schema` or `instance` |
+| Registry Entity | One admitted managed GTS Identifier, of kind Type Schema or registered Instance. Carries identity, ownership, the owning gear, lifecycle, and the `resource_version` that write preconditions test. Survives deletion as the tombstone that keeps a previously issued reference resolvable | `entity`, plus the kind-specific current-state row `type_schema` or `instance` |
 | Revision | One immutable admitted definition or value, with the content hash and the specification and implementation versions its verdict was computed under | `type_schema_revision`, `instance_revision` |
 | Version Family | The set of Version Successors of one another, named by the family key of ADR-0004. Holds an ownership scope and nothing else | `version_family` |
 | Dependency | A direct edge between two Registry Entities: `$ref`, `x-gts-ref`, immediate derivation base, or Instance conformance. Nothing transitive is stored | `dependency` |
@@ -355,7 +356,7 @@ erDiagram
 
 Four of these carry an invariant worth stating outright, because none of them is enforced by the relationship alone.
 
-**A Version Family fixes ownership before any member exists.** That ordering is the whole reason the row exists: two concurrent first registrations must not be able to create one family under two owners. The entity's own owner columns are a copy kept for SecureORM scoping, and admission maintains the agreement under the family row's lock rather than a constraint — a composite foreign key would silently skip the global case, where the tenant column is null.
+**A Version Family fixes ownership before any member exists.** That ordering is the whole reason the row exists: two concurrent first registrations must not be able to create one family under two owners. The entity's own owner columns are a copy kept for SecureORM scoping, and admission maintains the agreement under the family row's lock rather than a constraint — a composite foreign key would silently skip the global case, where the tenant column is null. `owning_gear` is not part of that agreement and is deliberately not held by the family: it is per-entity attribution that may be restated on any admission, while family ownership is write-once and decides visibility.
 
 **An Instance is pinned to the exact Type Schema revision that validated it,** and separately records the revision that most recently revalidated it. Neither is exposed: §3.3 removed revision numbers from the contract, and the second would invite the false inference that a value is stale, which ADR-0005 forbids by refusing to make a schema revision current while an affected Instance would cease to be valid.
 
@@ -444,7 +445,7 @@ The no-op fast path is the caller's, not the server's. A caller that reconciles 
 
 The normal caller workflow is read-before-write. It batch-reads the exact identifiers it owns, compares the returned canonical authored content with the desired definitions, and does not POST candidates that are already equal. A missing candidate is submitted with no `expected_resource_version`; an existing but different one carries the `resource_version` the read returned. The tenant REST plane derives the owner from `SecurityContext`; ownership is not caller-controlled request data. Platform gears use the SDK platform plane and `PlatformSecurityContext` for global definitions.
 
-Before accepting, the API validates the request envelope, batch size, uniqueness and canonical form of candidate GTS Identifiers, the declared JSON Schema Dialect of every Type Schema candidate, one common ownership and authorization scope, and registration authority for every candidate. Authorization still precedes every existence lookup. The dialect check is synchronous because it is a static property of the submitted document that needs no registry state: accepting a candidate only to fail it as an asynchronous item would defer a verdict the API already holds. It rejects an absent top-level `$schema`, a value outside the accepted Draft-07 spellings, and a `$schema` below the document root that differs from it.
+Before accepting, the API validates the request envelope, batch size against the 100-candidate bound, uniqueness and canonical form of candidate GTS Identifiers, the declared JSON Schema Dialect of every Type Schema candidate, one common ownership and authorization scope, and registration authority for every candidate. Authorization still precedes every existence lookup. The dialect check is synchronous because it is a static property of the submitted document that needs no registry state: accepting a candidate only to fail it as an asynchronous item would defer a verdict the API already holds. It rejects an absent top-level `$schema`, a value outside the accepted Draft-07 spellings, and a `$schema` below the document root that differs from it.
 
 The quarantine rule of ADR-0015 is checked in the same place and for the same reason, and it is cheaper than its statement suggests. The rule reads as a property of the resolution closure — the set of *documents* inlined to produce an effective schema, which is neither the dependency rows of §3.7 nor anything stored — but it needs only the **direct** references of the candidate: if every admitted entity satisfies it, no stable entity holds a direct edge to an unstable one, so no stable entity can reach one transitively either. The closure property follows by induction from the direct check, exactly as ADR-0003's whole-history guarantee follows from candidate-versus-current, and the base case is free because every entity admitted before ADR-0015 has a major of at least 1. The direct references are the derivation chain of the candidate's own identifier plus the `$ref` and `x-gts-ref` targets in the submitted document, and a major is readable from each — so the check loads no registry state and belongs with the envelope validation rather than in the worker. The API canonicalizes each authored schema or Instance value through `gts-rust`, computes a request fingerprint over the canonical body, operation kind, authorization scope, owner, and all optimistic preconditions, and resolves the mandatory `Idempotency-Key`.
 
@@ -491,7 +492,7 @@ Two properties of the write path make this cheap. The candidate's identifier is 
 
 The read path deliberately does not acquire the same filter. Narrowing discovery by granted pattern would need a prefix-capable predicate, and the five standard predicate types have none — it would mean registering a custom predicate type and a SQL compilation handler, which would compile to exactly the range scan §3.7 already indexes. P1 does not do this: what a caller may *see* stays the directed descendant relation of ADR-0009, and what a caller may *write* is the grant. Visibility and authority remain separate, as ADR-0009 requires.
 
-How the grant encodes its region is PRD open question #24. Two encodings are available and they are not equivalent: the pattern can sit directly in `resource_type`, which reads naturally and works today but overloads "the type of the resource" to mean "the identifier region governed"; or a Types-Registry resource type can carry the identifier as an attribute, which is more orthodox but needs a prefix operator that neither the standard predicates nor the GTS §3.3 examples currently provide.
+How the grant encodes its region is PRD open question 16. Two encodings are available and they are not equivalent: the pattern can sit directly in `resource_type`, which reads naturally and works today but overloads "the type of the resource" to mean "the identifier region governed"; or a Types-Registry resource type can carry the identifier as an attribute, which is more orthodox but needs a prefix operator that neither the standard predicates nor the GTS §3.3 examples currently provide.
 
 ##### Responsibility boundaries
 
@@ -669,11 +670,11 @@ A Registry Source Plugin registers itself as a registered Instance, and its inva
 
 ##### Responsibility scope
 
-A closed, hand-written set of validators for platform-defined control-plane types. Enforces Source Claim invariants and the capability profile required for a claim and entity kind to activate, rejects tenant-scoped registration of any control-plane type or instance, and governs claim takeover over a retired reservation as an explicit operation.
+A closed, hand-written set of validators for platform-defined control-plane types. Enforces Source Claim invariants and the capability profile required for a claim and entity kind to activate, rejects tenant-scoped registration of any control-plane type or instance, and rejects without exception any claim that overlaps a retired reservation, since ADR-0011 offers no runtime path to transfer one.
 
 ##### Responsibility boundaries
 
-Not extensible and not registered: it is not the P2 Validation Hook mechanism and must never grow into one. It validates only types the platform itself defines, whose base schemas are seeded built-ins that do not depend on user-registered definitions.
+Not extensible and not registered: it is not the P2 Validation Hook mechanism and must never grow into one. It validates only types the platform itself defines — the validators are compiled in and keyed by type identifier, while the schemas they validate against are admitted through the ordinary path along with everything else, so the validator set never depends on a user-registered definition.
 
 ##### Related components (by ID)
 
@@ -684,7 +685,7 @@ Not extensible and not registered: it is not the P2 Validation Hook mechanism an
 
 - [ ] `p2` - **ID**: `cpt-cf-types-registry-tech-source-plugin-registration`
 
-A Registry Source Plugin does not appear in a configuration file. It registers itself the way every ToolKit plugin does — as a well-known GTS Instance of a Type Schema derived from `gts.cf.toolkit.plugins.plugin.v1~` — which means Types Registry has to define and seed that derived type as a built-in.
+A Registry Source Plugin does not appear in a configuration file. It registers itself the way every ToolKit plugin does — as a well-known GTS Instance of a Type Schema derived from `gts.cf.toolkit.plugins.plugin.v1~` — which means Types Registry has to define that derived type. It declares it with the `toolkit-gts` macros and reconciles it through the ordinary admission path like any other definition (§3.3, *Where the desired definitions come from*); it is a type this gear owns, not a privileged insert.
 
 The base type already supplies most of the shape: `id` as the plugin's own GTS Instance Identifier, `vendor`, `priority` where lower wins, and a generic `properties` carrying the plugin-kind-specific spec. Types Registry's derived type puts three things in `properties` — the Source Claims the plugin asserts, the entity kinds it serves for each, and the capability declarations ADR-0007 requires before a claim may activate. Nothing about routing is invented here: `source_claim.priority` and `source_claim.plugin_entity_gts_id` are projections of the base type's `priority` and `id`.
 
@@ -698,7 +699,16 @@ In P1 the plugin is compiled into the same binary. The contract is nonetheless s
 
 Retirement is a governance act and never an observation of liveness. An unreachable plugin keeps its claims and a request needing it fails closed. Tying retirement to a health signal would let the claimed identifier space flicker, and not flickering is the entire purpose of a Source Claim.
 
-This settles the federation half of PRD open question 9 — which platform-defined control-plane types exist. The P2 Validation Hook declaration is the other half and is not decided here.
+**A retired reservation is not transferable at runtime.** ADR-0011 leaves no takeover operation: a claim overlapping a retired reservation is rejected, and no declared intent makes it succeed. The reason is that the assertion such an operation would carry — *I serve the same logical entities my predecessor served* — has nothing to be checked against, since the persistence rule leaves the registry holding no identifier, revision, or hash of what the predecessor served. Accepting it through an API would look like a check and be a formality.
+
+Ordinary plugin replacement is unaffected and does not reach this rule. A plugin is a registered Instance, so replacing the implementation behind a claim is a new content revision of the same Instance: the projection is rewritten, the generation is bumped, and no reservation is involved. Only a change of the plugin's own GTS Identity leaves a reservation behind.
+
+For that case the two paths are the purge of ADR-0013, which releases the space to whoever asks next, and a migration shipped with Types Registry, which retargets the claim rows to a named successor and leaves the space reserved throughout. The migration is the narrower act and the one to prefer; whoever writes it owes two things the ordinary write path would have done for them:
+
+- **bump `routing_config.generation` under that row's lock.** Without it the in-memory claim set does not reload and live federated cursors do not go stale, so pods keep routing to a plugin that no longer owns the space. It is also what invalidates every previously issued freshness validator, since the routing generation is one of the validator's components — which is what stops a conditional read from being answered `unchanged` against a source that has changed identity;
+- **leave the successor's Instance document and the `source_claim` projection in agreement.** The projection is derived from the document, and the Control-Plane Validator re-derives it on the next ordinary revision of that Instance. A row the document does not declare reads to that validator as a withdrawn claim, so a later routine plugin upgrade would silently undo the migration.
+
+This settles which platform-defined control-plane type the federation subsystem needs. The P2 Validation Hook declaration is the other half and is not decided here; it is D1 in §4.
 
 #### Supporting components
 
@@ -742,9 +752,13 @@ The routes below are the **tenant** surface, served on the business listener. Th
 
 **Type filter expansion is not a separate route.** A tenant user asking a domain gear for *everything of type `gts.acme.crm.*`* leaves that gear holding a pattern and a table keyed by `gts_uuid`, which a pattern cannot be matched against. What it needs is the matching references, and that is `GET /entities` with `$select=gts_uuid` and `availability=available` — paged, with the SDK's `expand_type_filter` accumulating the pages behind one call.
 
-A dedicated complete-or-fail route was the alternative, and pagination wins on memory: producing a deduplicated set means holding it, so an unpaged operation holds the whole expansion server-side while a paged one holds a page — and the maximum that would have bounded it is still open as PRD question 14. What it costs is atomicity. A set assembled across pages is complete with respect to the traversal rather than to an instant, because entities can be registered and deleted between the first page and the last. That is an accepted trade rather than an oversight, and `cpt-cf-types-registry-fr-type-query-assistance` and ADR-0001 were amended so that neither promises more than it delivers.
+A dedicated complete-or-fail route was the alternative, and pagination wins on memory: producing a deduplicated set means holding it, so an unpaged operation holds the whole expansion server-side while a paged one holds a page. What it costs is atomicity. A set assembled across pages is complete with respect to the traversal rather than to an instant, because entities can be registered and deleted between the first page and the last. That is an accepted trade rather than an oversight, and `cpt-cf-types-registry-fr-type-query-assistance` and ADR-0001 were amended so that neither promises more than it delivers.
 
-The expansion maximum stays **server-enforced** rather than becoming a client convention. The cursor carries the running count of references already served, and the page that would take the total past the maximum returns `QUERY_EXPANSION_LIMIT_EXCEEDED` instead. No up-front count is needed, which matters because counting a federated expansion would need a plugin capability the profile does not include. The refusal arrives at page `ceil(max / limit)` rather than before the first — but it arrives from the registry, not from whichever SDK the caller happens to be running.
+The expansion maximum is **1000 references**, and it stays **server-enforced** rather than becoming a client convention. The cursor carries the running count already served, and the page that would take the total past the maximum returns `QUERY_EXPANSION_LIMIT_EXCEEDED` instead. No up-front count is needed, which matters because counting a federated expansion would need a plugin capability the profile does not include. The refusal arrives at page `ceil(1000 / limit)` rather than before the first — but it arrives from the registry, not from whichever SDK the caller happens to be running.
+
+Unlike the batch bound, this one is not derived from anything observable: it bounds how many types match one user-facing filter, which depends on what tenants create through the API and cannot be read off the repository. It is chosen rather than measured, and chosen from the consumer side — a thousand references is roughly 36 KB of JSON, comfortable to transfer and to chunk into a gear's own `IN` predicate, and a filter matching more than a thousand types is one whose author should narrow it. `cpt-cf-types-registry-fr-type-query-assistance` and ADR-0001 both already say that narrowing is the caller's answer to a refusal.
+
+**The set carries no staleness contract, and that is a decision rather than an omission.** It is valid for the request that obtained it and must not be cached. It is already not a snapshot — pages are traversed over time and entities are registered and deleted between the first and the last. Attaching a validator would suggest it can be held and revalidated, which is precisely what it cannot usefully be: ADR-0010 lets an availability verdict change with **no mutation to any entity in the set**, so a validator would have to cover the availability inputs of every member for the Context Tenant, and recomputing that costs what recomputing the set costs. The consumer applies it as a query constraint inside the request it is already serving, so there is nowhere for it to be held in the first place.
 
 One consequence to state rather than leave to be discovered: the completeness contract now lives in the SDK. A caller that goes to REST directly receives pages and accumulates them itself.
 
@@ -780,7 +794,9 @@ Transport is a consequence rather than a fourth reason: identifiers run to 1024 
 
 The registration request carries an optional `dry_run` flag, defaulting to false. It changes nothing about the response shape — `202` with an operation, polled the same way — and everything about what the worker does at the end. It is not a way to ask a cheaper question: the run costs what admission costs, because it *is* admission up to the commit.
 
-The registration request contains a non-empty bounded `items` array. Each item is the authored GTS JSON and one optional `expected_resource_version`: present, the entity must still be at that version; absent, it must not exist. A literal `0` is rejected — absence already carries that meaning, and no entity ever holds version `0`, so a zero can only be caller confusion.
+The registration request contains a non-empty `items` array of **at most 100** candidates, rejected synchronously above that before anything is stored. The largest gear in the platform today declares 26 definitions, so the bound is roughly four times the observed maximum rather than a number chosen to be round.
+
+Splitting a batch to get under the bound is legitimate but not free, and one case cannot be split at all. A reference from one candidate to another resolves against the submitted candidate, so members separated into different batches lose that: an acyclic group still succeeds, because a candidate whose dependency is not yet registered fails retryably and succeeds on the next cycle, which `cpt-cf-types-registry-fr-two-phase-init` requires. A **dependency cycle** cannot survive the split at all — its members are admissible only together — so the bound is also the largest cycle the platform can admit. A hundred mutually referencing definitions is not a shape any real contract set has, and if one ever appears the bound is a configuration value. Each item is the authored GTS JSON and one optional `expected_resource_version`: present, the entity must still be at that version; absent, it must not exist. A literal `0` is rejected — absence already carries that meaning, and no entity ever holds version `0`, so a zero can only be caller confusion.
 
 Registration returns one model rather than a discriminated union, because acceptance has one shape:
 
@@ -869,7 +885,7 @@ Two things are common to every mutation and stated once: `Idempotency-Key` is a 
 | `$select` | query | As above, applied to every item on the page |
 | `limit`, `cursor` | query | Page size and position. The cursor binds the query, the routing generation, and the per-source position, so it goes stale when routing changes rather than silently skipping a source. It also carries the running count of items served, which is how the expansion maximum stays server-enforced across a paged accumulation |
 
-Deleted entities never appear. Ordering is by canonical identifier. Unstable Type Schemas do appear and cannot be filtered out: a GTS wildcard has no negation and there is no stability parameter, so a catalogue view that wants published contracts only cannot express it. That gap is PRD open question 26, and closing it is additive.
+Deleted entities never appear. Ordering is by canonical identifier. Unstable Type Schemas do appear and cannot be filtered out: a GTS wildcard has no negation and there is no stability parameter, so a catalogue view that wants published contracts only cannot express it. That gap is D3 in §4, and closing it is additive.
 
 `fr-type-query-assistance` names four kinds of user-facing filter — exact identifiers, compatible versions, derivation hierarchy constraints, and wildcard patterns — and they land on two parameters rather than four, which is worth spelling out so the shortfall is not rediscovered as a gap.
 
@@ -883,7 +899,7 @@ A **compatible-version constraint** is nearly empty under our own version model 
 
 | Parameter | Where | Meaning |
 |---|---|---|
-| `items[]` | body | Each the authored GTS JSON plus an optional `expected_resource_version`: present, the entity must still be at that version; absent, it must not exist. `0` is rejected |
+| `items[]` | body | Each the authored GTS JSON plus an optional `expected_resource_version`: present, the entity must still be at that version; absent, it must not exist. `0` is rejected. Non-empty, at most 100 |
 | `dry_run` | body | Runs the whole check sequence and commits nothing. Defaults to false |
 
 On the tenant plane the owner is derived from the `SecurityContext` and is never a body field; on the platform plane every candidate is global, because there is no tenant context to derive an owner from.
@@ -1122,7 +1138,14 @@ pub enum CompatibilityMode { Backward, Unenforced }
 
 pub enum ChainState { Proven, Frozen { since_spec_version: String }, Unenforced }
 
-pub struct Provenance { pub gts_spec_version: String, pub gts_impl_version: String }
+/// `owning_gear` is present for a global entity, optional for a tenant-owned
+/// one, and absent for an externally managed one. It names who to ask about the
+/// contract and confers nothing — see §3.3, *A gear submits what it owns*.
+pub struct Provenance {
+    pub gts_spec_version: String,
+    pub gts_impl_version: String,
+    pub owning_gear: Option<String>,
+}
 
 // ---- discovery ----------------------------------------------------------
 
@@ -1149,6 +1172,9 @@ pub struct EntityPage { pub items: Vec<EntitySnapshot>, pub next: Option<Cursor>
 
 /// Deduplicated and semantically unordered, even though the traversal that
 /// produced it is deterministic. No cursor — the SDK has already exhausted it.
+/// At most 1000 references; beyond that the registry refuses rather than
+/// truncating. No validator: the set is valid for the request that obtained it
+/// and must not be cached.
 pub struct ConcreteReferenceSet { pub references: Vec<Uuid> }
 
 // ---- write path ---------------------------------------------------------
@@ -1260,7 +1286,7 @@ Narrowing below the default is the point rather than an edge case. A gear holdin
 | `authored` | the authored document: a schema, or an Instance value | startup reconciliation |
 | `effective` | `resolved_schema`, `effective_traits`, `effective_traits_schema` | validating data against the type |
 | `compatibility` | enforced mode, per-level evolvability, chain state | an owner or a CI check |
-| `provenance` | `gts_spec_version`, `gts_impl_version` | diagnostics |
+| `provenance` | `gts_spec_version`, `gts_impl_version`, `owning_gear` | diagnostics, and a catalogue view asking who owns a contract |
 
 Grouping is not only brevity in the query string. `$select=authored`, `$select=effective`, and `$select=compatibility` are the three things anyone actually asks for, so the vocabulary matches the use rather than the storage. Per-field granularity survives where someone needs it, since OData addresses inside a group as `$select=effective/resolved_schema`.
 
@@ -1288,7 +1314,7 @@ Two questions come up often enough that a reader looks for an operation named af
 
 A dedicated, narrower resolve operation is not offered, and field selection is why. The case that would motivate one — a gear rendering rows for five hundred stored references, wanting identifiers and nothing more — is expressed as `$select=gts_id`, or as `$select=gts_id,availability` for the pairing ADR-0001's usage table actually describes, where the gear must also decide what to do with a row whose type is no longer usable. A separate operation would be a second way to ask a question `$select` already answers.
 
-Two behaviours are worth knowing before relying on it. Reverse resolution of a deleted entity succeeds and reports it deleted — that is what the tombstone is for. Reverse resolution of a reference outside the caller's visible scope is `not_found`, indistinguishable from a reference that was never issued, per ADR-0009. And because a reference encodes no source, an unresolved one fans out across every plugin; whether that needs a memo and a circuit breaker is PRD open question 8.
+Two behaviours are worth knowing before relying on it. Reverse resolution of a deleted entity succeeds and reports it deleted — that is what the tombstone is for. Reverse resolution of a reference outside the caller's visible scope is `not_found`, indistinguishable from a reference that was never issued, per ADR-0009. And because a reference encodes no source, an unresolved one walks the ordered plugin chain, batched so that each plugin is called at most once. ADR-0007 adds no memo and no circuit breaker over that walk: the expensive case is a reference held by no source, which must reach the last plugin and cannot be memoized, and under fail-closed a breaker yields the same source failure a timeout does.
 
 **Checking whether a tenant may use an entity is also just a read.** `availability` is in the default set, so an ordinary result already carries the verdict and its reason, for one entity or five hundred, with no second call. A caller that wants only that selects it alone and pays tens of bytes an entity.
 
@@ -1304,6 +1330,30 @@ Kind narrowing costs no round trip: the kind is the trailing `~` of the identifi
 
 Callers compare only canonical authored content when deciding whether a definition needs registration; dependency-derived effective content is not part of content equality.
 
+##### Where the desired definitions come from
+
+- [ ] `p2` - **ID**: `cpt-cf-types-registry-tech-inventory-registration`
+
+A gear declares its Type Schemas and well-known Instances with the `toolkit-gts` macros — `#[gts_type_schema(...)]` and `gts_instance!` — which submit link-time `inventory` records. That inventory is the input to the reconciliation workflow below. There is no separate bridge component and no registration code per gear: the SDK reads the collectors, narrows them by the rule in the next subsection, and reconciles.
+
+This replaces the mechanism the current implementation uses, and the replacement is a change of direction rather than a port. Today Types Registry **pulls**: its `init()` reads the whole process-wide inventory and registers it through the internal service, bypassing the client entirely. That only works while everything shares a process, and §3.8 makes the ordinary deployment several Types Registry replicas with other gears in their own processes, where their inventory is unreachable. Registration therefore becomes a **push** by each gear through the SDK.
+
+**Types Registry is not special.** Its own control-plane types reach storage the same way every other gear's do, through the ordinary admission path — there is no seeding mechanism, no migration, and no privileged insert. When Types Registry runs in the process it reconciles against itself through `PlatformTypesRegistryClient`, which is an in-process call under the embedded profile and a platform-plane call otherwise.
+
+##### A gear submits what it owns, and `owning_gear` is what says so
+
+**One rule governs submission: a gear submits the inventory records it owns, and nothing else.** The collectors are process-global and hold a record for every crate the binary links, while `cpt-cf-types-registry-fr-registration-authority` authorizes each candidate against the requesting subject's grants — so submitting everything a process happens to link means submitting candidates the caller has no authority to name. Every process links `toolkit-gts` and therefore carries the platform base types in its inventory whether or not it may register them.
+
+Each inventory record consequently carries an **`owning_gear`**: the gear name from `#[toolkit::gear(name = …)]`, already available as the generated `MODULE_NAME` constant, so nothing new has to be plumbed to produce it. It is the value the SDK filters on, and it is persisted on the entity.
+
+**The platform base types declared in `toolkit-gts` are owned by `types-registry`.** They are declared in a crate rather than by a gear, so they have no natural owner, and naming the registry keeps the submission rule single: Types Registry submits them because they are its own records, not through a second rule about owner-less definitions. It also needs them present regardless — its federation control-plane type derives from `gts.cf.toolkit.plugins.plugin.v1~`, which must be admitted before the derived type can be. Both go in one batch and dependency-aware admission orders them.
+
+This is a default rather than a claim of authorship, and it is safe because the field is **mutable across revisions**: a base type that later acquires a real owning gear carries that gear's name from its next admission onward. No correction operation is needed, and none of ADR-0009's argument against correcting ownership applies — that argument is about changing who can *see* a contract, and this field changes nothing about visibility.
+
+**`owning_gear` is attribution, never authority.** It answers *who do I ask about this contract* — which a global entity otherwise cannot answer at all, since ADR-0009 gives it no owning tenant and the identifier's vendor segments are a naming convention rather than a statement of ownership. It is declared by the caller and cannot be verified: in a single-process deployment every gear shares the process workload identity, so the platform cannot tell which gear inside it is registering. Nothing authorizes on it, no visibility rule reads it, and it is not a second ownership axis beside `ownership_scope` — which stays write-once and keeps deciding who may see and who may change.
+
+It is mandatory for a global entity and optional for a tenant-owned one, whose owner is already a tenant and whose registrant is usually an administrator rather than a gear. An Externally Managed Entity has none, like every other stored field.
+
 The SDK also provides a convenience reconciliation workflow for gear startup:
 
 1. batch-get every desired exact identifier;
@@ -1315,6 +1365,8 @@ The SDK also provides a convenience reconciliation workflow for gear startup:
 The helper reuses one generated key across transport retries and polling during that invocation. A caller that must resume the same request after process loss persists and supplies the key explicitly. A new reconciliation cycle performs a fresh read and uses a new key. A domain gear gates only its own readiness on the required outcomes; Types Registry has no global registration barrier.
 
 The vNext contract replaces the current `register(Vec<Value>) -> Vec<RegisterResult>` API. Backward compatibility adapters, the synchronous sequential local-client loop, and kind-specific registration duplicates are intentionally out of scope.
+
+Two things go with it. The gear's link-time seeding of the process inventory through the internal service is removed, for the reason above. So is **ready mode** — the `post_init` hook that waits for every gear's `init()` to finish and only then validates and opens the registry. That is precisely the global startup barrier `cpt-cf-types-registry-fr-two-phase-init` forbids and `cpt-cf-types-registry-constraint-boot-path` rules out: readiness follows this gear's own storage, each registrant retries and gates itself, and validation happens per admission unit rather than in one pass over everything the process happened to declare. Neither is ported; both are deleted.
 
 #### Registry Source Plugin contract
 
@@ -1354,7 +1406,6 @@ The `SecurityContext`, per the platform rule for in-process calls; the tenant th
 | Authored document | plugin | The same slot a Managed Entity's authored document occupies |
 | Resolved effective schema, effective traits, effective traits schema | plugin | Mandatory for a claimed Type Schema kind. Types Registry never resolves source-owned content, so a consumer has no other way to obtain them |
 | `external_revision` + `content_hash` | plugin | Equal revisions must identify equal content. Not exposed as fields; they are components of the validator |
-| Use-site validation and compatibility assertions | plugin | **Undefined** — see below |
 
 ##### What the plugin does not decide
 
@@ -1368,19 +1419,13 @@ Per-level evolvability and the frozen-chain state are likewise not asked for: th
 
 A caller's validator is opaque to the caller and composite to us. For an externally managed entity it must additionally be **recoverable**, not merely comparable, and that is a constraint rather than a preference: Types Registry holds no copy of an `external_revision`, so when a caller presents a validator the only place the source's token can come from is inside it. A digest would make the token unrecoverable and leave conditional reads on external entities unimplementable without persisting external state, which ADR-0002 forbids.
 
-The flow is therefore: decompose the caller's validator, hand the plugin its own token, and either report unchanged or reassemble a fresh validator around what came back. The validator is uniform in use and not in construction — for a Managed Entity the components are recomputable from local state, for an externally managed one they are carried. This narrows PRD open question 23.
+The flow is therefore: decompose the caller's validator, hand the plugin its own token, and either report unchanged or reassemble a fresh validator around what came back. The validator is uniform in use and not in construction — for a Managed Entity the components are recomputable from local state, for an externally managed one they are carried. This narrows PRD open question 15.
 
 ##### Open questions
 
-*Four remain, and three are recorded in the PRD.*
+*One remains, and it is recorded in the PRD.*
 
-*The use-site assertion above has no definition. ADR-0002 requires "source validation and compatibility assertions required by the use site" in every response, and no document says what a use-site requirement is or which component owns the model (PRD open question 22). The field is named here so the gap is visible in the contract rather than discovered when the first plugin is written.*
-
-*What a successor plugin must assert when taking over a retired Source Claim is owed by this section specifically — ADR-0011 defers it here in as many words, because a takeover transfers an identifier space whose deterministic references are already persisted in domain rows (PRD open question 7).*
-
-*Reverse resolution of a `gts_uuid` fans out across every plugin, since the reference encodes no source. Whether that needs a process-local source memo and a circuit breaker to stay available is PRD open question 8.*
-
-*Observability of a fail-closed federated control plane is PRD open question 15.*
+*Observability of a fail-closed federated control plane is PRD open question 10.*
 
 ### 3.4 Internal Dependencies
 
@@ -1622,9 +1667,23 @@ Registry Source Plugins are compiled into the same binary in P1. Moving one out 
 
 ## 4. Additional context
 
+### Open questions
+
+Design decisions this document deliberately leaves unmade. Two rules govern the list.
+
+**Everything here is P2.** A design question that P1 depends on is a blocker rather than a note, and belongs in the body of this document with an answer. If a question lands here and turns out to gate P1, that is a signal to answer it, not to record it more carefully.
+
+**These are questions about *how*.** Unresolved requirements — scope, policy, what the product owes — stay in the PRD's own table, which is what a reader of the PRD alone consults. A question moves here when what remains of it is a construction decision.
+
+| # | Question | Affects |
+|---|----------|---------|
+| D1 | The GTS Type that declares a P2 owning-gear Validation Hook: what a binding selects on, and what the built-in validator enforces about it. It cannot be settled ahead of the hook mechanism itself, since the declaration's shape follows from binding, execution, authentication, timeout, and failure policy — which `cpt-cf-types-registry-fr-validation-hooks` leaves to P2 and the PRD lists as a risk to close before implementation. The federation half of the same question is settled in §3.2 | `cpt-cf-types-registry-component-control-plane-validator` |
+| D2 | Alias chaining, retargeting, and canonical Alias content. An Alias is a Managed Entity with its own Registry Reference (ADR-0001), so the P1 reference contract does not change; what is undecided is whether an Alias may target another Alias, whether its target may be changed after admission, and what document an Alias resolution returns | `cpt-cf-types-registry-fr-aliasing` |
+| D3 | How discovery excludes contracts an owner does not want adopted. A GTS wildcard has no negation and `GET /entities` has no stability parameter, so a catalogue view that wants published contracts only cannot express it (ADR-0015). The answer must decide whether it is a new parameter or a value of an existing one, and whether it reaches Externally Managed Entities, whose majors the platform does not interpret. It should be shaped to carry deprecation too if that is ever introduced, rather than becoming the first of two adjacent booleans | `cpt-cf-types-registry-fr-type-query-assistance` |
+
 ### Benchmark profile
 
-*Pending — the production benchmark profile that `cpt-cf-types-registry-nfr-lookup-latency` and `cpt-cf-types-registry-nfr-query-latency` are verified against. It must be versioned and must fix entity counts by kind and ownership scope, derivation chain depth, dependency fan-out, tenant hierarchy depth, revision history length, and the backend under test, so that a threshold means the same thing across runs.*
+*Pending — the production benchmark profile that `cpt-cf-types-registry-nfr-lookup-latency` and `cpt-cf-types-registry-nfr-query-latency` are verified against. It must be versioned and must fix entity counts by kind and ownership scope, derivation chain depth, dependency fan-out, tenant hierarchy depth, revision history length, and the backend under test, so that a threshold means the same thing across runs. It must also fix the number of active Registry Source Plugins and the share of references not resolved locally, since ADR-0007 declines a memo and a circuit breaker over the ordered reverse-resolution walk and names measurement against this profile as what would reopen that.*
 
 ### Implementation prerequisites
 

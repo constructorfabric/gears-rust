@@ -123,7 +123,7 @@ The managed major-only policy does not rewrite authoritative external identities
 * Every live plugin response must provide an opaque `external_revision` and canonical `content_hash`.
 * The same `external_revision` for one exact entity must always identify the same content and hash, and changed canonical content must produce a different revision.
 * Types Registry does not require or persist an external versioning profile and does not interpret source revision ordering.
-* The External Registry Source remains responsible for its evolution and compatibility rules; Types Registry applies only the revision-bound platform use-site checks defined by ADR-0002 and ADR-0003.
+* The External Registry Source remains responsible for its evolution and compatibility rules; Types Registry applies only the federation response checks defined by ADR-0002 and makes no compatibility claim about source-owned content.
 * The managed version-family definition is a property of Types Registry storage and is not imposed on an External Registry Source. How source lifecycle assertions map onto the platform model is decided by ADR-0008.
 
 ### What counts as an identifier conflict

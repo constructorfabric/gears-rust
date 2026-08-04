@@ -144,9 +144,9 @@ Operational guarantees are reported separately from schema compatibility, as spe
 
 ### External Registry Sources
 
-An External Registry Source remains authoritative for its own evolution rules. Its Registry Source Plugin declares, per claimed entity kind, whether it guarantees backward evolution of its definitions, and every such assertion is bound to the returned exact GTS Identifier, `external_revision`, and `content_hash`.
+An External Registry Source remains authoritative for its own evolution rules, and Types Registry **MUST NOT** relabel a source guarantee, of any strength, as the platform guarantee. A consumer distinguishes the two from `origin` on the read result.
 
-Types Registry **MUST NOT** relabel a weaker source guarantee as the platform guarantee. Where the source format is supported, Types Registry **MAY** verify the assertion independently as an additional live check. An unprovable assertion fails closed for the affected use site.
+Nothing more is asked of a source about its evolution — no declared guarantee, and no platform check against one. There is nothing such a declaration could gate: the only consumer it would protect is a managed Type Schema referencing an external one, which ADR-0011 makes unrepresentable, so no managed verdict can depend on how a source evolves its definitions. A gear that reads an external entity directly decides for itself what it needs of it, as it does for any content the platform does not govern.
 
 A managed Type Schema cannot reference an externally managed one. ADR-0011 prohibits that direction in P1, and one of its four reasons is the evolution guarantee: specification §4.5 makes the compatibility of a referenced-type change depend on the effective resolved schemas, so a managed schema would inherit the weakest guarantee in its reference closure and could not claim backward compatibility unless the owning source asserted backward monotonicity per revision. The rule stated here therefore applies to a managed reference closure that is entirely managed, which is the only closure P1 admits.
 
@@ -179,7 +179,7 @@ This decision is confirmed when:
 * a compatibility check against a frozen entity reports the candidate-versus-current verdict together with the unproven-chain state, and never a bare pass;
 * successful revalidation restores ordinary evolution, and failed revalidation leaves the identity permanently closed to new content revisions;
 * the platform GTS implementation passes GTS 0.13 conformance for open-model property addition and removal and for both enum directions;
-* live External Registry Source admission preserves revision-bound source assertions without overstating their strength.
+* no result presents a source's own evolution behaviour as the platform guarantee, and no admission or federation check reads a source assertion about it.
 
 ## Pros and Cons of the Options
 

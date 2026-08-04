@@ -85,7 +85,7 @@ An admission candidate becomes an admitted revision and current only after:
 
 1. canonical GTS and JSON Schema validation succeeds;
 2. the backward compatibility check defined by ADR-0003 succeeds against the current revision;
-3. derivation-chain, `$ref`, `x-gts-ref`, ownership, lifecycle, and use-site rules succeed;
+3. derivation-chain, `$ref`, `x-gts-ref`, ownership, and lifecycle rules succeed;
 4. every affected registered dependent in the transitive dependency closure remains valid under the candidate and the exact dependency revision vector;
 5. every registered GTS Instance whose Type Schema dependency can be affected remains valid under ADR-0006;
 6. when P2 Validation Hooks are enabled and a required binding matches, every selected owning-gear semantic validator accepts the same candidate content hash;
@@ -173,7 +173,7 @@ This decision is confirmed when:
 * a lifecycle transition that creates no content revision still advances `resource_version`, so an update prepared before it is rejected;
 * ordinary resolution returns current revision and freshness metadata while domain references remain logical;
 * dependency-closure and registered-Instance validation are exercised before a base or referenced schema revision becomes current;
-* P2 hook tests cover initial admission and content revisions, including Version Successor admission with predecessor-deprecation context and no separate deprecation hook;
+* P2 hook tests cover initial admission and content revisions, including Version Successor admission, which under ADR-0008 changes no other member of its family and therefore triggers no further hook;
 * rollback is documented as P2 and a future rollback creates a new monotonically increasing revision.
 
 ## Pros and Cons of the Options

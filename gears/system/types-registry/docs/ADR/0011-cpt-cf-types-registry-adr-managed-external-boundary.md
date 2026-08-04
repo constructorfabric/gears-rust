@@ -182,9 +182,16 @@ A reservation is permanent under ordinary operation and is released by exactly o
 
 This costs a table of patterns. It persists no external entity identifiers — Types Registry already persists Source Claims, and a retired claim is the same kind of data — so it does not breach the persistence rule.
 
-Reservation alone is not sufficient, and the gap is stated rather than hidden. It prevents an identifier from rebinding to a Managed Entity, but a **successor plugin** taking over the same claim could serve different content under the same identifier, and deterministic Registry References would rebind persisted domain data to it. Claim takeover is therefore an explicit governed operation in which the successor asserts continuity of identity for the claimed space, not merely a new plugin registering the same pattern. The evidence required for that assertion is a DESIGN decision.
+Reservation alone is not sufficient, and the gap is stated rather than hidden. It prevents an identifier from rebinding to a Managed Entity, but a **successor plugin** serving the same claim could serve different content under the same identifier, and deterministic Registry References would rebind persisted domain data to it.
 
-Takeover is not made redundant by purge, and the two are not interchangeable. Takeover transfers a claim with no interval during which the space is unreserved, and is available in every deployment. Purge releases the space to whoever asks next, including a managed registration, and is disabled by default. One is the safe path and the other is the deliberate one.
+**There is therefore no claim takeover operation.** Activating a plugin claim that overlaps a retired reservation is rejected with no exception and no declared-intent escape. A governed takeover was considered and is not built, because the assertion it would carry cannot be checked by anything: this ADR's own persistence rule leaves Types Registry holding no identifier, revision, or content hash of what the predecessor served, so a successor's claim of continuity would be compared against nothing. An unverifiable assertion accepted through an API reads as a check and is a formality, which is the shape `cpt-cf-types-registry-principle-local-authority` exists to refuse.
+
+Two paths remain for reusing a reserved space, and neither is an ordinary operation:
+
+* **Purge the plugin Instance** (ADR-0013), which removes the reservation and releases the space to whoever asks next, including a managed registration. Disabled by default.
+* **A database migration shipped with Types Registry**, which retargets the claim rows to a named successor. This is the narrower of the two — the space is never unreserved and never becomes registrable by an unrelated party — and its cost of entry is an operator with database access and a reviewed migration, which is the ceremony proportional to an act that silently rebinds persisted domain references.
+
+Ordinary plugin replacement does not need either. A Registry Source Plugin is a registered Instance and its content is mutable under ADR-0006, so upgrading the implementation behind a claim is a new content revision of the same Instance and touches no reservation. Only a change of the plugin's own GTS Identity reaches this rule, and that is rare enough to be worth an operator.
 
 ### What a vendor does instead
 
@@ -223,7 +230,7 @@ This decision is confirmed when:
 * Types Registry exposes no plugin-callable operation that creates, modifies, or withdraws registry state;
 * deleting a Managed Entity with no managed dependent succeeds while every plugin is unreachable, and deleting one with a managed dependent is rejected while every plugin is unreachable — both proving the decision used local state only;
 * registering a Managed Entity whose identifier matches a retired Source Claim is rejected, and deleting a plugin Instance retires its claims into exactly that state while an unreachable plugin retains its own;
-* activating a new plugin's claim over a retired claim is rejected unless it is performed as an explicit takeover;
+* activating a new plugin's claim over a retired claim is rejected with no exception, and no request field, declared intent, or continuity assertion makes it succeed;
 * advisory impact reports degrade with a stated source-unavailable warning instead of failing the operation.
 
 ## Pros and Cons of the Options
@@ -295,5 +302,5 @@ This decision directly addresses:
 * `cpt-cf-types-registry-fr-ref-tracking` - makes the tracked dependency set entirely managed, so deletion safety needs no plugin-supplied data.
 * `cpt-cf-types-registry-fr-registry-source-routing` - defines the rooted single-segment claim grammar and makes a retired claim a reservation, released only by the purge of ADR-0013.
 * `cpt-cf-types-registry-fr-validate-type-derivation` - forbids derivation across the boundary in both directions.
-* `cpt-cf-types-registry-fr-id-resolution` - closes the rebinding path opened by plugin retirement, and identifies claim takeover as the remaining case.
+* `cpt-cf-types-registry-fr-id-resolution` - closes the rebinding path opened by plugin retirement, and leaves reuse of a reserved space to purge or to an operator-applied migration rather than to a runtime operation.
 * `cpt-cf-types-registry-nfr-lookup-latency` - keeps plugin calls out of the managed resolution and availability paths.
