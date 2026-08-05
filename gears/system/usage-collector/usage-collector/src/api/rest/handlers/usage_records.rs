@@ -168,13 +168,13 @@ pub async fn handle_get_usage_record(
 /// for exactly that purpose — and the service rejects an absent or
 /// one-sided window with `400 InvalidArgument`
 /// (`MISSING_TIME_WINDOW`) before any plugin dispatch. `$filter` /
-/// `$orderby` / `$top` / `cursor` flow through the standard [`OData`]
+/// `$orderby` / `limit` / `cursor` flow through the standard [`OData`]
 /// extractor.
 ///
 /// Gateway-side guards applied before the service is invoked:
 ///
-/// * **`$top` cap** — `ODataQuery.limit` is bounded by [`MAX_PAGE_SIZE`].
-///   A caller passing `?$top=1000000` receives a `400 InvalidArgument`
+/// * **`limit` cap** — `ODataQuery.limit` is bounded by [`MAX_PAGE_SIZE`].
+///   A caller passing `?limit=1000000` receives a `400 InvalidArgument`
 ///   so they cannot silently misinterpret a clamped page as complete.
 /// * **Cursor validation** — when a `cursor` is present, the toolkit's
 ///   [`validate_cursor_against`] confirms it was minted under the same
@@ -243,8 +243,8 @@ pub async fn handle_list_usage_records(
 /// `[from, to)` time window as a `created_at` predicate) and the
 /// `metadata.<key>=<value>` typed side-channel flow through query
 /// parameters, and only the [`AggregationSpec`] (operator + group-by
-/// dimensions) ships in the JSON body. `$orderby`, `$top` /
-/// `limit`, and `cursor` are intentionally NOT accepted here — the
+/// dimensions) ships in the JSON body. `$orderby`, `limit`, and
+/// `cursor` are intentionally NOT accepted here — the
 /// aggregation result is not paginated (the SDK contract emits one
 /// `AggregationResult` per call).
 ///
@@ -306,10 +306,10 @@ fn prepare_aggregate_request(
     Ok((gts_id, metadata_filter, query, aggregation))
 }
 
-/// `$`-prefixed `OData` parameters accepted on the aggregate path. `$top`,
-/// `cursor`, and `$select` are intentionally excluded — aggregation is
-/// not paginated and its projection is fixed (operator + group-by
-/// dimensions ship in the body).
+/// `$`-prefixed `OData` parameters accepted on the aggregate path.
+/// `limit`, `cursor`, and `$select` are intentionally excluded —
+/// aggregation is not paginated and its projection is fixed (operator +
+/// group-by dimensions ship in the body).
 const AGGREGATE_ODATA_PARAMS: &[&str] = &["$filter"];
 
 /// Reject any query parameter on the aggregate path that is not in the
@@ -377,10 +377,16 @@ pub const MAX_METADATA_FILTER_VALUES: usize = 32;
 
 /// `$`-prefixed `OData` parameters (parsed by the toolkit `OData`
 /// extractor) and the non-`OData` scalars the toolkit also accepts.
-/// Both `$top` (canonical `OData`) and `limit` (toolkit alias) are
-/// admitted — the toolkit extractor folds them onto the same
-/// `ODataQuery.limit` slot.
-const OUR_ODATA_PARAMS: &[&str] = &["$filter", "$orderby", "$select", "$top", "limit", "cursor"];
+///
+/// `limit` is the page-size parameter, and the only one. Canonical
+/// `OData` spells it `$top`, but [`toolkit::api::odata::ODataParams`]
+/// declares no `$top` field, so nothing would bind it — admitting it
+/// here would accept the caller's page size and silently ignore it,
+/// returning a full [`MAX_PAGE_SIZE`] page they would read as their
+/// requested one. It is therefore rejected as unrecognised, which tells
+/// the caller to send `limit` instead of leaving them to infer it from
+/// a page that looks complete.
+const OUR_ODATA_PARAMS: &[&str] = &["$filter", "$orderby", "$select", "limit", "cursor"];
 
 /// Typed query parameters carrying SDK values that are NOT part of the
 /// `OData` surface.
@@ -417,20 +423,20 @@ const CANONICAL_TIEBREAKER_FIELDS: &[&str] = &["created_at", "id"];
 // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-odata-parse
 // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-cursor-validate
 fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalError> {
-    // 1. $top cap. Reject above the cap so the caller observes the
+    // 1. `limit` cap. Reject above the cap so the caller observes the
     //    boundary rather than silently receiving a truncated page that
     //    looks complete.
     match query.limit {
         Some(l) if l > MAX_PAGE_SIZE => {
             return Err(UsageRecordResource::invalid_argument()
                 .with_field_violation(
-                    "$top",
-                    format!("$top must be <= {MAX_PAGE_SIZE}, got {l}"),
+                    "limit",
+                    format!("limit must be <= {MAX_PAGE_SIZE}, got {l}"),
                     "VALIDATION",
                 )
                 .create());
         }
-        // Within the cap: keep the caller's $top unchanged.
+        // Within the cap: keep the caller's `limit` unchanged.
         Some(_) => {}
         None => query.limit = Some(MAX_PAGE_SIZE),
     }

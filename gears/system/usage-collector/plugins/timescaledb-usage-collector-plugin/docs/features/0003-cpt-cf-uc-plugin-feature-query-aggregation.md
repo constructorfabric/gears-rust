@@ -146,7 +146,7 @@ Pushes analytical work into TimescaleDB so its native acceleration does it — a
 
 **Steps**:
 
-1. [ ] - `p1` - Floor the effective page size to 1 so a `$top=0` that slips the gateway cannot underflow the `LIMIT n+1` look-ahead - `inst-cur-1`
+1. [ ] - `p1` - Floor the effective page size to 1 so a `limit=0` that slips the gateway cannot underflow the `LIMIT n+1` look-ahead - `inst-cur-1`
 2. [ ] - `p1` - Build the seek predicate as a row-value tuple comparison over the `NOT NULL` `(created_at, id)` order - `inst-cur-2`
 3. [ ] - `p1` - Re-check the order key fail-closed via the SDK keyset-safety guard; reject a nullable ordering field (`subject_id` / `subject_type` / `corrects_id`) - `inst-cur-3`
 4. [ ] - `p1` - Fetch `effective_page_size + 1` rows to detect a next page, then trim to the page - `inst-cur-4`
@@ -234,7 +234,7 @@ The system **MUST** reject fail-closed an `$orderby` on a domain-optional (nulla
 - [ ] Raw list returns keyset-paginated pages over `(created_at, id)` honoring the supplied order and cursor, with a next cursor when a further page exists.
 - [ ] No caller-supplied string reaches query text as a literal or identifier: values are bound parameters, identifiers are allowlisted, and an unrecognized identifier is rejected as `Internal`.
 - [ ] A metadata predicate binds both the JSONB key and the compared value as parameters without enumerating keys.
-- [ ] An `$orderby` on a nullable field is rejected fail-closed; a `$top=0` cannot underflow the look-ahead (effective page size floored to 1).
+- [ ] An `$orderby` on a nullable field is rejected fail-closed; a `limit=0` cannot underflow the look-ahead (effective page size floored to 1).
 - [ ] Aggregation over a 30-day single-tenant range completes within 500ms at p95 within the parent throughput-profile envelope.
 
 ## 7. Non-Applicable Concerns

@@ -25,3 +25,7 @@ pub fn register_routes(
     router = usage_records::register_usage_record_routes(router, openapi);
     router.layer(axum::Extension(service))
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod openapi_contract_tests;

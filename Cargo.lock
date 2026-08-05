@@ -3105,7 +3105,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-usage-collector"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3129,6 +3129,7 @@ dependencies = [
  "opentelemetry_sdk",
  "rust_decimal",
  "serde",
+ "serde-saphyr 0.0.22",
  "serde_json",
  "thiserror 2.0.18",
  "time",

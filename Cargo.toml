@@ -293,7 +293,7 @@ resource-group = { package = "cf-gears-resource-group", version = "0.2.3", path 
 credstore = { package = "cf-gears-credstore", version = "0.2.2", path = "gears/credstore/credstore" }
 oagw = { package = "cf-gears-oagw", version = "0.3.3", path = "gears/system/oagw/oagw" }
 account-management = { package = "cf-gears-account-management", version = "0.4.3", path = "gears/system/account-management/account-management" }
-usage-collector = { package = "cf-gears-usage-collector", version = "0.2.3", path = "gears/system/usage-collector/usage-collector" }
+usage-collector = { package = "cf-gears-usage-collector", version = "0.3.0", path = "gears/system/usage-collector/usage-collector" }
 
 cf-gears-cluster-sdk = { version = "0.1.3", path = "gears/system/cluster/cluster-sdk" }
 cf-gears-cluster-conformance = { version = "0.1.3", path = "gears/system/cluster/cluster-conformance" }

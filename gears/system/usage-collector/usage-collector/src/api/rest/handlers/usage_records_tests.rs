@@ -1093,7 +1093,7 @@ async fn get_happy_path_returns_200_with_record_body() {
 }
 
 // ---------------------------------------------------------------------------
-// prepare_list_query — $top clamp, $orderby default, cursor validate
+// prepare_list_query — limit cap, $orderby default, cursor validate
 // ---------------------------------------------------------------------------
 
 mod prepare_list_query_tests {
@@ -1124,6 +1124,18 @@ mod prepare_list_query_tests {
         }
     }
 
+    fn extract_first_field_violation_field(err: &CanonicalError) -> Option<String> {
+        let CanonicalError::InvalidArgument { ctx, .. } = err else {
+            return None;
+        };
+        match ctx {
+            InvalidArgumentV1::FieldViolations { field_violations } => {
+                field_violations.first().map(|v| v.field.clone())
+            }
+            _ => None,
+        }
+    }
+
     #[test]
     fn limit_above_max_page_size_is_rejected_as_invalid_argument() {
         // A silent clamp would hand the caller a partial page that
@@ -1138,6 +1150,21 @@ mod prepare_list_query_tests {
         assert_eq!(
             extract_first_field_violation_reason(&err).as_deref(),
             Some("VALIDATION"),
+        );
+    }
+
+    #[test]
+    fn limit_above_max_page_size_names_limit_as_the_violating_field() {
+        // The violation MUST name the parameter the caller actually
+        // sent. `limit` is the only spelling that reaches
+        // `ODataQuery.limit`, so naming anything else blames a
+        // parameter that was never on the wire.
+        let mut q = ODataQuery::new();
+        q.limit = Some(5_000);
+        let err = prepare_list_query(q).expect_err("limit > cap must be rejected");
+        assert_eq!(
+            extract_first_field_violation_field(&err).as_deref(),
+            Some("limit"),
         );
     }
 
@@ -1709,9 +1736,84 @@ mod parse_required_gts_id_tests {
 }
 
 // ---------------------------------------------------------------------------
+// reject_unknown_list_params — the list allowlist admits exactly one
+// page-size spelling.
+//
+// `limit` is the only parameter bound to `ODataQuery.limit`:
+// `toolkit::api::odata::ODataParams` declares `$filter`, `$orderby`,
+// `$select`, `limit`, and `cursor`, and nothing else. An allowlist entry
+// with no binding behind it is worse than a rejection — it accepts the
+// parameter, ignores it, and hands back a full page the caller reads as
+// their requested page.
+// ---------------------------------------------------------------------------
+
+mod reject_unknown_list_params_tests {
+    use toolkit_canonical_errors::CanonicalError;
+    use toolkit_canonical_errors::context::InvalidArgumentV1;
+
+    use super::super::reject_unknown_list_params;
+
+    fn p(key: &str, value: &str) -> (String, String) {
+        (key.to_owned(), value.to_owned())
+    }
+
+    fn violating_field(err: &CanonicalError) -> Option<String> {
+        let CanonicalError::InvalidArgument { ctx, .. } = err else {
+            return None;
+        };
+        match ctx {
+            InvalidArgumentV1::FieldViolations { field_violations } => {
+                field_violations.first().map(|v| v.field.clone())
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn allowed_params_pass() {
+        reject_unknown_list_params(&[
+            p("$filter", "created_at ge 1 and created_at lt 2"),
+            p("$orderby", "created_at asc"),
+            p("$select", "id"),
+            p("limit", "10"),
+            p("cursor", "opaque"),
+            p("gts_id", "g"),
+            p("metadata.user_id", "u1"),
+        ])
+        .expect("the list allowlist admits every documented parameter");
+    }
+
+    #[test]
+    fn top_is_rejected_because_nothing_binds_it() {
+        // `$top` is canonical OData, but this gear's wire contract
+        // publishes `limit` and the toolkit extractor has no `$top`
+        // field. Admitting it would silently ignore the caller's page
+        // size — `?$top=5` would return the full `MAX_PAGE_SIZE` page.
+        let err = reject_unknown_list_params(&[p("gts_id", "g"), p("$top", "5")])
+            .expect_err("`$top` MUST be rejected: no code path binds it");
+        assert!(
+            matches!(err, CanonicalError::InvalidArgument { .. }),
+            "`$top` rejection MUST be InvalidArgument, got {err:?}",
+        );
+        assert_eq!(
+            violating_field(&err).as_deref(),
+            Some("$top"),
+            "the violation MUST name `$top` so the caller knows to send `limit`",
+        );
+    }
+
+    #[test]
+    fn unknown_parameter_is_rejected_with_field_naming_the_offender() {
+        let err = reject_unknown_list_params(&[p("unknown_param", "x")])
+            .expect_err("unknown param MUST reject");
+        assert_eq!(violating_field(&err).as_deref(), Some("unknown_param"));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // reject_unknown_aggregate_params — aggregate allowlist is STRICTER than list
 //
-// The list path admits `$top`, `cursor`, `$select`, and `limit`; the
+// The list path admits `cursor`, `$select`, `$orderby`, and `limit`; the
 // aggregate path intentionally rejects them (the aggregation result is
 // not paginated and the projection is fixed). Verify the asymmetry
 // directly — a regression that copy-pasted the list allowlist into the
@@ -1743,7 +1845,11 @@ mod reject_unknown_aggregate_params_tests {
         // NOT on `AGGREGATE_ODATA_PARAMS`. The aggregate validator MUST
         // reject them — silent admission would let a caller paginate an
         // unpaginated endpoint and ship an inconsistent wire contract.
-        for forbidden in ["$top", "cursor", "$select", "limit", "$orderby"] {
+        //
+        // `$top` is deliberately absent from this list: it is rejected on
+        // BOTH paths, so it demonstrates no asymmetry. Its list-path
+        // rejection is pinned by `reject_unknown_list_params_tests`.
+        for forbidden in ["cursor", "$select", "limit", "$orderby"] {
             assert!(
                 reject_unknown_aggregate_params(&[p(forbidden, "v")]).is_err(),
                 "`{forbidden}` MUST be rejected on the aggregate path - \
@@ -2125,7 +2231,7 @@ mod handle_list_usage_records_tests {
 // handle_query_aggregated_usage_records — wire validation + body projection
 //
 // The aggregate handler shares the metadata + gts_id surface with list,
-// but its allowlist is stricter (no `$top`, no `cursor`) and it ships
+// but its allowlist is stricter (no `limit`, no `cursor`) and it ships
 // the `AggregationSpec` in the body. The tests here pin only what list
 // tests can't: the stricter allowlist, the body lift through
 // `TryFrom<QueryAggregatedUsageRecordsRequest>`, and the result

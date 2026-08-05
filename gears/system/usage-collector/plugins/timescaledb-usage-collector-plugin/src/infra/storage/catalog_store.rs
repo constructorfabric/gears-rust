@@ -50,7 +50,7 @@ use crate::infra::storage::query::translate::{
 /// injection.
 const TYPE_COLUMNS: &str = "gts_id, kind, metadata_fields";
 
-/// Default page size when the caller omits `$top` (`query.limit`).
+/// Default page size when the caller omits `limit` (`query.limit`).
 const DEFAULT_PAGE_SIZE: u64 = 100;
 
 /// Upper bound on the FK-violation reference probe (`sample_ref_count`). The
@@ -344,7 +344,7 @@ impl CatalogStore for PgCatalogStore {
         let _timer =
             OpDurationGuard::start(Arc::clone(&self.metrics), TimedOp::Query(QueryKind::Raw));
         self.metrics.inc_query_request(QueryKind::Raw);
-        // Defense-in-depth: clamp the caller's `$top` to `MAX_PAGE_SIZE` (see
+        // Defense-in-depth: clamp the caller's `limit` to `MAX_PAGE_SIZE` (see
         // [`effective_page_size`]). The catalog is small/global, so this is a
         // backstop rather than a live scan concern, but it keeps both list
         // paths consistent.

@@ -54,7 +54,7 @@ use crate::infra::storage::query::translate::{
     SqlBind, SqlCtx, bind_one, bind_one_query, record_column, translate_record_filter,
 };
 
-/// Default page size when the caller omits `$top` (`query.limit`).
+/// Default page size when the caller omits `limit` (`query.limit`).
 const DEFAULT_PAGE_SIZE: u64 = 100;
 
 /// Column list for every `usage_records` SELECT / RETURNING, in
@@ -1036,8 +1036,8 @@ impl RecordStore for PgRecordStore {
         let _timer =
             OpDurationGuard::start(Arc::clone(&self.metrics), TimedOp::Query(QueryKind::Raw));
         self.metrics.inc_query_request(QueryKind::Raw);
-        // Defense-in-depth: clamp the caller's `$top` to `MAX_PAGE_SIZE` so a
-        // value that slipped past the core gateway's `$top` cap can never drive
+        // Defense-in-depth: clamp the caller's `limit` to `MAX_PAGE_SIZE` so a
+        // value that slipped past the core gateway's `limit` cap can never drive
         // an unbounded `LIMIT n+1 ... fetch_all`.
         let limit = effective_page_size(query.limit, DEFAULT_PAGE_SIZE);
 

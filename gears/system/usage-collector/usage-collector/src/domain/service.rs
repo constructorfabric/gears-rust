@@ -1860,7 +1860,7 @@ impl Service {
 
             // Reject an unbounded query before composition / dispatch so an
             // authorized caller cannot drive a full-table aggregation. The
-            // aggregate path has no `$top` ceiling, so the bounded window is
+            // aggregate path has no `limit` ceiling, so the bounded window is
             // its only scan bound. Runs after authz (PDP-first posture).
             require_bounded_time_window(query)?;
 
