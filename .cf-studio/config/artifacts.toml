@@ -320,6 +320,43 @@ require_kind_registered_in_kit = true
 require_md_extension = true
 fail_on_unmatched_markdown = true
 
+# Nested sub-plugin scope: Keycloak IdP plugin carries its own PRD/DESIGN/DECOMPOSITION
+# under gears/system/account-management/plugins/keycloak-idp-plugin/docs.
+[[systems.autodetect.children]]
+kit = "gears"
+system_root = "{project_root}/gears/system/account-management/plugins/keycloak-idp-plugin/docs"
+artifacts_root = "{system_root}"
+
+[systems.autodetect.children.artifacts.PRD]
+pattern = "PRD.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.DESIGN]
+pattern = "DESIGN.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.ADR]
+pattern = "ADR/*.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.DECOMPOSITION]
+pattern = "DECOMPOSITION.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.FEATURE]
+pattern = "features/*.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.validation]
+require_kind_registered_in_kit = true
+require_md_extension = true
+fail_on_unmatched_markdown = true
+
 # Nested sub-plugin scope: OIDC AuthN plugin carries its own PRD/DESIGN/DECOMPOSITION
 # under gears/system/authn-resolver/plugins/oidc-authn-plugin/docs.
 [[systems.autodetect.children]]
