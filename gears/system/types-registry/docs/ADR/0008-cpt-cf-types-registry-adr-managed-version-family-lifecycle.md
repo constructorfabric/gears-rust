@@ -42,13 +42,13 @@ The obvious answer to all three is one stored value: at most one member of a fam
 
 Conflating them has consequences that reach well past the status field. Keeping the derived value truthful requires supporting rules that serve nothing else — deleting the newest member has to be forbidden while older members claim an active successor, and admitting a major lower than the current one has to be rejected. Enforcing "at most one active" requires a family-scoped serialization point, because two successor admissions in one family need not touch the same predecessor row and entity-level optimistic concurrency therefore cannot see the conflict.
 
-The question this ADR settles is how many members of a family may be usable at once. What happens to deprecation follows from that answer rather than driving it.
+The question this ADR settles is how many members of a family may be `ACTIVE` at once. What happens to deprecation follows from that answer rather than driving it.
 
 ## Scope
 
 This ADR decides:
 
-* whether more than one member of a managed version family may be usable at once;
+* whether more than one member of a managed version family may be `ACTIVE` at once;
 * whether the registry states which member is newest, and what discovery must offer instead;
 * what the version-family record must hold, and whether it needs its own concurrency control;
 * the managed Lifecycle Status vocabulary for P1, and how external source assertions map onto it;
@@ -72,7 +72,7 @@ This ADR does not decide the version-family definition, minor-version policy, or
 
 ## Decision Outcome
 
-Chosen option: **several members of a version family may be usable at once, and the family record retains nothing but its owner scope.** The registry does not nominate a newest member — version ordering is already carried by the identifiers. Managed deprecation is not built in P1; when it arrives it will be authored rather than derived.
+Chosen option: **several members of a version family may be `ACTIVE` at once, and the family record retains nothing but its owner scope.** The registry does not nominate a newest member — version ordering is already carried by the identifiers. Managed deprecation is not built in P1; when it arrives it will be authored rather than derived.
 
 ### Several members may be ACTIVE
 
@@ -85,6 +85,8 @@ The managed Lifecycle Status of an admitted logical entity in P1 is `ACTIVE` or 
 * Members may be admitted in any order. A family has no current-member pointer, so nothing can move backwards and out-of-order admission needs no special rule.
 * Deletion is unchanged and remains governed by its own preconditions: an `ACTIVE` member may transition directly to terminal `DELETED`. Deleting any member has no effect on the status of the others.
 * P1 has no managed deprecation, undeprecation, or restore transition.
+
+`ACTIVE` is a lifecycle status and not a statement that a tenant may use the entity. Those are different dimensions: ADR-0010 computes Tenant Availability State separately, per tenant, from lifecycle, visibility, and the semantic dependency closure, so an `ACTIVE` member can still be `UNAVAILABLE` for a given tenant — and two tenants can receive different verdicts for one member. Where the options below and the discussion above say "usable", they are naming the question this ADR was asked; the answer it gives is about `ACTIVE`, and each tenant evaluates usability independently.
 
 This is what the platform's consumers actually do. A consumer holds a reference to one exact identifier and is not offered a choice among majors, so nothing in the registry needs to nominate one member as the one to use.
 

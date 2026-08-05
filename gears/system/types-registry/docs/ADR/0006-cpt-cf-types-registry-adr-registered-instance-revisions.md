@@ -205,7 +205,7 @@ This decision is confirmed when:
 * a Type Schema update cannot activate while an affected current registered Instance would become invalid;
 * P2 hook tests cover initial admission and content revisions of managed registered Instances;
 * all admitted Instance revisions remain internally retrievable after later updates and logical deletion;
-* ordinary resolution returns current revision and schema provenance while stable references remain logical;
+* ordinary resolution returns the current value's content hash, the freshness validator, and lifecycle and availability metadata, while stable references remain logical — and returns neither the Instance revision number nor the conforming Type Schema revision, since §*Resolution and historical access* keeps both out of the contract;
 * tests reject secret-bearing test fixtures according to the final security classification mechanism.
 
 ## Pros and Cons of the Options

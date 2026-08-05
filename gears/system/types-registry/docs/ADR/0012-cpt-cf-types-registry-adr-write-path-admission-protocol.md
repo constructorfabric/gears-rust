@@ -114,7 +114,9 @@ The sections below state each choice in full.
 
 A new registration request has exactly one successful acceptance result: `202 Accepted` with an operation UUID. The server never returns an admission result inline, whether because P1 validation happens to be fast or because the batch turns out to change nothing.
 
-A synchronous `200 OK / unchanged` acceptance for an all-equal batch is not offered either, and the reason is not economy of response shapes. The state such a path would optimize is unreachable for a caller that honours its own preconditions: `must_not_exist` yields `precondition_failed` once the entity exists, and `match_resource_version(v)` fails once the content has moved — and content can only have become equal by someone writing it, which advances the version past `v`. An all-equal batch therefore means the caller read current state, found equality, and submitted anyway. That is a caller defect, not a workflow, and a caller that reconciled sends no POST at all; the optimization belongs there, where it costs nothing, and §Startup places it there.
+A synchronous `200 OK / unchanged` acceptance for an all-equal batch is not offered either, and the reason is not economy of response shapes. The state such a path would optimize is reached only by a caller that read current state, compared it, found equality, and submitted anyway — which is a caller defect rather than a workflow, since a caller that reconciled sends no POST at all. The optimization belongs there, where it costs nothing, and §Startup places it there.
+
+The state is reachable, and the earlier claim that it was not overstated the case: submitting content identical to what was just read, under `match_resource_version(v)`, satisfies its own precondition and needs no other writer. What the preconditions do rule out is the *interesting* way of arriving at it — one where the content became equal underneath the caller. `must_not_exist` yields `precondition_failed` once the entity exists, and `match_resource_version(v)` fails once the content has moved, because content can only have become equal by someone writing it, which advances the version past `v`. So an all-equal batch is never a race the server has to resolve; it is a redundant submission, and it is answered as one.
 
 `unchanged` is therefore a **guarantee** rather than a path: a redundant submission creates no revision and no `resource_version` increment. Both the operation status and the per-candidate status carry the value for that reason.
 
@@ -156,13 +158,13 @@ The acceptance shape does not change. A dry run returns `202` with an operation 
 
 A dry run is not a guarantee of admission and must not be presented as one. Its verdict is relative to the state it observed: a target's `resource_version` may advance, a dependency may admit a new revision, or the entity may be deleted before the real submission. There is also one state in which the check is wanted and admission is impossible by construction — ADR-0003 freezes a logical entity whose revision chain spans a semantic change of the compatibility relation, and requires the check against it to remain answerable together with the unproven-chain state.
 
-The purge dry run of ADR-0013 is this mode applied to `kind = purge`, not a separate facility.
+**Purge is not one of the kinds this ADR governs, and its dry run is its own.** ADR-0013 makes purge a synchronous platform-plane job that creates no operation, so nothing here reaches it: no acceptance shape, no request key, no per-candidate row, no outbox message. The reasons this path exists do not apply to it — P2 hooks do not run on purge, so its duration is bounded by local database work; its candidates are found by a scan rather than named by a caller, so there is nothing to persist per candidate; and it has no gear-facing contract to keep stable across P2. What ADR-0013 does keep is the *property* that makes a dry run worth having, which is that it be a mode of the same code rather than a second implementation of the check sequence. That property is what this decision was protecting, and it survives outside this path.
 
 ### The public operation has one status and per-candidate results
 
 An operation has one status: `pending`, `running`, `succeeded`, `unchanged`, `partially_succeeded`, or `failed`. Progress and outcome are one field rather than two. Splitting them spreads a tagged union across two fields, because an outcome only ever exists under one progress value; that makes illegal combinations representable and requires a constraint to forbid them. One enumeration makes them unrepresentable, and it matches how a candidate result is modelled.
 
-Each exact candidate GTS Identifier has one result with status `pending`, `running`, `succeeded`, `unchanged`, or `failed`. `unchanged` is preferred to `not_modified` and `already_registered`: it applies to both create and update attempts and does not overload HTTP `304 Not Modified`. A terminal success also returns the Registry Reference, revision number, and resulting resource version. A failure returns a structured reason.
+Each exact candidate GTS Identifier has one result with status `pending`, `running`, `succeeded`, `unchanged`, or `failed`. `unchanged` is preferred to `not_modified` and `already_registered`: it applies to both create and update attempts and does not overload HTTP `304 Not Modified`. A terminal success also returns the Registry Reference and the resulting resource version. It does **not** return a revision number: no P1 operation accepts one, so exposing it would offer a handle attached to nothing, and the caller's next write is preconditioned on `resource_version` (ADR-0005, ADR-0006). A failure returns a structured reason.
 
 There is no separate public Admission Status vocabulary and no pending logical entity. An operation is the request-progress resource; an entity exists only after an admission unit commits.
 
@@ -263,7 +265,7 @@ This decision is confirmed when:
 * Good, because a redundant raw POST terminates in one round trip.
 * Bad, because strict replay of the no-op requires a separate durable receipt, and therefore a second table holding the optional half of a one-to-one relation.
 * Bad, because the whole-batch equality predicate duplicates, under a row lock in the request handler, a rule the worker already applies per candidate.
-* Bad, because the state it optimizes is unreachable for a caller that honours its own preconditions.
+* Bad, because the state it optimizes is reached only by a caller that reconciled and submitted anyway, and such a caller would not have sent the request.
 
 ### Always asynchronous with no synchronous no-op path
 

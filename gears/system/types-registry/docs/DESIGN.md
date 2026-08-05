@@ -36,7 +36,7 @@
 
 Types Registry is a control plane for type contracts. It owns the identity, definition, evolution, and platform-facing usability of GTS Type Schemas and registered GTS Instances, and it owns none of the runtime objects that conform to them. Every other gear reaches it through one SDK and one REST surface, whether the entity it asks about is stored here or lives in a vendor's own registry.
 
-Four decisions give the architecture its shape. First, **identity is derived rather than allocated**: a Registry Reference is a deterministic UUID computed from the canonical GTS Identifier, so the same contract carries the same reference in every installation with no allocation state to transport, and domain gears persist that UUID instead of an identifier string (ADR-0001). Second, **a managed identifier is a mutable logical entity with an immutable revision history**: the major-only GTS Identifier names a channel, not a snapshot, and successive definitions are internal revisions admitted under one enforced backward-compatibility mode — with one exemption, major 0, which marks a contract still being designed and is quarantined so the exemption cannot reach anything else (ADR-0003, ADR-0004, ADR-0005, ADR-0006, ADR-0015). This buys stability of stored references at the cost of making every resolution result something that has to be validated rather than assumed current. Third, **every actual mutation is an asynchronous operation guarded by optimistic concurrency**: a caller reads the current entities, omits authored content that is already equal, and submits the remaining candidates with an entity-level precondition. The API durably binds the `Idempotency-Key` to the request fingerprint on the operation row itself, persists the operation and its candidates, atomically enqueues the operation through the ToolKit transactional outbox, and returns the operation UUID. Acceptance has exactly one successful shape: there is no synchronous path, because a batch that equals current state is unreachable for a caller honouring its own preconditions, and a caller that has reconciled sends no request at all. A worker performs dependency-aware partial admission and records an independent outcome for every candidate GTS Identifier. Fourth, **federation is live delegation across a closed boundary**: external definitions are never projected into local storage, and the managed and externally managed identifier spaces are disjoint — no reference or derivation crosses in either direction. Every guarantee the platform offers for a managed entity is therefore enforceable from local state alone, without a plugin call on the managed read path and without depending on data a plugin chose to supply (ADR-0002, ADR-0007, ADR-0011).
+Four decisions give the architecture its shape. First, **identity is derived rather than allocated**: a Registry Reference is a deterministic UUID computed from the canonical GTS Identifier, so the same contract carries the same reference in every installation with no allocation state to transport, and domain gears persist that UUID instead of an identifier string (ADR-0001). Second, **a managed identifier is a mutable logical entity with an immutable revision history**: the major-only GTS Identifier names a channel, not a snapshot, and successive definitions are internal revisions admitted under one enforced backward-compatibility mode — with one exemption, major 0, which marks a contract still being designed and is quarantined so the exemption cannot reach anything else (ADR-0003, ADR-0004, ADR-0005, ADR-0006, ADR-0015). This buys stability of stored references at the cost of making every resolution result something that has to be validated rather than assumed current. Third, **every actual mutation is an asynchronous operation guarded by optimistic concurrency**: a caller reads the current entities, omits authored content that is already equal, and submits the remaining candidates with an entity-level precondition. The API durably binds the `Idempotency-Key` to the request fingerprint on the operation row itself, persists the operation and its candidates, atomically enqueues the operation through the ToolKit transactional outbox, and returns the operation UUID. Acceptance has exactly one successful shape: there is no synchronous path, because a batch that equals current state is reached only by a caller that reconciled and submitted anyway, and a caller that has reconciled sends no request at all. A worker performs dependency-aware partial admission and records an independent outcome for every candidate GTS Identifier. Fourth, **federation is live delegation across a closed boundary**: external definitions are never projected into local storage, and the managed and externally managed identifier spaces are disjoint — no reference or derivation crosses in either direction. Every guarantee the platform offers for a managed entity is therefore enforceable from local state alone, without a plugin call on the managed read path and without depending on data a plugin chose to supply (ADR-0002, ADR-0007, ADR-0011).
 
 The performance shape follows from a property of GTS itself: the derivation chain of a type is encoded in its identifier. `GtsId::chain_ids()` reconstructs every base from the string alone, so hierarchy questions need no graph traversal, and a pattern compiles to a bounded range predicate over the canonical identifier — an index range scan whose candidates the GTS matcher then confirms, since matching is segment-wise and field-wise rather than character-wise. What is not identifier-derivable — `$ref` and `x-gts-ref` targets — is kept as a flat edge set between managed entities, used for deletion safety and impact analysis, off the read path.
 
@@ -63,7 +63,7 @@ A revision and a current-state projection hold different facts rather than two c
 | `cpt-cf-types-registry-fr-externally-managed-entities` | No row, column, or projection of an external entity anywhere in §3.7; results enter live, are checked against the platform invariants of §3.2 — identifier integrity, derived reference equality, claim conformance, entity kind, ownership scope, revision and hash consistency — and leave. The managed-only tail of the read result sits in an `Origin` variant rather than in nullable fields, so a write precondition on an external entity does not compile. Returned content is never parsed, so the external half of the boundary rule is declared and not enforced. |
 | `cpt-cf-types-registry-fr-registry-federation`, `cpt-cf-types-registry-fr-registry-source-routing` | Managed storage consulted first, then non-overlapping Source Claims in deterministic priority order; claims are rooted single-segment patterns, so an identifier's owning source follows from its first segment, an external entity's whole derivation chain sits in one claim, and the two identifier spaces stay disjoint; capability profile enforced at claim activation, with no write path granted to a plugin. |
 | `cpt-cf-types-registry-fr-cache-freshness-metadata` | Every read carries an opaque composite validator, computed per request and never stored, published atomically with the mutation that invalidates it. Its components differ by origin: a managed one digests entity revision, closure fingerprint, tenant ancestor-chain version, and the normalized projection, while an external one additionally carries the source's revision and hash verbatim, because the registry keeps no copy to compare against. |
-| `cpt-cf-types-registry-fr-client-cache` | One SDK store per client instance, keyed by entity key, Context Tenant, and normalized projection because the validator digests the last two; bounded staleness whose safe direction comes from ADR-0003, with unstable entities excluded from it; revalidation coalesced onto the caller's own batch read rather than scheduled; fail-closed on revalidation failure. |
+| `cpt-cf-types-registry-fr-client-cache` | One SDK store per client instance, keyed by entity key, Context Tenant, and normalized projection because the validator digests the last two; bounded staleness whose safe direction comes from ADR-0003, with the residual for unstable entities stated rather than mechanised; revalidation coalesced onto the caller's own batch read rather than scheduled; fail-closed on revalidation failure. |
 | `cpt-cf-types-registry-fr-two-phase-init` | One plane per batch, dependency-aware partial admission with atomic cyclic dependency groups, no global startup barrier, and readiness gated by each registrant on its own required candidate outcomes. |
 
 #### NFR Allocation
@@ -73,7 +73,7 @@ A revision and a current-state projection hold different facts rather than two c
 | `cpt-cf-types-registry-nfr-lookup-latency` | Exact lookup p95 < 10 ms | Resolution path: identity mapping, current-state read, availability evaluation | Reference derived in-process rather than looked up; effective content read from the current-state row and authored content from the single revision it points at, both keyed on the entity with no history scan; availability decided in SQL from the entity's own state plus a cached tenant ancestor chain, with no dependency traversal; no plugin call can occur on a managed path because ADR-0011 admits no edge across the boundary in either direction. | Automated benchmark against the profile in §4, *Benchmark profile*. |
 | `cpt-cf-types-registry-nfr-query-latency` | Bounded search p95 < 100 ms (P2) | Discovery and query assistance | Pattern compiled to an index range predicate over the canonical identifier; over-returned candidates filtered in memory by the GTS matcher; federated expansion source-major with bounded internal paging. | Automated benchmark against the profile in §4, *Benchmark profile*. |
 | `cpt-cf-types-registry-nfr-multi-pod-correctness` | Committed mutations visible on every pod's first post-commit read | Storage, outbox worker, and caching layers | The platform database is the only authoritative store; the leased ToolKit outbox excludes concurrent claims while idempotent admission commits remain safe after lease expiry or duplicate delivery; every state transition and its validator metadata commit in one transaction; process-local state is confined to derived caches that are validated against a committed token before use and never consulted as authority. | Integration tests exercising duplicate delivery, lease expiry, concurrent first-family admission, and commit-then-read across pods. |
-| `cpt-cf-types-registry-nfr-cache-correctness` | No invalidated result accepted as current | SDK client cache | Opaque composite validator returned with every result and required on revalidation; past its freshness window an entry is served only if the registry confirms it, a failed revalidation is not served at all, and a successful mutation drops its own keys. §3.3, *The client-side cache*. | Integration tests covering mutation, revalidation, stale-entry rejection, and the unstable-entity carve-out. |
+| `cpt-cf-types-registry-nfr-cache-correctness` | No invalidated result accepted as current | SDK client cache | Opaque composite validator returned with every result and required on revalidation; past its freshness window an entry is served only if the registry confirms it, a failed revalidation is not served at all, and a successful mutation drops its own keys. §3.3, *The client-side cache*. | Integration tests covering mutation, revalidation, and stale-entry rejection. |
 
 #### Key ADRs
 
@@ -441,11 +441,11 @@ graph TD
 
 ##### Why this component exists
 
-Every mutation of registry state — initial admission, content revision, lifecycle transition, control-plane write, purge — must pass the same ordered set of checks. A batch is one durable client-visible operation, but its candidates have independent outcomes unless their dependency relation requires them to commit together. Spreading that order, partial-admission rules, or concurrency protocol across handlers would let one path skip a check another enforces.
+Every mutation of registry state — initial admission, content revision, lifecycle transition, control-plane write — must pass the same ordered set of checks. Purge is the exception and is a job of its own (ADR-0013): it admits nothing, so it has no admission sequence to share, and it runs synchronously outside this path. A batch is one durable client-visible operation, but its candidates have independent outcomes unless their dependency relation requires them to commit together. Spreading that order, partial-admission rules, or concurrency protocol across handlers would let one path skip a check another enforces.
 
 ##### Responsibility scope
 
-Owns the candidate lifecycle and the single write contract: the dry-run mode and the suppression of the commit under it, request-identity resolution against a stored fingerprint, the synchronous whole-batch no-op proof and receipt, operation and candidate creation when work remains, dependency ordering, content-equality no-op detection inside an operation, the ordered validation sequence, optimistic concurrency against the caller-observed entity resource version and the dependency freshness used during validation, allocation of the next revision number on success, and durable status and diagnostics for every asynchronous candidate GTS Identifier. It is the only component that writes entity state.
+Owns the candidate lifecycle and the single write contract: the dry-run mode and the suppression of the commit under it, request-identity resolution against a stored fingerprint, the synchronous whole-batch no-op proof and receipt, operation and candidate creation when work remains, dependency ordering, content-equality no-op detection inside an operation, the ordered validation sequence, optimistic concurrency against the caller-observed entity resource version and the dependency freshness used during validation, allocation of the next revision number on success, and durable status and diagnostics for every asynchronous candidate GTS Identifier. It is the only component that writes entity state, with one exception that only removes it: the purge job of ADR-0013, which is why that job re-evaluates the deletion preconditions itself rather than inheriting them from here.
 
 It also owns the position of the authorization check in that order, which is load-bearing rather than incidental. **Authorization runs first, before identifier availability is evaluated at all.** The reverse order would let an unauthorized caller distinguish a free identifier from a taken one by attempting a registration, converting the deliberate name-availability disclosure of ADR-0009 into an unauthenticated probe of the whole namespace. The plane is decided by the context type rather than by the endpoint: a candidate whose requested owner is global is admissible only under `PlatformSecurityContext`, and a tenant-scoped candidate is authorized by the platform PDP for the requesting subject, the action, and the candidate's canonical GTS Identifier supplied as a resource property.
 
@@ -791,7 +791,7 @@ These are thin adapters and one maintenance job. They hold no policy.
 | Operation Store | `cpt-cf-types-registry-component-operation-store` | Public asynchronous operation resources carrying their own scoped request key and fingerprint, per-GTS-ID candidate preconditions, state, results and diagnostics, and atomic enqueue of operation UUIDs through a dedicated `toolkit-db` outbox table family. Fails a stalled operation once its timeout passes, and sweeps unpinned terminal operations past the retention window | Request identity has no record of its own; the operation is the receipt. Outbox tables own dispatch leases, attempts, retry, and dead letters; registry operation tables own only client-visible workflow state. Outbox payloads contain no candidate content. The sweep reaches no admitted content and no identity, so it is not the purge of ADR-0013 in miniature |
 | Tenant Hierarchy Client | `cpt-cf-types-registry-component-tenant-hierarchy-client` | Ancestor chain of a tenant from `tenant-resolver` with barrier traversal disabled, cached with a version participating in the resolution validator | Does not interpret tenancy semantics; supplies the chain only |
 | Plugin Client Adapter | `cpt-cf-types-registry-component-plugin-client-adapter` | Scoped ClientHub access to Registry Source Plugins, timeouts, concurrency limits, and per-source failure classification | Applies no platform policy to responses; conformance validation belongs to the federation router |
-| Purge Job | `cpt-cf-types-registry-component-purge-job` | Operator-invoked purge over a GTS pattern, with dry run, on the platform plane; removes entity records, revisions, an emptied version family, and the operation items naming the purged identifiers, Instances before Type Schemas | Never scheduled, never automatic; disabled by default; re-evaluates deletion preconditions at execution time and writes through the ordinary write path |
+| Purge Job | `cpt-cf-types-registry-component-purge-job` | Operator-invoked purge over a GTS pattern, with dry run, on the platform plane. Expands the pattern, removes entity records, revisions, an emptied version family, and the operation items naming the purged identifiers, Instances before Type Schemas, and returns the per-identifier report synchronously | Never scheduled, never automatic; disabled by default; re-evaluates deletion preconditions at execution time. Creates no operation, no per-candidate row, and no request-identity record — the one mutation outside the asynchronous write path of ADR-0012 |
 
 ### 3.3 API Contracts
 
@@ -801,7 +801,7 @@ These are thin adapters and one maintenance job. They hold no policy.
 - **Technology**: REST/OpenAPI over Axum through the ToolKit `OperationBuilder`; transport-agnostic Rust SDK trait resolved through the typed ClientHub
 - **Location**: generated from the route registrations; no checked-in API specification file yet
 
-This section covers the whole surface: registration, deletion, purge, the read and discovery operations, type filter expansion, and operation polling. Deletion and purge are mutations like any other and go through the write path of ADR-0012, producing an operation and carrying an `Idempotency-Key`; purge is platform-plane only, and only where deployment policy enables it.
+This section covers the whole surface: registration, deletion, purge, the read and discovery operations, type filter expansion, and operation polling. Deletion is a mutation like registration and goes through the write path of ADR-0012, producing an operation and carrying an `Idempotency-Key`. **Purge does not**: ADR-0013 makes it a synchronous platform-plane job that returns its report in the response and creates no operation, no per-candidate row, and no request-identity record. It is platform-plane only, and only where deployment policy enables it.
 
 #### Tenant REST contract
 
@@ -866,6 +866,10 @@ The validator is **computed per request and never stored**, which is `cpt-cf-typ
 | normalized projection | ✓ | ✓ |
 
 Two rows are worth reading twice. **The routing generation belongs only to the external variant.** ADR-0011 admits no edge across the boundary, so a managed result cannot depend on any plugin and a claim change cannot alter it — including the generation in a managed validator would invalidate every managed consumer's cache for an event that provably did not reach it. On the external side it is load-bearing, because it is what makes a claim change or a retargeted reservation invalidate tokens minted against the previous source. And **`resolution_fingerprint` exists only for Type Schemas**: a registered Instance has no derived form to drift, so `resource_version` and the ancestor-chain version are a complete validator for it, which is what the `instance` table comment already says.
+
+**A row that is missing from the external column is an obligation on the plugin rather than an omission.** `availability` is in the default field set, so reporting `unchanged` asserts that the availability verdict has not moved either — and for a Managed Entity every way it can move is digested, since ADR-0010's P1 latitude leaves only the entity's own state and the tenant ancestor chain. For an Externally Managed Entity the tenant enablement that feeds the verdict is source-owned, ADR-0002 forbids persisting it, and an `external_revision` is a token over *content*: a source can disable an entity for one tenant without touching a byte of it. Nothing on this side could detect that.
+
+The federation contract therefore requires the source's own freshness token to be **scoped to the pair (entity, tenant)** and to change whenever anything the platform exposes for that pair changes, tenant enablement included — not only when canonical content does. A plugin that cannot offer that must answer every conditional read as changed; answering `unchanged` it cannot support produces exactly the false `unchanged` that `cpt-cf-types-registry-fr-cache-freshness-metadata` forbids, and it produces it in the one direction that hands a caller stale authority. This is why the conditional read is delegated rather than computed here: the registry holds nothing it could check the answer against.
 
 ##### Why the projection is an input
 
@@ -950,7 +954,7 @@ Served on the platform listener under [`cpt-cf-adr-platform-plane-auth`](../../.
 | `POST` | `/types-registry/v1/entities:batchGet` | Cross-tenant batch read | `200` with one result per requested key | unstable |
 | `POST` | `/types-registry/v1/entities` | Submit one **global** registration batch | `202` with the operation | unstable |
 | `POST` | `/types-registry/v1/entities:delete` | Submit one global deletion batch | `202` with the operation | unstable |
-| `POST` | `/types-registry/v1/entities:purge` | Purge over a GTS pattern, `dry_run` by default | `202` with the operation | unstable |
+| `POST` | `/types-registry/v1/entities:purge` | Purge over a GTS pattern, `dry_run` by default | `200` with the report, synchronously | unstable |
 | `GET` | `/types-registry/v1/operations/{operation_id}` | Poll an operation | `200` | unstable |
 
 **The paths are the same and the semantics are not.** Separation is by listener and credential, not by prefix: a request reaching the platform listener carries a workload identity that no tenant token can produce, and one reaching the business listener carries a tenant token that no gear presents. Misrouting therefore fails at authentication rather than silently returning the wrong plane's answer, which is what makes a shared path shape safe. Each listener publishes its own OpenAPI document; they are not one document with two security schemes.
@@ -968,7 +972,7 @@ Four differences run through the surface, and each comes from a decision recorde
 
 One table per operation, because the parameter sets barely overlap and a combined table hides which endpoint actually accepts what. Where an operation exists on both planes, the plane-specific rows are marked; a parameter offered on one plane is **rejected** on the other rather than ignored, since silently dropping a scoping parameter is how a caller comes to believe a filter was applied.
 
-Two things are common to every mutation and stated once: `Idempotency-Key` is a mandatory request header, scoped to plane, tenant, and principal and bound to the request fingerprint — a replay returns the stored operation, and a reuse with a different fingerprint is `409`; and every `202` carries `Location` pointing at the operation resource and `Retry-After` as a polling hint rather than a contract.
+Two things are common to registration and deletion and stated once: `Idempotency-Key` is a mandatory request header, scoped to plane, tenant, and principal and bound to the request fingerprint — a replay returns the stored operation, and a reuse with a different fingerprint is `409`; and every `202` carries `Location` pointing at the operation resource and `Retry-After` as a polling hint rather than a contract. Neither applies to purge, which is synchronous and stores no request identity.
 
 ##### `GET /entities/{entity_key}`
 
@@ -1001,7 +1005,7 @@ Two things are common to every mutation and stated once: `Idempotency-Key` is a 
 | `scope` | query | *Tenant plane only.* `mine` or `all`. Never a tenant identifier — accepting one would let a caller find its ancestors by observing whether a filtered result is empty |
 | `tenant_id` | query | The Context Tenant, as above |
 | `$select` | query | As above, applied to every item on the page |
-| `limit`, `cursor` | query | Page size and position. `limit` defaults to 100 and may not exceed 1000 — the same value as the expansion maximum, so a full type filter expansion can complete in a single page, which is the case it is sized for since `$select=gts_uuid` makes each item a few dozen bytes. A caller selecting documents on a thousand-item page is asking for a very large response and should page smaller; the bound is on items, not on bytes. The cursor binds the query, the routing generation, and the per-source position, so it goes stale when routing changes rather than silently skipping a source. It also carries the running count of items served, which is how the expansion maximum stays server-enforced across a paged accumulation |
+| `limit`, `cursor` | query | Page size and position. `limit` defaults to 100 and may not exceed 1000 — the same value as the expansion maximum, so a full type filter expansion can complete in a single page, which is the case it is sized for since `$select=gts_uuid` makes each item a few dozen bytes. A caller selecting documents on a thousand-item page is asking for a very large response and should page smaller; the bound is on items, not on bytes. The cursor binds the query, the requesting subject's visibility context and the Context Tenant the page was narrowed for, the authorization scope, the routing generation, and the per-source position, so it goes stale when routing changes rather than silently skipping a source, and is refused rather than continued when presented under another tenant or scope. The tenant components are there for completeness rather than disclosure — each page is filtered for whoever presents it, so nothing leaks either way — but a traversal continued across a change of context would splice two different visible sets into one result and would resume a source cursor pointing into a scan run for another tenant. It also carries the running count of items served, which is how the expansion maximum stays server-enforced across a paged accumulation |
 
 Deleted entities never appear. Ordering is by canonical identifier. Unstable Type Schemas do appear and cannot be filtered out: a GTS wildcard has no negation and there is no stability parameter, so a catalogue view that wants published contracts only cannot express it. That gap is D3 in §4, and closing it is additive.
 
@@ -1038,7 +1042,17 @@ There is no `If-Match`. It would carry the read validator, which covers more tha
 | `pattern` | body | A GTS pattern. Selecting a Type Schema necessarily selects every Instance conforming to it, since an Instance identifier begins with its schema's — which is what lets the job remove Instances first without a foreign key obstructing it |
 | `dry_run` | body | **Defaults to true**, the one place in the contract where it does: the report is the point of the operation, and the alternative is an operator who meant to look and instead released a namespace |
 
+No `Idempotency-Key`: the operation is synchronous and stores no request identity, and re-running it over the same pattern is harmless by construction.
+
 Platform plane only, and only where deployment policy enables purge at all.
+
+**Purge is synchronous, and that is what makes it the simplest mutation in the contract rather than the most awkward one.** It returns `200` with its report in the body, and creates no operation, no per-candidate row, no outbox message, and no request-identity record. ADR-0013 gives the reasons: no P2 hook runs on a purge, so its duration is bounded by local database work; its work is a scan and a delete over managed storage with no GTS resolution and no plugin call, since ADR-0011 leaves every dependent local; and its caller is an operator-invoked job rather than a gear whose response shape has to survive P2.
+
+The report is computed while the entities are still in hand, which is the whole economy of the shape. It carries, per matched identifier, whether it was released or skipped and why — not `DELETED`, or still holding a registered dependent — plus the matched, eligible, and skipped counts, and for a dry run the owner of every identifier it would release. That last one is what an asynchronous purge would have had to persist before the entities vanished; here it is a field read off the row the job is already looking at.
+
+`Idempotency-Key` is not accepted and is not needed. Re-running a purge over the same pattern finds the already-released identifiers absent and reports them as unmatched, so repeatability is a property of the act rather than of a stored receipt.
+
+Purge still removes the `operation_item` rows naming the identifiers it releases, so that a later re-registration cannot leave a history in which one identifier string spans two logical entities. Nothing is exempt from that and no ordering question arises, because a purge has no rows of its own to reach.
 
 ##### `GET /operations/{operation_id}`
 
@@ -1137,13 +1151,14 @@ pub trait PlatformTypesRegistryClient: Send + Sync {
     ) -> Result<RegistrationOperation, CanonicalError>;
 
     /// Pattern-scoped, `dry_run` defaulting to true. Available only where
-    /// deployment policy enables it (ADR-0013).
+    /// deployment policy enables it (ADR-0013). Synchronous: it returns the
+    /// report rather than an operation, takes no `IdempotencyKey`, and has
+    /// nothing to poll — see §3.3, *`POST /entities:purge`*.
     async fn purge(
         &self,
         ctx: &PlatformSecurityContext,
-        key: IdempotencyKey,
         request: Purge,
-    ) -> Result<RegistrationOperation, CanonicalError>;
+    ) -> Result<PurgeReport, CanonicalError>;
 
     async fn get_operation(
         &self,
@@ -1315,6 +1330,35 @@ pub struct Purge {
     pub dry_run: bool,
 }
 
+/// Returned synchronously. Purge creates no operation, so there is no
+/// `operation_id` and nothing to poll.
+pub struct PurgeReport {
+    pub dry_run: bool,
+    pub matched: u32,
+    pub eligible: u32,
+    pub items: Vec<PurgeItem>,
+}
+
+pub struct PurgeItem {
+    pub gts_id: GtsId,
+    pub gts_uuid: Uuid,
+    pub outcome: PurgeOutcome,
+    /// Present on a dry run, where the entity is still there to read it from.
+    /// ADR-0013 requires the report to be broken down by owner, and this is the
+    /// one place an owning tenant appears in the contract.
+    pub owner: Option<OwnershipScope>,
+}
+
+pub enum PurgeOutcome {
+    /// Removed, or — under `dry_run` — would be.
+    Released,
+    /// Matched the pattern and was left alone. Not `DELETED`, or still holding
+    /// a registered dependent.
+    Skipped { reason: CanonicalError },
+}
+
+pub enum OwnershipScope { Global, Tenant(TenantId) }
+
 pub struct RegisterItem {
     pub authored: JsonDocument,
     /// `Some(v)`: the entity must still be at `v`. `None`: it must not exist.
@@ -1419,7 +1463,7 @@ Two boundaries inside that are deliberate. **`authored` and `effective` are not 
 
 **One caveat, stated rather than enforced.** `kind` is recoverable from the identifier's trailing `~`, so dropping it costs a caller nothing it cannot reconstruct. `origin` is not recoverable from anything. A caller that selects `effective` without it receives a resolved schema and no way to tell whether the platform's guarantees stand behind it — Draft-07 throughout, derivation checked, chain backward compatible — or whether an external source computed it under rules we validate none of. Select both together; the registry does not refuse the request, because a caller may have other grounds for knowing.
 
-**`content_hash` in the default set costs one join, and that join pays for itself.** `content_hash` lives on the revision row rather than the current-state row, so returning it always makes the join to `type_schema_revision` unconditional where §1.1 previously reached for it only to fetch a document. It is keyed on `(entity_id, revision_no)`, which is that table's primary key, so it fits the lookup budget.
+**`content_hash` in the default set costs one join, and that join pays for itself.** `content_hash` lives on the revision row rather than the current-state row, so returning it always makes the join to the revision unconditional where §1.1 previously reached for it only to fetch a document. The join is **selected by `kind`** — `type_schema_revision` for a Type Schema, `instance_revision` for an Instance — since each kind's hash lives in its own table, exactly as §3.7 already routes the two current reads. It is keyed on `(entity_id, revision_no)` in both, which is that table's primary key, so it fits the lookup budget either way. A batch spanning both kinds resolves the two the same way it resolves the two current-state rows.
 
 What it buys is reconciliation without documents. A registrant can canonicalize its desired definition through `gts-rust`, compare hashes, and fetch the authored document only where they differ — so a gear whose definitions are current transfers no schema content at startup at all. Version skew between the caller's `gts-rust` and the registry's would make hashes disagree spuriously, and the resulting failure is benign: the caller submits, the worker finds the content equal, and the candidate terminates `unchanged`.
 
@@ -1473,11 +1517,9 @@ This is what `cpt-cf-types-registry-nfr-cache-correctness` requires and not less
 
 The window is defensible for content because of ADR-0003, and only there. Under enforced backward compatibility `Valid(current) ⊆ Valid(candidate)`, so a cached Type Schema that has since been superseded accepts a **subset** of what the current revision accepts. Validating against it can therefore reject an instance the registry would now admit, and can never admit one it would now reject. Staleness fails in the conservative direction, which is why a window is acceptable at all rather than merely convenient.
 
-Two cases escape that argument and are handled explicitly.
+**The argument does not reach an unstable Type Schema, and no rule is added for that.** ADR-0015 enforces no compatibility mode on a major-0 entity, so a superseded revision of one may widen rather than narrow, and a cached copy can admit an instance the current revision would reject. Such an entity is nevertheless cached under the same rules as every other, because a carve-out here would be a read-path lever that ADR-0015 deliberately declines to build: it records that a v0 reshape may leave live domain rows no longer conforming, that this "introduces no new class of hazard", and that a deployment wanting the marker enforced on the read path "needs a capability P1 does not have". Excluding v0 from this one store would enforce it in a single arbitrary place — shortening an exposure that decision already accepts as unbounded, while leaving a contract under active reshape with no cache at all on exactly the read path its consumers are most likely to be on. The residual is stated rather than mechanised: inside the window, a caller validating against a cached unstable schema may accept an instance the current revision would reject.
 
-**An unstable Type Schema is never served from cache.** ADR-0015 enforces no compatibility mode on a major-0 entity, so a superseded revision of one may accept anything, and the conservative direction is lost. The check needs no lookup and no stored flag: the major is a field of the identifier the SDK already holds, exactly as admission reads it. Such an entity is fetched on every read.
-
-**The availability verdict tolerates less staleness than content does.** ADR-0010 lets a verdict change with no mutation to the entity, and the sharp case is deletion: within the window a consumer can act on `AVAILABLE` for a contract that has been retired. The window is short for that reason rather than for content's. A caller that cannot accept it has two exits: the per-call `fresh` flag below, or a window of zero, which reduces the cache to payload suppression — every read revalidates, and an unchanged result transfers no document. Both are supported settings rather than degraded modes.
+**What shapes the default window is the availability verdict, which tolerates less staleness than content does.** ADR-0010 lets a verdict change with no mutation to the entity, and the sharp case is deletion: within the window a consumer can act on `AVAILABLE` for a contract that has been retired. The window is short for that reason rather than for content's. A caller that cannot accept it has two exits: the per-call `fresh` flag below, or a window of zero, which reduces the cache to payload suppression — every read revalidates, and an unchanged result transfers no document. Both are supported settings rather than degraded modes.
 
 ##### Configuration
 
@@ -1521,7 +1563,6 @@ The store bound turns that into eviction rather than exhaustion, so it is a hit-
 - the same read with `fresh` serves the new one immediately, and with a window of zero every read revalidates and an unchanged result transfers no document;
 - a deleted entity is not served as available past the window;
 - an expired entry whose revalidation fails is not served at all;
-- an unstable Type Schema is fetched on every read regardless of the window;
 - a terminal `register_entities` or `delete_entities` drops the affected entries, so the next read reflects the mutation with no window elapsing;
 - a batch read of cached and expired keys issues exactly one conditional `batchGet`, carrying validators only for the expired ones;
 - a validator obtained under one projection or one Context Tenant is never presented under another.
@@ -1617,7 +1658,7 @@ A caller's validator is opaque to the caller and composite to us. For an externa
 
 The flow is therefore: decompose the caller's validator, hand the plugin its own token, and either report unchanged or reassemble a fresh validator around what came back. The validator is uniform in use and not in construction — for a Managed Entity the components are recomputable from local state, for an externally managed one they are carried. Its concrete form is in §3.3, *What a validator is made of*.
 
-Two obligations fall on the plugin side of that flow. The token handed to a plugin **is untrusted input**: validators are not authenticated, so a plugin receives whatever bytes a caller supplied and must not assume it minted them. And `external_revision` **is capped in length**, because the validator carries it verbatim and an unbounded source string is an unbounded validator.
+Three obligations fall on the plugin side of that flow. The token handed to a plugin **is untrusted input**: validators are not authenticated, so a plugin receives whatever bytes a caller supplied and must not assume it minted them. `external_revision` **is capped in length**, because the validator carries it verbatim and an unbounded source string is an unbounded validator. And the token **is scoped to the pair (entity, tenant)** and must change on any change to what the platform exposes for that pair, tenant enablement included — a source that disables an entity for one tenant without touching its content must not answer that tenant's conditional read `unchanged`. A plugin unable to meet that answers every conditional read as changed instead.
 
 ##### Open questions
 
