@@ -77,6 +77,20 @@
 -- CHECK constraints list the admissible values rather than bounding a range, so
 -- that a number outside the vocabulary is rejected instead of being accepted as
 -- a value nothing has defined yet.
+--
+-- One rule governs the comments in this file, because the three documents
+-- describing this gear divide the work and a comment that forgets which one it
+-- is in becomes a stale copy of an argument made better elsewhere. A comment
+-- here says what a column means and the one invariant a reader would otherwise
+-- violate. Where the reason is a decision, it points at the ADR that took it
+-- instead of restating the argument - the ADR owns the alternatives and what
+-- would reverse them, and DESIGN owns how the decisions compose into a working
+-- system. What stays here is what only the schema knows: the ASCII and
+-- binary-collation rules, the enumeration rules above, the `family_key`
+-- encoding, why each index exists, the traversal rules on `dependency`, the
+-- `x-gts-ref` edge-naming rules that decide which rows exist at all, and every
+-- place where an invariant is held by application code rather than by a
+-- constraint.
 
 
 -- A version family binds a family key to one ownership scope, and holds nothing
@@ -179,11 +193,13 @@ CREATE TABLE types_registry__version_family (
 -- Were it excluded, the real submission would replay the dry run's stored
 -- operation and silently never execute.
 --
--- Dry-run operations are the one class of operation nothing pins. A real one is
+-- Dry-run operations are one of the two classes nothing pins, the other being
+-- an operation in which no candidate succeeded. A real successful one is
 -- reachable from every revision it produced through operation_item_id, whose
 -- foreign key is RESTRICT, so it is retained as long as those revisions are; a
--- dry run produces no revision and therefore no such reference. Whether that
--- makes it separately expirable is the retention half of PRD open question 10.
+-- dry run produces no revision and therefore no such reference. The unpinned
+-- classes are what the retention sweep removes; see the comment on
+-- idx_tr_operation_status.
 --
 -- There is no ownership-correction kind: ADR-0009 repairs a mis-assigned owner
 -- by delete, purge, re-register, so ownership is immutable for an entity's life.
@@ -196,12 +212,20 @@ CREATE TABLE types_registry__operation (
     dry_run                  boolean      NOT NULL,
     plane                    smallint     NOT NULL, -- 1 platform, 2 tenant
     tenant_id                uuid         NULL,
-    principal_id             varchar(255) NOT NULL,
+    -- The subject of the SecurityContext, which is a UUID there.
+    principal_id             uuid         NOT NULL,
     idempotency_key          varchar(255) NOT NULL,
     idempotency_scope_hash   bytea        NOT NULL,
     request_fingerprint      bytea        NOT NULL,
     -- 1 pending, 2 running, 3 succeeded, 4 unchanged, 5 partially_succeeded,
-    -- 6 failed, 7 cancelled, 8 expired
+    -- 6 failed.
+    --
+    -- The vocabulary has no cancellation and no expiry. Nothing asks to cancel a
+    -- mutation. An operation whose worker dies is redelivered by the outbox and
+    -- its commits are idempotent, so it becomes terminal only once retries are
+    -- exhausted - at which point `failed` or `partially_succeeded` already says
+    -- what happened and the per-item error_payload says why. A stalled operation
+    -- past its timeout is failed for the same reason.
     status                   smallint     NOT NULL,
     created_at               timestamptz  NOT NULL,
     started_at               timestamptz  NULL,
@@ -217,7 +241,7 @@ CREATE TABLE types_registry__operation (
         (plane = 2 AND tenant_id IS NOT NULL)        -- tenant
     ),
     CONSTRAINT ck_tr_operation_status CHECK (
-        status IN (1, 2, 3, 4, 5, 6, 7, 8)
+        status IN (1, 2, 3, 4, 5, 6)
     ),
     CONSTRAINT ck_tr_operation_state CHECK (
         (status = 1                                  -- pending
@@ -231,16 +255,27 @@ CREATE TABLE types_registry__operation (
         (status IN (3, 4, 5, 6)                      -- terminal outcomes
             AND started_at IS NOT NULL
             AND completed_at IS NOT NULL)
-        OR
-        (status IN (7, 8)                            -- cancelled, expired
-            AND completed_at IS NOT NULL)
     )
 );
 
--- Finds non-terminal operations whose worker died, so they can be expired. It
--- covers terminal rows too, which will be the overwhelming majority over time; a
+-- Two jobs, both scans over the same two leading columns. It finds non-terminal
+-- operations that stopped progressing, so they can be failed; and it finds
+-- terminal operations old enough for the retention sweep below to remove. It
+-- covers terminal rows, which will be the overwhelming majority over time; a
 -- partial index would be far smaller but is not portable to MySQL, so the full
 -- index is the deliberate choice.
+--
+-- Retention removes a terminal operation only when nothing points at it. A
+-- successful one is pinned by every revision it produced, through
+-- operation_item_id with ON DELETE RESTRICT, so it lives as long as those
+-- revisions - which is until purge. What the sweep reaches is the unpinned
+-- remainder: dry runs, which produce no revision by construction, and
+-- operations in which no candidate succeeded. Deleting one cascades to its
+-- items and releases its (idempotency_scope_hash, idempotency_key) pair, so a
+-- replay after the retention window executes afresh instead of returning the
+-- stored result. Sweeping the pinned majority as well would first require the
+-- admitting principal to stop being reachable only through this table; see
+-- DESIGN §4, open question D4.
 CREATE INDEX idx_tr_operation_status
     ON types_registry__operation (status, created_at, id);
 
@@ -300,8 +335,17 @@ CREATE TABLE types_registry__operation_item (
     dry_run                   boolean       NOT NULL,
     -- 0 means the candidate must not exist; otherwise the version to match
     expected_resource_version bigint        NOT NULL,
-    -- 1 pending, 2 running, 3 succeeded, 4 unchanged, 5 failed, 6 blocked,
-    -- 7 cancelled
+    -- 1 pending, 2 running, 3 succeeded, 4 unchanged, 5 failed.
+    --
+    -- There is no separate `blocked`. A status distinguishes outcomes that
+    -- differ in effect and a reason distinguishes causes: `succeeded` and
+    -- `unchanged` differ in whether a revision now exists, while a candidate
+    -- rejected on its own merits and one never evaluated because an in-batch
+    -- dependency failed differ in neither - both leave no entity, no revision
+    -- and no resource_version increment, so they would share this table's CHECK
+    -- arm verbatim. The second carries a `blocked_by_dependency` reason in
+    -- error_payload, which a caller needs, since it may pass unchanged once the
+    -- dependency is fixed.
     status                    smallint      NOT NULL,
     request_payload           text          NULL,
     result_revision_no        integer       NULL,
@@ -330,7 +374,7 @@ CREATE TABLE types_registry__operation_item (
             OR result_resource_version >= 1
         ),
     CONSTRAINT ck_tr_operation_item_status CHECK (
-        status IN (1, 2, 3, 4, 5, 6, 7)
+        status IN (1, 2, 3, 4, 5)
     ),
     CONSTRAINT ck_tr_operation_item_state CHECK (
         (status = 1                                  -- pending
@@ -364,17 +408,11 @@ CREATE TABLE types_registry__operation_item (
                     AND result_resource_version IS NULL)
             ))
         OR
-        (status IN (5, 6)                            -- failed, blocked
+        (status = 5                                  -- failed
             AND request_payload IS NULL
             AND result_revision_no IS NULL
             AND result_resource_version IS NULL
             AND error_payload IS NOT NULL
-            AND completed_at IS NOT NULL)
-        OR
-        (status = 7                                  -- cancelled
-            AND request_payload IS NULL
-            AND result_revision_no IS NULL
-            AND result_resource_version IS NULL
             AND completed_at IS NOT NULL)
     )
 );
@@ -524,8 +562,18 @@ CREATE INDEX idx_tr_entity_visibility
 -- are retained until purge, so the operations that produced them are too. This
 -- is affordable because an operation row is narrow and `request_payload` is
 -- already dropped when an item reaches a terminal state.
+--
+-- The primary key is the natural one, `(entity_id, revision_no)`, and there is no
+-- surrogate beside it. Every foreign key into this table already targets that
+-- pair rather than an opaque handle, because each referencing row needs both
+-- components as facts of its own: `type_schema` must carry which revision is
+-- current, `instance_revision` which revision validated a value, `instance`
+-- which one last revalidated it. A surrogate would leave those rows holding a
+-- number they cannot read and a join to recover it. Making the pair the key also
+-- clusters the revisions of one entity together on a clustering engine, which is
+-- both access patterns this table has - one revision of one entity, and its
+-- history in order.
 CREATE TABLE types_registry__type_schema_revision (
-    id                         bigint       GENERATED BY DEFAULT AS IDENTITY,
     entity_id                  bigint       NOT NULL,
     revision_no                integer      NOT NULL,
     raw_schema                 text         NOT NULL,
@@ -536,9 +584,7 @@ CREATE TABLE types_registry__type_schema_revision (
     created_at                 timestamptz  NOT NULL,
     updated_at                 timestamptz  NOT NULL,
 
-    CONSTRAINT pk_tr_type_schema_revision PRIMARY KEY (id),
-    CONSTRAINT uq_tr_type_schema_revision_no
-        UNIQUE (entity_id, revision_no),
+    CONSTRAINT pk_tr_type_schema_revision PRIMARY KEY (entity_id, revision_no),
     CONSTRAINT uq_tr_type_schema_revision_item UNIQUE (operation_item_id),
     CONSTRAINT fk_tr_type_schema_revision_entity
         FOREIGN KEY (entity_id)
@@ -562,16 +608,14 @@ CREATE TABLE types_registry__type_schema_revision (
 -- type_schema_revision: nothing reads the admission-time resolution, and the
 -- principal is reachable through operation_item_id.
 --
--- The validating Type Schema revision is referenced as an (entity, revision_no)
--- pair rather than by surrogate id, matching `instance`, which genuinely needs
--- the pair. One integer per row is worth keeping the two neighbouring tables
--- the same shape.
+-- The primary key is the natural `(entity_id, revision_no)`, for the reasons
+-- given on type_schema_revision, and the validating Type Schema revision is
+-- referenced the same way.
 --
 -- `type_schema_entity_id` is also derivable from the Instance identifier -
 -- the chain up to and including the last `~`, normative per GTS spec 11.1 - and
 -- is materialized here to carry the composite foreign key.
 CREATE TABLE types_registry__instance_revision (
-    id                            bigint       GENERATED BY DEFAULT AS IDENTITY,
     entity_id                     bigint       NOT NULL,
     revision_no                   integer      NOT NULL,
     canonical_value               text         NOT NULL,
@@ -584,9 +628,7 @@ CREATE TABLE types_registry__instance_revision (
     created_at                    timestamptz  NOT NULL,
     updated_at                    timestamptz  NOT NULL,
 
-    CONSTRAINT pk_tr_instance_revision PRIMARY KEY (id),
-    CONSTRAINT uq_tr_instance_revision_no
-        UNIQUE (entity_id, revision_no),
+    CONSTRAINT pk_tr_instance_revision PRIMARY KEY (entity_id, revision_no),
     CONSTRAINT uq_tr_instance_revision_item UNIQUE (operation_item_id),
     CONSTRAINT fk_tr_instance_revision_entity
         FOREIGN KEY (entity_id)

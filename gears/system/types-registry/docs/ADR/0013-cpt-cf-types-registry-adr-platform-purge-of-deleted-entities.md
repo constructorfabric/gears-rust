@@ -163,7 +163,7 @@ This decision is confirmed when:
 * a pattern that selects a Type Schema also selects every Instance conforming to it, Instances are removed before schemas, and no foreign key obstructs the job; an exact identifier still pinned by an Instance is refused with those Instances listed;
 * the job reports matched, eligible, and skipped counts with a reason per skipped entity, and a dry run reports the identifiers that would be released, broken down by owner, and removes nothing;
 * purge is unavailable, and reported as unavailable, in a deployment where it is not enabled;
-* no scheduled task, retention sweep, or background process removes registry state in any deployment.
+* no scheduled task, retention sweep, or background process removes **admitted content or identity** — a revision, an entity, a tombstone, a version family, or a Source Claim reservation — in any deployment. The one scheduled removal the platform does operate, the operation-retention sweep of DESIGN §3.2, is bounded to operations that no revision points at, so it releases no identifier and can rebind nothing.
 
 ## Pros and Cons of the Options
 

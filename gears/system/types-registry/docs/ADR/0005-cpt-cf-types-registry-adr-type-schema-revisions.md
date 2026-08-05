@@ -41,7 +41,7 @@ This ADR does not define concrete table names, route paths, cache transport, rev
 | Schema revision | An immutable canonical Type Schema definition admitted for one logical Type Schema. |
 | Current revision | The admitted revision returned by ordinary resolution and used for new validations. |
 | Admission candidate | Proposed canonical content undergoing validation before initial admission or before it can replace the current revision. It is not yet a Schema revision. |
-| Admission status | Candidate or operation state such as `PENDING`, `ADMITTED`, `REJECTED`, or `CANCELLED`; it is separate from logical-entity Lifecycle Status. |
+| Admission status | Candidate or operation state such as `PENDING`, `ADMITTED`, or `REJECTED`; it is separate from logical-entity Lifecycle Status. |
 | Revision number | A server-assigned monotonically increasing integer scoped to one logical Type Schema. |
 | Content hash | A digest of the canonical schema content used to bind validation, idempotency, and diagnostics to exact bytes or canonical semantics. |
 | Dependency revision vector | The exact revisions or equivalent freshness tokens of registered dependencies used while validating a candidate. It is in-flight concurrency-control state held for the duration of one validation attempt, not part of the admitted revision. |
@@ -73,7 +73,7 @@ Chosen option: every admitted managed GTS Type Schema definition is an immutable
 * Each subsequent successful content update allocates the next monotonically increasing revision number for that logical Type Schema.
 * A revision contains at least the logical entity reference, revision number, canonical content, content hash, creation and admission metadata, and the GTS specification and platform GTS implementation versions used for its compatibility check.
 * A revision does **not** retain the dependency revision vector it was validated against, nor the effective artifacts that resolution produced. Nothing reads the admission-time resolution. The only operation that looks backwards is the repair described in ADR-0003, and it compares each retained revision against the current one with both sides resolved against the dependencies that are current then — which is sufficient, because each dependency evolved backward compatibly on its own chain and conjunction is monotone, so the promised guarantee composes. Resolving a retained revision against its historical dependencies would reconstruct a form no consumer ever validated against. The recorded specification and implementation versions are what scope that repair to the chains admitted under superseded rules.
-* Revision numbers are allocated only when admission succeeds. A `PENDING`, `REJECTED`, or `CANCELLED` candidate is not an admitted revision and consumes no revision number.
+* Revision numbers are allocated only when admission succeeds. A `PENDING` or `REJECTED` candidate is not an admitted revision and consumes no revision number.
 * Once created, revision content, revision number, and content hash are immutable.
 * The logical Type Schema owns a current-revision pointer. Ordinary resolving returns only the current revision unless an authorized management or CI operation explicitly requests history.
 * Re-submitting content whose canonical content hash equals the current revision is an idempotent no-op and does not allocate a new revision.
@@ -112,7 +112,7 @@ The two baselines in step 4 fail differently, and ADR-0012 keeps them apart. A c
 
 Creation of a new logical Type Schema carries `must_not_exist` instead. A retry submitted after the entity exists therefore fails `precondition_failed`; it is not absorbed as an idempotent no-op, whatever its content, because request-level retry safety is supplied by the `Idempotency-Key` replay of ADR-0012, which returns the original operation without consulting current state. Content equality answers a different question and is evaluated per candidate by the worker: content equal to the current authored revision creates no revision and does not advance `resource_version`, and that candidate terminates `unchanged`. An existing divergent identity follows ADR-0004's update or conflict rules.
 
-Before initial admission there is no public logical Type Schema and no entity Lifecycle Status. A failed or cancelled initial candidate may remain as an operation or audit artifact, but it does not create a logical entity or tombstone, issue a Registry Reference for domain persistence, or establish a permanent GTS ID reservation. While an update candidate is `PENDING`, an existing logical Type Schema retains its current revision and its Lifecycle Status.
+Before initial admission there is no public logical Type Schema and no entity Lifecycle Status. A failed initial candidate may remain as an operation or audit artifact, but it does not create a logical entity or tombstone, issue a Registry Reference for domain persistence, or establish a permanent GTS ID reservation. While an update candidate is `PENDING`, an existing logical Type Schema retains its current revision and its Lifecycle Status.
 
 ### Retention and deletion
 
@@ -165,7 +165,7 @@ When introduced, rollback from current revision `N` to the content of historical
 This decision is confirmed when:
 
 * successful initial admission atomically creates an `ACTIVE` logical Type Schema and revision `1`, while a compatible update creates the next immutable revision without changing GTS ID or Registry Reference;
-* a pending, rejected, or cancelled initial candidate is never returned as a logical entity, consumes no revision number, and does not permanently reserve the GTS ID;
+* a pending or rejected initial candidate is never returned as a logical entity, consumes no revision number, and does not permanently reserve the GTS ID;
 * a pending or rejected update leaves the existing logical entity lifecycle and current revision unchanged;
 * all admitted revisions remain retrievable by internal compatibility and diagnostic paths after subsequent updates and logical deletion;
 * the ADR-0003 backward check is run against the current revision, and admission cost does not grow with the number of retained revisions;

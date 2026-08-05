@@ -41,7 +41,7 @@ This ADR does not apply to runtime domain objects stored by owning gears or to E
 | Instance revision | One immutable admitted canonical value of the logical registered Instance. |
 | Current revision | The Instance revision returned by ordinary resolution. |
 | Admission candidate | Proposed canonical Instance content undergoing validation before initial admission or before it can replace the current revision. It is not yet an Instance revision. |
-| Admission status | Candidate or operation state such as `PENDING`, `ADMITTED`, `REJECTED`, or `CANCELLED`; it is separate from logical-entity Lifecycle Status. |
+| Admission status | Candidate or operation state such as `PENDING`, `ADMITTED`, or `REJECTED`; it is separate from logical-entity Lifecycle Status. |
 | Conforming Type Schema revision | The exact Type Schema revision used to validate an Instance revision at admission time. |
 | Content hash | A digest of canonical Instance content used for idempotency, validation binding, and diagnostics. |
 
@@ -70,7 +70,7 @@ Chosen option: a managed registered GTS Instance is a mutable logical entity who
 * Initial successful admission atomically creates the logical registered Instance in lifecycle `ACTIVE`, creates Instance revision `1`, and makes it current.
 * Each successful content update allocates the next monotonically increasing revision number scoped to the logical Instance.
 * Each revision contains at least the logical Instance reference, revision number, canonical content, content hash, creation and admission metadata, conforming Type Schema GTS ID, and exact conforming Type Schema revision.
-* Revision numbers are allocated only when admission succeeds. A `PENDING`, `REJECTED`, or `CANCELLED` candidate is not an admitted revision and consumes no revision number.
+* Revision numbers are allocated only when admission succeeds. A `PENDING` or `REJECTED` candidate is not an admitted revision and consumes no revision number.
 * Revision content, number, hash, and schema-validation provenance are immutable after creation.
 * The logical Instance owns a current-revision pointer. Ordinary resolution returns the current revision.
 * Re-submitting content equal to the current canonical content is an idempotent no-op and does not allocate a revision.
@@ -106,7 +106,7 @@ Types Registry validates the candidate without a long-lived database lock, then 
 
 The first is the caller's baseline and the other two are internal, and they fail differently. A caller-precondition mismatch is a terminal per-candidate `precondition_failed`: Types Registry neither overwrites a concurrent change nor rebases the update onto it. A conforming schema or dependency that moved during validation causes the worker to revalidate within a bounded retry policy, without weakening the caller's precondition.
 
-Before initial admission there is no public logical registered Instance and no entity Lifecycle Status. A failed or cancelled initial candidate may remain as an operation or audit artifact, but it does not create a logical entity or tombstone, issue a Registry Reference for domain persistence, or establish a permanent GTS ID reservation. While an update candidate is `PENDING`, an existing logical Instance retains its current revision and its Lifecycle Status.
+Before initial admission there is no public logical registered Instance and no entity Lifecycle Status. A failed initial candidate may remain as an operation or audit artifact, but it does not create a logical entity or tombstone, issue a Registry Reference for domain persistence, or establish a permanent GTS ID reservation. While an update candidate is `PENDING`, an existing logical Instance retains its current revision and its Lifecycle Status.
 
 ### Retention and sensitive content
 
@@ -174,7 +174,7 @@ Instance rollback is not selected for P1 by this ADR. If introduced later, it mu
 This decision is confirmed when:
 
 * successful initial admission atomically creates an `ACTIVE` logical registered Instance and revision `1`, while a content update creates the next immutable revision without changing GTS ID or Registry Reference;
-* a pending, rejected, or cancelled initial candidate is never returned as a logical entity, consumes no revision number, and does not permanently reserve the GTS ID;
+* a pending or rejected initial candidate is never returned as a logical entity, consumes no revision number, and does not permanently reserve the GTS ID;
 * a pending or rejected update leaves the existing logical entity lifecycle and current revision unchanged;
 * every admitted Instance revision records the exact conforming Type Schema revision;
 * changed Instance or Type Schema freshness tokens produce a structured conflict before activation;

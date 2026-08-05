@@ -91,7 +91,7 @@ The erase-and-reintroduce hazard follows from the same property rather than from
 
 Consequently Types Registry does not compare a candidate against every retained revision, needs no cap on retained revisions for compatibility purposes, and has admission cost independent of history size.
 
-This depends on the platform-approved GTS implementation actually implementing 0.13, since the superseded 0.12 rules report some incompatible pairs as compatible and a candidate-versus-current check is **not** sufficient under them. Alignment of `gts-rust` was therefore a prerequisite for this decision rather than an independent task, and it is now satisfied.
+This depends on the platform-approved GTS implementation actually following the 0.13 semantics, since the superseded rules report some incompatible pairs as compatible and a candidate-versus-current check is **not** sufficient under them. That alignment is a prerequisite of this decision rather than an independent task: if the implementation does not provide it, the baseline chosen here is unsound and no amount of registry code repairs it.
 
 Because a checker upgrade can change the verdict for an unchanged pair of schemas, each admitted revision records the GTS specification version and platform GTS implementation version used for its check. Without that record the registry cannot identify which chains were validated under superseded rules. The field belongs to the revision record defined by ADR-0005.
 
@@ -156,7 +156,7 @@ A managed Type Schema cannot reference an externally managed one. ADR-0011 prohi
 * Admission cost is independent of retained history, so retention growth is a storage question only.
 * An open effective level is admitted normally, but cannot later gain properties in place; a change at that level requires a new major identity. Types Registry reports this per level up front rather than at the first failed update.
 * Generated Type Schemas are evolvable in place at the levels that carry their own properties, so ADR-0004's mutable logical entity is the normal case for platform gears rather than an exception. Object levels the toolchain does not own are the residual hazard and are addressed by an authoring convention, not by a registry rule.
-* Alignment of the platform GTS implementation with GTS 0.13, including per-level content-model classification computed on the resolved effective schema, was a P1 prerequisite and is satisfied.
+* Alignment of the platform GTS implementation with GTS 0.13, including per-level content-model classification computed on the resolved effective schema, is a P1 prerequisite of this decision. DESIGN enumerates the capabilities it covers and records verifying them as an implementation prerequisite.
 * Every comparison this ADR governs is between two documents of one dialect, because ADR-0014 pins it for the lifetime of a logical entity. Otherwise `Valid(S)` would be dialect-relative on both sides and the set-inclusion argument would not compose.
 * OP#8 as specified compares two definitions addressed by distinct GTS Type Identifiers, which ADR-0004's in-place replacement model never produces. Types Registry therefore uses the document-level compatibility entry point of the platform GTS implementation and owns its own revision addressing, as specification §4.2 anticipates.
 * Where a contract needs old readers to accept new payloads, the owner uses a new major identity.
@@ -190,7 +190,7 @@ This decision is confirmed when:
 * Good, because it matches the default strategy of the closest industry analogue.
 * Bad, because the platform gives no forward-direction guarantee; a contract whose old readers may receive new payloads must use a new major identity.
 * Bad, because whether a given Type Schema can actually evolve in place depends on the content model its author chose, so the guarantee is uniform while its practical reach is not.
-* Bad, because its sufficiency depends on the implementation being aligned with GTS 0.13 — satisfied now, but reopened by any later semantic change to the relation, which is what the freeze machinery exists for.
+* Bad, because its sufficiency depends on the implementation being aligned with GTS 0.13, and is reopened by any later semantic change to the relation, which is what the freeze machinery exists for.
 
 ### Require `FULL` compatibility
 

@@ -155,11 +155,15 @@ The purge dry run of ADR-0013 is this mode applied to `kind = purge`, not a sepa
 
 ### The public operation has one status and per-candidate results
 
-An operation has one status: `pending`, `running`, `succeeded`, `unchanged`, `partially_succeeded`, `failed`, `cancelled`, or `expired`. Progress and outcome are one field rather than two. Splitting them spreads a tagged union across two fields, because an outcome only ever exists under one progress value; that makes illegal combinations representable and requires a constraint to forbid them. One enumeration makes them unrepresentable, and it matches how a candidate result is modelled.
+An operation has one status: `pending`, `running`, `succeeded`, `unchanged`, `partially_succeeded`, or `failed`. Progress and outcome are one field rather than two. Splitting them spreads a tagged union across two fields, because an outcome only ever exists under one progress value; that makes illegal combinations representable and requires a constraint to forbid them. One enumeration makes them unrepresentable, and it matches how a candidate result is modelled.
 
-Each exact candidate GTS Identifier has one result with status `pending`, `running`, `succeeded`, `unchanged`, `failed`, `blocked`, or `cancelled`. `unchanged` is preferred to `not_modified` and `already_registered`: it applies to both create and update attempts and does not overload HTTP `304 Not Modified`. A terminal success also returns the Registry Reference, revision number, and resulting resource version. A failure returns a structured reason.
+Each exact candidate GTS Identifier has one result with status `pending`, `running`, `succeeded`, `unchanged`, or `failed`. `unchanged` is preferred to `not_modified` and `already_registered`: it applies to both create and update attempts and does not overload HTTP `304 Not Modified`. A terminal success also returns the Registry Reference, revision number, and resulting resource version. A failure returns a structured reason.
 
 There is no separate public Admission Status vocabulary and no pending logical entity. An operation is the request-progress resource; an entity exists only after an admission unit commits.
+
+**Neither vocabulary carries cancellation, expiry, or a blocked candidate.** No requirement, actor, or use case asks to cancel a mutation in flight; when P2 hooks make an operation's duration genuinely unbounded the question becomes real and can be answered then. Expiry would be redundant rather than unwanted: an operation whose worker dies is redelivered by the outbox and its commits are idempotent, so terminality arrives only once retries are exhausted, and at that point `partially_succeeded` or `failed` already states the outcome while the per-item structured reason states the cause; an operation that stalls past its timeout is failed for the same reason. A candidate that an in-batch dependency prevented from being evaluated is likewise `failed`, under a reason of its own. The rule behind all three is that **a status distinguishes outcomes that differ in effect and a reason distinguishes causes** — `succeeded` and `unchanged` differ in whether a revision now exists, while every way of producing nothing does not.
+
+**Operations are retained until nothing points at them, and then bounded by a retention window.** A successful operation is pinned by every revision it produced, so it lives as long as those revisions do, which is until purge; this is also why neither revision table duplicates the admitting principal. What a retention sweep may remove is the unpinned remainder — dry runs, which produce no revision by construction, and operations in which no candidate succeeded. Removing one releases its scoped request key, so a replay presented afterwards executes afresh, which is harmless for both classes. This is not a breach of ADR-0013: that decision reserves the removal of admitted content and identity to one operator-invoked act, and an unpinned operation is neither.
 
 ### Batches use dependency-aware partial admission
 
@@ -170,7 +174,7 @@ The candidate dependency graph is resolved with the submitted candidates as an o
 * one acyclic candidate is one admission unit;
 * one cyclic component is one atomic admission unit;
 * independent units that pass all checks commit even if another branch fails;
-* a dependent whose selected in-batch dependency fails becomes `blocked`;
+* a dependent whose selected in-batch dependency fails is itself failed, with a reason distinguishing it from a candidate that was evaluated and rejected;
 * failure of one cyclic member rejects or blocks the whole cyclic unit.
 
 This is called **dependency-aware partial admission**, not best effort. “Best effort” does not state dependency ordering, overlay resolution, or cycle atomicity.

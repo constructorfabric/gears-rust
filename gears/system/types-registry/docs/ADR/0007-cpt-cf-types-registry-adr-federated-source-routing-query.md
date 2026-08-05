@@ -79,7 +79,7 @@ The detailed plugin capability profile, resolution algorithms, pagination contra
 * Non-overlapping claims preserve global identity semantics but rule out overlay and failover-source models without a future ADR.
 * Source-major ordering is deterministic and avoids a global merge, but it cannot provide global ordering by an entity field.
 * Pagination correctness depends on stable plugin configuration and source cursor contracts.
-* Source-claim intersection becomes a platform prerequisite for wildcard routing, and the platform matcher already supplies it: `GtsIdPattern::covers()` in `gts-id` 0.11 is the containment primitive, so no bespoke intersection algorithm is needed.
+* Source-claim intersection becomes a platform prerequisite for wildcard routing, and it reduces to a pattern-containment test the platform GTS implementation is expected to provide, so no bespoke intersection algorithm is needed.
 * A rooted claim is broader than a complete-identifier claim, so it captures every chained identifier beneath it and the blast radius of a mis-specified claim grows. In exchange, claim overlap becomes trivially decidable — for this grammar the platform matcher's containment test reduces to one field list being a prefix of the other — and a vendor's external namespace and the managed identifier space cannot nest, which vendor namespace planning must account for.
 * Registry Source Plugins must provide a richer, completeness-preserving registry contract than ordinary ToolKit plugins — but a read-only one.
 
