@@ -103,20 +103,20 @@ A GTS Identifier can carry a version in more than one position. For a chained id
 A managed version family is identified by the canonical GTS Identifier with the **major version of its last segment removed** and the trailing `~` of a Type Identifier normalized away, with every preceding segment held exactly as written.
 
 ```text
-family(gts.acme.crm.customer.v1~)                 = (gts.acme.crm.customer)
-family(gts.acme.crm.customer.v2~)                 = (gts.acme.crm.customer)          -- same family
-family(gts.x.core.events.type.v1~acme.order.v1~)  = (gts.x.core.events.type.v1~, acme.order)
-family(gts.x.core.events.type.v1~acme.order.v2~)  = (gts.x.core.events.type.v1~, acme.order)  -- same family
-family(gts.x.core.events.type.v2~acme.order.v1~)  = (gts.x.core.events.type.v2~, acme.order)  -- DIFFERENT family
+family(gts.acme.crm.customer.type.v1~)                 = (gts.acme.crm.customer.type)
+family(gts.acme.crm.customer.type.v2~)                 = (gts.acme.crm.customer.type)          -- same family
+family(gts.cf.core.events.type.v1~acme.crm.order.type.v1~)  = (gts.cf.core.events.type.v1~, acme.crm.order.type)
+family(gts.cf.core.events.type.v1~acme.crm.order.type.v2~)  = (gts.cf.core.events.type.v1~, acme.crm.order.type)  -- same family
+family(gts.cf.core.events.type.v2~acme.crm.order.type.v1~)  = (gts.cf.core.events.type.v2~, acme.crm.order.type)  -- DIFFERENT family
 ```
 
 The consequences are deliberate:
 
 * A major bump of a base type says nothing about anything derived from it. Types derived from the `v1` base keep their own lifecycle, which is required because their owners may be other gears or other tenants and this ADR already forbids publishing owner-visible contracts without owner intent.
-* Adopting a new base major means admitting a **new logical entity in a new family**. `gts.x.core.events.type.v2~acme.order.v1~` does not succeed `gts.x.core.events.type.v1~acme.order.v1~`; the two are unrelated by version succession even though their identifiers look like siblings.
+* Adopting a new base major means admitting a **new logical entity in a new family**. `gts.cf.core.events.type.v2~acme.crm.order.type.v1~` does not succeed `gts.cf.core.events.type.v1~acme.crm.order.type.v1~`; the two are unrelated by version succession even though their identifiers look like siblings.
 * A derived entity's status is independent of the status of the base it chains through; every non-deleted base remains a valid reference and derivation target.
 * Version succession is therefore always a change in exactly one identifier segment — the last one. Types Registry never infers succession across a difference in any preceding segment.
-* Normalizing the kind marker away makes a family name **exclusive across kinds**: a derived Type Schema `gts.A~acme.order.v1~` and a well-known registered Instance `gts.A~acme.order.v1` map to the same family, and Types Registry admits whichever arrives first and refuses the other. This is a managed-profile restriction that GTS itself does not impose, alongside the prohibitions on minor versions here and on an explicit UUID tail in ADR-0001. It is adopted because the two identifiers differ by one character while denoting entirely unrelated things, nothing needs both — an Instance of that derived type is `gts.A~acme.order.v1~<segment>`, not the colliding form — and because a family groups Version Successors, which are by definition of one kind. Keeping the marker in the key would instead let both families exist and force a shared owner on them, rejecting the second registrant over a family it may not be able to see.
+* Normalizing the kind marker away makes a family name **exclusive across kinds**: a derived Type Schema `gts.A~acme.crm.order.type.v1~` and a well-known registered Instance `gts.A~acme.crm.order.type.v1` map to the same family, and Types Registry admits whichever arrives first and refuses the other. This is a managed-profile restriction that GTS itself does not impose, alongside the prohibitions on minor versions here and on an explicit UUID tail in ADR-0001. It is adopted because the two identifiers differ by one character while denoting entirely unrelated things, nothing needs both — an Instance of that derived type is `gts.A~acme.crm.order.type.v1~<segment>`, not the colliding form — and because a family groups Version Successors, which are by definition of one kind. Keeping the marker in the key would instead let both families exist and force a shared owner on them, rejecting the second registrant over a family it may not be able to see.
 
 ### Lifecycle of family members
 
@@ -231,8 +231,8 @@ Compatible changes update the current definition without changing the GTS ID; in
 
 Types Registry could support two explicit managed evolution modes:
 
-* `FLOATING_MAJOR`: a major-only GTS ID such as `gts.acme.crm.customer.v1~` identifies a mutable logical entity. Compatible changes create retained internal revisions under the same GTS ID and Registry Reference.
-* `PINNED_MINOR`: minor-versioned GTS IDs such as `gts.acme.crm.customer.v1.0~` and `gts.acme.crm.customer.v1.1~` identify separate immutable logical entities. A compatible change creates a higher-minor Version Successor with a new Registry Reference; an incompatible change creates a higher-major Version Successor.
+* `FLOATING_MAJOR`: a major-only GTS ID such as `gts.acme.crm.customer.type.v1~` identifies a mutable logical entity. Compatible changes create retained internal revisions under the same GTS ID and Registry Reference.
+* `PINNED_MINOR`: minor-versioned GTS IDs such as `gts.acme.crm.customer.type.v1.0~` and `gts.acme.crm.customer.type.v1.1~` identify separate immutable logical entities. A compatible change creates a higher-minor Version Successor with a new Registry Reference; an incompatible change creates a higher-major Version Successor.
 
 The mode would be selected when the first entity in a managed major family is admitted and would then be immutable for that family.
 

@@ -111,9 +111,9 @@
 -- trailing `~` of a type identifier normalized away (ADR-0004):
 --
 --   gts.acme.crm.customer.v1~                 -> gts.acme.crm.customer
---   gts.x.core.events.type.v1~acme.order.v1~  -> gts.x.core.events.type.v1~acme.order
---   gts.x.core.events.type.v2~acme.order.v1~  -> gts.x.core.events.type.v2~acme.order
---   gts.x.core.events.topic.v1~acme.orders.v1 -> gts.x.core.events.topic.v1~acme.orders
+--   gts.cf.core.events.type.v1~acme.order.v1~  -> gts.cf.core.events.type.v1~acme.order
+--   gts.cf.core.events.type.v2~acme.order.v1~  -> gts.cf.core.events.type.v2~acme.order
+--   gts.cf.core.events.topic.v1~acme.orders.v1 -> gts.cf.core.events.topic.v1~acme.orders
 --
 -- Dropping the kind marker is deliberate: it makes a name either a type family
 -- or an Instance family and never both. A derived type
@@ -819,7 +819,7 @@ CREATE INDEX idx_tr_instance_schema
 --   * an exact identifier names that entity;
 --   * a wildcard pattern names the longest prefix of itself that is a valid GTS
 --     identifier - `...topic.v1~*` and `...topic.v1~x.core.*` both name
---     `gts.x.core.events.topic.v1~`;
+--     `gts.cf.core.events.topic.v1~`;
 --   * a pattern naming nothing valid, such as `gts.*`, produces no edge, and so
 --     does the `/$id` self-reference of GTS spec 9.6.
 --

@@ -134,7 +134,7 @@ Types Registry **MUST NOT** store the profile as a column. It is derivable from 
 
 ### Graduation is an ordinary registration
 
-An unstable type becomes stable by being registered at v1. No operation, no transition, and no migration is required, because the existing model already covers it: `family(gts.a.b.c.d.v0~)` and `family(gts.a.b.c.d.v1~)` are the same family key under ADR-0004, ADR-0008 permits several members of one family to be `ACTIVE` simultaneously and in any order, and ADR-0009 fixes one owner for the whole family through the family record. The v0 member stays `ACTIVE` until its owner deletes it.
+An unstable type becomes stable by being registered at v1. No operation, no transition, and no migration is required, because the existing model already covers it: `family(gts.cf.b.c.d.v0~)` and `family(gts.cf.b.c.d.v1~)` are the same family key under ADR-0004, ADR-0008 permits several members of one family to be `ACTIVE` simultaneously and in any order, and ADR-0009 fixes one owner for the whole family through the family record. The v0 member stays `ACTIVE` until its owner deletes it.
 
 Graduating a type that is used as a **base** is expensive, and the cost belongs to ADR-0004 rather than to this decision. A family key holds every preceding segment exactly as written, so `A.v0~B.v1~` and `A.v1~B.v1~` are different families: moving a base out of the unstable profile orphans everything derived from it, which must be re-registered under new identifiers and receives new Registry References. The unstable profile is therefore appropriate for leaf types and expensive for bases, and authoring guidance must say so.
 

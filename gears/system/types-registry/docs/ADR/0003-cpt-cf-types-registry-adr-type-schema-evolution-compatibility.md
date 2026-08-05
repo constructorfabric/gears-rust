@@ -63,7 +63,7 @@ This ADR does not decide Type Derivation Compatibility, which is a separate rela
 
 | Term | Meaning |
 |---|---|
-| Type Schema major identity | One logical managed GTS Type Schema identity within one major version, for example `gts.acme.crm.customer.v1~`. |
+| Type Schema major identity | One logical managed GTS Type Schema identity within one major version, for example `gts.acme.crm.customer.type.v1~`. |
 | Schema revision | One immutable admitted definition of a Type Schema major identity. |
 | Current revision | The admitted revision returned by ordinary resolution and used as the comparison baseline. |
 | Effective schema | The authored schema after `allOf` chain aggregation, as the platform-approved GTS implementation materializes it. |

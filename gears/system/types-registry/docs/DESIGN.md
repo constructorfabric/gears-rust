@@ -57,7 +57,7 @@ A revision and a current-state projection hold different facts rather than two c
 | `cpt-cf-types-registry-fr-ref-tracking` | Flat dependency edge set between managed entities covering `$ref`, `x-gts-ref`, and Instance-to-schema; authoritative for deletion safety, evaluated without contacting any plugin and without consuming plugin-supplied data. Admission additionally refuses an edge from a stable subject to an unstable target, so the quarantine of ADR-0015 is a property of which edges may be written rather than a filter applied when they are read. |
 | `cpt-cf-types-registry-fr-type-query-assistance` | Pattern compiled to a range predicate over the canonical identifier, post-filtered by the GTS matcher, expanded source-major, and returned as one complete bounded set of Registry References or a structured limit failure. |
 | `cpt-cf-types-registry-fr-tenant-ownership` | Ownership scope stored on every Managed Entity; visibility evaluated as the directed descendant relation using the tenant ancestor chain, with disclosure bounded to name availability on the registration surface. |
-| `cpt-cf-types-registry-fr-registration-authority` | Global writes accepted only on the platform plane under `PlatformSecurityContext`; tenant writes authorized by the PDP against the candidate's GTS Identifier as a resource property, evaluated before identifier availability so the bounded name-availability disclosure cannot become a namespace probe. |
+| `cpt-cf-types-registry-fr-registration-authority` | Global writes accepted only on the platform plane under `PlatformSecurityContext`; tenant writes authorized by the PDP against the candidate's GTS Identifier as a resource property, evaluated before identifier availability so the bounded name-availability disclosure cannot become a namespace probe. `gts.cf.toolkit.*` is reserved outright: refused on the tenant plane and never tenant-owned in P1, decided from the identifier before the PDP is consulted so no grant configuration can reach it. |
 | `cpt-cf-types-registry-fr-tenant-availability` | Verdict computed by the registry from the entity's own state and the requesting tenant's ancestor chain, as one SQL predicate; never recomputed by consumers. In P1 no dependency can make a visible entity unavailable, so no closure is traversed. |
 | `cpt-cf-types-registry-fr-lifecycle` | `ACTIVE` and `DELETED` for Managed Entities; no newest-member statement, with exact family enumeration offered as a discovery filter instead; deletion blocked from local state while any registered dependent exists. |
 | `cpt-cf-types-registry-fr-externally-managed-entities` | No row, column, or projection of an external entity anywhere in §3.7; results enter live, are checked against the platform invariants of §3.2 — identifier integrity, derived reference equality, claim conformance, entity kind, ownership scope, revision and hash consistency — and leave. The managed-only tail of the read result sits in an `Origin` variant rather than in nullable fields, so a write precondition on an external entity does not compile. Returned content is never parsed, so the external half of the boundary rule is declared and not enforced. |
@@ -153,7 +153,7 @@ Two rules constrain the layering beyond the standard gear structure. All GTS sem
 
 Every guarantee Types Registry offers for a Managed Entity must be decidable from state Types Registry owns. No authoritative decision — admission, deletion, availability, routing activation — may depend on the uptime, latency, honesty, or diligence of a component the platform does not operate.
 
-This is what closes the managed–external boundary in both directions and splits plugin capabilities into authoritative and advisory. An advisory output may degrade with a stated warning; an authoritative one may not degrade at all.
+This is what closes the managed–external boundary in both directions. Every capability the P1 plugin contract asks for is therefore authoritative, and none of them may degrade: a plugin answers or the request fails closed. There is no advisory tier — not as an exemption granted to nothing, but because the one output that would have needed it was dropped for want of a consumer (§3.3, *Registry Source Plugin contract*).
 
 The last word in that list is the one that decided the boundary. Data a counterparty supplies makes a decision independent of its *uptime* while leaving it dependent on its *diligence*, and the second is not observable: a plugin that never registers a dependency is indistinguishable from one that has none, so the registry would believe a managed type unreferenced and permit a deletion that breaks a consumer. Closing the boundary removes the class rather than mitigating it — there is nothing to register because nothing can depend across.
 
@@ -177,7 +177,7 @@ The principle bounds itself rather than excluding denormalization. What may be m
 
 Absence of evidence is never evidence of absence. A source that cannot answer is not a `NOT_FOUND`; a compatibility check the implementation cannot decide is a rejection, not a pass; external state that cannot be confirmed is never `AVAILABLE`; a query whose completeness cannot be established returns a failure rather than a partial result.
 
-The single exception is output explicitly labelled advisory — a reverse dependency-impact report — which degrades with a stated source-unavailable warning precisely because no authoritative decision reads it.
+**The rule has no exception.** Every output the contract defines is authoritative, so there is nothing that degrades with a warning instead of failing — see §3.3, *Registry Source Plugin contract*, for the one candidate exception and why it is not in P1.
 
 **ADRs**: `cpt-cf-types-registry-adr-external-source-live-delegation`, `cpt-cf-types-registry-adr-type-schema-evolution-compatibility`, `cpt-cf-types-registry-adr-tenant-availability-evaluation`, `cpt-cf-types-registry-adr-managed-external-boundary`
 
@@ -378,7 +378,7 @@ Four of these carry an invariant worth stating outright, because none of them is
 
 ### 3.2 Component Model
 
-The components below are internal modules of one gear with distinct responsibilities, not deployable units — the gear itself runs as its own process and is horizontally scaled, as §3.8 describes. Of everything inside that process, Registry Source Plugins are the only part that may later move out; they are compiled into the same binary in P1, and the federation contract is written for a remote counterparty either way, so that move would change transport and deployment rather than semantics.
+The components below are internal modules of one gear with distinct responsibilities, not deployable units — the gear itself runs as its own process and is horizontally scaled, as §3.8 describes. Of everything inside that process, Registry Source Plugins are the only part that may later move out, and §3.3, *Registry Source Plugin contract*, says why that move is a transport change rather than a semantic one.
 
 ```mermaid
 graph TD
@@ -457,7 +457,7 @@ The no-op fast path is the caller's, not the server's. A caller that reconciles 
 
 The normal caller workflow is read-before-write. It batch-reads the exact identifiers it owns, compares the returned canonical authored content with the desired definitions, and does not POST candidates that are already equal. A missing candidate is submitted with no `expected_resource_version`; an existing but different one carries the `resource_version` the read returned. The tenant REST plane derives the owner from `SecurityContext`; ownership is not caller-controlled request data. Platform gears use the SDK platform plane and `PlatformSecurityContext` for global definitions.
 
-Before accepting, the API validates the request envelope, batch size against the 100-candidate bound, uniqueness and canonical form of candidate GTS Identifiers, the declared JSON Schema Dialect of every Type Schema candidate, one common ownership and authorization scope, and registration authority for every candidate. Authorization still precedes every existence lookup. The dialect check is synchronous because it is a static property of the submitted document that needs no registry state: accepting a candidate only to fail it as an asynchronous item would defer a verdict the API already holds. It rejects an absent top-level `$schema`, a value outside the accepted Draft-07 spellings, and a `$schema` below the document root that differs from it.
+Before accepting, the API validates the request envelope, batch size against the 100-candidate bound, uniqueness and canonical form of candidate GTS Identifiers, the declared JSON Schema Dialect of every Type Schema candidate, one common ownership and authorization scope, the reserved-namespace rule of *Registration authority is a grant over an identifier region* below, and registration authority for every candidate. The reserved-namespace rule precedes authorization, which in turn precedes every existence lookup: it is decided from the candidate's identifier and the plane alone, so consulting the PDP first could only produce an allow that has to be discarded. The dialect check is synchronous because it is a static property of the submitted document that needs no registry state: accepting a candidate only to fail it as an asynchronous item would defer a verdict the API already holds. It rejects an absent top-level `$schema`, a value outside the accepted Draft-07 spellings, and a `$schema` below the document root that differs from it.
 
 The quarantine rule of ADR-0015 is checked in the same place and for the same reason, and it is cheaper than its statement suggests. The rule reads as a property of the resolution closure — the set of *documents* inlined to produce an effective schema, which is neither the dependency rows of §3.7 nor anything stored — but it needs only the **direct** references of the candidate: if every admitted entity satisfies it, no stable entity holds a direct edge to an unstable one, so no stable entity can reach one transitively either. The closure property follows by induction from the direct check, exactly as ADR-0003's whole-history guarantee follows from candidate-versus-current, and the base case is free because every entity admitted before ADR-0015 has a major of at least 1. The direct references are the derivation chain of the candidate's own identifier plus the `$ref` and `x-gts-ref` targets in the submitted document, and a major is readable from each — so the check loads no registry state and belongs with the envelope validation rather than in the worker. The API canonicalizes each authored schema or Instance value through `gts-rust`, computes a request fingerprint over the canonical body, operation kind, authorization scope, owner, and all optimistic preconditions, and resolves the mandatory `Idempotency-Key`.
 
@@ -544,7 +544,13 @@ The version-family row is the single ownership authority. Its canonical family k
 
 Authority over part of the GTS namespace is granted, never acquired by registering first. The platform's canonical permission GTS Type already carries what is needed: its `resource_type` field accepts a GTS wildcard pattern, and matching follows GTS §3.6. A grant covering `gts.<vendor>.<package>.*` therefore authorizes registration inside that region and nothing outside it, with no new authorization primitive.
 
-Two properties of the write path make this cheap. The candidate's identifier is fully known before the check, so there is no result set to filter and the decision is boolean — `require_constraints: false` under the PEP fail-closed rules, which is the "non-resource decision" case. And because the identifier is the resource property, the PDP needs no knowledge of registry storage.
+**One region is not grantable at all.** A candidate matching `gts.cf.toolkit.*` is refused on the tenant plane and cannot be tenant-owned in P1, and the refusal happens in envelope validation — before the PDP is consulted, so it does not depend on how grants are configured. The pattern is matched by the GTS matcher already on that path, and under GTS §3.6 it covers the whole derivation chain beneath the prefix rather than the base segment alone: a type derived from a platform base and an Instance of either are inside the reservation, not beside it.
+
+That breadth is intentional, and the reason is the ownership authority of §3.7 rather than a threat model. Ownership is write-once per version family — the requested owner must equal the stored owner before any member is admitted — so a platform contract wrongly admitted as tenant-owned cannot be corrected by a revision. The only repair is a purge, which releases the identifier and belongs to a different destructive class than the mistake. Narrowing the reservation later, if some derived contract turns out to want a tenant owner, is additive and touches no stored row; widening it after the fact is not. Nothing in P1 is known to want it: the base types of `toolkit-gts` are registry-owned records (§3.3, *A gear submits what it owns*), a plugin registration and a permission declaration are platform-plane acts, and a vendor extending a platform base type may still do so globally on the platform plane.
+
+It also subsumes two checks that would otherwise have to exist separately. A Source Claim projection could not have been created by a tenant, and a permission Instance could not have appeared in the catalogue the future authorization gear enumerates, because both identifiers are inside the reservation — so neither the Control-Plane Validator nor the authorization model needs an ownership rule of its own.
+
+Two properties of the write path make the ordinary grant check cheap. The candidate's identifier is fully known before the check, so there is no result set to filter and the decision is boolean — `require_constraints: false` under the PEP fail-closed rules, which is the "non-resource decision" case. And because the identifier is the resource property, the PDP needs no knowledge of registry storage.
 
 The read path deliberately does not acquire the same filter. Narrowing discovery by granted pattern would need a prefix-capable predicate, and the five standard predicate types have none — it would mean registering a custom predicate type and a SQL compilation handler, which would compile to exactly the range scan §3.7 already indexes. P1 does not do this: what a caller may *see* stays the directed descendant relation of ADR-0009, and what a caller may *write* is the grant. Visibility and authority remain separate, as ADR-0009 requires.
 
@@ -552,11 +558,19 @@ The read path deliberately does not acquire the same filter. Narrowing discovery
 
 **Where that pattern is stored is not this gear's to decide.** If it sat in the `resource_type` of a permission Instance, every grantable vendor prefix would need its own Instance, and Types Registry cannot know vendor prefixes in advance — so the region has to arrive from the identity-to-permission binding, whose data model [`PERMISSION_GTS_TYPE.md`](../../../../docs/arch/authorization/PERMISSION_GTS_TYPE.md) places out of scope for a future design. Nothing here is blocked by that: Types Registry supplies the subject, the action, and the candidate's canonical identifier as a resource property, and consumes a boolean. How a grant is stored belongs to the authorization model.
 
-**The action vocabulary is `register`, `delete`, and `purge`.** These are what Types Registry contributes; whether they surface as three permission Instances carrying a region in `resource_type` or as three actions a binding parameterizes with one follows from the binding model above.
+##### Authorization on the platform plane is the plane
+
+Everything above is the **tenant** plane. The platform plane authorizes by a different mechanism, and not as a variation of the same one: under `cpt-cf-adr-two-plane-auth` a `PlatformSecurityContext` is never handed to the tenant `PolicyEnforcer`, and `cpt-cf-adr-platform-plane-auth` calls these handlers AuthZ-exempt. There is no PEP call, no PDP decision, and no grant over an identifier region on this plane. Types Registry does not get to choose otherwise — the context type is the plane marker, and the tenant enforcer has no subject to evaluate here.
+
+What stands in its place is authentication of a **workload**: `InternalAuthMiddleware` validates an `X-ToolKit-Internal-Token` service-account token in the first phase and an mTLS SPIFFE identity after, and produces the `PlatformIdentity` inside the context. Any narrowing beyond *is this a platform workload at all* is **workload policy over that identity**, which is the platform's sanctioned lever and lives outside this gear. Purge carries a second, unrelated guard: deployment policy decides whether the operation exists in a deployment at all (ADR-0013), which is a build-and-config decision rather than a request-time one.
+
+**The consequence is worth stating rather than leaving to be discovered: any authenticated platform workload can author, revise, or delete any global entity, including one another gear registered.** Nothing in Types Registry narrows that, and `owning_gear` does not — it is caller-declared attribution that nothing authorizes on (*A gear submits what it owns*, §3.3). Three things keep it from being as broad as it sounds. Global authoring is a startup reconciliation of definitions compiled into the binary, so the realistic failure is a buggy gear rather than a hostile one; every mutation is audited with the operation and its candidates; and the platform plane is reachable only from inside the trust boundary, on a separate listener, by a workload the platform issued an identity to. If a deployment wants per-gear narrowing, the place to add it is workload policy on `PlatformIdentity`, not a PDP call this plane does not make.
+
+**The action vocabulary is `register` and `delete`, and it is a tenant-plane vocabulary.** These are what Types Registry contributes; whether they surface as two permission Instances carrying a region in `resource_type` or as two actions a binding parameterizes with one follows from the binding model above.
 
 `register` covers initial admission **and** content revision, and that is a constraint rather than a simplification. `cpt-cf-types-registry-fr-registration-authority` requires authorization to run *before* identifier availability is evaluated, so at decision time it is not known whether the candidate exists — and therefore not known whether the act is a creation or a revision. There is nothing to select an action on. Should the split ever be wanted, the lever is the caller's **declared** precondition rather than an existence lookup: an absent `expected_resource_version` declares a creation and a present one declares a revision, both available before any read, and a false declaration fails at the commit precondition rather than at authorization.
 
-`purge` is separate from `delete` because it is the more destructive of the two and releases the identifier (ADR-0013). A grant to retire a contract must not imply a grant to release its name.
+**`purge` is not in the vocabulary, and that is a correction rather than an omission.** It reads naturally as a third action — it is more destructive than `delete` and releases the identifier, so a grant to retire a contract should plainly not imply a grant to release its name. But purge exists only on the platform plane, and that plane evaluates no grants, so a `purge` permission would be a permission with no evaluation point: defined, grantable, and never consulted, which is worse than absent because it reads as a control that is in force. The separation the intuition is reaching for is real and is already made elsewhere and more strongly — ADR-0013 disables purge by deployment policy, so a deployment that has not enabled it cannot be talked into a purge by any credential at all. Should a tenant-plane purge ever exist, the action arrives with it.
 
 A Dry Run carries **no action of its own** and is authorized as the operation it rehearses. ADR-0012 makes the mode "orthogonal to the mutation kind rather than a member of it", and giving it an action would make it a member.
 
@@ -676,13 +690,12 @@ Maintains one dependency relation holding every direct managed-to-managed depend
 
 ##### Responsibility boundaries
 
-It materializes no transitive relation. Derivation and Instance conformance are stored as direct edges despite following from the identifier, because a recursive CTE may reference itself only once on all three backends, so a second branch joining identifiers by prefix range is not expressible and the relation has to be uniform. That materialization is safe where a closure would not be: one edge to the immediate base, written once at admission, never updated, because an identifier never changes. It owns no plugin write path, because there is none. Advisory impact reports are labelled as such and never gate an authoritative decision.
+It materializes no transitive relation. Derivation and Instance conformance are stored as direct edges despite following from the identifier, because a recursive CTE may reference itself only once on all three backends, so a second branch joining identifiers by prefix range is not expressible and the relation has to be uniform. That materialization is safe where a closure would not be: one edge to the immediate base, written once at admission, never updated, because an identifier never changes. It owns no plugin write path, because there is none.
 
 ##### Related components (by ID)
 
 - `cpt-cf-types-registry-component-availability-evaluator` — owns data for
 - `cpt-cf-types-registry-component-admission-pipeline` — called by
-- `cpt-cf-types-registry-component-federation-router` — may request a source's own advisory reverse-impact report through, for diagnostics that inform no decision
 
 #### Federation Router
 
@@ -763,7 +776,7 @@ The Control-Plane Validator runs before the commit and checks what only registry
 
 The commit transaction then does three things together: it admits the Instance, writes the `source_claim` projection, and bumps `routing_config.generation` while holding that row's lock. The lock is what makes the overlap verdict sound, because validation ran outside the transaction and overlap is not expressible as a constraint — `gts.acme.*` and `gts.acme.foo.*` are distinct strings. The generation is what makes federated cursors and the in-memory claim set notice.
 
-In P1 the plugin is compiled into the same binary. The contract is nonetheless shaped for a remote counterparty — batch calls, explicit timeouts, `SOURCE_UNAVAILABLE` distinct from `NOT_FOUND` — so moving a plugin out of process later changes transport and deployment rather than semantics. It also does not disturb why ADR-0011 closed the managed–external boundary: that argument rests on a plugin's diligence, which is a property of code the platform did not write, in-process or not.
+In P1 the plugin is compiled into the same binary, which changes neither the contract (*Registry Source Plugin contract*, below) nor why ADR-0011 closed the managed–external boundary: that argument rests on a plugin's diligence, which is a property of code the platform did not write, in-process or not.
 
 Retirement is a governance act and never an observation of liveness. An unreachable plugin keeps its claims and a request needing it fails closed. Tying retirement to a health signal would let the claimed identifier space flicker, and not flickering is the entire purpose of a Source Claim.
 
@@ -805,7 +818,7 @@ This section covers the whole surface: registration, deletion, purge, the read a
 
 #### Tenant REST contract
 
-The routes below are the **tenant** surface, served on the business listener. The handler receives `SecurityContext`; `owner_tenant_id` is taken from that context and is never accepted in a request body. Registration authority is checked for every canonical GTS Identifier before any availability lookup. Nothing here can produce a global entity — that is a platform-plane operation, reached on the separate listener described under the SDK contract, and not a payload field a tenant caller can set.
+The routes below are the **tenant** surface, served on the business listener. The handler receives `SecurityContext`; `owner_tenant_id` is taken from that context and is never accepted in a request body. Nothing here can produce a global entity — that is a platform-plane operation, reached on the separate listener described under the SDK contract, and not a payload field a tenant caller can set. Nor can anything here name an identifier under `gts.cf.toolkit.*`, whatever its ownership would have been: that region is refused on this plane before authorization runs.
 
 **Endpoints Overview**:
 
@@ -1386,13 +1399,13 @@ One shape in there is load-bearing rather than incidental: `Origin` is a variant
 
 One asymmetry between the traits is deliberate rather than an omission: `expand_type_filter` exists only on the tenant trait. Type filter expansion is a tenant-plane operation under `cpt-cf-types-registry-fr-type-query-assistance` — it narrows the set to what is available to the requesting tenant, and the platform plane has no requesting tenant to narrow against. A platform caller that wants references pages `list_entities` itself.
 
-There is no method for enumerating what depends on an entity, on either trait, and none is coming. The operator path ADR-0009 promises for a deletion blocked by invisible dependents is a Dry Run deletion on the platform plane, which runs the same dependent revalidation and commits nothing.
+There is no method for enumerating what depends on an entity, on either trait, and none is coming — *There is no operation for enumerating what depends on an entity*, above, gives the reason and the operator path that replaces it.
 
 ##### The two planes are not mirrors
 
 The platform trait is not the tenant one with a different context type. It is broader in what it reads and narrower in what it writes, and both follow from decisions taken elsewhere.
 
-**Platform reads span every tenant.** They are not narrowed to global entities. ADR-0013 requires the purge dry run to report what would be released "broken down by owner, since one pattern can cross tenant boundaries", and ADR-0009 keeps "an authorized path to enumerate the dependents" of a blocked deletion — dependents that are by construction invisible to the tenant whose deletion they blocked. Neither is expressible against a global-only read. Visibility is not filtered on this plane because there is nothing to filter against: no requesting tenant, therefore no descendant relation. Authorization still applies through the PDP; only the tenancy relation drops out. One consequence worth stating: the rule that an invisible entity is indistinguishable from a missing one does not hold here, and must not, or the plane cannot serve diagnostics.
+**Platform reads span every tenant.** They are not narrowed to global entities. ADR-0013 requires the purge dry run to report what would be released "broken down by owner, since one pattern can cross tenant boundaries", and ADR-0009 keeps "an authorized path to enumerate the dependents" of a blocked deletion — dependents that are by construction invisible to the tenant whose deletion they blocked. Neither is expressible against a global-only read. Visibility is not filtered on this plane because there is nothing to filter against: no requesting tenant, therefore no descendant relation. Neither is the PDP consulted in its place, for the reasons in *Authorization on the platform plane is the plane* (§3.2). One consequence worth stating: the rule that an invisible entity is indistinguishable from a missing one does not hold here, and must not, or the plane cannot serve diagnostics.
 
 **Platform writes are global-only, and that is a consequence rather than a restriction.** `cpt-cf-types-registry-fr-registration-authority` forbids ownership from being request data, and this plane carries no tenant context — so there is nothing an owning tenant could be derived from, and a tenant-owned entity simply cannot be authored here. Purge is the single cross-tenant mutation, and it is deliberately of a different character: destructive maintenance under an operator, not authoring.
 
@@ -1400,7 +1413,7 @@ The platform trait is not the tenant one with a different context type. It is br
 
 **Tenant Availability needs a Context Tenant, and this plane has no default one.** The verdict is per-tenant, so it is present exactly when `tenant_id` was supplied and absent otherwise. That is the diagnostic the plane exists for — *why can tenant X not use this type* is answered by naming X — and it is the same shape the Registry Source Plugin call takes, where the tenant is optional for the same reason. The tenant plane takes the same parameter and merely defaults it to the subject's own tenant.
 
-**The two planes are two surfaces, separated by listener rather than by path.** `cpt-cf-types-registry-fr-registration-authority` requires the platform plane to be unreachable from the tenant-facing REST surface, and the platform already prescribes how: `cpt-cf-adr-platform-plane-auth` serves the platform plane on a listener separate from business endpoints, authenticated by `InternalCredential` resolving to a `PlatformIdentity` — a Kubernetes service-account token in the first phase, mTLS with SPIFFE identity after. A path prefix on the tenant listener would satisfy the requirement only on paper, leaving a surface that can author global contracts and read across every tenant one routing mistake away from tenant reach.
+**The two planes are two surfaces, separated by listener rather than by path.** `cpt-cf-types-registry-fr-registration-authority` requires the platform plane to be unreachable from the tenant-facing REST surface, and `cpt-cf-adr-platform-plane-auth` already prescribes how: a listener separate from business endpoints, under the identity described in §3.2. A path prefix on the tenant listener would satisfy the requirement only on paper, leaving a surface that can author global contracts and read across every tenant one routing mistake away from tenant reach.
 
 This is not deferred work. `cpt-cf-types-registry-nfr-multi-pod-correctness` makes horizontal scaling a P1 property, so the ordinary production deployment is several Types Registry replicas with other gears in their own processes, and a platform gear registering its global definitions is making a cross-process system call from the first release. Only the embedded profile has no transport at all.
 
@@ -1615,54 +1628,195 @@ Two things go with it. The gear's link-time seeding of the process inventory thr
 
 This is the one contract Types Registry defines rather than consumes. It is written for a remote counterparty — batch calls, explicit deadlines, `SOURCE_UNAVAILABLE` distinct from `NOT_FOUND` — even though P1 compiles plugins into the same binary, so moving one out of process later changes transport and deployment rather than semantics.
 
-##### Operations
+##### The trait
 
-Each is required for every entity kind a plugin claims, and absence of any of them blocks Source Claim activation.
+**Two operations, both mandatory for every entity kind a plugin claims:** a missing one blocks Source Claim activation rather than degrading a result. There is no separate tenant-state call, because every call already carries the tenant it concerns and two answers fetched separately could disagree across the gap between them — enablement is a field of the entity result.
 
-| Operation | Shape | Notes |
-|---|---|---|
-| Forward resolve | identifiers → results | Batch. One call per plugin per request, never one per identifier |
-| Reverse resolve | `gts_uuid`s → results | Batch. Must keep answering after the source deletes an entity, since a domain row may still hold the reference |
-| Candidate query | pattern + source cursor → page + next cursor | Complete for the pattern, no false negatives. The plugin may over-return for Types Registry to filter |
-| Tenant state | tenant + identifiers → enablement | May instead be folded into the entity results of the calls above |
-| Reverse dependency impact | identifier → dependents | **Optional and near-empty.** The closed boundary means it can only report external dependents of an externally managed entity, never anything about a Managed Entity, so no platform decision reads it. Its absence blocks nothing and costs nothing |
+It is object-safe, resolved through the scoped ClientHub, and reuses the models of §5.1 — `EntityKey`, `GtsIdPattern`, `EntityKind`, `OwnershipScope`, `AuthoredContent`, `EffectiveArtifacts`, `ContentHash`, `LifecycleStatus` — rather than restating them on this side. A parallel copy would be free to drift, and drift across this boundary is precisely what the platform cannot detect. Every response is checked against the platform boundary before anything is exposed — identifier integrity, derived reference equality, claim conformance, kind, revision and hash consistency — which the Federation Router owns (§3.2).
 
-##### What a call carries
+**A method answering the SDK's question keeps the SDK's name,** so `batch_get_entities` and `list_entities` appear on both sides and a reader never diffs names to discover that nothing changed. Where the shape differs the type differs instead: `SourceQuery`, `SourcePage`, `SourceLookup`.
 
-The `SecurityContext`, per the platform rule for in-process calls; the tenant the question concerns, **optional** because a platform-plane read has no tenant and asks no tenant-specific question; a deadline; and, for a conditional read, the source's own freshness token.
+**It is nonetheless not `TypesRegistryClient` with a different context type.** `register_entities`, `delete_entities`, and `purge` are absent because ADR-0011 grants a plugin no write path, and `get_operation` with them, since there is nothing asynchronous to poll. A reverse dependency-impact lookup is absent for the reason ADR-0011 records: nothing consumes one. That is also why every answer here is authoritative and none may degrade with a warning — it was the only candidate for an advisory tier.
 
-##### What a result carries
+**`expand_type_filter` has an analogue, and it is on this side of the call.** On the SDK it is already a provided method over `list_entities` rather than an operation of its own, and the federated equivalent is likewise composed here — paging each intersecting source source-major and enforcing the 1000-reference maximum against the running count in the registry's own cursor (§3.6, *Type filter expansion*). Asking a plugin to expand would move a platform limit and an availability verdict outside the platform, and the narrowing to what a tenant may use would have to be redone here anyway.
 
-| | Source | Notes |
-|---|---|---|
-| Canonical identifier | plugin | Must derive to the requested `gts_uuid` and fall inside the plugin's Source Claim; both are checked |
-| Entity kind | plugin | |
-| `ownership_scope` + `owner_tenant_id` | plugin | Mandatory. A flat fact; Types Registry expands it into the descendant relation. Absent, or naming an unknown tenant, is `INVALID_SOURCE_RESPONSE` |
-| Lifecycle assertion | plugin | Maps onto `ACTIVE` or `DELETED`. A deprecation assertion is accepted and exposed as `ACTIVE`; P1 does not relay it (ADR-0008) |
-| Tenant enablement state | plugin | When the operation needs a tenant-specific answer |
-| Authored document | plugin | The same slot a Managed Entity's authored document occupies |
-| Resolved effective schema, effective traits, effective traits schema | plugin | Mandatory for a claimed Type Schema kind. Types Registry never resolves source-owned content, so a consumer has no other way to obtain them |
-| `external_revision` + `content_hash` | plugin | Equal revisions must identify equal content. Not exposed as fields; they are carried verbatim inside the validator, so the revision is length-capped |
+```rust
+#[async_trait]
+pub trait RegistrySourcePlugin: Send + Sync {
+    /// Forward and reverse resolution, one operation over `EntityKey` for the
+    /// same reason its SDK namesake is one: they are one question. One call
+    /// per plugin per request, never one per key. `Some(revision)` beside a key
+    /// makes that key's read conditional; the token is whatever the registry
+    /// decomposed out of the caller's validator, so it is untrusted input that
+    /// this plugin may not assume it minted. A deleted entity is answered
+    /// `Found` with `SourceLifecycle::Deleted` under either key kind — never
+    /// `NotFound`, since a domain row may still hold its reference.
+    async fn batch_get_entities(
+        &self,
+        ctx: &SecurityContext,
+        call: &SourceCall,
+        keys: Vec<(EntityKey, Option<SourceRevision>)>,
+    ) -> Result<HashMap<EntityKey, SourceLookup>, SourceError>;
+
+    /// Complete for the pattern: no false negatives. Over-returning is expected
+    /// and the registry filters. Under-returning is not, because
+    /// `fr-registry-source-routing` forbids a partial page.
+    async fn list_entities(
+        &self,
+        ctx: &SecurityContext,
+        call: &SourceCall,
+        query: SourceQuery,
+    ) -> Result<SourcePage, SourceError>;
+
+}
+```
+
+##### Models
+
+```rust
+// ---- what every call carries --------------------------------------------
+
+/// One struct rather than two repeated parameters, because no operation takes
+/// a different set.
+pub struct SourceCall {
+    /// The tenant the question concerns. `None` on a platform-plane read, which
+    /// asks nothing tenant-specific — and then `tenant_enablement` is absent
+    /// from every result rather than defaulted to something.
+    pub tenant_id: Option<TenantId>,
+    /// Absolute rather than a budget, so a hop does not silently restart the
+    /// clock. Coarse by construction; it bounds a call, it does not order events.
+    pub deadline: Timestamp,
+    /// Which document groups the results must carry. Not the caller's `$select`
+    /// forwarded: it is that selection widened by what the registry needs for its
+    /// own filtering, computed before the call.
+    pub projection: SourceProjection,
+}
+
+/// Two flags rather than a `FieldSelection`, because everything else a
+/// `SourceEntity` carries is a mandatory floor and only the documents are
+/// negotiable. A plugin that returns a group not asked for is not in error —
+/// the registry drops it — but one that omits a group that was asked for is,
+/// and that is `INVALID_SOURCE_RESPONSE`.
+pub struct SourceProjection {
+    pub authored: bool,
+    /// Type Schemas only; ignored for an Instance, which has no derived form.
+    pub effective: bool,
+}
+
+// ---- results ------------------------------------------------------------
+
+pub enum SourceLookup {
+    Found(Box<SourceEntity>),
+    /// The presented `SourceRevision` still identifies what the source holds for
+    /// this (entity, tenant) pair — content and tenant enablement both. A plugin
+    /// whose token is not scoped that tightly answers `Found` here always.
+    Unchanged,
+    /// The source owns the space and the entity is not in it. A source that
+    /// *could not answer* returns `SourceError` instead. ADR-0002's
+    /// `SOURCE_UNAVAILABLE` ≠ `NOT_FOUND` is a type distinction here, so
+    /// collapsing the two does not compile.
+    NotFound,
+}
+
+/// Everything down to `content_hash` is the floor: the registry needs all of it
+/// to match the pattern, decide visibility, compose the availability verdict, and
+/// mint a validator, so none of it is selectable. Only the two document groups
+/// below it are, and they are the only fields large enough to be worth omitting.
+pub struct SourceEntity {
+    pub gts_id: GtsId,
+    pub kind: EntityKind,
+    /// A flat fact. The registry expands it into the descendant relation and
+    /// keeps the authoritative visibility check on its own side; a plugin may
+    /// pre-filter as an optimization but must still report the owner. Absent, or
+    /// naming a tenant the platform does not know, is `INVALID_SOURCE_RESPONSE`.
+    pub ownership: OwnershipScope,
+    /// The same two-valued `LifecycleStatus` a consumer sees. P1 has no status
+    /// between `Active` and `Deleted` (PRD §4.4), so there is nothing else for a
+    /// source to assert and no third variant to map.
+    pub lifecycle: LifecycleStatus,
+    /// Present exactly when `SourceCall::tenant_id` was.
+    pub tenant_enablement: Option<TenantEnablement>,
+    /// Equal revisions must identify equal content. Neither field is exposed to
+    /// a consumer; both ride inside the validator.
+    pub revision: SourceRevision,
+    pub content_hash: ContentHash,
+
+    // Selected by `SourceProjection`, and absent when it did not ask.
+    pub authored: Option<AuthoredContent>,
+    /// Required when asked for and the kind is a Type Schema; always absent for
+    /// an Instance. Types Registry never resolves source-owned content, so a
+    /// consumer has no other way to obtain these.
+    pub effective: Option<EffectiveArtifacts>,
+}
+
+pub enum TenantEnablement { Enabled, Disabled }
+
+/// Opaque, source-minted, and length-capped because the validator carries it
+/// verbatim: an unbounded source string is an unbounded validator.
+pub struct SourceRevision(String);
+pub const MAX_SOURCE_REVISION_LEN: usize = 256;
+
+// ---- discovery ----------------------------------------------------------
+
+pub struct SourceQuery {
+    pub pattern: GtsIdPattern,
+    pub kind: Option<EntityKind>,
+    pub cursor: Option<SourceCursor>,
+    /// A hint. Returning more is allowed — the registry pages its own output
+    /// independently — returning fewer than the source holds, with no cursor,
+    /// is the one thing that is not.
+    pub limit: u32,
+}
+
+pub struct SourcePage { pub items: Vec<SourceEntity>, pub next: Option<SourceCursor> }
+
+/// Opaque, and capped for the same reason as `SourceRevision`: the federation
+/// cursor the registry hands its own callers carries this one verbatim.
+pub struct SourceCursor(String);
+pub const MAX_SOURCE_CURSOR_LEN: usize = 4096;
+
+// ---- failures -----------------------------------------------------------
+
+/// Call-level, never per-key: a source that answered has answered every key it
+/// was handed. The registry maps one of these onto `Failed` for exactly the keys
+/// this plugin owned, leaving the rest of the batch untouched.
+pub enum SourceError {
+    /// Maps onto `SOURCE_UNAVAILABLE`. Fail-closed; never converted to absence.
+    Unavailable,
+    DeadlineExceeded,
+    /// Minted by an older state of the source and no longer honoured.
+    CursorExpired,
+    /// The registry sent something this plugin cannot parse — a defect report,
+    /// not a condition of the source.
+    InvalidRequest(String),
+}
+```
+
+**Projection exists because the resolved artifacts of a Type Schema are three documents,** so a page of a hundred external types — or a batch resolve of a hundred references — would otherwise ship three hundred resolved schemas to a registry that was asked for identifiers. It is the argument §3.3, *Field selection*, makes for the SDK's default set, with more force here because a plugin is a remote counterparty in the general case. Only the documents are negotiable, since everything else is needed on every call whatever the caller selected.
+
+**The plugin's `list_entities` returns a candidate feed rather than an answer,** which is where it parts from the SDK method of the same name: the completeness rule inverts, over-returning is expected, and `SourceCursor` is opaque source state that the registry wraps in a federation cursor bound to the routing generation before a caller sees it. Hence `SourcePage` and not `EntityPage` — one is input to filtering, the other its result.
+
+*Its filter is smaller, and each absence has a reason.* `availability` is not there because the plugin does not compute the verdict; `scope` is not, because the descendant relation is authoritative platform-side; `origin` is not, because a plugin *is* one origin; `max_chain_depth` is not, because a chain is derivable from the identifier, so the registry applies that predicate to results and asking would only invite an inconsistent second implementation.
+
+Two absences are deliberate. **There is no capability method**: capabilities are declared in the plugin's registration Instance and checked once at claim activation (*Registry Source Plugin registration*, above), so a plugin never receives a call for a kind it did not claim, and a per-call probe would ask at the wrong time. And **`INVALID_SOURCE_RESPONSE` is not in `SourceError`**: it is the registry's verdict on a response, not something a source reports about itself.
 
 ##### What the plugin does not decide
 
-It supplies inputs; the verdicts are platform-side. It does not compute Tenant Availability State, which Types Registry composes from the lifecycle assertion, enablement, visibility, and authorization. It does not decide the descendant relation authoritatively — it may pre-filter by visibility as an optimization, and taking its own `tenant-resolver` dependency to do so is fine, but it must still return the owner so the authoritative check stays here. Its own checks **may only deny**: hiding an entity is narrowing, and the worst outcome is indistinguishable from absence, whereas revealing one the platform refused would place an access decision outside the platform.
+It supplies inputs; the verdicts are platform-side. It does not compute Tenant Availability State, which Types Registry composes from the lifecycle assertion, enablement, visibility, and authorization. Per-tenant enablement is nonetheless the plugin's to report and no one else's — it is source-owned state that ADR-0002 forbids persisting here, which is why `SourceEntity` carries it and why the federation contract makes the source's freshness token answer for it. It arrives as a fact and not as an explanation: the reason vocabulary belongs to the availability evaluator (`cpt-cf-types-registry-component-availability-evaluator`), so a source says *disabled* and the platform decides what a caller is told. It does not decide the descendant relation authoritatively — it may pre-filter by visibility as an optimization, and taking its own `tenant-resolver` dependency to do so is fine, but it must still return the owner so the authoritative check stays here. Its own checks **may only deny**: hiding an entity is narrowing, and the worst outcome is indistinguishable from absence, whereas revealing one the platform refused would place an access decision outside the platform.
 
 It supplies no `resource_version`. That value is the precondition of a write, PRD §4.2 keeps authoritative management of external sources out of scope, and a constant standing in for it would look like concurrency control while detecting no conflict.
 
 Per-level evolvability and the frozen-chain state are likewise not asked for: they describe compliance with a compatibility mode the platform does not enforce on the external side.
 
-##### Conditional reads decompose the validator
+##### Conditional reads put three obligations on the plugin
 
-A caller's validator is opaque to the caller and composite to us. For an externally managed entity it must additionally be **recoverable**, not merely comparable, and that is a constraint rather than a preference: Types Registry holds no copy of an `external_revision`, so when a caller presents a validator the only place the source's token can come from is inside it. A digest would make the token unrecoverable and leave conditional reads on external entities unimplementable without persisting external state, which ADR-0002 forbids.
+Why the external variant of a validator carries the source's token verbatim and recoverably rather than hashed, and how the registry decomposes and reassembles it, is §3.3, *What a validator is made of*. What falls on the plugin side is this:
 
-The flow is therefore: decompose the caller's validator, hand the plugin its own token, and either report unchanged or reassemble a fresh validator around what came back. The validator is uniform in use and not in construction — for a Managed Entity the components are recomputable from local state, for an externally managed one they are carried. Its concrete form is in §3.3, *What a validator is made of*.
-
-Three obligations fall on the plugin side of that flow. The token handed to a plugin **is untrusted input**: validators are not authenticated, so a plugin receives whatever bytes a caller supplied and must not assume it minted them. `external_revision` **is capped in length**, because the validator carries it verbatim and an unbounded source string is an unbounded validator. And the token **is scoped to the pair (entity, tenant)** and must change on any change to what the platform exposes for that pair, tenant enablement included — a source that disables an entity for one tenant without touching its content must not answer that tenant's conditional read `unchanged`. A plugin unable to meet that answers every conditional read as changed instead.
+- the token it receives **is untrusted input** — validators are not authenticated, so those are whatever bytes a caller supplied and a plugin must not assume it minted them;
+- `external_revision` **is length-capped**, because the validator carries it verbatim;
+- the token **is scoped to the pair (entity, tenant)** and must change on any change to what the platform exposes for that pair, tenant enablement included. A source that disables an entity for one tenant without touching its content must not answer that tenant's conditional read `unchanged`; one that cannot scope its token that tightly answers every conditional read as changed.
 
 ##### Open questions
-
-*One remains, and it is recorded in the PRD.*
 
 *Observability of a fail-closed federated control plane is PRD open question 2.*
 
@@ -1703,7 +1857,7 @@ Consuming gears depend on Types Registry the same way, through `cpt-cf-types-reg
 
 - **Contract**: `cpt-cf-types-registry-contract-toolkit-plugins`
 
-Registry Source Plugins are registered as well-known GTS Instances and resolved through the scoped ClientHub. The federation contract is written for a remote counterparty — batch calls, explicit timeouts, `SOURCE_UNAVAILABLE` distinct from `NOT_FOUND` — so moving a plugin out of process changes transport and deployment rather than semantics.
+Registry Source Plugins are registered as well-known GTS Instances and resolved through the scoped ClientHub. The federation contract they implement is §3.3, *Registry Source Plugin contract*.
 
 #### Platform database
 
@@ -1831,7 +1985,7 @@ sequenceDiagram
         Note over A,G: The range is a pre-filter — matching is segment-wise,<br/>so the matcher decides
         opt managed rows exhausted and a claim intersects the pattern
             A->>R: Continue source-major, next plugin in priority order
-            R->>P: Candidate query (pattern, source cursor)
+            R->>P: list_entities(pattern, source cursor, projection)
             P-->>R: Bounded page, next source cursor, explicit exhaustion
             R->>R: Validate and re-filter under platform semantics
         end
@@ -1902,7 +2056,7 @@ Each replica exposes two surfaces on two listeners. The business listener carrie
 
 Admission work is dispatched through the leased ToolKit outbox, which supplies multi-pod exclusion, so any pod may run the worker and no pod is elected. `cpt-cf-types-registry-nfr-multi-pod-correctness` requires every committed mutation to be visible on every pod's first post-commit read, which follows from the database being the only authority.
 
-Registry Source Plugins are compiled into the same binary in P1. Moving one out of process is a transport and deployment change rather than a semantic one, because the federation contract is already written for a remote counterparty, and it does not disturb ADR-0011: the closed boundary rests on a plugin's diligence being unobservable, which is a property of code the platform did not write, in-process or not.
+Registry Source Plugins are compiled into the same binary in P1, so a deployment has no plugin processes to place. Moving one out later is a topology change and nothing more — §3.3, *Registry Source Plugin contract*, and §3.2 say why it reaches neither the contract nor ADR-0011.
 
 ## 4. Additional context
 

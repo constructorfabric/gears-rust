@@ -149,7 +149,7 @@ gts.<vendor>.<package>.<namespace>.<type>.*      -- any major version
 
 The single-segment requirement is what makes disjointness structural rather than a per-reference check at admission. **The owning claim of any identifier is determined by its first segment alone.** A derived identifier `A~B~` has first segment `A`, so the entire derivation chain of an externally managed entity necessarily falls inside the claim that owns its root segment; combined with ADR-0007's existing rule that a claim may not overlap the managed identifier space, no chain can begin in one universe and continue in the other.
 
-It also makes the genuinely dangerous form unrepresentable. A mid-chain claim such as `gts.x.core.events.type.v1~acme.*` slices into a chain whose base segment is managed, and every nesting pathology grows from there.
+It also makes the genuinely dangerous form unrepresentable. A mid-chain claim such as `gts.cf.core.events.type.v1~acme.*` slices into a chain whose base segment is managed, and every nesting pathology grows from there.
 
 Chain coverage itself is supplied by the matcher rather than by a separate rule. `gts-id` matches segment-wise and field-wise; a wildcard token replaces a whole token, and once a wildcard segment is reached it accepts every remaining segment including the chain separator. This is the "implicit derived-type coverage" of GTS §3.6, and under the closed boundary it is exactly what a claim needs.
 
@@ -169,11 +169,13 @@ Deletion of a Managed Entity is decided from managed storage alone. It calls no 
 
 What it examines is exactly what Types Registry owns and can enumerate: types derived from the target, read from the identifier chain; schemas holding a `$ref` or `x-gts-ref` to it; and registered Instances conforming to it. There is no fourth category.
 
-Live reverse-impact query is retained, but closing the boundary hollows out most of what it was for, and saying so is more useful than leaving the old description standing. It can no longer report anything **platform-authoritative** about a Managed Entity: no externally managed entity may depend on one, so any dependent a source named would be one the rule forbids and the platform does not recognize — and, because a reference from inside an external document is undetectable here, the platform could neither confirm nor refute it. Such a report is therefore **explicitly non-authoritative rather than guaranteed empty**, and it is returned to a caller as a diagnostic without being read by anything. What the query can still report usefully is external dependents of an *externally managed* entity — a question entirely inside the source's own universe, which the source's own tooling generally answers better. It informs no platform decision at all and survives as an optional pass-through diagnostic, which is why ADR-0007 keeps it out of the mandatory profile.
+**Live reverse-impact query is not retained at all,** and closing the boundary is what emptied it. It could report nothing **platform-authoritative** about a Managed Entity: no externally managed entity may depend on one, so any dependent a source named would be one the rule forbids and the platform does not recognize — and, because a reference from inside an external document is undetectable here, the platform could neither confirm nor refute it. What remained was external dependents of an *externally managed* entity: a question entirely inside the source's own universe, which the source's own tooling answers better.
 
-**Deletion is independent of that result in both directions.** It neither consults the query nor is blocked by anything the query might return, because it reads managed storage alone. A source that has built on a managed contract in a way the platform cannot see does not gain a veto by reporting it.
+Carrying that remainder as an optional diagnostic was the earlier position, and it does not survive one further step. Types Registry exposes no operation on either plane that enumerates dependents, and none is planned, because what a caller actually wants — *would this deletion or revision be refused, and by what* — is answered by the Dry Run of that same mutation. So the report would have had a producer, a router willing to relay it, and no caller. It is therefore out of the capability profile of ADR-0007 entirely rather than in it as optional, which is also what leaves that profile with no advisory tier and `cpt-cf-types-registry-principle-fail-closed` with no exception: this was the only output the platform would have allowed to degrade with a warning instead of failing. Re-introducing it alongside a surface that renders it is additive.
 
-The principle it was an example of is unaffected: authoritative decisions read local state, informational ones may query. Deletion safety is simply no longer one of the things a query could inform.
+**Deletion is independent of all of this in both directions.** It consults no source and is blocked by nothing a source could report, because it reads managed storage alone. A source that has built on a managed contract in a way the platform cannot see does not gain a veto by reporting it.
+
+The principle this was an example of is unaffected: authoritative decisions read local state. What changed is that there is no informational query left for the second half of that sentence to permit.
 
 ### A retired Source Claim reserves its space until purge
 
@@ -209,7 +211,7 @@ The composition story therefore sits on the managed side of the boundary rather 
 ### Consequences
 
 * ADR-0002's enumeration of prohibited persistence holds with no exception, so the persistence rule and the enumeration state the same thing.
-* The mandatory P1 capability profile of ADR-0007 contains no dependency registration, because a closed boundary leaves nothing to register, and reverse dependency-impact lookup sits outside the profile as an optional advisory capability. Plugin conformance tests cover it in that shape.
+* The P1 capability profile of ADR-0007 contains neither dependency registration nor reverse dependency-impact lookup: the boundary leaves nothing to register, and nothing to report that any operation would consume. Everything left in the profile is mandatory, so the profile has no optional or advisory tier and plugin conformance tests need only one shape.
 * **Registry Source Plugins have no write path to Types Registry.** The relationship is read-only, so the authentication, per-claim authorization, idempotency, and withdrawal semantics such a path would need do not arise.
 * Every availability-blocking relationship in ADR-0010's table holds between two Managed Entities, and none crosses the boundary.
 * Managed deletion, resolution, and availability involve no plugin and no plugin-supplied data. The managed lookup NFR is achievable without plugin-latency budgeting, and no degraded vendor integration can block or corrupt a managed decision.
@@ -229,14 +231,14 @@ This decision is confirmed when:
 * an externally managed entity cannot be admitted as derived from a managed base, and the impossibility follows from claim selection on the first segment rather than from a check that could be bypassed;
 * a managed entity referenced from inside an external schema document is deletable, purgeable, and revisable without obstruction, and no availability verdict or revalidation reflects that reference — the documented gap is exercised as a test rather than assumed;
 * no federation response validation parses returned content in order to detect a cross-boundary reference;
-* a Source Claim is rejected at activation unless its pattern is exactly one segment carrying a wildcard at a token boundary; in particular a multi-segment pattern such as `gts.x.core.events.type.v1~acme.*` is rejected;
-* the owning claim of an identifier is selected from its first segment alone, and a claim covering `gts.vendor.*` also covers `gts.vendor.foo.invoice.v1~acme.bar.v1~`, with registration of a managed entity at any identifier inside the claim rejected as overlapping it;
+* a Source Claim is rejected at activation unless its pattern is exactly one segment carrying a wildcard at a token boundary; in particular a multi-segment pattern such as `gts.cf.core.events.type.v1~acme.*` is rejected;
+* the owning claim of an identifier is selected from its first segment alone, and a claim covering `gts.vendor.*` also covers `gts.vendor.foo.invoice.type.v1~acme.crm.bar.type.v1~`, with registration of a managed entity at any identifier inside the claim rejected as overlapping it;
 * claim-overlap detection treats two patterns as overlapping exactly when one covers the other, and for this grammar that reduces to one field list being a prefix of the other;
 * Types Registry exposes no plugin-callable operation that creates, modifies, or withdraws registry state;
 * deleting a Managed Entity with no managed dependent succeeds while every plugin is unreachable, and deleting one with a managed dependent is rejected while every plugin is unreachable — both proving the decision used local state only;
 * registering a Managed Entity whose identifier matches a retired Source Claim is rejected, and deleting a plugin Instance retires its claims into exactly that state while an unreachable plugin retains its own;
 * activating a new plugin's claim over a retired claim is rejected with no exception, and no request field, declared intent, or continuity assertion makes it succeed;
-* advisory impact reports degrade with a stated source-unavailable warning instead of failing the operation.
+* no plugin operation asks a source about dependents, and no plugin output is permitted to degrade with a warning in place of failing closed — the capability profile has no optional or advisory tier to test.
 
 ## Pros and Cons of the Options
 
