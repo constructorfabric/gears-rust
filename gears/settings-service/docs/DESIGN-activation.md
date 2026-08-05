@@ -689,6 +689,7 @@ sequenceDiagram
 | `id` | UUID | No | auto | **PK** |
 | `subscriber` | text | No | — | |
 | `key` | text | No | — | Exact setting key (GTS instance id); one row per subscribed setting |
+| `created_at` | `timestamptz` | No | `now()` | Matches `Subscription.created_at` (§4.1), which the entity declares required |
 
 **Indexes:** unique `uq_sub_subscriber_key` on `(subscriber, key)`; `idx_sub_key` on `key` (fan-out lookup by changed key).
 
