@@ -22,11 +22,10 @@ pub use host_runtime::{
     TOOLKIT_MODULE_CONFIG_ENV,
 };
 #[cfg(feature = "bootstrap")]
-pub use oop_registration::ResolvedRestEndpoints;
-#[cfg(feature = "bootstrap")]
 pub use oop_serve::{DynBearerAuthenticator, DynInternalAuthenticator, OopServeOptions};
 pub use readiness::{
-    DEFAULT_HEALTHCHECK_TIMEOUT, ReadinessLifecycle, ReadinessReport, ReadinessState,
+    DEFAULT_HEALTHCHECK_TIMEOUT, DependencyChecker, ReadinessHealthcheck, ReadinessLifecycle,
+    ReadinessReport, ReadinessState,
 };
 #[cfg(feature = "bootstrap")]
 pub use runner::run_oop_serving;

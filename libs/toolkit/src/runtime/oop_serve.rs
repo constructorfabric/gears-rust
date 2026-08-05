@@ -608,7 +608,6 @@ async fn serve_loop(
 /// the presence task stops when `cancel` fires.
 pub(super) struct OopHttpServer {
     readiness: Arc<ReadinessState>,
-    resolved: Arc<super::oop_registration::ResolvedRestEndpoints>,
     late: LateRoutes,
     drain_guard: DrainGuard,
     options: OopServeOptions,
@@ -625,7 +624,6 @@ impl OopHttpServer {
     /// Returns an error if the main (or sidecar) listener cannot be bound.
     pub(super) async fn start(
         readiness: Arc<ReadinessState>,
-        resolved: Arc<super::oop_registration::ResolvedRestEndpoints>,
         options: OopServeOptions,
         cancel: CancellationToken,
     ) -> anyhow::Result<Self> {
@@ -687,7 +685,6 @@ impl OopHttpServer {
 
         Ok(Self {
             readiness,
-            resolved,
             late,
             drain_guard,
             options,
@@ -708,7 +705,7 @@ impl OopHttpServer {
     /// Presence (registration + heartbeat) and dep resolution start here — only
     /// once the gear can actually serve — so the directory never advertises a
     /// not-yet-serving instance.
-    pub(super) fn attach(&mut self, gear_router: Router, openapi_json: String, deps: Vec<String>) {
+    pub(super) fn attach(&mut self, gear_router: Router, openapi_json: String) {
         let openapi_arc: Arc<str> = Arc::from(openapi_json);
         let layered = layer_gear_router(gear_router, self.drain_guard.clone(), &self.options);
         self.late.publish(layered, Arc::clone(&openapi_arc));
@@ -716,6 +713,8 @@ impl OopHttpServer {
         tracing::info!(gear = %self.options.gear_name, "OoP gear routes attached (now serving)");
 
         // Single directory-presence task: registration + heartbeat + self-heal.
+        // Dependency resolution is handled by the proxy-wiring phase (typed
+        // `#[toolkit::consumes]` clients), which runs before serving.
         let registration_info = RegisterInstanceInfo {
             gear: self.options.gear_name.clone(),
             instance_id: self.options.instance_id.clone(),
@@ -730,15 +729,6 @@ impl OopHttpServer {
             self.options.heartbeat_interval,
             self.cancel.clone(),
         )));
-
-        // Background dependency resolution (gates /readyz). No-op if `deps` empty.
-        super::oop_registration::resolve_deps(
-            &self.options.directory,
-            deps,
-            &self.readiness,
-            &self.resolved,
-            &self.cancel,
-        );
     }
 
     /// Wait for the server to drain on shutdown, then deregister from

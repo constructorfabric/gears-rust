@@ -38,8 +38,8 @@ use toolkit::contracts::{ApiGatewayCapability, Gear, RestApiCapability, Runnable
 use toolkit::registry::RegistryBuilder;
 use toolkit::runtime::HostRuntime;
 use toolkit::{
-    ClientHub, DbOptions, DirectoryClient, GearCtx, GearManager, LocalDirectoryClient,
-    ReadinessPhase, ReadinessState,
+    ClientHub, DbOptions, DependencyChecker, DirectoryClient, GearCtx, GearManager,
+    LocalDirectoryClient,
 };
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_contract::policy::PolicyStack;
@@ -262,25 +262,26 @@ async fn consumer_resolves_provider_through_runtime_phases() {
 
     // Process readiness reflects eventual readiness: the readiness probe loop
     // (proxy-wiring phase) flips the consumed provider to resolved once it is
-    // advertised in the directory, so ReadinessState goes Starting -> Ready.
+    // advertised in the directory, so the DependencyChecker goes unresolved ->
+    // ready.
     let readiness = hub
-        .get::<ReadinessState>()
-        .expect("ReadinessState published in ClientHub by the runtime");
+        .get::<DependencyChecker>()
+        .expect("DependencyChecker published in ClientHub by the runtime");
     let rdy_deadline = Instant::now() + Duration::from_secs(15);
     while !readiness.is_ready() {
         assert!(
             Instant::now() < rdy_deadline,
             "readiness did not reach Ready; unresolved: {:?}",
-            readiness.report().unresolved_deps
+            readiness.unresolved_deps()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(readiness.report().phase, ReadinessPhase::Ready);
+    assert!(readiness.is_ready());
 
     // Shutdown → the draining watcher flips readiness to Draining (so /readyz 503).
     cancel.cancel();
     let drain_deadline = Instant::now() + Duration::from_secs(5);
-    while readiness.report().phase != ReadinessPhase::Draining {
+    while !readiness.is_draining() {
         assert!(
             Instant::now() < drain_deadline,
             "readiness did not reach Draining"

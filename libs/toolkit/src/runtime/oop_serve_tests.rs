@@ -263,8 +263,6 @@ use cf_system_sdks::directory::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::runtime::ResolvedRestEndpoints;
-
 /// Stub directory that fails `resolve_rest_service` a fixed number of times
 /// before succeeding, so `/readyz` can be observed transitioning 503 → 200.
 struct E2eDirectory {
@@ -347,7 +345,6 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
     });
 
     let readiness = readiness(["dep"]);
-    let resolved = Arc::new(ResolvedRestEndpoints::new());
     let cancel = CancellationToken::new();
 
     let gear_router = Router::new().route("/ping", get(|| async { "pong" }));
@@ -367,10 +364,9 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
         internal_authenticator: None,
     };
 
-    let mut server =
-        super::OopHttpServer::start(Arc::clone(&readiness), resolved, options, cancel.clone())
-            .await
-            .expect("server should bind");
+    let mut server = super::OopHttpServer::start(Arc::clone(&readiness), options, cancel.clone())
+        .await
+        .expect("server should bind");
 
     // 1. Liveness is up BEFORE gear routes are attached (probe-first bind).
     assert!(
@@ -386,11 +382,7 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
     );
 
     // 3. Attach the composed gear routes (simulates post-start()).
-    server.attach(
-        gear_router,
-        "{\"openapi\":\"3.1.0\"}".to_owned(),
-        vec!["dep".to_owned()],
-    );
+    server.attach(gear_router, "{\"openapi\":\"3.1.0\"}".to_owned());
 
     // 4. Gear routes now serve.
     assert!(
@@ -398,7 +390,16 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
         "gear route should serve after attach"
     );
 
-    // 5. /readyz is 503 until the dependency resolves, then flips to 200.
+    // 5. /readyz is 503 while the consumed dependency is unresolved. Dependency
+    // resolution now happens in the proxy-wiring phase (typed
+    // `#[toolkit::consumes]` clients feeding the shared DependencyChecker); here
+    // we simulate that resolution to prove the probe flips 503 → 200.
+    assert_eq!(
+        http_get(addr, "/readyz").await,
+        Some(503),
+        "/readyz should be 503 while `dep` is unresolved"
+    );
+    readiness.mark_dep_resolved("dep");
     assert!(
         poll_status(addr, "/readyz", 200, Duration::from_secs(3)).await,
         "/readyz should transition to 200 after dep resolves"
@@ -422,7 +423,6 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
 #[tokio::test]
 async fn ephemeral_listen_port_updates_advertise_uri() {
     let readiness = readiness(Vec::<String>::new());
-    let resolved = Arc::new(ResolvedRestEndpoints::new());
     let cancel = CancellationToken::new();
 
     let options = OopServeOptions {
@@ -443,7 +443,7 @@ async fn ephemeral_listen_port_updates_advertise_uri() {
         internal_authenticator: None,
     };
 
-    let server = super::OopHttpServer::start(readiness, resolved, options, cancel.clone())
+    let server = super::OopHttpServer::start(readiness, options, cancel.clone())
         .await
         .expect("server should bind on ephemeral port");
 
@@ -469,7 +469,6 @@ async fn ephemeral_listen_port_updates_advertise_uri() {
 #[tokio::test]
 async fn user_advertise_uri_is_not_overwritten_by_ephemeral_bind_port() {
     let readiness = readiness(Vec::<String>::new());
-    let resolved = Arc::new(ResolvedRestEndpoints::new());
     let cancel = CancellationToken::new();
 
     let options = OopServeOptions {
@@ -490,7 +489,7 @@ async fn user_advertise_uri_is_not_overwritten_by_ephemeral_bind_port() {
         internal_authenticator: None,
     };
 
-    let server = super::OopHttpServer::start(readiness, resolved, options, cancel.clone())
+    let server = super::OopHttpServer::start(readiness, options, cancel.clone())
         .await
         .expect("server should bind on ephemeral port");
 
@@ -517,7 +516,6 @@ async fn gear_handler_receives_connect_info_through_fallback() {
 
     let addr = free_addr();
     let readiness = readiness(Vec::<String>::new());
-    let resolved = Arc::new(ResolvedRestEndpoints::new());
     let cancel = CancellationToken::new();
 
     let options = OopServeOptions {
@@ -538,15 +536,11 @@ async fn gear_handler_receives_connect_info_through_fallback() {
         internal_authenticator: None,
     };
 
-    let mut server = super::OopHttpServer::start(readiness, resolved, options, cancel.clone())
+    let mut server = super::OopHttpServer::start(readiness, options, cancel.clone())
         .await
         .expect("server should bind");
 
-    server.attach(
-        Router::new().route("/peer", get(peer)),
-        "{}".to_owned(),
-        vec![],
-    );
+    server.attach(Router::new().route("/peer", get(peer)), "{}".to_owned());
 
     // A `200` proves the gear handler's `ConnectInfo<SocketAddr>` extractor found
     // the connect-info in the request extensions *through* the swap fallback — a

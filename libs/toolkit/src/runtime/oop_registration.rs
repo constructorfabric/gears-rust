@@ -1,36 +1,29 @@
-//! Background self-registration and dependency resolution for `OoP` gears
+//! Background self-registration (directory presence) for `OoP` gears
 //! (`cpt-cf-component-oop-bootstrap`).
 //!
-//! Both run as non-blocking background tasks so the HTTP server and its probes
-//! are up immediately:
+//! **Presence** ([`presence_loop`]) is the single owner of this instance's
+//! `DirectoryService` presence. It registers the instance's gRPC/REST endpoints
+//! and `OpenAPI` spec (retrying with exponential backoff, 100ms → 30s cap), then
+//! runs one loop that both sends periodic **heartbeats** (the steady-state
+//! liveness signal the directory uses to keep the instance routable) and
+//! periodically **re-registers** to self-heal after a `DirectoryService` restart
+//! / connection loss. Consolidating both into one task (owned by the `OoP` serve
+//! lifecycle) avoids the split-brain where an independent heartbeat task and a
+//! re-registration task raced to write conflicting liveness state onto the same
+//! directory record.
 //!
-//! - **Presence** ([`presence_loop`]) is the single owner of this instance's
-//!   `DirectoryService` presence. It registers the instance's gRPC/REST
-//!   endpoints and `OpenAPI` spec (retrying with exponential backoff,
-//!   100ms → 30s cap), then runs one loop that both sends periodic **heartbeats**
-//!   (the steady-state liveness signal the directory uses to keep the instance
-//!   routable) and periodically **re-registers** to self-heal after a
-//!   `DirectoryService` restart / connection loss. Consolidating both into one task (owned
-//!   by the `OoP` serve lifecycle) avoids the split-brain where an independent
-//!   heartbeat task and a re-registration task raced to write conflicting
-//!   liveness state onto the same directory record.
-//! - **Dependency resolution** ([`resolve_deps`]) polls
-//!   `DirectoryService.resolve_rest_service` for each declared dependency, wires
-//!   the resolved base URL into the [`ClientHub`] via [`ResolvedRestEndpoints`],
-//!   and marks the dep resolved so `/readyz` can flip to `200`.
-//!
-//! In Profile 1 (in-process) dependency resolution is a no-op — the topo-sorted
-//! `HostRuntime` already guarantees deps are initialized.
+//! Dependency resolution is **not** here: consumers are wired by the
+//! proxy-wiring phase via typed `#[toolkit::consumes]` directory-resolving
+//! clients, which feed the shared
+//! [`DependencyChecker`](super::readiness::DependencyChecker) that gates
+//! `/readyz`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 
 use cf_system_sdks::directory::{DirectoryClient, RegisterInstanceInfo};
-
-use super::readiness::ReadinessState;
 
 /// Initial retry backoff for registration and dependency polling.
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -50,47 +43,6 @@ async fn sleep_or_cancel(dur: Duration, cancel: &CancellationToken) -> bool {
     tokio::select! {
         () = cancel.cancelled() => false,
         () = tokio::time::sleep(dur) => true,
-    }
-}
-
-/// Resolved REST base URLs for the gear's dependencies, keyed by gear name.
-///
-/// Registered into the [`ClientHub`] by the `OoP` bootstrap and populated as
-/// dependencies resolve. Until typed REST client codegen lands, gears look up a
-/// dependency's base URL here (`hub.get::<ResolvedRestEndpoints>()`).
-#[derive(Debug, Default)]
-pub struct ResolvedRestEndpoints {
-    inner: DashMap<String, String>,
-}
-
-impl ResolvedRestEndpoints {
-    /// Create an empty registry.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record a resolved base URL for `gear`.
-    pub fn set(&self, gear: impl Into<String>, uri: impl Into<String>) {
-        self.inner.insert(gear.into(), uri.into());
-    }
-
-    /// Look up the resolved base URL for `gear`, if known.
-    #[must_use]
-    pub fn get(&self, gear: &str) -> Option<String> {
-        self.inner.get(gear).map(|v| v.value().clone())
-    }
-
-    /// Number of resolved dependencies.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Returns `true` if no dependencies have been resolved yet.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
     }
 }
 
@@ -188,58 +140,6 @@ pub(super) async fn presence_loop(
                 }
             }
         }
-    }
-}
-
-/// Poll for a single dependency until resolved (or cancelled), then wire it into
-/// the resolved-endpoints registry and mark it resolved in readiness.
-async fn resolve_one_dep(
-    directory: Arc<dyn DirectoryClient>,
-    dep: String,
-    readiness: Arc<ReadinessState>,
-    resolved: Arc<ResolvedRestEndpoints>,
-    cancel: CancellationToken,
-) {
-    let mut backoff = INITIAL_BACKOFF;
-    loop {
-        if cancel.is_cancelled() {
-            return;
-        }
-        match directory.resolve_rest_service(&dep).await {
-            Ok(endpoint) => {
-                tracing::info!(dep = %dep, endpoint = %endpoint.uri, "resolved REST dependency");
-                resolved.set(dep.clone(), endpoint.uri);
-                readiness.mark_dep_resolved(&dep);
-                return;
-            }
-            Err(e) => {
-                tracing::debug!(dep = %dep, error = %e, "dependency not yet resolvable; retrying");
-                if !sleep_or_cancel(backoff, &cancel).await {
-                    return;
-                }
-                backoff = next_backoff(backoff);
-            }
-        }
-    }
-}
-
-/// Spawn one resolution task per dependency. Each resolves independently and
-/// gates `/readyz` via `readiness`. A no-op when `deps` is empty (Profile 1).
-pub(super) fn resolve_deps(
-    directory: &Arc<dyn DirectoryClient>,
-    deps: Vec<String>,
-    readiness: &Arc<ReadinessState>,
-    resolved: &Arc<ResolvedRestEndpoints>,
-    cancel: &CancellationToken,
-) {
-    for dep in deps {
-        tokio::spawn(resolve_one_dep(
-            Arc::clone(directory),
-            dep,
-            Arc::clone(readiness),
-            Arc::clone(resolved),
-            cancel.clone(),
-        ));
     }
 }
 

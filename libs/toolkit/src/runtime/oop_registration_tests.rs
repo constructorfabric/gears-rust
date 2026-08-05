@@ -140,56 +140,8 @@ async fn presence_loop_registers_once_then_heartbeats_until_cancel() {
     task.await.unwrap();
 }
 
-#[tokio::test]
-async fn dep_resolution_marks_readiness_and_wires_endpoint() {
-    let directory: Arc<dyn DirectoryClient> = Arc::new(StubDirectory::new(0, 2));
-    let readiness = ReadinessState::new(
-        ["catalog"],
-        Arc::new(crate::healthcheck::RestHealthcheckRegistry::new()),
-    );
-    let resolved = Arc::new(ResolvedRestEndpoints::new());
-    let cancel = CancellationToken::new();
-
-    resolve_one_dep(
-        Arc::clone(&directory),
-        "catalog".to_owned(),
-        Arc::clone(&readiness),
-        Arc::clone(&resolved),
-        cancel,
-    )
-    .await;
-
-    assert!(readiness.all_deps_resolved());
-    assert_eq!(
-        resolved.get("catalog"),
-        Some("http://catalog:8080".to_owned())
-    );
-}
-
-#[tokio::test]
-async fn resolve_deps_empty_is_noop() {
-    let directory: Arc<dyn DirectoryClient> = Arc::new(StubDirectory::new(0, 0));
-    let readiness = ReadinessState::new(
-        Vec::<String>::new(),
-        Arc::new(crate::healthcheck::RestHealthcheckRegistry::new()),
-    );
-    let resolved = Arc::new(ResolvedRestEndpoints::new());
-    resolve_deps(
-        &directory,
-        vec![],
-        &readiness,
-        &resolved,
-        &CancellationToken::new(),
-    );
-    assert!(readiness.all_deps_resolved());
-}
-
-#[test]
-fn resolved_endpoints_basic_ops() {
-    let r = ResolvedRestEndpoints::new();
-    assert!(r.is_empty());
-    r.set("a", "http://a");
-    assert_eq!(r.len(), 1);
-    assert_eq!(r.get("a"), Some("http://a".to_owned()));
-    assert_eq!(r.get("b"), None);
-}
+// Dependency resolution moved to the proxy-wiring phase (typed
+// `#[toolkit::consumes]` clients feeding the shared `DependencyChecker`); the
+// former `resolve_one_dep`/`resolve_deps`/`ResolvedRestEndpoints` stopgap and
+// its tests were retired. Consumer-wiring resolution is covered by
+// `host_runtime` proxy-wiring tests and the api-contracts example E2E tests.

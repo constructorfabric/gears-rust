@@ -511,10 +511,10 @@ async fn health_endpoints_absent_from_openapi() {
 /// Liveness (`/healthz`) is a static handler and must stay 200 throughout.
 #[tokio::test]
 async fn readyz_reflects_process_readiness_state() {
-    use toolkit::{ReadinessHealthcheck, ReadinessState};
+    use toolkit::{DependencyChecker, ReadinessHealthcheck};
 
     // Unresolved dependency → Starting → 503, but /healthz stays 200.
-    let starting = Arc::new(ReadinessState::new());
+    let starting = Arc::new(DependencyChecker::new());
     starting.register_dep("billing");
     let router = build_standalone_health_router(|reg| {
         reg.register(
@@ -531,7 +531,7 @@ async fn readyz_reflects_process_readiness_state() {
 
     // Fresh router with a resolved state → Ready → 200. (A fresh registry
     // avoids the ~2s report cache from the previous instance.)
-    let ready = Arc::new(ReadinessState::new());
+    let ready = Arc::new(DependencyChecker::new());
     ready.register_dep("billing");
     ready.mark_resolved("billing");
     let router = build_standalone_health_router(|reg| {
