@@ -542,6 +542,8 @@ A staged, not-yet-applied mutation. Does not affect running services until Apply
 | `staged_at` | `timestamptz` | Yes | UTC timestamp. |
 | `applied_at` | `timestamptz` | No | Set when the change reaches `applied`. |
 
+**Invariants:** a `set` or `clone` carries **exactly one** of `staged_value` / `staged_secret_ref`; a `revert` or `remove` carries **neither** — both enforced by `CHECK` (§4.6). Which of the two a `set` uses follows the declaration's `secret` trait, enforced in the staging transaction rather than by a constraint, since the trait is not denormalized onto this table (§4.6). A `clone` is never secret-backed: cloning a `secret`-classified value is refused (§4.2 *Staging Manager*).
+
 **Invariants:** at most one `pending`/`applying` change per `(declaration_id, scope)`; a new staged change supersedes a prior discarded one.
 
 #### Enum: `ChangeType` / `PendingStatus`
@@ -1499,7 +1501,7 @@ Uniqueness is two **partial** unique indexes because `NULL` marks platform scope
 | `staged_at` | `timestamptz` | No | current timestamp | |
 | `applied_at` | `timestamptz` | Yes | — | |
 
-**Constraints/Indexes:** partial unique `uq_pending_active` (`declaration_id`, `scope`) where `status IN ('pending','applying')` — at most one active pending change per setting+scope; `idx_pending_scope` (`scope`); `idx_pending_status` (`status`).
+**Constraints/Indexes:** `CHECK (num_nonnulls(staged_value, staged_secret_ref) = CASE WHEN change_type IN ('set','clone') THEN 1 ELSE 0 END)` — a `set` or `clone` carries **exactly one** representation, a `revert` or `remove` carries **neither**; without it a staged change could be simultaneously doubly-valued and, for a `revert`, carry a value Apply has no reason to read. **Which** of the two a `set` may use follows the declaration's `secret` trait, and that cannot be a `CHECK` here — the trait lives on `setting_declarations` and this table keeps no denormalized copy, unlike `setting_values` where one exists for the search-index predicates. It is enforced in the staging transaction instead, which resolves the declaration anyway to validate the value against its type (§4.2 *Staging Manager*). A `clone` never stages a secret at all: cloning a `secret`-classified value is refused outright (§4.2 *Staging Manager* `clone_override`), so `staged_secret_ref` stays `NULL` for that change type. Partial unique `uq_pending_active` (`declaration_id`, `scope`) where `status IN ('pending','applying')` — at most one active pending change per setting+scope; `idx_pending_scope` (`scope`); `idx_pending_status` (`status`).
 
 #### Table: `apply_operations`
 
@@ -1978,6 +1980,7 @@ The targets above are validated against these order-of-magnitude bounds. They ar
 | Tenant isolation scoping | Must verify real `WHERE` generation, not application filtering |
 | FK `ON DELETE RESTRICT`/`CASCADE` (categories, values) | No-orphan and cleanup invariants are DB-level |
 | Partial unique pending index | At-most-one active pending per setting+scope is DB-enforced |
+| Staged value representation | A `set`/`clone` with both or neither of `staged_value`/`staged_secret_ref` is rejected by the `CHECK`, as is a `revert`/`remove` carrying either; a `set` on a secret-trait declaration that stages `staged_value` instead of `staged_secret_ref` is rejected by the staging transaction (§4.6, §4.2 *Staging Manager*) |
 
 #### Concurrency Testing
 
