@@ -110,7 +110,7 @@ A family-scoped record still exists, in a much reduced form. It binds a family k
 
 P1 has no named consumer for owner-authored deprecation: the requirement was introduced as machinery for the one-usable-member invariant, not in response to a stated need. It is therefore not built.
 
-Nor is it scheduled for P2. The absence of a named consumer is not a P1 accident that the next phase resolves, and none of the P2 capabilities — Aliases, casting, Validation Hooks, tenant enablement, SDK caching — needs it or is blocked by it. Deprecation is deferred until a consumer names it, and PRD open question 1 stays open until then rather than being carried as scheduled work.
+Nor is it scheduled for P2. The absence of a named consumer is not a P1 accident that the next phase resolves, and none of the P2 capabilities — Aliases, casting, Validation Hooks, tenant enablement — needs it or is blocked by it. Deprecation is deferred until a consumer names it, and PRD open question 1 stays open until then rather than being carried as scheduled work.
 
 Deferring it is safe precisely because a deprecated entity would behave identically to an active one — it would remain resolvable, discoverable, tenant-available, and valid as a reference target, and would only discourage new adoption. Nothing in P1 depends on its absence, so introducing it later is additive and requires no migration of P1 state.
 

@@ -60,8 +60,10 @@ A revision and a current-state projection hold different facts rather than two c
 | `cpt-cf-types-registry-fr-registration-authority` | Global writes accepted only on the platform plane under `PlatformSecurityContext`; tenant writes authorized by the PDP against the candidate's GTS Identifier as a resource property, evaluated before identifier availability so the bounded name-availability disclosure cannot become a namespace probe. |
 | `cpt-cf-types-registry-fr-tenant-availability` | Verdict computed by the registry from the entity's own state and the requesting tenant's ancestor chain, as one SQL predicate; never recomputed by consumers. In P1 no dependency can make a visible entity unavailable, so no closure is traversed. |
 | `cpt-cf-types-registry-fr-lifecycle` | `ACTIVE` and `DELETED` for Managed Entities; no newest-member statement, with exact family enumeration offered as a discovery filter instead; deletion blocked from local state while any registered dependent exists. |
+| `cpt-cf-types-registry-fr-externally-managed-entities` | No row, column, or projection of an external entity anywhere in §3.7; results enter live, are checked against the platform invariants of §3.2 — identifier integrity, derived reference equality, claim conformance, entity kind, ownership scope, revision and hash consistency — and leave. The managed-only tail of the read result sits in an `Origin` variant rather than in nullable fields, so a write precondition on an external entity does not compile. Returned content is never parsed, so the external half of the boundary rule is declared and not enforced. |
 | `cpt-cf-types-registry-fr-registry-federation`, `cpt-cf-types-registry-fr-registry-source-routing` | Managed storage consulted first, then non-overlapping Source Claims in deterministic priority order; claims are rooted single-segment patterns, so an identifier's owning source follows from its first segment, an external entity's whole derivation chain sits in one claim, and the two identifier spaces stay disjoint; capability profile enforced at claim activation, with no write path granted to a plugin. |
 | `cpt-cf-types-registry-fr-cache-freshness-metadata` | Every read carries an opaque composite validator, computed per request and never stored, published atomically with the mutation that invalidates it. Its components differ by origin: a managed one digests entity revision, closure fingerprint, tenant ancestor-chain version, and the normalized projection, while an external one additionally carries the source's revision and hash verbatim, because the registry keeps no copy to compare against. |
+| `cpt-cf-types-registry-fr-client-cache` | One SDK store per client instance, keyed by entity key, Context Tenant, and normalized projection because the validator digests the last two; bounded staleness whose safe direction comes from ADR-0003, with unstable entities excluded from it; revalidation coalesced onto the caller's own batch read rather than scheduled; fail-closed on revalidation failure. |
 | `cpt-cf-types-registry-fr-two-phase-init` | One plane per batch, dependency-aware partial admission with atomic cyclic dependency groups, no global startup barrier, and readiness gated by each registrant on its own required candidate outcomes. |
 
 #### NFR Allocation
@@ -71,7 +73,7 @@ A revision and a current-state projection hold different facts rather than two c
 | `cpt-cf-types-registry-nfr-lookup-latency` | Exact lookup p95 < 10 ms | Resolution path: identity mapping, current-state read, availability evaluation | Reference derived in-process rather than looked up; effective content read from the current-state row and authored content from the single revision it points at, both keyed on the entity with no history scan; availability decided in SQL from the entity's own state plus a cached tenant ancestor chain, with no dependency traversal; no plugin call can occur on a managed path because ADR-0011 admits no edge across the boundary in either direction. | Automated benchmark against the profile in §4, *Benchmark profile*. |
 | `cpt-cf-types-registry-nfr-query-latency` | Bounded search p95 < 100 ms (P2) | Discovery and query assistance | Pattern compiled to an index range predicate over the canonical identifier; over-returned candidates filtered in memory by the GTS matcher; federated expansion source-major with bounded internal paging. | Automated benchmark against the profile in §4, *Benchmark profile*. |
 | `cpt-cf-types-registry-nfr-multi-pod-correctness` | Committed mutations visible on every pod's first post-commit read | Storage, outbox worker, and caching layers | The platform database is the only authoritative store; the leased ToolKit outbox excludes concurrent claims while idempotent admission commits remain safe after lease expiry or duplicate delivery; every state transition and its validator metadata commit in one transaction; process-local state is confined to derived caches that are validated against a committed token before use and never consulted as authority. | Integration tests exercising duplicate delivery, lease expiry, concurrent first-family admission, and commit-then-read across pods. |
-| `cpt-cf-types-registry-nfr-cache-correctness` | No invalidated result accepted as current (P2) | SDK client cache | Opaque composite validator returned with every result and required on revalidation; a cache entry is current only while its validator matches. | Integration tests covering mutation, revalidation, and stale-entry rejection. |
+| `cpt-cf-types-registry-nfr-cache-correctness` | No invalidated result accepted as current | SDK client cache | Opaque composite validator returned with every result and required on revalidation; past its freshness window an entry is served only if the registry confirms it, a failed revalidation is not served at all, and a successful mutation drops its own keys. §3.3, *The client-side cache*. | Integration tests covering mutation, revalidation, stale-entry rejection, and the unstable-entity carve-out. |
 
 #### Key ADRs
 
@@ -1162,6 +1164,11 @@ pub struct BatchGet {
     /// A validator makes the read conditional for that key alone.
     pub keys: Vec<(EntityKey, Option<Validator>)>,
     pub projection: Projection,
+    /// Bypasses the SDK cache's freshness window for this call, revalidating
+    /// every key rather than serving any from the store. An SDK-side field with
+    /// no wire counterpart — the registry holds no cache — which is why no
+    /// parameter table above lists it. See §3.3, *The client-side cache*.
+    pub fresh: bool,
 }
 
 /// `Projection::default()` requests nothing explicitly and yields the default
@@ -1445,6 +1452,79 @@ Two tenants therefore act on one read, and keeping them apart is a disclosure re
 Kind narrowing costs no round trip: the kind is the trailing `~` of the identifier, so `get_type_schema` given an Instance identifier fails locally before a request is made. Even reaching the server would find nothing, since ADR-0004's kind-exclusive family key means the two spellings cannot both be registered.
 
 Callers compare only canonical authored content when deciding whether a definition needs registration; dependency-derived effective content is not part of content equality.
+
+##### The client-side cache
+
+- [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-sdk-cache`
+
+`cpt-cf-types-registry-fr-client-cache` makes SDK caching P1. It is not what makes resolution correct — the validator and the conditional read above are — and it does not run inside this gear: it lives in the consumer's process, which is why no component of §3.2 owns it and why the layering rule that no authoritative decision is taken from process-local state (§1.3) does not reach it. That rule governs decisions *Types Registry* takes. A consumer's cache is the consumer's trade, and what this design owes is that the trade be bounded and stated rather than reinvented per gear.
+
+**One store per client instance, keyed by the representation.** A key is `(EntityKey, Context Tenant, normalized projection)`; an entry holds the snapshot, its validator, and the instant the validator was last confirmed.
+
+The three components are structural rather than chosen. A validator digests the tenant ancestor-chain version and the normalized projection (§3.3, *What a validator is made of*), so an entry obtained under one tenant or one projection can never be revalidated on behalf of another — presenting it would yield a full result rather than a false `unchanged`, so the failure is benign, but the entry would be permanently unhittable and the store would fill with keys that can only miss. Two components a reader may expect are deliberately absent. The **plane** is implicit, because each client instance carries one context and owns its own store. The **requesting principal** is absent because the read path is not grant-filtered (§3.2, *Registration authority is a grant over an identifier region*) and visibility is the tenant descendant relation, so two subjects in one tenant are owed the same result; keying on the principal would partition the store for no disclosure it prevents.
+
+**An entry is indexed under both of its keys.** A read by GTS Identifier returns `gts_uuid` and a read by `gts_uuid` returns `gts_id`, so one fetch already answers both directions. Indexing both costs a second map entry and removes the case where a gear that stores references and renders identifiers misses on every row it displays.
+
+##### Bounded staleness, and the one direction in which it is safe
+
+Within a freshness window an entry is served without contacting the registry. Past the window it is revalidated by a conditional read and served only if the registry confirms it.
+
+This is what `cpt-cf-types-registry-nfr-cache-correctness` requires and not less than it: the threshold is that no invalidated result is accepted as current **after the relevant mutation is observed by the client**, and inside the window nothing has been observed. What the NFR forbids is continuing to serve an entry the client has been told is stale, which is a property of the eviction rule below rather than of the window.
+
+The window is defensible for content because of ADR-0003, and only there. Under enforced backward compatibility `Valid(current) ⊆ Valid(candidate)`, so a cached Type Schema that has since been superseded accepts a **subset** of what the current revision accepts. Validating against it can therefore reject an instance the registry would now admit, and can never admit one it would now reject. Staleness fails in the conservative direction, which is why a window is acceptable at all rather than merely convenient.
+
+Two cases escape that argument and are handled explicitly.
+
+**An unstable Type Schema is never served from cache.** ADR-0015 enforces no compatibility mode on a major-0 entity, so a superseded revision of one may accept anything, and the conservative direction is lost. The check needs no lookup and no stored flag: the major is a field of the identifier the SDK already holds, exactly as admission reads it. Such an entity is fetched on every read.
+
+**The availability verdict tolerates less staleness than content does.** ADR-0010 lets a verdict change with no mutation to the entity, and the sharp case is deletion: within the window a consumer can act on `AVAILABLE` for a contract that has been retired. The window is short for that reason rather than for content's. A caller that cannot accept it has two exits: the per-call `fresh` flag below, or a window of zero, which reduces the cache to payload suppression — every read revalidates, and an unchanged result transfers no document. Both are supported settings rather than degraded modes.
+
+##### Configuration
+
+| Knob | Default | Why this value |
+|---|---|---|
+| Freshness window | 30 s | Bounds how long a retired contract can be served as available, while letting a hot path serving hundreds of requests a second revalidate a given entity twice a minute rather than on every call. `0` is meaningful and supported |
+| Store bound | 64 MB of cached snapshots, evicted least-recently-used | §3.2, *Bounded inputs*, caps one resolved document at 1 MB, so an entry-count bound would bound memory to nothing useful — sixty-four entries could be 64 KB or 64 MB |
+| `fresh` on a read | false | Bypasses the window for one call and revalidates unconditionally. One boolean, and it is what makes the cache safe to leave enabled for a caller that occasionally needs an authoritative verdict |
+
+##### What is not cached
+
+Four results are deliberately excluded, each for its own reason.
+
+- **`NotFound`.** Registration is followed by a read often enough — the reconciliation workflow below does exactly that — that caching absence would make a newly admitted entity invisible for the length of the window. Negative caching buys a round trip on a path nobody is on.
+- **`Failed`.** A source that could not answer said nothing about the entity. Retaining that as knowledge is the conversion of unavailability into absence that ADR-0002 forbids the registry to make; the SDK does not make it either.
+- **A `ConcreteReferenceSet`.** §3.3 already states that it carries no staleness contract and must not be cached: it is not a snapshot, and a validator over it would have to cover the availability inputs of every member.
+- **A discovery page.** `list_entities` answers one question whose answer is a set, bounded by pagination as well as by the filter, and its members change independently of any one of them. A validator is issued per entity, so there is nothing to revalidate a page against; the individual entities on a page are also not stored, because a page is not an answer about a key. A caller wanting cached entities reads them by key.
+- **An operation resource.** `get_operation` reads progress that changes precisely because it is being polled.
+
+##### Revalidation is coalesced onto the caller's own batch, not scheduled
+
+There is no background task and no timer. An entry past its window is revalidated when it is next read, and a batch read is where that pays: for a caller presenting 500 keys of which 300 are expired, the SDK serves 200 from the store and issues **one** conditional `batchGet` carrying 300 validators. This is what `cpt-cf-types-registry-fr-client-cache` means by batch poll scheduling — it is coalesced onto work the caller was already doing rather than scheduled against a clock, which is why `POST /entities:batchGet` carries a validator per key at all.
+
+A background refresher was the alternative and is not built. It would put a lifecycle-managed task in every consumer process, and it would poll entities on behalf of a caller that may never read them again — the cost falls on the idle case and the benefit on the first read after expiry, which pays one round trip and no payload. If measurement shows that first read matters, a refresher is additive and reads the same store.
+
+**Revalidation failure is not an extension of the window.** An expired entry whose conditional read fails is not served; the SDK propagates the error. A cache that falls back to stale content when the registry is unreachable converts an outage into silently stale type authority, which is the failure `cpt-cf-types-registry-principle-fail-closed` exists to refuse and the one ADR-0001 names as belonging to the consumer's reliability policy.
+
+**A successful mutation invalidates its own keys.** `register_entities` and `delete_entities` return `gts_id` and `gts_uuid` per item, so the SDK drops exactly the affected entries when an operation terminates. Without it a gear that reconciles at startup and immediately reads would serve itself the value it just replaced.
+
+##### The ceiling this leaves
+
+Documents duplicate across tenants. The Context Tenant is in the key, so a multi-tenant consumer holding `$select=effective` for one hundred types across one thousand tenants stores one hundred thousand copies of content that is byte-identical in every one of them — only `availability` and `owned_by_caller` differ by tenant at all.
+
+The store bound turns that into eviction rather than exhaustion, so it is a hit-rate ceiling and not a correctness one. Two upgrades are available when it binds, and both are cheap because the projection is already part of the key: a shorter window for the default set than for `authored` and `effective`, which is the split the staleness argument above already implies; and a content-addressed layer under the key map, so that entries agreeing on `content_hash` share one copy of the document. Neither is built, because a consumer's tenant fan-out is not something this design can measure from here.
+
+##### Verification
+
+`cpt-cf-types-registry-nfr-cache-correctness` is verified by integration tests over a real client and registry:
+
+- a mutation followed by a read inside the window serves the previous snapshot, and the same read after the window serves the new one;
+- the same read with `fresh` serves the new one immediately, and with a window of zero every read revalidates and an unchanged result transfers no document;
+- a deleted entity is not served as available past the window;
+- an expired entry whose revalidation fails is not served at all;
+- an unstable Type Schema is fetched on every read regardless of the window;
+- a terminal `register_entities` or `delete_entities` drops the affected entries, so the next read reflects the mutation with no window elapsing;
+- a batch read of cached and expired keys issues exactly one conditional `batchGet`, carrying validators only for the expired ones;
+- a validator obtained under one projection or one Context Tenant is never presented under another.
 
 ##### Where the desired definitions come from
 
@@ -1796,7 +1876,7 @@ Design decisions this document deliberately leaves unmade. Two rules govern the 
 | # | Question | Affects |
 |---|----------|---------|
 | D1 | The GTS Type that declares a P2 owning-gear Validation Hook: what a binding selects on, and what the built-in validator enforces about it. It cannot be settled ahead of the hook mechanism itself, since the declaration's shape follows from binding, execution, authentication, timeout, and failure policy — which `cpt-cf-types-registry-fr-validation-hooks` leaves to P2 and the PRD lists as a risk to close before implementation. The federation half of the same question is settled in §3.2 | `cpt-cf-types-registry-component-control-plane-validator` |
-| D2 | Alias chaining, retargeting, and canonical Alias content. An Alias is a Managed Entity with its own Registry Reference (ADR-0001), so the P1 reference contract does not change; what is undecided is whether an Alias may target another Alias, whether its target may be changed after admission, and what document an Alias resolution returns | `cpt-cf-types-registry-fr-aliasing` |
+| D2 | What an Alias resolution returns. An Alias is a Managed Entity with its own Registry Reference (ADR-0001) and `cpt-cf-types-registry-fr-id-resolution` already requires reverse resolution to preserve the exact client-supplied Alias identifier while exposing target metadata separately, so the P1 reference contract does not change. What is undecided is the projection: whether a read of an Alias carries the target's authored and effective documents inline, a reference to them, or neither, and whether `$select` addresses the Alias or the target when the two differ. Whether an Alias may target another Alias, and whether its target may be retargeted after admission, are requirement questions and are PRD open question 6 | `cpt-cf-types-registry-fr-aliasing` |
 | D3 | How discovery excludes contracts an owner does not want adopted. A GTS wildcard has no negation and `GET /entities` has no stability parameter, so a catalogue view that wants published contracts only cannot express it (ADR-0015). The answer must decide whether it is a new parameter or a value of an existing one, and whether it reaches Externally Managed Entities, whose majors the platform does not interpret. It should be shaped to carry deprecation too if that is ever introduced, rather than becoming the first of two adjacent booleans | `cpt-cf-types-registry-fr-type-query-assistance` |
 | D4 | Whether retention should eventually reach **admitted revisions**, and with them the operations that produced them. P1 sweeps only unpinned operations (§3.2, *Operation retention*) and keeps every revision until purge, which is right while the registry holds contracts rather than volume. Three things have to be settled before it could reach further: what a revision is retained *for* once ADR-0003 has established that admission never reads history, so that a rule can say which revisions are no longer needed; where the admitting principal lives once an operation may outlive nothing, since both revision tables deliberately do not duplicate it and reach it through `operation_item_id` instead; and how any such sweep is reconciled with ADR-0013, which reserves the removal of admitted content to one operator-invoked act precisely so that no background process can do it | `cpt-cf-types-registry-component-operation-store`, ADR-0005, ADR-0006, ADR-0013 |
 
