@@ -1,13 +1,10 @@
 ---
 status: accepted
 date: 2026-07-26
+decision-makers: Constructor Fabric Steering Committee
 ---
 
 # Write Path and Admission Protocol
-
-**ID**: `cpt-cf-types-registry-adr-write-path-admission-protocol`
-
-## Table of Contents
 
 <!-- toc -->
 
@@ -23,8 +20,8 @@ date: 2026-07-26
   - [Batches use dependency-aware partial admission](#batches-use-dependency-aware-partial-admission)
   - [Startup is caller-side reconciliation, not a global barrier](#startup-is-caller-side-reconciliation-not-a-global-barrier)
   - [Control-plane records are registry entities with built-in validators](#control-plane-records-are-registry-entities-with-built-in-validators)
-- [Consequences](#consequences)
-- [Confirmation](#confirmation)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
   - [Always synchronous](#always-synchronous)
   - [Deadline-based inline completion](#deadline-based-inline-completion)
@@ -37,6 +34,8 @@ date: 2026-07-26
 - [Traceability](#traceability)
 
 <!-- /toc -->
+
+**ID**: `cpt-cf-types-registry-adr-write-path-admission-protocol`
 
 ## Context and Problem Statement
 
@@ -104,6 +103,12 @@ For startup:
 * caller-side read, reconcile, conditional registration, retry, and readiness gating.
 
 ## Decision Outcome
+
+Chosen options, one per dimension: **always-asynchronous execution with no synchronous no-op path**, **request idempotency plus an explicit entity resource-version precondition**, **dependency-aware partial admission with atomic dependency groups**, and **caller-side read, reconcile, conditional registration, retry, and readiness gating**.
+
+They are selected together because each protects a different one of the three concurrency forms the problem statement keeps apart, and none of them has to be withdrawn when P2 hooks make an operation's duration unbounded. A single acceptance shape means no successful response depends on load, timing, or whether a batch happened to change anything; a request key replays a request while a resource version guards a write, so a retry and a stale writer are answered differently; partial admission lets independent candidates progress without abandoning dependency ordering or cycle atomicity; and caller-side reconciliation keeps Types Registry off the platform boot path, which no server-side barrier could.
+
+The sections below state each choice in full.
 
 ### Actual mutations are always asynchronous
 
@@ -202,7 +207,7 @@ Registry Source Plugin configuration and, in P2, Validation Hook declarations ar
 
 Types Registry provides a closed in-process validator for these platform-defined control-plane types. It is not registered or extensible and is distinct from P2 semantic hooks. It enforces Source Claim non-overlap, retired-claim reservations, capability requirements, and the prohibition on tenant-scoped control-plane instances. Their base schemas are trusted platform seeds and do not depend on user definitions.
 
-## Consequences
+### Consequences
 
 * Real registration work always costs at least acceptance plus operation polling; the SDK hides that loop for callers that want a terminal result.
 * Every accepted POST costs an operation, its candidate rows, an outbox message, and a poll. The startup helper avoids the POST entirely, so no correct path pays this.
@@ -214,7 +219,7 @@ Types Registry provides a closed in-process validator for these platform-defined
 * Types Registry leaves the platform startup critical path; each registrant owns its retry and readiness.
 * The worker must be safe under outbox redelivery and lease expiry.
 
-## Confirmation
+### Confirmation
 
 This decision is confirmed when:
 

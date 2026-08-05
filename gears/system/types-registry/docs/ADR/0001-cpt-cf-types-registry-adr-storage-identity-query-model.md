@@ -1,13 +1,10 @@
 ---
 status: accepted
 date: 2026-07-23
+decision-makers: Constructor Fabric Steering Committee
 ---
 
 # Storage Identity and Query Model for GTS References
-
-**ID**: `cpt-cf-types-registry-adr-storage-identity-query-model`
-
-## Table of Contents
 
 <!-- toc -->
 
@@ -33,6 +30,8 @@ date: 2026-07-23
 - [Traceability](#traceability)
 
 <!-- /toc -->
+
+**ID**: `cpt-cf-types-registry-adr-storage-identity-query-model`
 
 ## Context and Problem Statement
 

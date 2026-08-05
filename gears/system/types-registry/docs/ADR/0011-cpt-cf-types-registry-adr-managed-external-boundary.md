@@ -1,13 +1,10 @@
 ---
 status: accepted
 date: 2026-07-29
+decision-makers: Constructor Fabric Steering Committee
 ---
 
 # The Managed–External Boundary
-
-**ID**: `cpt-cf-types-registry-adr-managed-external-boundary`
-
-## Table of Contents
 
 <!-- toc -->
 
@@ -35,6 +32,8 @@ date: 2026-07-29
 - [Traceability](#traceability)
 
 <!-- /toc -->
+
+**ID**: `cpt-cf-types-registry-adr-managed-external-boundary`
 
 ## Context and Problem Statement
 
@@ -286,6 +285,7 @@ Retained here because it was the alternative to registration under the asymmetri
 ## Traceability
 
 - **PRD**: [../PRD.md](../PRD.md)
+- **DESIGN**: [../DESIGN.md](../DESIGN.md)
 - **ADR-0001**: [0001-cpt-cf-types-registry-adr-storage-identity-query-model.md](./0001-cpt-cf-types-registry-adr-storage-identity-query-model.md)
 - **ADR-0002**: [0002-cpt-cf-types-registry-adr-external-source-live-delegation.md](./0002-cpt-cf-types-registry-adr-external-source-live-delegation.md)
 - **ADR-0003**: [0003-cpt-cf-types-registry-adr-type-schema-evolution-compatibility.md](./0003-cpt-cf-types-registry-adr-type-schema-evolution-compatibility.md)

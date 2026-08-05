@@ -1,13 +1,10 @@
 ---
 status: accepted
 date: 2026-07-23
+decision-makers: Constructor Fabric Steering Committee
 ---
 
 # Federated Registry Source Routing and Query Strategy
-
-**ID**: `cpt-cf-types-registry-adr-federated-source-routing-query`
-
-## Table of Contents
 
 <!-- toc -->
 
@@ -26,6 +23,8 @@ date: 2026-07-23
 - [Traceability](#traceability)
 
 <!-- /toc -->
+
+**ID**: `cpt-cf-types-registry-adr-federated-source-routing-query`
 
 ## Context and Problem Statement
 

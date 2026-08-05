@@ -1,13 +1,10 @@
 ---
 status: accepted
 date: 2026-07-27
+decision-makers: Constructor Fabric Steering Committee
 ---
 
 # Platform-Level Purge of Deleted Registry State
-
-**ID**: `cpt-cf-types-registry-adr-platform-purge-of-deleted-entities`
-
-## Table of Contents
 
 <!-- toc -->
 
@@ -34,6 +31,8 @@ date: 2026-07-27
 - [Traceability](#traceability)
 
 <!-- /toc -->
+
+**ID**: `cpt-cf-types-registry-adr-platform-purge-of-deleted-entities`
 
 ## Context and Problem Statement
 
@@ -207,6 +206,7 @@ This decision is confirmed when:
 ## Traceability
 
 - **PRD**: [../PRD.md](../PRD.md)
+- **DESIGN**: [../DESIGN.md](../DESIGN.md)
 - **ADR-0001**: [0001-cpt-cf-types-registry-adr-storage-identity-query-model.md](./0001-cpt-cf-types-registry-adr-storage-identity-query-model.md)
 - **ADR-0005**: [0005-cpt-cf-types-registry-adr-type-schema-revisions.md](./0005-cpt-cf-types-registry-adr-type-schema-revisions.md)
 - **ADR-0006**: [0006-cpt-cf-types-registry-adr-registered-instance-revisions.md](./0006-cpt-cf-types-registry-adr-registered-instance-revisions.md)

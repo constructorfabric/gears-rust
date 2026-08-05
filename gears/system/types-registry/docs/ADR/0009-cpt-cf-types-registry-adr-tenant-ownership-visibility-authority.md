@@ -1,13 +1,10 @@
 ---
 status: accepted
 date: 2026-07-26
+decision-makers: Constructor Fabric Steering Committee
 ---
 
 # Tenant Ownership, Visibility, and Management Authority
-
-**ID**: `cpt-cf-types-registry-adr-tenant-ownership-visibility-authority`
-
-## Table of Contents
 
 <!-- toc -->
 
@@ -36,6 +33,8 @@ date: 2026-07-26
 - [Traceability](#traceability)
 
 <!-- /toc -->
+
+**ID**: `cpt-cf-types-registry-adr-tenant-ownership-visibility-authority`
 
 ## Context and Problem Statement
 
@@ -274,6 +273,7 @@ This decision is confirmed when:
 ## Traceability
 
 - **PRD**: [../PRD.md](../PRD.md)
+- **DESIGN**: [../DESIGN.md](../DESIGN.md)
 - **ADR-0001**: [0001-cpt-cf-types-registry-adr-storage-identity-query-model.md](./0001-cpt-cf-types-registry-adr-storage-identity-query-model.md)
 - **ADR-0002**: [0002-cpt-cf-types-registry-adr-external-source-live-delegation.md](./0002-cpt-cf-types-registry-adr-external-source-live-delegation.md)
 - **ADR-0004**: [0004-cpt-cf-types-registry-adr-gts-minor-version-identity-evolution.md](./0004-cpt-cf-types-registry-adr-gts-minor-version-identity-evolution.md)

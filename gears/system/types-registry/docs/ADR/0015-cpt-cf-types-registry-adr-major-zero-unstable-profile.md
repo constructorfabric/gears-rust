@@ -1,13 +1,10 @@
 ---
 status: accepted
 date: 2026-08-04
+decision-makers: Constructor Fabric Steering Committee
 ---
 
 # Unstable Major-Zero Profile for Managed Type Schemas
-
-**ID**: `cpt-cf-types-registry-adr-major-zero-unstable-profile`
-
-## Table of Contents
 
 <!-- toc -->
 
@@ -37,6 +34,8 @@ date: 2026-08-04
 - [Traceability](#traceability)
 
 <!-- /toc -->
+
+**ID**: `cpt-cf-types-registry-adr-major-zero-unstable-profile`
 
 ## Context and Problem Statement
 
