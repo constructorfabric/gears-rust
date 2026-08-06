@@ -227,8 +227,6 @@ Two developments retire the "no traversal needed" argument without touching the 
 - **ADR-0008**: [0008-cpt-cf-types-registry-adr-managed-version-family-lifecycle.md](./0008-cpt-cf-types-registry-adr-managed-version-family-lifecycle.md)
 - **ADR-0009**: [0009-cpt-cf-types-registry-adr-tenant-ownership-visibility-authority.md](./0009-cpt-cf-types-registry-adr-tenant-ownership-visibility-authority.md)
 - **ADR-0011**: [0011-cpt-cf-types-registry-adr-managed-external-boundary.md](./0011-cpt-cf-types-registry-adr-managed-external-boundary.md) — closes the boundary in both directions, which is why every availability-blocking relationship here holds between two Managed Entities.
-- **Design note**: [../design-notes/lifecycle-and-tenant-state-model.md](../design-notes/lifecycle-and-tenant-state-model.md)
-- **Design note**: [../design-notes/managed-entity-resource-versioning.md](../design-notes/managed-entity-resource-versioning.md)
 
 This decision directly addresses:
 

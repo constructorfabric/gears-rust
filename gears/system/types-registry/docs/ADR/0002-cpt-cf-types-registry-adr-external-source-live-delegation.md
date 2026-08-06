@@ -271,7 +271,6 @@ Live delegation is chosen against projection on the grounds that a second servin
 - **ADR-0011**: [0011-cpt-cf-types-registry-adr-managed-external-boundary.md](./0011-cpt-cf-types-registry-adr-managed-external-boundary.md)
 - **ADR-0008**: [0008-cpt-cf-types-registry-adr-managed-version-family-lifecycle.md](./0008-cpt-cf-types-registry-adr-managed-version-family-lifecycle.md) — makes deprecation owner intent rather than a consequence of succession, and defers the status out of P1 on the external side as well as the managed one, which is why the lifecycle mapping here has two values and a source assertion of deprecation is accepted but not relayed.
 - **ADR-0012**: [0012-cpt-cf-types-registry-adr-write-path-admission-protocol.md](./0012-cpt-cf-types-registry-adr-write-path-admission-protocol.md) — decides the question this ADR leaves open, making Registry Source Plugin configuration a Managed registered Instance governed by the ordinary write path.
-- **Design note**: [../design-notes/registry-federation-external-sources.md](../design-notes/registry-federation-external-sources.md)
 - **ToolKit plugins**: [../../../../../docs/TOOLKIT_PLUGINS.md](../../../../../docs/TOOLKIT_PLUGINS.md)
 
 This decision directly addresses:

@@ -302,7 +302,6 @@ Retained here because it was the alternative to registration under the asymmetri
 - **ADR-0007**: [0007-cpt-cf-types-registry-adr-federated-source-routing-query.md](./0007-cpt-cf-types-registry-adr-federated-source-routing-query.md)
 - **ADR-0010**: [0010-cpt-cf-types-registry-adr-tenant-availability-evaluation.md](./0010-cpt-cf-types-registry-adr-tenant-availability-evaluation.md)
 - **ADR-0013**: [0013-cpt-cf-types-registry-adr-platform-purge-of-deleted-entities.md](./0013-cpt-cf-types-registry-adr-platform-purge-of-deleted-entities.md) — decides the purge that releases a retired Source Claim reservation, the single exception to the permanence this ADR gives it.
-- **Design note**: [../design-notes/registry-federation-external-sources.md](../design-notes/registry-federation-external-sources.md)
 - **Database reference schema**: [../database.sql](../database.sql)
 
 This decision directly addresses:

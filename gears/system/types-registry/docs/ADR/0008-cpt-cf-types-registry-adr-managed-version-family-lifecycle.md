@@ -198,8 +198,6 @@ Confluent Schema Registry and AWS Glue Schema Registry are worth noting for what
 - **ADR-0004**: [0004-cpt-cf-types-registry-adr-gts-minor-version-identity-evolution.md](./0004-cpt-cf-types-registry-adr-gts-minor-version-identity-evolution.md)
 - **ADR-0005**: [0005-cpt-cf-types-registry-adr-type-schema-revisions.md](./0005-cpt-cf-types-registry-adr-type-schema-revisions.md)
 - **ADR-0006**: [0006-cpt-cf-types-registry-adr-registered-instance-revisions.md](./0006-cpt-cf-types-registry-adr-registered-instance-revisions.md)
-- **Design note**: [../design-notes/lifecycle-and-tenant-state-model.md](../design-notes/lifecycle-and-tenant-state-model.md)
-- **Design note**: [../design-notes/managed-entity-resource-versioning.md](../design-notes/managed-entity-resource-versioning.md)
 
 This decision directly addresses:
 

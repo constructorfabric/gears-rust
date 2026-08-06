@@ -281,7 +281,6 @@ This decision is confirmed when:
 - **ADR-0008**: [0008-cpt-cf-types-registry-adr-managed-version-family-lifecycle.md](./0008-cpt-cf-types-registry-adr-managed-version-family-lifecycle.md)
 - **ADR-0010**: [0010-cpt-cf-types-registry-adr-tenant-availability-evaluation.md](./0010-cpt-cf-types-registry-adr-tenant-availability-evaluation.md)
 - **ADR-0013**: [0013-cpt-cf-types-registry-adr-platform-purge-of-deleted-entities.md](./0013-cpt-cf-types-registry-adr-platform-purge-of-deleted-entities.md) — decides the purge that releases an identifier, which is what makes delete, purge, re-register the repair for a mis-assigned owner and lets ownership stay immutable.
-- **Design note**: [../design-notes/lifecycle-and-tenant-state-model.md](../design-notes/lifecycle-and-tenant-state-model.md)
 
 This decision directly addresses:
 

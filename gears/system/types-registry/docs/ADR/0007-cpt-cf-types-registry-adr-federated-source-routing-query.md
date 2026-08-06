@@ -69,7 +69,7 @@ The architectural rules of the selected model are:
 
 The ordered walk carries no memo and no circuit breaker, and P1 adds neither. A `uuid → owning plugin` memo would speed up only a repeated **positive** resolution, while the case that costs most is the negative one — a reference held by no source walks the whole chain, because `NOT_FOUND` requires every source to answer authoritatively. That case cannot be memoized: a source may register the identifier at any time and nothing signals it, since the routing generation moves only when claims do. A circuit breaker changes no outcome either, because under fail-closed an open breaker must still yield a source failure rather than absence; it is resource protection, and timeouts, concurrency limits, and per-source failure classification already live in the plugin client adapter. Batching keeps the cost proportional to the number of plugins rather than to the number of references, and claim counts are single digits by design. Revisit if measurement against the benchmark profile shows otherwise; that profile must therefore fix the plugin count and the share of references not resolved locally.
 
-The detailed plugin capability profile, resolution algorithms, pagination contract, continuation-token contents, response validation, query-assistance expansion, and failure outcomes are specified in [Registry Federation And External Sources Design Notes](../design-notes/registry-federation-external-sources.md).
+The detailed plugin capability profile, resolution algorithms, pagination contract, continuation-token contents, response validation, query-assistance expansion, and failure outcomes are specified in [DESIGN](../DESIGN.md): §3.3, *Registry Source Plugin contract*, for the trait, its models, and the obligations a conditional read puts on a plugin; §3.2, *Federation Router*, for claim matching, ordering, and the platform invariants every response is checked against; and §3.6 for the federated resolution and type-filter-expansion sequences.
 
 ### Consequences
 
@@ -144,7 +144,7 @@ Registry References become source-qualified values instead of opaque UUIDs.
 
 ## More Information
 
-The normative design elaboration is maintained in [Registry Federation And External Sources Design Notes](../design-notes/registry-federation-external-sources.md). ADR-0002 separately decides that externally managed definitions and tenant state remain source-owned and are delegated live rather than projected into Types Registry.
+The normative design elaboration is [DESIGN](../DESIGN.md) §3.2 and §3.3, as listed under the decision above. ADR-0002 separately decides that externally managed definitions and tenant state remain source-owned and are delegated live rather than projected into Types Registry.
 
 ## Traceability
 
@@ -153,7 +153,6 @@ The normative design elaboration is maintained in [Registry Federation And Exter
 - **ADR-0001**: [0001-cpt-cf-types-registry-adr-storage-identity-query-model.md](./0001-cpt-cf-types-registry-adr-storage-identity-query-model.md)
 - **ADR-0002**: [0002-cpt-cf-types-registry-adr-external-source-live-delegation.md](./0002-cpt-cf-types-registry-adr-external-source-live-delegation.md)
 - **ADR-0011**: [0011-cpt-cf-types-registry-adr-managed-external-boundary.md](./0011-cpt-cf-types-registry-adr-managed-external-boundary.md) — bounds the capability profile: neither dependency registration nor reverse dependency-impact lookup is in it, every capability that remains is mandatory, and the claim grammar is fixed as a rooted single segment.
-- **Design note**: [registry-federation-external-sources.md](../design-notes/registry-federation-external-sources.md)
 - **ToolKit plugins**: [../../../../../docs/TOOLKIT_PLUGINS.md](../../../../../docs/TOOLKIT_PLUGINS.md)
 
 This decision directly addresses:
