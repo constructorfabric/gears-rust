@@ -65,19 +65,28 @@
 -- Three rules govern those values.
 --
 -- They are storage encoding only. The SDK and REST contracts keep the string
--- vocabulary - a response says `"status": "succeeded"`, never `3` - and the
--- mapping lives in the storage layer. A numeric value must never reach a public
--- payload.
+-- vocabulary - operation_item.status = 3 is rendered `"status": "succeeded"`,
+-- never `3` - and the mapping lives in the storage layer. A numeric value must
+-- never reach a public payload. The example names its column deliberately; see
+-- the per-column rule below for why an unqualified one would be wrong.
 --
 -- Numbering is append-only. Renumbering is a data migration, unlike renaming a
 -- string that no row stores. Values are assigned in the order the governing ADR
 -- lists them, a new value takes the next free number, and a retired value's
 -- number is never reused.
 --
--- Numbering is per column and deliberately not aligned between columns. Giving
--- `pending` the same number in operation.status and operation_item.status would
--- imply a relationship between two distinct vocabularies that does not exist,
--- and it would force gaps wherever they diverge - and a gap reads as a mistake.
+-- The rule binds from the first release. This file is a reference schema with no
+-- migration behind it, so a vocabulary is defined here rather than evolved, and a
+-- number may still change meaning until then. After the first release it cannot.
+--
+-- Numbering is per column and deliberately not aligned between columns. The two
+-- status columns are the worked example: `3` is `completed` in operation.status
+-- and `succeeded` in operation_item.status, because one carries progress and the
+-- other carries progress and outcome together. Where they happen to agree -
+-- `pending` is 1 in both - that is coincidence and not a contract. Aligning them
+-- on purpose would imply a relationship between two distinct vocabularies that
+-- does not exist, and would force gaps wherever they diverge - and a gap reads as
+-- a mistake.
 --
 -- CHECK constraints list the admissible values rather than bounding a range, so
 -- that a number outside the vocabulary is rejected instead of being accepted as
@@ -227,15 +236,19 @@ CREATE TABLE types_registry__operation (
     idempotency_key          varchar(255) NOT NULL,
     idempotency_scope_hash   bytea        NOT NULL,
     request_fingerprint      bytea        NOT NULL,
-    -- 1 pending, 2 running, 3 succeeded, 4 unchanged, 5 partially_succeeded,
-    -- 6 failed.
+    -- 1 pending, 2 running, 3 completed.
+    --
+    -- Progress only, and status = 3 asserts one thing: every item of this
+    -- operation is terminal. Whether they succeeded is answered per candidate, by
+    -- operation_item.status, and is not aggregated here - that would store a fold
+    -- over another table's rows, with no CHECK able to keep the two in agreement.
     --
     -- The vocabulary has no cancellation and no expiry. Nothing asks to cancel a
     -- mutation. An operation whose worker dies is redelivered by the outbox and
     -- its commits are idempotent, so it becomes terminal only once retries are
-    -- exhausted - at which point `failed` or `partially_succeeded` already says
-    -- what happened and the per-item error_payload says why. A stalled operation
-    -- past its timeout is failed for the same reason.
+    -- exhausted; the items that committed stay `succeeded`, the rest are `failed`
+    -- with a reason in error_payload. A stalled operation past its timeout is
+    -- completed the same way.
     status                   smallint     NOT NULL,
     created_at               timestamptz  NOT NULL,
     started_at               timestamptz  NULL,
@@ -251,7 +264,7 @@ CREATE TABLE types_registry__operation (
         (plane = 2 AND tenant_id IS NOT NULL)        -- tenant
     ),
     CONSTRAINT ck_tr_operation_status CHECK (
-        status IN (1, 2, 3, 4, 5, 6)
+        status IN (1, 2, 3)
     ),
     CONSTRAINT ck_tr_operation_state CHECK (
         (status = 1                                  -- pending
@@ -262,30 +275,38 @@ CREATE TABLE types_registry__operation (
             AND started_at IS NOT NULL
             AND completed_at IS NULL)
         OR
-        (status IN (3, 4, 5, 6)                      -- terminal outcomes
+        (status = 3                                  -- completed
             AND started_at IS NOT NULL
             AND completed_at IS NOT NULL)
     )
 );
 
 -- Two jobs, both scans over the same two leading columns. It finds non-terminal
--- operations that stopped progressing, so they can be failed; and it finds
--- terminal operations old enough for the retention sweep below to remove. It
--- covers terminal rows, which will be the overwhelming majority over time; a
--- partial index would be far smaller but is not portable to MySQL, so the full
--- index is the deliberate choice.
+-- operations that stopped progressing, so they can be completed with their
+-- unfinished items failed; and it finds completed operations old enough for the
+-- retention sweep below to remove. It covers completed rows, which will be the
+-- overwhelming majority over time; a partial index would be far smaller but is
+-- not portable to MySQL, so the full index is the deliberate choice.
 --
--- Retention removes a terminal operation only when nothing points at it. A
--- successful one is pinned by every revision it produced, through
--- operation_item_id with ON DELETE RESTRICT, so it lives as long as those
--- revisions - which is until purge. What the sweep reaches is the unpinned
--- remainder: dry runs, which produce no revision by construction, and
--- operations in which no candidate succeeded. Deleting one cascades to its
--- items and releases its (idempotency_scope_hash, idempotency_key) pair, so a
--- replay after the retention window executes afresh instead of returning the
--- stored result. Sweeping the pinned majority as well would first require the
--- admitting principal to stop being reachable only through this table; see
--- DESIGN §4, open question D4.
+-- Retention removes a completed operation only when nothing points at it, which
+-- is a per-item question this column cannot answer: an operation is pinned by
+-- every revision it produced, through operation_item_id with ON DELETE RESTRICT,
+-- so it lives as long as those revisions, which is until purge. The sweep reaches
+-- the unpinned remainder by anti-join - dry runs, which produce no revision by
+-- construction, and operations in which no candidate succeeded:
+--
+--   NOT EXISTS (SELECT 1 FROM types_registry__operation_item i
+--               WHERE i.operation_id = o.id AND i.status = 3)
+--
+-- Bounded by the 100-candidate batch limit and served by uq_tr_operation_item_no,
+-- whose leading column is operation_id.
+--
+-- Deleting one cascades to its items and releases its
+-- (idempotency_scope_hash, idempotency_key) pair, so a replay after the
+-- retention window executes afresh instead of returning the stored result.
+-- Sweeping the pinned majority as well would first require the admitting
+-- principal to stop being reachable only through this table; see DESIGN §4,
+-- open question D4.
 CREATE INDEX idx_tr_operation_status
     ON types_registry__operation (status, created_at, id);
 
