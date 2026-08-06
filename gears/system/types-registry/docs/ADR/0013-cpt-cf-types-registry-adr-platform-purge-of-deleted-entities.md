@@ -17,7 +17,6 @@ decision-makers: Constructor Fabric Steering Committee
   - [Everything that records the identity](#everything-that-records-the-identity)
   - [What guards purge](#what-guards-purge)
   - [Preconditions and shape](#preconditions-and-shape)
-  - [Non-goals: personal-data erasure](#non-goals-personal-data-erasure)
   - [The exception to identifier non-rebinding](#the-exception-to-identifier-non-rebinding)
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
@@ -42,7 +41,7 @@ Those properties are correct for production. They also make an ordinary developm
 
 The obvious fix — a deployment mode in which deletion is physical and identifiers are reusable — was considered and rejected during design discussion, for a reason worth recording: it makes the development environment stop being a rehearsal of production. Reverse resolution of a deleted entity's Registry Reference, rejection of re-registration under a deleted identifier, and tombstone retention are precisely the behaviours most likely to harbour bugs, and a mode that changes ordinary deletion hides all three.
 
-Recovering a burned identifier is the whole of the problem. A second driver suggests itself — retained revisions might hold personal data in descriptions, examples, or enum values, which would argue for splitting the mechanism in two to serve it. §Non-goals records why that driver is not taken.
+Recovering a burned identifier is the whole of the problem.
 
 ## Scope
 
@@ -54,7 +53,7 @@ This ADR decides:
 * the delivery shape, authority, and audit of the operation;
 * the single exception this creates to the identifier non-rebinding guarantee.
 
-This ADR does not decide deletion preconditions or lifecycle transitions (ADR-0008, PRD `cpt-cf-types-registry-fr-lifecycle`), the write-path contract the operation uses (ADR-0012), the retired Source Claim reservations of ADR-0011, or the platform-wide data classification policy that determines what counts as personal data.
+This ADR does not decide deletion preconditions or lifecycle transitions (ADR-0008, PRD `cpt-cf-types-registry-fr-lifecycle`), the write-path contract the operation uses (ADR-0012), the retired Source Claim reservations of ADR-0011, or the platform data-classification policy that decides which content may be registered under the retention terms recorded here.
 
 ## Decision Drivers
 
@@ -81,7 +80,11 @@ Ordinary deletion is unchanged everywhere. Every deployment, including developme
 
 Purge removes the records of a `DELETED` entity and releases its identifier for registration as a new logical entity. It is the operation development needs, and the one that can corrupt data.
 
-The alternative is to split it in two, adding a content purge that removes retained revisions while keeping the identity tombstone, on the ground that it is production-safe and could serve a personal-data erasure obligation. §Non-goals rejects that half, and with it the argument for a split: what remains is one act with one risk profile and one guard.
+The alternative is to split it in two, adding a content purge that removes retained revisions while keeping the identity tombstone, on the ground that removing content without releasing the identifier would be production-safe. It would not be, and the paragraph below says why. With that the argument for a split goes: what remains is one act with one risk profile and one guard.
+
+**A content purge is not production-safe, and the reason names the invariant that keeps the payload of a deleted entity.** P1 deletion sees only registry state — `cpt-cf-types-registry-fr-lifecycle` says plainly that a Type Schema **MAY** be deleted while live domain data still conforms to it, and that this stands as a limitation until the P2 owning-gear Validation Hooks close it. The gear holding that data is then the one that has to retire, migrate, export, or re-type it, and under `cpt-cf-types-registry-principle-contract-not-object` doing so is its job rather than the registry's. It cannot do any of it from a tombstone: an availability verdict says the contract is gone, while deciding what to do with an object requires the contract itself — the resolved effective schema, the effective traits, and the authored document behind them. Erasing the payload on deletion would therefore strand exactly the data that deletion left behind, and it would do so silently, since nothing in the registry can see that the data exists. That is why an exact read of a deleted entity still serves its content groups (DESIGN §3.3, *Read results*).
+
+The invariant reaches the **current** revision at deletion — the one every surviving object validates against, since ADR-0003 makes each revision accept everything its predecessors accepted. It does not by itself justify retaining the earlier ones; what those are retained for is DESIGN open question D4.
 
 The tombstone, the mapping, and any other durable record of the identity are removed in **one transaction**. A partial removal that leaves a mapping behind would let the identifier be re-registered while a stale record still points at the old entity.
 
@@ -127,16 +130,6 @@ Purging a Registry Source Plugin removes its Source Claims with it. No extra ord
 
 Purge never runs on a schedule, on a timer, or as a consequence of any retention rule. Every execution is an explicit act with an operator behind it.
 
-### Non-goals: personal-data erasure
-
-Types Registry is a registry of type contracts. What it stores is schema documents, well-known configuration values, and platform control-plane declarations, authored by developers about contracts rather than collected about people. Personal data in that content is already prohibited by ADR-0006 and by the DESIGN constraint on sensitive content. This decision declines to build a mechanism for the prohibited case, and the reasoning is worth recording because the opposite choice is the tempting one.
-
-A content-only purge would not discharge an erasure obligation. It would require the entity to be `DELETED`, so it could not reach the likeliest occurrence — content in a live, in-use type, where removal would first mean deleting the type and could only succeed if nothing depended on it. It would not touch identifiers, which can themselves carry a name and which live in the entity record, the family key, and the operation history. And removing a row does not remove it from write-ahead logs, from pages awaiting vacuum, or from backups, so the live dataset is the only thing any such operation reaches.
-
-A mechanism that satisfies none of those on its own, while being named for the obligation, invites reliance it cannot support. The honest position is the one taken here: the registry holds contracts, personal data in them is prohibited rather than managed, and P1 offers no erasure path. That statement is auditable and puts the obligation where it can actually be met — in the prohibition and in review — instead of in a job that would appear to discharge it.
-
-The consequence is stated plainly rather than hidden. Retention is unbounded by policy, and in a production deployment, where purge is disabled, admitted content cannot be removed at all. The prohibition is therefore not a guideline but the only control, and it is load-bearing in proportion.
-
 ### The exception to identifier non-rebinding
 
 ADR-0001 guarantees that a logically deleted GTS Identifier cannot be rebound to a new logical entity. Purge is the single, named exception to that guarantee, and it is the reason the guarantee is stated as a property of ordinary operation rather than of the storage layer.
@@ -146,7 +139,7 @@ Retired Source Claim reservations from ADR-0011 are released by the same excepti
 ### Consequences
 
 * Development iteration is delete, purge, re-register, with production-identical semantics at every step. That is the trade this decision makes deliberately. The job may batch the first two over a pattern — deleting in dependency order and then purging — which is sequencing rather than new semantics: each step keeps its own preconditions and produces its own operation record, so the development stand still rehearses production.
-* Retained content is unremovable in a production deployment, because the one operation that removes it also releases the identifier and is therefore disabled there. This is a deliberate outcome, and §Non-goals states what it rests on.
+* Retained content is unremovable in a production deployment, because the one operation that removes it also releases the identifier and is therefore disabled there. This is a deliberate outcome. Whether a given class of content may be held on those terms is a platform data-classification question rather than a registry one: Types Registry stores what it admits and applies no content policy of its own.
 * Retention of the admitted revisions of ADR-0005 and ADR-0006 is unbounded by policy and bounded only by explicit purge.
 * The identifier non-rebinding guarantee of ADR-0001 has exactly one exception, and this operation is it.
 * A deployment must expose whether purge is enabled, so that an operator can tell before invoking it.
@@ -189,9 +182,8 @@ This decision is confirmed when:
 
 ### An explicit platform-level purge, split into content removal and identity removal
 
-* Good, because the safe half would be usable in production while only the dangerous half is gated.
-* Bad, because the safe half serves only an erasure obligation this registry does not have (§Non-goals), so it is machinery for a case that should not arise.
-* Bad, because as specified it would not even serve that case: requiring `DELETED` puts it out of reach of the likeliest occurrence, content in a live, in-use type, whose removal would first require deleting the type.
+* Good, because the half that removes content without releasing the identifier looks production-safe, so only the other half would need gating.
+* Bad, because it is not safe: it would require the entity to be `DELETED`, which is precisely the state in which the owning gear still needs the contract to retire domain data that conforms to it (§One operation). It removes what its one remaining caller is there to read.
 * Bad, because it doubles the operation surface, the guards, and the vocabulary for one act.
 
 ### One explicit platform-level purge
@@ -201,7 +193,7 @@ This decision is confirmed when:
 * Good, because one act has one risk profile and one guard, and nothing has to explain which half an operator wants.
 * Bad, because development iteration costs an extra step.
 * Bad, because its safety rests on deployment policy and operator judgement rather than on anything the registry can verify.
-* Bad, because a production deployment has no way to remove retained content at all, which is acceptable only while the content is contracts.
+* Bad, because a production deployment has no way to remove retained content at all, so what may be registered has to be governed before admission rather than corrected after it.
 
 ## More Information
 
@@ -224,4 +216,4 @@ This decision directly addresses:
 
 * `cpt-cf-types-registry-fr-lifecycle` - supplies the only mechanism that physically removes registry state, and keeps it out of any retention policy.
 * `cpt-cf-types-registry-fr-id-resolution` - names the single exception to the identifier non-rebinding guarantee, and bounds it to one local transaction.
-* `cpt-cf-types-registry-fr-register-schemas`, `cpt-cf-types-registry-fr-register-instances` - bound the retention of admitted content: unbounded by policy, removable only by this operation, and therefore unremovable wherever it is disabled. §Non-goals records why no erasure path is offered instead, and why naming one here would invite reliance it could not support.
+* `cpt-cf-types-registry-fr-register-schemas`, `cpt-cf-types-registry-fr-register-instances` - bound the retention of admitted content: unbounded by policy, removable only by this operation, and therefore unremovable wherever it is disabled. §One operation records why no content-only removal is offered instead.

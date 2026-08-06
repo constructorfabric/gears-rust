@@ -174,7 +174,9 @@ Runtime, gear architecture, and project-wide quality baselines follow the reposi
 
 Types Registry has one gear-specific operational constraint: managed registry state and Registry Source Plugin configuration must be persistent and consistent across multi-pod deployments. External registry state remains plugin-owned. Process-local state and client caches are allowed only as derived cache state.
 
-A second constraint governs content rather than deployment. Registered Type Schemas, Instance values, and revision metadata **MUST NOT** contain secrets, credentials, keys, tokens, or personal data. Admitted revisions are retained without a time limit, and the one operation that physically removes them also releases the GTS Identifier and is therefore disabled by default in production, so admitted content in a production deployment is effectively unremovable. This prohibition is consequently the only control over such content rather than one of several, and it is enforced by authoring review rather than by the registry. ADR-0013 records why no erasure mechanism is offered in its place.
+A second constraint governs content rather than deployment. Admitted revisions are retained without a time limit, and the one operation that physically removes them also releases the GTS Identifier and is therefore disabled by default in production, so admitted content in a production deployment is effectively unremovable. ADR-0013 records why no narrower erasure path is offered in its place, including why the payload of a deleted entity cannot be dropped while its identity is kept.
+
+Those retention terms are unconditional, and deciding what may be registered under them is not a Types Registry responsibility. Data classification, and any resulting limit on what content may be placed in a registered Type Schema or Instance value, belongs to platform-wide policy and to the authors bound by it; Types Registry stores what it admits and applies no content policy of its own.
 
 ## 4. Scope
 

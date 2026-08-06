@@ -17,7 +17,7 @@ decision-makers: Constructor Fabric Steering Committee
   - [Revision identity and creation](#revision-identity-and-creation)
   - [Instance update validation](#instance-update-validation)
   - [Optimistic concurrency](#optimistic-concurrency)
-  - [Retention and sensitive content](#retention-and-sensitive-content)
+  - [Retention](#retention)
   - [Content revisions versus registry state](#content-revisions-versus-registry-state)
   - [Resolution and historical access](#resolution-and-historical-access)
   - [Rollback direction](#rollback-direction)
@@ -76,7 +76,6 @@ This ADR does not apply to runtime domain objects stored by owning gears or to E
 * A mutable conforming Type Schema means historical validation must identify the exact schema revision used.
 * Concurrent tenant administrators or gears must not overwrite each other's Instance changes.
 * Retained revisions support diagnostics and future rollback but must not turn Types Registry into an arbitrary runtime-object store.
-* Long-lived revision retention increases the impact of accidentally registering secrets or sensitive configuration.
 * Lifecycle, admission status, ownership, tenant enablement, and external-source freshness are separate state dimensions from Instance content.
 
 ## Considered Options
@@ -132,15 +131,14 @@ The first is the caller's baseline and the other two are internal, and they fail
 
 Before initial admission there is no public logical registered Instance and no entity Lifecycle Status. A failed initial candidate may remain as an operation or audit artifact, but it does not create a logical entity or tombstone, issue a Registry Reference for domain persistence, or establish a permanent GTS ID reservation. While an update candidate is `PENDING`, an existing logical Instance retains its current revision and its Lifecycle Status.
 
-### Retention and sensitive content
+### Retention
 
-* Every admitted registered Instance revision is retained for the lifetime of the registry identity, including after logical deletion while Registry References or registered dependents may still exist.
+* Every admitted registered Instance revision is retained for the lifetime of the registry identity, including after logical deletion while Registry References or registered dependents may still exist. As with a Type Schema, resolving the reference is not the whole reason: a gear holding a reference to a deleted well-known Instance may still need its value to retire what depends on it, so the current value survives deletion rather than only its hash (ADR-0013).
 * Admitted revisions are never physically removed by a retention period, time-to-live, or background policy. Physical removal happens only through the explicit platform-level purge operation decided by ADR-0013, which is operator-invoked and never automatic.
-* Registered Instance payloads and revision metadata must not contain secrets, credentials, private keys, access tokens, or equivalent sensitive configuration. Such values must remain in an approved secrets system and be referenced indirectly where the owning contract permits it.
 * Authorization and tenant visibility apply to historical revisions at least as strictly as to the current Instance; historical access must not expose content to a caller who could not access the logical entity.
 * Failed candidates may be retained under an operation-artifact policy but are not admitted revisions.
 
-The complete security classification, redaction, erasure, and exceptional legal-retention policy remains a cross-cutting security decision. If a future registered Instance use case requires content that cannot be retained under this policy, it must use a different storage owner or introduce a new ADR before registration is allowed.
+Those terms are unconditional, so whether a given class of content may be held under them is decided before registration and elsewhere: data classification is a cross-cutting platform decision, not one Types Registry owns, and the registry stores what it admits without applying a content policy of its own. A use case whose content cannot be retained on these terms belongs to a different storage owner.
 
 ### Content revisions versus registry state
 
@@ -188,7 +186,7 @@ Instance rollback is not selected for P1 by this ADR. If introduced later, it mu
 
 * Registered well-known Instances can evolve without changing their GTS IDs or Registry References.
 * Every admitted current value has reproducible schema-validation provenance.
-* Instance history retention is unbounded in P1, which is acceptable only because runtime domain objects remain out of scope and sensitive values are prohibited.
+* Instance history retention is unbounded in P1, which is acceptable because runtime domain objects remain out of scope.
 * In P2, matching owning-gear semantic validators, not a generic schema-diff algorithm, decide whether a domain-specific Instance value transition is acceptable.
 * Caches must validate Instance revision or ETag freshness just as they do for mutable Type Schemas.
 * Type Schema updates and Instance updates are coupled through exact schema revision checks but retain separate revision histories.
@@ -205,8 +203,7 @@ This decision is confirmed when:
 * a Type Schema update cannot activate while an affected current registered Instance would become invalid;
 * P2 hook tests cover initial admission and content revisions of managed registered Instances;
 * all admitted Instance revisions remain internally retrievable after later updates and logical deletion;
-* ordinary resolution returns the current value's content hash, the freshness validator, and lifecycle and availability metadata, while stable references remain logical — and returns neither the Instance revision number nor the conforming Type Schema revision, since §*Resolution and historical access* keeps both out of the contract;
-* tests reject secret-bearing test fixtures according to the final security classification mechanism.
+* ordinary resolution returns the current value's content hash, the freshness validator, and lifecycle and availability metadata, while stable references remain logical — and returns neither the Instance revision number nor the conforming Type Schema revision, since §*Resolution and historical access* keeps both out of the contract.
 
 ## Pros and Cons of the Options
 
@@ -229,7 +226,7 @@ This decision is confirmed when:
 * Good, because the public identity remains stable while every admitted value is distinguishable.
 * Good, because validation provenance, concurrency, diagnostics, and future rollback are supported.
 * Good, because the model aligns with Type Schema revisions without pretending Instance values have schema compatibility semantics.
-* Bad, because revision storage is unbounded and may retain sensitive content longer than intended.
+* Bad, because revision storage is unbounded and nothing after admission can shorten it.
 * Bad, because management authorization and historical visibility require explicit policy.
 
 ## More Information

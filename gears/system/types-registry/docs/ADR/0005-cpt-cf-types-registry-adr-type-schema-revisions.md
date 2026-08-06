@@ -139,11 +139,11 @@ Before initial admission there is no public logical Type Schema and no entity Li
 
 ### Retention and deletion
 
-* Every admitted Type Schema revision is retained for the lifetime of the registry identity, including after logical deletion, while Registry References or registered dependents may still exist.
+* Every admitted Type Schema revision is retained for the lifetime of the registry identity, including after logical deletion, while Registry References or registered dependents may still exist. Retention after deletion is not only about resolving a reference, which a tombstone alone would satisfy: P1 permits deletion while live domain data still conforms, and the owning gear retiring that data needs the contract itself. ADR-0013 records the invariant and why it refuses to erase the payload.
 * Admitted revisions are never physically removed by a retention period, time-to-live, or background policy. Physical removal happens only through the explicit platform-level purge operation decided by ADR-0013, which is operator-invoked and never automatic.
 * Logical entity lifecycle is separate from admission and definition revisions. `PENDING` is an Admission Status; the managed logical entity lifecycle contains `ACTIVE` and `DELETED` in P1 under ADR-0008. Admitting an internal Schema revision does not change Lifecycle Status, and neither does admitting a higher-major Version Successor. Lifecycle transitions do not duplicate unchanged schema content into new revisions, but they do advance registry state/cache metadata and produce the required operation or audit record.
 * Failed candidates may be retained as operation artifacts under a separate retention policy; they are not admitted revisions and never participate in ordinary resolution or compatibility history.
-* Secrets and credentials must not appear in schema content or revision metadata.
+* Whether a given class of content may be held under these terms is a platform data-classification question rather than a registry one. Types Registry stores what it admits and applies no content policy of its own.
 
 ### Resolution, caching, and historical access
 
@@ -220,7 +220,7 @@ This decision is confirmed when:
 * Good, because validation baselines, dependency effects, and historical content remain explainable.
 * Good, because a future rollback operation can reuse known admitted content.
 * Bad, because retention is unbounded and requires authorization, indexing, and deletion semantics.
-* Bad, because sensitive data must never be embedded in Type Schema documents or revision metadata.
+* Bad, because what may be registered has to be governed before admission, since nothing after it can shorten retention.
 
 ## More Information
 

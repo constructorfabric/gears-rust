@@ -238,6 +238,7 @@ This decision is confirmed when:
 * deleting a Managed Entity with no managed dependent succeeds while every plugin is unreachable, and deleting one with a managed dependent is rejected while every plugin is unreachable — both proving the decision used local state only;
 * registering a Managed Entity whose identifier matches a retired Source Claim is rejected, and deleting a plugin Instance retires its claims into exactly that state while an unreachable plugin retains its own;
 * activating a new plugin's claim over a retired claim is rejected with no exception, and no request field, declared intent, or continuity assertion makes it succeed;
+* the retargeting migration is documented as carrying the hazard it cannot dispel rather than as a safe path: the persistence rule leaves the platform holding no identifier, revision, or content hash of what the predecessor served, so nothing verifies that the named successor serves the same logical entities, and a successor that serves different content under a reserved identifier silently rebinds every domain row holding its Registry Reference. What stands behind continuity there is the review of that migration, never a registry check;
 * no plugin operation asks a source about dependents, and no plugin output is permitted to degrade with a warning in place of failing closed — the capability profile has no optional or advisory tier to test.
 
 ## Pros and Cons of the Options
