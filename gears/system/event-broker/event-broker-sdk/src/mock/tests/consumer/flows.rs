@@ -1,10 +1,11 @@
 //! Mirrors scenarios/consumer/flows/. Tests migrated per mock-reference-alignment.
 
-#[cfg(test)]
 use super::super::helpers::*;
+#[cfg(test)]
+use crate::sequence::Sequence;
 
 use super::super::helpers::{broker_with_topic, ctx, ctx2, join_group, make_group, wire_event};
-use crate::ResolvedPosition;
+use crate::Position;
 use crate::api::EventBrokerApi;
 use crate::api::{ControlCode, SeekPosition, WireFrame};
 use futures_util::StreamExt;
@@ -46,11 +47,12 @@ async fn s1_01_flow_two_consumer_rebalance() {
         .seek(
             &c,
             sub_a.subscription_id,
+            sub_a.topology_version,
             &(0u32..4)
                 .map(|p| SeekPosition {
                     topic: TOPIC.to_owned(),
                     partition: p,
-                    value: ResolvedPosition::Earliest,
+                    value: Position::Earliest,
                 })
                 .collect::<Vec<_>>(),
         )
@@ -102,12 +104,13 @@ async fn s1_01_flow_two_consumer_rebalance() {
         .seek(
             &c2,
             sub_b.subscription_id,
+            sub_b.topology_version,
             &b_slots
                 .iter()
                 .map(|sl| SeekPosition {
                     topic: sl.topic.clone(),
                     partition: sl.partition,
-                    value: ResolvedPosition::Earliest,
+                    value: Position::Earliest,
                 })
                 .collect::<Vec<_>>(),
         )
@@ -164,18 +167,19 @@ async fn s1_02_flow_positions_not_set_recovery() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Earliest,
+                value: Position::Earliest,
             }],
         )
         .await
         .unwrap();
-    assert_eq!(results[0].offset, 0);
+    assert_eq!(results[0].offset, Sequence::assigned(0));
     assert_eq!(
         h.cursor(&gid, TOPIC, 0).await,
-        Some(0),
+        Some(Sequence::assigned(0)),
         "SEEK seeds the cursor"
     );
 
@@ -187,7 +191,8 @@ async fn s1_02_flow_positions_not_set_recovery() {
         match next_frame(&mut s).await {
             Some(Ok(WireFrame::Event(e))) => {
                 assert_eq!(
-                    e.offset, 1,
+                    e.sequence,
+                    Sequence::assigned(1),
                     "emission begins at the seeded floor (1-based; Earliest→cursor 0, emit from 1)"
                 );
                 got_event = true;
@@ -232,28 +237,33 @@ async fn s1_03_flow_path_a_consumer_with_db() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Exact(510),
+                value: Position::Exact(Sequence::assigned(510)),
             }],
         )
         .await
         .unwrap();
     assert_eq!(
-        results[0].offset, 510,
+        results[0].offset,
+        Sequence::assigned(510),
         "exact stored offset is echoed verbatim"
     );
-    assert_eq!(h.cursor(&gid, TOPIC, 0).await, Some(510));
+    assert_eq!(
+        h.cursor(&gid, TOPIC, 0).await,
+        Some(Sequence::assigned(510))
+    );
 
     // Exchange 4 - stream delivers from the seeked offset (mock: inclusive → 510).
     let mut s = broker.stream(&c, sub.subscription_id).await.unwrap();
     let _ = next_frame(&mut s).await; // baseline
-    let mut first_event_offset = None;
+    let mut first_event_sequence = None;
     for _ in 0..10 {
         match next_frame(&mut s).await {
             Some(Ok(WireFrame::Event(e))) => {
-                first_event_offset = Some(e.offset);
+                first_event_sequence = Some(e.sequence);
                 break;
             }
             Some(Ok(_)) => {}
@@ -261,8 +271,8 @@ async fn s1_03_flow_path_a_consumer_with_db() {
         }
     }
     assert_eq!(
-        first_event_offset,
-        Some(511),
+        first_event_sequence,
+        Some(Sequence::assigned(511)),
         "emit from cursor+1: SEEK 510 (last-processed) → first delivered is 511"
     );
     drop(s);
@@ -275,21 +285,22 @@ async fn s1_03_flow_path_a_consumer_with_db() {
         .seek(
             &c,
             sub2.subscription_id,
+            sub2.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Exact(511),
+                value: Position::Exact(Sequence::assigned(511)),
             }],
         )
         .await
         .unwrap();
     let mut s2 = broker.stream(&c, sub2.subscription_id).await.unwrap();
     let _ = next_frame(&mut s2).await; // baseline
-    let mut resume_offset = None;
+    let mut resume_sequence = None;
     for _ in 0..10 {
         match next_frame(&mut s2).await {
             Some(Ok(WireFrame::Event(e))) => {
-                resume_offset = Some(e.offset);
+                resume_sequence = Some(e.sequence);
                 break;
             }
             Some(Ok(_)) => {}
@@ -297,8 +308,8 @@ async fn s1_03_flow_path_a_consumer_with_db() {
         }
     }
     assert_eq!(
-        resume_offset,
-        Some(512),
+        resume_sequence,
+        Some(Sequence::assigned(512)),
         "after reconnect, resumes from cursor+1 (SEEK 511 → first delivered 512)"
     );
 }
@@ -385,11 +396,12 @@ async fn s1_04_flow_leave_triggers_gain_terminate() {
         .seek(
             &c,
             sub_a2.subscription_id,
+            sub_a2.topology_version,
             &(0u32..4)
                 .map(|p| SeekPosition {
                     topic: TOPIC.to_owned(),
                     partition: p,
-                    value: ResolvedPosition::Earliest,
+                    value: Position::Earliest,
                 })
                 .collect::<Vec<_>>(),
         )

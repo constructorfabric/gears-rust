@@ -4,6 +4,7 @@ use crate::api::{IngestOutcome, ProducerMode};
 use crate::error::EventBrokerError;
 use crate::ids::ProducerId;
 use crate::models::Event;
+use crate::sequence::Sequence;
 
 use super::core::Core;
 use super::partitioning::partition_for;
@@ -208,11 +209,19 @@ pub(super) fn ingest_one(
         match mode {
             ProducerMode::Chained => {
                 let prev = meta.previous.expect("previous present for chained");
-                if seq <= last {
-                    // Duplicate - do NOT advance state (M2).
+                // Idempotent retry of a lost ack: the producer re-sends the
+                // exact step that established the current head, so `sequence`
+                // equals `last` and `previous` still links to the step before
+                // it. Do NOT advance state (M2).
+                if seq == last && prev == last - 1 {
                     return Ok((IngestOutcome::Duplicate, event.clone()));
                 }
-                if prev != last {
+                // Any other sequence at or below the head means the producer's
+                // chain pointer is behind the broker's (a crash/restore from a
+                // stale checkpoint); it must re-read the cursor. A broken link
+                // (`previous != last`) is the same desync. Either way it is a
+                // SequenceViolation, not a silently-ignored duplicate.
+                if seq <= last || prev != last {
                     return Err(EventBrokerError::SequenceViolation {
                         expected_previous: last,
                         detail: format!(
@@ -239,10 +248,8 @@ pub(super) fn ingest_one(
     let offset = topic_state.next_offset_for(partition);
     let mut stamped = event.clone();
     stamped.partition = Some(partition);
-    stamped.sequence = Some(offset);
+    stamped.sequence = Some(Sequence::assigned(offset));
     stamped.sequence_time = Some(now);
-    stamped.offset = Some(offset);
-    stamped.offset_time = Some(now);
     // Strip writeOnly publish-input fields from the stored read-projection.
     stamped.meta = None;
     topic_state.append(partition, stamped.clone());

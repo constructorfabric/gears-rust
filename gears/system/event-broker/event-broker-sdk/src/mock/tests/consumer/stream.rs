@@ -1,11 +1,12 @@
 //! Mirrors scenarios/consumer/stream/. Tests migrated per mock-reference-alignment.
 
 use super::super::helpers::*;
+use crate::sequence::Sequence;
 #[cfg(test)]
 use toolkit_gts::gts_id;
 
 use super::super::helpers::{broker_with_topic, ctx, ctx2, join_group, make_group, wire_event};
-use crate::ResolvedPosition;
+use crate::Position;
 use crate::api::EventBrokerApi;
 use crate::api::{ControlCode, SeekPosition, WireFrame};
 use crate::ids::SubscriptionId;
@@ -32,7 +33,7 @@ async fn s1_01_positive_stream_multipart_frames() {
     let (broker, h) = broker_with_topic(TOPIC, 1).await;
     h.set_heartbeat_interval(Duration::from_millis(20)).await;
     let c = ctx();
-    // Three events → offsets 1, 2, 3 (1-based).
+    // Three events → sequences 1, 2, 3 (1-based).
     for _ in 0..3 {
         broker
             .publish(&c, &wire_event(EVT, c.subject_tenant_id()))
@@ -45,10 +46,11 @@ async fn s1_01_positive_stream_multipart_frames() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Earliest,
+                value: Position::Earliest,
             }],
         )
         .await
@@ -64,14 +66,14 @@ async fn s1_01_positive_stream_multipart_frames() {
         "first frame must be the topology baseline"
     );
 
-    // Next three event frames carry offsets 0, 1, 2 in strict order.
-    let mut offsets = Vec::new();
+    // Next three event frames carry sequences 0, 1, 2 in strict order.
+    let mut sequences = Vec::new();
     let mut saw_heartbeat = false;
     for _ in 0..20 {
         match next_frame(&mut s).await {
-            Some(Ok(WireFrame::Event(e))) => offsets.push(e.offset),
+            Some(Ok(WireFrame::Event(e))) => sequences.push(e.sequence.as_i64()),
             Some(Ok(WireFrame::Heartbeat { .. })) => {
-                if offsets.len() == 3 {
+                if sequences.len() == 3 {
                     saw_heartbeat = true;
                     break;
                 }
@@ -81,7 +83,7 @@ async fn s1_01_positive_stream_multipart_frames() {
         }
     }
     assert_eq!(
-        offsets,
+        sequences,
         vec![1, 2, 3],
         "events delivered in offset-monotonic order (1-based)"
     );
@@ -103,10 +105,11 @@ async fn s1_02_positive_stream_heartbeat_cadence() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Earliest,
+                value: Position::Earliest,
             }],
         )
         .await
@@ -296,10 +299,11 @@ async fn s1_11_negative_streaming_in_progress() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Earliest,
+                value: Position::Earliest,
             }],
         )
         .await
@@ -336,10 +340,11 @@ async fn s1_13_positive_delete_while_streaming() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Earliest,
+                value: Position::Earliest,
             }],
         )
         .await
@@ -425,10 +430,11 @@ async fn s1_14_positive_control_progress_frame() {
         .seek(
             &c,
             sub.subscription_id,
+            sub.topology_version,
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition: 0,
-                value: ResolvedPosition::Earliest,
+                value: Position::Earliest,
             }],
         )
         .await
@@ -462,11 +468,12 @@ async fn s1_14_positive_control_progress_frame() {
                     "sparse: only the drifted partition appears"
                 );
                 assert_eq!(
-                    positions[0].offset, 0,
+                    positions[0].offset,
+                    Sequence::assigned(0),
                     "delivered offset stays at the seeded floor"
                 );
                 assert!(
-                    positions[0].last_examined >= 5,
+                    positions[0].last_examined >= Sequence::assigned(5),
                     "frontier advanced past the filtered events"
                 );
                 assert!(reason.is_none(), "Progress carries no reason");
@@ -483,7 +490,10 @@ async fn s1_14_positive_control_progress_frame() {
     );
     // Side effect: the group's offset-adviser frontier advanced past the scanned events.
     assert!(
-        h.last_examined(&gid, TOPIC, 0).await.unwrap_or(0) >= 5,
+        h.last_examined(&gid, TOPIC, 0)
+            .await
+            .unwrap_or(Sequence::assigned(0))
+            >= Sequence::assigned(5),
         "broker last_examined frontier advanced"
     );
 }
