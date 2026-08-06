@@ -4,7 +4,7 @@
   "description": "Event type resource. Defines the payload contract for events published on a topic. Identified by a GTS event-type identifier and bound to a topic.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["id", "topic", "data_schema"],
+  "required": ["id", "topic", "data_schema", "allowed_subject_types"],
   "properties": {
     "id": {
       "description": "Full GTS event-type identifier (e.g., gts.cf.core.events.event_type.v1~vendor.users.created.v1).",
@@ -17,6 +17,11 @@
     },
     "description": {
       "type": "string"
+    },
+    "allowed_subject_types": {
+      "description": "GTS Type-id patterns describing which subject types (a GTS Type id naming the kind of entity) this event type's events may declare (concrete Type match, wildcard suffix `<prefix>.*`, or bare base Type `<base>~` with implicit derived-type coverage). Enforced at publish time as a schema constraint, independent of the subject_type:produce/:consume authorization check.",
+      "type": "array",
+      "items": { "type": "string" }
     },
     "data_schema": {
       "description": "JSON Schema for the event payload. v1 treats event types as immutable: any change requires a new event type with a new GTS identifier.",

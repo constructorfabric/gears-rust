@@ -607,7 +607,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-event-broker
 
 E2E_TARGET ?=
 
@@ -655,6 +655,12 @@ e2e-usage-collector:
 	cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES)
 	E2E_BINARY=target/debug/cf-gears-example-server \
 		$(PYTHON) -m pytest testing/e2e/gears/usage_collector/ -vv
+
+## Run event-broker E2E tests (its own standalone binary, not a cf-gears-example-server feature)
+e2e-event-broker:
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/gears/event_broker/ -vv
 
 # -------- Code coverage --------
 

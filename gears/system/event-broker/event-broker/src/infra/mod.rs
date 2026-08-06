@@ -3,6 +3,7 @@
 
 pub mod cluster;
 pub mod dispatcher;
+pub mod specification;
 pub mod storage;
-pub mod type_provisioning;
+pub mod wiring;
 pub mod workers;

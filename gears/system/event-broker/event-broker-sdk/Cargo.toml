@@ -46,6 +46,8 @@ toolkit-stable-hash = { workspace = true }
 jsonschema = { workspace = true }
 
 gts-id = { workspace = true }
+gts = { workspace = true }
+schemars = { workspace = true }
 toolkit-gts = { workspace = true }
 toolkit-db = { workspace = true, optional = true }
 sea-orm = { workspace = true, optional = true }

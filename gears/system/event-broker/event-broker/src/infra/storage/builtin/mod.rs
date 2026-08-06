@@ -1,6 +1,7 @@
-//! Built-in storage backends bundled with the event broker
-//! (`DESIGN.md:602-603`: in-memory, for dev/test).
+//! Built-in storage backend bundled with the event broker: SQLite
+//! (eb-single-process-implementation D3), replacing the in-memory shell
+//! `DESIGN.md:602-603` originally sketched.
 
-pub mod memory;
+pub mod sqlite;
 
-pub use memory::InMemoryStorageBackend;
+pub use sqlite::SqliteEventBackend;

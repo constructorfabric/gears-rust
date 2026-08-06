@@ -14,6 +14,7 @@ pub mod api;
 pub mod consumer;
 pub mod dlq;
 pub mod error;
+pub mod gts;
 pub mod ids;
 pub mod models;
 pub mod producer;
@@ -49,6 +50,10 @@ pub use consumer::{
 };
 
 pub use error::{ConsumerError, EventBrokerError, OffsetManagerError, StorageBackendError};
+pub use gts::{
+    CONSUMER_GROUP_RESOURCE_TYPE, EventTypeV1, PRODUCER_RESOURCE_TYPE, REQUEST_RESOURCE_TYPE,
+    SUBSCRIPTION_RESOURCE_TYPE, TopicV1,
+};
 pub use ids::{ConsumerGroupId, EventTypeId, ProducerId, SubscriptionId, TopicId};
 pub use models::{
     ConsumerGroup, ConsumerGroupKind, ConsumerGroupQuery, CreateConsumerGroupRequest, Event,
