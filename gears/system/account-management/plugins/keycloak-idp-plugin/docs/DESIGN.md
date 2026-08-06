@@ -308,7 +308,9 @@ Each instance publishes `IdpPluginClient` with `ClientScope::gts_id(instance_id)
 
 Initialization validates configuration, approved realm profiles, SecretRef syntax, TLS policy, and GTS identity; resolves standard ClientHub dependencies; resolves the selected realm administrator through Credential Store; and proves the provider reports a supported Keycloak 26.x major. `provision_tenant` remains the operation-based provider readiness signal. Audit infrastructure does not add a plugin dependency.
 
-No V1 initialization path resolves P2 OpenBao mutation APIs or a master-realm bootstrap administrator. After successful publication, dependency loss is classified on the operation that needs it; the module remains registered so recovery does not require process restart.
+Before publication, inability to resolve the configured realm-administrator SecretRef because Credential Store is unavailable, or to reach the configured Keycloak endpoint to complete the 26.x check, is a retryable module-initialization failure: the scoped client is not registered, only IdP-dependent administration is blocked, and unrelated Account Management capabilities remain available.
+
+After successful publication, dependency loss is classified on the operation that needs it; `CleanFailure` or `Retryable` applies only when no mutation outcome is unknown, otherwise the SDK's `Ambiguous` or `Terminal` classification applies. The module remains registered so recovery does not require process restart.
 
 ### 3.3 API Contracts
 
