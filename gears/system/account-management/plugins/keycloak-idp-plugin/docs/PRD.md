@@ -306,7 +306,7 @@ Before p2 service-principal support is promoted, its owner and Account Managemen
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-tenant-user-access-termination`
 
-Account Management does not invoke this plugin for tenant suspension or soft deletion, so those transitions **MUST NOT** be presented as plugin-enforced access termination. During hard deprovisioning, the plugin **MUST** revoke provider sessions and delete every human identity bound to the retiring tenant. It **MUST NOT** delete identities or memberships belonging to another active tenant. The plugin **MUST** return `IdpDeprovisionFailure::Terminal` for operator action when session revocation or identity removal cannot be proven. An access JWT issued before hard deprovisioning can remain valid until its `exp`, which **MUST NOT** exceed 15 minutes in the v1 authentication profile.
+Account Management does not invoke this plugin for tenant suspension or soft deletion, so those transitions **MUST NOT** be presented as plugin-enforced access termination. During hard deprovisioning, the plugin **MUST** revoke provider sessions and delete every human identity bound to the retiring tenant. It **MUST NOT** delete identities or memberships belonging to another active tenant. `IdpDeprovisionFailure::Retryable` applies only when the plugin proves that no deprovisioning mutation has an unknown outcome: either no mutating request may have reached Keycloak, or completed partial work is proven replay-safe and no attempted stage remains uncertain. Once a session-revocation, identity-removal, or boundary-removal request may have reached Keycloak and its result cannot be proven, the plugin **MUST** return `IdpDeprovisionFailure::Terminal` for operator action; a timeout or transient transport label does not override that boundary. An access JWT issued before hard deprovisioning can remain valid until its `exp`, which **MUST NOT** exceed 15 minutes in the v1 authentication profile.
 
 - **Rationale**: This contract matches Account Management's hard-deletion hook and the OIDC resolver's offline JWT model without promising an unavailable suspension or real-time revocation path.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-keycloak`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`
@@ -846,8 +846,9 @@ When required dependencies meet their objectives, the plugin **MUST** support th
 
 **Alternative Flows**:
 - **Resources already absent**: The plugin returns a success-equivalent outcome.
-- **Transient dependency failure**: The plugin returns retryable.
-- **Unsafe or unrecoverable state**: The plugin returns terminal for operator action.
+- **Proven safe retry**: A dependency failure occurs before any mutation may have reached Keycloak, or after only proven replay-safe partial work with no uncertain attempted stage; the plugin returns retryable.
+- **Attempted mutation with unproven result**: A session-revocation, identity-removal, or boundary-removal request may have reached Keycloak but its result cannot be proven; the plugin returns terminal for operator action even when the immediate cause is a timeout or transient transport failure.
+- **Unsafe or unrecoverable state**: Ownership, complete enumeration, or safe continuation cannot be proven; the plugin returns terminal for operator action.
 
 #### Reconcile an Ambiguous Provider Mutation
 
@@ -890,7 +891,7 @@ When required dependencies meet their objectives, the plugin **MUST** support th
 - [ ] User updates distinguish not found, duplicate identity attributes, password-policy rejection, unsupported behavior, invalid input, and provider unavailability.
 - [ ] Cross-tenant negative tests produce zero successful reads or mutations.
 - [ ] Failure injection proves that ambiguous tenant provisioning is never reported as clean, while each user failure maps to an `IdpUserOperationFailure` outcome and equivalent replay remains idempotent.
-- [ ] Every mutating contract-test call and reconciliation resolution has one correlated terminal audit outcome containing no user profile value.
+- [ ] Every mutating contract-test call and reconciliation resolution has one correlated terminal audit outcome containing no user profile value; calls rejected before actor context exists are excluded, matching `cpt-cf-keycloak-idp-plugin-nfr-audit-completeness`.
 - [ ] Secret scanning finds no credential values in logs, metrics, audit events, listings, or debug output.
 - [ ] Every supported Keycloak 26.x release in the release matrix passes the provider contract suite, and representative unsupported major versions fail readiness.
 - [ ] Shared-realm tenant provisioning meets p95 ≤ 5 seconds; each named user operation meets p95 ≤ 1 second under the §6.1 qualification profile.
