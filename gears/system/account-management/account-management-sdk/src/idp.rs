@@ -328,27 +328,19 @@ impl IdpDeprovisionTenantRequest {
 
 /// Failure discriminant for `deprovision_tenant`.
 ///
-/// `Terminal` means the tenant cannot be deprovisioned safely without
-/// operator intervention. This includes any mutating request that may
-/// have reached the provider when its result cannot be proven, even if
-/// the immediate error is a timeout or transient transport failure.
-/// `Retryable` defers to the next tick and is valid only when no
-/// deprovisioning mutation has an unknown outcome: no mutating request
-/// may have reached the provider, or completed partial work is proven
-/// replay-safe with no uncertain attempted stage. `UnsupportedOperation`
-/// is the default path that preserves Phase 1/2 behaviour when no
-/// provider plugin is registered. `NotFound` is the "vendor-side already
-/// gone" path — AM treats it as a success-equivalent and proceeds with
-/// the local DB teardown (see the trait-level doc on idempotency vs typed
-/// errors).
+/// `Terminal` means the tenant cannot be deprovisioned by this
+/// provider and the operator must intervene; `Retryable` defers to the
+/// next tick; `UnsupportedOperation` is the default path that
+/// preserves Phase 1/2 behaviour when no provider plugin is
+/// registered. `NotFound` is the "vendor-side already gone" path — AM
+/// treats it as a success-equivalent and proceeds with the local DB
+/// teardown (see the trait-level doc on idempotency vs typed errors).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IdpDeprovisionFailure {
-    /// Non-recoverable or uncertain after a mutation may have reached
-    /// the provider; logs/audits and parks the tenant for operator action.
+    /// Non-recoverable; logs/audits and skips the tenant this tick.
     Terminal { detail: String },
-    /// Proven safe to retry: no mutation has an unknown outcome. Defer
-    /// the tenant to the next retention tick.
+    /// Transient; defer the tenant to the next retention tick.
     Retryable { detail: String },
     /// Provider does not support deprovisioning at all.
     UnsupportedOperation { detail: String },
@@ -533,12 +525,6 @@ pub trait IdpPluginClient: Send + Sync + 'static {
     ///   so plugins do NOT need to magic-map "already gone" into
     ///   `Ok(())` themselves. Idempotency by error-mapping is the
     ///   contract.
-    /// * MUST classify a failure as [`IdpDeprovisionFailure::Retryable`]
-    ///   only when no deprovisioning mutation has an unknown outcome.
-    ///   If a mutating request may have reached the provider and its
-    ///   result cannot be proven, MUST return
-    ///   [`IdpDeprovisionFailure::Terminal`] even when the immediate
-    ///   error is a timeout or transient transport failure.
     /// * MUST own retry / backoff / rate-limiting policy (see trait-
     ///   level doc). AM issues at most one call per reaper /
     ///   retention tick per row (rows are claimed via the same
