@@ -66,13 +66,33 @@ impl syn::parse::Parse for ContractAttr {
 }
 
 pub fn parse_trait(attr: ContractAttr, item: &ItemTrait) -> syn::Result<ContractModel> {
-    let kind = ContractKind::from_suffix(&item.ident.to_string()).ok_or_else(|| {
+    let trait_name = item.ident.to_string();
+    let kind = ContractKind::from_suffix(&trait_name).ok_or_else(|| {
         syn::Error::new(
             item.ident.span(),
             "contract trait name must end with one of: `Api`, `Embedded`, `Backend`, `Extension` \
              (PRD #1536 D6: contract type encoded in trait-name suffix)",
         )
     })?;
+
+    // A trailing major-version marker on the trait name is allowed (ADR-0007
+    // parallel versioned contracts) but must not disagree with the declared
+    // `version` — otherwise the name a reader trusts and the descriptor/IR a
+    // consumer resolves would claim different major versions. An unmarked name
+    // (`PaymentApi` with `version = "v1"`) is unconstrained.
+    if let Some(marker) = crate::support::version_marker(&trait_name)
+        && marker != attr.version
+    {
+        return Err(syn::Error::new(
+            item.ident.span(),
+            format!(
+                "trait name declares major version `{marker}` but the contract declares \
+                 `version = \"{}\"`; they must agree (ADR-0007: the trait-name marker, \
+                 `version`, and the projection `base_path` all spell the same version)",
+                attr.version
+            ),
+        ));
+    }
 
     let mut methods = Vec::new();
 

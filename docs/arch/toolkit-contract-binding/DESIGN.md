@@ -599,6 +599,8 @@ Generated `error_code` values: `NOTIFICATION_NOT_FOUND`, `DELIVERY_UNAVAILABLE`,
 
 **Enforcement**: Implemented at macro-expansion time (stronger than the original "by convention"). `#[toolkit::contract]` rejects any trait whose name does not end in `Api`/`Embedded`/`Backend`/`Extension`; `#[toolkit::rest_contract]` requires the projection be named `{Base}Rest` and rejects a REST projection on an `Embedded`/`Extension` base (only `Api`/`Backend` are remote-capable). A Dylint lint could still add coverage for *plain* (non-`#[toolkit::contract]`) trait declarations.
 
+**Trailing major-version marker**: a `V<digits>` tail is stripped before the suffix is classified, so `PaymentApiV2` is an `Api` contract exactly like `PaymentApi` (the parallel-version spelling chosen in [ADR-0007](./ADR/0007-cpt-cf-binding-adr-contract-versioning.md)). The rule is not weakened: the stripped name must still carry a contract-type suffix (`PaymentServiceV2` → `PaymentService` → rejected), and since local-only names end in `Embedded`/`Extension` with no trailing digits, stripping can never turn a local contract into a remote-capable one. When the trait carries a version marker it must agree with the declared `version = "vN"`.
+
 ### D7: Server-Side Route Registration via OperationBuilder
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-decision-server-codegen`
@@ -869,15 +871,19 @@ The guard would enforce that remote-capable contracts (Api, Backend) are never i
 
 ### Versioning and v1/v2 Coexistence
 
-This design covers non-breaking evolution (`#[non_exhaustive]` types, default trait methods, new enum variants) but does not yet specify how Rust traits coexist across major versions. The reasonable strategies are:
+**Resolved — see [ADR-0007](./ADR/0007-cpt-cf-binding-adr-contract-versioning.md).** No longer an open question.
 
-- **Parallel traits**: `NotificationBackendV1` and `NotificationBackendV2` as separate traits. ClientHub resolves by type. Consumers choose at compile time. Plugins may implement both during a transition window.
-- **Trait inheritance**: `trait NotificationBackendV2: NotificationBackendV1` with additive methods only. Works for extensions, fails for breaking changes.
-- **Separate SDK crates per major version**: `notification-sdk-v1` and `notification-sdk-v2` published independently. Maximum isolation, maximum duplication.
+The decision is **additive-by-default within a major version, parallel traits for breaking changes** (the gRPC / Kubernetes model):
 
-The **remote-side requirement** is clear: remote services MUST preserve backwards compatibility within a major version. A service exposing `/v1/deliver` must continue to accept requests that the Rust `V1` trait generates for as long as `V1` is supported. This is an operational requirement, not a code-generation concern.
+- **Additive changes stay in the current major and get no new version**: new optional fields on `#[non_exhaustive]` structs, new `#[non_exhaustive]` enum variants, new methods with default bodies (recorded as `optional` in the IR), new provider endpoints (the generated spec is a *minimum* conformance contract per ADR-0002).
+- **Breaking changes introduce a parallel trait pair** — a new base trait plus its projection — served alongside the old one from **one SDK crate**. Each projection generates its own `register_<trait>_routes()`, and both compose onto the same router; `ClientHub` keys by the fully-qualified `type_name`, so `v1::NotificationBackend` and `v2::NotificationBackend` are distinct registrations and the consumer's version choice is a compile-time, type-level property.
+- **Version spelling**: put the version as a **trailing marker on the trait name** — `NotificationBackendV2` + `NotificationBackendV2Rest`. The D6 suffix rule classifies the *contract type*, so the macro strips a trailing `V<digits>` before matching it; the rule stays strict (`PaymentServiceV2` → `PaymentService`, still rejected) and a local-only contract can never be widened (`FooEmbeddedV2` is still refused a projection). **Module-per-version (`v2::NotificationBackend`) is not recommended**: every generated identifier derives from the trait name alone, so two same-named traits emit duplicate `operationId`s into the shared OpenAPI document (silently), collide in `#[toolkit::provides]`/`#[toolkit::consumes]` (`wire_*` name and config key come from the path's last segment → `E0592`), and produce indistinguishable client spans.
+- **`version` ↔ `base_path`**: the contract's `version = "vN"` must match the `/vN` segment of the projection's `base_path`; projections opting into `require_full_coverage` get this asserted by the generated coverage test.
+- **Deprecation**: when vN+1 ships, vN traits are marked `#[deprecated]` with a documented sunset date, both versions are served for the migration window, and vN routes are removed only after it closes. Plugins may implement both traits during the window.
 
-The Rust-side strategy is deferred to an ADR. Whichever strategy is chosen must support: simultaneous presence of V1 and V2 traits in the same SDK crate, a migration window where plugins implement both, and clear deprecation of V1 on a documented timeline.
+**Trait inheritance** (`V2: V1`) was rejected as a category error — it can only express additive changes, which need no new version — and **separate SDK crates per major** is retained only as an escape hatch for externally published SDKs (see ADR-0007 Pros/Cons).
+
+The **remote-side requirement** is unchanged: remote services MUST preserve backwards compatibility within a major version. A service exposing `/v1/deliver` must continue to accept requests that the Rust `V1` trait generates for as long as `V1` is supported. This is an operational requirement, enforced mechanically by the `oasdiff breaking` CI gate (`.github/workflows/api_contracts.yml`), not by code generation.
 
 ### Remote Backend Unavailability
 
@@ -912,5 +918,6 @@ bodies — these fall to a manual `impl Base for MyClient` (ADR-0002 escape hatc
 - **ADR-0003** — projection server generation: [`./ADR/0003-cpt-cf-binding-adr-projection-server-gen.md`](./ADR/0003-cpt-cf-binding-adr-projection-server-gen.md)
 - **ADR-0004** — consumer wiring: [`./ADR/0004-cpt-cf-binding-adr-consumer-wiring.md`](./ADR/0004-cpt-cf-binding-adr-consumer-wiring.md)
 - **ADR-0006** — client observability (tracing/OTEL): [`./ADR/0006-cpt-cf-binding-adr-client-observability.md`](./ADR/0006-cpt-cf-binding-adr-client-observability.md)
+- **ADR-0007** — contract versioning (additive + parallel traits): [`./ADR/0007-cpt-cf-binding-adr-contract-versioning.md`](./ADR/0007-cpt-cf-binding-adr-contract-versioning.md)
 - **PoC**: [striped-zebra-dev/toolkit-binding-poc](https://github.com/striped-zebra-dev/toolkit-binding-poc)
 - **Gear/plugin declaration and resolution**: [PR #1380](https://github.com/constructorfabric/gears-rust/pull/1380)

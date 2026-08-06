@@ -1,0 +1,5 @@
+error: trait name declares major version `v2` but the contract declares `version = "v1"`; they must agree (ADR-0007: the trait-name marker, `version`, and the projection `base_path` all spell the same version)
+ --> tests/ui/fail/version_marker_mismatch.rs:9:11
+  |
+9 | pub trait PaymentApiV2: Send + Sync {
+  |           ^^^^^^^^^^^^

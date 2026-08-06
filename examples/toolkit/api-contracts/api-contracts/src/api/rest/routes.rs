@@ -18,22 +18,24 @@ use toolkit::api::OpenApiRegistry;
 use toolkit::api::operation_builder::OperationBuilder;
 
 use api_contracts_sdk::contract::PaymentApi;
+use api_contracts_sdk::contract_v2::PaymentApiV2;
 use api_contracts_sdk::models::PaymentSummary;
 
 use super::handlers;
 
 const API_TAG: &str = "API Contracts \u{2014} Payments";
 
-/// Register **all** `PaymentApi` REST routes — the full set used by the gear
-/// and the integration tests.
+/// Register **all v1** `PaymentApi` REST routes — the full v1 set used by the
+/// gear and the integration tests.
 ///
-/// Composes the two registration paths on one router:
+/// Composes the two v1 registration paths on one router:
 /// 1. macro-generated routes (`charge`, `get_invoice`) via
 ///    [`api_contracts_sdk::rest::register_payment_api_rest_routes`];
 /// 2. the manual SSE `list_payments` route via [`register_manual_routes`].
 ///
 /// This is the canonical proof that generated and hand-written
-/// `OperationBuilder` registration interoperate on the same router.
+/// `OperationBuilder` registration interoperate on the same router. For the
+/// v2 routes see [`register_v2_routes`] — the two compose on one router.
 #[allow(clippy::needless_pass_by_value)]
 pub fn register_routes(
     router: Router,
@@ -46,6 +48,21 @@ pub fn register_routes(
         Arc::clone(&service),
     );
     register_manual_routes(router, openapi, service)
+}
+
+/// Register the macro-generated **v2** routes under `/api/api-contracts/v2`.
+///
+/// Kept separate from [`register_routes`] so the two major versions compose on
+/// one router independently (ADR-0007: parallel versions served side by side
+/// during a migration window) — callers that only need v1 are unaffected.
+/// v2 declares no `#[server_manual]` method, so it has no hand-written
+/// counterpart and needs no `Extension` of its own.
+pub fn register_v2_routes(
+    router: Router,
+    openapi: &dyn OpenApiRegistry,
+    service_v2: Arc<dyn PaymentApiV2>,
+) -> Router {
+    api_contracts_sdk::rest_v2::register_payment_api_v2_rest_routes(router, openapi, service_v2)
 }
 
 /// Register the routes that are kept **manual** (not macro-generated).

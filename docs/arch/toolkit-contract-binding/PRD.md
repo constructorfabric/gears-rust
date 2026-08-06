@@ -566,6 +566,22 @@ The system SHALL define a trait for service directory resolution. Given a GTS ID
 
 ### 5.11 Versioning & Non-Exhaustive Types
 
+> **Major-version strategy — see [ADR-0007](./ADR/0007-cpt-cf-binding-adr-contract-versioning.md).**
+> The two requirements below are the *additive* primitives: within a major
+> version only additive changes are allowed, and they do not get a new version.
+> A **breaking** change introduces a **parallel trait pair** (new base trait +
+> projection) served alongside the old one from the same SDK crate, with the
+> version spelled as a **trailing marker on the trait name** (`PaymentApiV2` +
+> `PaymentApiV2Rest`). The trait-name suffix rule still applies — the macro
+> strips a trailing `V<digits>` before classifying the contract type, so
+> `PaymentServiceV2` is still rejected and a local-only contract is never widened.
+> Module-per-version (`v2::PaymentApi`) is **not** recommended: identical trait
+> names produce duplicate `operationId`s and collide in `#[toolkit::provides]`.
+> The contract's `version = "vN"` must match the `/vN` segment of the
+> projection's `base_path` (and the trait-name marker), which
+> `require_full_coverage` asserts. Breaking changes are detected in CI by
+> `oasdiff breaking` (`.github/workflows/api_contracts.yml`).
+
 #### Non-Exhaustive Request/Response Types
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-non-exhaustive`

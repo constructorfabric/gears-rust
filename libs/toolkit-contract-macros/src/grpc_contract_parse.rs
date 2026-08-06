@@ -146,15 +146,12 @@ pub fn parse(attr: GrpcContractAttr, item: ItemTrait) -> syn::Result<GrpcContrac
         ));
     }
 
-    // Base must be remote-capable (`Api` or `Backend`).
-    if !(base_name.ends_with("Api") || base_name.ends_with("Backend")) {
-        let suffix = if base_name.ends_with("Embedded") {
-            "Embedded"
-        } else if base_name.ends_with("Extension") {
-            "Extension"
-        } else {
-            "<unknown>"
-        };
+    // Base must be remote-capable (`Api` or `Backend`). Classification is
+    // delegated to `ContractKind` so the suffix rule — including its handling of
+    // a trailing major-version marker (ADR-0007) — lives in exactly one place.
+    let base_kind = crate::model::ContractKind::from_suffix(&base_name);
+    if !base_kind.is_some_and(crate::model::ContractKind::is_remote_capable) {
+        let suffix = base_kind.map_or("<unknown>", crate::model::ContractKind::suffix);
         return Err(syn::Error::new(
             trait_ident.span(),
             format!(

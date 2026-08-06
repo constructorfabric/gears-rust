@@ -21,8 +21,13 @@ pub enum ContractKind {
 
 impl ContractKind {
     /// Match a trait-name suffix to a [`ContractKind`].
+    ///
+    /// A trailing major-version marker is ignored, so `PaymentApiV2` classifies
+    /// as [`ContractKind::Api`] exactly like `PaymentApi` (ADR-0007: parallel
+    /// versioned traits). See [`strip_version_suffix`].
     #[must_use]
     pub fn from_suffix(name: &str) -> Option<Self> {
+        let name = crate::support::strip_version_suffix(name);
         if name.ends_with("Api") {
             Some(ContractKind::Api)
         } else if name.ends_with("Embedded") {
@@ -36,11 +41,24 @@ impl ContractKind {
         }
     }
 
-    /// Whether this kind permits a transport projection.
+    /// Whether this kind permits a transport projection (`*Rest`, `*Grpc`).
+    ///
+    /// Consumed by the REST and gRPC projection parsers to gate remote
+    /// capability, so the suffix rule is encoded here only.
     #[must_use]
-    #[allow(dead_code, reason = "consumed by future projection validation")]
     pub const fn is_remote_capable(self) -> bool {
         matches!(self, ContractKind::Api | ContractKind::Backend)
+    }
+
+    /// The contract-type suffix this kind corresponds to, for diagnostics.
+    #[must_use]
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            ContractKind::Api => "Api",
+            ContractKind::Embedded => "Embedded",
+            ContractKind::Backend => "Backend",
+            ContractKind::Extension => "Extension",
+        }
     }
 }
 

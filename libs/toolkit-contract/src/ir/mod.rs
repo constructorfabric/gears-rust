@@ -9,4 +9,6 @@ pub use contract::{
     ServiceIr, TypeRef,
 };
 pub use grpc::{GrpcBindingIr, GrpcIdempotency, GrpcMethodBindingIr, validate_grpc_binding};
-pub use validation::{ValidationError, validate_contract, validate_http_binding};
+pub use validation::{
+    ValidationError, validate_contract, validate_http_binding, version_matches_base_path,
+};

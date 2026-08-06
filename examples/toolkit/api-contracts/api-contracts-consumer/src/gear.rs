@@ -26,8 +26,17 @@ use crate::rest;
 ///   with a REST capability.
 /// - `#[toolkit::consumes]` declares the cross-gear dependency (resolved lazily,
 ///   tolerant of a not-yet-ready or remote provider — no topo-sort dep).
+///
+/// Both major versions of the provider's contract are declared (ADR-0007). The
+/// attributes stack: because the trait names differ, each gets its own wiring
+/// fn (`__toolkit_wire_payment_api_from_api_contracts` /
+/// `…_payment_api_v2_…`) with no collision. This gear's own business logic
+/// deliberately still calls **v1** — the realistic migration-window shape,
+/// where a consumer keeps working against the old version while the provider
+/// already serves the new one.
 #[toolkit::gear(name = "api-contracts-consumer", capabilities = [rest])]
 #[toolkit::consumes(contract = api_contracts_sdk::PaymentApi, from = "api-contracts")]
+#[toolkit::consumes(contract = api_contracts_sdk::PaymentApiV2, from = "api-contracts")]
 #[derive(Default)]
 pub struct ApiContractsConsumer;
 

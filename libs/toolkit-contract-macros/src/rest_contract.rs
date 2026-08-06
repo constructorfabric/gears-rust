@@ -62,8 +62,11 @@ pub fn generate(model: &RestContractModel) -> TokenStream {
 }
 
 /// When `require_full_coverage` (ADR-0003) is set, emit a generated test that
-/// asserts the base contract and the REST projection cover exactly the same
-/// method set (both directions), naming any offending method.
+/// asserts (a) the base contract and the REST projection cover exactly the same
+/// method set (both directions), naming any offending method, and (b) the
+/// contract's declared `version` appears as a segment of the projection's
+/// `base_path` (ADR-0007 §3 — the two are otherwise independent inputs and can
+/// silently drift).
 ///
 /// This runs under `cargo test`, is feature-independent (does not need
 /// `rest-client`), and reuses the runtime coverage validator
@@ -98,6 +101,21 @@ fn generate_full_coverage_check(model: &RestContractModel, support: &TokenStream
                     __errs
                 );
             }
+
+            // ADR-0007 §3: the version-designating segment of `base_path` must
+            // match the contract's declared version, so a major bump cannot land
+            // in one place only. The predicate itself lives in (and is unit-
+            // tested in) `toolkit-contract` so generated code has one definition
+            // to call — see `ir::version_matches_base_path`.
+            let __version = <dyn #base_trait as #support::Contract>::descriptor().version;
+            ::std::assert!(
+                #support::ir::version_matches_base_path(__version, &__binding.base_path),
+                "require_full_coverage: contract version '{}' does not match the version \
+                 segment of the projection base_path '{}' (ADR-0007: the trait-name marker, \
+                 `version`, and `base_path` must all spell the same version)",
+                __version,
+                __binding.base_path,
+            );
         }
     }
 }

@@ -15,6 +15,37 @@ impl fmt::Display for ValidationError {
     }
 }
 
+/// Whether a projection's `base_path` spells the same major version the
+/// contract declares (ADR-0007 §3).
+///
+/// The rule is the **last version-shaped segment wins**: a `base_path` may carry
+/// other segments, but the version-designating one — the last segment matching
+/// `v<digits>` — must equal `version`. That rejects a half-applied major bump
+/// such as `version = "v2"` against `base_path = "/v2/api/billing/v1"`, which a
+/// "contains the version anywhere" check would wave through.
+///
+/// An empty `version`, or a `base_path` with no version-shaped segment at all,
+/// is never a match — otherwise the check would pass vacuously (a leading-slash
+/// path splits into a leading empty segment).
+///
+/// Used by the `require_full_coverage` assertion the REST projection macro
+/// generates; exposed here so it is unit-testable and so generated code has a
+/// single definition to call.
+#[must_use]
+pub fn version_matches_base_path(version: &str, base_path: &str) -> bool {
+    if version.is_empty() {
+        return false;
+    }
+    let is_version_segment = |seg: &&str| {
+        seg.strip_prefix('v')
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    };
+    base_path
+        .split('/')
+        .rfind(is_version_segment)
+        .is_some_and(|seg| seg == version)
+}
+
 /// Validates a [`ContractIr`] for structural well-formedness.
 ///
 /// # Errors
@@ -533,5 +564,42 @@ mod tests {
             }],
         };
         validate_http_binding(&contract, &binding).expect("valid binding should pass");
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod version_base_path_tests {
+    use super::version_matches_base_path;
+
+    #[test]
+    fn accepts_matching_version_segment() {
+        assert!(version_matches_base_path("v1", "/api/billing/v1"));
+        assert!(version_matches_base_path("v2", "/api/api-contracts/v2"));
+        assert!(version_matches_base_path("v10", "/api/x/v10"));
+        // The version need not be the last path segment, only the last
+        // version-shaped one.
+        assert!(version_matches_base_path("v1", "/api/v1/payments"));
+    }
+
+    #[test]
+    fn rejects_disagreeing_version() {
+        assert!(!version_matches_base_path("v2", "/api/billing/v1"));
+        assert!(!version_matches_base_path("v2", "/api/billing"));
+        // A half-applied major bump: the version-designating (last) segment is
+        // still v1, so this must not pass just because "v2" appears somewhere.
+        assert!(!version_matches_base_path("v2", "/v2/api/billing/v1"));
+    }
+
+    #[test]
+    fn rejects_vacuous_and_malformed_inputs() {
+        // An empty version must never match — a leading-slash base_path splits
+        // into a leading empty segment, which would otherwise pass.
+        assert!(!version_matches_base_path("", "/api/billing/v1"));
+        assert!(!version_matches_base_path("", ""));
+        // `v` alone and non-numeric tails are not version segments.
+        assert!(!version_matches_base_path("v", "/api/v"));
+        assert!(!version_matches_base_path("v2", "/api/xv2"));
+        assert!(!version_matches_base_path("v2", "/api/v2beta"));
     }
 }

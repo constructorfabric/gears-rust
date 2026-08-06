@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use api_contracts_sdk::error::PaymentResourceError;
 use api_contracts_sdk::models::{
-    ChargeRequest, ChargeResponse, Invoice, ListPaymentsFilter, PaymentStatus, PaymentSummary,
+    ChargeRequest, ChargeResponse, ChargeV2Request, ChargeV2Response, Invoice, ListPaymentsFilter,
+    PaymentStatus, PaymentSummary,
 };
 use parking_lot::RwLock;
 use toolkit_canonical_errors::CanonicalError;
@@ -21,9 +22,25 @@ struct PaymentRecord {
     status: PaymentStatus,
 }
 
+/// Idempotency-store key for v2 charges.
+///
+/// Scoped by the **caller's identity**, not by the raw client-supplied string:
+/// `(subject_tenant_id, subject_id, idempotency_key)`. Keying on the bare key
+/// would let one tenant replay another tenant's key and be handed their
+/// `ChargeV2Response` — see the contract docs on
+/// [`ChargeV2Request::idempotency_key`](api_contracts_sdk::models::ChargeV2Request).
+type IdempotencyKey = (Uuid, Uuid, String);
+
 /// In-memory `PaymentService` implementation for the proof of concept.
+///
+/// One domain store backs **both** contract versions (v1 `PaymentApi` and v2
+/// `PaymentApiV2`): a major version changes the wire contract, not the
+/// business data, so a payment charged through either version is visible to
+/// both.
 pub struct PaymentDomainService {
     payments: RwLock<HashMap<Uuid, PaymentRecord>>,
+    /// v2 idempotent-charge dedupe: caller-scoped key → the payment it created.
+    idempotency: RwLock<HashMap<IdempotencyKey, Uuid>>,
 }
 
 impl PaymentDomainService {
@@ -32,6 +49,7 @@ impl PaymentDomainService {
     pub fn new() -> Self {
         Self {
             payments: RwLock::new(HashMap::new()),
+            idempotency: RwLock::new(HashMap::new()),
         }
     }
 
@@ -56,6 +74,61 @@ impl PaymentDomainService {
         };
         self.payments.write().insert(payment_id, record);
         Ok(ChargeResponse::new(payment_id, PaymentStatus::Pending))
+    }
+
+    /// Charge a payment — **v2**: an idempotent write keyed by
+    /// `idempotency_key`.
+    ///
+    /// Replaying the same key from the same caller returns the original
+    /// outcome instead of charging twice, which is what makes the v2 REST
+    /// method safe to mark `#[retryable]`. The dedupe key is scoped by the
+    /// caller's `(tenant, subject)` taken from `ctx`, so one tenant can never
+    /// replay another tenant's key.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CanonicalError` on invalid input.
+    #[allow(clippy::unnecessary_wraps, reason = "real impl would be fallible")]
+    pub fn charge_v2(
+        &self,
+        ctx: &SecurityContext,
+        req: &ChargeV2Request,
+    ) -> Result<ChargeV2Response, CanonicalError> {
+        let key: IdempotencyKey = (
+            ctx.subject_tenant_id(),
+            ctx.subject_id(),
+            req.idempotency_key.clone(),
+        );
+
+        // Replay: return the original payment without creating a second one.
+        if let Some(&payment_id) = self.idempotency.read().get(&key) {
+            return Ok(ChargeV2Response::new(
+                payment_id,
+                PaymentStatus::Pending,
+                req.amount_minor,
+                req.currency.clone(),
+            ));
+        }
+
+        let payment_id = Uuid::new_v4();
+        let record = PaymentRecord {
+            payment_id,
+            // v2 renamed the field; the stored amount is the same minor unit.
+            amount_cents: req.amount_minor,
+            currency: req.currency.clone(),
+            // v2 dropped `description` from the request payload.
+            description: format!("v2 charge {}", req.idempotency_key),
+            status: PaymentStatus::Pending,
+        };
+        self.payments.write().insert(payment_id, record);
+        self.idempotency.write().insert(key, payment_id);
+
+        Ok(ChargeV2Response::new(
+            payment_id,
+            PaymentStatus::Pending,
+            req.amount_minor,
+            req.currency.clone(),
+        ))
     }
 
     /// Get an invoice by payment ID.

@@ -39,10 +39,17 @@ impl ChargeProxyService {
         ctx: SecurityContext,
         req: ChargeRequest,
     ) -> Result<ChargeResponse, CanonicalError> {
-        let api = self
-            .hub
-            .get::<dyn PaymentApi>()
-            .map_err(|_| CanonicalError::service_unavailable().create())?;
+        // Carry the `ClientHubError` into the 503 detail: `NotFound` (nothing
+        // registered for the trait) and `TypeMismatch` (registered under a
+        // different concrete type) are very different wiring bugs, and both
+        // would otherwise collapse into the same opaque "Service temporarily
+        // unavailable". The error renders only a Rust type path, so it is safe
+        // for the public `Problem` body per the `with_detail` caller contract.
+        let api = self.hub.get::<dyn PaymentApi>().map_err(|err| {
+            CanonicalError::service_unavailable()
+                .with_detail(format!("PaymentApi not resolvable from ClientHub: {err}"))
+                .create()
+        })?;
         api.charge(ctx, req).await
     }
 }
