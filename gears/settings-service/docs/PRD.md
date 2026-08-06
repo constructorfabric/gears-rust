@@ -362,7 +362,7 @@ Activating a change **MUST NOT** require the Settings Service to reload or resta
 
 #### Dependency Group and Cross-Setting Constraint Declaration
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-fr-dependency-group-declaration`
+- [ ] `p3` - **ID**: `cpt-cf-settings-service-fr-dependency-group-declaration`
 
 The system **MUST** let a declaration author declare a **Dependency Group** — a named set of interdependent settings with an associated **cross-setting constraint** over their combined values — so that the atomic, all-or-nothing Apply and resulting-configuration validation required by `cpt-cf-settings-service-fr-apply-effect-resolution` have an explicit definition to enforce. A Dependency Group over **admin-authored** settings **MUST** be declarable by a platform administrator; a Dependency Group over a gear's **contributed** settings **MUST** be declarable by that owning gear on install/upgrade ([§5.8](#58-module-contributed-settings)). A Dependency Group definition and its cross-setting constraint are **behavior-affecting**: they **MUST** follow the same immutability rule as other behavior-affecting declaration fields ([§5.1](#51-settings--category-model)) — changed only via a replacement declaration, never edited in place — so a live scope's validity rules cannot change through an ungated edit. A setting not in any Dependency Group applies as an independent per-change unit.
 
