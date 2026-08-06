@@ -2,7 +2,9 @@
 //! (`openspec/changes/eb-service-topology/specs/event-broker-deployment-topology/spec.md`).
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use cluster_sdk::DiscoveryFilter;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use toolkit::config::ConfigProvider;
@@ -11,6 +13,7 @@ use uuid::Uuid;
 
 use super::EventBrokerModule;
 use crate::config::DeploymentMode;
+use crate::domain::cluster::EventBrokerCluster;
 
 struct StaticConfigProvider {
     root: serde_json::Value,
@@ -23,11 +26,19 @@ impl ConfigProvider for StaticConfigProvider {
 }
 
 fn make_ctx(mode: &str) -> GearCtx {
+    make_ctx_with_hub(mode, Arc::new(ClientHub::new()))
+}
+
+fn make_ctx_with_hub(mode: &str, hub: Arc<ClientHub>) -> GearCtx {
     let cfg = json!({
         "event-broker": {
             "config": {
                 "mode": mode,
                 "default_storage_backend": "memory",
+                // Only load-bearing for cluster_ingest/cluster_delivery
+                // (registration `init`-time validation, `eb-dispatcher-routing`
+                // design.md D5); harmless for the other two modes.
+                "registration": { "advertise_addr": "127.0.0.1:8080" },
             }
         }
     });
@@ -35,7 +46,7 @@ fn make_ctx(mode: &str) -> GearCtx {
         EventBrokerModule::MODULE_NAME,
         Uuid::new_v4(),
         Arc::new(StaticConfigProvider { root: cfg }),
-        Arc::new(ClientHub::new()),
+        hub,
         CancellationToken::new(),
     )
 }
@@ -99,6 +110,78 @@ async fn init_fails_for_unknown_mode() {
         "invalid config for gear 'event-broker': unknown variant `not_a_real_mode`, \
          expected one of `standalone`, `cluster_ingest`, `cluster_delivery`, `cluster_dispatcher`"
     );
+}
+
+/// Spec "Advertise-address resolution", "No `advertise_addr`, wildcard bind
+/// address, cluster mode" - the `init`-level integration (the resolver-level
+/// unit tests live in `infra::cluster::advertise_address::tests`).
+#[tokio::test]
+async fn init_fails_on_wildcard_bind_with_no_advertise_addr_in_cluster_mode() {
+    let cfg = json!({
+        "event-broker": {
+            "config": {
+                "mode": "cluster_ingest",
+                "default_storage_backend": "memory",
+                // `registration` omitted entirely -> defaults to
+                // `listen_addr: "0.0.0.0:0"`, `advertise_addr: None`.
+            }
+        }
+    });
+    let ctx = GearCtx::new(
+        EventBrokerModule::MODULE_NAME,
+        Uuid::new_v4(),
+        Arc::new(StaticConfigProvider { root: cfg }),
+        Arc::new(ClientHub::new()),
+        CancellationToken::new(),
+    );
+
+    let module = EventBrokerModule::default();
+    let err = module
+        .init(&ctx)
+        .await
+        .expect_err("a wildcard bind with no advertise_addr must fail init in cluster mode");
+
+    assert!(
+        format!("{err:#}").contains("wildcard address"),
+        "error: {err:#}"
+    );
+}
+
+/// Spec "Ingest/delivery self-registration": booting in `cluster_ingest`
+/// mode registers with `ServiceDiscoveryV1` under `"ingest"` at the
+/// resolved advertise address.
+#[tokio::test]
+async fn cluster_ingest_serve_registers_with_service_discovery() {
+    let (hub, _cluster) = crate::test_support::standalone_event_broker_cluster().await;
+    let ctx = make_ctx_with_hub("cluster_ingest", Arc::clone(&hub));
+
+    let module = Arc::new(EventBrokerModule::default());
+    module.init(&ctx).await.expect("init must succeed");
+
+    let cancel = CancellationToken::new();
+    let serve_module = Arc::clone(&module);
+    let serve_cancel = cancel.clone();
+    let serve_task = tokio::spawn(async move { serve_module.serve(serve_cancel).await });
+
+    // The standalone backend is in-process with no real I/O, so a short
+    // yield is enough for the spawned `serve()` to reach and complete its
+    // `register()` call before this test's own `discover()` runs.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let cluster = EventBrokerCluster::resolve(&hub).expect("event-broker profile is bound");
+    let instances = cluster
+        .service_discovery
+        .discover("ingest", DiscoveryFilter::default())
+        .await
+        .expect("discover must not fail");
+    assert_eq!(instances.len(), 1, "instances: {instances:?}");
+    assert_eq!(instances[0].address, "http://127.0.0.1:8080");
+
+    cancel.cancel();
+    serve_task
+        .await
+        .expect("serve task must not panic")
+        .expect("serve must return Ok on cancellation");
 }
 
 #[test]
