@@ -12,7 +12,8 @@ refs:
 
 - [ ] `p3` - **ID**: `cpt-cf-keycloak-idp-plugin-design-keycloak-idp-plugin`
 
-**Owners:** @platform-iam-team  
+**Owners:** @platform-iam-team
+
 **Scope:** Overall architecture for the priority-1 (V1) shared-realm plugin. In this document, **P2 means priority 2/deferred**, not version 2.
 
 <!-- toc -->
@@ -61,8 +62,8 @@ V1 does not adopt or create realms, write administrator secrets, manage service 
 | Shared-realm tenant isolation | Versioned routing metadata, a provider-owned tenant group, an immutable tenant marker, and mandatory boundary checks before reads or mutations |
 | Safe external mutation | Tenant clean/ambiguous classification, replay-safe user operations, bounded retries, and operator reconciliation evidence |
 | Hard access termination | Session revocation and identity deletion precede tenant-group deletion; unproven cleanup is terminal |
-| Provider compatibility | Keycloak 26.x startup compatibility check plus a read-only realm authentication-profile verifier |
-| Protected administration | Least-privileged per-realm administrator, Credential Store SecretRefs, shared ToolKit HTTP/auth, and no V1 master-realm administrator |
+| Provider compatibility | Per-operation Keycloak 26.x compatibility gate plus a read-only realm authentication-profile verifier |
+| Protected administration | Operator-provisioned OAGW routes, gateway-owned Credential Store injection, a least-privileged per-realm administrator, and no V1 master-realm administrator |
 | Audit completeness | Account Management and the platform audit owner guarantee one durable terminal outcome per supported mutation call |
 | User query correctness | SDK filter/order semantics, `CursorV1`, global deterministic sorting, and no stable-order claim based on Keycloak offset pages |
 | Lifecycle safety | ToolKit cancellation and bounded drain; the plugin owns no periodic or audit-delivery task |
@@ -72,11 +73,11 @@ V1 does not adopt or create realms, write administrator secrets, manage service 
 | NFR | Architectural response | Release verification |
 |---|---|---|
 | Tenant isolation | `TenantBoundaryGuard` validates both group membership and immutable tenant marker | Negative-isolation contract and real-Keycloak tests |
-| Secret non-disclosure | Secret wrappers, allowlisted diagnostics, protected SecretRefs, and output scanning | Logs, metrics, audit, errors, and debug output contain no injected secret |
-| Lifecycle latency | Shared HTTP pooling, bounded calls, point-lookup optimization, and measured full-group query scans | PRD qualification profile: 20 concurrent operations and stated p95 limits |
+| Secret non-disclosure | OAGW-owned credential injection, allowlisted diagnostics, no plugin-visible secret value, and output scanning | Logs, metrics, audit, errors, and debug output contain no injected secret |
+| Lifecycle latency | OAGW connection pooling, bounded calls, point-lookup optimization, and a 1,000-total-user full-group scan ceiling | Complete PRD qualification profile: topology, filter mix, 20 concurrent operations, call/memory limits, and stated p95 limits |
 | Failure classification | Current SDK enums are the only failure vocabulary | Exhaustive enum mapping and failure injection |
 | Audit completeness | The plugin returns a classified privacy-safe outcome; durable correlation and delivery are owned by Account Management and the platform audit contract | One terminal event per mutating call across cross-system contract tests |
-| Provider compatibility | Startup version gate and release compatibility matrix | Supported 26.x matrix passes; unsupported major fails deterministically |
+| Provider compatibility | Operation-level version gate and release compatibility matrix | Supported 26.x matrix passes; unsupported major fails affected operations before mutation without failing host startup |
 | Personal-data lifecycle | No local user directory; hard deletion removes identities and sessions | Hard-delete and output-minimization verification |
 | Availability recovery | Dependency state is evaluated per affected operation after startup | Dependency loss/recovery tests without fallback or default realm |
 
@@ -88,10 +89,10 @@ V1 introduces no approved exception to the repository architecture. Its signific
 - [Keep the IdP as user source of truth](../../../docs/ADR/0005-cpt-cf-account-management-adr-idp-user-identity-source-of-truth.md).
 - [Use provider-enforced tenant binding](../../../docs/ADR/0006-cpt-cf-account-management-adr-idp-user-tenant-binding.md).
 - [Preserve provider-backed partial user updates](../../../docs/ADR/0008-cpt-cf-account-management-adr-user-attribute-update.md).
-- [Use the first-party ToolKit HTTP client](../../../../../../docs/adrs/toolkit/0001-toolkit-hyper-tower-http-client.md).
+- Route external Keycloak traffic through the [Outbound API Gateway](../../../../oagw/docs/DESIGN.md).
 - Follow [ClientHub and plugin scoping](../../../../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md), [lifecycle rules](../../../../../../docs/toolkit_unified_system/08_lifecycle_stateful_tasks.md), the [Architecture Manifest](../../../../../../docs/ARCHITECTURE_MANIFEST.md), and [Security Guidelines](../../../../../../guidelines/SECURITY.md).
 
-A proposal to add a master-realm administrator, direct `reqwest`, direct OpenBao mutation, unscoped publication, or plugin-owned user storage is a material deviation and requires a new accepted ADR before this DESIGN can change.
+A proposal to add a master-realm administrator, direct external HTTP, direct OpenBao mutation, unscoped publication, or plugin-owned user storage is a material deviation and requires a new accepted ADR before this DESIGN can change.
 
 Durable audit delivery requires accepted Account Management and platform audit designs. This plugin design does not define their persistence, recovery, relay, sink, or retention mechanisms. The existing Account Management structured-log stand-in is suitable only for development.
 
@@ -102,22 +103,24 @@ flowchart LR
   operator([Platform operator])
   iac[IaC and protected configuration]
   cred[(Credential Store)]
+  oagw[Outbound API Gateway]
   kc[(Keycloak 26.x shared realm)]
   authn[OIDC AuthN Resolver]
   audit[Platform audit infrastructure]
   subgraph am[Account Management process]
     api[Account Management application layer]
     domain[Plugin domain coordinators and boundary guard]
-    infra[Credential and Keycloak adapters]
+    infra[OAGW and Keycloak representation adapters]
   end
 
   operator --> iac
-  iac -->|approved realm profiles and SecretRefs| infra
+  iac -->|approved realm, OAGW routes, and credential references| oagw
   api -->|scoped IdpPluginClient| domain
   api -->|durable terminal outcome; external contract| audit
   domain --> infra
-  infra -->|protected secret read| cred
-  infra -->|Admin REST over toolkit-http| kc
+  infra -->|ServiceGatewayClientV1| oagw
+  oagw -->|protected credential resolution| cred
+  oagw -->|OAuth and Admin REST| kc
   authn -->|OIDC discovery and JWKS; no plugin call| kc
 ```
 
@@ -125,8 +128,8 @@ flowchart LR
 |---|---|
 | Account Management application | Public authorization, tenant saga orchestration, opaque metadata persistence, scoped provider selection, and audit orchestration defined by the parent AM design |
 | Plugin domain | Tenant/user lifecycle, boundary enforcement, replay safety, error classification, and privacy-preserving outcomes |
-| Plugin infrastructure | ToolKit HTTP/auth, Credential Store resolution, Keycloak representation mapping, and telemetry transport |
-| Platform dependencies | Keycloak identity state, Credential Store secrets, platform audit infrastructure, and operator-owned realm configuration |
+| Plugin infrastructure | OAGW request construction, Keycloak representation mapping, bounded response handling, and telemetry |
+| Platform dependencies | OAGW egress and credential injection, Keycloak identity state, Credential Store secrets, platform audit infrastructure, and operator-owned realm configuration |
 
 ## 2. Principles & Constraints
 
@@ -198,7 +201,7 @@ V1 supports only `mode = shared` against an operator-approved Keycloak 26.x real
 
 - [ ] `p3` - **ID**: `cpt-cf-keycloak-idp-plugin-constraint-external-consistency-boundaries`
 
-Keycloak, Credential Store, and the platform audit sink are external consistency boundaries. Plugin calls occur outside Account Management database transactions, so the architecture does not claim atomic commit or transport-level exactly-once behavior across those systems.
+OAGW, Keycloak, Credential Store, and the platform audit sink are external consistency boundaries. Plugin calls occur outside Account Management database transactions, so the architecture does not claim atomic commit or transport-level exactly-once behavior across those systems.
 
 #### External durable audit prerequisite
 
@@ -210,7 +213,7 @@ The plugin owns no audit table, recovery worker, relay, or sink integration. Pro
 
 - [ ] `p3` - **ID**: `cpt-cf-keycloak-idp-plugin-constraint-opaque-metadata-replay`
 
-Account Management persists plugin metadata as opaque JSON and replays it on later calls.
+Account Management persists plugin metadata as opaque JSON and replays it on later calls. The envelope carries its producing GTS provider instance identifier, which the plugin verifies against its own identifier before any OAGW or provider access.
 
 #### No plugin persistence
 
@@ -222,7 +225,7 @@ The plugin owns no database table and no persistent user cache.
 
 - [ ] `p3` - **ID**: `cpt-cf-keycloak-idp-plugin-constraint-scoped-provider-selection`
 
-Account Management requires a coordinated change to select a GTS-scoped provider instance; no unscoped compatibility fallback is allowed.
+Account Management requires a coordinated change to select a GTS-scoped provider instance; no unscoped compatibility fallback is allowed. V1 does not support changing the selected instance while tenant metadata exists. A replayed instance mismatch fails closed and requires an operator-approved migration.
 
 #### Bounded offline-token exposure
 
@@ -234,7 +237,7 @@ A previously issued access JWT can remain valid until `exp`; the approved realm 
 
 - [ ] `p3` - **ID**: `cpt-cf-keycloak-idp-plugin-constraint-correct-global-query-ordering`
 
-Query correctness requires a global view of the tenant group because Keycloak does not guarantee stable ordering across offset pages. V1 accepts linear provider-read cost and must prove the PRD latency target on the release qualification population.
+Query correctness requires a global view of the tenant group because Keycloak does not guarantee stable ordering across offset pages. V1 accepts linear provider-read cost up to 1,000 total human identities, enabled or disabled, per tenant group and must prove the PRD latency, provider-call, and memory targets on the complete release qualification profile.
 
 ### 2.3 Applicability Matrix
 
@@ -259,19 +262,21 @@ Query correctness requires a global view of the tenant group because Keycloak do
 
 ### 3.1 Domain Model
 
-The provider metadata is a versioned, non-secret routing envelope owned by the plugin and persisted opaquely by Account Management. It identifies the shared realm, provider-owned tenant group, immutable tenant identity, and a non-secret administrator-profile reference. Exact serialization belongs to the implementation specification; compatibility rules are architectural:
+The provider metadata is a versioned, non-secret routing envelope owned by the plugin and persisted opaquely by Account Management. It identifies the exact producing GTS provider instance, shared realm, provider-owned tenant group, immutable tenant identity, and non-secret OAGW route/profile reference. Exact serialization belongs to the implementation specification; compatibility rules are architectural:
 
 - all versions in the declared rolling-upgrade window can read and safely deprovision metadata written by one another;
-- malformed or unknown newer-major metadata fails closed without provider mutation;
+- the replayed producing instance must equal the receiving plugin's published instance identifier before any OAGW or provider call;
+- an instance mismatch, malformed envelope, or unknown newer-major metadata fails closed without external access;
 - metadata never contains administrator secrets, tokens, passwords, or user profile values;
-- realm and tenant identifiers come from replayed metadata, not caller-controlled defaults on later operations.
+- realm and tenant identifiers come from replayed metadata, not caller-controlled defaults on later operations;
+- changing the selected provider instance requires an operator-approved migration or retirement of every tenant bound to the old instance.
 
 Provider ownership is split as follows:
 
 | Resource | Owner | Plugin authority |
 |---|---|---|
 | Shared realm and authentication profile | Platform operator | Read and verify only |
-| Realm-administrator client and secret | Platform operator | Authenticate with least privilege; never create or disclose |
+| OAGW Keycloak route and realm-administrator credential reference | Platform operator | Plugin invokes the approved route; OAGW injects least-privileged credentials without disclosure |
 | Tenant group and immutable tenant marker | Plugin | Create, inspect, and delete for the owning tenant |
 | Human identity and sessions in the tenant boundary | Plugin through Account Management | Create, update, query, revoke, and delete after boundary verification |
 | Opaque provider metadata row | Account Management | Persist/replay only; plugin owns interpretation |
@@ -288,16 +293,16 @@ The plugin is one logical architecture component. The following entries are resp
 
 | Responsibility partition | Architectural responsibility |
 |---|---|
-| Plugin module | Configuration, startup compatibility, lifecycle, and GTS-scoped ClientHub publication |
-| Approved realm registry | Maps explicit shared-realm intent to operator-approved realm and non-secret credential profile |
+| Plugin module | Static configuration validation, lifecycle, and GTS-scoped ClientHub publication |
+| Approved realm registry | Maps explicit shared-realm intent to operator-approved realm and non-secret OAGW route/profile reference |
 | Realm profile verifier | Read-only verification of Keycloak version, issuer, clients, scopes, protocol mappers, claims, signing, session/token policy, password/login policy, and required administration privileges |
 | Metadata codec | Versioned opaque metadata compatibility and fail-closed decoding |
 | Tenant lifecycle coordinator | Tenant-boundary provisioning, hard-deletion ordering, uncertainty classification, and reconciliation evidence |
 | Tenant boundary guard | Verifies tenant marker and group membership before every user read or mutation |
 | User lifecycle coordinator | Replay-safe user create/update/delete and provider projection |
 | User query adapter | Tenant-scoped filtering, ordering, point existence, global sorting, and `CursorV1` generation |
-| Keycloak adapter | ToolKit HTTP/auth integration, bounded provider calls, response classification, and allowlisted diagnostics |
-| Credential resolver | Protected SecretRef resolution under a least-privileged plugin system actor, including ownership validation and rotation refresh |
+| OAGW adapter | `ServiceGatewayClientV1` request construction, bounded response handling, Keycloak representation mapping, response classification, and allowlisted diagnostics |
+| Outbound authorization boundary | Forwards the caller's authorized `SecurityContext`; OAGW route policy admits only approved AM actors and stable AM system subjects, while OAGW owns credential resolution and injection |
 | Terminal outcome producer | Returns one classified, privacy-preserving outcome to the AM caller and records bounded-cardinality metrics separately |
 
 #### Deployment, Publication, and Readiness
@@ -306,11 +311,11 @@ The plugin is an in-process ModKit module in each Account Management replica. It
 
 Each instance publishes `IdpPluginClient` with `ClientScope::gts_id(instance_id)`. Account Management must select the configured provider instance through scoped ClientHub resolution. This coordinated consumer change is a V1 implementation prerequisite; ambiguous selection or unscoped fallback fails closed.
 
-Initialization validates configuration, approved realm profiles, SecretRef syntax, TLS policy, and GTS identity; resolves standard ClientHub dependencies; resolves the selected realm administrator through Credential Store; and proves the provider reports a supported Keycloak 26.x major. `provision_tenant` remains the operation-based provider readiness signal. Audit infrastructure does not add a plugin dependency.
+Initialization validates only static inputs: plugin configuration, approved realm and OAGW route references, identifier syntax, the required HTTPS posture, and GTS identity. It resolves required in-process ClientHub contracts and publishes the scoped client without sending a request to OAGW, Credential Store, or Keycloak. A missing required in-process contract or malformed static configuration is a deployment error and may fail ToolKit initialization. External dependency availability and provider compatibility do not.
 
-Before publication, inability to resolve the configured realm-administrator SecretRef because Credential Store is unavailable, or to reach the configured Keycloak endpoint to complete the 26.x check, is a retryable module-initialization failure: the scoped client is not registered, only IdP-dependent administration is blocked, and unrelated Account Management capabilities remain available.
+`provision_tenant` remains the operation-based readiness signal. Before any affected operation, the plugin verifies the replayed provider instance when metadata exists, invokes the approved OAGW route, and proves that the reachable provider reports Keycloak 26.x and the required realm profile. An unreachable OAGW, Credential Store, or Keycloak endpoint returns the operation's pre-mutation unavailable category. A reachable unsupported major or profile mismatch fails the affected operation deterministically before mutation. A successful version/profile result is cached per configured route and realm; failures are not cached, and the cache is invalidated when the route/profile configuration revision changes or a later response contradicts the cached compatibility state. The scoped client remains registered, and the next call repeats checks that did not complete successfully, so recovery requires no process restart.
 
-After successful publication, dependency loss is classified on the operation that needs it; `CleanFailure` or `Retryable` applies only when no mutation outcome is unknown, otherwise the SDK's `Ambiguous` or `Terminal` classification applies. The module remains registered so recovery does not require process restart.
+After a provider request may have produced an effect, `CleanFailure` or `Retryable` applies only when no mutation outcome is unknown; otherwise the SDK's `Ambiguous` or `Terminal` classification applies. Audit infrastructure does not add a plugin dependency.
 
 ### 3.3 API Contracts
 
@@ -319,13 +324,15 @@ The current [`idp.rs`](../../../account-management-sdk/src/idp.rs) and [`idp_use
 Architectural contract invariants are:
 
 - malformed shared-realm intent uses `IdpProvisionFailure::InvalidInput` before provider mutation;
-- deferred modes use `UnsupportedOperation` before provider or Credential Store mutation;
+- deferred modes use `UnsupportedOperation` before OAGW, Credential Store, or provider mutation;
 - only pre-provision failures proven to retain no provider state use `CleanFailure`;
 - uncertain tenant provisioning preserves `Ambiguous`;
 - duplicate users, password-policy rejection, absent update targets, and unavailability use their current classified user variants;
 - `Rejected` is reserved for provider rejection that cannot be classified further;
+- `UnsupportedOperation` covers a list scan that detects the declared 1,000-user implementation-profile ceiling before returning any page;
 - already-absent deprovisioning follows the SDK's success-equivalent semantics;
 - deprovisioning is `Retryable` only when no attempted mutation has an unknown outcome; any mutation request that may have reached Keycloak without a provable result is `Terminal`, regardless of whether the immediate error appears transient;
+- replayed metadata with a producing instance different from the receiving plugin fails closed before any OAGW request;
 - typed filter/order and `CursorV1` are used without a plugin-specific parallel contract;
 - every mutating return is classifiable and contains enough non-sensitive context for the external audit owner to construct its terminal outcome.
 
@@ -333,26 +340,25 @@ The plugin emits no public HTTP API. Account Management owns public status, vali
 
 ### 3.4 Internal Dependencies
 
-Domain components depend on plugin-owned ports rather than transport types. Direct `reqwest`, raw `hyper`, `tonic`, or Credential Store implementation types do not cross into the domain layer.
+Domain components depend on plugin-owned ports rather than transport types. Direct `reqwest`, raw `hyper`, `tonic`, Keycloak sockets, or Credential Store implementation types do not cross into the domain layer.
 
 | Internal dependency | Purpose |
 |---|---|
 | Account Management SDK | Provider-neutral trait, DTO, failure, and pagination authority |
 | ModKit and ClientHub | Module initialization, lifecycle context, GTS-scoped publication and dependency resolution |
-| `toolkit-http` | Shared TLS, redirects, timeout, retry, concurrency, body-limit, and telemetry policy |
-| `toolkit-auth` | Supported OAuth client-credential integration and token refresh |
+| OAGW SDK | `ServiceGatewayClientV1`, request/response body types, centralized egress policy, and credential injection boundary |
 | `toolkit-odata` | Typed filter/order interpretation and `CursorV1` compatibility |
-| Credential Store SDK | Protected SecretRef reads without implementation coupling |
 
 ### 3.5 External Dependencies
 
 | Dependency | Contract and failure boundary |
 |---|---|
 | Account Management | Authorizes calls, selects the scoped plugin, persists/replays opaque metadata, consumes typed outcomes, and owns audit orchestration defined by its parent design |
-| Keycloak 26.x | User/session/group source of truth and Admin REST provider; another major is unsupported until compatibility approval |
-| Credential Store | Protects operator-created realm-administrator secrets; ownership or availability failure blocks only dependent administration |
+| Outbound API Gateway | Executes operator-approved Keycloak routes through `ServiceGatewayClientV1`, enforces egress policy, and injects credentials; gateway or dependency failure blocks only affected operations |
+| Keycloak 26.x | User/session/group source of truth and Admin REST provider behind OAGW; another major is unsupported until compatibility approval |
+| Credential Store | Protects operator-created realm-administrator secrets consumed by OAGW; credential values never cross into the plugin |
 | Platform audit infrastructure | Owns the sink and delivery contract consumed by Account Management; not defined by this plugin |
-| Operator IaC | Creates the shared realm, realm-local administrator, required authentication profile, SecretRefs, and approved realm registry |
+| Operator IaC | Creates the shared realm, realm-local administrator, required authentication profile, OAGW upstream/routes, credential references, and approved realm registry |
 | OIDC AuthN Resolver | Independently validates tokens; the two plugins do not call each other |
 
 ### 3.6 Interactions & Sequences
@@ -363,7 +369,7 @@ Domain components depend on plugin-owned ports rather than transport types. Dire
 
 A realm is admissible only when explicit `mode = shared` intent names an operator-approved realm and the read-only verifier proves the supported provider version plus the complete platform authentication profile. The profile includes trusted issuer/discovery, required clients, scopes, protocol mappers and claims, signing policy, session/token limits, password/login controls, and least-privileged administration. A mismatch is a pre-mutation failure; the plugin never repairs operator-owned realm configuration.
 
-After admissibility succeeds, the tenant lifecycle coordinator creates or reconciles the plugin-owned tenant group with its immutable marker and returns provider metadata only after the boundary is usable. The verifier and lifecycle coordinator use the least-privileged administrator for the target realm; V1 has no master-realm administrator.
+After admissibility succeeds, the tenant lifecycle coordinator creates or reconciles the plugin-owned tenant group with its immutable marker and returns provider metadata only after the boundary is usable. The verifier and lifecycle coordinator use the approved OAGW route, whose injected administrator is least-privileged for the target realm; V1 has no master-realm administrator.
 
 #### User Mutation Safety
 
@@ -387,7 +393,7 @@ Already-absent plugin-owned resources are success-equivalent. `Retryable` is lim
 
 `IdpListUsersRequest` is authoritative. Because Keycloak 26.x does not document stable global order for group-member offset pages, V1 obtains a complete per-request tenant-group view, verifies tenant binding, applies supported SDK filter/order, and globally sorts with a unique provider-ID tiebreaker. The continuation token is a valid `CursorV1` that pins filter, order, tenant context, and the last emitted key tuple.
 
-This is a correctness-first linear scan, not an `O(page)` claim. Point existence may use a direct provider lookup followed by the same boundary guard. No persistent local index or user cache is introduced. Release qualification must prove the PRD 100-user-page latency target at the declared tenant population; failure requires an upstream capacity or contract decision rather than per-page sorting over unstable offsets.
+This is a correctness-first linear scan, not an `O(page)` claim. Point existence may use a direct provider lookup followed by the same boundary guard. No persistent local index or user cache is introduced. V1 list support is capped at 1,000 total human identities, enabled or disabled, per tenant group. The adapter reads Keycloak members in pages no larger than 500, permits at most `ceil(N / 500) + 1` member-page requests, and caps working memory at 16 MiB per list call. It stops on the first member beyond the ceiling and returns `IdpUserOperationFailure::UnsupportedOperation` without sorting or returning a partial page. Release qualification covers 100%, 10%, and 1% filter selectivity, every supported order, cached-token and forced-token-refresh runs, 20 concurrent operations, and the PRD topology and latency targets.
 
 #### Failure, Retry, and Reconciliation
 
@@ -397,13 +403,13 @@ Retries are bounded and limited to idempotent reads, token refresh, or operation
 
 Ambiguous tenant provisioning remains operator-owned in V1. Terminal outcomes provide non-secret stage and ownership evidence. Production enablement requires a reconciliation runbook whose resolution ends as compensated, accepted complete, blocked for investigation, or escalated for controlled cleanup.
 
-#### HTTP, Credentials, and Rotation
+#### Outbound HTTP, Credentials, and Rotation
 
 **ID**: `cpt-cf-keycloak-idp-plugin-seq-credential-resolution`
 
-All Keycloak OAuth and Admin REST traffic uses `toolkit-http` and the supported `toolkit-auth` integration. Direct `reqwest` is prohibited. Administrator credentials are operator-created SecretRefs read through the canonical Credential Store client under a stable plugin system actor restricted to configured references. The resolver validates returned ownership/sharing metadata and rejects inherited or cross-tenant material inconsistent with the approved platform credential profile.
+All Keycloak OAuth and Admin REST traffic uses an operator-provisioned OAGW upstream and route through `ServiceGatewayClientV1::proxy_request`. The plugin opens no direct external HTTP connection and cannot read a provider credential value. Operator IaC owns the HTTPS-only upstream, route allowlist, realm-local credential reference, timeouts, response limits, and auth policy. OAGW resolves and validates the Credential Store reference, injects the credential, applies egress and SSRF controls, and returns bounded responses with gateway-versus-upstream failure provenance.
 
-Credential values remain protected secret types and never enter metadata, errors, events, metrics, or debug formatting. Provider authentication rejection invalidates cached material, re-resolves the SecretRef, and permits one replay through the shared auth layer. V1 uses reactive refresh and has no scheduled credential-refresh task.
+The plugin forwards the `SecurityContext` received from Account Management for correlation and OAGW authorization; it does not mint a separate caller identity. OAGW route policy admits only Account Management-authorized actors and the stable AM system subjects used for bootstrap, reaper, retention, and cleanup flows. Credential rotation is transparent through the stable OAGW credential reference. Authentication failure never falls back to another route, realm, plaintext credential, or plugin cache, and mutation retry remains subject to the normal uncertainty rules.
 
 #### Durable Mutation Audit Boundary
 
@@ -413,11 +419,13 @@ Credential values remain protected secret types and never enter metadata, errors
 sequenceDiagram
   participant AM as Account Management
   participant P as Keycloak plugin
+  participant G as Outbound API Gateway
   participant K as Keycloak
   participant A as Platform audit infrastructure
 
   AM->>P: Invoke mutating contract
-  P->>K: Provider operation
+  P->>G: Approved provider request
+  G->>K: Credential-injected operation
   P-->>AM: Classified privacy-safe outcome
   AM->>A: Durably correlate terminal outcome
 ```
@@ -447,15 +455,15 @@ Not applicable because the plugin owns no database schema, table, migration, aud
 | Boundary | Control |
 |---|---|
 | Account Management caller to plugin | AM authorizes; forwarded `SecurityContext` identifies the actor but never substitutes for provider tenant checks |
-| Plugin to Credential Store | Dedicated system actor, configured SecretRef allowlist, response ownership validation, and no caller-tenant credential ownership |
-| Plugin to Keycloak | Least-privileged realm administrator, TLS verification, ToolKit HTTP policy, and provider-version/profile checks |
+| Plugin to OAGW | Forwarded authorized `SecurityContext`, fixed route aliases, bounded bodies, and no caller-controlled upstream URL |
+| OAGW to Credential Store and Keycloak | OAGW-owned credential resolution and injection, HTTPS-only egress, SSRF controls, least-privileged realm administrator, and gateway-versus-upstream failure provenance |
 | Tenant A to tenant B in one realm | Mandatory group-plus-marker guard on every read and mutation |
 | Account Management to platform audit infrastructure | External contract; the plugin supplies only classified privacy-safe outcomes |
 | Plugin to metrics | Bounded-cardinality labels and no profile or credential values |
 
 The V1 administrator has only realm-local permissions needed to inspect the authentication profile and administer users, sessions, and the configured tenant-group subtree. It cannot create/delete realms, administer another realm, read client secrets, or alter operator-owned authentication configuration.
 
-Missing, malformed, contradictory, unknown-major, or deferred-mode metadata causes no provider mutation. A realm outside the approved registry is rejected even if reachable. Tenant marker and group disagreement blocks access. Credential or TLS failure never falls back to plaintext, another realm, or cached user data.
+Missing, malformed, contradictory, unknown-major, deferred-mode, or producing-instance-mismatched metadata causes no OAGW or provider access. A realm or OAGW route outside the approved registry is rejected even if reachable. Tenant marker and group disagreement blocks access. Credential, gateway, or TLS failure never falls back to plaintext, another route or realm, or cached user data.
 
 Keycloak is the sole user directory. The plugin holds request data only for the operation lifetime and stores no local profile. Provider metadata contains routing identifiers rather than profile data. Hard deprovisioning removes identities and sessions before the group; failed proof is terminal. Plugin-provided audit evidence and metrics use provider IDs only where operationally necessary and contain no profile or credential values.
 
@@ -467,11 +475,11 @@ Verification is split by boundary rather than duplicated as method-level test ca
 |---|---|
 | Unit | Metadata compatibility, boundary predicates, cursor construction, error classification, redaction, and privacy-safe outcome construction |
 | SDK contract | Conformance to the existing `IdpPluginClient`, failure enums, typed filter/order, and `CursorV1` |
-| Real-Keycloak integration | Supported-version/profile checks, least privilege, user replay, cross-tenant denial, complete hard deletion, pre-send retryable versus post-send unproven terminal classification, provider failures, and global query behavior |
-| Credential Store integration | SecretRef ownership, rotation refresh, authorization denial, and non-disclosure |
+| Real-Keycloak integration | Supported-version/profile checks through OAGW, least privilege, user replay, cross-tenant denial, complete hard deletion, pre-send retryable versus post-send unproven terminal classification, provider failures, and global query behavior |
+| OAGW and Credential Store integration | Approved-route enforcement, no direct egress, credential-reference ownership, rotation, authorization denial, gateway/upstream failure provenance, and non-disclosure |
 | Cross-system audit contract | Account Management and the platform audit owner prove one durable terminal event per mutating call across crash and redelivery; this is an external production gate |
-| Lifecycle integration | Cancellation during provider stages, bounded drain, replay/reconciliation evidence, and absence of plugin-owned detached tasks |
-| End to end | Account Management scoped selection, tenant/user lifecycle, audit correlation, reconciliation evidence, and PRD latency profile |
+| Lifecycle integration | Host startup with OAGW, Credential Store, and Keycloak unavailable; unaffected AM availability; operation-level recovery without restart; cancellation, bounded drain, replay/reconciliation evidence, and no plugin-owned detached tasks |
+| End to end | Account Management scoped selection, two-instance metadata mismatch rejection before OAGW access, tenant/user lifecycle, audit correlation, reconciliation evidence, and the complete PRD latency/capacity profile |
 
 Tests that claim provider semantics use a supported real Keycloak 26.x instance. Test doubles are limited to deterministic local classification and failure injection; they do not establish Keycloak compatibility, tenant isolation, TLS, credential authorization, or latency.
 
@@ -481,16 +489,16 @@ Crash and redelivery verification for durable audit is owned by the parent Accou
 
 | Gate | Required resolution before V1 production enablement |
 |---|---|
-| Scoped provider selection | Account Management resolves the configured GTS instance; two-instance selection passes; no unscoped fallback remains |
+| Scoped provider selection | Account Management resolves the configured GTS instance; metadata records the producing instance; a two-instance priority/config change fails closed before OAGW access; no unscoped fallback remains; provider changes require an operator migration |
 | Realm profile | Operator-approved profile is versioned and every required property is verified before tenant mutation |
-| Query capacity | Correct full-group scan meets PRD latency at the declared release population; otherwise upstream capacity/contract is revised |
+| Query capacity | At 1,000 total tenant users, enabled or disabled, every required filter/order profile meets PRD latency with 20 concurrent operations, member-page reads stay within `ceil(N / 500) + 1`, memory stays within 16 MiB per request, and member 1,001 produces a non-partial `UnsupportedOperation` result |
 | User replay | Failure injection after each provider effect converges to one correctly bound identity |
 | Hard deletion | Two-tenant integration proves sessions and identities for the retiring tenant are removed without touching the active tenant |
 | Audit ownership | Parent Account Management and platform audit designs assign persistence, recovery, delivery, sink, and retention ownership; the plugin owns none of them |
 | Audit completeness | Cross-system tests prove one durable terminal outcome per mutating call across process failure and redelivery; the structured-log stand-in is not a production substitute |
 | Reconciliation | Operator runbook exists and consumes emitted evidence without secret inspection |
-| Compatibility | Supported Keycloak 26.x matrix passes and representative unsupported majors fail startup |
-| Lifecycle | Cancellation and rolling-restart tests prove bounded shutdown and replay safety |
+| Compatibility | Supported Keycloak 26.x matrix passes and representative unsupported majors fail affected operation-based readiness before mutation without preventing host startup |
+| Lifecycle | Dependency-down startup, recovery without restart, cancellation, and rolling-restart tests prove availability, bounded shutdown, and replay safety |
 
 Deferred adopted realms, plugin-created realms, OpenBao secret mutation, and service-principal lifecycle are not designed here. Each requires its own upstream contract, security review, DESIGN, ADRs where decisions depart from accepted standards, and release gates.
 
@@ -517,7 +525,7 @@ Deferred adopted realms, plugin-created realms, OpenBao secret mutation, and ser
 | `cpt-cf-keycloak-idp-plugin-fr-user-provision`, `cpt-cf-keycloak-idp-plugin-fr-user-update`, `cpt-cf-keycloak-idp-plugin-fr-user-update-outcomes`, `cpt-cf-keycloak-idp-plugin-fr-user-deprovision`, `cpt-cf-keycloak-idp-plugin-usecase-update-user` | §3.6 |
 | `cpt-cf-keycloak-idp-plugin-fr-user-query` | §3.6 |
 | `cpt-cf-keycloak-idp-plugin-fr-user-source-of-truth` | §§3.1, 4.1 |
-| `cpt-cf-keycloak-idp-plugin-fr-administrator-credentials`, `cpt-cf-keycloak-idp-plugin-contract-credstore` | §§3.5–3.6, 4.1 |
+| `cpt-cf-keycloak-idp-plugin-fr-administrator-credentials`, `cpt-cf-keycloak-idp-plugin-contract-oagw`, `cpt-cf-keycloak-idp-plugin-contract-credstore` | §§3.5–3.6, 4.1 |
 | `cpt-cf-keycloak-idp-plugin-fr-operator-reconciliation`, `cpt-cf-keycloak-idp-plugin-usecase-reconcile-ambiguous-mutation` | §§3.6, 4.3 |
 | `cpt-cf-keycloak-idp-plugin-fr-offline-token-lifetime` | §§2.2, 3.6 |
 | `cpt-cf-keycloak-idp-plugin-fr-audit-metrics`, `cpt-cf-keycloak-idp-plugin-nfr-audit-completeness` | §§3.3, 3.5–3.6, 4.1–4.3 |
