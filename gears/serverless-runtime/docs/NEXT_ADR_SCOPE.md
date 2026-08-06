@@ -2,7 +2,7 @@
 
 **Source:** Consistency review of `DESIGN.md` against `PRD.md`
 **Date:** 2026-01-21
-**Updated:** 2026-05-14 (renumbered ADR-2–7 → ADR-3–8 after ADR-0002 JSON-RPC/MCP was written; then ADR-3–8 → ADR-5–10 after ADR-0003 Workflow DSL and ADR-0004 Temporal Workflow Engine were written; then ADR-5–10 → ADR-6–11 after ADR-0005 Thin Host Gear, Fat Runtime Plugins was written)
+**Updated:** 2026-05-14 (renumbered ADR-2–7 → ADR-3–8 after ADR-0002 JSON-RPC/MCP was written; then ADR-3–8 → ADR-5–10 after ADR-0003 Workflow DSL and ADR-0004 Temporal Workflow Engine were written; then ADR-5–10 → ADR-6–11 after ADR-0005 Thin Host Gear, Fat Runtime Plugins was written); 2026-07-30 (section 3 added — gaps found during the consumer-SDK review)
 
 ---
 
@@ -163,5 +163,23 @@ See [ADR-0005](ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md).
 - Enumerate specific error types for all failure categories
 - Error code registry and documentation
 - Error-to-retry-policy mapping
+- **Authorization error type** — see gap G-01 in section 3
 
 **PRD Coverage:** BR-129
+
+---
+
+## 3. Gaps Found During Consumer-SDK Review (2026-07-30)
+
+Surfaced while writing `serverless-sdk/docs/PRD.md` §1–§4 against these host documents. Each
+is a host-side decision; the consumer SDK forwards or works around rather than inventing an
+answer, so none is resolved here.
+
+| ID | Gap | Impact | Where |
+|----|-----|--------|-------|
+| G-01 | **No authorization error type.** The invocation contract enumerates five error types (`not_found`, `not_active`, `validation`, `quota_exceeded`, `sync_suspension`) and none of them means "not authorised", although authorisation is asserted throughout the design. Three further reachable conditions are also unenumerated: a forbidden control transition, no plugin registered for a callable's adapter type, and plugin unavailability. | The consumer SDK declares `AccessDenied`, `UnsupportedControl`, `NoPluginAvailable` and `ServiceUnavailable` variants with no host error type to map onto, so in-process and REST behaviour cannot yet be proven to agree for those four. | `DESIGN_GTS_SCHEMAS.md` error catalog; fold into ADR-11 and/or ADR-6 |
+| G-02 | **`retry` has no state transition.** `InvocationControlAction::Retry` is defined as "retry a failed invocation with same parameters", but the status state machine gives `failed` no outgoing edge back to `queued`/`running` — only to `compensating` or `dead_lettered`. So it is undefined whether `retry` resumes the same invocation or mints a new one, as `replay` explicitly does. Note also that ADR-0005 assigns retry *execution* to the plugin; what the host owns is the `RetryPolicy` schema on the function definition. | If `retry` mints a new invocation ID, it is not a control action at all and belongs beside `replay` — which changes the published consumer trait's shape. | `DESIGN.md` §Invocation Status State Machine; `DESIGN_RUST_TYPES.md` `InvocationControlAction` |
+| G-03 | **SDK directory names do not match crate names.** On disk the crate directories are `serverless-sdk/` and `serverless-plugin-sdk/`, while every document calls the crates `serverless-runtime-sdk` and `serverless-runtime-plugin-sdk`. Elsewhere in the repo the directory equals the crate name (`gears/credstore/credstore-sdk/`), as it already does for `serverless-runtime/serverless-runtime/`. | Cosmetic today (no `Cargo.toml` exists yet), but it will become a real inconsistency the moment the crates are scaffolded. Decide before F-01. | `gears/serverless-runtime/` layout |
+| G-04 | **ADR-0002 filename carries a `-v1` suffix its declared ID does not.** The file is `0002-…-jsonrpc-mcp-protocol-surfaces-v1.md` while its `**ID**` is `cpt-cf-serverless-runtime-adr-jsonrpc-mcp-protocol-surfaces`. ADRs 0001 and 0003–0005 have matching filenames and IDs. | Anyone citing the ADR by its filename stem produces an ID that does not exist, which breaks ID-integrity checks. | `docs/ADR/0002-*.md` |
+| G-05 | **What an idempotency-deduplicated request returns is unspecified, and it is indistinguishable from a cache hit.** Two separate mechanisms exist: the `Idempotency-Key` header "prevents duplicate starts" within `deduplication_window_seconds` (§ Invocation request, BR-134), while response caching additionally requires `traits.is_idempotent: true` **and** `traits.caching.max_age_seconds > 0` (§ Response Caching, BR-118/BR-132). Caching states that a hit returns the original record with `cached: true`. Deduplication states no response shape at all — whether the caller receives the original invocation, an error, or a new record pointing at the original is undefined. | A caller that retries a request it is unsure about cannot tell whether its work was started, deduplicated onto an earlier run, or served from cache. Only the cache case is observable, so the deduplication case is silent. Blocks the consumer SDK's `cpt-cf-serverless-runtime-sdk-fr-idempotency`, which requires the caller to be able to tell. | `DESIGN.md` §Invocation request / §Response Caching |
+| G-06 | **Whether `failed` and `canceled` are terminal is self-contradictory.** The status state machine gives `failed → compensating \| dead_lettered` and `canceled → compensating \| [*]`, so neither is an end state when compensation is configured. But prose calls them terminal in two places: "Replay is valid from `succeeded` or `failed` terminal states" (line 481) and "When a Workflow invocation enters a terminal `failed` or `canceled` state" (line 1108). | No caller can reliably answer "has this run finished, and did it succeed?" for 2 of the 9 states — the two that matter most for failure handling. Blocks the consumer SDK's `cpt-cf-serverless-runtime-sdk-fr-run-states`. Resolving it needs one statement per state, most likely "terminal unless a compensation handler is configured". | `DESIGN.md` §Invocation Status State Machine, lines 481 and 1108 |

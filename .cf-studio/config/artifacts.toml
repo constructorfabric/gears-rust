@@ -85,7 +85,7 @@ reason = "Ignore module 'types-registry' (not SDLC-documented yet: missing requi
 patterns = ["gears/types-registry/*"]
 
 [[ignore]]
-reason = "Ignore the parked serverless-runtime plugin-SDK docs — pre-rescope material retained for provenance, not current design (see the README there). Remove this ignore and register the tree as a child scope once serverless-runtime-plugin-sdk gets a reviewed PRD/DESIGN; it currently has 6 dangling feature links (DECOMPOSITION lists 0001-0007, only 0001 exists) and a README that matches no artifact pattern."
+reason = "Ignore gears/serverless-runtime/serverless-plugin-sdk/BACKUP-pre-split-sdk-docs — a backup of the SDK documents as they stood before the SDK was split by audience, kept only so the prior work (notably four ADRs) is not lost. It is not current design, is not maintained, and must not be validated: it has 6 dangling feature links (its DECOMPOSITION lists features 0001-0007, only 0001 exists) and a README matching no artifact pattern. When the plugin-facing SDK is designed, write fresh documents in that crate's own docs/ directory and register that instead — do not lift this ignore to cover them."
 patterns = ["gears/serverless-runtime/serverless-plugin-sdk/*"]
 
 [[ignore]]
@@ -201,9 +201,9 @@ extensions = [".rs"]
 # serverless-runtime gear — without this they are not detected at all, so a malformed PRD, a
 # dangling ID reference, or a duplicate ID definition in the SDK docs passes CI unnoticed.
 #
-# The sibling `serverless-plugin-sdk/docs` tree is deliberately NOT registered here — it holds
-# pre-rescope material that is not current design (see the README there). It is carved out by an
-# [[ignore]] entry at the top of this file rather than left silently undetected.
+# The sibling `serverless-plugin-sdk/` tree is deliberately NOT registered here — it holds only a
+# backup of the pre-split SDK documents, not current design. It is carved out by an [[ignore]]
+# entry at the top of this file rather than left silently undetected.
 [[systems.autodetect.children]]
 kit = "gears"
 system_root = "{project_root}/gears/serverless-runtime/serverless-sdk/docs"
