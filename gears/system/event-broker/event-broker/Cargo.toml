@@ -27,13 +27,30 @@ axum = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["clock", "serde"] }
+rand = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
 
 toolkit = { workspace = true }
 toolkit-security = { workspace = true }
 
+# Minimal Pingora use: `connectors::http::v1::Connector` (pooled outbound
+# HTTP/1 client) called from ordinary axum handlers - not `pingora-proxy`'s
+# full session-owning engine (design.md D7). Crate-local, matching `oagw`'s
+# per-crate Pingora dependency convention - not a shared workspace dependency.
+pingora-core = { version = "0.8" }
+pingora-http = { version = "0.8" }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { workspace = true }
+utoipa = { workspace = true }
+# Test-only: production code never hardcodes a cluster-gear provider (that's
+# an operator choice); tests need a concrete one to wire against.
+cf-gears-standalone-cluster-plugin = { path = "../../cluster/plugins/standalone-cluster-plugin" }

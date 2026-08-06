@@ -35,6 +35,8 @@ pub struct EventBrokerConfig {
     pub subscription: SubscriptionConfig,
     #[serde(default)]
     pub workers: WorkersConfig,
+    #[serde(default)]
+    pub registration: RegistrationConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -104,6 +106,36 @@ impl Default for WorkersConfig {
     fn default() -> Self {
         Self {
             reaper_interval_secs: 60,
+        }
+    }
+}
+
+/// `ServiceDiscoveryV1` self-registration address in `cluster_ingest`/
+/// `cluster_delivery` mode (`eb-dispatcher-routing` design.md D5) - unused
+/// in `standalone`/`cluster_dispatcher` mode. Mirrors `grpc-hub`'s
+/// `listen_addr`/`advertise_addr` pattern
+/// (`gears/system/grpc-hub/src/gear.rs`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RegistrationConfig {
+    /// The address this instance's REST listener binds to.
+    pub listen_addr: String,
+    /// The address other instances (the dispatcher, in cluster mode) reach
+    /// this one at, if different from `listen_addr`. Accepted forms:
+    /// `host:<u16>` (literal host and port; `:0` means "use the actual
+    /// bound port") or `host` alone (the actual bound port is appended).
+    /// `None` falls back to `listen_addr` unless that's a wildcard bind
+    /// (`0.0.0.0`), which fails `init` in cluster mode rather than
+    /// registering an unroutable address.
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
+}
+
+impl Default for RegistrationConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: "0.0.0.0:0".to_owned(),
+            advertise_addr: None,
         }
     }
 }
