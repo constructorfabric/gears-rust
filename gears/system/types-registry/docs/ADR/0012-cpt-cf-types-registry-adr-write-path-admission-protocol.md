@@ -148,7 +148,7 @@ Dependency freshness is internal concurrency control. Validation records the dep
 
 ### Dry run is a mode of the operation, not an operation of its own
 
-Every mutation kind accepts a dry-run request: it runs the complete check sequence and commits nothing — no logical entity, no revision, no current-pointer move, no `resource_version` advance, no lifecycle transition, no removal. Per-candidate outcomes and diagnostics are what the real operation would have produced against the state observed during the run.
+Every mutation kind accepts a dry-run request: it runs the complete check sequence and commits nothing — no logical entity, no revision, no current-pointer move, no `resource_version` advance, no lifecycle transition, no removal. Per-candidate statuses and diagnostics are what the real operation would have produced against the state observed during the run. A candidate that would have committed carries no revision and no resulting resource version, because nothing was written; that is the one respect in which the result differs from the one it predicts.
 
 It is a mode rather than a separate validation operation for one reason. A separate operation is a second implementation of the ordered check sequence, and the two drift; a drifted check that passes before deployment and fails at admission is the exact failure a pre-deployment gate exists to prevent. As a mode it is the same code path with the commit suppressed, so drift is not merely discouraged but unrepresentable. It is consequently orthogonal to `kind` rather than three further values in it.
 
@@ -241,7 +241,7 @@ This decision is confirmed when:
 * a gear with stale definitions submits a conditional batch, polls it, and gates only its own readiness;
 * Types Registry reaches ready state before any domain gear registers definitions;
 * tenant-scoped control-plane registration is rejected and Source Claim invariants are enforced without P2 hooks;
-* a dry run of each mutation kind reports the same per-candidate outcomes and diagnostics as the real operation while leaving every entity, revision, current pointer, resource version, and lifecycle status untouched;
+* a dry run of each mutation kind reports the same per-candidate statuses and diagnostics as the real operation while leaving every entity, revision, current pointer, resource version, and lifecycle status untouched, and returns no revision and no resulting resource version for a candidate that would have committed;
 * a dry run and a real submission carrying the same scoped key are treated as different requests, so the real submission executes rather than replaying the dry run;
 * a dry run against a frozen logical entity returns the compatibility verdict together with the unproven-chain state, in a case where no real submission could be accepted at all.
 

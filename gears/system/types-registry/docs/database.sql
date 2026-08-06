@@ -65,7 +65,7 @@
 -- Three rules govern those values.
 --
 -- They are storage encoding only. The SDK and REST contracts keep the string
--- vocabulary - a response says `"status": "completed"`, never `3` - and the
+-- vocabulary - a response says `"status": "succeeded"`, never `3` - and the
 -- mapping lives in the storage layer. A numeric value must never reach a public
 -- payload.
 --

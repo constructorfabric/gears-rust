@@ -151,7 +151,7 @@ Three limits are stated here so that they are not discovered later.
 ### Consequences
 
 * An author with an unsettled contract keeps one identifier and one Registry Reference across any number of breaking reshapes, and pays a single re-point at graduation instead of one per reshape.
-* Admission acquires one closure comparison, placed beside ADR-0014's dialect check and reading the same already-loaded documents.
+* Admission acquires one comparison over the candidate's direct references, placed beside ADR-0014's dialect check. It reads a wider edge set — `x-gts-ref` targets are quarantined here and excluded from the dialect check, which never inlines them — and a cheaper one, since a major is readable from an identifier and no target document has to be loaded.
 * The managed identity profile acquires a third narrowing: no minor version, no explicit UUID tail, and no major 0 on a registered Instance identifier.
 * A v0 reshape can still be refused, by dependent revalidation, when a derived type would stop satisfying its base. This is derivation compatibility doing its job and is not a defect of the profile.
 * The rules-change repair pass of ADR-0003 skips v0 entities, which also makes it cheaper.
