@@ -31,9 +31,10 @@ mod gts_tests;
 pub mod mock;
 
 pub use api::{
-    AssignedPartition, BarrierMode, EventBrokerApi, EventBrokerBackend, IngestOutcome, JoinRequest,
-    PartitionCursor, ProducerCursors, ProducerMode, ResolvedPosition, SeekResult,
-    StorageBackendConfig, SubscriptionAssignment, TenantTraversalDepth, TopicCursors,
+    AssignedPartition, BarrierMode, EventBrokerApi, EventBrokerBackend, EventBrokerBackendProvider,
+    IngestOutcome, JoinRequest, PartitionCursor, ProducerCursors, ProducerMode, ResolvedPosition,
+    RetentionReport, RetentionRequest, RetentionRequestBuilder, SeekResult, StorageBackendConfig,
+    SubscriptionAssignment, TenantTraversalDepth, TopicCursors,
 };
 pub use consumer::{
     BatchHandlerOutcome, CommitOffset, ConnectionDropReason, Consumer, ConsumerBatching,
@@ -53,6 +54,10 @@ pub use consumer::{
 };
 
 pub use error::{ConsumerError, EventBrokerError, OffsetManagerError, StorageBackendError};
+pub use gts::{
+    CONSUMER_GROUP_RESOURCE_TYPE, EVENT_TYPE_RESOURCE_TYPE, PRODUCER_RESOURCE_TYPE,
+    REQUEST_RESOURCE_TYPE, SUBSCRIPTION_RESOURCE_TYPE, TopicV1,
+};
 pub use ids::{ConsumerGroupId, EventTypeId, ProducerId, SubscriptionId, TopicId};
 pub use models::{
     ConsumerGroup, ConsumerGroupKind, ConsumerGroupQuery, CreateConsumerGroupRequest, Event, Page,

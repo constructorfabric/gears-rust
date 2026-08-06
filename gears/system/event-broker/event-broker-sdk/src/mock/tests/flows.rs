@@ -13,11 +13,11 @@ use futures_util::StreamExt;
 /// earliest → stream the three events in strict offset order → ack via SEEK →
 /// re-JOIN on the same group resumes past the ack (no redelivery).
 ///
-/// The reference fixes RF=100 so offsets are 100/101/102; the in-process mock
-/// has no retention floor (offsets start at 0), so this asserts the *shape* of
+/// The reference fixes RF=100 so sequences are 100/101/102; the in-process mock
+/// has no retention floor (sequences start at 0), so this asserts the *shape* of
 /// the journey - three in-order events, an advancing group cursor, and a
 /// re-JOIN that resumes from the committed cursor - rather than the literal
-/// 100-based offsets.
+/// 100-based sequences.
 #[tokio::test]
 async fn s1_01_flow_publish_subscribe_consume() {
     // 4 partitions; all helper events hash to the tenant's partition (single
@@ -70,12 +70,12 @@ async fn s1_01_flow_publish_subscribe_consume() {
 
     // -- Exchange 7: open the stream and read the three events in order. ---------
     let mut stream = broker.stream(&c, sub.subscription_id).await.unwrap();
-    let mut offsets = Vec::new();
+    let mut sequences = Vec::new();
     for _ in 0..12 {
         match tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await {
             Ok(Some(Ok(WireFrame::Event(we)))) => {
-                offsets.push(we.offset);
-                if offsets.len() == 3 {
+                sequences.push(we.sequence);
+                if sequences.len() == 3 {
                     break;
                 }
             }
@@ -85,7 +85,7 @@ async fn s1_01_flow_publish_subscribe_consume() {
     }
     drop(stream); // release the stream so SEEK is not "streaming_in_progress".
     assert_eq!(
-        offsets,
+        sequences,
         vec![1, 2, 3],
         "events delivered in strict offset order (1-based)"
     );

@@ -272,7 +272,6 @@ pub(super) fn open_stream(broker: MockBroker, sub_id: SubscriptionId) -> FrameSt
                             subject_type: stamped.subject_type.clone(),
                             partition: stamped.partition.unwrap_or(*partition),
                             sequence: stamped.sequence.unwrap_or(0),
-                            offset: stamped.offset.unwrap_or(0),
                             occurred_at: stamped.occurred_at,
                             sequence_time: stamped.sequence_time.unwrap_or_else(chrono::Utc::now),
                             trace_parent: stamped.trace_parent.clone(),
