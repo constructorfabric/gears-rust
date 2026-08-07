@@ -1245,7 +1245,7 @@ RG relies on database-level performance rather than application-level caching:
 - **Connection pooling**: handled by platform database infrastructure (connection pool configuration is deployment-specific).
 - **Scalability approach**: vertical scaling of the database instance is the primary strategy. Horizontal read replicas can be added for read-heavy AuthZ query paths. `resource_group_membership` partitioning is a candidate optimization for production scale (see PRD Open Questions).
 - **Application-tier horizontal scaling**: RG is a stateless service with no in-process caches, sessions, or local state. Multiple RG instances can run behind the platform load balancer without session affinity. Scaling the application tier is a simple matter of increasing replica count — the platform orchestration layer handles load distribution. All coordination is delegated to PostgreSQL (SERIALIZABLE transactions for write consistency, connection pool for concurrency control).
-- **Query cost protection**: all list endpoints enforce `limit` (max 200 per page). Unbounded hierarchy traversals are bounded by `max_depth` query profile. Database-level query timeout (statement_timeout) is configured at the connection pool level per platform defaults. API-layer rate limiting is handled by the API gateway — RG does not implement its own throttling.
+- **Query cost protection**: all list endpoints enforce `limit` (max 200 per page). Unbounded hierarchy traversals are bounded by `max_depth` query profile. Database-level query timeout (`statement_timeout`) and lock wait (`lock_timeout`) are PostgreSQL runtime parameters, set per connection through the database config's `params` map — any key `toolkit-db` does not recognize is passed to the server as a runtime option. No platform default is set in this repository, so unless a deployment supplies one, neither is bounded. API-layer rate limiting is handled by the API gateway — RG does not implement its own throttling.
 - **Closure write amplification bounds**: subtree move operations update `O(N × D)` closure rows where N = subtree size and D = depth. With `max_depth = 10` and typical organizational hierarchies (width >> depth), expected subtree sizes for move operations are under 10K nodes. For larger subtrees, SERIALIZABLE isolation + bounded retry (max 3) prevents runaway transactions. No hard cap on subtree size is enforced — `max_depth` and `max_width` provide indirect bounds.
 - **Optimistic concurrency**: v1 uses last-write-wins semantics for `PUT /groups/{id}`. ETag-based optimistic concurrency control is a candidate for future versions if concurrent update conflicts become a production concern.
 - **Latency budget** (target p95 < 250 ms for hierarchy queries, default profile `max_depth = 10`):
@@ -1593,10 +1593,20 @@ Hierarchy mutations (`create/move/delete`) use `SERIALIZABLE` isolation with bou
 
 **Serialization retry policy**:
 
-- max retries: 3 (configurable)
-- backoff: none (immediate retry — serialization conflicts resolve within microseconds)
-- on exhaustion: return `ServiceUnavailable` with retry-after hint
-- transaction timeout: 5s (configurable)
+- max retries: 3 (configurable, `DEFAULT_TX_RETRY_ATTEMPTS`)
+- backoff: jittered, base 2 ms, factor 5, capped at 100 ms. It used to be none,
+  on the reasoning that serialization conflicts resolve within microseconds;
+  that is true of the conflict and false of the retry, because two
+  transactions that just collided both computed the same zero delay and
+  collided again.
+- on exhaustion: the error reaches the caller as `Internal` (HTTP 500). There
+  is no `ServiceUnavailable` variant to return, and whether an exhausted retry
+  deserves a dedicated status is an open contract question, not a settled
+  behaviour — see `db-behavior-audit.md`.
+- transaction timeout: **none**. `statement_timeout` bounds a single
+  statement, not a transaction, and PostgreSQL has no total-transaction
+  timeout to configure. Nothing in this repository sets even the statement
+  bound; see the query-cost note above for how a deployment can.
 
 **Concurrency test pattern** (E2E test level — requires real PostgreSQL for SERIALIZABLE isolation):
 
