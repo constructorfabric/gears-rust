@@ -544,14 +544,11 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         types_registry: &dyn types_registry_sdk::TypesRegistryClient,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
-        // Resolve type GTS path to surrogate ID; verify type exists
-        let type_id = type_repo
-            .resolve_id(tx, &req.code)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(&req.code))?;
-
-        let rg_type = type_repo
-            .find_by_code(tx, &req.code)
+        // One lookup for both the surrogate id and the type itself. Asking
+        // for them separately cost two `gts_type` SELECTs per create for the
+        // same row (RG-11).
+        let (type_id, rg_type) = type_repo
+            .find_by_code_with_id(tx, &req.code)
             .await?
             .ok_or_else(|| DomainError::type_not_found(&req.code))?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3

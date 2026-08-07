@@ -309,6 +309,33 @@ impl TypeRepositoryTrait for TypeRepository {
         self.load_full_type(db, &type_model).await.map(Some)
     }
 
+    /// Same lookup as `find_by_code`, but also returns the surrogate
+    /// SMALLINT id, for callers that need both (e.g. a group's
+    /// `gts_type_id` FK) from a single query instead of two (RG-11).
+    async fn find_by_code_with_id<C: DBRunner>(
+        &self,
+        db: &C,
+        code: &str,
+    ) -> Result<Option<(i16, ResourceGroupType)>, DomainError> {
+        let scope = system_scope();
+        let type_model = GtsTypeEntity::find()
+            .filter(gts_type::Column::SchemaId.eq(code))
+            .secure()
+            .scope_with(&scope)
+            .one(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        let Some(type_model) = type_model else {
+            return Ok(None);
+        };
+
+        let type_id = type_model.id;
+        self.load_full_type(db, &type_model)
+            .await
+            .map(|rg_type| Some((type_id, rg_type)))
+    }
+
     /// Load a full type by its surrogate SMALLINT ID.
     async fn load_full_type_by_id<C: DBRunner>(
         &self,
@@ -403,12 +430,13 @@ impl TypeRepositoryTrait for TypeRepository {
             ..Default::default()
         };
 
-        let _result = toolkit_db::secure::secure_insert::<GtsTypeEntity>(model, &scope, db)
+        // Use the row the insert already returned. Discarding it and
+        // re-reading by code cost a second `gts_type` SELECT on every
+        // create (RG-08); `secure_insert` returns the persisted model with
+        // the generated id in it.
+        toolkit_db::secure::secure_insert::<GtsTypeEntity>(model, &scope, db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        // Re-read to get the auto-generated ID
-        Self::find_model_by_code(db, schema_id).await
+            .map_err(|e| DomainError::database(e.to_string()))
     }
 
     /// Insert allowed parent junction entries.
