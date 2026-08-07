@@ -133,6 +133,16 @@ pub(crate) mod pep {
         pub const LIST: &str = "list";
         pub const DELETE: &str = "delete";
         pub const UPDATE: &str = "update";
+
+        /// Every action in this vocabulary, in declaration order. The
+        /// permission-catalog test asserts one `AuthzPermissionV1` per
+        /// `(resource_type, action)` pair drawn from these slices, so an
+        /// action that is enforced at a PEP gate but never declared as a
+        /// grantable permission fails the test instead of silently
+        /// becoming ungrantable. Add new actions here as well as above.
+        /// Test-only: nothing in the production path enumerates actions.
+        #[cfg(test)]
+        pub const ALL: &[&str] = &[CREATE, LIST, DELETE, UPDATE];
     }
 }
 
