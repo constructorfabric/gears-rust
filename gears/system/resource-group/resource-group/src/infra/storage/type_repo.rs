@@ -377,7 +377,20 @@ impl TypeRepositoryTrait for TypeRepository {
         // the generated id in it.
         toolkit_db::secure::secure_insert::<GtsTypeEntity>(model, &scope, db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))
+            .map_err(|e| {
+                // A duplicate `schema_id` is a conflict the caller can act on,
+                // not an internal database failure. `UNIQUE(schema_id)` has
+                // held it since the initial migration, on every backend and
+                // at every isolation level -- what was missing was the
+                // translation, so a race that the constraint caught surfaced
+                // as a 500. Symmetric with `GroupRepository::insert` and
+                // `MembershipRepository::insert`, which already do this.
+                if e.is_unique_violation() {
+                    DomainError::type_already_exists(schema_id)
+                } else {
+                    DomainError::database(e.to_string())
+                }
+            })
     }
 
     /// Insert allowed parent junction entries.

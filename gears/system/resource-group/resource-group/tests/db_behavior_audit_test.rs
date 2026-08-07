@@ -1319,16 +1319,18 @@ fn static_rule_pins_type_service_serializable_without_retry() {
 #[test]
 fn static_rule_passes_type_service_uses_retry() {
     let src = include_str!("../src/domain/type_service.rs");
-    let unretried = count_occurrences(
-        src,
-        ".transaction_ref_mapped_with_config(TxConfig::serializable(",
-    );
-    let retried = count_occurrences(src, ".transaction_with_retry(TxConfig::serializable(");
+    // The rule is "every transaction here is retry-aware", not "every
+    // transaction here is SERIALIZABLE". `create_type` runs at the backend
+    // default now, and still has to retry: contention retries catch
+    // deadlocks, which no isolation level rules out.
+    let unretried = count_occurrences(src, ".transaction_ref_mapped_with_config(");
+    let retried = count_occurrences(src, ".transaction_with_retry(");
     assert_eq!(
         unretried, 0,
-        "create_type/update_type must not open a SERIALIZABLE transaction without \
-         retry: a 40001 then reaches the caller as an unhandled database error and \
-         is reported as 500, on a path account-management drives at gear init"
+        "create_type/update_type must not open a transaction through the \
+         non-retrying helper: a 40001 then reaches the caller as an unhandled \
+         database error and is reported as 500, on a path account-management \
+         drives at gear init"
     );
     assert!(
         retried >= 2,

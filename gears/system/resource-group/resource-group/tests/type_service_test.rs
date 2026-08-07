@@ -43,6 +43,38 @@ fn system_scope() -> AccessScope {
     AccessScope::allow_all()
 }
 
+/// A duplicate `schema_id` reaches the caller as a typed conflict, not as a
+/// database failure.
+///
+/// Tested against the repository directly on purpose. Through the service the
+/// in-transaction `resolve_id` check catches an ordinary duplicate first, so
+/// the constraint path only runs when two writers race -- exactly the case a
+/// single-threaded test cannot stage. What matters is that when the
+/// constraint does fire, the answer is `TypeAlreadyExists`; that used to
+/// depend on `SERIALIZABLE` aborting and retrying until one writer won, and
+/// `create_type` no longer runs at that level.
+#[tokio::test]
+async fn type_repo_insert_maps_duplicate_code_to_conflict() {
+    let db = common::test_db().await;
+    let conn = db.conn().expect("conn");
+    let repo = TypeRepository;
+    let code = type_code("dupe");
+
+    repo.insert(&conn, &code, None)
+        .await
+        .expect("first insert should succeed");
+
+    let err = repo
+        .insert(&conn, &code, None)
+        .await
+        .expect_err("a second insert of the same code must be refused");
+
+    assert!(
+        matches!(err, DomainError::TypeAlreadyExists { .. }),
+        "expected a typed conflict, got: {err:?}"
+    );
+}
+
 // =========================================================================
 // Type CRUD tests (TC-TYP-01..16)
 // =========================================================================
