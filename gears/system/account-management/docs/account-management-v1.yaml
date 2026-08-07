@@ -1,6 +1,9 @@
 # Created:  2026-04-19 by Virtuozzo
 # Updated:  2026-06-09 by Virtuozzo
 
+# NOTE: the aggregated, CI-verified schema for the whole platform is
+# docs/api/api.json (also served live by the api-gateway at {prefix}/docs).
+# Paths below are gear-relative: the gateway prepends its prefix_path (e.g. /cf).
 openapi: 3.1.0
 info:
   title: Account Management API
@@ -15,7 +18,7 @@ info:
     shapes, field semantics, and HTTP-level error mapping.
 
     Versioning: breaking changes increment the major version embedded in the URL
-    path (`/api/account-management/v1/` → `/v2/`) and are coordinated with a
+    path (`/account-management/v1/` → `/account-management/v2/`) and are coordinated with a
     migration window per the Compatibility NFR in DESIGN.md. Additive changes
     within v1 do not rev the path.
 
@@ -57,7 +60,7 @@ security:
   - bearerAuth: []
 
 paths:
-  /api/account-management/v1/me:
+  /account-management/v1/me:
     get:
       operationId: getMe
       tags: [Identity]
@@ -80,7 +83,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants:
+  /account-management/v1/tenants:
     post:
       operationId: createTenant
       tags: [tenants]
@@ -112,7 +115,7 @@ paths:
         '5XX':
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}:
+  /account-management/v1/tenants/{tenant_id}:
     parameters:
       - $ref: '#/components/parameters/TenantId'
     get:
@@ -183,7 +186,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/suspend:
+  /account-management/v1/tenants/{tenant_id}/suspend:
     parameters:
       - $ref: '#/components/parameters/TenantId'
     post:
@@ -213,7 +216,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/unsuspend:
+  /account-management/v1/tenants/{tenant_id}/unsuspend:
     parameters:
       - $ref: '#/components/parameters/TenantId'
     post:
@@ -236,7 +239,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/children:
+  /account-management/v1/tenants/{tenant_id}/children:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/Limit'
@@ -265,7 +268,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/users:
+  /account-management/v1/tenants/{tenant_id}/users:
     parameters:
       - $ref: '#/components/parameters/TenantId'
     get:
@@ -321,7 +324,7 @@ paths:
         '5XX':
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/users/{user_id}:
+  /account-management/v1/tenants/{tenant_id}/users/{user_id}:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/UserId'
@@ -393,7 +396,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/conversions:
+  /account-management/v1/tenants/{tenant_id}/conversions:
     parameters:
       - $ref: '#/components/parameters/TenantId'
     post:
@@ -457,7 +460,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/conversions/{request_id}:
+  /account-management/v1/tenants/{tenant_id}/conversions/{request_id}:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/RequestId'
@@ -512,7 +515,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/child-conversions:
+  /account-management/v1/tenants/{tenant_id}/child-conversions:
     parameters:
       - $ref: '#/components/parameters/TenantId'
     post:
@@ -576,7 +579,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/child-conversions/{request_id}:
+  /account-management/v1/tenants/{tenant_id}/child-conversions/{request_id}:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/RequestId'
@@ -625,7 +628,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/metadata:
+  /account-management/v1/tenants/{tenant_id}/metadata:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/Limit'
@@ -646,7 +649,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/metadata/{type_id}:
+  /account-management/v1/tenants/{tenant_id}/metadata/{type_id}:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/SchemaId'
@@ -700,7 +703,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/metadata/{type_id}/resolved:
+  /account-management/v1/tenants/{tenant_id}/metadata/{type_id}/resolved:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/SchemaId'
