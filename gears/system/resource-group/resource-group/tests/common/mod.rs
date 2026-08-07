@@ -19,6 +19,7 @@ use authz_resolver_sdk::{
     models::DenyReason,
 };
 use sea_orm_migration::MigratorTrait;
+use toolkit_db::test_support::QueryRecorder;
 use toolkit_db::{
     ConnectOpts, DBProvider, DbError, connect_db, migration_runner::run_migrations_for_testing,
 };
@@ -470,6 +471,38 @@ pub fn assert_no_surrogate_ids(json: &serde_json::Value) {
 }
 
 // -- Service construction helpers --
+
+/// Build a `TypeService` from a DB provider.
+pub fn make_type_service(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
+    TypeService::new(db, Arc::new(TypeRepository))
+}
+
+/// In-memory SQLite with migrations applied and a [`QueryRecorder`] attached,
+/// for the DB-behaviour audit suites.
+///
+/// The callback goes on before the connection is wrapped, unlike [`test_db`]:
+/// `DBProvider`/`Db` never hand out the inner `SeaORM` connection, so
+/// attaching afterwards would miss every statement.
+pub async fn test_db_with_recorder() -> (Arc<DBProvider<DbError>>, QueryRecorder) {
+    let opts = ConnectOpts {
+        max_conns: Some(1),
+        min_conns: Some(1),
+        ..Default::default()
+    };
+    let (db, recorder) = toolkit_db::test_support::connect_with_recorder("sqlite::memory:", opts)
+        .await
+        .expect("connect to in-memory SQLite with recorder");
+
+    run_migrations_for_testing(&db, Migrator::migrations())
+        .await
+        .expect("run migrations");
+
+    // Migrations run their own DDL through the same callback -- start each
+    // test's trace from a clean slate.
+    recorder.clear();
+
+    (Arc::new(DBProvider::new(db)), recorder)
+}
 
 /// Build a `GroupService` from a DB provider using the allow-all enforcer.
 pub fn make_group_service(
