@@ -9,6 +9,11 @@ use toolkit_odata::{CursorV1, Error as ODataError, ODataOrderBy, OrderKey, SortD
 pub use toolkit_odata::ODataQuery;
 // CursorV1 is available through the private import above for internal use
 
+/// Wire binding for the `OData` query-parameter family.
+///
+/// This struct is the single place where `OData` query parameters are bound
+/// off the URL: `toolkit-odata` operates on already-parsed values and does no
+/// HTTP query parsing of its own.
 #[derive(Deserialize, Default)]
 pub struct ODataParams {
     #[serde(rename = "$filter")]
@@ -17,6 +22,15 @@ pub struct ODataParams {
     pub orderby: Option<String>,
     #[serde(rename = "$select")]
     pub select: Option<String>,
+    /// Page size. Accepted as `limit` or as the canonical `OData` spelling
+    /// `$top` (OASIS `OData` 4.01 Part 2: URL Conventions, §5.1.6 "System
+    /// Query Options $top and $skip") — both spellings fold onto this one
+    /// slot, so a gear needs no per-endpoint handling to honor either.
+    ///
+    /// Sending both in one request is ambiguous and is rejected with
+    /// `400 InvalidArgument` (serde reports the second spelling as a
+    /// duplicate field).
+    #[serde(alias = "$top")]
     pub limit: Option<u64>,
     pub cursor: Option<String>,
 }

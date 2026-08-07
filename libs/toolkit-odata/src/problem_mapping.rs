@@ -102,8 +102,16 @@ impl From<Error> for CanonicalError {
                 )
                 .create(),
 
+            // Keyed to the canonical `OData` spelling. `toolkit::api::odata`
+            // binds page size from either `$top` or `limit` (one slot, two
+            // accepted names), so the violation names `$top` and the
+            // description names both.
             InvalidLimit => OdataError::invalid_argument()
-                .with_field_violation("$top", "Invalid limit parameter", "INVALID_LIMIT")
+                .with_field_violation(
+                    "$top",
+                    "Invalid page size parameter ($top, alias limit)",
+                    "INVALID_LIMIT",
+                )
                 .create(),
 
             // Surface both halves of the conflict so a client filtering by

@@ -276,7 +276,8 @@ impl std::fmt::Display for ODataOrderBy {
 /// - `InvalidFilter` / `InvalidOrderByField` / cursor errors / cursor-vs-query
 ///   mismatches / `InvalidLimit` / `OrderWithCursor` → canonical
 ///   `InvalidArgument` (HTTP 400), with the offending parameter surfaced as
-///   a `field_violation` (`$filter`, `$orderby`, `$top`, or `cursor`).
+///   a `field_violation` (`$filter`, `$orderby`, `$top` — the page-size slot,
+///   which `toolkit::api::odata` also accepts as `limit` — or `cursor`).
 /// - `Db` / `ParsingUnavailable` → canonical `Internal` (HTTP 500).
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum Error {

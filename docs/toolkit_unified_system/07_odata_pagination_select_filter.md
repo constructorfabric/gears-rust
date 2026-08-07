@@ -349,6 +349,35 @@ pub fn page_to_projected_json<T: serde::Serialize>(
 
 ## Cursor-based pagination
 
+### Page size (`$top` / `limit`)
+
+The page size binds off the query string in exactly one place —
+`toolkit::api::odata::ODataParams` — and lands in `ODataQuery.limit`. Two
+spellings reach that slot:
+
+| Spelling | Notes |
+|----------|-------|
+| `$top` | Canonical OData (OASIS OData 4.01 Part 2: URL Conventions, §5.1.6). Serde alias. |
+| `limit` | The unprefixed spelling most gears publish in their OpenAPI documents. |
+
+```bash
+# Equivalent
+/users-info/v1/users?$top=20
+/users-info/v1/users?limit=20
+
+# Ambiguous — 400 InvalidArgument (duplicate field)
+/users-info/v1/users?$top=20&limit=50
+```
+
+Both spellings are one parameter, so a gear needs no per-endpoint handling to
+honor either. Two consequences worth knowing:
+
+- OpenAPI cannot express one parameter under two names. Publish the spelling
+  your gear treats as canonical and mention the other in its `description`.
+- `$top=0` is rejected (`InvalidLimit` → `400`, `field_violations[0].field` is
+  `$top`). Enforcing an upper bound is the handler's job — the extractor caps
+  filter/orderby/select size, not page size.
+
 ### Page structure
 
 ```rust
@@ -475,13 +504,17 @@ OData errors are defined in `toolkit_odata::Error` (aliased as `ODataError` in `
 
 | Variant | Description | HTTP status |
 |---------|-------------|-------------|
-| `InvalidFilter(String)` | Malformed `$filter` expression | 422 |
-| `InvalidOrderByField(String)` | Unsupported `$orderby` field | 422 |
-| `InvalidCursor` / `CursorInvalid*` | Malformed or expired cursor | 422 |
-| `OrderMismatch` | Cursor/query order conflict | 422 |
-| `FilterMismatch` | Cursor/query filter conflict | 422 |
-| `InvalidLimit` | Invalid limit parameter | 422 |
+| `InvalidFilter(String)` | Malformed `$filter` expression | 400 |
+| `InvalidOrderByField(String)` | Unsupported `$orderby` field | 400 |
+| `InvalidCursor` / `CursorInvalid*` | Malformed or expired cursor | 400 |
+| `OrderMismatch` | Cursor/query order conflict | 400 |
+| `FilterMismatch` | Cursor/query filter conflict | 400 |
+| `InvalidLimit` | Invalid page size parameter (`$top`, alias `limit`) | 400 |
 | `Db(String)` | Database error (logged, generic message returned) | 500 |
+
+Every variant above except `Db` maps through `OdataError::invalid_argument()`, and
+`CanonicalError::InvalidArgument` renders as `400`. The canonical error taxonomy has no `422`
+status, so no `OData` error can produce one.
 
 `$select` validation errors (too long, too many fields, duplicates) are caught during parsing in the `OData` extractor and returned as `400 Bad Request` with RFC 9457 Problem Details before reaching the handler.
 

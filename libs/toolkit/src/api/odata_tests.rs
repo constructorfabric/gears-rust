@@ -241,6 +241,105 @@ mod tests {
         assert_eq!(odata.limit, Some(10));
     }
 
+    // ─── `$top` ⇄ `limit` alias ──────────────────────────────────────
+    //
+    // `$top` is the canonical OData page-size spelling (OASIS OData 4.01
+    // Part 2: URL Conventions, §5.1.6). It is a serde alias of `limit`,
+    // so both spellings fold onto the same `ODataQuery.limit` slot.
+
+    #[tokio::test]
+    async fn test_extract_odata_query_top_binds_limit() {
+        let uri = "/?%24top=25";
+
+        let request = Request::builder().uri(uri).body(()).unwrap();
+
+        let (mut parts, _body) = request.into_parts();
+
+        let query = extract_odata_query(&mut parts, &()).await.unwrap();
+
+        assert_eq!(
+            query.limit,
+            Some(25),
+            "`$top` must bind the same slot as `limit`"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_odata_query_top_zero_error() {
+        // Same floor as `limit=0`: zero is not a usable page size.
+        let uri = "/?%24top=0";
+
+        let request = Request::builder().uri(uri).body(()).unwrap();
+
+        let (mut parts, _body) = request.into_parts();
+
+        let canonical = extract_odata_query(&mut parts, &())
+            .await
+            .expect_err("`$top=0` must be rejected");
+        assert_eq!(canonical.status_code(), 400);
+
+        // The violation names `$top` — a caller who sent `$top` must not be
+        // told about a parameter they did not use.
+        let problem = toolkit_canonical_errors::Problem::from(canonical);
+        let violations = problem
+            .context
+            .get("field_violations")
+            .and_then(|v| v.as_array())
+            .expect("invalid_argument must carry field_violations[]");
+        assert_eq!(
+            violations[0].get("field").and_then(|f| f.as_str()),
+            Some("$top"),
+            "violation was {:?}",
+            violations[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_odata_query_top_and_limit_conflict() {
+        // Two spellings of one slot in one request is ambiguous: reject it
+        // rather than silently picking a winner.
+        let uri = "/?%24top=25&limit=10";
+
+        let request = Request::builder().uri(uri).body(()).unwrap();
+
+        let (mut parts, _body) = request.into_parts();
+
+        let canonical = extract_odata_query(&mut parts, &())
+            .await
+            .expect_err("`$top` together with `limit` must be rejected");
+        assert_eq!(canonical.status_code(), 400);
+
+        // Surfaces through the axum-level deserialization path, so the
+        // violation is keyed to `query` (gear OpenAPI documents cite this
+        // reason for the two-spellings-in-one-request case).
+        let problem = toolkit_canonical_errors::Problem::from(canonical);
+        let violations = problem
+            .context
+            .get("field_violations")
+            .and_then(|v| v.as_array())
+            .expect("invalid_argument must carry field_violations[]");
+        assert_eq!(
+            violations[0].get("reason").and_then(|r| r.as_str()),
+            Some("INVALID_QUERY_PARAMS"),
+            "violation was {:?}",
+            violations[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_odata_extractor_top_alias() {
+        let uri = "/?%24filter=email%20eq%20%27test%40example.com%27&%24top=10";
+
+        let request = Request::builder().uri(uri).body(()).unwrap();
+
+        let (mut parts, _body) = request.into_parts();
+
+        let odata = OData::from_request_parts(&mut parts, &()).await.unwrap();
+
+        assert!(odata.filter.is_some());
+        assert_eq!(odata.limit, Some(10));
+    }
+
     #[test]
     fn test_odata_deref() {
         use toolkit_odata::ast::*;
