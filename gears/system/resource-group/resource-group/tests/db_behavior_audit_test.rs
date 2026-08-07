@@ -1358,6 +1358,27 @@ fn static_rule_pins_type_service_serializable_without_retry() {
          assertion above needs updating in the same commit."
 
 #[test]
+fn static_rule_passes_type_service_uses_retry() {
+    let src = include_str!("../src/domain/type_service.rs");
+    let unretried = count_occurrences(
+        src,
+        ".transaction_ref_mapped_with_config(TxConfig::serializable(",
+    );
+    let retried = count_occurrences(src, ".transaction_with_retry(TxConfig::serializable(");
+    assert_eq!(
+        unretried, 0,
+        "create_type/update_type must not open a SERIALIZABLE transaction without \
+         retry: a 40001 then reaches the caller as an unhandled database error and \
+         is reported as 500, on a path account-management drives at gear init"
+    );
+    assert!(
+        retried >= 2,
+        "expected create_type and update_type to use transaction_with_retry, \
+         found {retried}"
+    );
+}
+
+#[test]
 fn static_rule_metadata_schema_is_resolved_before_begin() {
     let src = include_str!("../src/domain/group_service.rs");
 

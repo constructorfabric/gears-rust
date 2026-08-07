@@ -89,7 +89,15 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         let db = self.db.db();
         let type_repo = self.type_repo.clone();
 
-        db.transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| {
+        // Retry-aware, like every other SERIALIZABLE write in this gear. A
+        // `40001` here used to reach the caller as an unhandled database
+        // error and surface as HTTP 500 -- on a path account-management
+        // drives at gear init, so a startup failure rather than latent code.
+        // Each attempt gets its own clones: the closure runs more than once.
+        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+            let req = req.clone();
+            let stored_schema = stored_schema.clone();
+            let type_repo = type_repo.clone();
             Box::pin(async move {
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-8
                 // IF unique constraint violation → RETURN TypeAlreadyExists with
@@ -242,7 +250,12 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         let type_repo = self.type_repo.clone();
         let code = code.to_owned();
 
-        db.transaction_ref_mapped_with_config(TxConfig::serializable(), |tx| {
+        // Retry-aware for the same reason as `create_type`; see there.
+        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+            let req = req.clone();
+            let code = code.clone();
+            let stored_schema = stored_schema.clone();
+            let type_repo = type_repo.clone();
             Box::pin(async move {
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-2
                 // DB: SELECT FROM gts_type WHERE schema_id = {code} — load existing type

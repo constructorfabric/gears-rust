@@ -82,21 +82,35 @@ const SQLITE_LOCKED_MSG: &str = "database is locked";
 ///
 /// Detection is based on the error's string representation, which avoids a
 /// direct dependency on `sqlx` types.
+///
+/// # Why `DbErr::Custom` is also checked
+///
+/// A caller may re-wrap a `DbErr` before it reaches `transaction_with_retry`,
+/// producing `DbErr::Custom(<message>)` and losing the `Exec`/`Query` shape
+/// but keeping the message text this function matches on.
+///
+/// Without this arm, retry detection silently returns `false` for a
+/// genuinely retryable error, so `transaction_with_retry` never fires (RG-15).
 #[must_use]
 pub fn is_retryable_contention(backend: DbBackend, err: &DbErr) -> bool {
     match err {
         DbErr::Exec(runtime_err) | DbErr::Query(runtime_err) => {
             let msg = runtime_err.to_string();
-            match backend {
-                DbBackend::MySql => is_mysql_deadlock(&msg),
-                DbBackend::Postgres => is_pg_contention(&msg),
-                DbBackend::Sqlite => is_sqlite_busy(&msg),
-                // `DbBackend` is `#[non_exhaustive]` as of SeaORM 2.0. We have no
-                // contention signatures for a backend we don't know, so treat it
-                // as non-retryable rather than retrying blindly.
-                _ => false,
-            }
+            is_contention_message(backend, &msg)
         }
+        DbErr::Custom(msg) => is_contention_message(backend, msg),
+        _ => false,
+    }
+}
+
+fn is_contention_message(backend: DbBackend, msg: &str) -> bool {
+    match backend {
+        DbBackend::MySql => is_mysql_deadlock(msg),
+        DbBackend::Postgres => is_pg_contention(msg),
+        DbBackend::Sqlite => is_sqlite_busy(msg),
+        // `DbBackend` is `#[non_exhaustive]` as of SeaORM 2.0. We have no
+        // contention signatures for a backend we don't know, so treat it
+        // as non-retryable rather than retrying blindly.
         _ => false,
     }
 }
@@ -203,6 +217,49 @@ mod tests {
     fn pg_deadlock_by_message_detected() {
         let err = exec_err("error returned from database: deadlock detected");
         assert!(is_retryable_contention(DbBackend::Postgres, &err));
+    }
+
+    // ── RG-15 regression: DbErr::Custom-wrapped contention errors ────
+    //
+    // See `is_retryable_contention`'s doc comment for why `DbErr::Custom`
+    // must be detected the same as `Exec`/`Query`.
+
+    #[test]
+    fn pg_serialization_failure_detected_through_custom_wrap() {
+        let err = DbErr::Custom(
+            "Query Error: error returned from database: could not serialize access due to \
+             read/write dependencies among transactions"
+                .to_owned(),
+        );
+        assert!(is_retryable_contention(DbBackend::Postgres, &err));
+    }
+
+    #[test]
+    fn pg_deadlock_detected_through_custom_wrap() {
+        let err = DbErr::Custom(
+            "Query Error: error returned from database: deadlock detected".to_owned(),
+        );
+        assert!(is_retryable_contention(DbBackend::Postgres, &err));
+    }
+
+    #[test]
+    fn mysql_deadlock_detected_through_custom_wrap() {
+        let err = DbErr::Custom("Error 1213 (40001): Deadlock found".to_owned());
+        assert!(is_retryable_contention(DbBackend::MySql, &err));
+    }
+
+    #[test]
+    fn sqlite_busy_detected_through_custom_wrap() {
+        let err =
+            DbErr::Custom("error returned from database: (code: 5) database is locked".to_owned());
+        assert!(is_retryable_contention(DbBackend::Sqlite, &err));
+    }
+
+    #[test]
+    fn custom_wrap_non_contention_message_not_retryable() {
+        let err = DbErr::Custom("UNIQUE constraint failed: gts_type.schema_id".to_owned());
+        assert!(!is_retryable_contention(DbBackend::Postgres, &err));
+        assert!(!is_retryable_contention(DbBackend::Sqlite, &err));
     }
 
     // ── SQLite BUSY (code 5) ─────────────────────────────────────────
