@@ -1212,22 +1212,34 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         conn: &impl DBRunner,
         root_id: Uuid,
     ) -> Result<(), DomainError> {
-        // Get all descendants
-        let descendant_ids = group_repo.get_descendant_ids(conn, root_id).await?;
+        let descendants_with_depth = group_repo
+            .get_descendant_ids_with_depth(conn, root_id)
+            .await?;
 
-        // Delete in reverse order (leaves first)
-        let mut all_ids = vec![root_id];
-        all_ids.extend(descendant_ids);
+        let all_ids: Vec<Uuid> = std::iter::once(root_id)
+            .chain(descendants_with_depth.iter().map(|(id, _depth)| *id))
+            .collect();
 
-        // Delete memberships and closure rows for all nodes
-        for &gid in all_ids.iter().rev() {
-            group_repo.delete_memberships(conn, gid).await?;
-            group_repo.delete_all_closure_rows(conn, gid).await?;
+        // Memberships and closure rows have no FK ordering constraint among
+        // themselves, so both go in one statement for the whole subtree
+        // rather than two per node.
+        group_repo.delete_memberships_many(conn, &all_ids).await?;
+        group_repo
+            .delete_all_closure_rows_many(conn, &all_ids)
+            .await?;
+
+        // Group rows do have one: a parent cannot go before its children.
+        // Deleting depth level by depth level, deepest first, keeps that
+        // order while still batching each level into a single statement --
+        // so the statement count follows tree depth, not node count.
+        let mut ids_by_depth: std::collections::BTreeMap<i32, Vec<Uuid>> =
+            std::collections::BTreeMap::new();
+        ids_by_depth.entry(0).or_default().push(root_id);
+        for (id, depth) in descendants_with_depth {
+            ids_by_depth.entry(depth).or_default().push(id);
         }
-
-        // Delete group entities in reverse order (leaves first)
-        for &gid in all_ids.iter().rev() {
-            group_repo.delete_by_id(conn, gid).await?;
+        for ids in ids_by_depth.into_values().rev() {
+            group_repo.delete_by_id_many(conn, &ids).await?;
         }
 
         Ok(())

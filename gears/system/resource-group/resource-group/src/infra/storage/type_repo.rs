@@ -282,15 +282,19 @@ impl TypeRepositoryTrait for TypeRepository {
         parent_ids: &[i16],
     ) -> Result<(), DomainError> {
         let scope = system_scope();
-        for &parent_id in parent_ids {
-            let model = gts_type_allowed_parent::ActiveModel {
+        // One INSERT for the whole set: the row count is the size of the
+        // request, and a per-row loop holds the enclosing transaction open
+        // proportionally longer for no gain.
+        let rows: Vec<gts_type_allowed_parent::ActiveModel> = parent_ids
+            .iter()
+            .map(|&parent_id| gts_type_allowed_parent::ActiveModel {
                 type_id: Set(type_id),
                 parent_type_id: Set(parent_id),
-            };
-            toolkit_db::secure::secure_insert::<AllowedParentEntity>(model, &scope, db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
-        }
+            })
+            .collect();
+        toolkit_db::secure::secure_insert_many::<AllowedParentEntity>(rows, &scope, db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
         Ok(())
     }
 
@@ -302,15 +306,17 @@ impl TypeRepositoryTrait for TypeRepository {
         membership_ids: &[i16],
     ) -> Result<(), DomainError> {
         let scope = system_scope();
-        for &membership_id in membership_ids {
-            let model = gts_type_allowed_membership::ActiveModel {
+        // One INSERT for the whole set -- see `insert_allowed_parent_types`.
+        let rows: Vec<gts_type_allowed_membership::ActiveModel> = membership_ids
+            .iter()
+            .map(|&membership_id| gts_type_allowed_membership::ActiveModel {
                 type_id: Set(type_id),
                 membership_type_id: Set(membership_id),
-            };
-            toolkit_db::secure::secure_insert::<AllowedMembershipEntity>(model, &scope, db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
-        }
+            })
+            .collect();
+        toolkit_db::secure::secure_insert_many::<AllowedMembershipEntity>(rows, &scope, db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
         Ok(())
     }
 

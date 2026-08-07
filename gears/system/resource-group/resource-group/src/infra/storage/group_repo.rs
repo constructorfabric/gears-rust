@@ -760,17 +760,20 @@ impl GroupRepositoryTrait for GroupRepository {
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        // For each ancestor of parent, create ancestor -> child with depth+1
-        for ancestor_row in parent_ancestors {
-            let model = closure_entity::ActiveModel {
+        // One INSERT for the whole ancestor chain, not one per ancestor:
+        // the row count here is the depth of the parent, so a per-row loop
+        // makes every create cost as much as the tree is deep.
+        let rows: Vec<closure_entity::ActiveModel> = parent_ancestors
+            .into_iter()
+            .map(|ancestor_row| closure_entity::ActiveModel {
                 ancestor_id: Set(ancestor_row.ancestor_id),
                 descendant_id: Set(child_id),
                 depth: Set(ancestor_row.depth + 1),
-            };
-            toolkit_db::secure::secure_insert::<ClosureEntity>(model, &scope, db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
-        }
+            })
+            .collect();
+        toolkit_db::secure::secure_insert_many::<ClosureEntity>(rows, &scope, db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
 
         Ok(())
     }
@@ -798,6 +801,108 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))?;
 
         Ok(rows.into_iter().map(|r| r.descendant_id).collect())
+    }
+
+    /// Delete every group in `ids` in a single statement, not one
+    /// `delete_by_id` per node (RG-10).
+    async fn delete_by_id_many<C: DBRunner>(
+        &self,
+        db: &C,
+        ids: &[Uuid],
+    ) -> Result<(), DomainError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let scope = system_scope();
+        ResourceGroupEntity::delete_many()
+            .filter(rg_entity::Column::Id.is_in(ids.to_vec()))
+            .secure()
+            .scope_with(&scope)
+            .exec(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete all memberships for every group in `group_ids` in a single
+    /// statement, not one per node (RG-10).
+    async fn delete_memberships_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError> {
+        if group_ids.is_empty() {
+            return Ok(());
+        }
+        let scope = system_scope();
+        MembershipEntity::delete_many()
+            .filter(membership_entity::Column::GroupId.is_in(group_ids.to_vec()))
+            .secure()
+            .scope_with(&scope)
+            .exec(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete all closure rows (both as ancestor and as descendant) for
+    /// every group in `group_ids`, in exactly 2 statements regardless of
+    /// how many groups (RG-10).
+    async fn delete_all_closure_rows_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError> {
+        if group_ids.is_empty() {
+            return Ok(());
+        }
+        let scope = system_scope();
+        let ids: Vec<Uuid> = group_ids.to_vec();
+
+        ClosureEntity::delete_many()
+            .filter(closure_entity::Column::AncestorId.is_in(ids.clone()))
+            .secure()
+            .scope_with(&scope)
+            .exec(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        ClosureEntity::delete_many()
+            .filter(closure_entity::Column::DescendantId.is_in(ids))
+            .secure()
+            .scope_with(&scope)
+            .exec(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Same result set as `get_descendant_ids`, but keeps each descendant's
+    /// depth relative to `group_id`, so callers don't re-derive it via a
+    /// second per-row query (RG-05/RG-10).
+    async fn get_descendant_ids_with_depth<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<Vec<(Uuid, i32)>, DomainError> {
+        use sea_orm::QueryOrder;
+
+        let scope = system_scope();
+        let rows = ClosureEntity::find()
+            .filter(closure_entity::Column::AncestorId.eq(group_id))
+            .filter(closure_entity::Column::Depth.ne(0))
+            .order_by_asc(closure_entity::Column::Depth)
+            .secure()
+            .scope_with(&scope)
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.descendant_id, r.depth))
+            .collect())
     }
 
     /// Get the depth of a group from its root (max depth in closure table where
@@ -1006,11 +1111,13 @@ impl GroupRepositoryTrait for GroupRepository {
                 // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a
             }
 
-            for row in new_rows {
-                toolkit_db::secure::secure_insert::<ClosureEntity>(row, &scope, db)
-                    .await
-                    .map_err(|e| DomainError::database(e.to_string()))?;
-            }
+            // One INSERT for the whole rebuilt closure. The row count here is
+            // `ancestors x subtree size`, so a per-row loop turned a move of a
+            // 10 000-node subtree under a depth-10 parent into ~100 000
+            // separate statements.
+            toolkit_db::secure::secure_insert_many::<ClosureEntity>(new_rows, &scope, db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4
         }
 

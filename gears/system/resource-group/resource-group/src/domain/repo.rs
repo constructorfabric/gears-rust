@@ -114,6 +114,36 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         group_id: Uuid,
     ) -> Result<Vec<Uuid>, DomainError>;
 
+    /// Delete every group in `group_ids` in a single statement (RG-10).
+    async fn delete_by_id_many<C: DBRunner>(&self, db: &C, ids: &[Uuid])
+    -> Result<(), DomainError>;
+
+    /// Delete all memberships for every group in `group_ids` in a single
+    /// statement (RG-10).
+    async fn delete_memberships_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError>;
+
+    /// Delete all closure rows (both as ancestor and as descendant) for
+    /// every group in `group_ids`, in exactly 2 statements (RG-10), safe
+    /// since the whole batch is deleted together with no ordering to preserve.
+    async fn delete_all_closure_rows_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError>;
+
+    /// Same result set as `get_descendant_ids`, but keeps each descendant's
+    /// depth relative to `group_id`, so callers needing it (RG-05's depth
+    /// check, RG-10's depth-level batching) don't re-query for it.
+    async fn get_descendant_ids_with_depth<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<Vec<(Uuid, i32)>, DomainError>;
+
     async fn get_depth<C: DBRunner>(&self, db: &C, group_id: Uuid) -> Result<i32, DomainError>;
 
     async fn count_children<C: DBRunner>(
