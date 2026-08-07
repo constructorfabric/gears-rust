@@ -1,8 +1,7 @@
 use crate::consumer::{
-    BatchHandlerOutcome, ConsumerBuffering, ConsumerBuilder, ConsumerCommitMode, ConsumerGroupRef,
-    ConsumerHandle, ConsumerHandler, ConsumerListenerSettings, ConsumerProfile, EventBatch,
-    EventTypeRef, Fallback, HandlerOutcome, InMemoryOffsetManager, RawEvent, SingleEventHandler,
-    TopicRef,
+    BatchHandlerOutcome, ConsumerBuffering, ConsumerBuilder, ConsumerGroupRef, ConsumerHandle,
+    ConsumerHandler, ConsumerListenerSettings, ConsumerProfile, EventBatch, EventTypeRef, Fallback,
+    HandlerOutcome, InMemoryOffsetManager, RawEvent, SingleEventHandler, TopicRef,
 };
 use crate::error::{ConsumerError, EventBrokerError};
 use std::time::Duration;
@@ -571,6 +570,7 @@ mod tx_typestate {
     #[tokio::test]
     async fn transactional_consumer_does_not_auto_commit_when_handler_omits_commit_in_tx() {
         use crate::EventBrokerApi;
+        use crate::consumer::ConsumerCommitMode;
         use crate::mock::stubs::test_ctx_for_tenant;
         use crate::mock::{MockBroker, MockBrokerHandle};
         use crate::models::Event;
