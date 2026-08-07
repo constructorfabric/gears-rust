@@ -32,7 +32,9 @@ use resource_group::infra::storage::entity::resource_group_membership::{
 };
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::{CreateGroupRequest, CreateTypeRequest, UpdateGroupRequest};
+use resource_group_sdk::{
+    CreateGroupRequest, CreateTypeRequest, UpdateGroupRequest, UpdateTypeRequest,
+};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use toolkit_db::secure::{SecureEntityExt, secure_insert};
 use toolkit_odata::ODataQuery;
@@ -446,6 +448,111 @@ async fn group_move_closure_rebuild() {
     assert_eq!(model.parent_id, Some(root2.id));
     assert_eq!(model.tenant_id, tenant_id);
     assert_eq!(model.name, "Child");
+}
+
+/// A type that allows itself as a parent, so a chain of arbitrary depth can
+/// be built. `resolve_ids` rejects a parent path that does not exist yet, so
+/// the self-reference is added by a follow-up update.
+async fn create_self_parenting_type(
+    type_svc: &TypeService<TypeRepository>,
+    suffix: &str,
+) -> resource_group_sdk::ResourceGroupType {
+    let code = format!(
+        "{}x.test.{}.i{}.v1~",
+        gts_id!("cf.core.rg.type.v1~"),
+        suffix.to_ascii_lowercase(),
+        Uuid::now_v7().as_simple()
+    );
+    type_svc
+        .create_type(CreateTypeRequest {
+            code: code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .expect("create self-parenting type");
+    type_svc
+        .update_type(
+            &code,
+            UpdateTypeRequest {
+                can_be_root: true,
+                allowed_parent_types: vec![code.clone()],
+                allowed_membership_types: vec![],
+                metadata_schema: None,
+            },
+        )
+        .await
+        .expect("add the self-reference")
+}
+
+/// Move a two-level subtree under a parent that is itself two levels down.
+///
+/// `group_move_closure_rebuild` above moves under a *root*, so every new
+/// closure row gets its depth from the subtree side alone. Here the new
+/// parent has ancestors of its own, so each rebuilt row's depth is a sum of
+/// both sides plus one -- the arithmetic that a rebuild can get wrong in a
+/// way a move-to-root never exposes.
+#[tokio::test]
+async fn group_move_under_deep_parent_rebuilds_every_depth() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t = create_self_parenting_type(&type_svc, "deepmv").await;
+
+    // Destination chain: root -> mid -> target. `target` sits at depth 2, so
+    // it has three closure rows of its own (itself, mid, root).
+    let root = common::create_root_group(&group_svc, &ctx, &t.code, "root", tenant_id).await;
+    let mid =
+        common::create_child_group(&group_svc, &ctx, &t.code, root.id, "mid", tenant_id).await;
+    let target =
+        common::create_child_group(&group_svc, &ctx, &t.code, mid.id, "target", tenant_id).await;
+
+    // Subtree to move: other -> moved -> leaf.
+    let other = common::create_root_group(&group_svc, &ctx, &t.code, "other", tenant_id).await;
+    let moved =
+        common::create_child_group(&group_svc, &ctx, &t.code, other.id, "moved", tenant_id).await;
+    let leaf =
+        common::create_child_group(&group_svc, &ctx, &t.code, moved.id, "leaf", tenant_id).await;
+
+    group_svc
+        .move_group(moved.id, Some(target.id))
+        .await
+        .expect("move under the deep parent");
+
+    let conn = db.conn().expect("conn");
+
+    // moved: self, target(1), mid(2), root(3) -- and nothing from `other`.
+    common::assert_closure_rows(
+        &conn,
+        moved.id,
+        &[(moved.id, 0), (target.id, 1), (mid.id, 2), (root.id, 3)],
+    )
+    .await;
+
+    // leaf: one deeper on every path, and its link to `moved` is preserved
+    // rather than rewritten -- internal subtree rows are not part of a move.
+    common::assert_closure_rows(
+        &conn,
+        leaf.id,
+        &[
+            (leaf.id, 0),
+            (moved.id, 1),
+            (target.id, 2),
+            (mid.id, 3),
+            (root.id, 4),
+        ],
+    )
+    .await;
+
+    // The old parent keeps only itself.
+    common::assert_closure_rows(&conn, other.id, &[(other.id, 0)]).await;
+
+    common::assert_closure_matches_parent_links(&conn).await;
 }
 
 /// TC-GRP-06: Move under descendant -> CycleDetected.

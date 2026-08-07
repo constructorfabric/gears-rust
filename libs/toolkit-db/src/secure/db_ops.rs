@@ -274,6 +274,66 @@ where
     Ok(())
 }
 
+/// Execute an `INSERT ... SELECT`: the rows are computed and written inside
+/// the database and never travel through this process.
+///
+/// The set-based counterpart of [`secure_insert_many`]. Use it where the rows
+/// to insert are a function of rows the database already holds -- a closure
+/// table rebuilt from itself, say. [`secure_insert_many`] still has to
+/// materialize every row here first, which for a cross product means the row
+/// count in process memory and on the wire; this sends one statement whose
+/// size does not depend on how many rows it writes.
+///
+/// # Security
+///
+/// [`secure_insert`] and [`secure_insert_many`] validate every row against
+/// the caller's scope before any of it reaches the database. Rows produced by
+/// a `SELECT` inside the database are never visible here, so that check
+/// cannot be run -- and this helper does not pretend otherwise. It is
+/// restricted to entities that declare no scope columns at all
+/// (`#[secure(no_tenant, no_resource, no_owner, no_type)]`), where per-row
+/// validation has nothing to examine and skipping it forfeits nothing. Any
+/// other entity is refused before the statement is built, so the restriction
+/// cannot be waived by a caller that would rather not honour it.
+///
+/// Scoping the *source* rows remains the caller's job: build the inner
+/// `SELECT` from a scoped query when the source table is scoped.
+///
+/// # Errors
+///
+/// - `ScopeError::Invalid` if `E` declares any scope column.
+/// - `ScopeError::Db` if the statement fails.
+pub async fn secure_insert_from_select<E>(
+    stmt: &sea_orm::sea_query::InsertStatement,
+    runner: &impl DBRunner,
+) -> Result<(), ScopeError>
+where
+    E: ScopableEntity + EntityTrait,
+{
+    if E::tenant_col().is_some()
+        || E::resource_col().is_some()
+        || E::owner_col().is_some()
+        || E::type_col().is_some()
+    {
+        return Err(ScopeError::Invalid(
+            "insert-from-select is limited to entities without scope columns: \
+             rows produced inside the database cannot be validated per row",
+        ));
+    }
+
+    match DBRunnerInternal::as_seaorm(runner) {
+        SeaOrmRunner::Conn(db) => {
+            let backend = sea_orm::ConnectionTrait::get_database_backend(db);
+            sea_orm::ConnectionTrait::execute(db, backend.build(stmt)).await?;
+        }
+        SeaOrmRunner::Tx(tx) => {
+            let backend = sea_orm::ConnectionTrait::get_database_backend(tx);
+            sea_orm::ConnectionTrait::execute(tx, backend.build(stmt)).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Bind-parameter budget for one statement, per backend.
 ///
 /// Deliberately below each backend's hard ceiling, since the count here is

@@ -11,7 +11,7 @@ use resource_group_sdk::models::{
     GroupHierarchy, GroupHierarchyWithDepth, ResourceGroup, ResourceGroupWithDepth,
 };
 use resource_group_sdk::odata::{GroupFilterField, HierarchyFilterField};
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Alias, Expr, Query};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use toolkit_db::odata::{LimitCfg, paginate_odata};
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
@@ -790,29 +790,30 @@ impl GroupRepositoryTrait for GroupRepository {
         child_id: Uuid,
         parent_id: Uuid,
     ) -> Result<(), DomainError> {
-        let scope = system_scope();
+        // One statement for the whole ancestor chain: every row the parent
+        // has as a descendant becomes a row for the child, one deeper. The
+        // ancestors are neither fetched nor rebuilt here -- a create used to
+        // pay a round-trip to read them and a second to write them back,
+        // both inside the transaction that create holds open.
+        let mut source = Query::select();
+        source
+            .expr(Expr::col(closure_entity::Column::AncestorId))
+            .expr(Expr::val(child_id))
+            .expr(Expr::col(closure_entity::Column::Depth).add(1))
+            .from(ClosureEntity)
+            .and_where(Expr::col(closure_entity::Column::DescendantId).eq(parent_id));
 
-        // Get all ancestors of the parent (including parent's self-row)
-        let parent_ancestors = ClosureEntity::find()
-            .filter(closure_entity::Column::DescendantId.eq(parent_id))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
+        let mut insert = Query::insert();
+        insert.into_table(ClosureEntity).columns([
+            closure_entity::Column::AncestorId,
+            closure_entity::Column::DescendantId,
+            closure_entity::Column::Depth,
+        ]);
+        insert
+            .select_from(source)
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        // One INSERT for the whole ancestor chain, not one per ancestor:
-        // the row count here is the depth of the parent, so a per-row loop
-        // makes every create cost as much as the tree is deep.
-        let rows: Vec<closure_entity::ActiveModel> = parent_ancestors
-            .into_iter()
-            .map(|ancestor_row| closure_entity::ActiveModel {
-                ancestor_id: Set(ancestor_row.ancestor_id),
-                descendant_id: Set(child_id),
-                depth: Set(ancestor_row.depth + 1),
-            })
-            .collect();
-        toolkit_db::secure::secure_insert_many::<ClosureEntity>(rows, &scope, db)
+        toolkit_db::secure::secure_insert_from_select::<ClosureEntity>(&insert, db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
@@ -1076,101 +1077,103 @@ impl GroupRepositoryTrait for GroupRepository {
         new_parent_id: Option<Uuid>,
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-1
-        // Collect subtree: SELECT descendant_id FROM resource_group_closure WHERE ancestor_id = group_id
+        // Collect subtree: SELECT descendant_id FROM resource_group_closure
+        // WHERE ancestor_id = group_id -- the group itself included, via its
+        // own self-row.
+        //
+        // Defined as a query and used by the steps below rather than
+        // materialized here. The subtree is exactly the input this operation
+        // must not be linear in, and none of the decisions taken from it need
+        // the rows in this process.
         let scope = system_scope();
-        let subtree_rows = ClosureEntity::find()
-            .filter(closure_entity::Column::AncestorId.eq(group_id))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        let subtree_ids: Vec<Uuid> = subtree_rows.iter().map(|r| r.descendant_id).collect();
-        let subtree_internal: std::collections::HashMap<Uuid, i32> = subtree_rows
-            .iter()
-            .map(|r| (r.descendant_id, r.depth))
-            .collect();
+        let subtree_query = Query::select()
+            .column(closure_entity::Column::DescendantId)
+            .from(ClosureEntity)
+            .and_where(Expr::col(closure_entity::Column::AncestorId).eq(group_id))
+            .to_owned();
         // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-1
 
         // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-2
         // Delete affected paths: DELETE FROM resource_group_closure
         // WHERE descendant_id IN (subtree) AND ancestor_id NOT IN (subtree)
-        let subtree_set: std::collections::HashSet<Uuid> = subtree_ids.iter().copied().collect();
-
-        let all_desc_rows = ClosureEntity::find()
-            .filter(closure_entity::Column::DescendantId.is_in(subtree_ids.clone()))
+        //
+        // Both predicates are that same subquery. The previous form read
+        // every closure row of the subtree back into the process only to
+        // decide which ancestors were external, then bound the survivors into
+        // two `IN (...)` lists -- one parameter per id, unbounded, so a large
+        // enough subtree failed in the driver rather than in the query.
+        ClosureEntity::delete_many()
+            .filter(closure_entity::Column::DescendantId.in_subquery(subtree_query.clone()))
+            .filter(closure_entity::Column::AncestorId.not_in_subquery(subtree_query))
             .secure()
             .scope_with(&scope)
-            .all(db)
+            .exec(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
-
-        // Collect (ancestor_id, descendant_id) pairs where ancestor is outside subtree
-        let external_pairs: Vec<(Uuid, Uuid)> = all_desc_rows
-            .iter()
-            .filter(|r| !subtree_set.contains(&r.ancestor_id))
-            .map(|r| (r.ancestor_id, r.descendant_id))
-            .collect();
-
-        // Batch-delete: delete rows where ancestor is NOT in subtree for each subtree descendant.
-        // Group by descendant_id to minimize queries.
-        if !external_pairs.is_empty() {
-            // Delete all external ancestor rows for all subtree descendants in one query
-            // We delete rows where descendant_id IN (subtree) AND ancestor_id NOT IN (subtree)
-            let external_ancestor_ids: Vec<Uuid> = external_pairs
-                .iter()
-                .map(|(a, _)| *a)
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-
-            ClosureEntity::delete_many()
-                .filter(closure_entity::Column::DescendantId.is_in(subtree_ids.clone()))
-                .filter(closure_entity::Column::AncestorId.is_in(external_ancestor_ids))
-                .secure()
-                .scope_with(&scope)
-                .exec(db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
-        }
         // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-2
 
-        // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-3
-        // Compute new ancestor paths from new parent
         if let Some(parent_id) = new_parent_id {
-            let parent_ancestors = ClosureEntity::find()
-                .filter(closure_entity::Column::DescendantId.eq(parent_id))
-                .secure()
-                .scope_with(&scope)
-                .all(db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
+            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-3
+            // Compute new ancestor paths from new parent: the closure rows
+            // whose descendant is the new parent, i.e. its ancestors and its
+            // own self-row. Named as a join side, not fetched.
+            let ancestors = Alias::new("pa");
+            let subtree = Alias::new("st");
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-3
 
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4
-            let mut new_rows: Vec<closure_entity::ActiveModel> = Vec::new();
-            for ancestor_row in &parent_ancestors {
-                // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a
-                for &desc_id in &subtree_ids {
-                    // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a1
-                    let internal_depth = subtree_internal.get(&desc_id).copied().unwrap_or(0);
-                    let new_depth = ancestor_row.depth + 1 + internal_depth;
-                    new_rows.push(closure_entity::ActiveModel {
-                        ancestor_id: Set(ancestor_row.ancestor_id),
-                        descendant_id: Set(desc_id),
-                        depth: Set(new_depth),
-                    });
-                    // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a1
-                }
-                // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a
-            }
+            let mut source = Query::select();
 
-            // One INSERT for the whole rebuilt closure. The row count here is
-            // `ancestors x subtree size`, so a per-row loop turned a move of a
-            // 10 000-node subtree under a depth-10 parent into ~100 000
-            // separate statements.
-            toolkit_db::secure::secure_insert_many::<ClosureEntity>(new_rows, &scope, db)
+            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a
+            // FOR EACH new_ancestor, FOR EACH subtree_node: the cross product
+            // of the two closure ranges. The database forms it; the pairs
+            // never exist as Rust values. For a 10 000-node subtree under a
+            // depth-10 parent that is 100 000 rows the process no longer
+            // builds, holds, or sends.
+            source
+                .from_as(ClosureEntity, ancestors.clone())
+                .from_as(ClosureEntity, subtree.clone())
+                .and_where(
+                    Expr::col((ancestors.clone(), closure_entity::Column::DescendantId))
+                        .eq(parent_id),
+                )
+                .and_where(
+                    Expr::col((subtree.clone(), closure_entity::Column::AncestorId)).eq(group_id),
+                );
+            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a
+
+            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a1
+            // One row per pair: ancestor_id = new_ancestor, descendant_id =
+            // subtree_node, depth = new_ancestor_depth +
+            // subtree_node_relative_depth + 1. Column order here is the
+            // column order the insert declares.
+            source
+                .expr(Expr::col((
+                    ancestors.clone(),
+                    closure_entity::Column::AncestorId,
+                )))
+                .expr(Expr::col((
+                    subtree.clone(),
+                    closure_entity::Column::DescendantId,
+                )))
+                .expr(
+                    Expr::col((ancestors, closure_entity::Column::Depth))
+                        .add(Expr::col((subtree, closure_entity::Column::Depth)))
+                        .add(1),
+                );
+            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a1
+
+            let mut insert = Query::insert();
+            insert.into_table(ClosureEntity).columns([
+                closure_entity::Column::AncestorId,
+                closure_entity::Column::DescendantId,
+                closure_entity::Column::Depth,
+            ]);
+            insert
+                .select_from(source)
+                .map_err(|e| DomainError::database(e.to_string()))?;
+
+            toolkit_db::secure::secure_insert_from_select::<ClosureEntity>(&insert, db)
                 .await
                 .map_err(|e| DomainError::database(e.to_string()))?;
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4

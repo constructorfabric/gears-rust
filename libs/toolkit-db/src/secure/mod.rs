@@ -159,8 +159,9 @@ pub use select::{
 // Update/Delete/Insert operations
 pub use db_ops::{
     SecureDeleteExt, SecureDeleteMany, SecureInsertExt, SecureInsertOne, SecureOnConflict,
-    SecureUpdateExt, SecureUpdateMany, max_bind_params_for, secure_insert, secure_insert_many,
-    secure_update_with_scope, validate_tenant_in_scope,
+    SecureUpdateExt, SecureUpdateMany, max_bind_params_for, secure_insert,
+    secure_insert_from_select, secure_insert_many, secure_update_with_scope,
+    validate_tenant_in_scope,
 };
 
 // Provider pattern for advanced tenant filtering
