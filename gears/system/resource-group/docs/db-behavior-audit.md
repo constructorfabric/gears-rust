@@ -22,13 +22,23 @@ to be reused — this gear is the worked example, not the point.
 
 ## Scope of this branch
 
-This report is the full audit. The branch carrying it fixes the **query-count**
-subset only — the N+1 and redundant-I/O findings — and leaves the
-transaction-boundary, retry, isolation and error-classification findings to the
-branch they came from. The Status column says which is which, and the audit
-suite carries only the tests that exercise what is here: a test asserting a
-fix that is absent would be noise, not coverage, so those tests stay with the
-branch that carries their fixes.
+This report is the full audit. The branch carrying it started as the
+**query-count** subset — the N+1 and redundant-I/O findings — and has since
+taken the transaction-boundary, retry and isolation findings that are about
+*performance*: RG-02, RG-03, RG-09 and RG-15, plus the isolation decisions
+they unblock.
+
+What stays out is the correctness and security work: the membership
+transaction boundaries (RG-01, RG-14), tenant scoping, the authorization
+gates, and the wider error-mapping changes. Two error classifications did come
+along, but only where a constraint was already enforcing the invariant and
+what was missing was the translation — the duplicate type code and the
+in-use type — because an isolation level was standing in for it.
+
+The Status column says which is which, and the audit suite carries only the
+tests that exercise what is here: a test asserting a fix that is absent would
+be noise, not coverage, so those tests stay with the branch that carries their
+fixes.
 
 ## What was found
 
@@ -48,7 +58,7 @@ depth-10 parent issued roughly 100 000 separate `INSERT`s.
 | ID | Class | Severity | Where | Status |
 |----|-------|----------|-------|--------|
 | RG-01 | no-tx-write | **Critical** | `membership_service.rs` `add_membership_inner` — check-then-insert on a bare connection; the PK includes `group_id`, so two concurrent first-memberships in different tenants both commit and the "one tenant per resource" invariant breaks | Fixed on the source branch; not in this one — a transaction boundary, not a query count |
-| RG-02 | no-tx-write | Medium | `type_service.rs` `delete_type` — resolve/count/delete outside any transaction | Fixed on the source branch; not in this one — a transaction boundary, not a query count |
+| RG-02 | no-tx-write | Medium | `type_service.rs` `delete_type` — resolve/count/delete outside any transaction | Fixed. One transaction with bounded retry, at the backend default: `ON DELETE RESTRICT` is what makes a type in use undeletable, and `delete_by_id` maps that constraint to the same conflict the count reports. Guarded by `trace_delete_type` |
 | RG-03 | no-retry-serializable | **Critical** | `type_service.rs` `create_type`/`update_type` — `SERIALIZABLE` without retry, so a `40001` reaches the caller raw. Live call sites: account-management's gear-init type registration, i.e. a startup path, not latent code | Fixed. Both moved to `transaction_with_retry`, each attempt on its own clones. Guarded by a Section 4 rule |
 | RG-04 | n-plus-one | High | `group_repo.rs` `rebuild_subtree_closure` — one `INSERT` per closure row, `A×N` of them | Fixed |
 | RG-05 | n-plus-one | Medium | `group_service.rs` `move_group_internal_impl` — `is_descendant` + `get_relative_depth` per descendant; both answers were already in the rows loaded a moment earlier | Fixed |

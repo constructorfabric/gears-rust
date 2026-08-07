@@ -511,7 +511,22 @@ impl TypeRepositoryTrait for TypeRepository {
             .scope_with(&scope)
             .exec(db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+            .map_err(|e| {
+                // `resource_group.gts_type_id` and the membership table both
+                // reference this row `ON DELETE RESTRICT`, so the constraint
+                // is what actually prevents deleting a type still in use. The
+                // count the caller runs first is a better message, not the
+                // guard -- under a concurrent create it can be stale by the
+                // time the delete runs, and then the answer comes from here.
+                // Same conflict either way.
+                if e.is_foreign_key_violation() {
+                    DomainError::conflict_active_references(format!(
+                        "Cannot delete type: group(s) of this type exist (type_id {type_id})"
+                    ))
+                } else {
+                    DomainError::database(e.to_string())
+                }
+            })?;
         Ok(())
     }
 
