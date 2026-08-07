@@ -28,7 +28,6 @@ use crate::infra::storage::entity::{
     resource_group_membership::{self as membership_entity, Entity as MembershipEntity},
 };
 use crate::infra::storage::odata_mapper::GroupODataMapper;
-use crate::infra::storage::type_repo::TypeRepository;
 
 /// Default `OData` pagination limits for groups.
 const GROUP_LIMIT_CFG: LimitCfg = LimitCfg {
@@ -209,78 +208,121 @@ impl GroupRepository {
     /// numeric value is then handled by `filter_node_to_condition` which converts
     /// it to `sea_orm::Value::BigInt` — `PostgreSQL` implicitly casts to SMALLINT.
     #[allow(clippy::type_complexity)]
-    fn resolve_type_filter_node<'a>(
-        db: &'a (impl DBRunner + 'a),
-        node: &'a toolkit_odata::filter::FilterNode<GroupFilterField>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        toolkit_odata::filter::FilterNode<GroupFilterField>,
-                        DomainError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
+    /// Collect every GTS type path a `type` predicate references, anywhere
+    /// in the filter tree.
+    fn collect_type_filter_paths(
+        node: &toolkit_odata::filter::FilterNode<GroupFilterField>,
+        out: &mut Vec<String>,
+    ) {
         use toolkit_odata::ast::Value as V;
         use toolkit_odata::filter::FilterNode as FN;
+        match node {
+            FN::Binary {
+                field: GroupFilterField::Type,
+                value: V::String(path),
+                ..
+            } => out.push(path.clone()),
+            FN::InList {
+                field: GroupFilterField::Type,
+                values,
+            } => {
+                for v in values {
+                    if let V::String(path) = v {
+                        out.push(path.clone());
+                    }
+                }
+            }
+            FN::Composite { children, .. } => {
+                for child in children {
+                    Self::collect_type_filter_paths(child, out);
+                }
+            }
+            FN::Not(inner) => Self::collect_type_filter_paths(inner, out),
+            _ => {}
+        }
+    }
 
-        Box::pin(async move {
-            match node {
-                FN::Binary {
-                    field: GroupFilterField::Type,
-                    op,
-                    value: V::String(path),
-                } => {
-                    let id = TypeRepository::resolve_id(db, path).await?.ok_or_else(|| {
-                        DomainError::validation(format!("Unknown type in filter: {path}"))
-                    })?;
-                    Ok(FN::Binary {
-                        field: GroupFilterField::Type,
-                        op: *op,
-                        value: V::Number(id.into()),
-                    })
+    /// Rewrite every `type` predicate to compare against the surrogate id,
+    /// using an already-resolved path -> id map. Purely in memory.
+    fn substitute_type_filter_ids(
+        node: &toolkit_odata::filter::FilterNode<GroupFilterField>,
+        ids: &std::collections::HashMap<String, i16>,
+    ) -> Result<toolkit_odata::filter::FilterNode<GroupFilterField>, DomainError> {
+        use toolkit_odata::ast::Value as V;
+        use toolkit_odata::filter::FilterNode as FN;
+        let unknown =
+            |path: &str| DomainError::validation(format!("Unknown type in filter: {path}"));
+        Ok(match node {
+            FN::Binary {
+                field: GroupFilterField::Type,
+                op,
+                value: V::String(path),
+            } => FN::Binary {
+                field: GroupFilterField::Type,
+                op: *op,
+                value: V::Number((*ids.get(path).ok_or_else(|| unknown(path))?).into()),
+            },
+            FN::InList {
+                field: GroupFilterField::Type,
+                values,
+            } => {
+                let mut resolved = Vec::with_capacity(values.len());
+                for v in values {
+                    if let V::String(path) = v {
+                        resolved.push(V::Number(
+                            (*ids.get(path).ok_or_else(|| unknown(path))?).into(),
+                        ));
+                    } else {
+                        resolved.push(v.clone());
+                    }
                 }
                 FN::InList {
                     field: GroupFilterField::Type,
-                    values,
-                } => {
-                    let mut resolved = Vec::with_capacity(values.len());
-                    for v in values {
-                        if let V::String(path) = v {
-                            let id =
-                                TypeRepository::resolve_id(db, path).await?.ok_or_else(|| {
-                                    DomainError::validation(format!(
-                                        "Unknown type in filter: {path}"
-                                    ))
-                                })?;
-                            resolved.push(V::Number(id.into()));
-                        } else {
-                            resolved.push(v.clone());
-                        }
-                    }
-                    Ok(FN::InList {
-                        field: GroupFilterField::Type,
-                        values: resolved,
-                    })
+                    values: resolved,
                 }
-                FN::Composite { op, children } => {
-                    let mut resolved_children = Vec::with_capacity(children.len());
-                    for child in children {
-                        resolved_children.push(Self::resolve_type_filter_node(db, child).await?);
-                    }
-                    Ok(FN::Composite {
-                        op: *op,
-                        children: resolved_children,
-                    })
-                }
-                FN::Not(inner) => Ok(FN::Not(Box::new(
-                    Self::resolve_type_filter_node(db, inner).await?,
-                ))),
-                other => Ok(other.clone()),
             }
+            FN::Composite { op, children } => FN::Composite {
+                op: *op,
+                children: children
+                    .iter()
+                    .map(|c| Self::substitute_type_filter_ids(c, ids))
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+            FN::Not(inner) => FN::Not(Box::new(Self::substitute_type_filter_ids(inner, ids)?)),
+            other => other.clone(),
         })
+    }
+
+    /// Resolve every `type` predicate in the tree to its surrogate id.
+    ///
+    /// Two passes in memory around a single query, rather than one query
+    /// per referenced path: a `type in (...)` filter with N values used to
+    /// cost N `gts_type` SELECTs before the page query even ran (N+1 audit
+    /// finding (b)).
+    async fn resolve_type_filter_node(
+        db: &impl DBRunner,
+        node: &toolkit_odata::filter::FilterNode<GroupFilterField>,
+    ) -> Result<toolkit_odata::filter::FilterNode<GroupFilterField>, DomainError> {
+        let mut paths = Vec::new();
+        Self::collect_type_filter_paths(node, &mut paths);
+        if paths.is_empty() {
+            return Ok(node.clone());
+        }
+        paths.sort_unstable();
+        paths.dedup();
+
+        let scope = system_scope();
+        let rows = GtsTypeEntity::find()
+            .filter(gts_type::Column::SchemaId.is_in(paths))
+            .secure()
+            .scope_with(&scope)
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+        let ids: std::collections::HashMap<String, i16> =
+            rows.into_iter().map(|t| (t.schema_id, t.id)).collect();
+
+        Self::substitute_type_filter_ids(node, &ids)
     }
 
     /// Parse and extract hierarchy filters from an `OData` query.

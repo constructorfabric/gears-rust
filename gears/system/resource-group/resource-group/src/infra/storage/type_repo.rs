@@ -40,6 +40,143 @@ fn system_scope() -> AccessScope {
 pub struct TypeRepository;
 
 impl TypeRepository {
+    /// Batch-resolve full types (junction references) for a whole page of
+    /// models in a constant number of queries, regardless of page size.
+    ///
+    /// One query per junction table across the whole page, one combined
+    /// id->code resolution query for every referenced parent/membership
+    /// type, then assembles each `ResourceGroupType` in memory (RG-12).
+    async fn load_full_types_batch(
+        db: &impl DBRunner,
+        models: &[gts_type::Model],
+    ) -> Result<Vec<ResourceGroupType>, DomainError> {
+        if models.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope = system_scope();
+        let type_ids: Vec<i16> = models.iter().map(|m| m.id).collect();
+
+        let parent_rows = AllowedParentEntity::find()
+            .filter(gts_type_allowed_parent::Column::TypeId.is_in(type_ids.clone()))
+            .secure()
+            .scope_with(&scope)
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        let membership_rows = AllowedMembershipEntity::find()
+            .filter(gts_type_allowed_membership::Column::TypeId.is_in(type_ids))
+            .secure()
+            .scope_with(&scope)
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        let referenced_ids: std::collections::HashSet<i16> = parent_rows
+            .iter()
+            .map(|r| r.parent_type_id)
+            .chain(membership_rows.iter().map(|r| r.membership_type_id))
+            .collect();
+
+        let code_by_id: std::collections::HashMap<i16, String> = if referenced_ids.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let ids: Vec<i16> = referenced_ids.into_iter().collect();
+            GtsTypeEntity::find()
+                .filter(gts_type::Column::Id.is_in(ids))
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?
+                .into_iter()
+                .map(|m| (m.id, m.schema_id))
+                .collect()
+        };
+
+        let mut parents_by_type: std::collections::HashMap<i16, Vec<String>> =
+            std::collections::HashMap::new();
+        for r in &parent_rows {
+            if let Some(code) = code_by_id.get(&r.parent_type_id) {
+                parents_by_type
+                    .entry(r.type_id)
+                    .or_default()
+                    .push(code.clone());
+            }
+        }
+        let mut memberships_by_type: std::collections::HashMap<i16, Vec<String>> =
+            std::collections::HashMap::new();
+        for r in &membership_rows {
+            if let Some(code) = code_by_id.get(&r.membership_type_id) {
+                memberships_by_type
+                    .entry(r.type_id)
+                    .or_default()
+                    .push(code.clone());
+            }
+        }
+
+        Ok(models
+            .iter()
+            .map(|m| {
+                let mut allowed_parent_types = parents_by_type.remove(&m.id).unwrap_or_default();
+                allowed_parent_types.sort();
+                let mut allowed_membership_types =
+                    memberships_by_type.remove(&m.id).unwrap_or_default();
+                allowed_membership_types.sort();
+                Self::build_resource_group_type(m, allowed_parent_types, allowed_membership_types)
+            })
+            .collect())
+    }
+
+    /// Assemble a `ResourceGroupType` from a raw model plus resolved junction
+    /// data. Shared by `load_full_type` and `load_full_types_batch` so both
+    /// derive `can_be_root`/`metadata_schema` identically.
+    fn build_resource_group_type(
+        type_model: &gts_type::Model,
+        allowed_parent_types: Vec<String>,
+        allowed_membership_types: Vec<String>,
+    ) -> ResourceGroupType {
+        // Derive can_be_root from stored metadata_schema internal key.
+        // Per the placement invariant: can_be_root == true OR len(allowed_parent_types) >= 1.
+        // If no allowed_parent_types, can_be_root must be true.
+        let can_be_root = type_model
+            .metadata_schema
+            .as_ref()
+            .and_then(|ms| ms.get("__can_be_root"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(allowed_parent_types.is_empty());
+
+        // Extract the user-facing metadata_schema without internal keys.
+        // Non-object schemas are stored under `__user_schema`; restore them on read.
+        let metadata_schema = type_model.metadata_schema.as_ref().and_then(|ms| {
+            if let serde_json::Value::Object(map) = ms {
+                if let Some(user_schema) = map.get("__user_schema") {
+                    return Some(user_schema.clone());
+                }
+                let filtered: serde_json::Map<String, serde_json::Value> = map
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with("__"))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Object(filtered))
+                }
+            } else {
+                Some(ms.clone())
+            }
+        });
+
+        ResourceGroupType {
+            code: type_model.schema_id.clone(),
+            can_be_root,
+            allowed_parent_types,
+            allowed_membership_types,
+            metadata_schema,
+        }
+    }
+
     /// Resolve a GTS type path to its surrogate SMALLINT ID (static helper for filter resolution).
     pub async fn resolve_id(db: &impl DBRunner, code: &str) -> Result<Option<i16>, DomainError> {
         let scope = system_scope();
@@ -414,16 +551,47 @@ impl TypeRepositoryTrait for TypeRepository {
         Ok(count)
     }
 
-    /// Find resource groups that have a specific parent type and are of a given child type.
+    /// Batch replacement for a removed-allowed-parent-types sweep -- see the
+    /// trait doc comment for the full rationale (N+1 audit finding (b)).
     ///
-    /// Uses a batch lookup instead of N+1 individual parent queries.
-    async fn find_groups_using_parent_type<C: DBRunner>(
+    /// Three queries regardless of how many `parent_codes` are checked:
+    /// resolve every candidate path to its surrogate id, load every group
+    /// of `child_type_id` once, then batch-match those groups' actual
+    /// parents against every candidate parent-type id at once.
+    async fn find_groups_violating_removed_parents<C: DBRunner>(
         &self,
         db: &C,
         child_type_id: i16,
-        parent_type_id: i16,
-    ) -> Result<Vec<(uuid::Uuid, String)>, DomainError> {
+        parent_codes: &[String],
+    ) -> Result<Vec<(String, uuid::Uuid, String)>, DomainError> {
+        if parent_codes.is_empty() {
+            return Ok(Vec::new());
+        }
         let scope = system_scope();
+
+        // Resolve every candidate parent-type path in one query. A path
+        // that doesn't currently resolve to any gts_type row is silently
+        // dropped -- no group can reference a type that no longer exists.
+        let parent_types = GtsTypeEntity::find()
+            .filter(gts_type::Column::SchemaId.is_in(parent_codes.to_vec()))
+            .secure()
+            .scope_with(&scope)
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        if parent_types.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let code_by_id: std::collections::HashMap<i16, String> = parent_types
+            .iter()
+            .map(|t| (t.id, t.schema_id.clone()))
+            .collect();
+        let parent_type_ids: Vec<i16> = parent_types.iter().map(|t| t.id).collect();
+
+        // Groups of the child type being updated -- one query, independent
+        // of how many candidate parent types there are.
         let groups: Vec<rg_entity::Model> = ResourceGroupEntity::find()
             .filter(rg_entity::Column::GtsTypeId.eq(child_type_id))
             .secure()
@@ -432,37 +600,35 @@ impl TypeRepositoryTrait for TypeRepository {
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        // Collect all parent IDs in a single batch
         let parent_ids: Vec<uuid::Uuid> = groups.iter().filter_map(|g| g.parent_id).collect();
-
         if parent_ids.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Batch-load all parent groups in a single query
+        // Which of those groups' actual parents are of one of the
+        // candidate parent types -- one query for every candidate at once,
+        // not one per candidate.
         let parents: Vec<rg_entity::Model> = ResourceGroupEntity::find()
             .filter(rg_entity::Column::Id.is_in(parent_ids))
-            .filter(rg_entity::Column::GtsTypeId.eq(parent_type_id))
+            .filter(rg_entity::Column::GtsTypeId.is_in(parent_type_ids))
             .secure()
             .scope_with(&scope)
             .all(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        let matching_parent_ids: std::collections::HashSet<uuid::Uuid> =
-            parents.into_iter().map(|p| p.id).collect();
+        let parent_type_by_id: std::collections::HashMap<uuid::Uuid, i16> =
+            parents.into_iter().map(|p| (p.id, p.gts_type_id)).collect();
 
-        // Filter child groups whose parent matched the target type
-        let violations = groups
+        Ok(groups
             .into_iter()
-            .filter(|g| {
-                g.parent_id
-                    .is_some_and(|pid| matching_parent_ids.contains(&pid))
+            .filter_map(|g| {
+                let pid = g.parent_id?;
+                let parent_type_id = *parent_type_by_id.get(&pid)?;
+                let code = code_by_id.get(&parent_type_id)?.clone();
+                Some((code, g.id, g.name))
             })
-            .map(|g| (g.id, g.name))
-            .collect();
-
-        Ok(violations)
+            .collect())
     }
 
     /// Find root groups (`parent_id` IS NULL) of a given type.
@@ -504,12 +670,10 @@ impl TypeRepositoryTrait for TypeRepository {
         .await
         .map_err(|e| DomainError::database(e.to_string()))?;
 
-        // Resolve full types (junction references) for each model in the page
-        let mut types = Vec::with_capacity(page.items.len());
-        for model in &page.items {
-            let rg_type = self.load_full_type(db, model).await?;
-            types.push(rg_type);
-        }
+        // Resolve the junction references for the whole page in a constant
+        // number of queries: one per junction table plus one combined
+        // id->code resolution, instead of two per row (RG-12).
+        let types = Self::load_full_types_batch(db, &page.items).await?;
 
         Ok(Page {
             items: types,

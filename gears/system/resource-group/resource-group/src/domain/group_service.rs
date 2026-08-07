@@ -1121,21 +1121,18 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             if let Some(max_depth) = profile.max_depth {
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 let parent_depth = group_repo.get_depth(conn, new_pid).await?;
-                // Check depth of deepest descendant of moved node
-                let subtree_descendants = group_repo.get_descendant_ids(conn, group_id).await?;
-                let mut max_subtree_depth = 0i32;
-                for desc_id in &subtree_descendants {
-                    // Internal depth within the subtree
-                    let is_desc_result = group_repo.is_descendant(conn, group_id, *desc_id).await?;
-                    if is_desc_result {
-                        // Get the depth of this descendant relative to the moved group
-                        // by looking at the closure table
-                        let depth = Self::get_relative_depth(conn, group_id, *desc_id).await?;
-                        if depth > max_subtree_depth {
-                            max_subtree_depth = depth;
-                        }
-                    }
-                }
+                // One query for the whole subtree. The rows already carry
+                // the depth relative to the moved group, and every id they
+                // contain is a descendant by construction -- so the previous
+                // `is_descendant` + `get_relative_depth` pair per row was
+                // re-asking the database what it had just returned.
+                let max_subtree_depth = group_repo
+                    .get_descendant_ids_with_depth(conn, group_id)
+                    .await?
+                    .into_iter()
+                    .map(|(_id, depth)| depth)
+                    .max()
+                    .unwrap_or(0);
                 let new_deepest = parent_depth + 1 + max_subtree_depth;
                 // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2b
@@ -1261,34 +1258,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .all(conn)
             .await
             .map_err(|e| DomainError::database(e.to_string()))
-    }
-
-    /// Get relative depth between an ancestor and descendant via closure table.
-    async fn get_relative_depth(
-        conn: &impl DBRunner,
-        ancestor_id: Uuid,
-        descendant_id: Uuid,
-    ) -> Result<i32, DomainError> {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        use toolkit_db::secure::SecureEntityExt;
-
-        let scope = toolkit_security::AccessScope::allow_all();
-        let row = crate::infra::storage::entity::resource_group_closure::Entity::find()
-            .filter(
-                crate::infra::storage::entity::resource_group_closure::Column::AncestorId
-                    .eq(ancestor_id),
-            )
-            .filter(
-                crate::infra::storage::entity::resource_group_closure::Column::DescendantId
-                    .eq(descendant_id),
-            )
-            .secure()
-            .scope_with(&scope)
-            .one(conn)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        Ok(row.map_or(0, |r| r.depth))
     }
 
     /// Resolve a type ID to its GTS path.
