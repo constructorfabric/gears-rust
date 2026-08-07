@@ -111,3 +111,4 @@ Cons:
 - `DESIGN.md:739-768` — `ClusterCapabilities` (Platform Dependency): the adopted mapping to `cluster-sdk`.
 - `DESIGN.md` §3.7 Key Invariants (`DESIGN.md:2195-2202`) — the no-Cleaner/no-Retention invariant this ADR reconciles the module tree against.
 - Related tracking: gears-rust#4343 (this ADR + skeleton), #4345 (dispatcher routing), #4346 (REST API), #4347 (standalone runtime).
+- Platform decision for how the dispatcher routes to specific ingest/delivery instances: ToolKit OoP ADR-0009 *Instance-Addressable Discovery* (see `docs/arch/toolkit-oop/ADR/`).
