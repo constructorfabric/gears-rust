@@ -1,5 +1,49 @@
 # PRD — Infrastructure Inventory
 
+<!-- toc -->
+
+- [1. Overview](#1-overview)
+  - [1.1 Purpose](#11-purpose)
+  - [1.2 Background / Problem Statement](#12-background--problem-statement)
+  - [1.3 Goals (Business Outcomes)](#13-goals-business-outcomes)
+  - [1.4 Glossary](#14-glossary)
+- [2. Actors](#2-actors)
+  - [2.1 Human Actors](#21-human-actors)
+  - [2.2 System Actors](#22-system-actors)
+- [3. Operational Concept & Environment](#3-operational-concept--environment)
+- [4. Scope](#4-scope)
+  - [4.1 In Scope](#41-in-scope)
+  - [4.2 Out of Scope](#42-out-of-scope)
+- [5. Functional Requirements](#5-functional-requirements)
+  - [5.1 Typed Item Model on GTS](#51-typed-item-model-on-gts)
+  - [5.2 Connector Contract & Sources](#52-connector-contract--sources)
+  - [5.3 Projection, Provenance & Freshness](#53-projection-provenance--freshness)
+  - [5.4 Read Surface](#54-read-surface)
+  - [5.5 Change Signals](#55-change-signals)
+  - [5.6 Tenancy Scoping & Access Gating](#56-tenancy-scoping--access-gating)
+  - [5.7 Audit](#57-audit)
+  - [5.8 Source Lifecycle Operations (p2)](#58-source-lifecycle-operations-p2)
+  - [5.9 Item Relationships (p2)](#59-item-relationships-p2)
+- [6. Non-Functional Requirements](#6-non-functional-requirements)
+  - [6.1 Gear-Specific NFRs](#61-gear-specific-nfrs)
+  - [6.2 NFR Exclusions](#62-nfr-exclusions)
+- [7. Public Library Interfaces](#7-public-library-interfaces)
+  - [7.1 Public API Surface](#71-public-api-surface)
+  - [7.2 External Integration Contracts](#72-external-integration-contracts)
+- [8. Use Cases](#8-use-cases)
+  - [Register a Source and consume its estate](#register-a-source-and-consume-its-estate)
+  - [Staleness-aware consumption](#staleness-aware-consumption)
+  - [Decommission with clean retirement](#decommission-with-clean-retirement)
+- [9. Acceptance Criteria](#9-acceptance-criteria)
+- [10. Dependencies](#10-dependencies)
+  - [10.1 Launch Prerequisites (blocking)](#101-launch-prerequisites-blocking)
+- [11. Assumptions](#11-assumptions)
+- [12. Risks](#12-risks)
+- [13. Open Questions](#13-open-questions)
+- [14. Traceability](#14-traceability)
+
+<!-- /toc -->
+
 - **Gear**: `infrastructure-inventory`
 - **Status**: DRAFT (for review)
 - **Owner**: TBD
@@ -40,8 +84,8 @@ The platform has no shared record of external infrastructure. Every gear that ne
 | **Inventory Item** | One typed record of a piece of external infrastructure. Identified by a GTS **instance** id `<kind-type>~<item-instance-id>`; payload validated against the kind's GTS schema; carries scope, provenance, and freshness state. |
 | **Item Kind** | The GTS type an item conforms to. Kinds live in a curated, registered catalog (see §5.1); the baseline kinds are **Cluster**, **Host**, and **Node**. The catalog is extensible without core changes. |
 | **Cluster** (baseline kind) | A group of compute/storage capacity managed as one unit by an external control plane. |
-| **Host** (baseline kind) | A physical or virtual machine that provides capacity, addressable by the external estate (e.g., a hypervisor host). |
-| **Node** (baseline kind) | A member of a Cluster in the external estate's own topology (control or worker role). |
+| **Host** (baseline kind) | A physical or virtual machine that provides workload capacity, addressable by the external estate (e.g., a hypervisor or bare-metal machine). Where an estate presents one machine in both a capacity role and a Cluster-member role, the Connector projects **one** item and expresses membership via a `member-of` relationship — never two items for one machine (§5.1). |
+| **Node** (baseline kind) | A machine fulfilling a role in a Cluster's own topology (control or worker) **where the estate distinguishes it from capacity Hosts**. Where an estate carries only one machine concept, the Connector uses **Host**. Host and Node are disjoint for any single machine within one Source (§5.1). |
 | **Connector** | A module implementing the Connector contract (§5.2): it discovers infrastructure in one class of external estate and projects it into Inventory. Vendor-specific Connectors (e.g., for VMware vCenter, OpenStack-family platforms, bare-metal Redfish/IPMI estates, public-cloud inventories) ship as separate modules; none is part of this gear. |
 | **Source** | A registered Connector *instance* bound to one concrete external estate/endpoint, with its own credentials (held by reference in the platform credential store), declared sync interval, and liveness state. One Connector kind MAY have N Sources. |
 | **Projection** | The read-only import of discovered items from a Source into Inventory — full (complete estate enumeration) or incremental (changes since the last projection, where the Connector declares that capability). Projection MUST NOT modify the external estate. |
@@ -120,7 +164,7 @@ The gear MUST ship the baseline Item Kind catalog — **Cluster**, **Host**, **N
 
 - [ ] `p1` - **ID**: `cpt-cf-infrastructure-inventory-fr-item-identity-stability`
 
-An item's instance identifier MUST be stable across projections of the same underlying infrastructure (the Connector derives it deterministically from estate-native identity), so that consumers, events, policies, and audit records can reference the item durably.
+An item's instance identifier MUST be stable across projections of the same underlying infrastructure and MUST be collision-safe across Sources: the Connector derives it deterministically from the registered `source_id` **plus** estate-native identity, so two Sources exposing equal native identifiers never collide. One machine observed by one Source MUST yield exactly **one** item (Host/Node disjointness — see Glossary); the same machine observed by two Sources yields two items, one per observation (cross-Source de-duplication is out of scope for v1 and recorded as a candidate follow-up). Consumers, events, policies, and audit records reference items durably by this identifier. The identifier **shape** is fixed here; the curated namespace string for kind types remains an Open Question for the Types Registry owners.
 
 ### 5.2 Connector Contract & Sources
 
@@ -136,15 +180,19 @@ The gear MUST expose a Connector contract with exactly three obligations: **full
 
 Projection MUST NOT modify, create, or delete anything in the external estate. The Connector contract offers no write channel toward the estate.
 
+- [ ] `p1` - **ID**: `cpt-cf-infrastructure-inventory-fr-projection-authorization`
+
+Every `project_full`, `project_incremental`, and `heartbeat` call MUST be authorized against the registered Source: the authenticated caller identity MUST match the Source's registered Connector kind and the Source's scope, and cross-Source submissions MUST be rejected. The platform's trusted-caller posture for in-process modules does not waive this per-Source binding.
+
 ### 5.3 Projection, Provenance & Freshness
 
 - [ ] `p1` - **ID**: `cpt-cf-infrastructure-inventory-fr-projection-semantics`
 
-Each projection MUST upsert items by instance id (new → registered; changed → updated) and retire items absent from a full projection. Every item MUST carry provenance: the `source_id` it came from and `observed_at`, the instant of the Connector's last observation. Per-item outcomes MUST be reported for every projection batch — a bad item never fails the batch wholesale.
+Each projection MUST upsert items by instance id (new → registered; changed → updated). Retirement on absence MUST follow only a **complete** full projection: the contract carries an explicit completed-enumeration marker, and a partial or aborted enumeration MUST NOT retire anything. An item that fails validation is rejected per-item **and its previous valid record is retained** (never dropped by a bad batch). Incremental projection MUST be continuity-safe: where the gear cannot establish that the incremental chain since the last accepted projection is unbroken, it MUST fall back to a full projection on the next cycle (cursor/checkpoint mechanics are owned by DESIGN). Every item MUST carry provenance: the `source_id` it came from and `observed_at`, the instant of the Connector's last observation. Per-item outcomes MUST be reported for every projection batch — a bad item never fails the batch wholesale.
 
 - [ ] `p1` - **ID**: `cpt-cf-infrastructure-inventory-fr-freshness-staleness`
 
-An item whose Source misses its declared sync interval (plus a configurable grace) MUST be marked **stale** — retained, readable, and flagged; consumers MUST be able to filter by freshness. A stale item returns to fresh on the next successful projection that includes it. Staleness MUST be derived from Source behavior, never from consumer reads.
+An item's `observed_at` and freshness MUST be updated **only by a successful projection that includes the item** — the heartbeat updates Source liveness alone and never item freshness. An item whose Source misses its declared sync interval (plus a configurable grace) MUST be marked **stale** — retained, readable, and flagged — regardless of heartbeat state (a live-but-not-projecting Source still goes stale; a projecting Source with failed heartbeats does not). A paused Source stops projecting, so its items follow the same staleness clock. Consumers MUST be able to filter by freshness; a stale item returns to fresh on the next successful projection that includes it. Staleness MUST be derived from Source behavior, never from consumer reads.
 
 - [ ] `p1` - **ID**: `cpt-cf-infrastructure-inventory-fr-retire-retention`
 
@@ -164,7 +212,7 @@ The read surface SHOULD offer cheap aggregate counts (per kind, per Source, per 
 
 - [ ] `p1` - **ID**: `cpt-cf-infrastructure-inventory-fr-change-signals`
 
-The gear MUST publish change signals through the platform Events Broker on item registration, update, retirement, and staleness transitions, and on Source lifecycle transitions. Signals MUST carry **identifiers only** — the GTS instance id and scope — never item payloads, credentials, or secrets; a consumer needing the data re-reads through §5.4. Signal delivery is at-least-once; consumers MUST treat re-reads as the source of truth (convergent, not event-sourced).
+The gear MUST publish change signals through the platform Events Broker on item registration, update, retirement, and staleness transitions, and on Source lifecycle transitions. Signals MUST carry **identifiers only** and never item payloads, credentials, or secrets: item signals (`inventory.item.*`) carry the GTS instance id and scope; Source signals (`inventory.source.*`) carry the `source_id`, its scope, and the new lifecycle state. A consumer needing the data re-reads through §5.4. A signal MUST be published only **after** the corresponding state change is durably committed and readable (no signal may precede its record), and a committed transition MUST NOT go silently unsignaled — publication is retried until the broker accepts it (durable-publication mechanics are owned by DESIGN). Delivery is at-least-once; consumers MUST treat re-reads as the source of truth (convergent, not event-sourced). Signals MUST be delivered only to subscribers authorized for the signal's scope — the enforcement point (tenant-aware broker routing or per-subscriber filtering before delivery) is owned by DESIGN and MUST fail closed when the authorization decision is unavailable, consistent with §5.6.
 
 ### 5.6 Tenancy Scoping & Access Gating
 
@@ -280,11 +328,11 @@ Types Registry (kind catalog registration + schema retrieval), tenant resolver (
 ## 9. Acceptance Criteria
 
 1. **Typed registration**: given a registered Source, when a projection lands, every accepted item is a GTS instance of a catalog kind, schema-validated, carrying `source_id`, `observed_at`, and scope; invalid items are rejected per-item without failing the batch.
-2. **Identity stability**: given repeated projections of an unchanged estate, item instance ids are identical across runs.
+2. **Identity stability**: given repeated projections of an unchanged estate, item instance ids are identical across runs; given two Sources exposing equal estate-native identifiers, the resulting items do not collide; given one machine in both a capacity and a Cluster-member role in one Source, exactly one item exists, with membership expressed as a `member-of` relationship.
 3. **Read surface**: given items across kinds, scopes, and Sources, consumers can get-by-id, filter lists by kind/scope/source/freshness, and bulk-read with per-item outcomes, within the §6.1 thresholds.
 4. **Identifiers-only signals**: given any item or Source transition, a signal is published carrying only identifiers and scope; no payload or secret appears in the stream.
-5. **Staleness**: given a Source that misses interval + grace, its items — and only its items — are marked stale and signal it; the next successful projection restores freshness.
-6. **Retirement**: given a full projection missing a previously present item, the item retires, leaves default reads, remains under the explicit filter through the retention window, and purges after it.
+5. **Staleness**: given a Source that misses its projection interval + grace, its items — and only its items — are marked stale and signal it, regardless of heartbeat state; heartbeats alone never refresh `observed_at`; the next successful projection that includes an item restores its freshness.
+6. **Retirement**: given a **complete** full projection missing a previously present item, the item retires, leaves default reads, remains under the explicit filter through the retention window, and purges after it; given a partial or aborted enumeration, nothing retires; given an item rejected by validation, its previous valid record is retained.
 7. **Scope isolation**: given items in two tenant scopes, no read, list, bulk, aggregate, signal, or error surface reveals an item — or its existence — outside the caller's visible scope; authorization failures deny fail-closed.
 8. **Projection isolation**: given one failing Source among many, all other Sources' items stay fresh and the read path stays within thresholds.
 9. **Read-only estates**: given any projection or Source operation, no request that would mutate the external estate is issued through the Connector contract.
@@ -304,7 +352,7 @@ Types Registry (kind catalog registration + schema retrieval), tenant resolver (
 ### 10.1 Launch Prerequisites (blocking)
 
 1. Types Registry supports the curated kind-catalog registration flow this gear uses at startup.
-2. At least one Connector module exists to exercise the contract end-to-end (a reference/mock Connector is acceptable for the first release; the first vendor Connector is a separate deliverable).
+2. A reference Connector exists and **passes the contract test suite** end-to-end: projection semantics (upsert / complete-enumeration retirement / per-item outcomes with retained-last-valid records), staleness and retirement transitions, read-only estate behavior, projection authorization, and identifiers-only signals — i.e., the reference Connector demonstrably satisfies the §9 acceptance criteria before release. The first vendor Connector is a separate deliverable.
 
 ## 11. Assumptions
 
@@ -327,7 +375,7 @@ Types Registry (kind catalog registration + schema retrieval), tenant resolver (
 |---|---|
 | Curated GTS namespace for the kind catalog | Proposed: the gear registers its kinds under the platform toolkit namespace (mirroring the settings-service value-type catalog pattern); exact namespace string to be confirmed with the Types Registry owners. |
 | Baseline kind granularity | Cluster / Host / Node is the v1 set. Whether storage estates warrant a fourth baseline kind (e.g., StoragePool) in v1 or arrive with the first storage Connector is open. |
-| Reference Connector for launch | A mock Connector satisfies §10.1; whether the first *vendor* Connector ships in the same release window is a roadmap decision, not a contract question. |
+| First vendor Connector timing | The reference Connector (with its contract test suite) satisfies launch per §10.1; whether the first *vendor* Connector ships in the same release window is a roadmap decision, not a contract question. |
 | Relationship traversal depth | §5.9 fixes one-hop traversal; whether consumers need bounded multi-hop queries (and whether that pushes toward a graph read model) is deferred to DESIGN with real consumer input. |
 
 ## 14. Traceability
