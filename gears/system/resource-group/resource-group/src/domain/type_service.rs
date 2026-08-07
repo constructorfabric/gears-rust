@@ -42,10 +42,14 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     ///
     /// The full INSERT-junction sequence (`type_repo.insert` →
     /// `insert_allowed_parent_types` → `insert_allowed_membership_types` →
-    /// `load_full_type`) runs inside one `SERIALIZABLE` transaction so that
-    /// a failure on any step rolls back the whole operation. Without this,
-    /// a partial insert (e.g. type row written but parent-types junction
-    /// failed) would leave the registry in an inconsistent state.
+    /// `load_full_type`) runs inside one transaction with bounded retry, so
+    /// a failure on any step rolls back the whole operation. Without it, a
+    /// partial insert -- type row written, parent-types junction not -- would
+    /// leave the registry inconsistent.
+    ///
+    /// At the backend default isolation, not `SERIALIZABLE`: see the comment
+    /// on the transaction itself for why the duplicate-code invariant does
+    /// not need it.
     pub async fn create_type(
         &self,
         req: CreateTypeRequest,
@@ -89,12 +93,25 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         let db = self.db.db();
         let type_repo = self.type_repo.clone();
 
-        // Retry-aware, like every other SERIALIZABLE write in this gear. A
-        // `40001` here used to reach the caller as an unhandled database
-        // error and surface as HTTP 500 -- on a path account-management
-        // drives at gear init, so a startup failure rather than latent code.
-        // Each attempt gets its own clones: the closure runs more than once.
-        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+        // Retry-aware, and no longer SERIALIZABLE.
+        //
+        // What this transaction protects is the atomicity of the row plus its
+        // junction inserts, and that is the transaction's job at any level.
+        // The one cross-row invariant -- no two types with the same
+        // `schema_id` -- is held by `UNIQUE(schema_id)` in the initial
+        // migration, on every backend, regardless of isolation. Until now the
+        // only thing turning a duplicate into a typed 409 was SERIALIZABLE
+        // aborting and retrying until one writer won; `TypeRepository::insert`
+        // classifies the constraint violation itself now, so the answer no
+        // longer depends on the level.
+        //
+        // Retry stays: it catches deadlocks, which are not an isolation-level
+        // concern. A `40001` here used to reach the caller as an unhandled
+        // database error and surface as HTTP 500 -- on a path
+        // account-management drives at gear init, so a startup failure rather
+        // than latent code. Each attempt gets its own clones: the closure runs
+        // more than once.
+        db.transaction_with_retry(TxConfig::default(), DomainError::db_err, |tx| {
             let req = req.clone();
             let stored_schema = stored_schema.clone();
             let type_repo = type_repo.clone();
