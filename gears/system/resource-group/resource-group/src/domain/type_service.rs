@@ -95,7 +95,10 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
                 // conflicting schema_id. Performed in-tx so a concurrent create
                 // cannot slip a duplicate row in between this read and the
                 // insert below.
-                if type_repo.find_by_code(tx, &req.code).await?.is_some() {
+                // Existence only: `find_by_code` assembles the full type,
+                // reading both junction tables to answer a question that the
+                // surrogate id alone settles (RG-13).
+                if type_repo.resolve_id(tx, &req.code).await?.is_some() {
                     debug!(code = %req.code, "Type already exists, rejecting create");
                     return Err(DomainError::type_already_exists(&req.code));
                 }
@@ -244,8 +247,11 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
                 // DB: SELECT FROM gts_type WHERE schema_id = {code} — load existing type
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-3
                 // IF type not found → RETURN NotFound
-                let existing = type_repo
-                    .find_by_code(tx, &code)
+                // One lookup for both the row and its surrogate id: the
+                // update path needs each, and resolving the code twice cost
+                // a second `gts_type` SELECT per update (RG-11).
+                let (type_id, existing) = type_repo
+                    .find_by_code_with_id(tx, &code)
                     .await?
                     .ok_or_else(|| DomainError::type_not_found(&code))?;
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-3
@@ -268,11 +274,6 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
                         .await?
                 };
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-5
-
-                let type_id = type_repo
-                    .resolve_id(tx, &code)
-                    .await?
-                    .ok_or_else(|| DomainError::type_not_found(&code))?;
 
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-6
                 // Invoke hierarchy safety check algorithm for
@@ -427,13 +428,17 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2
         if !removed_parents.is_empty() {
+            // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
             // One call for every removed parent, instead of a `resolve_id`
             // plus a single-parent lookup per removed parent (N+1 audit
-            // finding (b): two SELECTs per element of the request).
+            // finding (b): two SELECTs per element of the request). The
+            // instruction below covers the lookup step it replaces.
             let violations = type_repo
                 .find_groups_violating_removed_parents(conn, type_id, &removed_parents)
                 .await?;
+            // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
 
+            // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
             // Report the first removed parent, in request order, that has a
             // violation -- the same answer the per-parent loop gave, since
             // it iterated in that order and returned on its first hit.
@@ -451,6 +456,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
                     names.join(", ")
                 )));
             }
+            // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
         }
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2
 

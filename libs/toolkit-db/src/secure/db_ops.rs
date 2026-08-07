@@ -289,6 +289,22 @@ const fn max_bind_params(backend: sea_orm::DbBackend) -> usize {
     }
 }
 
+/// Maximum bind parameters a single statement may carry on `runner`'s
+/// backend.
+///
+/// Exposed so callers building their own multi-row statement -- an
+/// `IN (...)` delete over a collected id list, say -- can chunk against the
+/// same limit [`secure_insert_many`] uses, instead of duplicating the
+/// number or discovering it as a driver error on a large enough input.
+#[must_use]
+pub fn max_bind_params_for(runner: &impl DBRunner) -> usize {
+    let backend = match DBRunnerInternal::as_seaorm(runner) {
+        SeaOrmRunner::Conn(db) => sea_orm::ConnectionTrait::get_database_backend(db),
+        SeaOrmRunner::Tx(tx) => sea_orm::ConnectionTrait::get_database_backend(tx),
+    };
+    max_bind_params(backend)
+}
+
 /// How many rows of `E` fit in one multi-row insert on `backend`.
 ///
 /// Uses the entity's full column count as the per-row cost, an upper bound

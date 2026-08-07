@@ -691,7 +691,10 @@ impl GroupRepositoryTrait for GroupRepository {
             ..Default::default()
         };
 
-        // The group PK is global, so a caller-supplied `id` may already be taken.
+        // The group PK is global, so a caller-supplied `id` may already be
+        // taken. The insert returns the persisted row, so re-reading it by
+        // id afterwards was a second `resource_group` SELECT per create for
+        // data already in hand (RG-08).
         toolkit_db::secure::secure_insert::<ResourceGroupEntity>(model, &scope, db)
             .await
             .map_err(|e| {
@@ -700,11 +703,7 @@ impl GroupRepositoryTrait for GroupRepository {
                 } else {
                     DomainError::database(e.to_string())
                 }
-            })?;
-
-        self.find_model_by_id(db, id)
-            .await?
-            .ok_or_else(|| DomainError::database("Insert succeeded but row not found"))
+            })
     }
 
     /// Update a resource group entity.
@@ -856,13 +855,19 @@ impl GroupRepositoryTrait for GroupRepository {
             return Ok(());
         }
         let scope = system_scope();
-        ResourceGroupEntity::delete_many()
-            .filter(rg_entity::Column::Id.is_in(ids.to_vec()))
-            .secure()
-            .scope_with(&scope)
-            .exec(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+        // Chunk against the backend's bind-parameter ceiling, the same one
+        // `secure_insert_many` respects: one `IN (...)` predicate binds one
+        // parameter per id, so an unchunked delete of a large subtree fails
+        // in the driver rather than in the query.
+        for chunk in ids.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            ResourceGroupEntity::delete_many()
+                .filter(rg_entity::Column::Id.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .exec(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -877,13 +882,19 @@ impl GroupRepositoryTrait for GroupRepository {
             return Ok(());
         }
         let scope = system_scope();
-        MembershipEntity::delete_many()
-            .filter(membership_entity::Column::GroupId.is_in(group_ids.to_vec()))
-            .secure()
-            .scope_with(&scope)
-            .exec(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+        // Chunk against the backend's bind-parameter ceiling, the same one
+        // `secure_insert_many` respects: one `IN (...)` predicate binds one
+        // parameter per id, so an unchunked delete of a large subtree fails
+        // in the driver rather than in the query.
+        for chunk in group_ids.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            MembershipEntity::delete_many()
+                .filter(membership_entity::Column::GroupId.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .exec(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -899,23 +910,25 @@ impl GroupRepositoryTrait for GroupRepository {
             return Ok(());
         }
         let scope = system_scope();
-        let ids: Vec<Uuid> = group_ids.to_vec();
+        // Chunked for the same reason as the other batch deletes: one bind
+        // parameter per id, capped per backend.
+        for chunk in group_ids.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            ClosureEntity::delete_many()
+                .filter(closure_entity::Column::AncestorId.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .exec(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
 
-        ClosureEntity::delete_many()
-            .filter(closure_entity::Column::AncestorId.is_in(ids.clone()))
-            .secure()
-            .scope_with(&scope)
-            .exec(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        ClosureEntity::delete_many()
-            .filter(closure_entity::Column::DescendantId.is_in(ids))
-            .secure()
-            .scope_with(&scope)
-            .exec(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+            ClosureEntity::delete_many()
+                .filter(closure_entity::Column::DescendantId.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .exec(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+        }
 
         Ok(())
     }

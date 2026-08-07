@@ -204,16 +204,33 @@ fn is_in_transaction() -> bool {
     IN_TX.try_with(Cell::get).unwrap_or(false)
 }
 
-/// **Test-only**: report whether the current async task is inside a
-/// `Db::transaction*` closure, i.e. whether the guard above is armed.
-///
-/// Reads the exact same task-local the guard enforces, so query recorders
-/// can tag captured SQL as in-tx/out-of-tx. Precise, not a heuristic: a
-/// `SeaORM` metric callback fires synchronously on the issuing task.
-////// Execute a closure with the transaction guard set.
+/// Execute a closure with the transaction guard set.
 ///
 /// This sets `IN_TX = true` for the duration of the closure, ensuring
 /// that any calls to `Db::conn()` within will fail.
+/// Name the class of a `SqlErr` without echoing its payload.
+///
+/// `SqlErr`'s variants carry the driver's message, which on `PostgreSQL` and
+/// `MySQL` includes the conflicting column values; the discriminant alone is
+/// what a log line can safely say.
+/// Gated behind the `test-support` feature; never used by production code.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn in_transaction_for_testing() -> bool {
+    is_in_transaction()
+}
+
+fn sql_err_kind(err: Option<&sea_orm::SqlErr>) -> &'static str {
+    match err {
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_)) => "unique_constraint_violation",
+        Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_)) => {
+            "foreign_key_constraint_violation"
+        }
+        Some(_) => "other_sql_error",
+        None => "not_a_sql_error",
+    }
+}
+
 async fn with_tx_guard<F, T>(f: F) -> T
 where
     F: Future<Output = T>,
@@ -744,8 +761,18 @@ impl Db {
                                 backend = ?backend,
                                 phase = %phase,
                                 retryable,
-                                sql_err = ?db_err.sql_err(),
-                                error = %db_err,
+                                // Only the classification, never the driver's
+                                // message. Both `DbErr`'s `Display` and
+                                // `SqlErr`'s payload embed the offending
+                                // values on PostgreSQL and MySQL -- a unique
+                                // violation renders as
+                                // `Key (email)=(user@example.com) already
+                                // exists`. This is shared infrastructure, so
+                                // that would put user data in the logs of
+                                // every gear that opens a transaction. The
+                                // error itself is returned to the caller,
+                                // which is where the detail belongs.
+                                sql_err = sql_err_kind(db_err.sql_err().as_ref()),
                                 "transaction failed with a database error not recognized as retryable"
                             );
                         }
