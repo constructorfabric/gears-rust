@@ -9,7 +9,7 @@ date: 2026-04-10
 
 ## Context and Problem Statement
 
-ADR-0001 chose the Rust trait as the contract source of truth, with `#[toolkit_rest_contract]` generating clients and OpenAPI specs via `schemars`. This decision inherits a structural limitation: a Rust trait signature plus `schemars`-derived JSON schemas cannot faithfully express the full REST surface. The generator cannot represent union request bodies (oneOf/anyOf with discriminators), content-type negotiation (e.g., `application/vnd.foo+json`), multiple response schemas per status code, non-body content (multipart, form, octet-stream), path parameters with regex/range validation, response headers, custom security schemes, complex query parameter serialization (arrays, deep objects), or responses that vary by input.
+ADR-0001 chose the Rust trait as the contract source of truth, with `#[toolkit::rest_contract]` generating clients and OpenAPI specs via `schemars`. This decision inherits a structural limitation: a Rust trait signature plus `schemars`-derived JSON schemas cannot faithfully express the full REST surface. The generator cannot represent union request bodies (oneOf/anyOf with discriminators), content-type negotiation (e.g., `application/vnd.foo+json`), multiple response schemas per status code, non-body content (multipart, form, octet-stream), path parameters with regex/range validation, response headers, custom security schemes, complex query parameter serialization (arrays, deep objects), or responses that vary by input.
 
 Option D (IDL-first) was rejected in ADR-0001 because no IDL captures REST and gRPC faithfully at once. The trait-first approach has a symmetric problem: Rust traits plus `schemars` cannot faithfully express everything REST permits. If the generated spec is treated as the authoritative specification for third-party implementors, two failure modes appear:
 
@@ -32,19 +32,19 @@ This ADR defines the role of the generated spec and the policy for everything it
 ## Considered Options
 
 * **Option A**: Narrow but honest — generator covers the common case, manual implementation fills the gaps, generated OpenAPI is declared the minimum conformance contract (current design)
-* **Option B**: Aggressive annotation vocabulary — extend `#[toolkit_rest_contract]` with `#[content_type]`, `#[response_header]`, `#[multipart]`, `#[response(status=404, schema=…)]`, `#[path(pattern="…")]`, and similar attributes until the macro covers ~95% of REST
+* **Option B**: Aggressive annotation vocabulary — extend `#[toolkit::rest_contract]` with `#[content_type]`, `#[response_header]`, `#[multipart]`, `#[response(status=404, schema=…)]`, `#[path(pattern="…")]`, and similar attributes until the macro covers ~95% of REST
 * **Option C**: OpenAPI-first with augmentation — hand-write the spec, generate Rust types from it
 * **Option D**: Dual source — authors write both the Rust trait and the OpenAPI YAML, CI verifies they agree
 
 ## Decision Outcome
 
-Chosen option: **Option A — Narrow but honest.** The `#[toolkit_rest_contract]` macro covers a deliberate subset of REST, the generated OpenAPI spec is documented as the **minimum conformance contract** (services may offer strictly more, never strictly less), and anything outside the subset is handled by manual implementation — authors write `impl Base for MyCustomRestClient` with full HTTP control, and the consumer interface (`Arc<dyn Base>`) is identical to the macro-generated case.
+Chosen option: **Option A — Narrow but honest.** The `#[toolkit::rest_contract]` macro covers a deliberate subset of REST, the generated OpenAPI spec is documented as the **minimum conformance contract** (services may offer strictly more, never strictly less), and anything outside the subset is handled by manual implementation — authors write `impl Base for MyCustomRestClient` with full HTTP control, and the consumer interface (`Arc<dyn Base>`) is identical to the macro-generated case.
 
 Option B was rejected because the attribute vocabulary required to cover 95% of REST approaches the complexity of a bespoke IDL embedded in Rust attribute syntax, reintroducing the "lowest common denominator" problem ADR-0001 used to reject IDL-first. Option C was rejected for the same reasons as ADR-0001 Option C. Option D was rejected because dual sources drift in practice regardless of CI discipline, and because it forces every author to learn two authoring surfaces.
 
 ### Phase 1 scope — what the macro generates
 
-The `#[toolkit_rest_contract]` macro supports:
+The `#[toolkit::rest_contract]` macro supports:
 
 * `POST`, `GET`, `DELETE` with a single JSON request body (where applicable)
 * Path parameter extraction via the future `#[path]` annotation on method arguments

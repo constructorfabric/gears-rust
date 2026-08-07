@@ -118,7 +118,7 @@ Collapsing to fewer contract types would force callers into unnecessary defensiv
 
 - Four contract types (Api, Embedded, Backend, Extension) with naming convention enforcement
 - Base trait definition as plain Rust traits with zero transport annotations
-- REST transport projection via `#[toolkit_rest_contract]` proc macro
+- REST transport projection via `#[toolkit::rest_contract]` proc macro
 - REST client code generation implementing both base and transport traits
 - OpenAPI 3.1 spec generation from transport projection traits
 - SSE streaming support via `#[streaming]` annotation
@@ -135,7 +135,7 @@ Collapsing to fewer contract types would force callers into unnecessary defensiv
 
 ### 4.2 Out of Scope
 
-- gRPC transport projection (`#[toolkit_grpc_contract]`) -- future work, same pattern
+- gRPC transport projection (`#[toolkit::grpc_contract]`) -- future work, same pattern
 - Service directory implementation -- delivered by cluster service discovery workstream
 - Transaction guard (TxGuard) compile-time mechanism -- open design question, separate ADR
 - Transaction context propagation for Embedded/Extension contracts -- separate ADR
@@ -228,7 +228,7 @@ All base contract traits MUST have `Send + Sync` supertraits to support sharing 
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-rest-macro`
 
-The `#[toolkit_rest_contract]` proc macro SHALL generate a REST client struct and OpenAPI spec function from a trait that extends a base contract trait. When a trait annotated with `#[toolkit_rest_contract]` extends a base trait (e.g., `trait FooApiRest: FooApi`), the macro SHALL generate a `FooApiRestClient` struct that implements both the base trait (with HTTP dispatch logic) and the transport trait.
+The `#[toolkit::rest_contract]` proc macro SHALL generate a REST client struct and OpenAPI spec function from a trait that extends a base contract trait. When a trait annotated with `#[toolkit::rest_contract]` extends a base trait (e.g., `trait FooApiRest: FooApi`), the macro SHALL generate a `FooApiRestClient` struct that implements both the base trait (with HTTP dispatch logic) and the transport trait.
 
 - **Rationale**: Eliminates hand-written HTTP client code, ensures generated clients conform to the contract.
 - **Actors**: `cpt-cf-binding-actor-gear-developer`
@@ -316,7 +316,7 @@ The transport projection trait MAY add methods with default implementations that
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-openapi-generation`
 
-The `#[toolkit_rest_contract]` macro SHALL generate a function (e.g., `foo_api_rest_openapi_spec()`) returning a `serde_json::Value` with a valid OpenAPI 3.1 spec. The spec SHALL include endpoint paths, HTTP methods, request/response schemas (via `schemars`), and error schemas.
+The `#[toolkit::rest_contract]` macro SHALL generate a function (e.g., `foo_api_rest_openapi_spec()`) returning a `serde_json::Value` with a valid OpenAPI 3.1 spec. The spec SHALL include endpoint paths, HTTP methods, request/response schemas (via `schemars`), and error schemas.
 
 - **Rationale**: OpenAPI spec is the conformance target for remote implementations and enables spec validation at registration.
 - **Actors**: `cpt-cf-binding-actor-gear-developer`, `cpt-cf-binding-actor-service-directory`
@@ -449,7 +449,7 @@ Methods annotated with `#[retryable]` SHALL generate retry logic with exponentia
 >   (plus `with_http_client`), not `from_config`.
 > - The retry helper is `retry_with_backoff(&RetryConfig, f)`, not `with_retry()`.
 > - The macro attribute is `#[toolkit::rest_contract]` (namespaced), not
->   `#[toolkit_rest_contract]`.
+>   `#[toolkit::rest_contract]`.
 > - The generated per-trait `*_openapi_spec()` function is **not** emitted; the
 >   OpenAPI document is assembled by the framework `OperationBuilder` →
 >   `OpenApiRegistry` (utoipa) path as `register_<trait>_routes()` registers
@@ -608,7 +608,7 @@ New methods added to transport projection traits MUST have default implementatio
 
 - [ ] `p2` - **ID**: `cpt-cf-binding-nfr-macro-transparency`
 
-The generated code from `#[toolkit_rest_contract]` MUST be inspectable via `cargo expand`. Generated struct names, method names, and trait implementations MUST follow predictable naming conventions (e.g., `{Trait}Client` for the client struct).
+The generated code from `#[toolkit::rest_contract]` MUST be inspectable via `cargo expand`. Generated struct names, method names, and trait implementations MUST follow predictable naming conventions (e.g., `{Trait}Client` for the client struct).
 
 - **Rationale**: Developers and LLM agents must be able to understand and debug generated code.
 
@@ -640,7 +640,7 @@ SDK crates with the `rest-client` feature disabled MUST NOT incur additional com
 
 - **Transaction guard (TxGuard)**: A compile-time mechanism that restricts which contracts can be called inside a transaction scope. Within a `TxGuard<'tx>`, only Embedded/Extension contracts would be callable -- the compiler would reject calls to Api/Backend traits. This would enforce the operational semantics table at the type level, not just by naming convention. Needs its own ADR to design the type-state mechanism and interaction with database transactions (SeaORM/SQLx). Not a requirement for this change.
 - **Remote backend unavailability**: Circuit breakers, fallback methods, degraded-mode behavior when remote plugins are temporarily down.
-- **gRPC transport projection**: `#[toolkit_grpc_contract]` macro design, proto generation approach, interaction with tonic.
+- **gRPC transport projection**: `#[toolkit::grpc_contract]` macro design, proto generation approach, interaction with tonic.
 - **Transaction context propagation**: How Embedded/Extension contracts receive and participate in the caller's transaction scope.
 
 ## 8. Prior Art

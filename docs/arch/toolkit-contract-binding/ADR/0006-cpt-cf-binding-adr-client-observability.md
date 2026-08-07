@@ -19,7 +19,7 @@ date: 2026-07-31
 
 ## Context and Problem Statement
 
-Generated REST/gRPC contract clients (`#[toolkit_rest_contract]`, `#[toolkit_grpc_contract]`) carry
+Generated REST/gRPC contract clients (`#[toolkit::rest_contract]`, `#[toolkit::grpc_contract]`) carry
 retry, timeout, and error mapping. Without telemetry — a span per call and downstream propagation of
 the trace/`request_id` — they are unusable in production and a contract hop breaks the distributed
 trace.
@@ -62,7 +62,7 @@ or via the existing `tracing`/OTEL stack?
 
 Chosen option: **Option A — `tracing`/OpenTelemetry.**
 
-The `#[toolkit_rest_contract]` macro now emits, inside each generated client method, a
+The `#[toolkit::rest_contract]` macro now emits, inside each generated client method, a
 `tracing::info_span!` with a baked-in name (`{Trait}.{method}`) and OTel-semantic fields
 (`otel.kind = "client"`, `rpc.system`, `rpc.service`, `rpc.method`, `http.method`, `http.route`,
 `error`), entered across the awaited dispatch. Because the span is `Context::current()` at send time,

@@ -130,7 +130,7 @@ absent from the local registry — the opposite of the non-blocking-startup mode
 Co-located hard dependencies stay explicit in `#[toolkit::gear(deps = [...])]`; everything else is
 tolerated lazily by the resolving client.
 
-### Runtime integration — OoP bootstrap (`bootstrap/oop.rs`)
+### Runtime integration — proxy-wiring phase (`runtime/host_runtime.rs`)
 
 After establishing the `DirectoryClient` connection and before calling `gear.run()`, the bootstrap
 wires every `ConsumerRegistration` whose `owner_gear` matches the current gear, then spawns a
@@ -190,6 +190,17 @@ When the key is present the proxy-wiring phase (`host_runtime::run_proxy_wiring_
 `static_endpoint_override(...)` and wires the dep through a `StaticEndpointResolver`
 (`toolkit::discovery`), which bypasses the directory entirely and is readiness-resolved immediately —
 no probe loop. Every use is logged at `warn!`.
+
+The `<owner>` segment is `ConsumerRegistration::owner_gear`, which `#[toolkit::consumes]` derives as
+the **kebab-case of the annotated struct's ident** — a separate attribute cannot read the
+`name = "..."` given to `#[toolkit::gear]`. So `orders` above assumes `struct Orders`, and
+`api-contracts-consumer` assumes `struct ApiContractsConsumer`. If a gear's declared name is not the
+kebab form of its struct ident the key will not resolve; the proxy-wiring phase emits a `warn!`
+naming both rather than ignoring the override silently.
+
+Known limits of the escape hatch: exactly one address (no list, weights or failover), no fallback to
+the directory if that address is dead, no metadata or version predicate, and it is read once at
+startup with no hot reload.
 
 **The production guard is deferred.** This ADR originally specified that the key's presence in a
 production configuration should be a fatal startup error. The runtime has no deployment-profile or
@@ -333,5 +344,7 @@ Document the current pattern; require authors to configure static endpoints.
   `deps` declared on `#[toolkit::gear]`, never anything from `#[toolkit::consumes]`.
 * `ClientHub`: `libs/toolkit/src/client_hub.rs` — `try_get`, `register`, `get` are the three methods
   used by the generated `wire` closure.
-* OoP bootstrap integration point: `libs/toolkit/src/bootstrap/oop.rs` — the background
-  wiring task is inserted here, after `DirectoryClient` is connected and before `gear.run()`.
+* Wiring integration point: `libs/toolkit/src/runtime/host_runtime.rs` —
+  `run_proxy_wiring_phase`, after `DirectoryClient` is in the hub and before `gear.run()`. It is
+  shared by both runtime paths (in-process host and OoP serving); `bootstrap/oop.rs` contains no
+  consumer-wiring code.

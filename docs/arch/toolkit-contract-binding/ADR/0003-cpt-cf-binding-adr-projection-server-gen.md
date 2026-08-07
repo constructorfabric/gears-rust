@@ -20,13 +20,26 @@ date: 2026-06-02
 
 ADR-0001 introduced a two-layer architecture: a clean **base trait** (zero transport annotations)
 and a **projection trait** (`*Rest`, `*Grpc`) that carries transport annotations and is processed
-by `#[toolkit_rest_contract]`. The macro currently generates a REST client struct from the
+by `#[toolkit::rest_contract]`. The macro currently generates a REST client struct from the
 projection. Two gaps remain unfixed.
 
 **Gap 1 — no parity enforcement.** There is no compile-time guarantee that the projection trait
-covers the same methods as the base with matching signatures. A rename or new parameter on the
-base that is not propagated to the projection silently creates a stale client — the old method
-signature is still compiled, the mismatch is invisible until a runtime call fails.
+agrees with the base. A rename or new parameter on the base that is not propagated to the
+projection silently creates a stale client — the old method signature is still compiled, the
+mismatch is invisible until a runtime call fails.
+
+Note that "parity" has two independent directions, and they are **not** equally desirable to
+enforce:
+
+* *No drift* — every projection method must exist on the base with the same signature. This is
+  always wanted; a projection method that does not correspond to a base method is by definition a
+  stale client.
+* *Full coverage* — every base method must appear in the projection. This is **not** universally
+  wanted. A projection is a transport surface, and an author may deliberately expose only part of
+  the domain contract over REST. Enforcing it by default would be wrong.
+
+The decision below closes the first direction unconditionally and makes the second opt-in. See
+[Parity: what is enforced, and when](#parity-what-is-enforced-and-when).
 
 **Gap 2 — two independent OpenAPI sources.** Server-side handler code (`routes.rs`,
 `handlers.rs`) is written by hand against `OperationBuilder`, duplicating every path, HTTP verb,
@@ -85,6 +98,64 @@ a `const _` validation block that, for each method declared in the projection, v
 A `#[rest_contract(require_full_coverage)]` opt-in causes the macro to also error when a method
 exists on the base but is absent from the projection (i.e., no REST binding declared for it).
 Without this flag the missing method is silently skipped (useful during incremental adoption).
+
+### Parity: what is enforced, and when
+
+As built, the no-drift direction is enforced by the **delegating default methods** the macro
+installs on the projection trait, not by the separate `const _` blocks sketched above. Each
+projection method's body becomes `<Self as Base>::method(self, args…).await`
+(`projection.rs::build_delegation_body`), so name and signature agreement is checked by ordinary
+name resolution and type checking when the projection trait itself compiles — no feature flag, no
+test run.
+
+| Property | How | When |
+|---|---|---|
+| Projection method exists on the base | `E0576` — the delegating body cannot resolve the name | always, at `cargo check` |
+| Projection signature matches the base | `E0308` from the delegation call | always, at `cargo check` |
+| Every base method has a REST binding | `E0046` on the generated client `impl` | only with `rest-client` |
+| ↳ same, without `rest-client` | `validate_http_binding` against the base `Contract` IR | opt-in: `require_full_coverage` (a generated `#[test]`), or at startup via `#[toolkit::provides]` |
+| Contract `version` matches the `base_path` version segment | `version_matches_base_path` | opt-in, same generated test |
+| Duplicate `(verb, path)` in one projection | macro error | always |
+
+The practical consequence: **partial projections are the default and compile fine.** A gear that
+exposes three of its five contract methods over REST needs no flag and gets no warning. Only an
+author who wants the stricter guarantee opts in.
+
+### Reshaping and aggregation live above the projection
+
+A projection method is a strict 1:1 delegation to a base method. Three properties make this
+binding, and they are worth stating because they rule out a shape people reasonably expect:
+
+* A projection method whose name is absent from the base fails with `E0576`.
+* Every projection method must carry an HTTP verb attribute, so a non-transport helper cannot be
+  declared on the projection at all.
+* An author-written default body on a projection method is **discarded** — the parser reads it only
+  as a presence flag and the macro overwrites it with the delegation.
+
+So a method that combines two contract operations, renames one, or reshapes its arguments cannot be
+a projection method. That is deliberate: such a method is not a wire operation, and it should not
+appear in `HttpBindingIr`, the OpenAPI document, or the generated routes.
+
+The place for it is **above** the generated client — an extension trait over the base contract:
+
+```rust
+#[async_trait]
+pub trait BillingApiExt: BillingApi {
+    /// Convenience: charge, then fetch the resulting invoice.
+    async fn charge_and_fetch(&self, ctx: SecurityContext, req: ChargeRequest)
+        -> Result<Invoice, CanonicalError>
+    {
+        let resp = self.charge(ctx.clone(), req).await?;
+        self.get_invoice(ctx, &resp.invoice_id).await
+    }
+}
+impl<T: BillingApi + ?Sized> BillingApiExt for T {}
+```
+
+Because it is blanket-implemented over the base trait, it composes identically over the local
+in-process impl, the generated REST client, and the directory-resolving client. It is also
+invisible to `require_full_coverage`, so opting into strict coverage does not conflict with
+shipping convenience APIs.
 
 ### 2. Server-side `register_<name>_routes()` generation
 
@@ -300,10 +371,14 @@ actually builds (the macro crate is `toolkit-contract-macros`, attribute `#[tool
 
 * Unit tests: each projection annotation → `OperationBuilder` emission mapping covered by
   `cargo expand`-based macro expansion tests in `libs/toolkit-contract-macros/tests/`.
-* Parity test: projection with a method absent from the base emits a compile error naming the
-  offending method.
-* Coverage test: `require_full_coverage` on a projection that omits a base method emits a compile
-  error listing the uncovered method name.
+* Parity test: a projection method absent from the base fails to compile, naming the offending
+  method — `E0576` from the delegating default body. Covered by the trybuild fixture
+  `tests/ui/fail/rest_extra_projection_method.rs`; signature drift is covered by
+  `rest_sig_drift_param_type.rs` (`E0308`).
+* Coverage test: `require_full_coverage` on a projection that omits a base method fails, listing
+  the uncovered method. This is a **generated `#[test]` that panics**, not a compile error — see
+  [Implementation status](#implementation-status-poc) for why the macro cannot do it at
+  `cargo check` time.
 * Integration test: `register_billing_api_routes` for the `api-contracts` example produces an
   OpenAPI JSON fragment equal to the hand-written `routes.rs` fragment it replaces.
 * Regression: all existing projection traits (`BillingApiRest` without `require_full_coverage`)
