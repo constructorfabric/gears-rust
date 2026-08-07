@@ -828,7 +828,7 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         child_id: Uuid,
         parent_id: Uuid,
-    ) -> Result<(), DomainError> {
+    ) -> Result<u64, DomainError> {
         // `Expr`'s combinators (`eq`, `add`) live on `ExprTrait` as of
         // sea-query 1.0. Imported here rather than file-wide: its `min`
         // would shadow `Ord::min` for the paginating methods above.
@@ -848,7 +848,7 @@ impl GroupRepositoryTrait for GroupRepository {
             .from(ClosureEntity)
             .and_where(Expr::col(closure_entity::Column::DescendantId).eq(parent_id));
 
-        toolkit_db::secure::secure_insert_from_select::<ClosureEntity, _>(
+        let written = toolkit_db::secure::secure_insert_from_select::<ClosureEntity, _>(
             [
                 closure_entity::Column::AncestorId,
                 closure_entity::Column::DescendantId,
@@ -867,7 +867,7 @@ impl GroupRepositoryTrait for GroupRepository {
             other => DomainError::database(other.to_string()),
         })?;
 
-        Ok(())
+        Ok(written)
     }
 
     /// Delete every group in `ids` in one statement per bind-parameter
@@ -1104,7 +1104,7 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
-    ) -> Result<(), DomainError> {
+    ) -> Result<u64, DomainError> {
         // `Expr`'s combinators (`eq`, `add`) live on `ExprTrait` as of
         // sea-query 1.0. Imported here rather than file-wide: its `min`
         // would shadow `Ord::min` for the paginating methods above.
@@ -1182,7 +1182,7 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))?;
         // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-2
 
-        if let Some(parent_id) = new_parent_id {
+        let rows_written = if let Some(parent_id) = new_parent_id {
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-3
             // Compute new ancestor paths from new parent: the closure rows
             // whose descendant is the new parent, i.e. its ancestors and its
@@ -1233,7 +1233,7 @@ impl GroupRepositoryTrait for GroupRepository {
                 );
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a1
 
-            toolkit_db::secure::secure_insert_from_select::<ClosureEntity, _>(
+            let written = toolkit_db::secure::secure_insert_from_select::<ClosureEntity, _>(
                 [
                     closure_entity::Column::AncestorId,
                     closure_entity::Column::DescendantId,
@@ -1252,11 +1252,16 @@ impl GroupRepositoryTrait for GroupRepository {
                 other => DomainError::database(other.to_string()),
             })?;
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4
-        }
+            written
+        } else {
+            // Moving to root attaches no external ancestors, so there is
+            // nothing to insert.
+            0
+        };
 
         // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-5
         // RETURN: closure rows updated within transaction — commit handled by caller
-        Ok(())
+        Ok(rows_written)
         // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-5
     }
 

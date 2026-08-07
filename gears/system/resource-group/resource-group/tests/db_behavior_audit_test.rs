@@ -1356,6 +1356,8 @@ fn static_rule_pins_type_service_serializable_without_retry() {
         "type_service.rs is not expected to use transaction_with_retry yet; \
          found {retried}. If it now does, RG-03 is being fixed and the \
          assertion above needs updating in the same commit."
+    );
+}
 
 #[test]
 fn static_rule_passes_type_service_uses_retry() {

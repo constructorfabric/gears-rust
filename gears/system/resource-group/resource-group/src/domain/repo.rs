@@ -112,12 +112,15 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         group_id: Uuid,
     ) -> Result<(), DomainError>;
 
+    /// Returns the number of closure rows written, as the database counted
+    /// them: the statement is an `INSERT ... SELECT`, so the rows never reach
+    /// this process and nothing here can derive the figure.
     async fn insert_ancestor_closure_rows<C: DBRunner>(
         &self,
         db: &C,
         child_id: Uuid,
         parent_id: Uuid,
-    ) -> Result<(), DomainError>;
+    ) -> Result<u64, DomainError>;
 
     /// Delete every group in `group_ids` in one statement per bind-parameter
     /// chunk, not one per group (RG-10).
@@ -179,12 +182,15 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         group_id: Uuid,
     ) -> Result<(), DomainError>;
 
+    /// Returns the number of closure rows written; see
+    /// [`Self::insert_ancestor_closure_rows`] for why the caller cannot
+    /// compute it.
     async fn rebuild_subtree_closure<C: DBRunner>(
         &self,
         db: &C,
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
-    ) -> Result<(), DomainError>;
+    ) -> Result<u64, DomainError>;
 
     async fn has_memberships<C: DBRunner>(
         &self,
