@@ -32,7 +32,7 @@ decision.
   `ContractIr.version` (`libs/toolkit-contract-macros/src/codegen.rs`) and does
   **not** influence routing or URL construction.
 * The URL version segment is written by hand in the projection's
-  `base_path` (e.g. `#[toolkit::rest_contract(base_path = "/api/billing/v1")]`).
+  `base_path` (e.g. `#[toolkit::rest_contract(base_path = "/billing/v1")]`).
   The two are therefore **decoupled** and can drift.
 * Additive evolution is supported: DTOs are `#[non_exhaustive]`, and a
   projection/base method with a default body is recorded as `optional` in the IR
@@ -124,7 +124,7 @@ constraint below):
 pub trait PaymentApi: Send + Sync { /* … */ }
 
 // sdk/src/rest.rs
-#[toolkit::rest_contract(base_path = "/api/billing/v1")]
+#[toolkit::rest_contract(base_path = "/billing/v1")]
 pub trait PaymentApiRest: PaymentApi { /* … */ }
 
 // sdk/src/contract_v2.rs — the breaking change lives here
@@ -132,7 +132,7 @@ pub trait PaymentApiRest: PaymentApi { /* … */ }
 pub trait PaymentApiV2: Send + Sync { /* … */ }
 
 // sdk/src/rest_v2.rs
-#[toolkit::rest_contract(base_path = "/api/billing/v2", require_full_coverage)]
+#[toolkit::rest_contract(base_path = "/billing/v2", require_full_coverage)]
 pub trait PaymentApiV2Rest: PaymentApiV2 { /* … */ }
 ```
 
@@ -255,7 +255,7 @@ base↔projection method-set check.
 * v1+v2 coexistence is exercised live in the `api-contracts` example: the SDK
   ships `PaymentApi`/`PaymentApiRest` (v1) alongside `PaymentApiV2`/
   `PaymentApiV2Rest` (v2), the gear provides both, and the server serves
-  `/api/api-contracts/v1/**` and `/api/api-contracts/v2/**` from one router —
+  `/api-contracts/v1/**` and `/api-contracts/v2/**` from one router —
   asserted by `tests/v1_v2_coexistence.rs`, which also pins that every
   `operationId` in the shared OpenAPI document is unique.
 

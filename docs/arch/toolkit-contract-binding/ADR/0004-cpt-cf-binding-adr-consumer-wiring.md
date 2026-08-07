@@ -7,19 +7,6 @@ date: 2026-06-02
 
 **ID**: `cpt-cf-binding-adr-consumer-wiring`
 
-> **Implementation reconciliation (current code).** Historical `modkit`
-> names in this ADR map to `toolkit`: the macro is `#[toolkit::consumes]`
-> (`libs/toolkit-contract-macros/src/consumes.rs`), the runtime lives under
-> `libs/toolkit/…`, and `ConsumerRegistration`/`EndpointResolver` are in
-> `toolkit::discovery`. The shipped `/readyz` body shape is
-> `{"state": "starting"|"ready"|"draining", "unresolved_deps": [..]}` (per the
-> normative section of the accepted eventual-readiness ADR), **not**
-> `{"status", "deps": {..}}` as illustrated below. The wiring closure now
-> returns a `WireOutcome::{Local,Remote}`: a co-located local impl (hub
-> short-circuit) is marked readiness-resolved immediately and spawns no
-> directory probe; only `Remote` deps gate `/readyz` and get the background
-> resolve loop.
-
 ## Table of Contents
 
 1. [Context and Problem Statement](#context-and-problem-statement)
@@ -31,7 +18,7 @@ date: 2026-06-02
 
 ## Context and Problem Statement
 
-ADR-0001 defines how a module *provides* a contract to its consumers via `#[toolkit::provides]`. There
+ADR-0001 defines how a gear *provides* a contract to its consumers via `#[toolkit::provides]`. There
 is no symmetric consumer-side counterpart. In the current PoC (`c280de1`), a consumer that needs a
 remote implementation must either:
 
@@ -41,7 +28,7 @@ remote implementation must either:
    manually in `init()` — with no integration with service discovery and no readiness gating.
 
 The `DirectoryService` was extended in `c280de1` with `resolve_rest_service(name)`, which maps a
-logical module name to a live REST endpoint. Vision ADR-0007 (`cpt-cf-adr-eventual-readiness`,
+logical gear name to a live REST endpoint. Vision ADR-0007 (`cpt-cf-adr-eventual-readiness`,
 PR #1957) specifies that the OoP runtime should poll `DirectoryService.ResolveRestService(dep)` for
 each declared dependency and wire the resulting endpoint into `ClientHub`, gating `/readyz` until all
 critical dependencies are resolved. No developer-facing API for that polling loop was defined.
@@ -57,12 +44,13 @@ with the OoP bootstrap and the embedded (in-process) runtime.
   through `DirectoryService`, not hard-coded in `config.yaml` or source code.
 * **Transparency across runtime profiles** — in Profile 1 (embedded), the local in-process
   implementation is used without any HTTP hop; in Profile 2/3 (OoP), the generated REST client is
-  wired automatically. Module business logic sees `Arc<dyn BillingApi>` in both cases.
-* **Readiness gating** — a module must not signal readiness (`/readyz` returning 200) until all of its
+  wired automatically. Gear business logic sees `Arc<dyn BillingApi>` in both cases.
+* **Readiness gating** — a gear must not signal readiness (`/readyz` returning 200) until all of its
   critical dependencies are resolved and wired, consistent with vision ADR-0007.
-* **Init ordering preserved** — declaring `from = "billing"` on the consumer automatically adds
-  `"billing"` to the module's `deps`, which the existing topo-sort in Profile 1 already honours for
-  correct startup sequencing.
+* **Startup must not block on a dependency** — a consumer has to start, and keep starting cleanly,
+  while its provider is absent. Ordering is therefore *not* solved by declaring the dependency; it is
+  solved by resolving lazily (see the topology note under
+  [What the macro generates](#what-the-macro-generates)).
 * **Escape hatch** — a developer must be able to override discovery with a static endpoint for local
   development and integration testing.
 
@@ -81,8 +69,8 @@ with the OoP bootstrap and the embedded (in-process) runtime.
 
 Chosen option: **Option B — `#[toolkit::consumes]` explicit macro.**
 
-Option A requires the framework to infer, for every module name, which Rust trait `TypeId` to wire.
-There is no static mapping — a module may provide multiple contracts — and a convention-based
+Option A requires the framework to infer, for every gear name, which Rust trait `TypeId` to wire.
+There is no static mapping — a gear may provide multiple contracts — and a convention-based
 name→`TypeId` lookup would require either fragile string matching or a global side-table populated
 by provider-side inventory items, reintroducing provider-crate linkage. Option C is the status quo;
 it does not satisfy the SDK-only or discovery requirements.
@@ -90,14 +78,14 @@ it does not satisfy the SDK-only or discovery requirements.
 ### Macro shape
 
 ```rust
-#[toolkit::module(name = "orders")]
+#[toolkit::gear(name = "orders")]
 #[toolkit::consumes(contract = billing_sdk::BillingApi, from = "billing")]
 #[toolkit::consumes(contract = inventory_sdk::InventoryApi, from = "inventory")]
-pub struct OrdersModule { … }
+pub struct OrdersGear { … }
 ```
 
 Multiple `#[toolkit::consumes]` attributes are allowed on the same struct, one per dependency trait.
-Each is independent; they may name the same or different provider modules.
+Each is independent; they may name the same or different provider gears.
 
 ### What the macro generates
 
@@ -106,45 +94,66 @@ of a `ConsumerRegistration`:
 
 ```rust
 inventory::submit! {
-    toolkit::contract::ConsumerRegistration {
-        owner_module: "orders",
-        dep_module:   "billing",
-        wire: |hub: &ClientHub, endpoint: &str| -> anyhow::Result<()> {
+    toolkit::discovery::ConsumerRegistration {
+        owner_gear: "orders",
+        dep_gear:   "billing",
+        wire: |hub: &ClientHub, resolver: Arc<dyn EndpointResolver>|
+              -> anyhow::Result<WireOutcome> {
             // Short-circuit: Profile 1 in-process impl already present.
             if hub.try_get::<dyn billing_sdk::BillingApi>().is_some() {
-                return Ok(());
+                return Ok(WireOutcome::Local);
             }
-            let client = billing_sdk::BillingApiRestClient::new(
-                ClientConfig::new(endpoint),
-            );
+            let client = billing_sdk::BillingApiRestResolvingClient::new(resolver);
             hub.register::<dyn billing_sdk::BillingApi>(Arc::new(client));
-            Ok(())
+            Ok(WireOutcome::Remote)
         },
     }
 }
 ```
 
-The macro also inserts `"billing"` into the module's `deps` list so that the existing topo-sort in
-`RegistryBuilder::build_topo_sorted` includes it for Profile 1 startup ordering.
+Two details differ from the sketch this ADR originally carried, both load-bearing:
+
+* **`wire` takes an `Arc<dyn EndpointResolver>`, not a resolved `&str` endpoint.** Wiring therefore
+  happens once, at startup, and the client resolves (and re-resolves) the provider address per call.
+  A provider that restarts on a new address is picked up without re-wiring the consumer.
+* **`wire` returns [`WireOutcome`](../../../../libs/toolkit/src/discovery.rs)**, distinguishing a
+  dependency satisfied in-process (`Local`) from one bound to a remote client (`Remote`). Only
+  `Remote` deps gate `/readyz` and get a background resolve loop; a co-located local impl is marked
+  readiness-resolved immediately and spawns no directory probe. Returning `()` — as the original
+  sketch did — would have forced every embedded-profile gear to wait on a directory it never needs.
+
+**Topology: `#[toolkit::consumes]` does not inject a topo-sort dependency.** An earlier draft of this
+ADR had it insert `from` into the gear's `deps`; the shipped macro deliberately does not. Two reasons:
+a separate attribute cannot mutate the `&'static` deps baked in by `#[toolkit::gear]`, and
+auto-injecting `from` would make the topo-sort *fail* whenever the provider is remote and therefore
+absent from the local registry — the opposite of the non-blocking-startup model this ADR is built on.
+Co-located hard dependencies stay explicit in `#[toolkit::gear(deps = [...])]`; everything else is
+tolerated lazily by the resolving client.
 
 ### Runtime integration — OoP bootstrap (`bootstrap/oop.rs`)
 
-After establishing the `DirectoryClient` connection and before calling `module.run()`, the bootstrap
-spawns one background task per `ConsumerRegistration` whose `owner_module` matches the current
-module:
+After establishing the `DirectoryClient` connection and before calling `gear.run()`, the bootstrap
+wires every `ConsumerRegistration` whose `owner_gear` matches the current gear, then spawns a
+resolve loop for those that bound remotely:
 
 ```text
-for each ConsumerRegistration where owner_module == this_module:
-    loop with exponential backoff (100 ms → 200 ms → … → 30 s cap):
-        result = DirectoryService.resolve_rest_service(dep_module)
-        if Ok(endpoint):
-            ConsumerRegistration.wire(client_hub, endpoint)?
-            mark dep_module as wired
-            break
+for each ConsumerRegistration where owner_gear == this_gear:
+    outcome = ConsumerRegistration.wire(client_hub, resolver_for(dep_gear))?
+    if outcome == Local:
+        mark dep_gear readiness-resolved       // no directory probe at all
+    else:
+        spawn probe: loop with exponential backoff (100 ms → 200 ms → … → 30 s cap):
+            if DirectoryService.resolve_rest_service(dep_gear) is Ok:
+                mark dep_gear readiness-resolved
+                break
 
-when all ConsumerRegistrations are wired:
-    set readiness_flag = true   →   /readyz responds HTTP 200
+when no dep_gear remains unresolved:
+    state = ready   →   /readyz responds HTTP 200
 ```
+
+Wiring happens once and up front; the probe only drives *readiness*, not the binding. The client
+registered for a `Remote` dep resolves its endpoint per call through the same
+`EndpointResolver`, so a provider that restarts elsewhere is followed without re-wiring.
 
 Re-resolution is triggered on `DirectoryClient` reconnect to handle provider restarts. The backoff
 policy and reconnect behaviour are consistent with the self-registration retry already specified in
@@ -152,67 +161,76 @@ vision ADR-0007.
 
 ### Runtime integration — embedded profile (Profile 1)
 
-For in-process modules the topo-sort guarantees the provider is initialised before the consumer. The
-`wire` closure calls `hub.try_get::<dyn BillingApi>()` first; if the local implementation is already
-registered it returns immediately without constructing an HTTP client or making a discovery call. No
-polling task is spawned for Profile 1 builds.
+For a co-located provider the `wire` closure calls `hub.try_get::<dyn BillingApi>()` first; if the
+local implementation is already registered it returns `WireOutcome::Local` immediately — no HTTP
+client, no discovery call, no polling task, and no `/readyz` gating.
+
+Ordering here comes from `#[toolkit::gear(deps = [...])]`, not from `#[toolkit::consumes]`. If the
+provider is declared as a hard dep the topo-sort initialises it first and the short-circuit always
+hits; if it is not, the consumer may wire before the provider registers and will fall through to the
+resolving client. That is a correctness-preserving fallback rather than a failure — the client
+resolves per call — but it costs an HTTP hop to an in-process gear, so declare co-located providers
+in `deps` when you want the local path guaranteed.
 
 ### Static endpoint override (escape hatch)
 
-For local development and integration tests a static endpoint overrides discovery:
+For local development and integration tests a static endpoint overrides discovery, set per gear
+under the same `config` block the provider side already uses for `client_wiring`:
 
-```toml
+```yaml
 # config.yaml (development / test only)
-modules.orders.wiring.billing = "http://localhost:8081"
+gears:
+  orders:
+    config:
+      consumer_wiring:
+        billing: "http://localhost:8081"
 ```
 
-When this key is present the bootstrap skips `resolve_rest_service` and calls
-`wire(hub, static_endpoint)` directly at startup. The key is validated at boot time; its presence
-in a production configuration is a fatal startup error.
+When the key is present the proxy-wiring phase (`host_runtime::run_proxy_wiring_phase`) reads it via
+`static_endpoint_override(...)` and wires the dep through a `StaticEndpointResolver`
+(`toolkit::discovery`), which bypasses the directory entirely and is readiness-resolved immediately —
+no probe loop. Every use is logged at `warn!`.
 
-> **Implementation note (as-built).** The static override IS implemented, but at
-> the per-gear config key `gears.<owner>.config.consumer_wiring.<dep> =
-> "http://host:port"` (consistent with the existing `client_wiring` provider-side
-> schema), **not** the illustrative `modules.<owner>.wiring.<dep>`. The
-> proxy-wiring phase (`host_runtime::run_proxy_wiring_phase`) reads it via
-> `static_endpoint_override(...)` and, when present, wires the dep through a
-> `StaticEndpointResolver` (`toolkit::discovery`) that bypasses the directory and
-> is readiness-resolved immediately (no probe loop). Its use is logged at
-> `warn!`.
->
-> **The production fatal-guard is deferred.** The runtime has no
-> deployment-profile / environment concept (`AppConfig` carries no `profile`
-> field), so "presence in a production configuration is a fatal startup error"
-> has nothing to key on. Introducing that guard requires first adding a
-> deployment-profile notion to `AppConfig` — a separate, deliberate config-schema
-> change. Until then the `warn!` on every static-override use is the safety
-> signal.
+**The production guard is deferred.** This ADR originally specified that the key's presence in a
+production configuration should be a fatal startup error. The runtime has no deployment-profile or
+environment concept to key that on — `AppConfig` carries no `profile` field — so the guard would
+require a deliberate config-schema change first. Until then the `warn!` on every static-override use
+is the only safety signal.
 
 ### Readiness response shape
 
-`/readyz` is managed by the OoP bootstrap. While wiring is in progress:
+`/readyz` is served from `ReadinessReport` (`toolkit::runtime::readiness`). While a consumed
+dependency is still unresolved:
 
 ```json
 HTTP 503
-{ "status": "starting", "deps": { "billing": "waiting", "inventory": "resolved" } }
+{ "state": "starting", "ready": false, "unresolved_deps": ["billing"] }
 ```
 
-Once all `ConsumerRegistration` closures have returned `Ok`:
+Once every `Remote` dependency has resolved:
 
 ```json
 HTTP 200
-{ "status": "ready", "deps": { "billing": "resolved", "inventory": "resolved" } }
+{ "state": "ready", "ready": true }
 ```
 
-This response shape is the same format specified in vision ADR-0007.
+`state` is the primary signal and has four variants — `starting`, `ready`, `degraded`, `draining`.
+`degraded` maps to `200` (serving with a healthcheck reporting reduced functionality), `draining`
+to `503` during graceful shutdown. `ready` is a convenience mirror of `state ∈ {ready, degraded}`
+for probes that would rather not encode the state→status mapping. `unresolved_deps` lists only
+dependencies bound remotely and is omitted from the body when empty — a dependency satisfied
+in-process ([`WireOutcome::Local`](#what-the-macro-generates)) never appears there.
+
+This is the shape specified by the accepted eventual-readiness ADR
+(`cpt-cf-adr-eventual-readiness`).
 
 ### Relationship to `#[toolkit::provides]`
 
 `#[toolkit::provides]` (ADR-0001, producer side) generates a `wire_<contract>()` method on the
-module struct. `ClientWiring::Rest { endpoint }` within `#[toolkit::provides]` remains valid as a
-standalone-mode override for provider modules that also act as self-contained OoP processes
+gear struct. `ClientWiring::Rest { endpoint }` within `#[toolkit::provides]` remains valid as a
+standalone-mode override for provider gears that also act as self-contained OoP processes
 (e.g., the `api-contracts` example with `transport = rest`). It is not the primary wiring path for
-consumers in a multi-module topology. The `wire_*` methods are not removed; they remain usable in
+consumers in a multi-gear topology. The `wire_*` methods are not removed; they remain usable in
 unit tests and manual integration setups.
 
 ### Consequences
@@ -221,26 +239,31 @@ unit tests and manual integration setups.
   crate (`billing`) is never a direct or transitive dependency of the consumer binary.
 * `ConsumerRegistration` and its `inventory::submit!` become part of the public API surface of
   `toolkit` (`toolkit::discovery`); changes to its fields are semver breaking changes.
-* Modules declaring `#[toolkit::consumes]` that are built as in-process libraries still compile; the
+* Gears declaring `#[toolkit::consumes]` that are built as in-process libraries still compile; the
   generated `inventory::submit!` is emitted unconditionally. In Profile 1 builds the bootstrap
   iterates the registrations and the `try_get` short-circuit fires for all of them.
-* Init cycle detection: because `"billing"` is added to `deps` by the macro, a dependency cycle
-  `orders → billing → orders` is caught as a hard error by the existing topo-sort at startup.
+* Init cycle detection stays with `deps`, not with `consumes`: a cycle `orders → billing → orders`
+  is caught by the existing topo-sort only for providers the author declared in
+  `#[toolkit::gear(deps = [...])]`. A consumed-but-undeclared provider is invisible to cycle
+  detection by design — it may not even be in this process. The resolving client's per-call lookup
+  is what makes that safe: a mutual dependency degrades to `ServiceUnavailable` until both sides are
+  up, instead of deadlocking startup.
 * `SecurityContext` propagation: the generated `BillingApiRestClient` extracts the raw bearer token
   from the passed `SecurityContext` and forwards it in the `Authorization` header. The full
-  `SecurityContext` struct is not serialised over the wire; the receiving module reconstructs context
+  `SecurityContext` struct is not serialised over the wire; the receiving gear reconstructs context
   from the incoming `Authorization` and `x-secctx-bin` headers via its own middleware, consistent
   with vision ADR-0002 (`cpt-cf-adr-auth-edge-only`).
 
 ### Confirmation
 
 * Unit test: macro expansion for `#[toolkit::consumes(contract = BillingApi, from = "billing")]`
-  produces a `ConsumerRegistration` with the correct `owner_module`, `dep_module`, and a `wire`
+  produces a `ConsumerRegistration` with the correct `owner_gear`, `dep_gear`, and a `wire`
   closure that compiles against `billing_sdk` alone (no `billing` impl crate in scope).
-* Unit test: `wire` closure short-circuits when `hub.try_get::<dyn BillingApi>().is_some()`.
-* Integration test (Profile 1): `OrdersModule` initialises after `BillingModule` (topo-sort);
+* Unit test: `wire` short-circuits when `hub.try_get::<dyn BillingApi>().is_some()`, returning
+  `WireOutcome::Local` so the dep never gates `/readyz`.
+* Integration test (Profile 1): `OrdersGear` initialises after `BillingGear` (topo-sort);
   `wire` short-circuits; `hub.get::<dyn BillingApi>()` returns the local implementation.
-* Integration test (Profile 2/OoP): `OrdersModule` starts as OoP; bootstrap polls
+* Integration test (Profile 2/OoP): `OrdersGear` starts as OoP; bootstrap polls
   `resolve_rest_service("billing")`; wires `BillingApiRestClient`; `/readyz` transitions 503 → 200.
 * Negative compile test: `cargo check --package orders` with only `billing-sdk` (not `billing`) in
   `Cargo.toml` must pass.
@@ -255,7 +278,7 @@ Bootstrap iterates `deps`, calls `resolve_rest_service`, and for each resolved n
 name → `TypeId` registry to find the matching factory.
 
 * Good, because no new macro syntax is required on the consumer side.
-* Bad, because a module that provides multiple contracts (e.g., `BillingApi` and `AuditApi`) requires
+* Bad, because a gear that provides multiple contracts (e.g., `BillingApi` and `AuditApi`) requires
   an additional disambiguation step that cannot be expressed by name alone.
 * Bad, because the factory is only available if the provider's inventory item was linked into the
   binary, reintroducing provider-crate linkage — the exact problem this ADR exists to eliminate.
@@ -271,7 +294,7 @@ by the consumer binary. No inference, no provider linkage.
   `cargo check` time.
 * Good, because the factory is owned by the consumer binary; no provider code needs to be linked.
 * Good, because one macro attribute per consumed contract serves as clear, greppable documentation
-  of module dependencies.
+  of gear dependencies.
 * Neutral, because requires a new macro attribute; adds a small amount of syntax to learn.
 * Neutral, because adding a consumed contract requires both a `Cargo.toml` dep on the SDK crate and
   a `#[toolkit::consumes]` attribute — two places. Mitigated: omitting either produces a loud
@@ -306,31 +329,9 @@ Document the current pattern; require authors to configure static endpoints.
   the generated REST client must conform to this protocol.
 * Directory SDK extension: `libs/system-sdks/sdks/directory/src/api.rs` — `resolve_rest_service`
   added in `c280de1`; this ADR depends on that method being present.
-* Topo-sort entry point: `libs/toolkit/src/registry.rs` — `build_topo_sorted`; the `deps` injection
-  from `#[toolkit::consumes]` plugs into this existing mechanism.
+* Topo-sort entry point: `libs/toolkit/src/registry.rs` — `build_topo_sorted`; it sees only the
+  `deps` declared on `#[toolkit::gear]`, never anything from `#[toolkit::consumes]`.
 * `ClientHub`: `libs/toolkit/src/client_hub.rs` — `try_get`, `register`, `get` are the three methods
   used by the generated `wire` closure.
 * OoP bootstrap integration point: `libs/toolkit/src/bootstrap/oop.rs` — the background
   wiring task is inserted here, after `DirectoryClient` is connected and before `gear.run()`.
-
-## Implementation note (toolkit) — deliberate deviation: no topo-dep injection
-
-The shipped `#[toolkit::consumes(contract = X, from = "gear")]` macro
-(`libs/toolkit-contract-macros/src/consumes.rs`) **does not** inject `from` into the consuming
-gear's topo-sort `deps`, contrary to the "Init cycle detection" consequence above. Reasons:
-
-1. **Mechanically infeasible across attributes.** `deps` are baked by `#[toolkit::gear]` into a
-   `&'static [&'static str]` inside the emitted `Registrator` closure at expansion time; a separate
-   attribute macro cannot mutate them.
-2. **Wrong for eventual readiness / remote providers.** A consumed provider is frequently a *remote*
-   gear (separate OoP process) absent from the local registry. Injecting it as a hard dep would make
-   `build_topo_sorted` fail with `depends on unknown gear`, and would force the consumer to block on
-   the provider's local init — contradicting ADR-0007 non-blocking startup. The directory-resolving
-   client already tolerates a not-yet-ready or remote provider lazily (per-call resolve →
-   `ServiceUnavailable` until ready → self-heals).
-
-Therefore `#[toolkit::consumes]` emits **only** the `ConsumerRegistration` (`inventory::submit!`,
-behind `directory-rest-client`) replayed by the runtime proxy-wiring phase. If a provider is
-co-located and must initialise first (so the `try_get` short-circuit picks up its local impl), the
-author declares that ordering explicitly in `#[toolkit::gear(deps = ["provider-gear"])]`. Cycle
-detection thus remains the responsibility of explicitly-declared `deps`, not of `consumes`.

@@ -1105,9 +1105,23 @@ fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) ->
     // so it uses the schema-less `.json_response(..)` — matching the generated
     // handler, which wraps the unit value in `Json(())` (200 + `null` body).
     let response_registration = match &method.result_types {
-        Some((ok_ty, _)) if !is_unit_type(ok_ty) => quote! {
-            .json_response_with_schema::<#ok_ty>(openapi, ::axum::http::StatusCode::OK, "")
-        },
+        Some((ok_ty, _)) if !is_unit_type(ok_ty) => {
+            // A `Vec<T>` Ok type must register the ITEM, not the vector:
+            // utoipa names every `Vec<_>` `Vec`, so registering the vector
+            // would collide with every other list response in the process and
+            // panic at boot. The array-aware builder emits an inline array.
+            if let Some(item_ty) = vec_item_type(ok_ty) {
+                quote! {
+                    .json_array_response_with_schema::<#item_ty>(
+                        openapi, ::axum::http::StatusCode::OK, ""
+                    )
+                }
+            } else {
+                quote! {
+                    .json_response_with_schema::<#ok_ty>(openapi, ::axum::http::StatusCode::OK, "")
+                }
+            }
+        }
         _ => quote! {
             .json_response(::axum::http::StatusCode::OK, "")
         },
@@ -1174,6 +1188,31 @@ fn scalar_openapi_type(ty: &Type) -> Option<(&'static str, bool)> {
 /// schema-less `.json_response(..)` (the unit type is not a `ResponseApiDto`).
 fn is_unit_type(ty: &Type) -> bool {
     matches!(ty, Type::Tuple(t) if t.elems.is_empty())
+}
+
+/// If `ty` is syntactically `Vec<Inner>` (or `std::vec::Vec<Inner>`), returns
+/// `Inner`.
+///
+/// Response codegen uses this to route a `Result<Vec<T>, E>` contract method to
+/// `json_array_response_with_schema::<T>()`. Registering the `Vec` itself would
+/// name the component `Vec` — utoipa's `ToSchema::name()` strips generics — and
+/// collide with every other list response in the same process.
+///
+/// Purely syntactic: a type aliased to a vector is not detected. That is safe,
+/// since the alias would register under its own distinct name.
+fn vec_item_type(ty: &Type) -> Option<Type> {
+    let Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last()?;
+    if seg.ident != "Vec" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    match args.args.first()? {
+        syn::GenericArgument::Type(inner) => Some(inner.clone()),
+        _ => None,
+    }
 }
 
 /// Returns the type of the request-body parameter (the `Body`-classified param),
@@ -1371,6 +1410,54 @@ mod scalar_openapi_type_tests {
         assert_eq!(
             scalar_openapi_type(&parse_quote!(Option<ListPaymentsFilter>)),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod vec_item_type_tests {
+    use super::vec_item_type;
+    use syn::{Type, parse_quote};
+
+    fn item_of(ty: &Type) -> Option<String> {
+        vec_item_type(ty).map(|t| quote::quote!(#t).to_string())
+    }
+
+    #[test]
+    fn unwraps_vec() {
+        // The whole point: a `Result<Vec<T>, E>` method must register `T`, not
+        // the vector — utoipa names every `Vec<_>` `Vec`, so registering the
+        // vector collides with every other list response in the process.
+        assert_eq!(
+            item_of(&parse_quote!(Vec<PaymentSummary>)).as_deref(),
+            Some("PaymentSummary")
+        );
+        assert_eq!(
+            item_of(&parse_quote!(std::vec::Vec<Invoice>)).as_deref(),
+            Some("Invoice")
+        );
+        assert_eq!(
+            item_of(&parse_quote!(Vec<models::Invoice>)).as_deref(),
+            Some("models :: Invoice")
+        );
+    }
+
+    #[test]
+    fn leaves_non_vec_types_alone() {
+        assert!(item_of(&parse_quote!(Invoice)).is_none());
+        assert!(item_of(&parse_quote!(Option<Invoice>)).is_none());
+        assert!(item_of(&parse_quote!(Page<Invoice>)).is_none());
+        assert!(item_of(&parse_quote!(())).is_none());
+    }
+
+    #[test]
+    fn nested_vec_unwraps_one_level() {
+        // `Vec<Vec<T>>` yields `Vec<T>`, which would then register as `Vec`.
+        // No contract does this today; documented so the behaviour is a choice
+        // rather than an accident if one ever does.
+        assert_eq!(
+            item_of(&parse_quote!(Vec<Vec<u8>>)).as_deref(),
+            Some("Vec < u8 >")
         );
     }
 }

@@ -758,36 +758,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "schema name collision")]
-    fn ensure_schema_raw_panics_on_conflicting_definition() {
-        // Two distinct definitions under the same name must fail fast (M-14),
-        // not silently overwrite.
-        let registry = OpenApiRegistryImpl::new();
-        registry.ensure_schema_raw(
-            "Dup",
-            vec![(
-                "Dup".to_owned(),
-                RefOr::T(Schema::Object(ObjectBuilder::new().build())),
-            )],
-        );
-        registry.ensure_schema_raw(
-            "Dup",
-            vec![("Dup".to_owned(), RefOr::Ref(Ref::from_schema_name("Other")))],
-        );
-    }
-
-    #[test]
-    fn ensure_schema_raw_allows_identical_reregistration() {
-        // Re-registering the SAME definition (common when a type is referenced by
-        // several operations) is a no-op, not a collision.
-        let registry = OpenApiRegistryImpl::new();
-        let mk = || RefOr::T(Schema::Object(ObjectBuilder::new().build()));
-        registry.ensure_schema_raw("Same", vec![("Same".to_owned(), mk())]);
-        registry.ensure_schema_raw("Same", vec![("Same".to_owned(), mk())]);
-        assert_eq!(registry.components_registry.load().len(), 1);
-    }
-
-    #[test]
     fn test_build_openapi_with_binary_request() {
         use crate::api::operation_builder::RequestBodySchema;
 

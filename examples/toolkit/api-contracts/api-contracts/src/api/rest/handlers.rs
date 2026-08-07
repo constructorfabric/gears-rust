@@ -24,7 +24,7 @@ use toolkit::api::canonical_prelude::Problem;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 
-/// `GET /api/api-contracts/v1/payments` — SSE stream of `PaymentSummary`.
+/// `GET /api-contracts/v1/payments` — SSE stream of `PaymentSummary`.
 ///
 /// Authentication failures bubble out as a `CanonicalError` BEFORE the
 /// `text/event-stream` upgrade happens, so the client sees a proper

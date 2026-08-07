@@ -50,7 +50,7 @@ pub fn register_routes(
     register_manual_routes(router, openapi, service)
 }
 
-/// Register the macro-generated **v2** routes under `/api/api-contracts/v2`.
+/// Register the macro-generated **v2** routes under `/api-contracts/v2`.
 ///
 /// Kept separate from [`register_routes`] so the two major versions compose on
 /// one router independently (ADR-0007: parallel versions served side by side
@@ -80,8 +80,8 @@ pub fn register_manual_routes(
     openapi: &dyn OpenApiRegistry,
     service: Arc<dyn PaymentApi>,
 ) -> Router {
-    // GET /api/api-contracts/v1/payments — SSE stream of PaymentSummary items.
-    let router = OperationBuilder::get("/api/api-contracts/v1/payments")
+    // GET /api-contracts/v1/payments — SSE stream of PaymentSummary items.
+    let router = OperationBuilder::get("/api-contracts/v1/payments")
         .operation_id("api_contracts.list_payments")
         .summary("List payments (SSE)")
         .description(

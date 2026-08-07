@@ -20,7 +20,7 @@ const API_TAG: &str = "API Contracts \u{2014} Consumer";
 
 /// Register the consumer's single proxy route on the given router.
 ///
-/// `POST /api/api-contracts-consumer/v1/charge` forwards to the consumed
+/// `POST /api-contracts-consumer/v1/charge` forwards to the consumed
 /// `PaymentApi`. The domain service is layered by value into the handler closure
 /// (per request it resolves `Arc<dyn PaymentApi>` from the hub).
 #[allow(clippy::needless_pass_by_value)]
@@ -29,7 +29,7 @@ pub fn register_routes(
     openapi: &dyn OpenApiRegistry,
     service: Arc<ChargeProxyService>,
 ) -> Router {
-    OperationBuilder::post("/api/api-contracts-consumer/v1/charge")
+    OperationBuilder::post("/api-contracts-consumer/v1/charge")
         .operation_id("api_contracts_consumer.charge")
         .summary("Charge via the consumed PaymentApi")
         .description(

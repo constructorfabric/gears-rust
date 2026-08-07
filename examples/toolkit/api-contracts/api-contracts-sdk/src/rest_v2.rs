@@ -1,6 +1,6 @@
 //! REST projection of [`PaymentApiV2`].
 //!
-//! Mounted at `/api/api-contracts/v2`, alongside v1's `/api/api-contracts/v1`.
+//! Mounted at `/api-contracts/v2`, alongside v1's `/api-contracts/v1`.
 //! Both projections generate their own `register_*_routes()` function, and the
 //! server composes them onto a single `axum::Router` — that is how two major
 //! versions are served simultaneously during a migration window (ADR-0007).
@@ -24,7 +24,7 @@ use crate::contract_v2::PaymentApiV2;
 use crate::models::{ChargeV2Request, ChargeV2Response, Invoice};
 
 /// HTTP projection of [`PaymentApiV2`].
-#[toolkit::rest_contract(base_path = "/api/api-contracts/v2", require_full_coverage)]
+#[toolkit::rest_contract(base_path = "/api-contracts/v2", require_full_coverage)]
 pub trait PaymentApiV2Rest: PaymentApiV2 {
     // `#[retryable]` is sound here only because v2's `charge` is an idempotent
     // write keyed by `idempotency_key` (see the base trait) — the client may

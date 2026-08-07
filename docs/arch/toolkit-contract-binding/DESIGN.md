@@ -613,7 +613,7 @@ Generated `error_code` values: `NOTIFICATION_NOT_FOUND`, `DELIVERY_UNAVAILABLE`,
 
 ```rust
 // SDK crate — projection trait with HTTP annotations (unchanged)
-#[toolkit::rest_contract(base_path = "/api/billing/v1")]
+#[toolkit::rest_contract(base_path = "/billing/v1")]
 pub trait BillingApiRest: BillingApi {
     #[post("/payments/charge")]
     async fn charge(&self, ctx: SecurityContext, req: ChargeRequest) 
@@ -630,7 +630,7 @@ pub fn register_billing_api_rest_routes(
     openapi: &dyn toolkit::api::OpenApiRegistry,
     svc: std::sync::Arc<dyn BillingApi>,
 ) -> axum::Router {
-    let router = OperationBuilder::post("/api/billing/v1/payments/charge")
+    let router = OperationBuilder::post("/billing/v1/payments/charge")
         .operation_id("billing.charge")
         .summary("Charge a payment")
         .authenticated()

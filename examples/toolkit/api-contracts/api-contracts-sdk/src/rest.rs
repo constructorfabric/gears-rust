@@ -16,7 +16,7 @@ use crate::contract::PaymentApi;
 use crate::models::{ChargeRequest, ChargeResponse, Invoice, ListPaymentsFilter, PaymentSummary};
 
 /// HTTP projection of [`PaymentApi`].
-#[toolkit::rest_contract(base_path = "/api/api-contracts/v1")]
+#[toolkit::rest_contract(base_path = "/api-contracts/v1")]
 pub trait PaymentApiRest: PaymentApi {
     #[post("/payments/charge")]
     async fn charge(

@@ -19300,5 +19300,6 @@
     {
       "url": "/cf"
     }
-  ]
+  ],
+  "x-toolkit-spec-scope": "minimum-conformance"
 }

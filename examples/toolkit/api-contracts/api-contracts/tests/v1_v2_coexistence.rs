@@ -14,6 +14,7 @@
 //!    caller**, so one tenant cannot replay another tenant's key.
 
 #![allow(clippy::unwrap_used)]
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![cfg_attr(coverage_nightly, coverage(off))]
 
 use std::collections::HashSet;
@@ -36,8 +37,8 @@ use cf_api_contracts::api::rest::routes::{register_routes, register_v2_routes};
 use cf_api_contracts::client::local::{PaymentApiV2LocalClient, PaymentLocalClient};
 use cf_api_contracts::domain::service::PaymentDomainService;
 
-const V1_CHARGE_PATH: &str = "/api/api-contracts/v1/payments/charge";
-const V2_CHARGE_PATH: &str = "/api/api-contracts/v2/payments/charge";
+const V1_CHARGE_PATH: &str = "/api-contracts/v1/payments/charge";
+const V2_CHARGE_PATH: &str = "/api-contracts/v2/payments/charge";
 
 fn empty_policies() -> Arc<PolicyStack> {
     Arc::new(PolicyStack::new())

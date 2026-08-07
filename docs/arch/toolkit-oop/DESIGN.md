@@ -590,7 +590,7 @@ Pipeline:
 2. **REST projection** (in `<gear>-sdk/src/rest.rs`):
 
    ```rust
-   #[toolkit::rest_contract(base_path = "/api/payments/v1")]
+   #[toolkit::rest_contract(base_path = "/payments/v1")]
    pub trait PaymentApiRest: PaymentApi {
        #[post("/charge")]                       async fn charge(...);
        #[get("/invoices/{invoice_id}")]         async fn get_invoice(...);

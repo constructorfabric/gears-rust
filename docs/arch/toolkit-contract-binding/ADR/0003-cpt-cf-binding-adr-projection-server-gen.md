@@ -7,21 +7,6 @@ date: 2026-06-02
 
 **ID**: `cpt-cf-binding-adr-projection-server-gen`
 
-> **Naming/status banner.** Historical `#[modkit::…]` / `libs/modkit/…` names in
-> this ADR are `#[toolkit::…]` / `libs/toolkit-contract…` in the code. The
-> worked example and the metadata-resolution table describe the **target state**;
-> the authoritative "as-built" surface is the *Implementation status (PoC)*
-> section below — server route generation and `#[server_manual]` are shipped,
-> while doc-comment→summary, `#[rest(...)]` grouped attributes,
-> `<module>.<method>` operation IDs, and streaming-server generation remain
-> deferred. **`require_full_coverage` is now implemented** — but as a generated
-> `cargo test`-time coverage assertion (via `validate_http_binding` against the
-> base `Contract` IR), not a `cargo check`-time compile error: the projection
-> macro cannot see the base trait's method set at expansion time. The
-> signature / no-extra-method parity direction is enforced feature-independently
-> by the delegating default methods (the compile-time "witness" outcome, via
-> delegation rather than the separate `const _` blocks the DESIGN sketched).
-
 ## Table of Contents
 
 1. [Context and Problem Statement](#context-and-problem-statement)
@@ -119,6 +104,9 @@ produces the client's URL template and method verb drives the `OperationBuilder`
 
 ### Before / After
 
+> Target state. The `#[rest(...)]` attributes below are not implemented yet;
+> see [Implementation status (PoC)](#implementation-status-poc).
+
 **Before (current state):**
 
 ```rust
@@ -133,7 +121,7 @@ pub trait BillingApi: Send + Sync {
 }
 
 // projection — generates client only; no parity check; no server routes
-#[toolkit::rest_contract(base_path = "/api/billing/v1")]
+#[toolkit::rest_contract(base_path = "/billing/v1")]
 pub trait BillingApiRest: BillingApi {
     #[post("/payments/charge")]
     async fn charge(
@@ -144,7 +132,7 @@ pub trait BillingApiRest: BillingApi {
 // routes.rs — hand-written; independently duplicates path and schema
 pub fn routes(service: Arc<dyn BillingApi>) -> Router {
     OperationBuilder::new()
-        .post("/api/billing/v1/payments/charge")
+        .post("/billing/v1/payments/charge")
         .summary("Charge a payment method")
         // ... 25 more lines, maintained manually
         .build(handler, service)
@@ -166,7 +154,7 @@ pub trait BillingApi: Send + Sync {
 
 // projection — generates client AND register_billing_api_routes()
 // compile error if method absent from base or signature mismatches
-#[toolkit::rest_contract(base_path = "/api/billing/v1", require_full_coverage)]
+#[toolkit::rest_contract(base_path = "/billing/v1", require_full_coverage)]
 pub trait BillingApiRest: BillingApi {
     /// Charge a payment method.
     /// Creates a new payment in `pending` status and returns its identifier.
@@ -181,6 +169,11 @@ pub trait BillingApiRest: BillingApi {
 ```
 
 ### Metadata resolution for generated `OperationBuilder` calls
+
+> Target state. Doc-comment→`summary`/`description`, `<module>.<method>`
+> operation IDs, and the `#[rest(...)]` overrides in this table are deferred —
+> see [Implementation status (PoC)](#implementation-status-poc) for what the
+> macro resolves today.
 
 | `OperationBuilder` field | Source (in priority order) |
 |--------------------------|----------------------------|
@@ -290,10 +283,18 @@ actually builds (the macro crate is `toolkit-contract-macros`, attribute `#[tool
 * **PoC migration is hybrid**: `api-contracts` registers `charge` + `get_invoice` via the generated
   function and `list_payments` via a manual `register_manual_routes()` chained on the same router,
   composed by `register_routes()`.
-* **Not yet implemented** (follow-up): compile-time base↔projection parity check,
-  `require_full_coverage`, doc-comment → `summary`/`description` extraction, `#[rest(...)]` grouped
-  attributes (`status`, `tag`, `license`), and streaming-handler generation. `operation_id`/`tag`
-  currently use a generated default (`<trait_snake>_<method>`) rather than `<module>.<method>`.
+* **`require_full_coverage` is implemented**, but as a generated `cargo test`-time assertion rather
+  than the `cargo check`-time compile error this ADR originally proposed: the projection macro
+  cannot see the base trait's method set at expansion time. `generate_full_coverage_check`
+  (`rest_contract.rs`) emits a `#[test]` that runs `validate_http_binding` against the base
+  `Contract` IR and also asserts the contract `version` matches the `base_path` version segment
+  (ADR-0007 §3). The signature / no-extra-method direction *is* enforced at compile time and
+  feature-independently — by the delegating default methods, rather than by the separate `const _`
+  witness blocks the DESIGN sketched.
+* **Not yet implemented** (follow-up): doc-comment → `summary`/`description` extraction,
+  `#[rest(...)]` grouped attributes (`status`, `tag`, `license`), and streaming-handler generation.
+  `operation_id`/`tag` currently use a generated default (`<trait_snake>_<method>`) rather than
+  `<module>.<method>`.
 
 ### Confirmation
 
