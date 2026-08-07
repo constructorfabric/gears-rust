@@ -165,7 +165,17 @@ The platform has no configuration service yet: each gear owns its own configurat
 
 **ID**: `cpt-cf-settings-service-actor-internal-caller`
 
-- **Role**: A restricted, token-authenticated internal caller invoking Internal Activation Endpoints (integrity-verified apply, tenant cache invalidation) as part of the Apply pipeline.
+- **Role**: A platform gear that consumes settings at runtime. It resolves effective values through the Settings Read SDK ([§7.1](#71-public-api-surface)), registers interest in the specific settings it depends on, reacts when one of them changes, and reports the outcome of that reaction back ([§5.5](#55-staged-change--apply)).
+- **Integration Direction**: Bidirectional — the consuming gear calls Settings Service to resolve values and to register interest; Settings Service delivers change notifications to it and receives its activation outcomes. Neither direction is administrator-facing, and neither is a tenant-facing operation.
+- **Availability Expectation**: **Not** required at request time by Settings Service. A consumer that is down has simply not confirmed its activations yet: Settings Service **MUST NOT** treat an unavailable consumer as an Apply failure, **MUST NOT** discard an unconfirmed activation on any timeout, and **MUST** still be able to report which consumers have confirmed and which have not.
+
+#### Event Broker
+
+**ID**: `cpt-cf-settings-service-actor-event-broker`
+
+- **Role**: Platform event delivery service. It carries the two signals an Apply produces — the change notification each subscribed consuming gear receives, and the coherence signal every Settings Service replica receives ([§5.5](#55-staged-change--apply)). Settings Service offers **no request interface as an alternative path for either signal**: they are published, never fetched. A consumer's activation outcome travels the other way and does **not** come back through the broker: it is reported through the Settings Service SDK ([§7.1](#71-public-api-surface)).
+- **Integration Direction**: Outbound — Settings Service publishes change notifications and replica coherence signals to the broker. The broker never reads or writes settings.
+- **Availability Expectation**: **Not** required at Apply time for correctness. A broker outage **MUST NOT** fail an Apply, **MUST NOT** lose an outstanding activation (it stays outstanding and is delivered once the broker returns), and **MUST NOT** leave a replica indefinitely stale, because bounded replica staleness ([§6.1](#61-gear-specific-nfrs)) does not depend on any single signal arriving. Values already applied stay applied and readable throughout.
 
 #### Tenant Resolver
 
@@ -233,7 +243,8 @@ No constraints beyond project defaults apply to this gear (no GPU/async-runtime/
 | **Search & Discoverability**                   | `p2`         | Cross-field search (key/description/value/category) respecting scope, mode, and visibility; secrets never indexed/matched; PII authorization applied before matching.                                                                                                                                       |
 | **Defaults & Revert**                          | `p2`         | Independent Schema Defaults; revert at tenant scope (to nearest ancestor) and platform scope (to Schema Default), with fallback preview.                                                                                                                 |
 | **Domain Affinity Filtering**                  | `p3`         | Optional per-setting domain affinity; hub filters categories by the admin's current domain; cross-domain hidden by default with an "All domains" platform-admin view.                                                                                    |
-| **Internal Activation Endpoints**              | `p3`         | Restricted, token-only inter-service operations (integrity-verified apply, tenant cache invalidation).                                                                                                                                                   |
+| **Replica Coherence After Apply**              | `p3`         | Every replica converges on an applied value within a bounded staleness window, for the applied scope and every descendant scope a `cascading` change altered; carried by a coherence signal over the platform Event Broker, with the bound holding even when a signal is lost. Not invocable by any actor.                                                                                                   |
+| **Consumer Activation**                        | `p3`         | A consuming gear registers interest in the settings it depends on, receives change notifications limited to those settings (identifiers only, never values), reports the outcome of its reaction, and the service keeps a per-Apply account of who has confirmed and who has not. Delivery continues until confirmed; repeats are safe.                                                                       |
 
 
 *Sorting order: priority (`p1` → `p2` → `p3`).*
@@ -355,10 +366,38 @@ Activating a change **MUST NOT** require the Settings Service to reload or resta
 
 **Atomicity, success, and ordering.** Apply is **deliberately non-atomic across independent changes**: each independent change succeeds or fails on its own and failed items remain pending. However, interdependent settings **MUST** be groupable into a **Dependency Group** (declared per `cpt-cf-settings-service-fr-dependency-group-declaration`) that applies **atomically** (all-or-nothing), and an Apply **MUST** validate the **resulting configuration** of the applied scope before committing a group; an Apply that would leave the scope in an invalid combination (violating a declared cross-setting constraint) **MUST** be rejected for that group and leave it pending, rather than committing a partial, invalid combination. A change is **"successfully applied"** only when its new value is **durably persisted** *and* the applied scope's cache invalidation has been issued (with descendant cache-invalidation emitted for cascading settings); the service **MUST** persist durably **before** invalidating cache or signaling consumers, so no consumer can observe an invalidation for a value that is not yet stored. Apply **MUST** be **idempotent**, keyed by an **Apply Revision** ([§1.4](#14-glossary)): a retried Apply re-acts only on still-pending changes and **MUST NOT** double-apply an already-applied change, and an Apply against a superseded pending set **MUST** be detected and reported rather than silently overwriting ([§6.1 Reliability](#61-gear-specific-nfrs)). Revision-token format, persistence/invalidation transaction mechanics, and retry backoff are owned by DESIGN.
 
-> **Note**: Apply activates **the applied scope only** — the scope being applied to (the acting admin's own tenant, or a targeted descendant within its subtree per `cpt-cf-settings-service-fr-tenant-scope-enforcement`); that scope's consumers self-react (live-read, or their own heavier reaction). Scopes *below* the applied scope are **not** reloaded or restarted — an apply of a cascading setting **MUST** emit cache-invalidation for the affected descendant scopes (via the Internal Activation Endpoints), so those descendants re-resolve the new effective value lazily on next read rather than reading stale values. Cross-scope reaction fan-out is out of scope for v1; invalidation mechanics → DESIGN.
+> **Note**: Apply activates **the applied scope only** — the scope being applied to (the acting admin's own tenant, or a targeted descendant within its subtree per `cpt-cf-settings-service-fr-tenant-scope-enforcement`); that scope's consumers self-react (live-read, or their own heavier reaction). Scopes *below* the applied scope are **not** reloaded or restarted — an apply of a cascading setting **MUST** invalidate the affected descendant scopes on every replica (`cpt-cf-settings-service-fr-replica-coherence`), so those descendants re-resolve the new effective value lazily on next read rather than reading stale values. Cross-scope reaction fan-out is out of scope for v1; invalidation mechanics → DESIGN.
 
 - **Rationale**: In a supervised platform, reload / regenerate / restart all collapse into self-react: a consumer re-renders its own config or restarts itself (exit → supervisor restarts → reads the current value on boot), so a central per-setting effect and platform-driven reload/restart are redundant, not primitive-blocked.
 - **Actors**: `cpt-cf-settings-service-actor-platform-admin`, `cpt-cf-settings-service-actor-tenant-admin`, `cpt-cf-settings-service-actor-internal-caller`
+
+#### Replica Coherence After Apply
+
+- [ ] `p3` - **ID**: `cpt-cf-settings-service-fr-replica-coherence`
+
+The Settings Service runs as multiple replicas and an Apply is handled by one of them; the other replicas hold their own caches of the same effective values. After a change is applied, **every** replica **MUST** converge on the new effective value — for the applied scope and, for a `cascading` setting, for every descendant scope whose effective value the change altered — so that no replica keeps serving the superseded value beyond a **bounded staleness window**. The applying replica's own cache is invalidated within the apply itself ([§6.1 Performance: Read-Path Caching](#61-gear-specific-nfrs)); this requirement is about the others.
+
+Convergence **MUST** be reached by a **coherence signal carried over the platform Event Broker** ([§2.2](#22-system-actors)), and the staleness bound **MUST** hold **whether or not that signal reaches a given replica** — a lost or delayed signal may postpone convergence within the bound, but **MUST NOT** be able to leave a replica stale indefinitely. The bound's value and the recovery mechanism are owned by DESIGN, on the same footing as the hierarchy-snapshot freshness bound in [§6.1](#61-gear-specific-nfrs).
+
+**No actor may invoke replica coherence.** It is an internal property of the service, not an operation: there is no request — administrative, tenant-facing, or service-to-service — by which any actor can trigger, target, or observe it. This is stated as a prohibition because the alternative was previously specified as a callable inter-service endpoint, and re-introducing one would create a surface whose only legitimate caller is the service itself.
+
+- **Rationale**: A single-replica deployment is coherent by construction; every real deployment is not. Without this requirement `cpt-cf-settings-service-fr-apply-effect-resolution`'s guarantee — that a consumer reads the new value on its next read — holds only for consumers that happen to reach the replica that handled the Apply, which is not a guarantee at all. Making the bound independent of signal delivery is what stops a transient broker outage from turning into permanently divergent configuration.
+- **Actors**: `cpt-cf-settings-service-actor-event-broker`
+
+#### Consumer Activation: Notify, Confirm, and Account
+
+- [ ] `p3` - **ID**: `cpt-cf-settings-service-fr-consumer-activation`
+
+A consuming gear **MUST** be able to register interest in the **specific settings it depends on**, and **MUST** then receive a change notification **limited to those settings** — never the rest of an Apply's contents, and never a setting it is not entitled to read. A notification **MUST** carry identifiers only and no setting value, so the notification stream cannot become a disclosure path for `secret`- or PII-classified content ([§5.2](#52-typed-values--validation)); the consumer re-reads to obtain the value, through the same authorization it would face on any read.
+
+Having reacted ([§5.5 Apply Activates Values via Live-Read](#55-staged-change--apply)), the consumer **MUST** be able to **report the outcome** of that reaction. The Settings Service **MUST** record, per Apply, which registered consumers have confirmed and which have not, and **MUST** make that account available to the administrator who applied and to platform operations — an Apply that committed its values but whose consumers have not taken them up is a distinct and visible state, not a success.
+
+Delivery **MUST** continue until a consumer confirms: an outstanding activation **MUST NOT** be discarded on a timeout or on any deadline, and a consumer that is unavailable at Apply time **MUST** still be notified once it returns. Because that implies a consumer may receive the same notification more than once, a repeat **MUST NOT** be treated as a different event — the consumer re-reads, converges, and confirms on every delivery, so notification delivery needs no exactly-once guarantee to be correct.
+
+Permissions are exact: **only** the registered consuming gear itself may register its own interest and report its own outcomes; it **MUST NOT** be able to register on another gear's behalf or confirm another gear's activation. An administrator and platform operations may **read** the activation account but **MUST NOT** be able to write, forge, or clear a confirmation.
+
+- **Rationale**: `cpt-cf-settings-service-nfr-reliability-fail-safe-staged` requires that no consumer activation be lost, and the companion activation design allocates its entire delivery-until-confirmed mechanism to that NFR — but no functional requirement described the capability the NFR constrains, so the notify/confirm/account behaviour existed in the design with nothing above it. The accounting half is what turns "the value was written" into "the platform is actually running on it", which is the question an administrator is really asking after an Apply.
+- **Actors**: `cpt-cf-settings-service-actor-internal-caller`, `cpt-cf-settings-service-actor-event-broker`, `cpt-cf-settings-service-actor-platform-admin`
 
 #### Dependency Group and Cross-Setting Constraint Declaration
 
@@ -485,15 +524,6 @@ The system **MUST** support an optional Domain Affinity per setting (not every s
 - **Rationale**: Domain-affinity filtering keeps administrators focused on settings relevant to their administrative domain without permanently hiding cross-domain configuration from those who need it.
 - **Actors**: `cpt-cf-settings-service-actor-platform-admin`
 
-#### Internal Activation Endpoints
-
-- [ ] `p3` - **ID**: `cpt-cf-settings-service-fr-internal-activation-endpoints`
-
-The system **MUST** expose restricted, token-only inter-service operations for integrity-verified apply and tenant cache invalidation, callable only by authenticated internal service callers.
-
-- **Rationale**: Descendant cache invalidation on ancestor apply and other internal reconciliation flows need a narrow, non-administrator-facing activation surface.
-- **Actors**: `cpt-cf-settings-service-actor-internal-caller`
-
 ## 6. Non-Functional Requirements
 
 > **Global baselines**: Project-wide NFRs (performance, security, reliability, scalability) are defined once at the project/foundational level — see `[docs/ARCHITECTURE_MANIFEST.md](../../../docs/ARCHITECTURE_MANIFEST.md)`. Only gear-specific NFRs (exclusions from defaults or standalone requirements) are documented here.
@@ -605,13 +635,13 @@ The system **MUST** support at least 100,000 tenants in the tenant scope hierarc
 
 ### 7.2 External Integration Contracts
 
-#### Internal Activation Endpoints (Integration Contract)
+#### Consuming Gear Activation Contract
 
-- [ ] `p3` - **ID**: `cpt-cf-settings-service-contract-internal-activation-endpoints`
+- [ ] `p3` - **ID**: `cpt-cf-settings-service-contract-consumer-activation`
 
-- **Direction**: provided by the Settings Service, consumed by internal platform services only
-- **Protocol/Format**: Owned by the downstream DESIGN document.
-- **Compatibility**: Token-only, restricted to authenticated internal service callers; not a tenant- or administrator-facing contract. A major version bump is required for any incompatible change to request/response shape or authorization requirements; protocol-level detail is owned by the downstream DESIGN document.
+- **Direction**: **Bidirectional**, between the Settings Service and a consuming gear (`cpt-cf-settings-service-actor-internal-caller`). *Provided by the Settings Service:* the change notification a gear receives for the settings it registered interest in. *Required from the gear:* the activation outcome it reports once it has reacted. Both halves are needed for `cpt-cf-settings-service-fr-consumer-activation` to hold — a gear that takes the notification and never reports leaves the platform unable to say whether its configuration is actually live.
+- **Protocol/Format**: The notification is **published** to the platform Event Broker ([§2.2](#22-system-actors)) and cannot be fetched by request; the outcome is **reported through the Settings Service SDK** ([§7.1](#71-public-api-surface)). Message shapes are owned by the downstream DESIGN document. Two content rules are fixed here rather than delegated: a notification **MUST** carry identifiers only and never a setting value, so the stream is never wider than the receiving gear's own read entitlement ([§5.2](#52-typed-values--validation)); an outcome **MUST** identify the Apply and the setting it answers for, and **MUST NOT** carry a `secret`-classified value in the clear.
+- **Compatibility**: The contract **tolerates repeats and MUST NOT be read as exactly-once** — a gear receiving a notification it has already handled must reach the same result as the first time, which is what allows delivery to continue until confirmed without placing a deduplication burden on either side. A late outcome is **always** accepted: an activation stays open until answered, so no timeout forms part of this contract and a gear that was unavailable when the change was applied can still discharge its obligation on return. A gear reports **only its own** outcomes — the contract carries no means to answer for another, and an outcome claiming a different gear **MUST** be rejected. A major version bump is required for any incompatible change to the meaning of either half, to the identifiers a notification carries, or to what a valid outcome must identify; additive identifiers do not.
 
 ## 8. Use Cases
 
@@ -761,7 +791,8 @@ Each criterion validates the referenced FR/NFR; the full normative statement liv
 - [ ] Apply-failure-rate metric present in shared platform dashboards with an alert-routing rule for platform-wide Apply failure conditions (`cpt-cf-settings-service-nfr-ops-apply-monitoring`)
 - [ ] 100,000 tenants, 10-level cascade depth, 5,000 settings per platform instance, and ≥ 50,000,000 audit events per platform instance per year (aggregate) with ≥ 12-month configurable online retention and scoped audit query ≤ 2s p95, sustained without degrading the read-latency or Apply thresholds (`cpt-cf-settings-service-nfr-scale-growth`)
 - [ ] Hub categories filtered by the administrator's current Domain Affinity; cross-domain settings hidden by default; platform administrators can switch to "All domains"; orthogonal to Standard/Advanced mode (`cpt-cf-settings-service-fr-domain-affinity-filtering`)
-- [ ] Internal Activation Endpoints (integrity-verified apply, tenant cache invalidation) are restricted, token-only, and callable only by authenticated internal service callers (`cpt-cf-settings-service-fr-internal-activation-endpoints`)
+- [ ] After an Apply, every replica converges on the new effective value within the stated staleness bound — including when the coherence signal is dropped — and no actor can invoke, target, or observe that convergence as an operation (`cpt-cf-settings-service-fr-replica-coherence`)
+- [ ] A consuming gear registered for a setting is notified when it changes and not when other settings change; the notification carries no value; a repeated notification produces the same result as the first; an unconfirmed activation survives the consumer being unavailable and is still outstanding when it returns; and the per-Apply account shows which consumers have confirmed and which have not (`cpt-cf-settings-service-fr-consumer-activation`)
 
 ## 10. Dependencies
 
