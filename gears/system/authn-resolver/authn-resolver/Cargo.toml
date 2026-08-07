@@ -28,6 +28,8 @@ types-registry = { workspace = true }
 # ToolKit dependencies
 toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
+# Leaf crate for DynBearerAuthenticator (avoids depending on the bootstrap-gated toolkit runtime).
+toolkit-security = { workspace = true }
 
 # Async runtime
 async-trait = { workspace = true }

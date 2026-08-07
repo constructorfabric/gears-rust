@@ -13,7 +13,7 @@ For the full architectural design (AuthZEN model, predicate types, caching, depl
 - **Rule**: Every sensitive DB access MUST be covered by a PDP decision (via `PolicyEnforcer`). Exception: the approved prefetch-first flow for GET/UPDATE/DELETE may read with `AccessScope::allow_all()` before the PDP call, provided the required compensating checks are applied (see [GET prefetch pattern](#get--prefetch-pattern) and [UPDATE/DELETE prefetch + TOCTOU safety](#update--delete--prefetch--toctou-safety)).
 - **Rule**: Fail-closed — denied PDP decisions, unreachable PDP, and missing constraints all result in 403 Forbidden.
 - **Rule**: Map `EnforcerError` to domain errors. Never expose PDP internals to the client.
-- **Rule**: Use `.authenticated()` on `OperationBuilder` for protected endpoints, `.public()` for unauthenticated ones.
+- **Rule**: Use `.authenticated()` on `OperationBuilder` for protected endpoints, `.anonymous()` for unauthenticated ones.
 - **Rule**: No plain SQL in handlers/services/repos. Raw SQL is allowed only in migration infrastructure. See [`11_database_patterns.md`](./11_database_patterns.md) for migration rules.
 
 ## Architecture overview
@@ -54,14 +54,14 @@ OperationBuilder::get("/users-info/v1/users")
 
 // Public endpoint — no token required
 OperationBuilder::get("/users-info/v1/health")
-    .public()
+    .anonymous()
     .handler(handlers::health)
     // ...
 ```
 
 The builder enforces at compile time that every route declares its auth posture before `.register()`:
 - `.authenticated()` marks the route as protected, then requires `.require_license_features::<L>(features)` (or `.no_license_required()`) before registration.
-- `.public()` marks the route as unauthenticated and automatically satisfies the license requirement.
+- `.anonymous()` marks the route as unauthenticated and automatically satisfies the license requirement.
 
 The API Gateway middleware uses these declarations to decide how to handle each request:
 - **Protected routes**: extract bearer token → call AuthN Resolver → inject `SecurityContext` into request extensions. Returns 401 if token is invalid.
@@ -700,7 +700,7 @@ In tests, build scopes explicitly (`AccessScope::for_tenant(...)`, `AccessScope:
 - [ ] Call `policy_enforcer.access_scope()` or `.access_scope_with()` in every service method.
 - [ ] Implement `From<EnforcerError>` for your domain error type.
 - [ ] Use `.authenticated()` + `.require_license_features::<License>([])` on protected `OperationBuilder` routes.
-- [ ] Use `.public()` only for truly unauthenticated routes (health checks, OpenAPI spec).
+- [ ] Use `.anonymous()` only for truly unauthenticated routes (health checks, OpenAPI spec).
 
 ### SecureConn / database
 - [ ] Derive `Scopable` on SeaORM entities with `tenant_col` (required).
@@ -722,6 +722,6 @@ In tests, build scopes explicitly (`AccessScope::for_tenant(...)`, `AccessScope:
 - Full authorization architecture: [`docs/arch/authorization/DESIGN.md`](../arch/authorization/DESIGN.md)
 - Usage scenarios: [`docs/arch/authorization/AUTHZ_USAGE_SCENARIOS.md`](../arch/authorization/AUTHZ_USAGE_SCENARIOS.md)
 - Database execution patterns (DBRunner, transactions, repos, migrations): [`11_database_patterns.md`](./11_database_patterns.md)
-- REST OperationBuilder (`.authenticated()`, `.public()`): [`04_rest_operation_builder.md`](./04_rest_operation_builder.md)
+- REST OperationBuilder (`.authenticated()`, `.anonymous()`): [`04_rest_operation_builder.md`](./04_rest_operation_builder.md)
 - OData pagination / filtering: [`07_odata_pagination_select_filter.md`](./07_odata_pagination_select_filter.md)
 - Canonical example: `examples/toolkit/users-info/users-info/src/`

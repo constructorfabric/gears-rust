@@ -32,3 +32,6 @@ toolkit-gts = { workspace = true }
 # ToolKit dependencies
 toolkit = { workspace = true }
 toolkit-security = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

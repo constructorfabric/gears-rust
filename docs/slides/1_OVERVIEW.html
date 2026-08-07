@@ -450,7 +450,7 @@ Core Platform Integration · Core Platform Services.</em> See <code>docs/GEARS.m
 <p><code>OperationBuilder</code> is the authoritative route-registration mechanism — one place declares:</p>
 <ul>
 <li>HTTP method + <strong>versioned path</strong> (<code>/resource-group/v1/groups</code>)</li>
-<li><strong>Auth posture</strong> (<code>.authenticated()</code> / <code>.public()</code>) + <strong>license posture</strong></li>
+<li><strong>Auth posture</strong> (<code>.authenticated()</code> / <code>.anonymous()</code>) + <strong>license posture</strong></li>
 <li>Request/response schemas, tags, summary, registered error responses</li>
 </ul>
 <p>Result:</p>

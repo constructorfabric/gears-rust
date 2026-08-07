@@ -165,11 +165,14 @@ pub struct OopHttpConfig {
     /// unspecified host (`0.0.0.0`) rewritten to `127.0.0.1`.
     #[serde(default)]
     pub advertise_uri: Option<String>,
-    /// Platform-plane (`InternalAuthenticator`) configuration. When present and
-    /// the `k8s-auth` feature is enabled, the bootstrap installs the Kubernetes
-    /// `TokenReview` authenticator on incoming system calls.
+    /// Platform-plane (`InternalAuthenticator`) configuration. When present it
+    /// drives both the *inbound* HTTP validator on the gear's own routes and
+    /// the *outbound* credential attached to the gear's `DirectoryService`
+    /// calls. The `shared_secret` provider works out of the box; the `kube`
+    /// provider's inbound `TokenReview` validator requires the `k8s-auth`
+    /// feature.
     #[serde(default)]
-    pub internal_auth: Option<InternalAuthConfig>,
+    pub internal_auth: Option<toolkit_security::InternalAuthConfig>,
 }
 
 fn default_drain_timeout_secs() -> u64 {
@@ -178,16 +181,6 @@ fn default_drain_timeout_secs() -> u64 {
 
 fn default_healthcheck_timeout_ms() -> u64 {
     500
-}
-
-/// Platform-plane authentication configuration for the `OoP` HTTP server.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct InternalAuthConfig {
-    /// Expected token audiences for Kubernetes `TokenReview`. When empty, the
-    /// API server's default audience validation applies.
-    #[serde(default)]
-    pub audiences: Vec<String>,
 }
 
 impl ConfigProvider for AppConfig {

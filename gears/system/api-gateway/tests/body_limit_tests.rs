@@ -86,7 +86,7 @@ impl RestApiCapability for BodyLimitTestGear {
             .operation_id("test:upload")
             .summary("Upload endpoint with body limit")
             .json_request::<LargePayload>(openapi, "Large payload")
-            .public()
+            .anonymous()
             .json_response(http::StatusCode::OK, "Success")
             .json_response(http::StatusCode::PAYLOAD_TOO_LARGE, "Payload too large")
             .handler(post(upload_handler))

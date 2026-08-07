@@ -177,6 +177,17 @@ impl OpenApiRegistryImpl {
                 ext.insert("x-odata-orderby".to_owned(), value);
             }
 
+            // Visibility axis (`OperationSpec.is_public`): mark routes that are
+            // registered in the gateway for external access. The `GatewayProvider`
+            // reads this vendor extension to select which routes to reverse-proxy.
+            // The key is mirrored as a constant in `cf-gears-toolkit-gateway`.
+            if spec.is_public {
+                ext.insert(
+                    "x-cf-api-visibility".to_owned(),
+                    serde_json::Value::String("public".to_owned()),
+                );
+            }
+
             if !ext.is_empty() {
                 op = op.extensions(Some(ext));
             }
@@ -867,6 +878,61 @@ mod tests {
         let allowed_order = order_ext.get("allowedFields").unwrap().as_array().unwrap();
         assert!(allowed_order.iter().any(|v| v.as_str() == Some("name asc")));
         assert!(allowed_order.iter().any(|v| v.as_str() == Some("age desc")));
+    }
+
+    #[test]
+    fn test_public_operation_emits_visibility_extension() {
+        let registry = OpenApiRegistryImpl::new();
+        let public = OperationSpec {
+            method: Method::GET,
+            path: "/calc/v1/ping".to_owned(),
+            operation_id: Some("ping".to_owned()),
+            summary: Some("Ping".to_owned()),
+            description: None,
+            tags: vec![],
+            params: vec![],
+            request_body: None,
+            responses: vec![ResponseSpec {
+                status: 200,
+                content_type: "application/json",
+                description: "OK".to_owned(),
+                schema: None,
+            }],
+            handler_id: "get_ping".to_owned(),
+            authenticated: false,
+            is_public: true,
+            rate_limit: None,
+            allowed_request_content_types: None,
+            vendor_extensions: VendorExtensions::default(),
+            license_requirement: None,
+        };
+        // A second, internal operation must NOT carry the extension.
+        let mut internal = public.clone();
+        internal.path = "/calc/v1/internal".to_owned();
+        internal.handler_id = "get_internal".to_owned();
+        internal.operation_id = Some("internal".to_owned());
+        internal.is_public = false;
+
+        registry.register_operation(&public);
+        registry.register_operation(&internal);
+        let doc = registry.build_openapi(&OpenApiInfo::default()).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+        let paths = json.get("paths").unwrap();
+
+        let public_op = paths.get("/calc/v1/ping").unwrap().get("get").unwrap();
+        assert_eq!(
+            public_op
+                .get("x-cf-api-visibility")
+                .and_then(|v| v.as_str()),
+            Some("public"),
+            "public operation must advertise the gateway visibility extension"
+        );
+
+        let internal_op = paths.get("/calc/v1/internal").unwrap().get("get").unwrap();
+        assert!(
+            internal_op.get("x-cf-api-visibility").is_none(),
+            "non-public operation must not carry the visibility extension"
+        );
     }
 
     /// Helper: build a minimal `OpenAPI` doc with the given component schemas.
