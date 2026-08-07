@@ -20,6 +20,16 @@
 //! runtime proxy-wiring phase exist). If that feature is absent the wiring
 //! silently compiles out — declare it (see the api-contracts example crate).
 //!
+//! **Gear name is derived from the struct ident.** The emitted `owner_gear` is
+//! the kebab-case of the annotated struct's name, because the runtime uses it
+//! as a config key for the ADR-0004 static-endpoint override
+//! (`gears.<owner_gear>.config.consumer_wiring.<dep>`) and in log/error fields.
+//! A separate attribute cannot read the `name = "..."` given to
+//! `#[toolkit::gear]`, so `#[toolkit::gear(name = ...)]` MUST be the kebab form
+//! of the struct ident for the override to resolve — the convention everywhere
+//! in this repo, but load-bearing here. A mismatch is reported at `warn!` by the
+//! proxy-wiring phase rather than failing silently.
+//!
 //! **Topology:** `#[toolkit::consumes]` does NOT inject a topo-sort dependency.
 //! A separate attribute cannot mutate the `&'static` deps baked by
 //! `#[toolkit::gear]`, and auto-injecting `from` would make topo-sort fail for
@@ -28,7 +38,7 @@
 //! `#[toolkit::gear(deps = [...])]`; the resolving client tolerates a
 //! not-yet-ready or remote provider lazily.
 
-use heck::ToSnakeCase;
+use heck::{ToKebabCase, ToSnakeCase};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::Result as SynResult;
@@ -163,6 +173,15 @@ pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream
         from.replace(['-', '.'], "_"),
     );
 
+    // `owner_gear` is the *gear name*, not the Rust type name: the runtime uses
+    // it as a config key (`gears.<owner_gear>.config.consumer_wiring.<dep>`) for
+    // the ADR-0004 static-endpoint override, and as a log/error field. Gear
+    // names are kebab-case, so derive it from the struct ident rather than
+    // emitting `stringify!` — `stringify!(ApiContractsConsumer)` would look up
+    // `gears.ApiContractsConsumer`, which no config declares, and the override
+    // would silently never fire.
+    let owner_gear = struct_ident.to_string().to_kebab_case();
+
     Ok(quote! {
         #item
 
@@ -193,7 +212,7 @@ pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream
         #[cfg(feature = "directory-rest-client")]
         ::toolkit::inventory::submit! {
             ::toolkit::discovery::ConsumerRegistration {
-                owner_gear: ::std::stringify!(#struct_ident),
+                owner_gear: #owner_gear,
                 dep_gear: #from,
                 wire: #wire_fn,
             }
@@ -203,3 +222,49 @@ pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream
 
 // `parent_module` / `append_segment` are shared with `provides.rs` via
 // `crate::support`.
+
+#[cfg(test)]
+mod tests {
+    use super::{ConsumesAttr, generate};
+    use syn::parse_quote;
+
+    fn expand(item: &syn::ItemStruct) -> String {
+        let attr: ConsumesAttr = parse_quote!(contract = billing_sdk::BillingApi, from = "billing");
+        generate(&attr, item).unwrap().to_string()
+    }
+
+    /// `owner_gear` is a config key (`gears.<owner_gear>.config.consumer_wiring.<dep>`),
+    /// so it must be the kebab gear name — not the Rust type name. Emitting
+    /// `stringify!(ApiContractsConsumer)` made the static override unresolvable.
+    #[test]
+    fn owner_gear_is_kebab_case_of_the_struct_ident() {
+        let out = expand(&parse_quote!(
+            pub struct ApiContractsConsumer;
+        ));
+        assert!(
+            out.contains(r#"owner_gear : "api-contracts-consumer""#),
+            "expected kebab owner_gear, got:\n{out}"
+        );
+        assert!(
+            !out.contains("stringify ! (ApiContractsConsumer)"),
+            "owner_gear must not be the Rust type name"
+        );
+    }
+
+    #[test]
+    fn single_word_struct_ident_is_unchanged() {
+        let out = expand(&parse_quote!(
+            pub struct Orders;
+        ));
+        assert!(out.contains(r#"owner_gear : "orders""#), "got:\n{out}");
+    }
+
+    #[test]
+    fn dep_gear_is_the_verbatim_from_value() {
+        let out = expand(&parse_quote!(
+            pub struct OrdersGear;
+        ));
+        // `from` is a directory lookup key and must survive untouched.
+        assert!(out.contains(r#"dep_gear : "billing""#), "got:\n{out}");
+    }
+}

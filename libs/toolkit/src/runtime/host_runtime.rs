@@ -457,6 +457,28 @@ impl HostRuntime {
         // Every dep is registered as a readiness gate; local ones are marked
         // resolved immediately, and only remote ones gate readiness + get the
         // background directory-resolve loop (ADR-0007: startup-gating + sticky).
+        // `owner_gear` is derived by `#[toolkit::consumes]` from the struct
+        // ident, while `#[toolkit::gear(name = ...)]` sets the registry name
+        // independently. When they diverge, wiring still works (the loop below
+        // does not filter on owner) but the static-override config key silently
+        // resolves to nothing. Say so rather than leaving the operator to wonder
+        // why `consumer_wiring` is ignored.
+        let known_gears: std::collections::HashSet<&str> =
+            self.registry.gears().iter().map(GearEntry::name).collect();
+        for reg in &regs {
+            if !known_gears.contains(reg.owner_gear) {
+                tracing::warn!(
+                    owner = reg.owner_gear,
+                    dep = reg.dep_gear,
+                    "proxy-wiring: consumer's owner gear name does not match any registered gear; \
+                     the `gears.{}.config.consumer_wiring.{}` static override will never resolve. \
+                     Rename the gear to the kebab-case of its struct ident.",
+                    reg.owner_gear,
+                    reg.dep_gear,
+                );
+            }
+        }
+
         let mut remote_deps: Vec<String> = Vec::new();
         for reg in &regs {
             // ADR-0004 static-endpoint override (dev/test escape hatch): if the
@@ -1686,6 +1708,41 @@ mod tests {
         assert_eq!(
             super::static_endpoint_override(&EmptyConfigProvider, "orders", "billing"),
             None
+        );
+    }
+
+    /// The override is keyed by the *gear name* (kebab), which is what
+    /// `#[toolkit::consumes]` puts in `ConsumerRegistration::owner_gear`.
+    /// Regression guard: the macro used to emit `stringify!(StructIdent)`, so
+    /// the lookup asked for `gears.ApiContractsConsumer` — a key no config
+    /// declares — and the escape hatch could never fire.
+    #[cfg(feature = "contract-directory-rest-client")]
+    #[test]
+    fn static_endpoint_override_is_keyed_by_kebab_gear_name() {
+        struct MapCfg(std::collections::HashMap<String, serde_json::Value>);
+        impl ConfigProvider for MapCfg {
+            fn get_gear_config(&self, gear: &str) -> Option<&serde_json::Value> {
+                self.0.get(gear)
+            }
+        }
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "api-contracts-consumer".to_owned(),
+            serde_json::json!({
+                "config": { "consumer_wiring": { "api-contracts": "http://localhost:9099" } }
+            }),
+        );
+        let cfg = MapCfg(map);
+
+        assert_eq!(
+            super::static_endpoint_override(&cfg, "api-contracts-consumer", "api-contracts")
+                .as_deref(),
+            Some("http://localhost:9099"),
+        );
+        // The pre-fix value — the Rust struct ident — must NOT resolve.
+        assert_eq!(
+            super::static_endpoint_override(&cfg, "ApiContractsConsumer", "api-contracts"),
+            None,
         );
     }
 
