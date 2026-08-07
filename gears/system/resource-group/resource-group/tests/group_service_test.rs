@@ -555,6 +555,107 @@ async fn group_move_under_deep_parent_rebuilds_every_depth() {
     common::assert_closure_matches_parent_links(&conn).await;
 }
 
+/// A move whose new parent belongs to another tenant is refused.
+///
+/// `tenant_id` is immutable gear-wide, so accepting the move would either
+/// carry a group out of its tenant or leave it parented across the boundary.
+/// Nothing covered this: the check could be deleted outright and the whole
+/// suite stayed green.
+#[tokio::test]
+async fn group_move_to_parent_in_another_tenant_rejected() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+
+    let t = create_self_parenting_type(&type_svc, "xtenant").await;
+
+    let tenant_a = Uuid::now_v7();
+    let ctx_a = common::make_ctx(tenant_a);
+    let tenant_b = Uuid::now_v7();
+    let ctx_b = common::make_ctx(tenant_b);
+
+    let root_a = common::create_root_group(&group_svc, &ctx_a, &t.code, "a-root", tenant_a).await;
+    let child_a =
+        common::create_child_group(&group_svc, &ctx_a, &t.code, root_a.id, "a-child", tenant_a)
+            .await;
+    let root_b = common::create_root_group(&group_svc, &ctx_b, &t.code, "b-root", tenant_b).await;
+
+    let err = group_svc
+        .move_group(child_a.id, Some(root_b.id))
+        .await
+        .expect_err("a move across the tenant boundary must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("different tenant"),
+        "expected a cross-tenant rejection, got: {msg}"
+    );
+    // The caller cannot act on a foreign tenant id, and naming it would
+    // disclose ownership of `root_b` across the boundary.
+    assert!(
+        !msg.contains(&tenant_b.to_string()),
+        "the message names the foreign tenant: {msg}"
+    );
+
+    // The transaction rolled back: the child still hangs off its own root,
+    // and the closure table still mirrors the parent links.
+    let conn = db.conn().expect("conn");
+    common::assert_closure_rows(&conn, child_a.id, &[(child_a.id, 0), (root_a.id, 1)]).await;
+    common::assert_closure_matches_parent_links(&conn).await;
+}
+
+/// The same boundary, reached through `update_group`'s `parent_id` instead
+/// of `move_group`.
+///
+/// `update_group_inner` carries its own copy of the check, and that copy was
+/// the uncovered one: deleting it left the whole suite green.
+#[tokio::test]
+async fn group_update_parent_to_another_tenant_rejected() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+
+    let t = create_self_parenting_type(&type_svc, "xtenantupd").await;
+
+    let tenant_a = Uuid::now_v7();
+    let ctx_a = common::make_ctx(tenant_a);
+    let tenant_b = Uuid::now_v7();
+    let ctx_b = common::make_ctx(tenant_b);
+
+    let root_a = common::create_root_group(&group_svc, &ctx_a, &t.code, "a-root", tenant_a).await;
+    let child_a =
+        common::create_child_group(&group_svc, &ctx_a, &t.code, root_a.id, "a-child", tenant_a)
+            .await;
+    let root_b = common::create_root_group(&group_svc, &ctx_b, &t.code, "b-root", tenant_b).await;
+
+    let err = group_svc
+        .update_group(
+            &ctx_a,
+            child_a.id,
+            UpdateGroupRequest {
+                name: "a-child".to_owned(),
+                parent_id: Some(root_b.id),
+                metadata: None,
+            },
+        )
+        .await
+        .expect_err("re-parenting across the tenant boundary must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("different tenant"),
+        "expected a cross-tenant rejection, got: {msg}"
+    );
+    assert!(
+        !msg.contains(&tenant_b.to_string()),
+        "the message names the foreign tenant: {msg}"
+    );
+
+    let conn = db.conn().expect("conn");
+    common::assert_closure_rows(&conn, child_a.id, &[(child_a.id, 0), (root_a.id, 1)]).await;
+    common::assert_closure_matches_parent_links(&conn).await;
+}
+
 /// TC-GRP-06: Move under descendant -> CycleDetected.
 #[tokio::test]
 async fn group_move_under_descendant_cycle() {

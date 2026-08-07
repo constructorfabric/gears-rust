@@ -926,8 +926,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-8
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-9
         // Cycle detect, type compat, profile enforce, closure rebuild
-        Self::move_group_internal_impl(group_repo, tx, group_id, new_parent_id, &rg_type, profile)
-            .await?;
+        let new_parent = Self::move_group_internal_impl(
+            group_repo,
+            tx,
+            group_id,
+            new_parent_id,
+            &rg_type,
+            profile,
+        )
+        .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-9
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-8
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-7
@@ -939,21 +946,17 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // gear-wide invariant). Reject the move when the new parent lives
         // in a different tenant than the moved group; tenant-type roots have
         // `tenant_id == group_id`, so the equality check covers them too.
-        if let Some(new_parent_id) = new_parent_id {
-            let new_parent = group_repo
-                .find_model_by_id(tx, new_parent_id)
-                .await?
-                .ok_or_else(|| DomainError::group_not_found(new_parent_id))?;
-            if new_parent.tenant_id != existing.tenant_id {
-                // Generic message: do not interpolate tenant ids — the caller
-                // can't act on them legitimately, and disclosing the foreign
-                // tenant_id would leak ownership of `new_parent_id` across the
-                // tenant boundary.
-                return Err(DomainError::validation(format!(
-                    "Cannot move group {group_id} to a parent in a different tenant; \
-                     cross-tenant moves are not supported"
-                )));
-            }
+        if let Some(new_parent) = new_parent
+            && new_parent.tenant_id != existing.tenant_id
+        {
+            // Generic message: do not interpolate tenant ids — the caller
+            // can't act on them legitimately, and disclosing the foreign
+            // tenant_id would leak ownership of `new_parent_id` across the
+            // tenant boundary.
+            return Err(DomainError::validation(format!(
+                "Cannot move group {group_id} to a parent in a different tenant; \
+                 cross-tenant moves are not supported"
+            )));
         }
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-10
@@ -994,10 +997,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await?
             .ok_or_else(|| DomainError::group_not_found(group_id))?;
 
-        let _existing = group_repo
-            .find_model_by_id(tx, group_id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))?;
+        // The row was just read and its absence already answered; a second
+        // read of the same id added a round-trip inside the transaction and
+        // was discarded. The artifact declares one SELECT here, not two.
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-3
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-2
 
@@ -1064,6 +1066,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// Performs cycle detection, type compatibility checks, query profile
     /// enforcement, and closure table rebuild. Must be called within a
     /// SERIALIZABLE transaction.
+    ///
+    /// Returns the new parent's row when there is a new parent. It has to be
+    /// read here for the type-compatibility check, and the caller needs the
+    /// same row for the cross-tenant check -- handing it back keeps the move
+    /// path to the one parent read the artifact declares in step 3, instead
+    /// of two reads of the same id inside the same transaction.
     #[allow(clippy::cognitive_complexity)]
     async fn move_group_internal_impl(
         group_repo: &GR,
@@ -1072,7 +1080,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         new_parent_id: Option<Uuid>,
         rg_type: &resource_group_sdk::ResourceGroupType,
         profile: &QueryProfile,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Option<crate::infra::storage::entity::resource_group::Model>, DomainError> {
+        let mut new_parent_model: Option<crate::infra::storage::entity::resource_group::Model> =
+            None;
         if let Some(new_pid) = new_parent_id {
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-1
             // Cycle detection: self-parent check (covered by is_descendant via self-row)
@@ -1103,6 +1113,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     rg_type.code, parent_type_path
                 )));
             }
+            new_parent_model = Some(parent);
 
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-4
             // Cycle detection passed
@@ -1197,7 +1208,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .rebuild_subtree_closure(conn, group_id, new_parent_id)
             .await?;
 
-        Ok(())
+        Ok(new_parent_model)
     }
 
     /// Force-delete an entire subtree (group + descendants + memberships + closure).
