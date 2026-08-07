@@ -3,9 +3,11 @@
 /libs/toolkit-gts-macros @aviator5
 /gears/bss/ @diffora
 /gears/credstore/ @diffora
+/gears/file-storage/ @ffedoroff
 /gears/mini-chat/ @MikeFalcon77
 /gears/system/account-management/ @diffora
 /gears/system/authn-resolver/plugins/oidc-authn-plugin/ @fluiderson
+/gears/system/resource-group/ @ffedoroff
 /gears/system/usage-collector/ @capybutler
 /gears/system/types-registry @aviator5
 /gears/system/authn-resolver/authn-resolver @aviator5
