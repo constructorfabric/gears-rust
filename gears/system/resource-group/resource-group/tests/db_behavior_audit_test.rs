@@ -1407,6 +1407,34 @@ fn static_rule_passes_type_service_uses_retry() {
 }
 
 #[test]
+fn static_rule_non_force_delete_locks_before_it_decides() {
+    let src = include_str!("../src/domain/group_service.rs");
+
+    // Not observable as SQL here: SQLite has no row locks and sea-query omits
+    // the clause for it entirely, so the trace on this backend looks the same
+    // with and without the lock. On PostgreSQL it is the whole reason the
+    // non-force path may run below SERIALIZABLE -- it decides from a group's
+    // children and memberships and then deletes on that decision, and the
+    // lock is what keeps the decision true against a concurrent
+    // `create_group` under the same parent.
+    assert!(
+        src.contains("find_model_by_id_for_update"),
+        "the non-force delete must lock the target row before checking its \
+         children: without it, lowering the isolation level below SERIALIZABLE \
+         opens the window it was closing"
+    );
+
+    // And the level must still be chosen, not hard-coded back.
+    assert!(
+        src.contains("if force {")
+            && src.contains("TxConfig::serializable()")
+            && src.contains("TxConfig::default()"),
+        "delete_group must pick its isolation level from `force`: a force \
+         delete rewrites a subtree and keeps SERIALIZABLE"
+    );
+}
+
+#[test]
 fn static_rule_metadata_schema_is_resolved_before_begin() {
     let src = include_str!("../src/domain/group_service.rs");
 
