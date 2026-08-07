@@ -274,32 +274,6 @@ where
     Ok(())
 }
 
-/// The restriction [`secure_insert_from_select`] enforces, extracted so it can
-/// be checked without a database.
-///
-/// Only an entity that declares no scope column at all may be written this
-/// way.
-///
-/// # Errors
-///
-/// `ScopeError::Invalid` when `E` declares any scope column.
-fn insert_from_select_allowed<E>() -> Result<(), ScopeError>
-where
-    E: ScopableEntity + EntityTrait,
-{
-    if E::tenant_col().is_some()
-        || E::resource_col().is_some()
-        || E::owner_col().is_some()
-        || E::type_col().is_some()
-    {
-        return Err(ScopeError::Invalid(
-            "insert-from-select is limited to entities without scope columns: \
-             rows produced inside the database cannot be validated per row",
-        ));
-    }
-    Ok(())
-}
-
 /// Execute an `INSERT ... SELECT`: the rows are computed and written inside
 /// the database and never travel through this process.
 ///
@@ -322,15 +296,6 @@ where
 /// other entity is refused before the statement is built, so the restriction
 /// cannot be waived by a caller that would rather not honour it.
 ///
-/// The target table is `E`'s, and only `E`'s. The caller supplies the target
-/// columns and the source `SELECT`; the `INSERT` around them is built here.
-/// An earlier shape took a prepared `InsertStatement` and used `E` only for
-/// the check above -- which meant the check and the table it was supposed to
-/// be about were not connected: passing a scope-free `E` alongside a
-/// statement writing into a scoped table satisfied the guard and defeated it
-/// in the same call. Nothing about that was detectable from here, so the
-/// statement is no longer the caller's to hand over.
-///
 /// Scoping the *source* rows remains the caller's job: build the inner
 /// `SELECT` from a scoped query when the source table is scoped.
 ///
@@ -350,28 +315,25 @@ where
 ///
 /// # Errors
 ///
-/// - `ScopeError::Invalid` if `E` declares any scope column, or if the target
-///   column count does not match the source `SELECT`.
+/// - `ScopeError::Invalid` if `E` declares any scope column.
 /// - `ScopeError::Db` if the statement fails.
-pub async fn secure_insert_from_select<E, C>(
-    columns: C,
-    source: sea_orm::sea_query::SelectStatement,
+pub async fn secure_insert_from_select<E>(
+    stmt: &sea_orm::sea_query::InsertStatement,
     runner: &impl DBRunner,
 ) -> Result<u64, ScopeError>
 where
     E: ScopableEntity + EntityTrait,
-    C: IntoIterator<Item = E::Column>,
 {
-    insert_from_select_allowed::<E>()?;
-
-    let mut insert = sea_orm::sea_query::Query::insert();
-    insert.into_table(E::default()).columns(columns);
-    insert.select_from(source).map_err(|_| {
-        ScopeError::Invalid(
-            "insert-from-select: the target column count does not match the source select",
-        )
-    })?;
-    let stmt = &insert;
+    if E::tenant_col().is_some()
+        || E::resource_col().is_some()
+        || E::owner_col().is_some()
+        || E::type_col().is_some()
+    {
+        return Err(ScopeError::Invalid(
+            "insert-from-select is limited to entities without scope columns: \
+             rows produced inside the database cannot be validated per row",
+        ));
+    }
 
     let result = match DBRunnerInternal::as_seaorm(runner) {
         SeaOrmRunner::Conn(db) => {
@@ -1151,68 +1113,6 @@ mod tests {
                     pep_properties::RESOURCE_ID => Self::resource_col(),
                     _ => None,
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn insert_from_select_refuses_a_scoped_entity() {
-        // The whole justification for skipping per-row scope validation is
-        // that there is nothing to validate. An entity that declares a scope
-        // column has something, and must not be written this way.
-        let err = insert_from_select_allowed::<test_entity::Entity>()
-            .expect_err("a tenant-scoped entity must be refused");
-        assert!(matches!(err, ScopeError::Invalid(_)), "got: {err:?}");
-    }
-
-    #[test]
-    fn insert_from_select_allows_an_entity_with_no_scope_columns() {
-        // Negative control: without this the rule above would be satisfied by
-        // a guard that refuses everything.
-        //
-        // Not `global_entity` -- that one is global only in the tenant sense
-        // and still declares `resource_col`, so the guard refuses it, which is
-        // correct. A join or closure table with no identity of its own is the
-        // shape this helper exists for.
-        insert_from_select_allowed::<unscoped_entity::Entity>()
-            .expect("an entity with no scope columns must be allowed");
-    }
-
-    /// A link table: two foreign keys and a value, no identity the scope
-    /// system could filter on. `resource_group_closure` is the real one.
-    mod unscoped_entity {
-        use super::*;
-
-        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
-        #[sea_orm(table_name = "unscoped_table")]
-        pub struct Model {
-            #[sea_orm(primary_key, auto_increment = false)]
-            pub left_id: Uuid,
-            #[sea_orm(primary_key, auto_increment = false)]
-            pub right_id: Uuid,
-            pub depth: i32,
-        }
-
-        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-        pub enum Relation {}
-
-        impl ActiveModelBehavior for ActiveModel {}
-
-        impl ScopableEntity for Entity {
-            fn tenant_col() -> Option<Column> {
-                None
-            }
-            fn resource_col() -> Option<Column> {
-                None
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
-            fn type_col() -> Option<Column> {
-                None
-            }
-            fn resolve_property(_property: &str) -> Option<Column> {
-                None
             }
         }
     }

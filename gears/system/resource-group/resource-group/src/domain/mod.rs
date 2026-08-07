@@ -6,6 +6,7 @@
 pub mod error;
 pub mod group_service;
 pub mod membership_service;
+pub mod metrics;
 pub mod read_service;
 pub mod repo;
 pub mod rg_service;

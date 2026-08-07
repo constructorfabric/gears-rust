@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 use crate::domain::DbProvider;
 use crate::domain::error::DomainError;
+use crate::domain::metrics::{NoopMetrics, Operation, Outcome, RgMetricsPort};
 use crate::domain::repo::{GroupRepositoryTrait, TypeRepositoryTrait};
 use crate::domain::validation;
 
@@ -76,6 +77,12 @@ pub struct GroupService<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> {
     group_repo: Arc<GR>,
     type_repo: Arc<TR>,
     types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+    /// Bound to the process-global meter, not injected: the constructor has
+    /// 150-odd call sites and a required parameter would bury the change that
+    /// matters. Until the host installs an exporter the global provider is
+    /// the built-in no-op, so an uninstrumented run -- including every test
+    /// here -- records nothing and pays nothing.
+    metrics: Arc<dyn RgMetricsPort>,
 }
 
 /// Result of one `update_group_inner` attempt.
@@ -116,7 +123,44 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             group_repo,
             type_repo,
             types_registry,
+            metrics: Arc::new(NoopMetrics),
         }
+    }
+
+    /// Record one operation's wall time and whether it succeeded.
+    ///
+    /// Taken around the whole public method, so it includes the retries the
+    /// caller never sees as separate attempts -- which is the point: a
+    /// latency tail made of retried work looks like slow work from outside,
+    /// and that is what a caller experiences.
+    fn record_op<T>(
+        &self,
+        operation: Operation,
+        started: std::time::Instant,
+        result: &Result<T, DomainError>,
+    ) {
+        self.metrics.operation_duration(
+            operation,
+            if result.is_ok() {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            },
+            started.elapsed().as_secs_f64(),
+        );
+    }
+
+    /// Install a metrics recorder.
+    ///
+    /// Separate from `new` on purpose. The constructor has 150-odd call
+    /// sites, nearly all of them tests that have no interest in metrics, and
+    /// a required parameter would bury the change that matters in churn. The
+    /// composition root -- `gear.rs`, which is where infrastructure belongs
+    /// -- calls this; everything else keeps the no-op and records nothing.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn RgMetricsPort>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     // @cpt-flow:cpt-cf-resource-group-flow-entity-hier-create-group:p1
@@ -130,6 +174,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         req: CreateGroupRequest,
         tenant_id: Uuid,
     ) -> Result<ResourceGroup, DomainError> {
+        let started = std::time::Instant::now();
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-1
         // Pre-validation (stateless, outside transaction)
         validation::validate_type_code(&req.code)?;
@@ -142,12 +187,18 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // the lookup and the compile again. It reads no database state, so
         // nothing about the transaction makes its answer more correct.
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
-        validation::validate_metadata_via_gts(
+        let validation_started = std::time::Instant::now();
+        let validated = validation::validate_metadata_via_gts(
             req.metadata.as_ref(),
             &req.code,
             &*self.types_registry,
         )
-        .await?;
+        .await;
+        self.metrics.metadata_validation_duration(
+            Operation::Create,
+            validation_started.elapsed().as_secs_f64(),
+        );
+        validated?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
 
         // Derive `is_tenant` for AuthZ properties from the code prefix: any type
@@ -186,17 +237,27 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-10
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-9
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-11
-        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
-            let req = req.clone();
-            let profile = profile.clone();
-            let group_repo = group_repo.clone();
-            let type_repo = type_repo.clone();
-            Box::pin(async move {
-                Self::create_group_inner(&*group_repo, &*type_repo, tx, &req, tenant_id, &profile)
+        let result = db
+            .transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+                let req = req.clone();
+                let profile = profile.clone();
+                let group_repo = group_repo.clone();
+                let type_repo = type_repo.clone();
+                Box::pin(async move {
+                    Self::create_group_inner(
+                        &*group_repo,
+                        &*type_repo,
+                        tx,
+                        &req,
+                        tenant_id,
+                        &profile,
+                    )
                     .await
+                })
             })
-        })
-        .await
+            .await;
+        self.record_op(Operation::Create, started, &result);
+        result
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-11
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-9
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-10
@@ -268,6 +329,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         req: UpdateGroupRequest,
     ) -> Result<ResourceGroup, DomainError> {
+        let started = std::time::Instant::now();
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-1
         // Actor sends PUT /api/resource-group/v1/groups/{group_id}
         // AuthZ gate: verify the caller can update this group (tenant check).
@@ -312,12 +374,18 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             if req.metadata.is_some() {
                 let type_path =
                     Self::resolve_type_path_from_id(&conn, existing.gts_type_id).await?;
-                validation::validate_metadata_via_gts(
+                let validation_started = std::time::Instant::now();
+                let validated = validation::validate_metadata_via_gts(
                     req.metadata.as_ref(),
                     &type_path,
                     &*self.types_registry,
                 )
-                .await?;
+                .await;
+                self.metrics.metadata_validation_duration(
+                    Operation::Update,
+                    validation_started.elapsed().as_secs_f64(),
+                );
+                validated?;
             }
             existing
         };
@@ -353,9 +421,10 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         )
         .await?;
 
-        match first {
+        let result = match first {
             UpdateGroupOutcome::Done(group) => Ok(group),
             UpdateGroupOutcome::NeedsSerializable => {
+                self.metrics.isolation_escalation(Operation::Update);
                 match Self::attempt_update_group(
                     &db,
                     &group_repo,
@@ -379,7 +448,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     )),
                 }
             }
-        }
+        };
+        self.record_op(Operation::Update, started, &result);
+        result
     }
 
     /// Run one `update_group` attempt at the isolation level `serializable`
@@ -434,6 +505,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
     ) -> Result<ResourceGroup, DomainError> {
+        let started = std::time::Instant::now();
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-1
         // Actor sends PUT /api/resource-group/v1/groups/{group_id} with new hierarchy.parent_id
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-1
@@ -441,28 +513,34 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
+        let metrics = Arc::clone(&self.metrics);
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-2
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-12
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-11
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-13
-        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
-            let profile = profile.clone();
-            let group_repo = group_repo.clone();
-            let type_repo = type_repo.clone();
-            Box::pin(async move {
-                Self::move_group_inner(
-                    &*group_repo,
-                    &*type_repo,
-                    tx,
-                    group_id,
-                    new_parent_id,
-                    &profile,
-                )
-                .await
+        let result = db
+            .transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+                let profile = profile.clone();
+                let group_repo = group_repo.clone();
+                let type_repo = type_repo.clone();
+                let metrics = Arc::clone(&metrics);
+                Box::pin(async move {
+                    Self::move_group_inner(
+                        &*group_repo,
+                        &*type_repo,
+                        tx,
+                        group_id,
+                        new_parent_id,
+                        &profile,
+                        &*metrics,
+                    )
+                    .await
+                })
             })
-        })
-        .await
+            .await;
+        self.record_op(Operation::Move, started, &result);
+        result
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-13
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-11
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-12
@@ -480,6 +558,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         force: bool,
     ) -> Result<(), DomainError> {
+        let started = std::time::Instant::now();
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-1
         // Actor sends DELETE /api/resource-group/v1/groups/{group_id}?force={true|false}
         // AuthZ gate: verify the caller can delete this group (tenant check).
@@ -493,15 +572,29 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
 
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
+        let metrics = Arc::clone(&self.metrics);
 
-        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
-            let scope = scope.clone();
-            let group_repo = group_repo.clone();
-            Box::pin(async move {
-                Self::delete_group_inner(&*group_repo, tx, &scope, group_id, force).await
+        let result = db
+            .transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+                let scope = scope.clone();
+                let group_repo = group_repo.clone();
+                let metrics = Arc::clone(&metrics);
+                Box::pin(async move {
+                    Self::delete_group_inner(&*group_repo, tx, &scope, group_id, force, &*metrics)
+                        .await
+                })
             })
-        })
-        .await
+            .await;
+        self.record_op(
+            if force {
+                Operation::ForceDelete
+            } else {
+                Operation::Delete
+            },
+            started,
+            &result,
+        );
+        result
     }
 
     /// Get descendants of a group (depth >= 0, AuthZ-scoped).
@@ -1071,6 +1164,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
         profile: &QueryProfile,
+        metrics: &dyn RgMetricsPort,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-3
         // Load group and new parent in transaction
@@ -1093,7 +1187,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-8
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-9
         // Cycle detect, type compat, profile enforce, closure rebuild
-        let new_parent = Self::move_group_internal_impl(
+        let (new_parent, closure_rows) = Self::move_group_internal_impl(
             group_repo,
             tx,
             group_id,
@@ -1141,6 +1235,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-10
 
+        metrics.closure_rows_written(Operation::Move, closure_rows);
+
         // Assembled rather than read back, as in `update_group_inner`: a move
         // writes exactly one column, and the rest of the row is `existing`
         // unchanged.
@@ -1163,6 +1259,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         scope: &toolkit_security::AccessScope,
         group_id: Uuid,
         force: bool,
+        metrics: &dyn RgMetricsPort,
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-2
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-3
@@ -1186,7 +1283,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5d
             // Force delete: cascade entire subtree + memberships + closure
             #[allow(clippy::let_and_return)]
-            let result = Self::force_delete_subtree(group_repo, tx, group_id).await;
+            let result = Self::force_delete_subtree(group_repo, tx, group_id, metrics).await;
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5d
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5c
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5b
@@ -1255,7 +1352,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         new_parent_id: Option<Uuid>,
         rg_type: &resource_group_sdk::ResourceGroupType,
         profile: &QueryProfile,
-    ) -> Result<Option<crate::infra::storage::entity::resource_group::Model>, DomainError> {
+    ) -> Result<
+        (
+            Option<crate::infra::storage::entity::resource_group::Model>,
+            u64,
+        ),
+        DomainError,
+    > {
         let mut new_parent_model: Option<crate::infra::storage::entity::resource_group::Model> =
             None;
         if let Some(new_pid) = new_parent_id {
@@ -1379,11 +1482,11 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         }
 
         // Rebuild closure table for the subtree
-        group_repo
+        let closure_rows = group_repo
             .rebuild_subtree_closure(conn, group_id, new_parent_id)
             .await?;
 
-        Ok(new_parent_model)
+        Ok((new_parent_model, closure_rows))
     }
 
     /// Force-delete an entire subtree (group + descendants + memberships + closure).
@@ -1391,6 +1494,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_repo: &GR,
         conn: &impl DBRunner,
         root_id: Uuid,
+        metrics: &dyn RgMetricsPort,
     ) -> Result<(), DomainError> {
         let descendants_with_depth = group_repo
             .get_descendant_ids_with_depth(conn, root_id)
@@ -1399,6 +1503,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let all_ids: Vec<Uuid> = std::iter::once(root_id)
             .chain(descendants_with_depth.iter().map(|(id, _depth)| *id))
             .collect();
+
+        // The input this operation's cost is a function of. Recorded so a
+        // slow tail can be read against the shape of the subtree rather than
+        // guessed at.
+        metrics.subtree_nodes(
+            Operation::ForceDelete,
+            all_ids.len().try_into().unwrap_or(u64::MAX),
+        );
 
         // Memberships and closure rows have no FK ordering constraint among
         // themselves, so both go in one statement for the whole subtree
