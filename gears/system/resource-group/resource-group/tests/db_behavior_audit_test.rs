@@ -1255,6 +1255,30 @@ async fn negative_control_read_paths_produce_no_write_statements() {
     );
 }
 
+#[tokio::test]
+async fn trace_delete_type() {
+    // RG-02. `delete_type` resolved the id, counted referencing groups and
+    // deleted the row on a bare connection, so a concurrent `create_group` of
+    // that type could land between the count and the delete. All three are
+    // one transaction now.
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+    let t = common::create_root_type(&type_svc, "deltype").await;
+
+    rec.clear();
+    type_svc
+        .delete_type(&t.code)
+        .await
+        .expect("delete_type should succeed for an unreferenced type");
+
+    snapshot_trace("delete_type", &rec);
+    assert!(
+        rec.writes_outside_tx().is_empty(),
+        "delete_type must run its writes inside a transaction (RG-02):\n{}",
+        rec.dump()
+    );
+}
+
 // Section 4 -- static source-scan rules for the defect classes that leave no
 // trace in the SQL: RG-03 (SERIALIZABLE without retry) and RG-09 (an external
 // call inside a transaction closure), matched on call shape.

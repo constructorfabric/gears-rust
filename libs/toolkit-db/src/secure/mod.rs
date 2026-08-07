@@ -122,7 +122,7 @@ mod tx_error;
 
 // Core types
 pub use entity_traits::ScopableEntity;
-pub use error::{ScopeError, is_unique_violation};
+pub use error::{ScopeError, is_foreign_key_violation, is_unique_violation};
 
 // Security types from toolkit-security
 pub use toolkit_security::{
