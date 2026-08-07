@@ -731,7 +731,7 @@ sequenceDiagram
 Write-concurrency rule for hierarchy mutations (`create/move/delete`):
 
 - authoritative invariant checks MUST run inside the same write transaction that applies closure/entity mutations
-- write transactions MUST use `SERIALIZABLE` isolation to prevent phantom reads between cycle-check and closure/entity insert under concurrent hierarchy mutations; `SERIALIZABLE` is the recommended default
+- write transactions that rewrite closure rows across a subtree MUST use `SERIALIZABLE` isolation to prevent phantom reads between cycle-check and closure/entity insert under concurrent hierarchy mutations. A write that touches one row by primary key does not need it, provided it locks whatever its decision was read from — see the retry-policy section for which operation is which
 - serialization conflicts are handled by bounded retry with deterministic error mapping when retries are exhausted
 
 #### AuthZ + RG + SQL Responsibility Split
@@ -1589,7 +1589,12 @@ Fixtures (following `oagw` e2e pattern): session-scoped `rg_base_url` (from env 
 
 #### Concurrency Testing
 
-Hierarchy mutations (`create/move/delete`) use `SERIALIZABLE` isolation with bounded retry. Concurrency tests verify correctness under parallel access.
+Hierarchy mutations run with bounded retry, at an isolation level chosen per operation rather than fixed:
+
+- `SERIALIZABLE` where a write depends on a predicate over rows it does not itself lock: `create`, `move`, a parent-changing `update`, and a **force** delete — all of which rewrite closure rows across a subtree.
+- The backend default where there is no such predicate: a name/metadata-only `update`, which changes one row by primary key, and a **non-force** delete, which takes a row lock (`SELECT ... FOR UPDATE`) on its target so the children and membership checks it decides from stay true until it commits.
+
+Contention and retry expectations differ accordingly: the second group does not produce serialization failures, and waits on a row lock instead. Concurrency tests verify correctness under parallel access.
 
 **Serialization retry policy**:
 
@@ -1604,9 +1609,14 @@ Hierarchy mutations (`create/move/delete`) use `SERIALIZABLE` isolation with bou
   surfaces whatever the database said, which today reaches HTTP as a 500.
   Whether an exhausted retry deserves its own status is an open contract
   question, tracked in `db-behavior-audit.md` under Deferred.
-- transaction timeout: none. `TxConfig` carries `isolation` and `access_mode`
-  and nothing else — there is no timeout mechanism to configure. The "5s
-  (configurable)" this list used to claim never existed.
+- transaction timeout: none is set. `TxConfig` carries `isolation` and
+  `access_mode` and nothing else, so there is no per-call knob. On the server
+  side `statement_timeout` bounds a single statement, not a transaction;
+  `transaction_timeout` (PostgreSQL 17+) bounds the transaction, and on
+  earlier versions there is no equivalent. The benchmark environment above is
+  PostgreSQL 17, so the 5s bound this section used to claim is reachable — it
+  is simply not configured. Nothing in this repository sets any of the three;
+  see the query-cost note above for how a deployment can.
 
 **Concurrency test pattern** (E2E test level — requires real PostgreSQL for SERIALIZABLE isolation):
 
