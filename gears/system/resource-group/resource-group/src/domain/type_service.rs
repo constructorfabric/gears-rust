@@ -373,41 +373,62 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
     // @cpt-flow:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1
     /// Delete a GTS type definition.
+    ///
+    /// Resolve, reference check and delete run in one transaction with
+    /// bounded retry (RG-02). They used to run on a bare connection, so a
+    /// concurrent `create_group` of this type could land between the count
+    /// and the delete.
+    ///
+    /// At the backend default isolation, not `SERIALIZABLE`: what makes a
+    /// type undeletable while it is in use is `ON DELETE RESTRICT` on
+    /// `resource_group.gts_type_id`, which holds at any level. The count is
+    /// there to say *how many* groups block the delete -- a better message
+    /// than the constraint can give -- and `TypeRepository::delete_by_id`
+    /// maps the constraint to the same conflict for the case where the count
+    /// was already stale.
     pub async fn delete_type(&self, code: &str) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-1
         // Actor sends DELETE /api/types-registry/v1/types/{code}
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-1
-        let conn = self.db.conn()?;
+        let db = self.db.db();
+        let type_repo = self.type_repo.clone();
+        let code = code.to_owned();
 
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-2
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-3
-        let type_id = self
-            .type_repo
-            .resolve_id(&conn, code)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(code))?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-3
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-2
+        db.transaction_with_retry(TxConfig::default(), DomainError::db_err, |tx| {
+            let type_repo = type_repo.clone();
+            let code = code.clone();
+            Box::pin(async move {
+                // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-2
+                // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-3
+                let type_id = type_repo
+                    .resolve_id(tx, &code)
+                    .await?
+                    .ok_or_else(|| DomainError::type_not_found(&code))?;
+                // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-3
+                // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-2
 
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-4
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-5
-        // Check for active references
-        let count = self.type_repo.count_groups_of_type(&conn, type_id).await?;
-        if count > 0 {
-            warn!(code = %code, count, "Cannot delete type: active group references exist");
-            return Err(DomainError::conflict_active_references(format!(
-                "Cannot delete type '{code}': {count} group(s) of this type exist"
-            )));
-        }
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-5
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-4
+                // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-4
+                // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-5
+                // Check for active references
+                let count = type_repo.count_groups_of_type(tx, type_id).await?;
+                if count > 0 {
+                    warn!(code = %code, count, "Cannot delete type: active group references exist");
+                    return Err(DomainError::conflict_active_references(format!(
+                        "Cannot delete type '{code}': {count} group(s) of this type exist"
+                    )));
+                }
+                // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-5
+                // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-4
 
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-6
-        self.type_repo.delete_by_id(&conn, type_id).await?;
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-6
-        // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-7
-        Ok(())
-        // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-7
+                // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-6
+                type_repo.delete_by_id(tx, type_id).await?;
+                // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-6
+                // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-7
+                Ok(())
+                // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-7
+            })
+        })
+        .await
     }
 
     // -- Validation helpers --
