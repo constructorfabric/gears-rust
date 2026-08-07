@@ -28,6 +28,7 @@ resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.2
 
 # Core dependencies
 anyhow = { workspace = true }
+opentelemetry = { workspace = true, features = ["metrics"] }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }
@@ -76,6 +77,7 @@ toolkit-macros = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["metrics", "testing"] }
 # "test-support" enables `connect_db_with_metric_callback` and
 # `secure::in_transaction_for_testing`, which the DB-behaviour audit's
 # `QueryRecorder` needs. Test-only: the production dependency above pulls in
