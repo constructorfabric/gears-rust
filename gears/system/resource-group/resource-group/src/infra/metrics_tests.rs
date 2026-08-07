@@ -122,10 +122,14 @@ fn every_operation_has_a_distinct_label() {
 }
 
 #[test]
-fn the_noop_port_records_nothing() {
-    // Used where a service is built without a meter; it must stay a total
-    // no-op rather than reaching for the global provider behind the caller's
-    // back.
+fn the_noop_port_accepts_every_recording_without_panicking() {
+    // Named for what it checks. There is no assertion here and there cannot
+    // usefully be one: `NoopMetrics` holds no instrument to inspect, so this
+    // proves the calls compile and return, not that nothing was recorded. A
+    // `NoopMetrics` that forwarded to the global provider would pass it.
+    //
+    // What keeps that honest is the type: the struct has no fields, so there
+    // is nothing for it to forward to.
     let n = NoopMetrics;
     n.operation_duration(Operation::Move, Outcome::Ok, 1.0);
     n.subtree_nodes(Operation::Move, 1);
