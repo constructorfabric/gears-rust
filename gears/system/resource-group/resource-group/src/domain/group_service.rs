@@ -8,10 +8,16 @@
 //! cycle detection, closure table management, query profile enforcement,
 //! and CRUD orchestration.
 //!
-//! All hierarchy-mutating operations (`create_group`, `update_group`,
-//! `move_group`, `delete_group`) use `SERIALIZABLE` transactions with
-//! bounded retry (max 3 attempts) to prevent phantom reads and ensure
-//! closure table consistency under concurrent mutations.
+//! Hierarchy-mutating operations (`create_group`, `move_group`,
+//! `delete_group`, and `update_group`'s parent-change branch) use
+//! `SERIALIZABLE` transactions with bounded retry (max 3 attempts) to prevent
+//! phantom reads and keep the closure table consistent under concurrent
+//! mutation.
+//!
+//! `update_group`'s rename/metadata path changes one row by primary key and
+//! has no cross-row predicate to protect, so it runs at the backend default
+//! instead. See `update_group` for how the level is chosen before the
+//! transaction opens and how the race with that choice is closed.
 
 use std::sync::Arc;
 
@@ -20,7 +26,7 @@ use resource_group_sdk::models::{
     CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupWithDepth, UpdateGroupRequest,
 };
 use resource_group_sdk::{GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH};
-use toolkit_db::secure::{DBRunner, TxConfig};
+use toolkit_db::secure::{DBRunner, Db, TxConfig};
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::{SecurityContext, pep_properties};
 use tracing::debug;
@@ -70,6 +76,25 @@ pub struct GroupService<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> {
     group_repo: Arc<GR>,
     type_repo: Arc<TR>,
     types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+}
+
+/// Result of one `update_group_inner` attempt.
+///
+/// Internal control flow only -- it never crosses a `?` boundary into
+/// `DomainError`, so it changes nothing a caller can observe.
+/// `update_group` picks the transaction's isolation level from a
+/// pre-transaction hint about whether the request moves the group;
+/// `NeedsSerializable` is how the authoritative in-transaction read reports
+/// that the hint was wrong in the direction that matters. It is returned
+/// before that attempt writes anything, so abandoning the attempt is always
+/// a no-op, never a partial write.
+enum UpdateGroupOutcome {
+    /// The update finished under a transaction strong enough for what it
+    /// turned out to need.
+    Done(ResourceGroup),
+    /// The move branch is required, but this transaction is not
+    /// SERIALIZABLE. Nothing was written.
+    NeedsSerializable,
 }
 
 impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
@@ -264,15 +289,19 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
 
+        // One pre-transaction read, serving two purposes.
+        //
         // Metadata validation goes over the network and compiles a schema, so
         // it must not run with the transaction open -- see `create_group`.
-        // Unlike create, the type is not in the request; it has to be read.
-        // Only requests that actually carry metadata pay for that read, and
-        // it cannot go stale: a group's type is immutable, which is why
-        // `UpdateGroupRequest` has no `code` field at all. The transaction
-        // resolves the type again for its own checks; this read decides
-        // nothing except which schema to validate against.
-        if req.metadata.is_some() {
+        // Unlike create, the type is not in the request; it has to be read,
+        // and it cannot go stale, because a group's type is immutable (which
+        // is why `UpdateGroupRequest` has no `code` field).
+        //
+        // The same row also carries the current `parent_id`, which decides
+        // the transaction's isolation level below. `conn` is scoped to this
+        // block so the pooled connection is back before the transaction asks
+        // for its own.
+        let existing = {
             let conn = db
                 .conn()
                 .map_err(|e| DomainError::database(e.to_string()))?;
@@ -280,16 +309,99 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 .find_model_by_id(&conn, group_id)
                 .await?
                 .ok_or_else(|| DomainError::group_not_found(group_id))?;
-            let type_path = Self::resolve_type_path_from_id(&conn, existing.gts_type_id).await?;
-            validation::validate_metadata_via_gts(
-                req.metadata.as_ref(),
-                &type_path,
-                &*self.types_registry,
-            )
-            .await?;
-        }
+            if req.metadata.is_some() {
+                let type_path =
+                    Self::resolve_type_path_from_id(&conn, existing.gts_type_id).await?;
+                validation::validate_metadata_via_gts(
+                    req.metadata.as_ref(),
+                    &type_path,
+                    &*self.types_registry,
+                )
+                .await?;
+            }
+            existing
+        };
 
-        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+        // Take the least-strict level that stays correct for this update.
+        // Write-skew here -- cycle detection racing a concurrent create or
+        // move, and the closure rebuild -- is reachable only on the
+        // parent-change branch. A rename or metadata edit touches one row by
+        // primary key and has no cross-row predicate to protect, so the
+        // backend default is enough. On SQLite that changes nothing, since it
+        // is serializable regardless; this is a PostgreSQL saving.
+        //
+        // It is a *hint*: computed before the transaction opens, so a
+        // concurrent request can change this group's parent in the gap. The
+        // authoritative answer is always `update_group_inner`'s own fresh
+        // read. If the hint was wrong in the dangerous direction -- it said
+        // "no move", the fresh read says otherwise -- the inner function
+        // returns `NeedsSerializable` before writing anything and the whole
+        // operation reruns at `TxConfig::serializable()`. Wrong in the other
+        // direction is harmless: SERIALIZABLE is a safe superset, so a hint
+        // that overshoots costs a little and protects the same invariants.
+        let guessed_parent_changed = existing.parent_id != req.parent_id;
+
+        let first = Self::attempt_update_group(
+            &db,
+            &group_repo,
+            &type_repo,
+            &scope,
+            group_id,
+            &req,
+            &profile,
+            guessed_parent_changed,
+        )
+        .await?;
+
+        match first {
+            UpdateGroupOutcome::Done(group) => Ok(group),
+            UpdateGroupOutcome::NeedsSerializable => {
+                match Self::attempt_update_group(
+                    &db,
+                    &group_repo,
+                    &type_repo,
+                    &scope,
+                    group_id,
+                    &req,
+                    &profile,
+                    true,
+                )
+                .await?
+                {
+                    UpdateGroupOutcome::Done(group) => Ok(group),
+                    // Unreachable: this attempt ran at SERIALIZABLE, which is
+                    // the level `NeedsSerializable` asks for. Reported rather
+                    // than looped, so a future change that breaks the
+                    // invariant surfaces instead of spinning.
+                    UpdateGroupOutcome::NeedsSerializable => Err(DomainError::database(
+                        "update_group still reported NeedsSerializable after escalating to \
+                         SERIALIZABLE",
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Run one `update_group` attempt at the isolation level `serializable`
+    /// selects, with the usual bounded retry inside it.
+    #[allow(clippy::too_many_arguments)]
+    async fn attempt_update_group(
+        db: &Db,
+        group_repo: &Arc<GR>,
+        type_repo: &Arc<TR>,
+        scope: &toolkit_security::AccessScope,
+        group_id: Uuid,
+        req: &UpdateGroupRequest,
+        profile: &QueryProfile,
+        serializable: bool,
+    ) -> Result<UpdateGroupOutcome, DomainError> {
+        let config = if serializable {
+            TxConfig::serializable()
+        } else {
+            TxConfig::default()
+        };
+
+        db.transaction_with_retry(config, DomainError::db_err, |tx| {
             let req = req.clone();
             let scope = scope.clone();
             let profile = profile.clone();
@@ -304,6 +416,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     group_id,
                     &req,
                     &profile,
+                    serializable,
                 )
                 .await
             })
@@ -798,7 +911,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         req: &UpdateGroupRequest,
         profile: &QueryProfile,
-    ) -> Result<ResourceGroup, DomainError> {
+        serializable: bool,
+    ) -> Result<UpdateGroupOutcome, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-2
         // DB: SELECT FROM resource_group WHERE id = {group_id} -- load existing group
         group_repo
@@ -888,6 +1002,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // `DomainError::invalid_parent_type` when the parent's type is not in
         // the moved subtree's `allowed_parent_types`).
         let parent_changed = existing.parent_id != req.parent_id;
+        // The fresh read is the authoritative one. If it says this request
+        // moves the group but the transaction was opened below SERIALIZABLE
+        // on a stale hint, stop here -- before the move branch and before the
+        // update below, so nothing has been written -- and let the caller
+        // rerun the whole operation at the right level.
+        if parent_changed && !serializable {
+            return Ok(UpdateGroupOutcome::NeedsSerializable);
+        }
         if parent_changed {
             // Delegate to move logic (cycle detection + closure rebuild).
             // Type stays the same, so use the resolved `rg_type` for parent
@@ -935,7 +1057,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // the type path was resolved above -- so the row the database now
         // holds is fully determined here. The read this replaces was the
         // second one after the write, the first being inside `update` itself.
-        Ok(ResourceGroup {
+        Ok(UpdateGroupOutcome::Done(ResourceGroup {
             id: group_id,
             code: existing_type_path,
             name: req.name.clone(),
@@ -944,7 +1066,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 tenant_id: existing.tenant_id,
             },
             metadata: req.metadata.clone(),
-        })
+        }))
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-6
     }
 
