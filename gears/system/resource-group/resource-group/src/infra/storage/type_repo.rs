@@ -365,45 +365,11 @@ impl TypeRepositoryTrait for TypeRepository {
         let allowed_membership_types =
             Self::load_allowed_membership_types(db, type_model.id).await?;
 
-        // Derive can_be_root from stored metadata_schema internal key.
-        // Per the placement invariant: can_be_root == true OR len(allowed_parent_types) >= 1.
-        // If no allowed_parent_types, can_be_root must be true.
-        let can_be_root = type_model
-            .metadata_schema
-            .as_ref()
-            .and_then(|ms| ms.get("__can_be_root"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(allowed_parent_types.is_empty());
-
-        // Extract the user-facing metadata_schema without internal keys.
-        // Non-object schemas are stored under `__user_schema`; restore them on read.
-        let metadata_schema = type_model.metadata_schema.as_ref().and_then(|ms| {
-            if let serde_json::Value::Object(map) = ms {
-                if let Some(user_schema) = map.get("__user_schema") {
-                    return Some(user_schema.clone());
-                }
-                let filtered: serde_json::Map<String, serde_json::Value> = map
-                    .iter()
-                    .filter(|(k, _)| !k.starts_with("__"))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                if filtered.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::Value::Object(filtered))
-                }
-            } else {
-                Some(ms.clone())
-            }
-        });
-
-        Ok(ResourceGroupType {
-            code: type_model.schema_id.clone(),
-            can_be_root,
+        Ok(Self::build_resource_group_type(
+            type_model,
             allowed_parent_types,
             allowed_membership_types,
-            metadata_schema,
-        })
+        ))
     }
 
     /// Resolve a GTS type path to its surrogate SMALLINT ID.
@@ -628,7 +594,14 @@ impl TypeRepositoryTrait for TypeRepository {
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        let parent_ids: Vec<uuid::Uuid> = groups.iter().filter_map(|g| g.parent_id).collect();
+        // One entry per group that has a parent, so this list grows with the
+        // number of groups of the child type, not with the number of
+        // candidate codes -- and siblings sharing a parent repeat it.
+        // Deduplicate before binding: it is both fewer parameters and fewer
+        // rows for the database to match.
+        let mut parent_ids: Vec<uuid::Uuid> = groups.iter().filter_map(|g| g.parent_id).collect();
+        parent_ids.sort_unstable();
+        parent_ids.dedup();
         if parent_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -636,17 +609,31 @@ impl TypeRepositoryTrait for TypeRepository {
         // Which of those groups' actual parents are of one of the
         // candidate parent types -- one query for every candidate at once,
         // not one per candidate.
-        let parents: Vec<rg_entity::Model> = ResourceGroupEntity::find()
-            .filter(rg_entity::Column::Id.is_in(parent_ids))
-            .filter(rg_entity::Column::GtsTypeId.is_in(parent_type_ids))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+        //
+        // Chunked against the backend's bind-parameter ceiling for the same
+        // reason the batch deletes in `group_repo` are: an unbounded
+        // `IN (...)` fails in the driver rather than in the query. The
+        // budget is shared with the second predicate, so the type ids come
+        // off the top before the ids are chunked.
+        let type_id_params = parent_type_ids.len();
+        let id_budget = toolkit_db::secure::max_bind_params_for(db)
+            .saturating_sub(type_id_params)
+            .max(1);
 
-        let parent_type_by_id: std::collections::HashMap<uuid::Uuid, i16> =
-            parents.into_iter().map(|p| (p.id, p.gts_type_id)).collect();
+        let mut parent_type_by_id: std::collections::HashMap<uuid::Uuid, i16> =
+            std::collections::HashMap::new();
+        for chunk in parent_ids.chunks(id_budget) {
+            let parents: Vec<rg_entity::Model> = ResourceGroupEntity::find()
+                .filter(rg_entity::Column::Id.is_in(chunk.to_vec()))
+                .filter(rg_entity::Column::GtsTypeId.is_in(parent_type_ids.clone()))
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+
+            parent_type_by_id.extend(parents.into_iter().map(|p| (p.id, p.gts_type_id)));
+        }
 
         Ok(groups
             .into_iter()

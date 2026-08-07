@@ -14,11 +14,13 @@
 //! is what is asserted — an absolute count rots on the next refactor, a slope
 //! does not.
 //!
-//! Deliberately absent: the `no-tx-write`, `no-retry-serializable` and
-//! `external-call-in-tx` classes, and the write-set narrowing checks. Those
-//! belong to the transaction-boundary and isolation fixes, which this branch
-//! does not carry — a test asserting a fix that is not here would only be
-//! noise. They live on the branch that carries their fixes.
+//! The `no-tx-write` class is asserted throughout: every operation test ends
+//! on [`QueryRecorder::writes_outside_tx`], and `no-retry-serializable` has
+//! its own source-scan rule in Section 4.
+//!
+//! Deliberately absent: the write-set narrowing checks, which belong to a
+//! fix this branch does not carry — a test asserting a fix that is not here
+//! would only be noise. It lives on the branch that carries it.
 //!
 //! Healthy operations assert the invariant directly, doubling as negative
 //! controls.

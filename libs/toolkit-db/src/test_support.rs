@@ -151,10 +151,17 @@ static RE_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expe
 static RE_PG_PLACEHOLDER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\$\d+").expect("valid regex"));
 // Collapse a run of 2+ `?` placeholders into a single marker, so an `IN (...)`
-// list or a multi-row `INSERT ... VALUES` batch normalizes the same way
-// regardless of N.
+// list normalizes the same way regardless of N.
 static RE_PLACEHOLDER_LIST: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\?(?:\s*,\s*\?)+").expect("valid regex"));
+// Collapse a run of 2+ parenthesized placeholder groups into one. The regex
+// above only reaches inside a single group: the `), (` separator of a
+// multi-row `INSERT ... VALUES` stops it, so without this a two-row batch and
+// a three-row batch would carry different signatures and a scale rule
+// grouping by the normalized text would compare nothing. Runs after it, once
+// every group has been reduced to `(?)`.
+static RE_VALUES_GROUP_LIST: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\(\?\)(?:\s*,\s*\(\?\))+").expect("valid regex"));
 
 static RE_INSERT_TABLE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)^insert\s+into\s+"?([a-zA-Z_][a-zA-Z0-9_]*)"?"#).expect("valid regex")
@@ -182,6 +189,7 @@ pub fn normalize_sql(sql: &str) -> String {
     let s = RE_PG_PLACEHOLDER.replace_all(&s, "?");
     let s = RE_NUMBER.replace_all(&s, "?");
     let s = RE_PLACEHOLDER_LIST.replace_all(&s, "?");
+    let s = RE_VALUES_GROUP_LIST.replace_all(&s, "(?)");
     let s = RE_WHITESPACE.replace_all(&s, " ");
     s.trim().to_owned()
 }
@@ -204,6 +212,11 @@ fn extract_table(kind: QueryKind, raw_sql: &str) -> Option<String> {
 #[derive(Clone)]
 pub struct QueryRecorder {
     events: Arc<Mutex<Vec<RecordedQuery>>>,
+    /// Shared with the metric callback so [`Self::clear`] can reset it
+    /// alongside the trace. Without the handle here the counter would
+    /// outlive the events it numbers, and `seq` would stop agreeing with the
+    /// position in [`Self::events`].
+    seq: Arc<AtomicUsize>,
 }
 
 impl QueryRecorder {
@@ -212,6 +225,7 @@ impl QueryRecorder {
     #[cfg(test)]
     fn from_events_for_testing(events: Vec<RecordedQuery>) -> Self {
         Self {
+            seq: Arc::new(AtomicUsize::new(events.len())),
             events: Arc::new(Mutex::new(events)),
         }
     }
@@ -231,6 +245,7 @@ impl QueryRecorder {
         let seq = Arc::new(AtomicUsize::new(0));
         let recorder = Self {
             events: Arc::clone(&events),
+            seq: Arc::clone(&seq),
         };
 
         let callback = move |info: &sea_orm::metric::Info<'_>| {
@@ -294,11 +309,21 @@ impl QueryRecorder {
     /// Clear the recorded trace. Each audit test normally builds a fresh
     /// database instead of reusing a recorder, but this is handy for the
     /// recorder's own unit tests.
+    ///
+    /// Resets the sequence counter with the trace, so the `seq` of the first
+    /// statement recorded afterwards is again `0` and keeps agreeing with the
+    /// position in [`Self::events`].
+    ///
+    /// Like the rest of this type's aggregation surface, meant to be called
+    /// while nothing is recording: the callback increments the counter before
+    /// it takes the events lock, so a statement racing this call can still be
+    /// numbered against the trace it is no longer part of.
     pub fn clear(&self) {
         self.events
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.seq.store(0, Ordering::Relaxed);
     }
 
     /// Counts grouped by `(kind, table)`. Table is `"<none>"` when no table
@@ -591,9 +616,17 @@ mod tests {
                 r#"SELECT * FROM "gts_type" WHERE "id" IN ($1, $2, $3)"#,
                 r#"SELECT * FROM "gts_type" WHERE "id" IN (?)"#,
             ),
+            // A multi-row batch collapses to one group, so its signature does
+            // not encode the batch size...
             (
                 r#"INSERT INTO "resource_group_closure" VALUES ($1, $2), ($3, $4)"#,
-                r#"INSERT INTO "resource_group_closure" VALUES (?), (?)"#,
+                r#"INSERT INTO "resource_group_closure" VALUES (?)"#,
+            ),
+            // ...and a wider batch of the same statement lands on that same
+            // signature rather than growing a group per row.
+            (
+                r#"INSERT INTO "resource_group_closure" VALUES ($1, $2), ($3, $4), ($5, $6)"#,
+                r#"INSERT INTO "resource_group_closure" VALUES (?)"#,
             ),
         ];
         for (input, expected) in cases {

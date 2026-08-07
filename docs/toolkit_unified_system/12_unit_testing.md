@@ -62,7 +62,7 @@ Every test must pass all three:
 - Cursor codec encode/decode over HTTP → E2E tests
 - Performance, load, concurrency under contention → out of scope
 
-All of the above requires a running server with real PostgreSQL. Unit tests use SQLite and mock AuthZ — they cannot catch these bugs.
+All of the above requires real PostgreSQL; the entries that name the transport or the AuthN/AuthZ pipeline additionally require a running server. Unit tests use SQLite and mock AuthZ — they cannot catch these bugs. Throughout this guide "E2E" means HTTP over PostgreSQL: a case that needs the real database but not the transport belongs in a PostgreSQL-backed Rust integration suite, which runs in-process and boots no server.
 
 Routing a case to E2E only counts as coverage if the venue actually runs on PostgreSQL. Some pytest harnesses seed SQLite directly; sending a PostgreSQL-specific case there moves it out of the unit suite without testing it anywhere.
 

@@ -745,8 +745,13 @@ impl Db {
                                 backend = ?backend,
                                 phase = %phase,
                                 retryable,
-                                sql_err = ?db_err.sql_err(),
-                                error = %db_err,
+                                // Same reasoning as the WARN arm below, and
+                                // the same two fields: neither `DbErr`'s
+                                // `Display` nor `SqlErr`'s payload may reach
+                                // a log line from shared infrastructure. This
+                                // arm runs at ERROR, so it is the more likely
+                                // of the two to be shipped and retained.
+                                sql_err = sql_err_kind(db_err.sql_err().as_ref()),
                                 "transaction retry budget exhausted"
                             );
                         } else {
