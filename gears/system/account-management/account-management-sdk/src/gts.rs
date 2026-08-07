@@ -411,7 +411,18 @@ pub struct TenantMetadataTraits {
     // the OP#13 rationale. Guarded by
     // `sync_tests::tenant_metadata_envelope_trait_contract_matches_docs`.
     traits = serde_json::json!({ "inheritance_policy": "override_only" }),
-    gts_abstract = true
+    gts_abstract = true,
+    // The envelope's payload is OPEN by contract: derived metadata schemas
+    // own the payload shape (PRD §5.7 — "branding, contacts") and
+    // MetadataService validates entries against the DERIVED schema at PUT
+    // time. Without an explicit `additionalProperties: true` the OP#12
+    // chain-narrowing check treats the envelope as a closed empty object and
+    // rejects every derived schema that declares a single typed property —
+    // making typed tenant metadata unregistrable. The upstream emitter
+    // closes the object unconditionally, so the toolkit wrapper opens it in
+    // the inventory `schema_fn`. Guarded by
+    // `sync_tests::tenant_metadata_envelope_payload_is_open`.
+    open_payload = true
 )]
 pub struct TenantMetadataEnvelopeV1 {
     /// Required by the `gts-macros` base-struct contract; envelopes carry
@@ -608,10 +619,12 @@ mod sync_tests {
     //! (`x-gts-traits-schema` shape + the envelope's `x-gts-traits`
     //! defaults) MUST agree with the documented
     //! `docs/schemas/<name>.v1.schema.json`. The macro additionally emits
-    //! a data-type top-level shape (`id`/`properties`/`required`/
-    //! `additionalProperties`) that the docs omit by design and that is
-    //! inert at runtime (see gear docs), so only the trait subtrees are
-    //! compared.
+    //! a data-type top-level shape (`id`/`properties`/`required`) that the
+    //! docs omit by design, so only the trait subtrees are compared —
+    //! EXCEPT `additionalProperties`, which is NOT inert: the OP#12
+    //! chain-narrowing check reads it to decide whether derived schemas may
+    //! declare payload properties (see
+    //! `tenant_metadata_envelope_payload_is_open`).
 
     use std::fs;
     use std::path::PathBuf;
@@ -708,6 +721,43 @@ mod sync_tests {
             &read_disk_schema("tenant_metadata.v1.schema.json"),
             TenantMetadataEnvelopeV1::TYPE_ID,
             &serde_json::json!({ "inheritance_policy": "override_only" }),
+        );
+    }
+
+    /// The metadata envelope must reach types-registry with an OPEN payload
+    /// (`additionalProperties: true`), otherwise the OP#12 chain-narrowing
+    /// check rejects every derived schema that declares a typed payload
+    /// property — see the typed-tenant-metadata registration bug.
+    ///
+    /// Asserted on the INVENTORY entry (what types-registry actually
+    /// registers): `open_payload = true` opens the schema in the wrapper's
+    /// `schema_fn`, so the raw `gts_schema_with_refs()` accessor still
+    /// reflects the upstream emitter's closed default.
+    #[test]
+    fn tenant_metadata_envelope_payload_is_open() {
+        let registered = toolkit_gts::all_inventory_type_schemas()
+            .expect("collect inventory type schemas")
+            .into_iter()
+            .find(|s| {
+                s.pointer("/$id").and_then(Value::as_str)
+                    == Some(&format!("gts://{}", TenantMetadataEnvelopeV1::TYPE_ID))
+            })
+            .expect("tenant_metadata envelope must be in the type-schema inventory");
+        assert_eq!(
+            registered
+                .pointer("/additionalProperties")
+                .and_then(Value::as_bool),
+            Some(true),
+            "the inventory-registered tenant_metadata envelope must declare \
+             additionalProperties: true so derived schemas can add typed \
+             payload properties",
+        );
+        assert_eq!(
+            read_disk_schema("tenant_metadata.v1.schema.json")
+                .pointer("/additionalProperties")
+                .and_then(Value::as_bool),
+            Some(true),
+            "docs/schemas/tenant_metadata.v1.schema.json must stay in sync",
         );
     }
 }
