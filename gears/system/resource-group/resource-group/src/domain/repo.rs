@@ -32,6 +32,22 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         id: Uuid,
     ) -> Result<Option<rg_entity::Model>, DomainError>;
 
+    /// Same read, taking a row lock on the group for the rest of the
+    /// transaction.
+    ///
+    /// For the paths that decide something from rows *related* to this group
+    /// -- its children, its memberships -- and then write based on that
+    /// decision. Serializing those writers on the group row is what keeps the
+    /// decision true, and is why such a path does not need SERIALIZABLE.
+    ///
+    /// Backends without row locks (`SQLite`) ignore the clause; they are
+    /// serializable regardless, so the guarantee is unchanged.
+    async fn find_model_by_id_for_update<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<Option<rg_entity::Model>, DomainError>;
+
     /// Return the id of *any* existing root group (`parent_id` IS NULL) whose
     /// `gts_type.schema_id` starts with the given prefix, or `None` when no
     /// such root exists. Used to enforce tenant-root uniqueness

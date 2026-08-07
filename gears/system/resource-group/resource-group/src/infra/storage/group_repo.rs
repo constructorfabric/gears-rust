@@ -495,6 +495,23 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))
     }
 
+    async fn find_model_by_id_for_update<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<Option<rg_entity::Model>, DomainError> {
+        use sea_orm::QuerySelect;
+        let scope = system_scope();
+        ResourceGroupEntity::find()
+            .filter(rg_entity::Column::Id.eq(id))
+            .lock(sea_orm::sea_query::LockType::Update)
+            .secure()
+            .scope_with(&scope)
+            .one(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))
+    }
+
     /// Return the id of any existing root group (`parent_id IS NULL`) whose
     /// `gts_type.schema_id` starts with the given prefix, or `None` when no
     /// such root exists. Used to enforce tenant-root uniqueness.

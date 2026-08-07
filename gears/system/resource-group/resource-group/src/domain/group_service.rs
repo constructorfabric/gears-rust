@@ -8,16 +8,21 @@
 //! cycle detection, closure table management, query profile enforcement,
 //! and CRUD orchestration.
 //!
-//! Hierarchy-mutating operations (`create_group`, `move_group`,
-//! `delete_group`, and `update_group`'s parent-change branch) use
-//! `SERIALIZABLE` transactions with bounded retry (max 3 attempts) to prevent
-//! phantom reads and keep the closure table consistent under concurrent
-//! mutation.
+//! Every write runs in a transaction with bounded retry (max 3 attempts).
+//! The isolation level is chosen per operation, not fixed:
 //!
-//! `update_group`'s rename/metadata path changes one row by primary key and
-//! has no cross-row predicate to protect, so it runs at the backend default
-//! instead. See `update_group` for how the level is chosen before the
-//! transaction opens and how the race with that choice is closed.
+//! - `SERIALIZABLE` where a write depends on a predicate over rows it does
+//!   not itself lock — `create_group`, `move_group`, `update_group`'s
+//!   parent-change branch, and a force delete, all of which rewrite closure
+//!   rows across a subtree.
+//! - The backend default where there is no such predicate: `update_group`'s
+//!   rename/metadata path, which changes one row by primary key, and a
+//!   non-force delete, which takes a row lock on its target so the children
+//!   and membership checks it decides from stay true until it commits.
+//!
+//! See `update_group` for how a level is picked before the transaction opens
+//! when the answer is not yet known, and how the race with that guess is
+//! closed. `delete_group` needs none of that: `force` is a request field.
 
 use std::sync::Arc;
 
@@ -574,8 +579,28 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let group_repo = self.group_repo.clone();
         let metrics = Arc::clone(&self.metrics);
 
+        // A force delete rewrites a whole subtree -- closure rows for every
+        // node, memberships, the group rows themselves -- and races a
+        // concurrent create or move anywhere inside it. That is write skew,
+        // and it keeps SERIALIZABLE.
+        //
+        // A non-force delete removes one leaf, and refuses if it has children
+        // or memberships. The only thing it needs is for that refusal to
+        // still be true when the delete runs, which a row lock on the target
+        // gives it: a concurrent `create_group` under this parent has to wait
+        // for the lock, and then finds the row gone. No cross-row predicate,
+        // so nothing for SERIALIZABLE to protect that the lock does not.
+        //
+        // Unlike `update_group`, no hint is involved: `force` is a request
+        // field, known before the transaction opens.
+        let config = if force {
+            TxConfig::serializable()
+        } else {
+            TxConfig::default()
+        };
+
         let result = db
-            .transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+            .transaction_with_retry(config, DomainError::db_err, |tx| {
                 let scope = scope.clone();
                 let group_repo = group_repo.clone();
                 let metrics = Arc::clone(&metrics);
@@ -1295,6 +1320,19 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         } else {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4
             // Non-force: check children and memberships
+            //
+            // Lock the target first. The two checks below decide from rows
+            // that reference this group, and the delete acts on that
+            // decision; without the lock a concurrent `create_group` under
+            // this parent can land between them and leave an orphan. Holding
+            // the row makes that writer wait and then find the parent gone.
+            // This is what lets the transaction run below SERIALIZABLE --
+            // see `delete_group`.
+            group_repo
+                .find_model_by_id_for_update(tx, group_id)
+                .await?
+                .ok_or_else(|| DomainError::group_not_found(group_id))?;
+
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4a
             let children = Self::get_direct_children(tx, group_id).await?;
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4a
