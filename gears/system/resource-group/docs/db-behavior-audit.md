@@ -55,7 +55,7 @@ depth-10 parent issued roughly 100 000 separate `INSERT`s.
 | RG-06 | n-plus-one | Medium-High | `group_repo.rs` `insert_ancestor_closure_rows` — one `INSERT` per ancestor | Fixed |
 | RG-07 | n-plus-one | Low-Medium | `type_repo.rs` — junction rows inserted one per allowed parent/membership type | Fixed |
 | RG-08 | redundant-io | Low-Medium | `group_repo.rs`/`type_repo.rs`/`membership_repo.rs` — insert discards the model it just got back, then re-reads the row by id | Fixed in all three, both halves. Inserts return what they wrote or assemble it from the values they were given; the `update_many` + re-read shape is gone too — `group_repo::update` returns `()` and `type_repo::update_type` returns only the timestamp it chose, and both callers build the response from what they wrote. `find_by_code_with_id` now hands back the row rather than just its id, so `update_type` has the immutable `created_at` without a second read |
-| RG-09 | external-call-in-tx | High | `group_service.rs` — a cross-gear `types_registry` call plus JSON-Schema compilation inside a `SERIALIZABLE` transaction, repeated on every retry | Fixed on the source branch; not in this one — transaction duration, not a query count |
+| RG-09 | external-call-in-tx | High | `group_service.rs` — a cross-gear `types_registry` call plus JSON-Schema compilation inside a `SERIALIZABLE` transaction, repeated on every retry | Fixed. Both entry points validate before `BEGIN`; the transaction-inner functions no longer take a `TypesRegistryClient`, so the call cannot return by accident. Guarded by a Section 4 rule |
 | RG-10 | n-plus-one | High | `group_service.rs` `force_delete_subtree` — ~4 statements per node | Fixed |
 | RG-11 | redundant-io | Low | `group_service.rs` — the same type resolved twice per create/update (`resolve_id` then `find_by_code`) | Fixed |
 | RG-12 | n-plus-one | Medium | `type_repo.rs` `list_types` — junction reads per row, so a page of N types costs `2N+1` queries. **Read path** — the only finding not on a write path | Fixed |
@@ -281,11 +281,9 @@ The point of the exercise. Nothing needs copying: the recorder lives in
 - **Membership ownership guard table** — a schema-level alternative to RG-01's
   fix. SSI plus retry is sufficient for correctness; the guard row would be
   stronger, opt-in hardening.
-(RG-08's `update` re-read was listed here on the grounds that removing the
-follow-up read meant restructuring the write to a read-then-`ActiveModel::update`
-shape, trading one read for another. That was wrong about the callers: both
-already held the row and both discarded what `update` returned, then read a
-third time to build the response. No trade was needed — see the table above.)
+- **RG-08's `update` re-read** — `update_many` returns only a row count, so
+  removing the follow-up read means restructuring the write to a read-then-
+  `ActiveModel::update` shape, trading one extra read for another.
 - **Two contract questions**, both pinned as executable `#[ignore]`d tests rather
   than silently accepted. They were written as drifts against DESIGN.md; since
   then DESIGN.md has been corrected to describe what the code actually does, so

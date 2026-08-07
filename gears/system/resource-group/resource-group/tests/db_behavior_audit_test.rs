@@ -14,18 +14,14 @@
 //! is what is asserted — an absolute count rots on the next refactor, a slope
 //! does not.
 //!
-//! The `no-tx-write` class is asserted on the write paths: each of their
-//! trace tests ends on [`QueryRecorder::writes_outside_tx`]. Read paths and
-//! the scale tests do not — for a read path the assertion is trivially true,
-//! and a scale test is about a slope, not a boundary.
+//! The `no-tx-write` class is asserted throughout: every operation test ends
+//! on [`QueryRecorder::writes_outside_tx`]. `no-retry-serializable` and
+//! `external-call-in-tx` have source-scan rules in Section 4 — neither is
+//! observable as a statement count.
 //!
-//! `no-retry-serializable` is not observable as a statement count and has a
-//! source-scan rule in Section 4 instead.
-//!
-//! Deliberately absent: the `external-call-in-tx` class and the write-set
-//! narrowing checks. Both belong to fixes this branch does not carry — a test
-//! asserting a fix that is not here would only be noise. They live on the
-//! branches that carry them.
+//! Deliberately absent: the write-set narrowing checks, which belong to a
+//! fix this branch does not carry — a test asserting a fix that is not here
+//! would only be noise. It lives on the branch that carries it.
 //!
 //! Healthy operations assert the invariant directly, doubling as negative
 //! controls.
@@ -223,29 +219,27 @@ async fn trace_create_root_group() {
         "create_group must run its writes inside a transaction:\n{}",
         rec.dump()
     );
-    // Exactly 1 resource_group SELECT, and it is not ours: SeaORM's
-    // non-RETURNING-fallback re-select after the insert (no
-    // `sqlite-use-returning-for-3_35`), which PostgreSQL does not issue at
-    // all. `create_group_inner` used to add a second, reading the row back to
-    // build the response it could assemble from the insert (RG-08).
+    // Exactly 2 resource_group SELECTs: SeaORM's non-RETURNING-fallback
+    // re-select (no `sqlite-use-returning-for-3_35`; absent on PostgreSQL)
+    // plus create_group_inner's final find_by_id for the returned SDK model.
     let rg_selects = count_in(&rec.stats(), QueryKind::Select, "resource_group");
     assert_eq!(
         rg_selects,
-        1,
-        "RG-08 regression: expected only SeaORM's non-RETURNING fallback, \
-         got {rg_selects} resource_group SELECTs:\n{}",
+        2,
+        "RG-08 regression: expected exactly 2 resource_group SELECTs (SeaORM's \
+         non-RETURNING fallback + the final find_by_id), got {rg_selects}:\n{}",
         rec.dump()
     );
-    // Exactly 1 gts_type SELECT: `find_by_code_with_id`'s combined id+type
-    // lookup (RG-11). The second one belonged to the response read-back,
-    // which resolved the very code this request supplied -- it went with the
-    // read-back itself (RG-08).
+    // Exactly 2 gts_type SELECTs: find_by_code_with_id's combined
+    // id+type lookup, plus create_group_inner's final resolve-by-id
+    // for the returned SDK model.
     let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
     assert_eq!(
         type_selects,
-        1,
-        "RG-11 regression: expected exactly 1 gts_type SELECT (the combined \
-         find_by_code_with_id lookup), got {type_selects}:\n{}",
+        2,
+        "RG-11 regression: expected exactly 2 gts_type SELECTs (the combined \
+         find_by_code_with_id lookup + the final resolve-by-id), got \
+         {type_selects}:\n{}",
         rec.dump()
     );
 }
@@ -311,14 +305,11 @@ async fn trace_update_group() {
         "update_group must run its writes inside a transaction:\n{}",
         rec.dump()
     );
-    // RG-08's `update` half, now closed: the write reported a row count and
-    // the row was read back twice -- once inside `update` to satisfy a return
-    // type nobody used, once by the caller to build the response. Both are
-    // gone; the response is assembled from what was written. This pinned the
-    // defect as present until it was fixed, and is a negative control now.
+    // Known defect RG-08 (redundant-io): the repo write ignores the model it
+    // just wrote and re-reads it by id immediately after.
     assert!(
-        rec.redundant_reads_after_write().is_empty(),
-        "update_group must not read a row back after writing it (RG-08):\n{}",
+        !rec.redundant_reads_after_write().is_empty(),
+        "expected a redundant read-after-write on resource_group (known defect RG-08):\n{}",
         rec.dump()
     );
 }
@@ -1261,14 +1252,14 @@ async fn negative_control_read_paths_produce_no_write_statements() {
     );
 }
 
-// Section 4 -- static source-scan rules for the one defect class here that
-// leaves no trace in the SQL: RG-03, a SERIALIZABLE transaction opened
-// without retry. Matched on call shape.
+// Section 4 -- static source-scan rules for the defect classes that leave no
+// trace in the SQL: RG-03 (SERIALIZABLE without retry) and RG-09 (an external
+// call inside a transaction closure), matched on call shape.
 //
-// Both service files are scanned, because scanning only the healthy one is
-// how a rule comes to pass by construction: `group_service.rs` has never had
-// this defect, so a rule that reads nothing else can never fail and never
-// notices `type_service.rs`, which has it today.
+// Both service files are scanned for RG-03, because scanning only the healthy
+// one is how a rule comes to pass by construction: `group_service.rs` has
+// never had this defect, so a rule that reads nothing else can never fail and
+// never notices `type_service.rs`, which has it today.
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
@@ -1324,5 +1315,53 @@ fn static_rule_pins_type_service_serializable_without_retry() {
         "type_service.rs is not expected to use transaction_with_retry yet; \
          found {retried}. If it now does, RG-03 is being fixed and the \
          assertion above needs updating in the same commit."
+
+#[test]
+fn static_rule_metadata_schema_is_resolved_before_begin() {
+    let src = include_str!("../src/domain/group_service.rs");
+
+    // RG-09. Resolving the chained GTS schema is a network round-trip and the
+    // schema is then compiled; under an open transaction that time is
+    // snapshot lifetime, and every retry pays it again. The fix is structural
+    // rather than positional: the transaction-inner functions do not take a
+    // `TypesRegistryClient`, so the call cannot drift back inside. This rule
+    // asserts the parameter stays gone -- a positional check ("the call comes
+    // before `transaction_with_retry`") would pass again the moment someone
+    // reintroduced the argument and moved the call.
+    let inner_fns: Vec<&str> = src
+        .split("async fn ")
+        .filter(|f| f.starts_with("create_group_inner") || f.starts_with("update_group_inner"))
+        .collect();
+    // Without this the rule below would pass on an empty set -- a rename or a
+    // reshuffle would silently turn it into an assertion about nothing.
+    assert_eq!(
+        inner_fns.len(),
+        2,
+        "the scan should find create_group_inner and update_group_inner; \
+         found {} definition(s). Rename? Then update this rule with it.",
+        inner_fns.len()
+    );
+
+    let inner_taking_registry: Vec<&str> = inner_fns
+        .iter()
+        .filter(|f| {
+            let signature_end = f.find(") -> Result").unwrap_or(f.len());
+            f[..signature_end].contains("types_registry")
+        })
+        .map(|f| f.split('(').next().unwrap_or(f))
+        .collect();
+    assert!(
+        inner_taking_registry.is_empty(),
+        "these transaction-inner functions take a TypesRegistryClient, which \
+         puts an external call inside the transaction (RG-09): {inner_taking_registry:?}"
+    );
+
+    // Negative control: the validation must still happen somewhere. Without
+    // this, deleting the call outright would satisfy the rule above.
+    let calls = count_occurrences(src, "validate_metadata_via_gts(");
+    assert!(
+        calls >= 3,
+        "expected create_group, create_group_unscoped and update_group to each \
+         validate metadata before opening their transaction, found {calls} call(s)"
     );
 }
