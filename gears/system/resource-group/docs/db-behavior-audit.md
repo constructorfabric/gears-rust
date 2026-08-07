@@ -54,7 +54,7 @@ depth-10 parent issued roughly 100 000 separate `INSERT`s.
 | RG-05 | n-plus-one | Medium | `group_service.rs` `move_group_internal_impl` — `is_descendant` + `get_relative_depth` per descendant; both answers were already in the rows loaded a moment earlier | Fixed |
 | RG-06 | n-plus-one | Medium-High | `group_repo.rs` `insert_ancestor_closure_rows` — one `INSERT` per ancestor | Fixed |
 | RG-07 | n-plus-one | Low-Medium | `type_repo.rs` — junction rows inserted one per allowed parent/membership type | Fixed |
-| RG-08 | redundant-io | Low-Medium | `group_repo.rs`/`type_repo.rs`/`membership_repo.rs` — insert discards the model it just got back, then re-reads the row by id | Partially fixed (insert paths; the `update_many` + re-read shape is left, see Deferred) |
+| RG-08 | redundant-io | Low-Medium | `group_repo.rs`/`type_repo.rs`/`membership_repo.rs` — insert discards the model it just got back, then re-reads the row by id | Fixed. Insert paths first; the `update_many` + re-read shape after, by dropping `update`'s unused return so it no longer reads, and assembling the response from what was written instead of reading again |
 | RG-09 | external-call-in-tx | High | `group_service.rs` — a cross-gear `types_registry` call plus JSON-Schema compilation inside a `SERIALIZABLE` transaction, repeated on every retry | Fixed on the source branch; not in this one — transaction duration, not a query count |
 | RG-10 | n-plus-one | High | `group_service.rs` `force_delete_subtree` — ~4 statements per node | Fixed |
 | RG-11 | redundant-io | Low | `group_service.rs` — the same type resolved twice per create/update (`resolve_id` then `find_by_code`) | Fixed |
@@ -269,9 +269,11 @@ The point of the exercise. Nothing needs copying: the recorder lives in
 - **Membership ownership guard table** — a schema-level alternative to RG-01's
   fix. SSI plus retry is sufficient for correctness; the guard row would be
   stronger, opt-in hardening.
-- **RG-08's `update` re-read** — `update_many` returns only a row count, so
-  removing the follow-up read means restructuring the write to a read-then-
-  `ActiveModel::update` shape, trading one extra read for another.
+(RG-08's `update` re-read was listed here on the grounds that removing the
+follow-up read meant restructuring the write to a read-then-`ActiveModel::update`
+shape, trading one read for another. That was wrong about the callers: both
+already held the row and both discarded what `update` returned, then read a
+third time to build the response. No trade was needed — see the table above.)
 - **Two contract questions**, both pinned as executable `#[ignore]`d tests rather
   than silently accepted. They were written as drifts against DESIGN.md; since
   then DESIGN.md has been corrected to describe what the code actually does, so

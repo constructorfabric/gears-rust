@@ -81,6 +81,13 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         tenant_id: Uuid,
     ) -> Result<rg_entity::Model, DomainError>;
 
+    /// Apply the update and return nothing.
+    ///
+    /// Deliberately not the updated row: `update_many` reports a row count,
+    /// so returning the model meant reading it straight back, and both
+    /// callers threw that model away and read again for themselves. Every
+    /// value the row now holds was supplied by the caller, so a caller that
+    /// wants the updated entity can assemble it without asking (RG-08).
     async fn update<C: DBRunner>(
         &self,
         db: &C,
@@ -89,7 +96,7 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         gts_type_id: i16,
         name: &str,
         metadata: Option<&serde_json::Value>,
-    ) -> Result<rg_entity::Model, DomainError>;
+    ) -> Result<(), DomainError>;
 
     async fn delete_by_id<C: DBRunner>(&self, db: &C, id: Uuid) -> Result<(), DomainError>;
 

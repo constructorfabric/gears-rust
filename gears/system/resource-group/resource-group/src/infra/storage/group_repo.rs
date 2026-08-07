@@ -715,7 +715,7 @@ impl GroupRepositoryTrait for GroupRepository {
         gts_type_id: i16,
         name: &str,
         metadata: Option<&serde_json::Value>,
-    ) -> Result<rg_entity::Model, DomainError> {
+    ) -> Result<(), DomainError> {
         let scope = system_scope();
 
         let parent_val: sea_orm::Value = match parent_id {
@@ -744,9 +744,7 @@ impl GroupRepositoryTrait for GroupRepository {
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        self.find_model_by_id(db, id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(id))
+        Ok(())
     }
 
     /// Delete a resource group entity by ID.

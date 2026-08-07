@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
 use resource_group_sdk::models::{
-    CreateGroupRequest, ResourceGroup, ResourceGroupWithDepth, UpdateGroupRequest,
+    CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupWithDepth, UpdateGroupRequest,
 };
 use resource_group_sdk::{GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH};
 use toolkit_db::secure::{DBRunner, TxConfig};
@@ -648,7 +648,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
 
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-6
             // Insert group
-            let _model = group_repo
+            let model = group_repo
                 .insert(
                     tx,
                     group_id,
@@ -675,11 +675,19 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-8a
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-8
 
-            let sys = toolkit_security::AccessScope::allow_all();
-            group_repo
-                .find_by_id(tx, &sys, group_id)
-                .await?
-                .ok_or_else(|| DomainError::database("Insert succeeded but group not found"))
+            // The row the insert returned, not a re-read of it. Its type path
+            // is the code this request named -- `type_id` was resolved from
+            // it above -- so nothing here needs the database again (RG-08).
+            Ok(ResourceGroup {
+                id: model.id,
+                code: req.code.clone(),
+                name: model.name,
+                hierarchy: GroupHierarchy {
+                    parent_id: model.parent_id,
+                    tenant_id: model.tenant_id,
+                },
+                metadata: model.metadata,
+            })
         } else {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5a
@@ -712,7 +720,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5
 
             // Insert group
-            let _model = group_repo
+            let model = group_repo
                 .insert(
                     tx,
                     group_id,
@@ -727,11 +735,17 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // Insert closure: self-row only
             group_repo.insert_closure_self_row(tx, group_id).await?;
 
-            let sys = toolkit_security::AccessScope::allow_all();
-            group_repo
-                .find_by_id(tx, &sys, group_id)
-                .await?
-                .ok_or_else(|| DomainError::database("Insert succeeded but group not found"))
+            // As in the child branch: the inserted row, not a read of it.
+            Ok(ResourceGroup {
+                id: model.id,
+                code: req.code.clone(),
+                name: model.name,
+                hierarchy: GroupHierarchy {
+                    parent_id: model.parent_id,
+                    tenant_id: model.tenant_id,
+                },
+                metadata: model.metadata,
+            })
         }
     }
 
@@ -875,7 +889,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-5
         // Persist name/parent/metadata. `gts_type_id` is reused from the
         // existing row — type is immutable on update.
-        let _model = group_repo
+        group_repo
             .update(
                 tx,
                 group_id,
@@ -888,11 +902,21 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-5
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-6
-        let sys = toolkit_security::AccessScope::allow_all();
-        group_repo
-            .find_by_id(tx, &sys, group_id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))
+        // Assembled, not read back. Every field was either just written from
+        // this request or reused from `existing` because it is immutable, and
+        // the type path was resolved above -- so the row the database now
+        // holds is fully determined here. The read this replaces was the
+        // second one after the write, the first being inside `update` itself.
+        Ok(ResourceGroup {
+            id: group_id,
+            code: existing_type_path,
+            name: req.name.clone(),
+            hierarchy: GroupHierarchy {
+                parent_id: req.parent_id,
+                tenant_id: existing.tenant_id,
+            },
+            metadata: req.metadata.clone(),
+        })
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-6
     }
 
@@ -974,11 +998,19 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-10
 
-        let sys = toolkit_security::AccessScope::allow_all();
-        group_repo
-            .find_by_id(tx, &sys, group_id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))
+        // Assembled rather than read back, as in `update_group_inner`: a move
+        // writes exactly one column, and the rest of the row is `existing`
+        // unchanged.
+        Ok(ResourceGroup {
+            id: group_id,
+            code: type_path,
+            name: existing.name,
+            hierarchy: GroupHierarchy {
+                parent_id: new_parent_id,
+                tenant_id: existing.tenant_id,
+            },
+            metadata: existing.metadata,
+        })
     }
 
     /// Inner logic for `delete_group`, runs inside a SERIALIZABLE transaction.
