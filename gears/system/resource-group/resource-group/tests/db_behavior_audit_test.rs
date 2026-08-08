@@ -1300,23 +1300,43 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
 
-const UNRETRIED_SERIALIZABLE: &str = ".transaction_ref_mapped_with_config(TxConfig::serializable()";
-const RETRIED_SERIALIZABLE: &str = ".transaction_with_retry(TxConfig::serializable()";
+/// The source of one `async fn`, from its name to the start of the next one.
+///
+/// These rules are text scans, so their reach is whatever slice they are
+/// handed, and handing them the whole file is how a rule comes to pass on
+/// someone else's code. Panics rather than returning empty: a rule that
+/// silently scans nothing is worse than one that fails.
+fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+    let prefix = format!("{name}(");
+    src.split("async fn ")
+        .find(|f| f.starts_with(&prefix))
+        .unwrap_or_else(|| {
+            panic!(
+                "no `async fn {name}(` in the scanned source -- renamed? then rename it here too"
+            )
+        })
+}
 
 #[test]
 fn static_rule_passes_group_service_uses_retry() {
     let src = include_str!("../src/domain/group_service.rs");
-    let unretried = count_occurrences(src, UNRETRIED_SERIALIZABLE);
-    let retried = count_occurrences(src, RETRIED_SERIALIZABLE);
+    // Matched without the level, unlike an earlier revision that looked for
+    // `.transaction_with_retry(TxConfig::serializable()` as one literal.
+    // `update_group` and `delete_group` choose their level first and pass the
+    // binding, so the literal missed exactly the two call sites where the
+    // choice is dynamic -- the ones a regression is most likely to touch --
+    // while the message claimed all four were covered.
+    let unretried = count_occurrences(src, ".transaction_ref_mapped_with_config(");
+    let retried = count_occurrences(src, ".transaction_with_retry(");
     assert_eq!(
         unretried, 0,
         "negative control violated: group_service.rs should not bypass \
-         transaction_with_retry for its SERIALIZABLE writes"
+         transaction_with_retry for its writes"
     );
     assert!(
-        retried >= 3,
-        "expected create/update/move/delete_group to all use \
-         transaction_with_retry, found {retried}"
+        retried >= 5,
+        "expected create/update/move/delete_group and the tenant-root create \
+         to all use transaction_with_retry, found {retried}"
     );
 }
 
@@ -1345,17 +1365,24 @@ fn static_rule_passes_type_service_uses_retry() {
 
 #[test]
 fn static_rule_non_force_delete_locks_before_it_decides() {
+    // Scoped to the two functions this is about, not to the file. Scanning
+    // the whole file made the second assertion pass by accident: `if force {`,
+    // `TxConfig::serializable()` and `TxConfig::default()` all appear
+    // somewhere in `group_service.rs` regardless of what `delete_group` does
+    // -- `update_group` alone supplies both TxConfig literals -- so hard-coding
+    // the level back would not have failed it.
     let src = include_str!("../src/domain/group_service.rs");
+    let delete_group = fn_body(src, "delete_group");
+    let delete_inner = fn_body(src, "delete_group_inner");
 
     // Not observable as SQL here: SQLite has no row locks and sea-query omits
     // the clause for it entirely, so the trace on this backend looks the same
-    // with and without the lock. On PostgreSQL it is the whole reason the
-    // non-force path may run below SERIALIZABLE -- it decides from a group's
-    // children and memberships and then deletes on that decision, and the
-    // lock is what keeps the decision true against a concurrent
-    // `create_group` under the same parent.
+    // with and without the lock. On PostgreSQL it is what makes the ordering
+    // against a concurrent `create_group` decidable -- the blocking itself
+    // comes from the foreign key's `FOR KEY SHARE`, see the comment in
+    // `delete_group`.
     assert!(
-        src.contains("find_model_by_id_for_update"),
+        delete_inner.contains("find_model_by_id_for_update"),
         "the non-force delete must lock the target row before checking its \
          children: without it, lowering the isolation level below SERIALIZABLE \
          opens the window it was closing"
@@ -1363,9 +1390,9 @@ fn static_rule_non_force_delete_locks_before_it_decides() {
 
     // And the level must still be chosen, not hard-coded back.
     assert!(
-        src.contains("if force {")
-            && src.contains("TxConfig::serializable()")
-            && src.contains("TxConfig::default()"),
+        delete_group.contains("if force {")
+            && delete_group.contains("TxConfig::serializable()")
+            && delete_group.contains("TxConfig::default()"),
         "delete_group must pick its isolation level from `force`: a force \
          delete rewrites a subtree and keeps SERIALIZABLE"
     );

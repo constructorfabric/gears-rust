@@ -741,6 +741,24 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| {
                 if e.is_unique_violation() {
                     DomainError::group_already_exists(id)
+                } else if e.is_foreign_key_violation() {
+                    // The parent this create read a moment ago is gone: a
+                    // concurrent non-force delete of it won the race, and
+                    // `fk_resource_group_parent` is `ON DELETE RESTRICT`, so
+                    // the loser learns about it here rather than from its own
+                    // read. That read is the caller's snapshot; the FK check
+                    // is not, which is exactly why this arm exists.
+                    //
+                    // It exists *now* because the non-force delete runs at the
+                    // backend default. Under SERIALIZABLE on both sides the
+                    // same race surfaced as a `40001` and the retry loop
+                    // re-read a clean answer; with the delete lowered, SSI has
+                    // no second serializable party to detect against and the
+                    // foreign key answers instead. Unmapped it was a 500.
+                    parent_id.map_or_else(
+                        || DomainError::database(e.to_string()),
+                        DomainError::group_not_found,
+                    )
                 } else {
                     DomainError::database(e.to_string())
                 }
