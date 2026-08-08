@@ -1,0 +1,266 @@
+---
+status: accepted
+date: 2026-07-25
+decision-makers: Constructor Fabric Steering Committee
+---
+
+# Type Schema Evolution Compatibility for Managed GTS Type Schemas
+
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Scope](#scope)
+- [Terminology](#terminology)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Backward-compatible evolution](#backward-compatible-evolution)
+  - [The comparison baseline](#the-comparison-baseline)
+  - [Content model is exposed, not mandated](#content-model-is-exposed-not-mandated)
+  - [Reporting](#reporting)
+  - [External Registry Sources](#external-registry-sources)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+  - [Require `BACKWARD` compatibility](#require-backward-compatibility)
+  - [Require `FULL` compatibility](#require-full-compatibility)
+  - [Make the mode configurable per version family or per identifier namespace](#make-the-mode-configurable-per-version-family-or-per-identifier-namespace)
+- [More Information](#more-information)
+  - [Industry Practice](#industry-practice)
+  - [Relationship to the GTS specification](#relationship-to-the-gts-specification)
+- [Traceability](#traceability)
+
+<!-- /toc -->
+
+**ID**: `cpt-cf-types-registry-adr-type-schema-evolution-compatibility`
+
+## Context and Problem Statement
+
+Types Registry must decide when a new definition may replace the current definition of the same managed GTS Type Schema identity.
+
+[GTS specification](https://github.com/globaltypesystem/gts-spec) 0.13 defines Type Schema Evolution Compatibility by inclusion of accepted-instance sets: backward means `Valid(old) ⊆ Valid(new)`, forward means `Valid(new) ⊆ Valid(old)`, and full means the two sets are equal. It leaves the enforced mode to the implementation (§6, item 6) and requires a registry to validate each successive definition against its preceding definition before publication (§5.3, item 2).
+
+Two other decisions in this gear determine what Types Registry needs from that vocabulary:
+
+* ADR-0004 makes a managed major-only GTS ID a mutable logical entity. Successive definitions are internal revisions of one identifier rather than new identifiers, and a managed `$ref` is a floating reference to the current revision.
+* ADR-0005 states that domain gears do not store a Type Schema revision in their rows. A stored Registry Reference resolves to the logical entity, and resolution returns the current revision.
+
+Together these remove the mechanism that a message-schema registry relies on. There is no per-object schema pinning, so no reader ever reconciles against the exact definition a payload was written under. The current revision must therefore accept payloads written under every earlier revision.
+
+## Scope
+
+This ADR decides:
+
+* the compatibility strategy Types Registry follows when a managed Type Schema evolves;
+* the comparison baseline for an admission candidate;
+* how a Type Schema's content model affects its ability to evolve in place, and what Types Registry does about it;
+* how forward-direction results and operational guarantees are reported;
+* what an External Registry Source must assert about its own evolution rules.
+
+This ADR does not decide Type Derivation Compatibility, which is a separate relation governed by the GTS specification and `cpt-cf-types-registry-fr-validate-type-derivation`. It does not decide transitions between successive values of a registered GTS Instance (ADR-0006), revision storage and retention (ADR-0005), or optimistic concurrency.
+
+## Terminology
+
+| Term | Meaning |
+|---|---|
+| Type Schema major identity | One logical managed GTS Type Schema identity within one major version, for example `gts.acme.crm.customer.type.v1~`. |
+| Schema revision | One immutable admitted definition of a Type Schema major identity. |
+| Current revision | The admitted revision returned by ordinary resolution and used as the comparison baseline. |
+| Effective schema | The authored schema after `allOf` chain aggregation, as the platform-approved GTS implementation materializes it. |
+| Backward compatible | `Valid(previous) ⊆ Valid(candidate)`, per GTS specification §4.3. |
+| Operational guarantee | A claim about producer or reader behaviour, casting, or default materialization. It is not schema compatibility and is reported separately. |
+
+## Decision Drivers
+
+* A stable GTS Type Schema identity must provide a predictable guarantee to consumers that hold a Registry Reference rather than a revision.
+* Floating references plus no revision in domain rows mean the current revision is the only definition a consumer ever validates against.
+* P1 has no owning-gear Validation Hooks, so any guarantee that depends on consumer-code behaviour cannot be enforced by the registry.
+* Admission cost should not grow with the number of retained revisions.
+* The registry must not restate or contradict semantics the GTS specification already defines.
+
+## Considered Options
+
+* Require `BACKWARD` compatibility.
+* Require `FULL` compatibility.
+* Make the mode configurable per version family or per identifier namespace.
+
+`FORWARD` is not among them. Under it the current revision may accept fewer instances than an earlier one, so a payload written earlier could be rejected by the definition a consumer resolves today. With floating references and no revision stored in domain rows, that is the one outcome the registry must never permit.
+
+## Decision Outcome
+
+Chosen option: **Types Registry follows a `BACKWARD` compatibility strategy and compares an admission candidate against the current revision only.**
+
+### Backward-compatible evolution
+
+A candidate is admissible only when `Valid(current) ⊆ Valid(candidate)` under the platform-approved GTS implementation. Because deciding that inclusion is not always possible for arbitrary JSON Schema, a candidate whose compatibility the implementation cannot establish is rejected rather than published; Types Registry fails closed and never treats an undecided check as a pass.
+
+This is exactly the guarantee the architecture requires. Because a domain object carries no revision and a `$ref` floats, the current revision is validated against payloads and references created under any earlier revision. Backward compatibility is the property that makes that safe.
+
+One profile is exempt, and it is exempt rather than weaker. ADR-0015 gives major version 0 the meaning of an unstable Type Schema: no mode is enforced for it, the freeze machinery below does not apply to it because it carries no whole-history guarantee to protect, and a revalidation pass after a semantic change of the relation skips it. That exemption is safe for everything decided here only because the same ADR forbids any entity outside the profile from referencing or deriving from one — without that rule a floating reference would carry the exemption upward into a chain this ADR does guarantee.
+
+`FULL` is not enforced. Under GTS 0.13 full compatibility requires the accepted-instance sets to be equal, so the only admissible in-place changes would be annotations such as `description`, `examples`, and `default`. That would make ADR-0004's mutable logical entity inert: no content update could ever preserve the GTS ID, and every change would require a new major identity.
+
+`FORWARD` is not enforced. Types Registry has no platform requirement to guarantee that an older reader accepts a newer payload, and it has no mechanism to establish which readers exist.
+
+### The comparison baseline
+
+An admission candidate is compared against the current revision. It is not compared against every retained revision.
+
+This is sufficient because backward compatibility is set inclusion, and set inclusion is transitive. If every admitted revision satisfies `Valid(rev_n) ⊆ Valid(rev_n+1)`, then `Valid(rev_1) ⊆ Valid(rev_N)` holds across the whole chain without any earlier revision being re-examined. GTS specification §5.3, item 2 states the same baseline as a registry requirement: validate each successive definition against its preceding definition before publication. The specification defines no transitive compatibility mode, and this ADR does not introduce one.
+
+The argument requires the chain to stay intact, which ADR-0005 guarantees — every revision is checked against the then-current revision, no admitted revision is removed, and the current pointer never moves backward.
+
+The erase-and-reintroduce hazard follows from the same property rather than from a separate rule. Under specification §4.5, adding and removing a property have opposite backward verdicts in each content model: in a closed model addition is backward compatible and removal is not, in an open model removal is backward compatible and addition is not. A property therefore cannot be dropped and later reintroduced under a different schema without one of the two steps failing the enforced mode.
+
+Consequently Types Registry does not compare a candidate against every retained revision, needs no cap on retained revisions for compatibility purposes, and has admission cost independent of history size.
+
+This depends on the platform-approved GTS implementation actually following the 0.13 semantics, since the superseded rules report some incompatible pairs as compatible and a candidate-versus-current check is **not** sufficient under them. That alignment is a prerequisite of this decision rather than an independent task: if the implementation does not provide it, the baseline chosen here is unsound and no amount of registry code repairs it.
+
+Because a checker upgrade can change the verdict for an unchanged pair of schemas, each admitted revision records the GTS specification version and platform GTS implementation version used for its check. Without that record the registry cannot identify which chains were validated under superseded rules. The field belongs to the revision record defined by ADR-0005.
+
+That record is the detection mechanism; the policy it serves is stated here. **The transitivity argument holds only within one version of the compatibility relation.** A chain whose edges were admitted under different semantics proves nothing about its endpoints, because an edge accepted under superseded rules may not satisfy the current relation at all.
+
+Types Registry therefore applies the following on a semantic change to the relation, whether from a GTS specification revision or an implementation correction:
+
+* a chain whose edges were all admitted under the current rule version carries the guarantee, and candidate-versus-current remains sufficient for it;
+* a logical entity whose chain spans a semantic change is **frozen for content evolution**: Types Registry **MUST NOT** admit a new content revision for it until the affected edges are revalidated under the current rules. Admitting one would extend a chain whose endpoints are already unproven, and the candidate-versus-current check would be computing a verdict on a premise that does not hold. Merely flagging the entity while letting it evolve would propagate the defect forward one revision at a time;
+* a frozen entity remains resolvable, discoverable, and valid as a reference target. Its content is real content, and withdrawing it would turn a possible failure into a certain one. Types Registry **MUST** expose that the entity is frozen and that the backward guarantee is not currently established for it;
+* lifecycle transitions are not gated. Deletion in particular remains available, because it is how an owner retires an entity whose chain cannot be repaired;
+* revalidation is an explicit operation over the affected entities, not a background sweep. On success the entity resumes ordinary evolution. On failure evolution under that identity stays closed in P1, and the owner continues under a new major identity — the same remedy any incompatible change uses. That closure is a **policy choice, not a proof of irreparability**, and claiming the latter would be wrong: failure means some retained `rev_k` is not included in the current revision, and a later candidate could in principle widen the accepted set to cover both, satisfying `Valid(current) ⊆ Valid(candidate)` and `Valid(rev_k) ⊆ Valid(candidate)` together and so restoring the whole-history guarantee. What P1 lacks is not the possibility but the check: ordinary admission compares against the current revision only — the property that keeps its cost independent of history size — and admitting a repair on that check alone would extend a chain whose endpoints are still unproven. A full-history admission mode would be a second ordered check sequence with a second cost model, built for the rarest state the registry has, when a new major reaches the same place at the cost of one re-point. If a semantic change ever strands enough chains to make that trade wrong, the repair-revision mode is additive and this is where it lands;
+* a compatibility check **MAY** still be run against a frozen entity, since CI needs the answer. Its result **MUST** report both the candidate-versus-current verdict and the fact that the chain is unproven. A bare pass would suggest the whole-history guarantee had been restored by a check that cannot restore it.
+
+Revalidation does not walk the chain edge by edge. For each retained revision `k` it checks `Valid(rev_k) ⊆ Valid(current)`, both sides resolved against the dependencies current at repair time — which is the property actually promised, since no consumer ever validates against `rev_k`.
+
+Current dependencies are sufficient rather than approximate: every dependency that contributes to the resolved form is a Type Schema evolving under the mode enforced here, so each is itself backward compatible, and conjunction is monotone, so `Effective(rev_k)@D_then ⊆ Effective(rev_k)@D_now`. The argument needs no premise about the other dependency kinds, because none of them reaches the resolved form. An `x-gts-ref` target is an instance-value constraint that is never inlined (ADR-0014), so a registered Instance named by one may change its value freely — which ADR-0006 permits, successive Instance values having no compatibility relation — without altering what the referring schema accepts. The non-monotone case, a reference under `not`, is caught instead by the dependent revalidation ADR-0005 requires before a target's new revision becomes current. A pass therefore reads only authored content, which is why ADR-0005 retains neither a dependency revision vector nor admission-time effective artifacts. The cost is history-proportional but paid once per rules change, not at admission.
+
+This costs nothing at P1 launch, where every admitted edge is checked under the same rules; it exists so the first semantic change after launch has a defined answer. ADR-0014 closes the second way a chain could span two rule versions by pinning the dialect — otherwise a repair pass would compare two revisions whose accepted-instance sets are defined under different validation semantics.
+
+### Content model is exposed, not mandated
+
+Types Registry does not require a managed Type Schema to declare `additionalProperties: false`.
+
+The content model does decide whether a Type Schema can evolve in place, and it decides it per object level. In an open object, adding an optional property is not backward compatible, because the previous definition already accepted arbitrary values under that property name. An open effective level therefore cannot gain properties in place at all, and such a change needs a new major identity; a closed effective level admits additive changes.
+
+Both are legitimate. A schema meant to be extended by derived types — in particular an `x-gts-abstract` base — needs an open level precisely so that derived types can declare properties there, and closing it would defeat its purpose under specification §3.1. A blanket closure rule would therefore be wrong at exactly the levels that exist in order to be extended.
+
+The platform's schema-generation toolchain already resolves this per level rather than per schema: a generated Type Schema closes the root of a base type and the level that carries a derived type's own properties, while leaving each declared extension container open for the next derivation level. That is the closed-envelope-with-designated-open-containers shape recommended by specification §4.4.1, so a generated Type Schema is evolvable in place at the levels its owner actually edits. Types Registry relies on that property of the schemas it receives, not on how they are produced.
+
+The property does not extend to every level of such a schema. An object level introduced by a generated property subschema is open unless its author closes it, and hand-authored or externally supplied schemas carry no guarantee at all. Both cases are admitted normally and reported as not evolvable at the affected level.
+
+Instead of a rule, Types Registry makes the consequence visible:
+
+* at admission it classifies every object level of the fully resolved effective schema as open, closed, or partially open, and reports evolvability per level rather than as one verdict for the document. A single top-level flag is insufficient for the closed-envelope shape: a derived type's own properties live inside an extension container, so the level that decides its evolvability is not the document root. A partially open level is reported as such rather than forced into either category;
+* the classification **MUST** be computed after GTS reference resolution, because a derived Type Schema may be closed at a level only through the `$ref` to its base. It is not a test of the authored `additionalProperties` keyword: GTS specification §4.4 requires the classification to come from the resolved schema, because `unevaluatedProperties`, `patternProperties`, `propertyNames`, a schema-valued `additionalProperties`, or a conjunctive subschema reached through `allOf` or `$ref` can all change whether undeclared properties are accepted;
+* resolution metadata exposes the same per-level property, so an owner or CI check learns it immediately rather than at the first update that fails a compatibility check.
+
+Owners that want in-place evolution **SHOULD** use the closed envelope with designated open containers described in specification §4.4.1: the closed envelope carries evolvability, the declared open containers carry extensibility by derivation. Generated Type Schemas obtain that shape for the levels the toolchain owns; an owner who introduces further object levels **SHOULD** close them explicitly, otherwise those levels cannot gain properties in place. How a given authoring toolchain expresses closure is a platform authoring convention, not a registry rule. Closing a trait sub-schema would break `allOf` composition and is not expected.
+
+### Reporting
+
+Ordinary compatibility results expose:
+
+* the backward-compatibility verdict against the current revision;
+* the forward-direction result as advisory metadata, since the platform GTS implementation computes both directions in one call and the information is useful to owners without gating admission;
+* structured diagnostics identifying the offending schema location.
+
+Operational guarantees are reported separately from schema compatibility, as specification §4.3 requires. P1 does not certify tolerant-reader contracts, constrained-producer conventions, casting, or default materialization, and **MUST NOT** present any of them as a schema-compatibility result.
+
+### External Registry Sources
+
+An External Registry Source remains authoritative for its own evolution rules, and Types Registry **MUST NOT** relabel a source guarantee, of any strength, as the platform guarantee. A consumer distinguishes the two from `origin` on the read result.
+
+Nothing more is asked of a source about its evolution — no declared guarantee, and no platform check against one. There is nothing such a declaration could gate: the only consumer it would protect is a managed Type Schema referencing an external one, which ADR-0011 makes unrepresentable, so no managed verdict can depend on how a source evolves its definitions. A gear that reads an external entity directly decides for itself what it needs of it, as it does for any content the platform does not govern.
+
+A managed Type Schema cannot reference an externally managed one. ADR-0011 prohibits that direction in P1, and one of its four reasons is the evolution guarantee: specification §4.5 makes the compatibility of a referenced-type change depend on the effective resolved schemas, so a managed schema would inherit the weakest guarantee in its reference closure and could not claim backward compatibility unless the owning source asserted backward monotonicity per revision. The rule stated here therefore applies to a managed reference closure that is entirely managed, which is the only closure P1 admits.
+
+### Consequences
+
+* Every managed Type Schema whose major version is 1 or higher follows the same backward-compatible evolution rule. Major 0 is the single exemption, quarantined from the rest by ADR-0015.
+* Admission cost is independent of retained history, so retention growth is a storage question only.
+* An open effective level is admitted normally, but cannot later gain properties in place; a change at that level requires a new major identity. Types Registry reports this per level up front rather than at the first failed update.
+* Generated Type Schemas are evolvable in place at the levels that carry their own properties, so ADR-0004's mutable logical entity is the normal case for platform gears rather than an exception. Object levels the toolchain does not own are the residual hazard and are addressed by an authoring convention, not by a registry rule.
+* Alignment of the platform GTS implementation with GTS 0.13, including per-level content-model classification computed on the resolved effective schema, is a P1 prerequisite of this decision. DESIGN enumerates the capabilities it covers and records verifying them as an implementation prerequisite.
+* Every comparison this ADR governs is between two documents of one dialect, because ADR-0014 pins it for the lifetime of a logical entity. Otherwise `Valid(S)` would be dialect-relative on both sides and the set-inclusion argument would not compose.
+* OP#8 as specified compares two definitions addressed by distinct GTS Type Identifiers, which ADR-0004's in-place replacement model never produces. Types Registry therefore uses the document-level compatibility entry point of the platform GTS implementation and owns its own revision addressing, as specification §4.2 anticipates.
+* Where a contract needs old readers to accept new payloads, the owner uses a new major identity.
+
+### Confirmation
+
+This decision is confirmed when:
+
+* admission rejects a candidate that is not backward compatible with the current revision, and admits one that is;
+* admission compares against the current revision only, and a test with a long revision history shows admission cost independent of history length;
+* the erase-and-reintroduce sequence is rejected: a revision that drops a property and a later revision that reintroduces it under a different schema cannot both be admitted;
+* admission reports evolvability per object level, classified from the resolved effective schema, and admits open-topped and `x-gts-abstract` schemas without objection;
+* the classification is exercised against a schema closed only by `unevaluatedProperties`, one closed only through an `allOf` branch, one closed only through a resolved GTS `$ref` to its base, and one made partially open by a schema-valued `additionalProperties`;
+* an additive update to a Type Schema in the closed-envelope shape is admitted at the level carrying its own properties, while the same update at an open level is rejected as not backward compatible, and the diagnostic identifies the open level rather than the document root;
+* trait-composed schemas are accepted when the effective outer level is closed even though trait sub-schemas are not;
+* compatibility results expose the backward verdict and the forward result labelled as advisory;
+* no compatibility result presents a tolerant-reader, casting, or default-materialization claim as schema compatibility;
+* each admitted revision records the specification and implementation versions used for its check;
+* a chain whose edges span a semantic change of the compatibility relation is reported as not carrying the backward guarantee, and a new content revision for that logical entity is rejected, while its resolution, discovery, reference validation, and deletion continue to work;
+* a compatibility check against a frozen entity reports the candidate-versus-current verdict together with the unproven-chain state, and never a bare pass;
+* successful revalidation restores ordinary evolution, and failed revalidation leaves the identity closed to new content revisions in P1, with the refusal reported as an unproven chain rather than as a compatibility verdict on the candidate;
+* the platform GTS implementation passes GTS 0.13 conformance for open-model property addition and removal and for both enum directions;
+* no result presents a source's own evolution behaviour as the platform guarantee, and no admission or federation check reads a source assertion about it.
+
+## Pros and Cons of the Options
+
+### Require `BACKWARD` compatibility
+
+* Good, because it is exactly the guarantee the floating-reference and no-revision-in-rows architecture requires.
+* Good, because admission cost is constant in history size and no revision cap is needed.
+* Good, because it matches the default strategy of the closest industry analogue.
+* Bad, because the platform gives no forward-direction guarantee; a contract whose old readers may receive new payloads must use a new major identity.
+* Bad, because whether a given Type Schema can actually evolve in place depends on the content model its author chose, so the guarantee is uniform while its practical reach is not.
+* Bad, because its sufficiency depends on the implementation being aligned with GTS 0.13, and is reopened by any later semantic change to the relation, which is what the freeze machinery exists for.
+
+### Require `FULL` compatibility
+
+* Good, because producers and consumers could be deployed in any order without coordination.
+* Bad, because under GTS 0.13 full compatibility is equality of accepted-instance sets, so it admits only annotation changes and semantics-preserving refactorings. Applied platform-wide it would make ADR-0004's mutable logical entity unusable and force a new major identity for every semantic change, defeating the stable-Registry-Reference goal of ADR-0001.
+* Bad, because it would be a platform-wide answer to a per-type question: most contracts do not need it, and the ones that do are asking for immutability rather than for a different evolution policy.
+
+### Make the mode configurable per version family or per identifier namespace
+
+GTS 0.13 offers this latitude explicitly: §4.3 notes that "systems may enforce different modes for different identifier namespaces", and §6 leaves the enforced mode to the implementation. Types Registry could expose the mode as policy — selected for a version family at its first admission, or attached to a namespace — rather than fixing one platform-wide value.
+
+* Good, because a contract that genuinely needs producers and consumers deployed in any order could ask for `FULL` without imposing it on every other type. The family record introduced by ADR-0008 already provides durable per-family policy storage, so the objection that this option requires new state is weaker than it was when it was first considered.
+* Bad, because the configurable set could only be `BACKWARD` and `FULL`. `FORWARD` remains unavailable for the architectural reason above, so configurability would not unlock the case that usually motivates it — an event contract wanting old readers to accept new payloads — and `FULL` under 0.13 is nearer to immutability than to an alternative evolution policy.
+* Bad, because a managed `$ref` floats, so the guarantee a Type Schema offers is the weakest mode in its reference closure. Under one platform mode that holds automatically; under configurable modes it becomes a property that has to be computed, pinned at admission, and rechecked whenever any member of the closure changes. That is the problem this ADR currently confines to External Registry Sources, imported into managed entities.
+* Bad, because derivation crosses ownership: a tenant deriving from a platform base cannot hold its own type to a stronger guarantee than the base whose mode another owner controls.
+* Bad, because the mode would be effectively immutable once chosen. Strengthening says nothing about history, and weakening retracts a guarantee consumers may already rely on — so it would be selected before the consumers who care about it exist.
+
+Adopting it would first require deciding where the mode attaches and how precedence works if namespaces are used, which introduces a second prefix-policy system over the identifier space that Source Claims already partition; whether the effective mode of a reference closure is computed and pinned; what a mode means for registered Instances, whose successive values have no compatibility relation at all; and whether the mode participates in the resolution cache validator, since changing it changes the meaning of a result.
+
+## More Information
+
+### Industry Practice
+
+* [Confluent Schema Registry](https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html) defaults to `BACKWARD` and documents it as non-transitive. Its transitive strategies compare against all previous versions, while the non-transitive strategy compares only against the most recent version. Its JSON Schema rules reason about open and closed content models in the same way GTS 0.13 does, and its documented advice for an evolvable schema is to close the content model from the start.
+* [Kubernetes API deprecation policy](https://kubernetes.io/docs/reference/using-api/deprecation-policy/) forbids removing or changing an API element within an existing API version and requires a new version for incompatible evolution. This is the closer analogue for a platform type registry, where consumers are built against a version as a whole rather than reconciling per payload.
+* [Protocol Buffers](https://protobuf.dev/programming-guides/proto3/#updating) permits field removal but permanently reserves the field identity, showing that the hazard is identity reuse rather than removal itself.
+
+### Relationship to the GTS specification
+
+This ADR selects behaviour inside the latitude GTS 0.13 leaves to implementations. It requires backward compatibility as defined by the specification and adds no authoring rule the specification does not already recommend. It does not redefine compatibility, transitivity, or derivation.
+
+It declines one part of that latitude deliberately. §4.3 permits an implementation to enforce different modes for different identifier namespaces; Types Registry enforces one mode platform-wide, for the reasons recorded against the configurable option above. Should that be revisited, the specification permits the change without amendment.
+
+## Traceability
+
+- **PRD**: [../PRD.md](../PRD.md)
+- **DESIGN**: [../DESIGN.md](../DESIGN.md)
+- **ADR-0002**: [0002-cpt-cf-types-registry-adr-external-source-live-delegation.md](./0002-cpt-cf-types-registry-adr-external-source-live-delegation.md)
+- **ADR-0004**: [0004-cpt-cf-types-registry-adr-gts-minor-version-identity-evolution.md](./0004-cpt-cf-types-registry-adr-gts-minor-version-identity-evolution.md)
+- **ADR-0005**: [0005-cpt-cf-types-registry-adr-type-schema-revisions.md](./0005-cpt-cf-types-registry-adr-type-schema-revisions.md)
+- **ADR-0014**: [0014-cpt-cf-types-registry-adr-managed-type-schema-dialect-profile.md](./0014-cpt-cf-types-registry-adr-managed-type-schema-dialect-profile.md)
+- **ADR-0011**: [0011-cpt-cf-types-registry-adr-managed-external-boundary.md](./0011-cpt-cf-types-registry-adr-managed-external-boundary.md) — forbids a managed Type Schema from referencing an externally managed one, so the guarantee defined here applies to a reference closure that is entirely managed.
+- **ADR-0015**: [0015-cpt-cf-types-registry-adr-major-zero-unstable-profile.md](./0015-cpt-cf-types-registry-adr-major-zero-unstable-profile.md) — exempts major 0 from the mode enforced here, and quarantines it so the exemption cannot reach a chain this ADR guarantees.
+- **GTS specification**: [Global Type System](https://github.com/globaltypesystem/gts-spec) §4.1–§4.5, §5.3, §6
+
+This decision directly addresses:
+
+* `cpt-cf-types-registry-fr-validate-schema-compat` - defines the guarantee enforced for managed Type Schema evolution and the baseline it is checked against.
+* `cpt-cf-types-registry-fr-ref-tracking` - a floating reference remains valid because the current revision stays backward compatible with the revision a dependent was admitted against.
+* `cpt-cf-types-registry-usecase-validate-type-evolution` - defines what CI and admission must prove before an in-place change is accepted.
