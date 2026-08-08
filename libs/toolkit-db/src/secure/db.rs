@@ -204,15 +204,12 @@ fn is_in_transaction() -> bool {
     IN_TX.try_with(Cell::get).unwrap_or(false)
 }
 
-/// Execute a closure with the transaction guard set.
+/// Whether the caller is inside a transaction, for query recorders that tag
+/// captured SQL as in-tx or out-of-tx.
 ///
-/// This sets `IN_TX = true` for the duration of the closure, ensuring
-/// that any calls to `Db::conn()` within will fail.
-/// Name the class of a `SqlErr` without echoing its payload.
+/// Reads the same task-local the guard enforces, so the answer is the one
+/// `Db::conn()` acts on rather than a guess from the SQL text.
 ///
-/// `SqlErr`'s variants carry the driver's message, which on `PostgreSQL` and
-/// `MySQL` includes the conflicting column values; the discriminant alone is
-/// what a log line can safely say.
 /// Gated behind the `test-support` feature; never used by production code.
 #[cfg(feature = "test-support")]
 #[must_use]
@@ -220,6 +217,11 @@ pub fn in_transaction_for_testing() -> bool {
     is_in_transaction()
 }
 
+/// Name the class of a `SqlErr` without echoing its payload.
+///
+/// `SqlErr`'s variants carry the driver's message, which on `PostgreSQL` and
+/// `MySQL` includes the conflicting column values; the discriminant alone is
+/// what a log line can safely say.
 fn sql_err_kind(err: Option<&sea_orm::SqlErr>) -> &'static str {
     match err {
         Some(sea_orm::SqlErr::UniqueConstraintViolation(_)) => "unique_constraint_violation",
@@ -231,6 +233,11 @@ fn sql_err_kind(err: Option<&sea_orm::SqlErr>) -> &'static str {
     }
 }
 
+/// Execute a closure with the transaction guard set.
+///
+/// Sets `IN_TX = true` for the duration of the closure, so that any call to
+/// `Db::conn()` within it fails rather than silently opening a second
+/// connection outside the transaction.
 async fn with_tx_guard<F, T>(f: F) -> T
 where
     F: Future<Output = T>,
@@ -662,11 +669,14 @@ impl Db {
     /// [`tracing`] event (`ERROR` for budget exhaustion, `WARN` for an
     /// unrecognized error) carrying the attempt number, the budget, the
     /// backend, the `retryable` flag, which phase of the transaction failed
-    /// (begin/body/commit), `SeaORM`'s best-effort `sql_err()` classification,
-    /// and the underlying `DbErr`'s message. Only emitted when
-    /// `extract_db_err` actually found a `DbErr` -- a plain non-database
-    /// domain error was never a retry candidate, so logging it here on every
-    /// occurrence would drown both outcomes above in noise.
+    /// (begin/body/commit), and the *class* of `SeaORM`'s best-effort
+    /// `sql_err()` classification. Deliberately not the driver's message:
+    /// on `PostgreSQL` and `MySQL` a constraint violation embeds the
+    /// conflicting column values, and this is shared infrastructure whose
+    /// logs every gear inherits. Only emitted when `extract_db_err` actually
+    /// found a `DbErr` -- a plain non-database domain error was never a retry
+    /// candidate, so logging it here on every occurrence would drown both
+    /// outcomes above in noise.
     ///
     /// # Errors
     ///

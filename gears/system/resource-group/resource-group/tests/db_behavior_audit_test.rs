@@ -501,7 +501,7 @@ async fn trace_list_memberships() {
     assert_eq!(
         membership_selects,
         1,
-        " regression: expected exactly 1 resource_group_membership \
+        "RG-12 regression: expected exactly 1 resource_group_membership \
          SELECT for the page (no N+1 from the per-row tenant-scope subquery), \
          got {membership_selects}:\n{}",
         rec.dump()

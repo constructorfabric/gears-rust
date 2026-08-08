@@ -326,16 +326,25 @@ impl GroupRepository {
         paths.sort_unstable();
         paths.dedup();
 
+        // These paths come straight out of the client's `$filter`, so their
+        // number is the caller's choice. `ODataLimits::max_filter_length`
+        // would bound it, but `validate_filter` is not called anywhere in the
+        // workspace, so today the only ceiling is the transport's URI limit.
+        // Chunked against the bind ceiling like every other client-fed list
+        // here -- `type_repo`'s `resolve_ids` and the removed-parent sweep
+        // already are, and this was the one that was not.
         let scope = system_scope();
-        let rows = GtsTypeEntity::find()
-            .filter(gts_type::Column::SchemaId.is_in(paths))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-        let ids: std::collections::HashMap<String, i16> =
-            rows.into_iter().map(|t| (t.schema_id, t.id)).collect();
+        let mut ids: std::collections::HashMap<String, i16> = std::collections::HashMap::new();
+        for chunk in paths.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            let rows = GtsTypeEntity::find()
+                .filter(gts_type::Column::SchemaId.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            ids.extend(rows.into_iter().map(|t| (t.schema_id, t.id)));
+        }
 
         Self::substitute_type_filter_ids(node, &ids)
     }

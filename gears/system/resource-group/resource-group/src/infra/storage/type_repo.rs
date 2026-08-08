@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use resource_group_sdk::ResourceGroupType;
 use resource_group_sdk::odata::TypeFilterField;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use toolkit_db::odata::{LimitCfg, paginate_odata};
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
@@ -567,21 +567,52 @@ impl TypeRepositoryTrait for TypeRepository {
             .collect();
         let parent_type_ids: Vec<i16> = parent_types.iter().map(|t| t.id).collect();
 
-        // Groups of the child type being updated -- one query, independent
-        // of how many candidate parent types there are.
-        let groups: Vec<rg_entity::Model> = ResourceGroupEntity::find()
-            .filter(rg_entity::Column::GtsTypeId.eq(child_type_id))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+        // Only the groups that actually violate: those of the child type
+        // whose parent is of one of the candidate types. The database decides
+        // that, so a widely-used type with no violation returns no rows.
+        //
+        // The previous form asked only `gts_type_id = child_type_id` and
+        // filtered afterwards, which loaded *every* group of that type into
+        // the process -- unbounded by anything the request said, inside the
+        // `SERIALIZABLE` transaction `update_type` holds open. What is left
+        // is bounded by the answer itself: a caller asking which groups it
+        // must fix has to receive one row per group it must fix.
+        //
+        // A join projecting the parent's type would answer in one statement
+        // instead of two, but `SecureSelect` exposes `all`/`one`/`count` over
+        // `E::Model` only, so that projection would have to leave the secure
+        // layer -- and `resource_group` declares scope columns. The subquery
+        // below is hand-built and inherits no scope predicate of its own; it
+        // is safe because this method runs under the system scope it
+        // constructs itself above, where `build_scope_condition` is empty.
+        // Give this method a caller-supplied scope and the subquery has to be
+        // scoped with it.
+        let budget = toolkit_db::secure::max_bind_params_for(db);
+        let mut violating: Vec<rg_entity::Model> = Vec::new();
+        for type_chunk in parent_type_ids.chunks(budget.saturating_sub(1).max(1)) {
+            let parents_of_candidate_type = Query::select()
+                .column(rg_entity::Column::Id)
+                .from(ResourceGroupEntity)
+                .and_where(Expr::col(rg_entity::Column::GtsTypeId).is_in(type_chunk.to_vec()))
+                .to_owned();
 
-        // One entry per group that has a parent, so this list grows with the
-        // number of groups of the child type, not with the number of
-        // candidate codes -- and siblings sharing a parent repeat it.
-        // Deduplicate before binding: it is both fewer parameters and fewer
-        // rows for the database to match.
+            let found: Vec<rg_entity::Model> = ResourceGroupEntity::find()
+                .filter(rg_entity::Column::GtsTypeId.eq(child_type_id))
+                .filter(rg_entity::Column::ParentId.in_subquery(parents_of_candidate_type))
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            violating.extend(found);
+        }
+
+        let groups = violating;
+
+        // One entry per violating group, so this list grows with the number
+        // of violations, not with the number of groups of the child type --
+        // and siblings sharing a parent repeat it. Deduplicate before
+        // binding: it is both fewer parameters and fewer rows to match.
         let mut parent_ids: Vec<uuid::Uuid> = groups.iter().filter_map(|g| g.parent_id).collect();
         parent_ids.sort_unstable();
         parent_ids.dedup();
@@ -607,7 +638,6 @@ impl TypeRepositoryTrait for TypeRepository {
         // half, so the inner budget is never squeezed to nothing. In the
         // ordinary case -- a handful of candidate parent types -- the outer
         // loop runs once and the ids get the whole remainder.
-        let budget = toolkit_db::secure::max_bind_params_for(db);
         let type_budget = budget.div_euclid(2).max(1);
 
         let mut parent_type_by_id: std::collections::HashMap<uuid::Uuid, i16> =
