@@ -107,10 +107,22 @@ mod tests {
     use sea_orm::DbErr;
 
     // The classifiers are reached through two shapes: the typed `SqlErr` the
-    // driver produces, and the `DbErr::Custom` a caller that re-wrapped the
-    // error through `to_string()` leaves behind. Repositories in this
-    // workspace do exactly that, so the message path is the one that
-    // actually runs in production, not a fallback.
+    // driver produces, and the `DbErr::Custom` left by a caller that
+    // re-wrapped the error through `to_string()`.
+    //
+    // In this workspace the *typed* shape is the production one for these two
+    // functions: every call site classifies the raw `ScopeError::Db` straight
+    // out of `secure_insert`/`secure_delete`, and only stringifies what the
+    // classifier already rejected. (`is_retryable_contention` is the opposite
+    // case, and the one RG-15 was about -- do not carry that conclusion
+    // across.)
+    //
+    // The typed path cannot be exercised from here: it needs a `DbErr` whose
+    // `sql_err()` resolves, and that requires a real `PgDatabaseError` or
+    // `SqliteError`, both of which have crate-private constructors. It is
+    // covered end-to-end instead, by tests that provoke a genuine violation
+    // against live SQLite. What is left for a unit test is the message
+    // matching below, per backend.
 
     #[test]
     fn foreign_key_violation_detected_per_backend_message() {
@@ -134,6 +146,13 @@ mod tests {
         // "already exists" -- so a classifier that matched both would report
         // the wrong conflict.
         let unique = DbErr::Custom("UNIQUE constraint failed: gts_type.schema_id".to_owned());
+        let unique_pg = DbErr::Custom(
+            "error returned from database: duplicate key value violates unique constraint \
+             \"gts_type_schema_id_key\""
+                .to_owned(),
+        );
+        assert!(is_unique_violation(&unique_pg));
+        assert!(!is_foreign_key_violation(&unique_pg));
         let fk = DbErr::Custom("FOREIGN KEY constraint failed".to_owned());
 
         assert!(is_unique_violation(&unique));
