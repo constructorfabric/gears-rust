@@ -41,7 +41,7 @@
 //! let user_id = result?;
 //! ```
 
-use std::{cell::Cell, future::Future, pin::Pin, sync::Arc};
+use std::{cell::Cell, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use sea_orm::{DatabaseConnection, DatabaseTransaction, TransactionTrait};
 
@@ -60,12 +60,133 @@ use crate::{DbError, DbHandle};
 ///   [`crate::contention::is_retryable_contention`] (`PostgreSQL`
 ///   serialization failures / deadlocks, `MySQL`/`InnoDB` deadlocks,
 ///   `SQLite` `BUSY` / `BUSY_SNAPSHOT`);
-/// - bounded latency on the hot path — no exponential backoff, just
-///   immediate retry of a guaranteed-stale transaction;
+/// - bounded latency on the hot path — the success path pays no backoff at
+///   all, and even a fully-exhausted retry sequence only ever waits through
+///   [`RETRY_BACKOFF_MAX`]-capped, millisecond-scale delays (see
+///   [`retry_backoff_delay`]), not a real exponential-backoff schedule;
 /// - predictable failure semantics — after exhausting attempts the
 ///   original error is returned, so callers can surface e.g.
 ///   `503 Service Unavailable`.
 pub const DEFAULT_TX_RETRY_ATTEMPTS: u32 = 3;
+
+/// Base delay (milliseconds) for the retry backoff computed by
+/// [`retry_backoff_delay`].
+///
+/// Deliberately tiny: the only job of this delay is to de-synchronize two
+/// transactions that just collided, not to add real latency to a path that
+/// is already a bounded, small-N retry loop. See [`retry_backoff_delay`]
+/// for the full rationale.
+const RETRY_BACKOFF_BASE_MS: u64 = 2;
+
+/// Growth factor applied on top of [`RETRY_BACKOFF_BASE_MS`] by
+/// [`retry_backoff_delay`]'s [`ExponentialBackoff`](tokio_retry::strategy::ExponentialBackoff).
+///
+/// With base `2` and factor `5`, pre-jitter delays are `10ms, 20ms, 40ms,
+/// …` — i.e. attempt 2 waits up to ~10ms, attempt 3 up to ~20ms, doubling
+/// per further attempt (workspace default `DEFAULT_TX_RETRY_ATTEMPTS = 3`
+/// only ever reaches the first of these).
+const RETRY_BACKOFF_FACTOR: u64 = 5;
+
+/// Upper bound on any single retry backoff delay, in case a caller raises
+/// `max_attempts` well above [`DEFAULT_TX_RETRY_ATTEMPTS`].
+const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(100);
+
+/// Delay to wait before retrying transaction attempt `next_attempt`
+/// (1-based, counting the attempt about to run — so `next_attempt == 2` is
+/// the delay before the *second* try, right after the first collided).
+///
+/// # Why back off at all
+///
+/// Before this, [`Db::transaction_with_retry_max`] looped straight back to
+/// `BEGIN` on a retryable contention error, with no delay whatsoever. Two
+/// transactions that collide once (e.g. both inserting a first row under
+/// the same predicate lock) restart at essentially the same instant; with
+/// nothing to de-synchronize them, they are liable to collide again on the
+/// very next attempt and burn through the whole (small) attempt budget
+/// within a few milliseconds without ever getting staggered. This is the
+/// diagnosed root cause of a rare (reported ~1-in-14 runs) flake in a
+/// Postgres-backed concurrency test of `cf-gears-resource-group`, where two
+/// concurrent `add_membership` calls under `SERIALIZABLE` retry each other
+/// into exhaustion instead of the invariant-preserving "one wins, one gets a
+/// clean `TenantIncompatibility`" outcome. The failure
+/// mode itself did not reproduce in extensive local testing (see the
+/// commit message for numbers) -- this fix closes the one genuine gap the
+/// diagnosis identified (this is the only retry loop in the workspace with
+/// no backoff at all; see `git log --oneline -- libs/toolkit-db/src/advisory_locks.rs`
+/// for the sibling lock-retry path, which always had one), on a mechanism
+/// that is well established for this class of database contention retry.
+///
+/// # Why jitter is mandatory
+///
+/// Without jitter, two competing transactions computing the *same*
+/// deterministic delay from the *same* backoff schedule would simply sleep
+/// in lockstep and re-collide synchronized, defeating the point of backing
+/// off at all. [`tokio_retry::strategy::jitter`] is already a dependency of
+/// this crate -- see `advisory_locks::LockManager::try_lock` for its other,
+/// pre-existing use in this same module tree -- so reusing it here adds no
+/// new dependency; it applies `rand`-backed full jitter (multiplying the
+/// delay by a fresh uniform `[0, 1)` sample), which is exactly the
+/// de-synchronization primitive contention retries need.
+///
+/// # Why this shape, this small
+///
+/// [`ExponentialBackoff`](tokio_retry::strategy::ExponentialBackoff) from
+/// `tokio-retry` (already used the same way for advisory-lock retries)
+/// gives growth-with-attempt for free. The base/factor are tuned so the
+/// *pre-jitter* delay is single-to-double-digit milliseconds even at the
+/// first retry point, capped at [`RETRY_BACKOFF_MAX`] — enough to scatter
+/// competing retries across a real window, not enough to meaningfully slow
+/// down the already-rare contention path. This is unconditional on backend:
+/// the same tiny delay is correct whether the caller is retrying a
+/// `PostgreSQL` serialization failure, a `MySQL`/`InnoDB` deadlock, or a
+/// `SQLite` `database is locked` -- all three benefit equally from not
+/// re-colliding in lockstep, and none of them need more than milliseconds
+/// of staggering to avoid it.
+fn retry_backoff_delay(next_attempt: u32) -> Duration {
+    use tokio_retry::strategy::{ExponentialBackoff, jitter};
+
+    debug_assert!(
+        next_attempt >= 2,
+        "attempt 1 (the first try) is never delayed"
+    );
+    // 0-based index into the backoff sequence: the delay before attempt 2
+    // is the sequence's first element, attempt 3's delay is the second, …
+    let index = next_attempt.saturating_sub(2) as usize;
+
+    let base = ExponentialBackoff::from_millis(RETRY_BACKOFF_BASE_MS)
+        .factor(RETRY_BACKOFF_FACTOR)
+        .max_delay(RETRY_BACKOFF_MAX)
+        .nth(index)
+        .unwrap_or(RETRY_BACKOFF_MAX);
+
+    jitter(base)
+}
+
+/// Where inside a transaction attempt an error originated.
+///
+/// Exists only so [`Db::transaction_with_retry_max`]'s give-up diagnostics
+/// can answer "did this fail inside the transactional work, or at commit?"
+/// -- the two are indistinguishable from the returned error type `E` alone,
+/// since both surface as a plain `Err(e)` to the caller.
+#[derive(Clone, Copy, Debug)]
+enum TxPhase {
+    /// `BEGIN` (or `BEGIN ... ISOLATION LEVEL ...`) itself failed.
+    Begin,
+    /// The transaction body closure returned `Err`.
+    Body,
+    /// The body succeeded but `COMMIT` failed.
+    Commit,
+}
+
+impl std::fmt::Display for TxPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Begin => "begin",
+            Self::Body => "body",
+            Self::Commit => "commit",
+        })
+    }
+}
 
 // Task-local guard to detect transaction bypass attempts.
 //
@@ -87,6 +208,29 @@ fn is_in_transaction() -> bool {
 ///
 /// This sets `IN_TX = true` for the duration of the closure, ensuring
 /// that any calls to `Db::conn()` within will fail.
+/// Name the class of a `SqlErr` without echoing its payload.
+///
+/// `SqlErr`'s variants carry the driver's message, which on `PostgreSQL` and
+/// `MySQL` includes the conflicting column values; the discriminant alone is
+/// what a log line can safely say.
+/// Gated behind the `test-support` feature; never used by production code.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn in_transaction_for_testing() -> bool {
+    is_in_transaction()
+}
+
+fn sql_err_kind(err: Option<&sea_orm::SqlErr>) -> &'static str {
+    match err {
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_)) => "unique_constraint_violation",
+        Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_)) => {
+            "foreign_key_constraint_violation"
+        }
+        Some(_) => "other_sql_error",
+        None => "not_a_sql_error",
+    }
+}
+
 async fn with_tx_guard<F, T>(f: F) -> T
 where
     F: Future<Output = T>,
@@ -349,6 +493,31 @@ impl Db {
             + Send,
         T: Send + 'static,
     {
+        self.transaction_ref_mapped_with_config_tagged(tx_config, f)
+            .await
+            .map_err(|(e, _phase)| e)
+    }
+
+    /// Like [`Self::transaction_ref_mapped_with_config`], but also reports
+    /// *where* in the transaction lifecycle the error came from.
+    ///
+    /// Exists solely so [`Self::transaction_with_retry_max`] can distinguish
+    /// a body failure from a commit failure in its give-up diagnostics
+    /// without duplicating the begin/run/commit sequence --
+    /// `transaction_ref_mapped_with_config` above is now a thin wrapper
+    /// around this that discards the phase tag, so there is exactly one
+    /// place that knows how to run this sequence.
+    async fn transaction_ref_mapped_with_config_tagged<F, T, E>(
+        &self,
+        tx_config: TxConfig,
+        f: F,
+    ) -> Result<T, (E, TxPhase)>
+    where
+        E: From<DbError> + Send + 'static,
+        F: for<'a> FnOnce(&'a DbTx<'a>) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>
+            + Send,
+        T: Send + 'static,
+    {
         use sea_orm::{AccessMode, IsolationLevel};
 
         let isolation: Option<IsolationLevel> = tx_config.isolation.map(Into::into);
@@ -360,20 +529,21 @@ impl Db {
             .begin_with_config(isolation, access_mode)
             .await
             .map_err(DbError::from)
-            .map_err(E::from)?;
+            .map_err(E::from)
+            .map_err(|e| (e, TxPhase::Begin))?;
         let tx = DbTx { tx: &txn };
 
         // Run the closure with the transaction guard set
         let res = with_tx_guard(f(&tx)).await;
 
         match res {
-            Ok(v) => {
-                txn.commit().await.map_err(DbError::from).map_err(E::from)?;
-                Ok(v)
-            }
+            Ok(v) => match txn.commit().await {
+                Ok(()) => Ok(v),
+                Err(commit_err) => Err((E::from(DbError::from(commit_err)), TxPhase::Commit)),
+            },
             Err(e) => {
                 _ = txn.rollback().await;
-                Err(e)
+                Err((e, TxPhase::Body))
             }
         }
     }
@@ -427,10 +597,13 @@ impl Db {
     ///    - if `extract_db_err(&e)` yields a `DbErr` that
     ///      [`crate::contention::is_retryable_contention`] flags as
     ///      retryable for the active backend, and attempts remain, log at
-    ///      `WARN` and retry;
+    ///      `WARN`, wait a small jittered backoff (see
+    ///      [`retry_backoff_delay`]), and retry;
     ///    - otherwise, return the error.
     ///
-    /// On exhausting all attempts the **last** error is returned.
+    /// On exhausting all attempts the **last** error is returned. The
+    /// backoff only ever runs between a failed attempt and the next retry —
+    /// the success path (first-try or otherwise) never waits.
     ///
     /// # Errors
     ///
@@ -477,6 +650,24 @@ impl Db {
     /// for tests and for the rare case where a service has a justified reason
     /// to deviate from the workspace-wide default.
     ///
+    /// # Give-up diagnostics
+    ///
+    /// Both ways this can give up and return `Err` -- exhausting the attempt
+    /// budget on a recognized contention error, and receiving a database
+    /// error that [`crate::contention::is_retryable_contention`] does *not*
+    /// recognize as retryable -- look identical to a caller (a plain `Err`),
+    /// but have different fixes (raise the budget / investigate contention
+    /// vs. extend the contention classifier). To make them distinguishable
+    /// without changing the returned value, both emit a structured
+    /// [`tracing`] event (`ERROR` for budget exhaustion, `WARN` for an
+    /// unrecognized error) carrying the attempt number, the budget, the
+    /// backend, the `retryable` flag, which phase of the transaction failed
+    /// (begin/body/commit), `SeaORM`'s best-effort `sql_err()` classification,
+    /// and the underlying `DbErr`'s message. Only emitted when
+    /// `extract_db_err` actually found a `DbErr` -- a plain non-database
+    /// domain error was never a retry candidate, so logging it here on every
+    /// occurrence would drown both outcomes above in noise.
+    ///
     /// # Errors
     ///
     /// Returns `E` if the transaction fails (after retries) or if any
@@ -501,24 +692,97 @@ impl Db {
 
         loop {
             let result = self
-                .transaction_ref_mapped_with_config(tx_config.clone(), |tx| body(tx))
+                .transaction_ref_mapped_with_config_tagged(tx_config.clone(), |tx| body(tx))
                 .await;
 
             match result {
                 Ok(value) => return Ok(value),
-                Err(e) => {
-                    let retryable = extract_db_err(&e).is_some_and(|db_err| {
+                Err((e, phase)) => {
+                    let db_err = extract_db_err(&e);
+                    let retryable = db_err.is_some_and(|db_err| {
                         crate::contention::is_retryable_contention(backend, db_err)
                     });
                     if retryable && attempt < max {
+                        let next_attempt = attempt + 1;
+                        let delay = retry_backoff_delay(next_attempt);
                         tracing::warn!(
                             attempt,
                             max_attempts = max,
+                            delay = ?delay,
                             "retrying transaction after retryable failure"
                         );
-                        attempt += 1;
+                        // Small jittered backoff so two transactions that
+                        // just collided don't restart in lockstep and
+                        // collide again -- see `retry_backoff_delay`.
+                        tokio::time::sleep(delay).await;
+                        attempt = next_attempt;
                         continue;
                     }
+
+                    // Giving up. `e` is returned unchanged below -- this
+                    // block only *observes* the decision already made
+                    // above, it never changes it (no behavior/backoff
+                    // change here, diagnostics only).
+                    //
+                    // Only a recognized database error is worth a give-up
+                    // event: a plain domain error unrelated to the database
+                    // (validation failure, not-found, ...) was never a retry
+                    // candidate in the first place -- logging every such
+                    // exit here would drown the two outcomes this exists to
+                    // make visible in routine noise.
+                    if let Some(db_err) = db_err {
+                        if retryable {
+                            // attempt >= max here: this *was* a recognized
+                            // contention error, but the budget ran out
+                            // before another attempt was possible -- the
+                            // scenario `retry_backoff_delay`'s doc comment
+                            // diagnosed (and this backoff was meant to
+                            // prevent) for
+                            // `membership_first_write_race_exactly_one_tenant_wins`.
+                            tracing::error!(
+                                attempt,
+                                max_attempts = max,
+                                backend = ?backend,
+                                phase = %phase,
+                                retryable,
+                                // Same reasoning as the WARN arm below, and
+                                // the same two fields: neither `DbErr`'s
+                                // `Display` nor `SqlErr`'s payload may reach
+                                // a log line from shared infrastructure. This
+                                // arm runs at ERROR, so it is the more likely
+                                // of the two to be shipped and retained.
+                                sql_err = sql_err_kind(db_err.sql_err().as_ref()),
+                                "transaction retry budget exhausted"
+                            );
+                        } else {
+                            // `is_retryable_contention` looked at this exact
+                            // error and said no. Distinct from budget
+                            // exhaustion above: the fix here, if any, is in
+                            // that classifier, not in the attempt budget or
+                            // backoff.
+                            tracing::warn!(
+                                attempt,
+                                max_attempts = max,
+                                backend = ?backend,
+                                phase = %phase,
+                                retryable,
+                                // Only the classification, never the driver's
+                                // message. Both `DbErr`'s `Display` and
+                                // `SqlErr`'s payload embed the offending
+                                // values on PostgreSQL and MySQL -- a unique
+                                // violation renders as
+                                // `Key (email)=(user@example.com) already
+                                // exists`. This is shared infrastructure, so
+                                // that would put user data in the logs of
+                                // every gear that opens a transaction. The
+                                // error itself is returned to the caller,
+                                // which is where the detail belongs.
+                                sql_err = sql_err_kind(db_err.sql_err().as_ref()),
+                                "transaction failed with a database error not recognized as retryable"
+                            );
+                        }
+                    }
+
                     return Err(e);
                 }
             }
@@ -783,3 +1047,158 @@ impl std::fmt::Debug for DbTx<'_> {
 
 // NOTE: tests for `Db` live under `libs/toolkit-db/tests/` so they can be gated per-backend
 // without creating feature-specific unused-import warnings in this gear.
+//
+// `retry_backoff_delay` is the exception: it's pure `Duration` arithmetic
+// with no backend dependency (no `pg`/`sqlite`/`mysql` feature needed, no
+// I/O, no actual sleeping), so it's tested in-place instead -- same pattern
+// `contention.rs` uses for its own backend-agnostic pure logic in this
+// crate. These tests never call `tokio::time::sleep`, so they're
+// synchronous, deterministic, and effectively instantaneous.
+#[cfg(test)]
+mod tests {
+    use super::{
+        RETRY_BACKOFF_BASE_MS, RETRY_BACKOFF_FACTOR, RETRY_BACKOFF_MAX, TxPhase,
+        retry_backoff_delay, sql_err_kind,
+    };
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    /// The deterministic pre-jitter ceiling for a given `next_attempt`,
+    /// computed independently of `retry_backoff_delay` from the same
+    /// constants, so this test doesn't just re-execute the production
+    /// formula and trivially agree with itself.
+    fn pre_jitter_ceiling(next_attempt: u32) -> Duration {
+        let power = next_attempt.saturating_sub(2);
+        let millis = RETRY_BACKOFF_BASE_MS
+            .saturating_pow(power + 1)
+            .saturating_mul(RETRY_BACKOFF_FACTOR);
+        Duration::from_millis(millis).min(RETRY_BACKOFF_MAX)
+    }
+
+    #[test]
+    fn delay_is_bounded_by_the_pre_jitter_ceiling() {
+        // Full jitter (`tokio_retry::strategy::jitter`) multiplies by a
+        // uniform `[0, 1)` sample, so every observed delay must fall in
+        // `[0, ceiling]` -- never above it, never negative (Duration can't
+        // be negative, but this also guards against an accidental >1.0
+        // multiplier creeping in).
+        for next_attempt in 2..=6 {
+            let ceiling = pre_jitter_ceiling(next_attempt);
+            for _ in 0..200 {
+                let delay = retry_backoff_delay(next_attempt);
+                assert!(
+                    delay <= ceiling,
+                    "attempt {next_attempt}: delay {delay:?} exceeded ceiling {ceiling:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delay_grows_with_attempt_number() {
+        // Structural growth check on the *ceiling* (deterministic), not on
+        // any individual jittered sample -- two samples from a later
+        // attempt aren't guaranteed to exceed an earlier one (jitter can
+        // draw close to zero), but the achievable ceiling must strictly
+        // grow attempt-over-attempt up to the cap.
+        let ceilings: Vec<Duration> = (2..=5).map(pre_jitter_ceiling).collect();
+        for pair in ceilings.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "backoff ceiling must not shrink as attempts increase: {ceilings:?}"
+            );
+        }
+        // And it must actually increase somewhere in this range (not
+        // flat-lined at the cap immediately) -- otherwise "growing per
+        // attempt" would be vacuously true.
+        assert!(
+            ceilings.iter().collect::<HashSet<_>>().len() > 1,
+            "expected the ceiling to vary across attempts 2..=5, got {ceilings:?}"
+        );
+    }
+
+    #[test]
+    fn delay_stays_small() {
+        // Order-of-magnitude guard: the whole point of this backoff is to
+        // desynchronize retries without adding real latency, so even the
+        // worst case (attempt exhaustion with a caller-raised max_attempts)
+        // must stay well under a second.
+        for next_attempt in 2..=10 {
+            assert!(
+                retry_backoff_delay(next_attempt) <= RETRY_BACKOFF_MAX,
+                "attempt {next_attempt} exceeded RETRY_BACKOFF_MAX"
+            );
+        }
+        assert!(RETRY_BACKOFF_MAX <= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn jitter_is_actually_applied() {
+        // If jitter were accidentally dropped (e.g. a refactor that calls
+        // the base strategy directly), every sample for a fixed
+        // `next_attempt` would come back identical. Full jitter over a
+        // continuous `[0, 1)` sample makes repeated exact ties
+        // astronomically unlikely, so requiring >1 distinct value across
+        // 100 samples is a robust, non-flaky way to prove randomization is
+        // wired in without asserting on any specific duration.
+        let samples: HashSet<Duration> = (0..100).map(|_| retry_backoff_delay(2)).collect();
+        assert!(
+            samples.len() > 1,
+            "expected jittered delays to vary, got {} identical samples",
+            100 - samples.len() + 1
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt 1 (the first try) is never delayed")]
+    fn debug_assert_catches_delaying_the_first_attempt() {
+        // `next_attempt` is 1-based counting the attempt about to run;
+        // attempt 1 is the first try and must never be delayed (that would
+        // put latency on the success path). This only fires in debug
+        // builds (`debug_assert!`), which is how `cargo test` runs.
+        let _ = retry_backoff_delay(1);
+    }
+
+    // `TxPhase` and `sql_err_kind` exist only to label a give-up log line.
+    // Nothing asserts on them, so nothing would notice a label going wrong --
+    // and a mislabelled phase or an error class that reads
+    // "not_a_sql_error" for a constraint violation is exactly the kind of
+    // thing that misleads whoever is reading the log during an incident.
+
+    #[test]
+    fn tx_phase_labels_are_distinct_and_lowercase() {
+        let labels: Vec<String> = [TxPhase::Begin, TxPhase::Body, TxPhase::Commit]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(labels, vec!["begin", "body", "commit"]);
+    }
+
+    #[test]
+    fn sql_err_kind_names_the_class_and_never_the_values() {
+        // The payload of each variant carries the offending values on
+        // PostgreSQL and MySQL; the point of this function is that none of it
+        // reaches the log line.
+        let unique = sea_orm::SqlErr::UniqueConstraintViolation(
+            "Key (email)=(user@example.com) already exists".to_owned(),
+        );
+        let fk = sea_orm::SqlErr::ForeignKeyConstraintViolation(
+            "Key (gts_type_id)=(7) is still referenced".to_owned(),
+        );
+
+        assert_eq!(sql_err_kind(Some(&unique)), "unique_constraint_violation");
+        assert_eq!(sql_err_kind(Some(&fk)), "foreign_key_constraint_violation");
+        assert_eq!(sql_err_kind(None), "not_a_sql_error");
+
+        for kind in [
+            sql_err_kind(Some(&unique)),
+            sql_err_kind(Some(&fk)),
+            sql_err_kind(None),
+        ] {
+            assert!(
+                !kind.contains('@') && !kind.contains('='),
+                "the class name must not carry a value: {kind}"
+            );
+        }
+    }
+}

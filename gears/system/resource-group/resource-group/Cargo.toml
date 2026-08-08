@@ -76,7 +76,11 @@ toolkit-macros = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-toolkit-db = { workspace = true, features = ["sqlite"] }
+# "test-support" enables `connect_db_with_metric_callback` and
+# `secure::in_transaction_for_testing`, which the DB-behaviour audit's
+# `QueryRecorder` needs. Test-only: the production dependency above pulls in
+# toolkit-db without it.
+toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 tower = { workspace = true }
 http-body-util = { workspace = true }
 # Enable the SDK `test-util` feature so integration-test fakes can build the

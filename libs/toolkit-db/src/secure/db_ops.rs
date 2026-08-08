@@ -202,6 +202,233 @@ where
     }
 }
 
+/// Secure batch-insert helper for `Scopable` entities -- the multi-row
+/// counterpart of [`secure_insert`], issuing one `INSERT ... VALUES (r1),
+/// (r2), ...` instead of one `INSERT` per model.
+///
+/// # Security
+///
+/// Every model is validated against `scope` individually, in memory, before
+/// any row reaches the database: if any model fails, nothing is inserted --
+/// stronger than looping `secure_insert`, which can leave earlier rows committed.
+///
+/// # Batching
+///
+/// A multi-row insert binds one parameter per column per row, and each
+/// backend caps that count (see [`max_bind_params`]); the batch is split
+/// into as many statements as needed, one statement when it fits.
+///
+/// **A split batch is not atomic on its own** -- wrap the call in a
+/// transaction if a partial commit across split statements is unacceptable.
+///
+/// # Errors
+///
+/// - `ScopeError::Invalid` if a tenant-scoped model is missing `tenant_id`.
+/// - `ScopeError::Denied` if a model's values do not satisfy the scope.
+/// - `ScopeError::Db` if the database insert fails.
+pub async fn secure_insert_many<E>(
+    models: Vec<E::ActiveModel>,
+    scope: &AccessScope,
+    runner: &impl DBRunner,
+) -> Result<(), ScopeError>
+where
+    E: ScopableEntity + EntityTrait,
+    E::Column: ColumnTrait + Copy,
+    E::ActiveModel: ActiveModelTrait<Entity = E> + Send,
+{
+    if models.is_empty() {
+        return Ok(());
+    }
+
+    // Validate every row before sending anything, so a scope violation anywhere
+    // in the batch inserts nothing at all -- including when the batch is about
+    // to be split into several statements below.
+    for am in &models {
+        if let Some(tenant_col) = E::tenant_col()
+            && let sea_orm::ActiveValue::NotSet = am.get(tenant_col)
+        {
+            return Err(ScopeError::Invalid("tenant_id is required"));
+        }
+        validate_insert_scope(am, scope)?;
+    }
+
+    let backend = match DBRunnerInternal::as_seaorm(runner) {
+        SeaOrmRunner::Conn(db) => sea_orm::ConnectionTrait::get_database_backend(db),
+        SeaOrmRunner::Tx(tx) => sea_orm::ConnectionTrait::get_database_backend(tx),
+    };
+    let rows_per_statement = rows_per_insert::<E>(backend);
+
+    let mut rest = models;
+    while !rest.is_empty() {
+        let take = rows_per_statement.min(rest.len());
+        let chunk: Vec<E::ActiveModel> = rest.drain(..take).collect();
+        match DBRunnerInternal::as_seaorm(runner) {
+            SeaOrmRunner::Conn(db) => {
+                E::insert_many(chunk).exec(db).await?;
+            }
+            SeaOrmRunner::Tx(tx) => {
+                E::insert_many(chunk).exec(tx).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The restriction [`secure_insert_from_select`] enforces, extracted so it can
+/// be checked without a database.
+///
+/// Only an entity that declares no scope column at all may be written this
+/// way.
+///
+/// # Errors
+///
+/// `ScopeError::Invalid` when `E` declares any scope column.
+fn insert_from_select_allowed<E>() -> Result<(), ScopeError>
+where
+    E: ScopableEntity + EntityTrait,
+{
+    if E::tenant_col().is_some()
+        || E::resource_col().is_some()
+        || E::owner_col().is_some()
+        || E::type_col().is_some()
+    {
+        return Err(ScopeError::Invalid(
+            "insert-from-select is limited to entities without scope columns: \
+             rows produced inside the database cannot be validated per row",
+        ));
+    }
+    Ok(())
+}
+
+/// Execute an `INSERT ... SELECT`: the rows are computed and written inside
+/// the database and never travel through this process.
+///
+/// The set-based counterpart of [`secure_insert_many`]. Use it where the rows
+/// to insert are a function of rows the database already holds -- a closure
+/// table rebuilt from itself, say. [`secure_insert_many`] still has to
+/// materialize every row here first, which for a cross product means the row
+/// count in process memory and on the wire; this sends one statement whose
+/// size does not depend on how many rows it writes.
+///
+/// # Security
+///
+/// [`secure_insert`] and [`secure_insert_many`] validate every row against
+/// the caller's scope before any of it reaches the database. Rows produced by
+/// a `SELECT` inside the database are never visible here, so that check
+/// cannot be run -- and this helper does not pretend otherwise. It is
+/// restricted to entities that declare no scope columns at all
+/// (`#[secure(no_tenant, no_resource, no_owner, no_type)]`), where per-row
+/// validation has nothing to examine and skipping it forfeits nothing. Any
+/// other entity is refused before the statement is built, so the restriction
+/// cannot be waived by a caller that would rather not honour it.
+///
+/// The target table is `E`'s, and only `E`'s. The caller supplies the target
+/// columns and the source `SELECT`; the `INSERT` around them is built here.
+/// An earlier shape took a prepared `InsertStatement` and used `E` only for
+/// the check above -- which meant the check and the table it was supposed to
+/// be about were not connected: passing a scope-free `E` alongside a
+/// statement writing into a scoped table satisfied the guard and defeated it
+/// in the same call. Nothing about that was detectable from here, so the
+/// statement is no longer the caller's to hand over.
+///
+/// Scoping the *source* rows remains the caller's job: build the inner
+/// `SELECT` from a scoped query when the source table is scoped.
+///
+/// The source may read the target table — every backend here permits an
+/// `INSERT ... SELECT` whose `SELECT` names the table being written. The
+/// symmetry does not extend to deletes: `MySQL` rejects a `DELETE` whose
+/// subquery names the target table (ER 1093), where `PostgreSQL` and `SQLite`
+/// accept it. Callers pairing this helper with a set-based `DELETE` over the
+/// same table are writing `PostgreSQL`/`SQLite`-only code.
+///
+/// # Returns
+///
+/// The number of rows the statement wrote, as the database counted them.
+/// Nothing here can derive it -- the rows never enter this process -- so a
+/// caller that needs the figure (a metric, a budget check) has to be given
+/// it.
+///
+/// # Errors
+///
+/// - `ScopeError::Invalid` if `E` declares any scope column, or if the target
+///   column count does not match the source `SELECT`.
+/// - `ScopeError::Db` if the statement fails.
+pub async fn secure_insert_from_select<E, C>(
+    columns: C,
+    source: sea_orm::sea_query::SelectStatement,
+    runner: &impl DBRunner,
+) -> Result<u64, ScopeError>
+where
+    E: ScopableEntity + EntityTrait,
+    C: IntoIterator<Item = E::Column>,
+{
+    insert_from_select_allowed::<E>()?;
+
+    let mut insert = sea_orm::sea_query::Query::insert();
+    insert.into_table(E::default()).columns(columns);
+    insert.select_from(source).map_err(|_| {
+        ScopeError::Invalid(
+            "insert-from-select: the target column count does not match the source select",
+        )
+    })?;
+    let stmt = &insert;
+
+    let result = match DBRunnerInternal::as_seaorm(runner) {
+        SeaOrmRunner::Conn(db) => {
+            let backend = sea_orm::ConnectionTrait::get_database_backend(db);
+            sea_orm::ConnectionTrait::execute(db, backend.build(stmt)).await?
+        }
+        SeaOrmRunner::Tx(tx) => {
+            let backend = sea_orm::ConnectionTrait::get_database_backend(tx);
+            sea_orm::ConnectionTrait::execute(tx, backend.build(stmt)).await?
+        }
+    };
+    Ok(result.rows_affected())
+}
+
+/// Bind-parameter budget for one statement, per backend.
+///
+/// Deliberately below each backend's hard ceiling, since the count here is
+/// derived from the entity's declared columns and a builder may bind extras:
+///
+/// - `PostgreSQL`/`MySQL`: `u16` wire-protocol limit, 65535.
+/// - `SQLite`: `SQLITE_MAX_VARIABLE_NUMBER`, 32766 on modern builds.
+#[must_use]
+const fn max_bind_params(backend: sea_orm::DbBackend) -> usize {
+    match backend {
+        sea_orm::DbBackend::Postgres | sea_orm::DbBackend::MySql => 60_000,
+        sea_orm::DbBackend::Sqlite => 30_000,
+    }
+}
+
+/// Maximum bind parameters a single statement may carry on `runner`'s
+/// backend.
+///
+/// Exposed so callers building their own multi-row statement -- an
+/// `IN (...)` delete over a collected id list, say -- can chunk against the
+/// same limit [`secure_insert_many`] uses, instead of duplicating the
+/// number or discovering it as a driver error on a large enough input.
+#[must_use]
+pub fn max_bind_params_for(runner: &impl DBRunner) -> usize {
+    let backend = match DBRunnerInternal::as_seaorm(runner) {
+        SeaOrmRunner::Conn(db) => sea_orm::ConnectionTrait::get_database_backend(db),
+        SeaOrmRunner::Tx(tx) => sea_orm::ConnectionTrait::get_database_backend(tx),
+    };
+    max_bind_params(backend)
+}
+
+/// How many rows of `E` fit in one multi-row insert on `backend`.
+///
+/// Uses the entity's full column count as the per-row cost, an upper bound
+/// since a row with `NotSet` columns binds fewer. Truncates on purpose --
+/// rounding up could push a statement past the limit -- and floors at 1.
+#[allow(clippy::integer_division)]
+fn rows_per_insert<E: EntityTrait>(backend: sea_orm::DbBackend) -> usize {
+    use sea_orm::Iterable as _;
+    let columns_per_row = E::Column::iter().count().max(1);
+    (max_bind_params(backend) / columns_per_row).max(1)
+}
+
 /// Secure update helper for updating a single entity by ID inside a scope.
 ///
 /// # Security
@@ -928,6 +1155,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn insert_from_select_refuses_a_scoped_entity() {
+        // The whole justification for skipping per-row scope validation is
+        // that there is nothing to validate. An entity that declares a scope
+        // column has something, and must not be written this way.
+        let err = insert_from_select_allowed::<test_entity::Entity>()
+            .expect_err("a tenant-scoped entity must be refused");
+        assert!(matches!(err, ScopeError::Invalid(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn insert_from_select_allows_an_entity_with_no_scope_columns() {
+        // Negative control: without this the rule above would be satisfied by
+        // a guard that refuses everything.
+        //
+        // Not `global_entity` -- that one is global only in the tenant sense
+        // and still declares `resource_col`, so the guard refuses it, which is
+        // correct. A join or closure table with no identity of its own is the
+        // shape this helper exists for.
+        insert_from_select_allowed::<unscoped_entity::Entity>()
+            .expect("an entity with no scope columns must be allowed");
+    }
+
+    /// A link table: two foreign keys and a value, no identity the scope
+    /// system could filter on. `resource_group_closure` is the real one.
+    mod unscoped_entity {
+        use super::*;
+
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+        #[sea_orm(table_name = "unscoped_table")]
+        pub struct Model {
+            #[sea_orm(primary_key, auto_increment = false)]
+            pub left_id: Uuid,
+            #[sea_orm(primary_key, auto_increment = false)]
+            pub right_id: Uuid,
+            pub depth: i32,
+        }
+
+        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+        pub enum Relation {}
+
+        impl ActiveModelBehavior for ActiveModel {}
+
+        impl ScopableEntity for Entity {
+            fn tenant_col() -> Option<Column> {
+                None
+            }
+            fn resource_col() -> Option<Column> {
+                None
+            }
+            fn owner_col() -> Option<Column> {
+                None
+            }
+            fn type_col() -> Option<Column> {
+                None
+            }
+            fn resolve_property(_property: &str) -> Option<Column> {
+                None
+            }
+        }
+    }
+
     // Test entity without tenant_col (global entity)
     mod global_entity {
         use super::*;
@@ -1414,5 +1703,44 @@ mod tests {
             validate_insert_scope(&am, &scope).is_err(),
             "Unknown property must cause constraint to fail (fail-closed)"
         );
+    }
+    // -- batch-insert chunk sizing --
+
+    #[test]
+    fn rows_per_insert_stays_under_each_backend_hard_limit() {
+        // 4 columns on the test entity. The product of rows and columns must
+        // stay under the real wire limit, not just under our own budget:
+        // 65535 for Postgres/MySQL, 32766 for modern SQLite.
+        let columns = <test_entity::Column as sea_orm::Iterable>::iter().count();
+        for (backend, hard_limit) in [
+            (sea_orm::DbBackend::Postgres, 65_535),
+            (sea_orm::DbBackend::MySql, 65_535),
+            (sea_orm::DbBackend::Sqlite, 32_766),
+        ] {
+            let rows = rows_per_insert::<test_entity::Entity>(backend);
+            assert!(
+                rows * columns < hard_limit,
+                "{backend:?}: {rows} rows x {columns} cols exceeds {hard_limit}"
+            );
+            assert!(
+                rows > 1,
+                "{backend:?}: a 4-column entity should batch freely"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_per_insert_never_returns_zero() {
+        // Guards the division: an entity wider than the whole budget must still
+        // make progress, one row per statement, rather than looping forever on a
+        // chunk size of zero.
+        assert!(rows_per_insert::<test_entity::Entity>(sea_orm::DbBackend::Sqlite) >= 1);
+        for backend in [
+            sea_orm::DbBackend::Postgres,
+            sea_orm::DbBackend::MySql,
+            sea_orm::DbBackend::Sqlite,
+        ] {
+            assert!(max_bind_params(backend) > 0);
+        }
     }
 }
