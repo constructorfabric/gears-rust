@@ -508,11 +508,6 @@ pub async fn assert_closure_matches_parent_links(conn: &impl toolkit_db::secure:
         }
     }
 
-    // Comparing sets rather than multisets is safe here, and only here:
-    // `resource_group_closure` is declared `PRIMARY KEY (ancestor_id,
-    // descendant_id)`, so the table cannot hold the same pair twice at any
-    // depth. Without that key this would have to compare lengths first --
-    // collapsing duplicates into a set would hide them.
     let actual: BTreeSet<(Uuid, Uuid, i32)> = rows
         .iter()
         .map(|r| (r.ancestor_id, r.descendant_id, r.depth))

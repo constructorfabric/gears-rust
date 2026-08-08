@@ -14,10 +14,15 @@
 //! is what is asserted — an absolute count rots on the next refactor, a slope
 //! does not.
 //!
-//! The `no-tx-write` class is asserted throughout: every operation test ends
-//! on [`QueryRecorder::writes_outside_tx`]. `no-retry-serializable` and
-//! `external-call-in-tx` have source-scan rules in Section 4 — neither is
-//! observable as a statement count.
+//! The `no-tx-write` class is asserted on the write paths: each of their
+//! trace tests ends on [`QueryRecorder::writes_outside_tx`]. Read paths and
+//! the scale tests of Section 2 do not — for a read path the assertion is
+//! trivially true, and a scale test is about a slope, not a boundary.
+//!
+//! Three classes are not observable as a statement count at all and have
+//! source-scan rules in Section 4 instead: `no-retry-serializable`,
+//! `external-call-in-tx`, and the row lock that lets a non-force delete run
+//! below `SERIALIZABLE` (invisible on SQLite, which has no row locks).
 //!
 //! Deliberately absent: the write-set narrowing checks, which belong to a
 //! fix this branch does not carry — a test asserting a fix that is not here
@@ -1279,14 +1284,13 @@ async fn trace_delete_type() {
     );
 }
 
-// Section 4 -- static source-scan rules for the defect classes that leave no
-// trace in the SQL: RG-03 (SERIALIZABLE without retry) and RG-09 (an external
-// call inside a transaction closure), matched on call shape.
+// Section 4 -- static source-scan rules for the contracts that leave no
+// trace in the SQL: RG-03 (SERIALIZABLE without retry), RG-09 (an external
+// call inside a transaction closure), and the row lock a non-force delete
+// takes in place of SERIALIZABLE. Matched on call shape.
 //
-// Both service files are scanned for RG-03, because scanning only the healthy
-// one is how a rule comes to pass by construction: `group_service.rs` has
-// never had this defect, so a rule that reads nothing else can never fail and
-// never notices `type_service.rs`, which has it today.
+// Both service files are scanned for RG-03, because scanning only the one
+// that is already healthy is how a rule comes to pass by construction.
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
