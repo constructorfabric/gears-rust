@@ -1594,7 +1594,7 @@ Hierarchy mutations run with bounded retry, at an isolation level chosen per ope
 - `SERIALIZABLE` where a write depends on a predicate over rows it does not itself lock: `create`, `move`, a parent-changing `update`, and a **force** delete — all of which rewrite closure rows across a subtree.
 - The backend default where there is no such predicate: a name/metadata-only `update`, which changes one row by primary key, and a **non-force** delete, which takes a row lock (`SELECT ... FOR UPDATE`) on its target so the children and membership checks it decides from stay true until it commits.
 
-Contention and retry expectations differ accordingly: the second group does not produce serialization failures, and waits on a row lock instead. Concurrency tests verify correctness under parallel access.
+The second group does not *require* `SERIALIZABLE` — it does not stop being correct under it. What changes is where contention shows up: on PostgreSQL's default (`READ COMMITTED`) those operations wait on a row lock rather than aborting with `40001`, so retries there are for deadlocks, not for serialization failures. A deployment that raises the default to `SERIALIZABLE`, and SQLite, which is serializable regardless, keep the abort-and-retry behaviour; retry is in place either way. Concurrency tests verify correctness under parallel access.
 
 **Serialization retry policy**:
 
