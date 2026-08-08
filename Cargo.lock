@@ -1389,6 +1389,8 @@ dependencies = [
  "axum",
  "bytes",
  "cf-chat-engine-sdk",
+ "cf-gears-authz-resolver",
+ "cf-gears-authz-resolver-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-db",

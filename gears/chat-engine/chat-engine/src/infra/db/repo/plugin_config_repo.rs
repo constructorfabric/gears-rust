@@ -22,9 +22,10 @@ use sea_orm::sea_query::OnConflict;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Set};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
-use toolkit_db::secure::{AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt};
+use toolkit_db::secure::{SecureDeleteExt, SecureEntityExt, SecureInsertExt};
 use uuid::Uuid;
 
+use crate::domain::authz::bypass;
 use crate::domain::error::ChatEngineError;
 use crate::domain::ports::PluginConfigRepo;
 use crate::infra::db::entity::plugin_config::{ActiveModel, Column, Entity as PluginConfigEntity};
@@ -35,8 +36,8 @@ use crate::infra::db::repo::ChatEngineDb;
 /// Holds the toolkit-db `DBProvider` so every method runs against the same
 /// connection the migration runner used. `plugin_configs` has no tenant
 /// column (entity is marked `#[secure(unrestricted)]`), so the secure
-/// wrappers run with `AccessScope::allow_all()` — they give us a
-/// `&impl DBRunner` execution path.
+/// wrappers run with a named bypass scope (see `crate::domain::authz::bypass`)
+/// — they give us a `&impl DBRunner` execution path.
 pub struct SeaPluginConfigRepo {
     db: Arc<ChatEngineDb>,
 }
@@ -56,7 +57,9 @@ impl PluginConfigRepo for SeaPluginConfigRepo {
         session_type_id: Uuid,
     ) -> Result<Option<JsonValue>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let row = PluginConfigEntity::find_by_id((plugin_instance_id.to_owned(), session_type_id))
             .secure()
             .scope_with(&scope)
@@ -89,7 +92,9 @@ impl PluginConfigRepo for SeaPluginConfigRepo {
             .to_owned();
 
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         PluginConfigEntity::insert(am)
             .secure()
             .scope_unchecked(&scope)?
@@ -105,7 +110,9 @@ impl PluginConfigRepo for SeaPluginConfigRepo {
         session_type_id: Uuid,
     ) -> Result<(), ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         PluginConfigEntity::delete_many()
             .secure()
             .scope_with(&scope)

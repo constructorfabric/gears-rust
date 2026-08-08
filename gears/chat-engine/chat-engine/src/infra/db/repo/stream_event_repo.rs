@@ -15,9 +15,10 @@ use async_trait::async_trait;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryOrder};
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
-use toolkit_db::secure::{AccessScope, SecureDeleteExt, SecureEntityExt, SecureInsertExt};
+use toolkit_db::secure::{SecureDeleteExt, SecureEntityExt, SecureInsertExt};
 use uuid::Uuid;
 
+use crate::domain::authz::bypass;
 use crate::domain::error::ChatEngineError;
 use crate::domain::ports::{BufferedEvent, StreamEventBuffer};
 use crate::infra::db::entity::stream_event::{
@@ -53,7 +54,9 @@ impl StreamEventBuffer for SeaStreamEventBuffer {
         expires_at: OffsetDateTime,
     ) -> Result<(), ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let am = stream_event_entity::ActiveModel {
             message_id: Set(message_id),
             seq: Set(seq_to_i64(seq)),
@@ -78,7 +81,9 @@ impl StreamEventBuffer for SeaStreamEventBuffer {
         after_seq: Option<u64>,
     ) -> Result<Vec<BufferedEvent>, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let mut cond = Condition::all().add(stream_event_entity::Column::MessageId.eq(message_id));
         if let Some(after) = after_seq {
             cond = cond.add(stream_event_entity::Column::Seq.gt(seq_to_i64(after)));
@@ -101,7 +106,9 @@ impl StreamEventBuffer for SeaStreamEventBuffer {
 
     async fn delete_expired(&self, now: OffsetDateTime) -> Result<u64, ChatEngineError> {
         let conn = self.db.conn()?;
-        let scope = AccessScope::allow_all();
+        // AUTHZ-BYPASS: non-PDP path; row scoping via explicit WHERE / non-tenant table
+        // @cpt-cf-chat-engine-design-authz-bypass-registry
+        let scope = bypass::unrestricted_table_scope();
         let res = StreamEventEntity::delete_many()
             .secure()
             .scope_with(&scope)
