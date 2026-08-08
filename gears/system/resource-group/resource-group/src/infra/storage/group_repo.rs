@@ -755,10 +755,26 @@ impl GroupRepositoryTrait for GroupRepository {
                     // re-read a clean answer; with the delete lowered, SSI has
                     // no second serializable party to detect against and the
                     // foreign key answers instead. Unmapped it was a 500.
-                    parent_id.map_or_else(
-                        || DomainError::database(e.to_string()),
-                        DomainError::group_not_found,
-                    )
+                    //
+                    // Which foreign key, though: this table has two, and
+                    // `fk_rg_gts_type` fails when a concurrent `delete_type`
+                    // removes the type between this transaction resolving it
+                    // and inserting. Answering *that* with "group not found,
+                    // id = parent" would name the wrong resource and the wrong
+                    // cause, so only the parent constraint maps. PostgreSQL
+                    // puts the constraint name in the message; SQLite says
+                    // only "FOREIGN KEY constraint failed", so there the
+                    // answer stays a database error -- unhelpful, but not a
+                    // confident lie, and the race needs concurrent writers
+                    // SQLite does not have.
+                    let msg = e.to_string();
+                    if msg.contains("fk_resource_group_parent")
+                        && let Some(parent_id) = parent_id
+                    {
+                        DomainError::group_not_found(parent_id)
+                    } else {
+                        DomainError::database(msg)
+                    }
                 } else {
                     DomainError::database(e.to_string())
                 }
