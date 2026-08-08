@@ -904,9 +904,10 @@ impl GroupRepositoryTrait for GroupRepository {
 
     /// Delete all closure rows (both as ancestor and as descendant) for
     /// every group in `group_ids`, in 2 statements per bind-parameter chunk
-    /// rather than 2 per group (RG-10). One chunk covers 30 000 groups on
-    /// `SQLite` and 60 000 on `PostgreSQL`, so "2" is the ordinary case, not
-    /// the guarantee.
+    /// rather than 2 per group (RG-10). One chunk covers whatever
+    /// `max_bind_params_for` allows — 30 000 on `SQLite`, 60 000 on
+    /// `PostgreSQL`, both below the backends' own limits on purpose — so "2"
+    /// is the ordinary case, not the guarantee.
     async fn delete_all_closure_rows_many<C: DBRunner>(
         &self,
         db: &C,

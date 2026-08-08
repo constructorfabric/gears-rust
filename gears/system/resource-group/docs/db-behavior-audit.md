@@ -102,8 +102,15 @@ and are recorded here rather than fixed:
 
 - `group_repo.rs` `resolve_type_paths_batch` and `type_repo.rs`
   `load_full_types_batch` bind one parameter per distinct GTS type id. The
-  column is `SMALLINT`, so the list cannot exceed 32 767 — which is above
-  SQLite's 30 000 ceiling and below PostgreSQL's 60 000.
+  column is `SMALLINT`, so the list cannot exceed 32 767 — which is above the
+  30 000 `max_bind_params_for` allows on SQLite and below the 60 000 it allows
+  on PostgreSQL.
+
+Those two numbers are `toolkit-db`'s, not the databases'. SQLite's own limit
+is 32 766 host parameters and PostgreSQL's is 65 535; `max_bind_params_for`
+returns a deliberately rounder, lower figure so that a caller chunking against
+it has room for the predicates it did not count. Read every "ceiling" in this
+document as that budget rather than as the backend's hard limit.
 
 Reaching it needs more than 30 000 distinct types registered in one
 deployment, at which point the failure is a driver error on a read path, not

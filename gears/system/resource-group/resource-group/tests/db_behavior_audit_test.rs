@@ -615,10 +615,7 @@ async fn trace_seeding() {
     snapshot_trace("seeding", &rec);
 
     // Seeding is a write path, so it carries the class's assertion like the
-    // others. An earlier revision deferred to a `trace_add_membership` that
-    // does not exist in this branch, which left the module header's claim --
-    // that every write path's trace test ends on this -- untrue of the one
-    // test most likely to be read as proof of it.
+    // others, rather than deferring to another test for it.
     assert!(
         rec.writes_outside_tx().is_empty(),
         "seeding's writes run inside a transaction:\n{}",
