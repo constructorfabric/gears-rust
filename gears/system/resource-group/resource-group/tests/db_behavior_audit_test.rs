@@ -14,13 +14,18 @@
 //! is what is asserted — an absolute count rots on the next refactor, a slope
 //! does not.
 //!
-//! The `no-tx-write` class is asserted throughout: every operation test ends
-//! on [`QueryRecorder::writes_outside_tx`], and `no-retry-serializable` has
-//! its own source-scan rule in Section 4.
+//! The `no-tx-write` class is asserted on the write paths: each of their
+//! trace tests ends on [`QueryRecorder::writes_outside_tx`]. Read paths and
+//! the scale tests do not — for a read path the assertion is trivially true,
+//! and a scale test is about a slope, not a boundary.
 //!
-//! Deliberately absent: the write-set narrowing checks, which belong to a
-//! fix this branch does not carry — a test asserting a fix that is not here
-//! would only be noise. It lives on the branch that carries it.
+//! `no-retry-serializable` is not observable as a statement count and has a
+//! source-scan rule in Section 4 instead.
+//!
+//! Deliberately absent: the `external-call-in-tx` class and the write-set
+//! narrowing checks. Both belong to fixes this branch does not carry — a test
+//! asserting a fix that is not here would only be noise. They live on the
+//! branches that carry them.
 //!
 //! Healthy operations assert the invariant directly, doubling as negative
 //! controls.
@@ -1178,9 +1183,9 @@ async fn negative_control_read_paths_produce_no_write_statements() {
     );
 }
 
-// Section 4 -- static source-scan rules for two defect classes not
-// observable as SQL: RG-03 (SERIALIZABLE without retry) and RG-09 (an
-// external call inside a transaction closure), matched on call shape.
+// Section 4 -- a static source-scan rule for the one defect class here that
+// leaves no trace in the SQL: RG-03, a SERIALIZABLE transaction opened
+// without retry. Matched on call shape.
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
@@ -1205,11 +1210,3 @@ fn static_rule_passes_group_service_uses_retry() {
          transaction_with_retry, found {retried}"
     );
 }
-
-// Section 5 -- contract-drift rules: a "contract" is a documented promise
-// (DESIGN.md) about observable behavior; where the code doesn't yet keep
-// it, the drift becomes an executable #[ignore]d assertion, not a comment.
-//
-// A third DESIGN.md promise (pool-level statement_timeout) is explicitly
-// scoped as a deployment concern with no code path to assert against
-// (checked toolkit_db::ConnectOpts in full), so it gets no test here.

@@ -801,19 +801,17 @@ impl GroupRepositoryTrait for GroupRepository {
             .from(ClosureEntity)
             .and_where(Expr::col(closure_entity::Column::DescendantId).eq(parent_id));
 
-        let mut insert = Query::insert();
-        insert.into_table(ClosureEntity).columns([
-            closure_entity::Column::AncestorId,
-            closure_entity::Column::DescendantId,
-            closure_entity::Column::Depth,
-        ]);
-        insert
-            .select_from(source)
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        toolkit_db::secure::secure_insert_from_select::<ClosureEntity>(&insert, db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+        toolkit_db::secure::secure_insert_from_select::<ClosureEntity, _>(
+            [
+                closure_entity::Column::AncestorId,
+                closure_entity::Column::DescendantId,
+                closure_entity::Column::Depth,
+            ],
+            source,
+            db,
+        )
+        .await
+        .map_err(|e| DomainError::database(e.to_string()))?;
 
         Ok(())
     }
@@ -1161,19 +1159,17 @@ impl GroupRepositoryTrait for GroupRepository {
                 );
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a1
 
-            let mut insert = Query::insert();
-            insert.into_table(ClosureEntity).columns([
-                closure_entity::Column::AncestorId,
-                closure_entity::Column::DescendantId,
-                closure_entity::Column::Depth,
-            ]);
-            insert
-                .select_from(source)
-                .map_err(|e| DomainError::database(e.to_string()))?;
-
-            toolkit_db::secure::secure_insert_from_select::<ClosureEntity>(&insert, db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
+            toolkit_db::secure::secure_insert_from_select::<ClosureEntity, _>(
+                [
+                    closure_entity::Column::AncestorId,
+                    closure_entity::Column::DescendantId,
+                    closure_entity::Column::Depth,
+                ],
+                source,
+                db,
+            )
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4
         }
 

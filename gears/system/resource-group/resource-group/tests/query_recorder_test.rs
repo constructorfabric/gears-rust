@@ -58,11 +58,14 @@ async fn recorder_observes_statements_and_tags_tx_membership() {
         events.len() > after_read,
         "create_type should have produced additional statements"
     );
+    // Sliced by position, not by `seq`. Both agree -- `seq` is the row's
+    // index in the trace -- but taking the slice by position keeps this test
+    // from depending on that invariant to be correct about *which* statements
+    // it is looking at.
     let inserts: Vec<_> = events
         .iter()
-        .filter(|e| {
-            matches!(e.kind, toolkit_db::test_support::QueryKind::Insert) && e.seq >= after_read
-        })
+        .skip(after_read)
+        .filter(|e| matches!(e.kind, toolkit_db::test_support::QueryKind::Insert))
         .collect();
     assert!(
         !inserts.is_empty(),
@@ -77,4 +80,28 @@ async fn recorder_observes_statements_and_tags_tx_membership() {
     // Stats grouping is non-empty and keyed by (kind, table).
     let stats = rec.stats();
     assert!(!stats.is_empty());
+
+    // `seq` is the row's index in the trace. It is assigned under the same
+    // lock that appends, so this holds by construction rather than by
+    // convention -- and it is what makes a trace dump readable against
+    // `events()`.
+    assert!(
+        events.iter().enumerate().all(|(i, e)| e.seq == i),
+        "seq must be the position in the trace:\n{}",
+        rec.dump()
+    );
+
+    // And it restarts with the trace: `clear()` needs no separate counter to
+    // reset, because there is no separate counter.
+    rec.clear();
+    type_svc.get_type(&code).await.ok();
+    let after_clear = rec.events();
+    assert!(
+        !after_clear.is_empty(),
+        "expected a statement after clear()"
+    );
+    assert_eq!(
+        after_clear[0].seq, 0,
+        "the first statement of a new trace is numbered 0"
+    );
 }

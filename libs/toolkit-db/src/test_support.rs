@@ -34,7 +34,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -87,7 +86,13 @@ impl std::fmt::Display for QueryKind {
 /// One captured statement.
 #[derive(Debug, Clone)]
 pub struct RecordedQuery {
-    /// Monotonic sequence number, in execution order.
+    /// Position of this statement in the trace, in execution order.
+    ///
+    /// Assigned under the same lock that appends the statement, so it is
+    /// always the index into [`QueryRecorder::events`] -- including after a
+    /// [`QueryRecorder::clear`], which starts a new trace at 0. Use it to
+    /// order statements against each other, not as an identifier that
+    /// outlives the trace.
     pub seq: usize,
     pub kind: QueryKind,
     /// Best-effort target table, extracted from the raw SQL text.
@@ -212,11 +217,6 @@ fn extract_table(kind: QueryKind, raw_sql: &str) -> Option<String> {
 #[derive(Clone)]
 pub struct QueryRecorder {
     events: Arc<Mutex<Vec<RecordedQuery>>>,
-    /// Shared with the metric callback so [`Self::clear`] can reset it
-    /// alongside the trace. Without the handle here the counter would
-    /// outlive the events it numbers, and `seq` would stop agreeing with the
-    /// position in [`Self::events`].
-    seq: Arc<AtomicUsize>,
 }
 
 impl QueryRecorder {
@@ -225,7 +225,6 @@ impl QueryRecorder {
     #[cfg(test)]
     fn from_events_for_testing(events: Vec<RecordedQuery>) -> Self {
         Self {
-            seq: Arc::new(AtomicUsize::new(events.len())),
             events: Arc::new(Mutex::new(events)),
         }
     }
@@ -242,10 +241,8 @@ impl QueryRecorder {
         impl Fn(&sea_orm::metric::Info<'_>) + Send + Sync + 'static,
     ) {
         let events: Arc<Mutex<Vec<RecordedQuery>>> = Arc::new(Mutex::new(Vec::new()));
-        let seq = Arc::new(AtomicUsize::new(0));
         let recorder = Self {
             events: Arc::clone(&events),
-            seq: Arc::clone(&seq),
         };
 
         let callback = move |info: &sea_orm::metric::Info<'_>| {
@@ -260,9 +257,16 @@ impl QueryRecorder {
                 .values
                 .as_ref()
                 .map_or(0, |values| values.0.len());
-            let n = seq.fetch_add(1, Ordering::Relaxed);
-            let rec = RecordedQuery {
-                seq: n,
+            // The number is taken under the same lock that appends, so it is
+            // the row's own index by construction. A separate counter cannot
+            // give that: it has to be incremented before the lock is taken,
+            // so two statements racing here could be appended in the opposite
+            // order to the one they were numbered in -- and `clear()` would
+            // then need a reset that races them again.
+            let mut events = events.lock().unwrap_or_else(PoisonError::into_inner);
+            let seq = events.len();
+            events.push(RecordedQuery {
+                seq,
                 kind,
                 table,
                 sql,
@@ -271,11 +275,7 @@ impl QueryRecorder {
                 param_count,
                 elapsed: info.elapsed,
                 failed: info.failed,
-            };
-            events
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(rec);
+            });
         };
 
         (recorder, callback)
@@ -310,20 +310,14 @@ impl QueryRecorder {
     /// database instead of reusing a recorder, but this is handy for the
     /// recorder's own unit tests.
     ///
-    /// Resets the sequence counter with the trace, so the `seq` of the first
-    /// statement recorded afterwards is again `0` and keeps agreeing with the
-    /// position in [`Self::events`].
-    ///
-    /// Like the rest of this type's aggregation surface, meant to be called
-    /// while nothing is recording: the callback increments the counter before
-    /// it takes the events lock, so a statement racing this call can still be
-    /// numbered against the trace it is no longer part of.
+    /// Numbering restarts with the trace: `seq` is the row's index in
+    /// [`Self::events`], so the first statement recorded after a clear is
+    /// again `0`. Nothing separate has to be reset for that to hold.
     pub fn clear(&self) {
         self.events
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-        self.seq.store(0, Ordering::Relaxed);
     }
 
     /// Counts grouped by `(kind, table)`. Table is `"<none>"` when no table
