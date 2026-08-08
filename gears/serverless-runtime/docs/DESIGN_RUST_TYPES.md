@@ -1,6 +1,6 @@
 <!--
 Created:  2026-03-12 by Constructor Tech
-Updated:  2026-04-30 by Constructor Tech
+Updated:  2026-07-30 by Constructor Tech
 -->
 
 # Serverless Runtime: Rust Domain Types and Runtime Traits
@@ -8,14 +8,30 @@ Updated:  2026-04-30 by Constructor Tech
 > **Companion file to [DESIGN.md](./DESIGN.md) section 3.1 "Rust Domain Types and Runtime Traits".**
 >
 > This file contains the complete Rust type definitions and trait interfaces for the
-> Serverless Runtime domain model. These types are transport-agnostic and live in the
-> `serverless-runtime-sdk` crate. Per ADR `cpt-cf-serverless-runtime-adr-thin-host`, the
-> public surface is split across two traits: `ServerlessRuntimeClient` (host-implemented,
-> consumer- and plugin-callable; carries the public CRUD surface plus a thin
-> plugin-to-host event port) and `RuntimeAdapter` (Runtime Plugin-implemented,
-> host-callable; carries identity, lifecycle hooks, invocation, schedule, and
-> event-trigger methods). Each Runtime Plugin implementation (Temporal, Starlark, cloud
-> FaaS, etc.) provides a `RuntimeAdapter` impl bound to a single GTS adapter type.
+> Serverless Runtime domain model. These types are transport-agnostic.
+>
+> **Four traits, four audiences.** Per ADR `cpt-cf-serverless-runtime-adr-thin-host` and the
+> 2026-07-30 amendment recording the SDK split:
+>
+> | Trait | Declared in | Implemented by | Called by |
+> |---|---|---|---|
+> | `ServerlessRuntimeService` | the host crate (internal) | the host | the host's own REST / JSON-RPC / MCP handlers |
+> | `ServerlessRuntimeClientV1` | `serverless-runtime-sdk` | the host | other gears |
+> | `RuntimeAdapter` | `serverless-runtime-plugin-sdk` | each runtime plugin | the host |
+> | `InvocationIndexPort` | `serverless-runtime-plugin-sdk` | the host | runtime plugins |
+>
+> `ServerlessRuntimeService` is deliberately **not** named `*ClientV1` and is **not** a
+> `ClientHub` contract: nothing outside the host crate resolves it. It is the full internal
+> surface the transports are built on, which is why it carries registry, schedule, trigger and
+> tenant-policy CRUD that the published consumer trait does not.
+>
+> `ServerlessRuntimeClientV1` is the narrower published subset — invocation and observation only
+> (`serverless-sdk/docs/PRD.md` §4, `serverless-sdk/docs/DESIGN.md` §3.3). Where the two overlap
+> they differ on purpose, and neither difference is a defect: the internal service returns an
+> `InvocationSummary` from `control_invocation` because its callers render it immediately, while
+> the published trait returns nothing there and exposes replay as its own operation so a caller
+> receives the new invocation id. Each Runtime Plugin (Temporal, Starlark, cloud FaaS, …) provides
+> one `RuntimeAdapter` impl bound to a single GTS adapter type.
 
 ##### Core Types (Rust)
 
@@ -310,6 +326,9 @@ pub struct OwnerRef {
     pub tenant_id: TenantId,
 }
 
+/// The full invocation record. Owned by the Runtime Plugin, which is the system of
+/// record for it. The host does **not** persist this — see [`InvocationSummary`] for
+/// what the host index holds, and reach the full record through the plugin trait.
 #[derive(Clone, Debug)]
 pub struct InvocationRecord {
     pub invocation_id: InvocationId,
@@ -324,6 +343,26 @@ pub struct InvocationRecord {
     pub error: Option<RuntimeErrorPayload>,
     pub timestamps: InvocationTimestamps,
     pub observability: InvocationObservability,
+}
+
+/// One row of the host invocation index — the lightweight, queryable projection the
+/// host persists from plugin-emitted events (ADR `cpt-cf-serverless-runtime-adr-thin-host`).
+/// This is what host-trait reads return: answering them never requires a plugin
+/// round-trip. Fields absent here (`params`, `result`, full observability, the timeline)
+/// live only with the owning plugin.
+#[derive(Clone, Debug)]
+pub struct InvocationSummary {
+    pub invocation_id: InvocationId,
+    pub function_id: FunctionId,
+    /// GTS adapter type of the plugin that ran the invocation.
+    pub adapter: GtsId,
+    pub tenant_id: TenantId,
+    pub owner: OwnerRef,
+    pub status: InvocationStatus,
+    pub timestamps: InvocationTimestamps,
+    /// Populated when `status` is a failure state. The full error detail stays with
+    /// the plugin.
+    pub error_summary: Option<RuntimeErrorPayload>,
 }
 
 #[derive(Clone, Debug)]
@@ -546,16 +585,25 @@ pub enum InvocationControlAction {
     Replay,
 }
 
-/// Host-implemented client trait. Consumed by external callers (REST/JSON-RPC/MCP
-/// handlers) and by Runtime Plugins (via `ClientHub::get::<dyn ServerlessRuntimeClient>()`).
+/// Host-implemented aggregate surface — the **gear-internal** shape the REST,
+/// JSON-RPC and MCP handlers are built on. It is not the contract published to
+/// other gears.
 ///
-/// Carries the public CRUD surface across functions, invocations (host-indexed
-/// aggregate queries), schedules, triggers, and tenant policy, plus a thin
-/// notification-only event port that plugins use to populate the host invocation
-/// index. The event port is one-directional plugin -> host: the host never calls
-/// back into the plugin through this surface.
+/// Two audiences were split out of this trait and are declared elsewhere:
+///
+/// * **Consuming gears** use `ServerlessRuntimeClientV1`, declared in
+///   `serverless-runtime-sdk`. It is deliberately narrower — invocation and
+///   observation only (start, read, query, control, replay) — and carries none of
+///   the CRUD below. See `serverless-sdk/docs/DESIGN.md` §3.3.
+/// * **Runtime plugins** report index updates through `InvocationIndexPort`, declared
+///   in `serverless-runtime-plugin-sdk` and defined below — not through this trait.
+///
+/// The CRUD methods below belong here by design, not by omission: registry,
+/// schedule, trigger and tenant-policy management are administrative operations
+/// whose callers are people or external clients, so they are reachable over the
+/// transports and are deliberately absent from the published consumer trait.
 #[async_trait]
-pub trait ServerlessRuntimeClient: Send + Sync {
+pub trait ServerlessRuntimeService: Send + Sync {
     // --- Functions (registry CRUD) ---
 
     async fn register_function(
@@ -613,11 +661,11 @@ pub trait ServerlessRuntimeClient: Send + Sync {
     // resolving the adapter directly.
     //
     // `list_invocations` / `get_invocation` are served from the host-owned
-    // `invocation_index` populated via the plugin event port. The returned
-    // `InvocationRecord` carries only the index-resident fields (id, function_id,
-    // tenant, status, timestamps, error summary); transport, observability, and
-    // full timeline data require `RuntimeAdapter::get_invocation` /
-    // `RuntimeAdapter::get_invocation_timeline`.
+    // `invocation_index` populated via the plugin event port, and so return
+    // `InvocationSummary` — the index row itself, rather than an `InvocationRecord`
+    // with most of its fields left empty. Params, results, observability and the
+    // full timeline require `RuntimeAdapter::get_invocation` /
+    // `RuntimeAdapter::get_invocation_timeline`, which read the plugin's own store.
 
     async fn start_invocation(
         &self,
@@ -625,24 +673,29 @@ pub trait ServerlessRuntimeClient: Send + Sync {
         request: InvocationRequest,
     ) -> Result<InvocationResult, RuntimeErrorPayload>;
 
+    // Note: `Replay` mints a *new* invocation with a new id, unlike the in-place
+    // actions, which is why the published consumer trait exposes replay as its own
+    // operation rather than as a control action (see `serverless-sdk/docs/PRD.md` §4.1).
+    // Whether `Retry` also mints a new id is undecided: the status state machine has no
+    // `failed -> running` transition, so it is unspecified here pending that decision.
     async fn control_invocation(
         &self,
         ctx: &SecurityContext,
         invocation_id: &InvocationId,
         action: InvocationControlAction,
-    ) -> Result<InvocationRecord, RuntimeErrorPayload>;
+    ) -> Result<InvocationSummary, RuntimeErrorPayload>;
 
     async fn list_invocations(
         &self,
         ctx: &SecurityContext,
         filter: InvocationListFilter,
-    ) -> Result<Vec<InvocationRecord>, RuntimeErrorPayload>;
+    ) -> Result<Vec<InvocationSummary>, RuntimeErrorPayload>;
 
     async fn get_invocation(
         &self,
         ctx: &SecurityContext,
         invocation_id: &InvocationId,
-    ) -> Result<InvocationRecord, RuntimeErrorPayload>;
+    ) -> Result<InvocationSummary, RuntimeErrorPayload>;
 
     // --- Schedules (host-side metadata CRUD; plugin owns the schedule itself) ---
 
@@ -756,12 +809,25 @@ pub trait ServerlessRuntimeClient: Send + Sync {
         filter: UsageHistoryFilter,
     ) -> Result<Vec<TenantUsage>, RuntimeErrorPayload>;
 
-    // --- Thin event port (plugin -> host; notification surface only) ---
-    //
-    // These two methods are the ONLY plugin-to-host callback surface. They are not
-    // a general-purpose callback API: the host accepts notifications and updates
-    // the host-owned invocation index / re-emits timeline events to subscribers.
+    // The plugin -> host event port is NOT part of this trait. It is a separate
+    // contract, `InvocationIndexPort` below, declared in
+    // `serverless-runtime-plugin-sdk`.
+}
 
+/// Thin plugin -> host event port. Declared in `serverless-runtime-plugin-sdk` and
+/// implemented by the host; only runtime plugins call it. Kept separate from the
+/// host's aggregate surface above so that a consuming gear, which depends on
+/// neither, cannot see it — and so that a plugin depends on this alone rather than
+/// on the registry CRUD it has no business calling.
+///
+/// This is a **notification surface only**. It is not a general-purpose callback
+/// API: the host accepts notifications, updates the host-owned invocation index and
+/// re-emits timeline events to subscribers. Nothing here returns data to the plugin,
+/// and the host never calls back into the plugin through it. See ADR
+/// `cpt-cf-serverless-runtime-adr-thin-host` (Consequences, and the 2026-07-30
+/// amendment recording the SDK split).
+#[async_trait]
+pub trait InvocationIndexPort: Send + Sync {
     /// Notify the host of an invocation status transition. Plugins call this on
     /// every status change so the host invocation index stays current.
     /// `error_summary` carries the human-readable failure reason for terminal
@@ -790,7 +856,7 @@ pub trait ServerlessRuntimeClient: Send + Sync {
 /// host dispatches calls via `dyn RuntimeAdapter` after `ClientHub` scoped resolution
 /// keyed by adapter GTS type. Plugins own the execution engine, scheduler, and event
 /// subscription stack for their adapter type and report progress back to the host
-/// only through `ServerlessRuntimeClient::publish_invocation_status` /
+/// only through `InvocationIndexPort::publish_invocation_status` /
 /// `publish_invocation_event`.
 #[async_trait]
 pub trait RuntimeAdapter: Send + Sync {
