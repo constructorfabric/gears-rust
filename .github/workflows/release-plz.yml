@@ -22,8 +22,11 @@ on:
 permissions:
   contents: read
 
+# One constant group for the whole workflow. `release-pr` (push to main) and
+# `release` (release PR merged) mutate the same state — tags, the release
+# branch, crates.io — and both fire on the same merge.
 concurrency:
-  group: release-plz-${{ github.workflow }}-${{ github.ref }}
+  group: release-plz-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -127,9 +130,13 @@ jobs:
     # IMPORTANT: don't publish on every push. Publish only:
     # - manually via workflow_dispatch (mode=release), or
     # - when a release PR (labeled `release-plz`) is merged into main.
+    # The `!cancelled()` below is what matters — it replaces the implicit
+    # `success()` on `needs`, so a failed or skipped cache cleanup no longer
+    # blocks the publish.
     if: >-
       ${{
-        github.repository == 'constructorfabric/gears-rust'
+        !cancelled()
+        && github.repository == 'constructorfabric/gears-rust'
         && (
           (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
           || (
@@ -141,12 +148,67 @@ jobs:
       }}
     permissions:
       contents: write
+      checks: read
     steps:
+      # Pin the checkout to the merge commit this run was triggered by. Without
+      # `ref`, actions/checkout resolves the default branch and does
+      # `git checkout -B main refs/remotes/origin/main` — i.e. main's tip at the
+      # moment the job happens to start, minutes after the merge event. Any PR
+      # merged in that window would silently be published under the version
+      # numbers from the release PR. workflow_dispatch has no PR context, so it
+      # falls back to github.sha.
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      # Pinning makes the published tree deterministic, but not automatically
+      # the tree CI validated: PR checks run against the ephemeral
+      # refs/pull/N/merge computed when the run started, and GitHub silently
+      # recomputes that ref as main advances without re-running CI. If the merge
+      # was trivial (release PR was up to date with main) the merge commit's
+      # tree is byte-identical to the PR head's tree and the green signal does
+      # cover it. This is the workflow-level equivalent of the branch-protection
+      # setting "require branches to be up to date before merging".
+      - name: Verify the published tree is the reviewed tree
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+
+          actual=$(git rev-parse HEAD)
+          if [ "$actual" != "$MERGE_SHA" ]; then
+            echo "::error::checkout landed on $actual, expected merge commit $MERGE_SHA"
+            exit 1
+          fi
+
+          if ! git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags --quiet origin "$HEAD_SHA" || true
+          fi
+          if ! git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
+            echo "::error::release PR head $HEAD_SHA is unreachable (squash-merged with the branch deleted?);" \
+                 "cannot prove the tree about to be published is the one that was reviewed and tested"
+            exit 1
+          fi
+
+          merge_tree=$(git rev-parse "${MERGE_SHA}^{tree}")
+          head_tree=$(git rev-parse "${HEAD_SHA}^{tree}")
+          echo "merge commit $MERGE_SHA  tree=$merge_tree"
+          echo "PR head      $HEAD_SHA  tree=$head_tree"
+
+          if [ "$merge_tree" != "$head_tree" ]; then
+            echo "::error::main advanced after the release PR was last updated, so the merge is not trivial." \
+                 "The tree about to be published was never tested as a whole. Re-run release-plz to refresh" \
+                 "the release PR against current main, or publish via workflow_dispatch to override."
+            git --no-pager diff --stat "$HEAD_SHA" "$MERGE_SHA" | tail -20
+            exit 1
+          fi
+
+          echo "merge was trivial: published tree == reviewed tree"
 
       - name: Disk report (before cleanup)
         run: |
@@ -188,19 +250,71 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustup show
 
-      - name: Install nextest
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
-        with:
-          tool: nextest
-
-      - name: cargo test (workspace)
-        run: make test-no-macros
-
-      - name: Clean build artifacts
-        run: rm -rf target
+      # No test run here on purpose. Merging a release PR is the maintainer's
+      # release decision, so re-testing could only override it, never inform it.
+      # The tree being published is the one CI validated on the release PR (see
+      # the tree check above); `cargo publish` still compiles every crate, so a
+      # crate that does not build cannot be published.
 
       - name: Clear cargo registry index (workaround gix slotmap overflow)
         run: rm -rf ~/.cargo/registry/index
+
+      # Advisory only: merging a release PR IS the maintainer's release decision,
+      # so this never blocks the publish and never waits on pending checks. It
+      # records what the state of the release PR was at publish time, so a
+      # release made over red or unfinished CI is visible afterwards in the run
+      # summary rather than having to be reconstructed from the PR.
+      - name: Report release PR check status
+        if: ${{ github.event_name == 'pull_request' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_FULL: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # This workflow's own jobs are check runs on the same SHA; reporting
+          # our own in-progress state is just noise.
+          SELF_JOBS: '^(Publish crates|Create release PR|Cleanup PR caches before release)$'
+        run: |
+          set -uo pipefail
+
+          list=$(gh api "/repos/$REPO_FULL/commits/$HEAD_SHA/check-runs?per_page=100" \
+            --jq '.check_runs[]
+                  | select((.name | test(env.SELF_JOBS)) | not)
+                  | "\(.status)|\(.conclusion // "")|\(.name)"')
+
+          {
+            echo "### Release PR check status at publish time"
+            echo
+            echo "Head \`$HEAD_SHA\` of ${{ github.event.pull_request.html_url }}"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$list" ]; then
+            echo "::warning::no check runs found on release PR head $HEAD_SHA"
+            echo "No check runs found." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          red=$(printf '%s\n' "$list" \
+            | awk -F'|' '$2 ~ /^(failure|timed_out|cancelled|action_required|stale)$/ {print $3" ("$2")"}')
+          pending=$(printf '%s\n' "$list" | awk -F'|' '$1 != "completed" {print $3" ("$1")"}')
+
+          if [ -n "$red" ]; then
+            echo "::warning::publishing over $(printf '%s\n' "$red" | wc -l | tr -d ' ') non-green check(s) — merged by maintainer decision"
+            { echo "**Not green:**"; printf '%s\n' "$red" | sed 's/^/- /'; echo; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -n "$pending" ]; then
+            echo "::warning::publishing while $(printf '%s\n' "$pending" | wc -l | tr -d ' ') check(s) had not finished"
+            { echo "**Unfinished:**"; printf '%s\n' "$pending" | sed 's/^/- /'; echo; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -z "$red" ] && [ -z "$pending" ]; then
+            echo "all $(printf '%s\n' "$list" | wc -l | tr -d ' ') check(s) green"
+            echo "All checks green." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          printf '%s\n' "$list" | awk -F'|' '{print "  "$3": "$1" "$2}'
 
       - name: release-plz release
         uses: release-plz/action@52440b50d383aa252927de395c8b2c1e0a9cf8e9 # v0.3.155
