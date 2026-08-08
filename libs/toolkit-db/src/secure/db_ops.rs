@@ -334,6 +334,13 @@ where
 /// Scoping the *source* rows remains the caller's job: build the inner
 /// `SELECT` from a scoped query when the source table is scoped.
 ///
+/// The source may read the target table — every backend here permits an
+/// `INSERT ... SELECT` whose `SELECT` names the table being written. The
+/// symmetry does not extend to deletes: `MySQL` rejects a `DELETE` whose
+/// subquery names the target table (ER 1093), where `PostgreSQL` and `SQLite`
+/// accept it. Callers pairing this helper with a set-based `DELETE` over the
+/// same table are writing `PostgreSQL`/`SQLite`-only code.
+///
 /// # Returns
 ///
 /// The number of rows the statement wrote, as the database counted them.

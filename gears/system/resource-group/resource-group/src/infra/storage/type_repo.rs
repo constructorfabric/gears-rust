@@ -258,30 +258,6 @@ impl TypeRepository {
         codes.sort();
         Ok(codes)
     }
-
-    /// Find the raw model by code. Used to re-read a row immediately after
-    /// `INSERT … RETURNING`-less writes (insert/update); returns a
-    /// `DomainError::Database` if the row is unexpectedly missing — i.e. the
-    /// write committed but the row vanished (possible only under concurrent
-    /// delete with the same `schema_id`).
-    async fn find_model_by_code(
-        db: &impl DBRunner,
-        code: &str,
-    ) -> Result<gts_type::Model, DomainError> {
-        let scope = system_scope();
-        GtsTypeEntity::find()
-            .filter(gts_type::Column::SchemaId.eq(code))
-            .secure()
-            .scope_with(&scope)
-            .one(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?
-            .ok_or_else(|| {
-                DomainError::database(format!(
-                    "GTS type row with schema_id={code} not found after write (concurrent delete?)"
-                ))
-            })
-    }
 }
 
 #[async_trait]
@@ -316,7 +292,7 @@ impl TypeRepositoryTrait for TypeRepository {
         &self,
         db: &C,
         code: &str,
-    ) -> Result<Option<(i16, ResourceGroupType)>, DomainError> {
+    ) -> Result<Option<(gts_type::Model, ResourceGroupType)>, DomainError> {
         let scope = system_scope();
         let type_model = GtsTypeEntity::find()
             .filter(gts_type::Column::SchemaId.eq(code))
@@ -330,10 +306,9 @@ impl TypeRepositoryTrait for TypeRepository {
             return Ok(None);
         };
 
-        let type_id = type_model.id;
         self.load_full_type(db, &type_model)
             .await
-            .map(|rg_type| Some((type_id, rg_type)))
+            .map(|rg_type| Some((type_model, rg_type)))
     }
 
     /// Load a full type by its surrogate SMALLINT ID.
@@ -490,10 +465,10 @@ impl TypeRepositoryTrait for TypeRepository {
         &self,
         db: &C,
         type_id: i16,
-        code: &str,
         metadata_schema: Option<&serde_json::Value>,
-    ) -> Result<gts_type::Model, DomainError> {
+    ) -> Result<time::OffsetDateTime, DomainError> {
         let scope = system_scope();
+        let updated_at = time::OffsetDateTime::now_utc();
 
         // Use SecureUpdateMany for scoped update
         GtsTypeEntity::update_many()
@@ -503,16 +478,15 @@ impl TypeRepositoryTrait for TypeRepository {
                 gts_type::Column::MetadataSchema,
                 Expr::value(metadata_schema.cloned()),
             )
-            .col_expr(
-                gts_type::Column::UpdatedAt,
-                Expr::value(time::OffsetDateTime::now_utc()),
-            )
+            .col_expr(gts_type::Column::UpdatedAt, Expr::value(updated_at))
             .scope_with(&scope)
             .exec(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        Self::find_model_by_code(db, code).await
+        // The timestamp is handed back rather than read back: it is the only
+        // thing this write decided that the caller did not already know.
+        Ok(updated_at)
     }
 
     /// Delete a GTS type by its surrogate ID. CASCADE handles junction rows.
@@ -566,13 +540,22 @@ impl TypeRepositoryTrait for TypeRepository {
         // Resolve every candidate parent-type path in one query. A path
         // that doesn't currently resolve to any gts_type row is silently
         // dropped -- no group can reference a type that no longer exists.
-        let parent_types = GtsTypeEntity::find()
-            .filter(gts_type::Column::SchemaId.is_in(parent_codes.to_vec()))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+        //
+        // `parent_codes` is `allowed_parent_types` straight off the request
+        // body, so its length is the client's choice, not the schema's:
+        // chunked against the bind ceiling like every other list-valued
+        // predicate here.
+        let mut parent_types: Vec<gts_type::Model> = Vec::new();
+        for chunk in parent_codes.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            let found = GtsTypeEntity::find()
+                .filter(gts_type::Column::SchemaId.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            parent_types.extend(found);
+        }
 
         if parent_types.is_empty() {
             return Ok(Vec::new());
@@ -612,27 +595,37 @@ impl TypeRepositoryTrait for TypeRepository {
         //
         // Chunked against the backend's bind-parameter ceiling for the same
         // reason the batch deletes in `group_repo` are: an unbounded
-        // `IN (...)` fails in the driver rather than in the query. The
-        // budget is shared with the second predicate, so the type ids come
-        // off the top before the ids are chunked.
-        let type_id_params = parent_type_ids.len();
-        let id_budget = toolkit_db::secure::max_bind_params_for(db)
-            .saturating_sub(type_id_params)
-            .max(1);
+        // `IN (...)` fails in the driver rather than in the query.
+        //
+        // Two predicates share one budget, and *neither* list is bounded by
+        // construction -- `parent_codes` comes from the request body. So both
+        // are chunked, and a chunk of each has to fit together. Subtracting
+        // the type ids off the top is not enough: if that list alone exceeds
+        // the ceiling, every query still binds it whole and still overruns.
+        //
+        // Capping the type ids at half leaves the ids at least the other
+        // half, so the inner budget is never squeezed to nothing. In the
+        // ordinary case -- a handful of candidate parent types -- the outer
+        // loop runs once and the ids get the whole remainder.
+        let budget = toolkit_db::secure::max_bind_params_for(db);
+        let type_budget = budget.div_euclid(2).max(1);
 
         let mut parent_type_by_id: std::collections::HashMap<uuid::Uuid, i16> =
             std::collections::HashMap::new();
-        for chunk in parent_ids.chunks(id_budget) {
-            let parents: Vec<rg_entity::Model> = ResourceGroupEntity::find()
-                .filter(rg_entity::Column::Id.is_in(chunk.to_vec()))
-                .filter(rg_entity::Column::GtsTypeId.is_in(parent_type_ids.clone()))
-                .secure()
-                .scope_with(&scope)
-                .all(db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
+        for type_chunk in parent_type_ids.chunks(type_budget) {
+            let id_budget = budget.saturating_sub(type_chunk.len()).max(1);
+            for id_chunk in parent_ids.chunks(id_budget) {
+                let parents: Vec<rg_entity::Model> = ResourceGroupEntity::find()
+                    .filter(rg_entity::Column::Id.is_in(id_chunk.to_vec()))
+                    .filter(rg_entity::Column::GtsTypeId.is_in(type_chunk.to_vec()))
+                    .secure()
+                    .scope_with(&scope)
+                    .all(db)
+                    .await
+                    .map_err(|e| DomainError::database(e.to_string()))?;
 
-            parent_type_by_id.extend(parents.into_iter().map(|p| (p.id, p.gts_type_id)));
+                parent_type_by_id.extend(parents.into_iter().map(|p| (p.id, p.gts_type_id)));
+            }
         }
 
         Ok(groups
@@ -707,13 +700,22 @@ impl TypeRepositoryTrait for TypeRepository {
         }
 
         let scope = system_scope();
-        let types = GtsTypeEntity::find()
-            .filter(gts_type::Column::SchemaId.is_in(codes.to_vec()))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        // `codes` is `allowed_parent_types` / `allowed_membership_types`
+        // straight off the request body -- its length is the client's choice.
+        // Chunked against the bind ceiling for the same reason as everywhere
+        // else: an unbounded `IN (...)` fails in the driver, not in the query.
+        let mut types: Vec<gts_type::Model> = Vec::new();
+        for chunk in codes.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            let found = GtsTypeEntity::find()
+                .filter(gts_type::Column::SchemaId.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            types.extend(found);
+        }
 
         let found_codes: Vec<&str> = types.iter().map(|t| t.schema_id.as_str()).collect();
         let missing: Vec<&str> = codes

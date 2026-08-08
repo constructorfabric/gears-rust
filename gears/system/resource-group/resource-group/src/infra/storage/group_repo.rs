@@ -115,16 +115,31 @@ impl GroupRepository {
             });
         }
 
-        let groups = ResourceGroupEntity::find()
-            .filter(rg_entity::Column::Id.is_in(group_ids.clone()))
-            .secure()
-            .scope_with(scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        let group_map: std::collections::HashMap<Uuid, rg_entity::Model> =
-            groups.into_iter().map(|g| (g.id, g)).collect();
+        // This id list is the whole subtree, bounded by the data rather than
+        // by the page size -- the pagination below happens in memory, after
+        // the read. One bind parameter per id fails in the driver on a large
+        // subtree, exactly as the batch deletes would without chunking.
+        //
+        // Half the ceiling, not all of it: `scope` compiles to predicates that
+        // bind parameters of their own -- `ScopeFilter::In` and `InGroup` both
+        // carry value lists -- and this call cannot see how many. A scope
+        // carrying more than half the ceiling in values is a scope-side
+        // problem that no chunk size chosen here can fix.
+        let id_budget = toolkit_db::secure::max_bind_params_for(db)
+            .div_euclid(2)
+            .max(1);
+        let mut group_map: std::collections::HashMap<Uuid, rg_entity::Model> =
+            std::collections::HashMap::with_capacity(group_ids.len());
+        for chunk in group_ids.chunks(id_budget) {
+            let groups = ResourceGroupEntity::find()
+                .filter(rg_entity::Column::Id.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            group_map.extend(groups.into_iter().map(|g| (g.id, g)));
+        }
 
         let all_type_ids: Vec<i16> = group_map.values().map(|g| g.gts_type_id).collect();
         let type_path_map = self.resolve_type_paths_batch(db, &all_type_ids).await?;
@@ -707,6 +722,14 @@ impl GroupRepositoryTrait for GroupRepository {
     }
 
     /// Update a resource group entity.
+    ///
+    /// A missing row is silently a no-op, not an error: this is an
+    /// `UPDATE ... WHERE id = ?` and `rows_affected` is not inspected. The
+    /// previous shape loaded an `ActiveModel` first and so answered
+    /// `RecordNotFound` -- at the cost of the very read this method exists to
+    /// avoid. Both callers already read the row inside the same `SERIALIZABLE`
+    /// transaction, so absence is answered there; a future caller that does
+    /// not must check for itself.
     async fn update<C: DBRunner>(
         &self,
         db: &C,
@@ -816,33 +839,8 @@ impl GroupRepositoryTrait for GroupRepository {
         Ok(())
     }
 
-    /// Get all descendants of a group (from closure table, excluding self-row).
-    ///
-    /// Results are ordered by depth ASC (root-to-leaf). Callers that need
-    /// leaf-to-root order (e.g. `force_delete_subtree`) reverse the list.
-    async fn get_descendant_ids<C: DBRunner>(
-        &self,
-        db: &C,
-        group_id: Uuid,
-    ) -> Result<Vec<Uuid>, DomainError> {
-        use sea_orm::QueryOrder;
-
-        let scope = system_scope();
-        let rows = ClosureEntity::find()
-            .filter(closure_entity::Column::AncestorId.eq(group_id))
-            .filter(closure_entity::Column::Depth.ne(0))
-            .order_by_asc(closure_entity::Column::Depth)
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        Ok(rows.into_iter().map(|r| r.descendant_id).collect())
-    }
-
-    /// Delete every group in `ids` in a single statement, not one
-    /// `delete_by_id` per node (RG-10).
+    /// Delete every group in `ids` in one statement per bind-parameter
+    /// chunk, not one `delete_by_id` per node (RG-10).
     async fn delete_by_id_many<C: DBRunner>(
         &self,
         db: &C,
@@ -896,8 +894,10 @@ impl GroupRepositoryTrait for GroupRepository {
     }
 
     /// Delete all closure rows (both as ancestor and as descendant) for
-    /// every group in `group_ids`, in exactly 2 statements regardless of
-    /// how many groups (RG-10).
+    /// every group in `group_ids`, in 2 statements per bind-parameter chunk
+    /// rather than 2 per group (RG-10). One chunk covers 30 000 groups on
+    /// `SQLite` and 60 000 on `PostgreSQL`, so "2" is the ordinary case, not
+    /// the guarantee.
     async fn delete_all_closure_rows_many<C: DBRunner>(
         &self,
         db: &C,
@@ -930,9 +930,10 @@ impl GroupRepositoryTrait for GroupRepository {
         Ok(())
     }
 
-    /// Same result set as `get_descendant_ids`, but keeps each descendant's
-    /// depth relative to `group_id`, so callers don't re-derive it via a
-    /// second per-row query (RG-05/RG-10).
+    /// Every descendant of `group_id` (the self-row excluded) with its depth
+    /// relative to `group_id`, so callers don't re-derive the depth via a
+    /// second per-row query (RG-05/RG-10). Ordered by depth ascending;
+    /// callers needing leaf-to-root order reverse the list.
     async fn get_descendant_ids_with_depth<C: DBRunner>(
         &self,
         db: &C,
@@ -1098,6 +1099,20 @@ impl GroupRepositoryTrait for GroupRepository {
         // decide which ancestors were external, then bound the survivors into
         // two `IN (...)` lists -- one parameter per id, unbounded, so a large
         // enough subtree failed in the driver rather than in the query.
+        //
+        // `NOT IN` here is only correct because `descendant_id` is `NOT NULL`
+        // in both backend branches of the migration. Were it ever nullable, a
+        // single NULL would make the predicate NULL for every row and this
+        // DELETE would quietly stop deleting -- no error, no rows, a closure
+        // table that keeps its stale ancestors.
+        //
+        // The DELETE runs before the INSERT below and cannot disturb either of
+        // its sources: it only removes rows whose ancestor is *outside* the
+        // subtree, while the `st` source ranges over `ancestor_id = group_id`
+        // (inside by definition) and the `pa` source over
+        // `descendant_id = parent_id`, whose ancestors are all outside --
+        // guaranteed by the `is_descendant` check the service makes before
+        // calling this.
         ClosureEntity::delete_many()
             .filter(closure_entity::Column::DescendantId.in_subquery(subtree_query.clone()))
             .filter(closure_entity::Column::AncestorId.not_in_subquery(subtree_query))
@@ -1197,22 +1212,6 @@ impl GroupRepositoryTrait for GroupRepository {
     }
 
     /// Delete all memberships for a group.
-    async fn delete_memberships<C: DBRunner>(
-        &self,
-        db: &C,
-        group_id: Uuid,
-    ) -> Result<(), DomainError> {
-        let scope = system_scope();
-        MembershipEntity::delete_many()
-            .filter(membership_entity::Column::GroupId.eq(group_id))
-            .secure()
-            .scope_with(&scope)
-            .exec(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-        Ok(())
-    }
-
     /// Batch-resolve SMALLINT type IDs to GTS type path strings.
     ///
     /// Issues a single `SELECT ... WHERE id IN (...)` query for all distinct type IDs,

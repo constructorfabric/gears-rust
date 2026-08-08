@@ -104,11 +104,11 @@ const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(100);
 /// nothing to de-synchronize them, they are liable to collide again on the
 /// very next attempt and burn through the whole (small) attempt budget
 /// within a few milliseconds without ever getting staggered. This is the
-/// diagnosed root cause of a rare (reported ~1-in-14 runs) flake in
-/// `pg_concurrency_test.rs::membership_first_write_race_exactly_one_tenant_wins`,
-/// where two concurrent `add_membership` calls under `SERIALIZABLE` retry
-/// each other into exhaustion instead of the invariant-preserving "one
-/// wins, one gets a clean `TenantIncompatibility`" outcome. The failure
+/// diagnosed root cause of a rare (reported ~1-in-14 runs) flake in a
+/// Postgres-backed concurrency test of `cf-gears-resource-group`, where two
+/// concurrent `add_membership` calls under `SERIALIZABLE` retry each other
+/// into exhaustion instead of the invariant-preserving "one wins, one gets a
+/// clean `TenantIncompatibility`" outcome. The failure
 /// mode itself did not reproduce in extensive local testing (see the
 /// commit message for numbers) -- this fix closes the one genuine gap the
 /// diagnosis identified (this is the only retry loop in the workspace with

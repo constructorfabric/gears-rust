@@ -19,6 +19,7 @@ use crate::domain::error::DomainError;
 use crate::domain::repo::TypeRepositoryTrait;
 #[allow(unused_imports)]
 use crate::domain::validation;
+use crate::infra::storage::entity::gts_type;
 
 // @cpt-dod:cpt-cf-resource-group-dod-type-mgmt-service-crud:p1
 /// Service for GTS type lifecycle management.
@@ -250,10 +251,11 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
                 // One lookup for both the row and its surrogate id: the
                 // update path needs each, and resolving the code twice cost
                 // a second `gts_type` SELECT per update (RG-11).
-                let (type_id, existing) = type_repo
+                let (type_model, existing) = type_repo
                     .find_by_code_with_id(tx, &code)
                     .await?
                     .ok_or_else(|| DomainError::type_not_found(&code))?;
+                let type_id = type_model.id;
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-3
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-2
 
@@ -314,9 +316,21 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-12
                 // DB: UPDATE gts_type SET metadata_schema = {new}, updated_at = now().
-                let updated_model = type_repo
-                    .update_type(tx, type_id, &code, Some(&stored_schema))
+                let updated_at = type_repo
+                    .update_type(tx, type_id, Some(&stored_schema))
                     .await?;
+
+                // Assembled, not read back (RG-08). `metadata_schema` and
+                // `updated_at` are what the write just set, `id` and
+                // `schema_id` are the keys it was addressed by, and
+                // `created_at` is immutable -- carried from the row this
+                // transaction read at the top. The re-read this replaces
+                // could only return these same five values.
+                let updated_model = gts_type::Model {
+                    metadata_schema: Some(stored_schema),
+                    updated_at: Some(updated_at),
+                    ..type_model
+                };
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-12
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-13
                 // RETURN updated ResourceGroupType (loaded with refreshed junctions).

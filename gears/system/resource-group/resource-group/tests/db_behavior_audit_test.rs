@@ -390,9 +390,9 @@ async fn trace_create_type() {
     snapshot_trace("create_type", &rec);
     assert!(
         rec.writes_outside_tx().is_empty(),
-        "create_type's writes run inside a transaction (RG-03's missing retry \
-         wrapper -- not trace-observable -- is fixed too, see the static rule \
-         tests at the bottom of this file):\n{}",
+        "create_type's writes run inside a transaction. That transaction is \
+         still SERIALIZABLE without a retry wrapper -- RG-03, pinned as a \
+         known defect by the static rule at the bottom of this file:\n{}",
         rec.dump()
     );
     // Exactly 2 gts_type SELECTs: the "does this code already exist"
@@ -435,20 +435,21 @@ async fn trace_update_type() {
     snapshot_trace("update_type", &rec);
     assert!(
         rec.writes_outside_tx().is_empty(),
-        "update_type's writes run inside a transaction (RG-03's retry wrapper, \
-         not trace-observable, is fixed too):\n{}",
+        "update_type's writes run inside a transaction. As with create_type, \
+         that transaction is still SERIALIZABLE without retry (RG-03):\n{}",
         rec.dump()
     );
-    // Exactly 2 gts_type SELECTs: find_by_code_with_id's combined lookup,
-    // plus the necessary post-update_many re-read (`SecureUpdateMany`
-    // reports only rows-affected, never the model).
+    // Exactly 1 gts_type SELECT: find_by_code_with_id's combined lookup.
+    // `SecureUpdateMany` reports only rows-affected, but the row it wrote is
+    // fully determined by that lookup plus the values the update set, so the
+    // service assembles the answer instead of reading it back (RG-08).
     let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
     assert_eq!(
         type_selects,
-        2,
-        "RG-11 regression: expected exactly 2 gts_type SELECTs (the combined \
-         find_by_code_with_id lookup + the necessary post-update re-read), got \
-         {type_selects}:\n{}",
+        1,
+        "RG-08/RG-11 regression: expected exactly 1 gts_type SELECT (the \
+         combined find_by_code_with_id lookup, with no post-update re-read), \
+         got {type_selects}:\n{}",
         rec.dump()
     );
 }
@@ -507,6 +508,70 @@ async fn trace_list_memberships() {
     );
 }
 
+/// `add_membership`'s own trace, which the suite did not have.
+///
+/// Two things are pinned here, and they point in opposite directions.
+///
+/// The membership table is read once and written once: the tenant-compatibility
+/// check is a single statement whose subquery derives the member groups
+/// server-side, and the insert is not followed by a read-back — every column of
+/// that table is a key part or `created_at`, all four known to the caller
+/// (RG-08).
+///
+/// And the writes run on a bare connection. That is RG-01, still present here:
+/// the transaction boundary belongs to the isolation branch, so this asserts
+/// the defect rather than its absence, and fails the day it is fixed.
+#[tokio::test]
+async fn trace_add_membership() {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let membership_svc = common::make_membership_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let member_type = common::create_root_type(&type_svc, "addmbr").await;
+    let grp_type = create_type_with_memberships(&type_svc, "addgrp", &[&member_type.code]).await;
+    let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant_id).await;
+
+    rec.clear();
+    membership_svc
+        .add_membership(&ctx, group.id, &member_type.code, "res-1")
+        .await
+        .expect("add_membership should succeed");
+
+    snapshot_trace("add_membership", &rec);
+
+    let membership_selects = count_in(&rec.stats(), QueryKind::Select, "resource_group_membership");
+    assert_eq!(
+        membership_selects,
+        1,
+        "RG-08 regression: expected exactly 1 resource_group_membership SELECT \
+         (the tenant-compatibility check, whose subquery derives the member \
+         groups in the database), with no read-back after the insert, got \
+         {membership_selects}:\n{}",
+        rec.dump()
+    );
+
+    let membership_inserts = count_in(&rec.stats(), QueryKind::Insert, "resource_group_membership");
+    assert_eq!(
+        membership_inserts,
+        1,
+        "expected exactly 1 resource_group_membership INSERT, got \
+         {membership_inserts}:\n{}",
+        rec.dump()
+    );
+
+    assert!(
+        !rec.writes_outside_tx().is_empty(),
+        "RG-01 is pinned as present in this branch: add_membership writes on a \
+         bare connection. If this now fails, the transaction boundary landed -- \
+         flip this to `is_empty()` and update the RG-01 row in \
+         docs/db-behavior-audit.md in the same commit:\n{}",
+        rec.dump()
+    );
+}
+
 #[tokio::test]
 async fn trace_seeding() {
     let (db, rec) = common::test_db_with_recorder().await;
@@ -547,9 +612,18 @@ async fn trace_seeding() {
         .expect("seed_groups should succeed");
     assert_eq!(group_result.created, 1);
 
-    // Membership seeding shares add_membership_inner's transaction behavior;
-    // trace_add_membership asserts it directly, not repeated here.
     snapshot_trace("seeding", &rec);
+
+    // Seeding is a write path, so it carries the class's assertion like the
+    // others. An earlier revision deferred to a `trace_add_membership` that
+    // does not exist in this branch, which left the module header's claim --
+    // that every write path's trace test ends on this -- untrue of the one
+    // test most likely to be read as proof of it.
+    assert!(
+        rec.writes_outside_tx().is_empty(),
+        "seeding's writes run inside a transaction:\n{}",
+        rec.dump()
+    );
 }
 
 // =========================================================================
@@ -558,8 +632,8 @@ async fn trace_seeding() {
 
 #[tokio::test]
 async fn scale_create_child_closure_inserts_do_not_grow_with_ancestor_depth() {
-    // insert_ancestor_closure_rows batches the whole ancestor set into one
-    // secure_insert_many call (RG-06).
+    // insert_ancestor_closure_rows computes the whole ancestor set inside the
+    // database with one INSERT ... SELECT (RG-06).
     async fn closure_inserts_for_new_child_at_depth(depth: usize) -> usize {
         let (db, rec) = common::test_db_with_recorder().await;
         let type_svc = common::make_type_service(db.clone());
@@ -613,8 +687,9 @@ async fn move_stats_for_subtree_size(n: usize) -> BTreeMap<(QueryKind, String), 
 
 #[tokio::test]
 async fn scale_move_closure_inserts_do_not_grow_with_subtree_size() {
-    // rebuild_subtree_closure sends the whole A x N batch as a single
-    // secure_insert_many call (RG-04).
+    // rebuild_subtree_closure forms the whole A x N cross product inside the
+    // database with one INSERT ... SELECT; the pairs never become Rust
+    // values (RG-04).
     let small = count_in(
         &move_stats_for_subtree_size(3).await,
         QueryKind::Insert,
@@ -825,10 +900,11 @@ async fn scale_force_delete_statements_do_not_grow_with_subtree_size() {
 /// Statements issued by a *rejected* non-force delete, with `n` children
 /// each of a distinct GTS type.
 ///
-/// Distinct types on purpose: the classifier has to learn each child's type
-/// path to decide whether the child is nameable in the rejection, and a
-/// per-type lookup is the shape that scales. Children sharing one type would
-/// hide the defect behind the memoization the loop used to rely on.
+/// Distinct types on purpose: a rejection that named its blocking children
+/// would have to learn each one's type path, and a per-type lookup is the
+/// shape that scales. Children sharing one type would hide that behind
+/// memoization -- the growth would be in the number of *distinct* types, not
+/// in the number of children.
 async fn total_statements_for_rejected_delete(n: usize) -> usize {
     let (db, rec) = common::test_db_with_recorder().await;
     let type_svc = common::make_type_service(db.clone());
@@ -877,14 +953,16 @@ async fn total_statements_for_rejected_delete(n: usize) -> usize {
 }
 
 /// The rejection path must cost the same whether one child blocks the delete
-/// or twelve of different types do. It used to resolve each distinct type
-/// with its own `SELECT`, memoized per `gts_type_id` -- which bounded the
-/// cost by the number of distinct types rather than removing the growth.
+/// or twelve of different types do.
 ///
-/// This case is the one the original audit did not have: nine scale tests
-/// covered create, move, force delete, the two `$filter` paths and the type
-/// operations, but nothing covered `delete_group(force = false)`, so the
-/// regression could land unseen.
+/// A forward guard, not a regression test: the per-type `SELECT` this
+/// describes belongs to the `name blocking children on delete` work, which is
+/// not in this branch — the rejection here counts children and never looks at
+/// their types. So this passes on the code as it stands *and* on the code
+/// before this branch, and it is here for the reason the original audit found
+/// out the hard way: of ten scale tests, none covered
+/// `delete_group(force = false)`, so a per-type lookup landed there unseen.
+/// This is the watch that was missing, set before the code it watches.
 #[tokio::test]
 async fn scale_rejected_delete_statements_do_not_grow_with_child_type_count() {
     let small = total_statements_for_rejected_delete(2).await;
@@ -1071,7 +1149,10 @@ async fn scale_update_type_removed_parents_statements_do_not_grow_with_count() {
 // must show writes_outside_tx() == empty, proving the no-tx-write rule
 // doesn't flag these paths.
 //
-// SQLite can't exercise the actual SSI conflict; see tests/pg_concurrency_test.rs.
+// SQLite can't exercise the actual SSI conflict at all: it serializes every
+// writer, so there is nothing to conflict. Showing that these paths retry
+// rather than fail needs a Postgres-backed concurrency suite, which is not in
+// this branch.
 
 fn unique_tenant_type_code() -> String {
     format!(
@@ -1183,22 +1264,27 @@ async fn negative_control_read_paths_produce_no_write_statements() {
     );
 }
 
-// Section 4 -- a static source-scan rule for the one defect class here that
+// Section 4 -- static source-scan rules for the one defect class here that
 // leaves no trace in the SQL: RG-03, a SERIALIZABLE transaction opened
 // without retry. Matched on call shape.
+//
+// Both service files are scanned, because scanning only the healthy one is
+// how a rule comes to pass by construction: `group_service.rs` has never had
+// this defect, so a rule that reads nothing else can never fail and never
+// notices `type_service.rs`, which has it today.
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
 
+const UNRETRIED_SERIALIZABLE: &str = ".transaction_ref_mapped_with_config(TxConfig::serializable()";
+const RETRIED_SERIALIZABLE: &str = ".transaction_with_retry(TxConfig::serializable()";
+
 #[test]
 fn static_rule_passes_group_service_uses_retry() {
     let src = include_str!("../src/domain/group_service.rs");
-    let unretried = count_occurrences(
-        src,
-        ".transaction_ref_mapped_with_config(TxConfig::serializable()",
-    );
-    let retried = count_occurrences(src, ".transaction_with_retry(TxConfig::serializable()");
+    let unretried = count_occurrences(src, UNRETRIED_SERIALIZABLE);
+    let retried = count_occurrences(src, RETRIED_SERIALIZABLE);
     assert_eq!(
         unretried, 0,
         "negative control violated: group_service.rs should not bypass \
@@ -1208,5 +1294,38 @@ fn static_rule_passes_group_service_uses_retry() {
         retried >= 3,
         "expected create/update/move/delete_group to all use \
          transaction_with_retry, found {retried}"
+    );
+}
+
+/// RG-03, pinned where it actually is.
+///
+/// `create_type` and `update_type` open SERIALIZABLE transactions with no
+/// retry wrapper, so a serialization failure surfaces as a 500 instead of a
+/// second attempt. The fix belongs to the isolation branch, not this one, and
+/// the audit's rule is to pin a defect as an executable assertion rather than
+/// describe it -- so this asserts the count that is there, not the count that
+/// ought to be.
+///
+/// It fails in both directions on purpose: fixing one of the two, or adding a
+/// third unretried transaction, both break it. Whoever lands the fix updates
+/// the expectation to 0 and this becomes the negative control its neighbour
+/// already is.
+#[test]
+fn static_rule_pins_type_service_serializable_without_retry() {
+    let src = include_str!("../src/domain/type_service.rs");
+    let unretried = count_occurrences(src, UNRETRIED_SERIALIZABLE);
+    let retried = count_occurrences(src, RETRIED_SERIALIZABLE);
+    assert_eq!(
+        unretried, 2,
+        "RG-03 is pinned at 2 unretried SERIALIZABLE transactions in \
+         type_service.rs (create_type, update_type); found {unretried}. \
+         If this dropped, the fix landed -- change the expectation to 0 and \
+         say so in the doc comment above."
+    );
+    assert_eq!(
+        retried, 0,
+        "type_service.rs is not expected to use transaction_with_retry yet; \
+         found {retried}. If it now does, RG-03 is being fixed and the \
+         assertion above needs updating in the same commit."
     );
 }

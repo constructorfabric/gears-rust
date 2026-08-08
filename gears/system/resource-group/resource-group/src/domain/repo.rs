@@ -115,18 +115,13 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         parent_id: Uuid,
     ) -> Result<(), DomainError>;
 
-    async fn get_descendant_ids<C: DBRunner>(
-        &self,
-        db: &C,
-        group_id: Uuid,
-    ) -> Result<Vec<Uuid>, DomainError>;
-
-    /// Delete every group in `group_ids` in a single statement (RG-10).
+    /// Delete every group in `group_ids` in one statement per bind-parameter
+    /// chunk, not one per group (RG-10).
     async fn delete_by_id_many<C: DBRunner>(&self, db: &C, ids: &[Uuid])
     -> Result<(), DomainError>;
 
-    /// Delete all memberships for every group in `group_ids` in a single
-    /// statement (RG-10).
+    /// Delete all memberships for every group in `group_ids` in one statement
+    /// per bind-parameter chunk, not one per group (RG-10).
     async fn delete_memberships_many<C: DBRunner>(
         &self,
         db: &C,
@@ -134,16 +129,17 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
     ) -> Result<(), DomainError>;
 
     /// Delete all closure rows (both as ancestor and as descendant) for
-    /// every group in `group_ids`, in exactly 2 statements (RG-10), safe
-    /// since the whole batch is deleted together with no ordering to preserve.
+    /// every group in `group_ids`, in 2 statements per bind-parameter chunk
+    /// rather than 2 per group (RG-10) — safe since the whole batch is
+    /// deleted together with no ordering to preserve.
     async fn delete_all_closure_rows_many<C: DBRunner>(
         &self,
         db: &C,
         group_ids: &[Uuid],
     ) -> Result<(), DomainError>;
 
-    /// Same result set as `get_descendant_ids`, but keeps each descendant's
-    /// depth relative to `group_id`, so callers needing it (RG-05's depth
+    /// Every descendant of `group_id` (the self-row excluded) with its depth
+    /// relative to `group_id`, so callers needing that depth (RG-05's depth
     /// check, RG-10's depth-level batching) don't re-query for it.
     async fn get_descendant_ids_with_depth<C: DBRunner>(
         &self,
@@ -192,12 +188,6 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         group_id: Uuid,
     ) -> Result<bool, DomainError>;
 
-    async fn delete_memberships<C: DBRunner>(
-        &self,
-        db: &C,
-        group_id: Uuid,
-    ) -> Result<(), DomainError>;
-
     async fn resolve_type_paths_batch<C: DBRunner>(
         &self,
         db: &C,
@@ -216,11 +206,16 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
     /// Same lookup as `find_by_code`, but also returns the surrogate
     /// SMALLINT id, letting a caller that needs both avoid a separate
     /// `resolve_id` call for the same code (RG-11).
+    /// The row and the type built from it, in one query.
+    ///
+    /// Returns the `gts_type` row itself, not just its surrogate id: the
+    /// update path needs `created_at` to assemble its answer without reading
+    /// the row back after the write, and this query already held it.
     async fn find_by_code_with_id<C: DBRunner>(
         &self,
         db: &C,
         code: &str,
-    ) -> Result<Option<(i16, ResourceGroupType)>, DomainError>;
+    ) -> Result<Option<(gts_type::Model, ResourceGroupType)>, DomainError>;
 
     async fn load_full_type_by_id<C: DBRunner>(
         &self,
@@ -270,13 +265,18 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
         type_id: i16,
     ) -> Result<(), DomainError>;
 
+    /// Update `metadata_schema` and `updated_at` on one `gts_type` row.
+    ///
+    /// Returns the `updated_at` it wrote rather than the row: every other
+    /// column is either the key it was addressed by or immutable, so the
+    /// caller can assemble the new row from what it already holds. Reading
+    /// it back cost a second `gts_type` SELECT per update (RG-08).
     async fn update_type<C: DBRunner>(
         &self,
         db: &C,
         type_id: i16,
-        code: &str,
         metadata_schema: Option<&serde_json::Value>,
-    ) -> Result<gts_type::Model, DomainError>;
+    ) -> Result<time::OffsetDateTime, DomainError>;
 
     async fn delete_by_id<C: DBRunner>(&self, db: &C, type_id: i16) -> Result<(), DomainError>;
 

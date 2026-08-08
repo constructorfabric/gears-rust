@@ -54,7 +54,7 @@ depth-10 parent issued roughly 100 000 separate `INSERT`s.
 | RG-05 | n-plus-one | Medium | `group_service.rs` `move_group_internal_impl` — `is_descendant` + `get_relative_depth` per descendant; both answers were already in the rows loaded a moment earlier | Fixed |
 | RG-06 | n-plus-one | Medium-High | `group_repo.rs` `insert_ancestor_closure_rows` — one `INSERT` per ancestor | Fixed |
 | RG-07 | n-plus-one | Low-Medium | `type_repo.rs` — junction rows inserted one per allowed parent/membership type | Fixed |
-| RG-08 | redundant-io | Low-Medium | `group_repo.rs`/`type_repo.rs`/`membership_repo.rs` — insert discards the model it just got back, then re-reads the row by id | Fixed. Insert paths first; the `update_many` + re-read shape after, by dropping `update`'s unused return so it no longer reads, and assembling the response from what was written instead of reading again |
+| RG-08 | redundant-io | Low-Medium | `group_repo.rs`/`type_repo.rs`/`membership_repo.rs` — insert discards the model it just got back, then re-reads the row by id | Fixed in all three, both halves. Inserts return what they wrote or assemble it from the values they were given; the `update_many` + re-read shape is gone too — `group_repo::update` returns `()` and `type_repo::update_type` returns only the timestamp it chose, and both callers build the response from what they wrote. `find_by_code_with_id` now hands back the row rather than just its id, so `update_type` has the immutable `created_at` without a second read |
 | RG-09 | external-call-in-tx | High | `group_service.rs` — a cross-gear `types_registry` call plus JSON-Schema compilation inside a `SERIALIZABLE` transaction, repeated on every retry | Fixed on the source branch; not in this one — transaction duration, not a query count |
 | RG-10 | n-plus-one | High | `group_service.rs` `force_delete_subtree` — ~4 statements per node | Fixed |
 | RG-11 | redundant-io | Low | `group_service.rs` — the same type resolved twice per create/update (`resolve_id` then `find_by_code`) | Fixed |
@@ -93,6 +93,29 @@ introduced there afterwards was invisible by construction. The tenth test now
 exists and was validated the same way as the rest — the loop was restored, the
 test went from 17 statements at N=12 against 7 at N=2 to a clean failure, and
 the batch version brought both back to equal.
+
+### Known and not fixed: `IN (...)` lists bounded only by a column's domain
+
+Every list-valued predicate whose length follows the *data* or the *request*
+is now chunked against `max_bind_params_for`. Two are chunked against nothing,
+and are recorded here rather than fixed:
+
+- `group_repo.rs` `resolve_type_paths_batch` and `type_repo.rs`
+  `load_full_types_batch` bind one parameter per distinct GTS type id. The
+  column is `SMALLINT`, so the list cannot exceed 32 767 — which is above
+  SQLite's 30 000 ceiling and below PostgreSQL's 60 000.
+
+Reaching it needs more than 30 000 distinct types registered in one
+deployment, at which point the failure is a driver error on a read path, not
+data loss. The fix is the same three lines used everywhere else; what makes it
+not worth landing blind is that no test can reach the boundary without
+building 30 000 rows. If the type count ever gets within an order of magnitude
+of that, chunk these two the same way.
+
+Not on this list: `build_hierarchy_page`, which *is* bounded by the data
+(subtree size) and is chunked — at half the ceiling, because the caller's
+`AccessScope` compiles to predicates binding an unknown number of parameters
+into the same statement.
 
 ### Transaction-behaviour findings (`TX-nn`)
 
@@ -160,6 +183,12 @@ getting a clean `CycleDetected`, and force-delete races produced no orphans in
 60+ runs.
 
 ## Deviation from the unit/E2E testing guide
+
+**None of the PostgreSQL suites below are in this branch.** This branch
+carries the query-count half of the audit — SQLite plus the statement
+recorder — and the concurrency findings reported above were measured on the
+branch that carries the isolation half. The rationale is recorded here
+because it is the audit's, not that branch's, and the suites land against it.
 
 `pg_concurrency_test.rs` (this audit's own suite), and the three narrower
 repro suites that followed it — `pg_membership_filter_test.rs` and
@@ -231,8 +260,13 @@ The point of the exercise. Nothing needs copying: the recorder lives in
 6. Add a PostgreSQL suite behind the `integration` feature for anything whose
    correctness depends on concurrency, with a post-state invariant helper
    called from every scenario.
-7. Pin each known defect as an executable `#[ignore = "known defect …"]`
-   assertion so it starts passing the day it is fixed.
+7. Pin each known defect as an executable assertion, so that fixing it breaks
+   the pin and the fix cannot land silently. `#[ignore = "known defect …"]`
+   works when the defect is observable as a statement count. When it is not —
+   `SERIALIZABLE` without retry is the case here — assert the count that *is*
+   there rather than the count that ought to be, and say in the doc comment
+   what to change when the fix lands. See
+   `static_rule_pins_type_service_serializable_without_retry`.
 
 ## What this does not cover
 
