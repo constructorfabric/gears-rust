@@ -1055,9 +1055,10 @@ impl std::fmt::Debug for DbTx<'_> {
 // crate. These tests never call `tokio::time::sleep`, so they're
 // synchronous, deterministic, and effectively instantaneous.
 #[cfg(test)]
-mod backoff_tests {
+mod tests {
     use super::{
-        RETRY_BACKOFF_BASE_MS, RETRY_BACKOFF_FACTOR, RETRY_BACKOFF_MAX, retry_backoff_delay,
+        RETRY_BACKOFF_BASE_MS, RETRY_BACKOFF_FACTOR, RETRY_BACKOFF_MAX, TxPhase,
+        retry_backoff_delay, sql_err_kind,
     };
     use std::collections::HashSet;
     use std::time::Duration;
@@ -1156,5 +1157,48 @@ mod backoff_tests {
         // put latency on the success path). This only fires in debug
         // builds (`debug_assert!`), which is how `cargo test` runs.
         let _ = retry_backoff_delay(1);
+    }
+
+    // `TxPhase` and `sql_err_kind` exist only to label a give-up log line.
+    // Nothing asserts on them, so nothing would notice a label going wrong --
+    // and a mislabelled phase or an error class that reads
+    // "not_a_sql_error" for a constraint violation is exactly the kind of
+    // thing that misleads whoever is reading the log during an incident.
+
+    #[test]
+    fn tx_phase_labels_are_distinct_and_lowercase() {
+        let labels: Vec<String> = [TxPhase::Begin, TxPhase::Body, TxPhase::Commit]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(labels, vec!["begin", "body", "commit"]);
+    }
+
+    #[test]
+    fn sql_err_kind_names_the_class_and_never_the_values() {
+        // The payload of each variant carries the offending values on
+        // PostgreSQL and MySQL; the point of this function is that none of it
+        // reaches the log line.
+        let unique = sea_orm::SqlErr::UniqueConstraintViolation(
+            "Key (email)=(user@example.com) already exists".to_owned(),
+        );
+        let fk = sea_orm::SqlErr::ForeignKeyConstraintViolation(
+            "Key (gts_type_id)=(7) is still referenced".to_owned(),
+        );
+
+        assert_eq!(sql_err_kind(Some(&unique)), "unique_constraint_violation");
+        assert_eq!(sql_err_kind(Some(&fk)), "foreign_key_constraint_violation");
+        assert_eq!(sql_err_kind(None), "not_a_sql_error");
+
+        for kind in [
+            sql_err_kind(Some(&unique)),
+            sql_err_kind(Some(&fk)),
+            sql_err_kind(None),
+        ] {
+            assert!(
+                !kind.contains('@') && !kind.contains('='),
+                "the class name must not carry a value: {kind}"
+            );
+        }
     }
 }

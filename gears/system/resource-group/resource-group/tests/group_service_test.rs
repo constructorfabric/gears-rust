@@ -3025,3 +3025,158 @@ async fn group_create_duplicate_id_same_tenant_is_already_exists() {
         "expected GroupAlreadyExists({id}), got: {err:?}"
     );
 }
+
+// =========================================================================
+// `$filter` type-path resolution
+//
+// A `type` filter names a GTS path; the column holds a surrogate SMALLINT.
+// `list_groups` therefore walks the filter AST, collects every type literal,
+// resolves them in one query, and substitutes the ids back. Each node shape
+// is a separate arm of that walk, and the scale test elsewhere in this suite
+// only ever builds `type in (...)` -- so the plain comparison, the boolean
+// combinations, the negation and the unknown-path rejection went unexercised.
+// =========================================================================
+
+/// Build a `list_groups` query from an OData filter string.
+fn filter_query(expr: &str) -> ODataQuery {
+    let parsed = toolkit_odata::parse_filter_string(expr).expect("filter should parse");
+    ODataQuery::new().with_filter(parsed.into_expr())
+}
+
+#[tokio::test]
+async fn list_groups_filters_by_a_single_type() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t_a = common::create_root_type(&type_svc, "fone").await;
+    let t_b = common::create_root_type(&type_svc, "ftwo").await;
+    let a = common::create_root_group(&group_svc, &ctx, &t_a.code, "a", tenant_id).await;
+    common::create_root_group(&group_svc, &ctx, &t_b.code, "b", tenant_id).await;
+
+    let page = group_svc
+        .list_groups(&ctx, &filter_query(&format!("type eq '{}'", t_a.code)))
+        .await
+        .expect("list_groups with a type filter should succeed");
+
+    let ids: Vec<Uuid> = page.items.iter().map(|g| g.id).collect();
+    assert_eq!(ids, vec![a.id], "only the group of the filtered type");
+    assert_eq!(
+        page.items[0].code, t_a.code,
+        "the surrogate id must be mapped back to the GTS path on the way out"
+    );
+}
+
+#[tokio::test]
+async fn list_groups_filters_by_either_of_two_types() {
+    // `or` is a Composite node: the walk has to recurse into every child to
+    // find the literals, and again to substitute them.
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t_a = common::create_root_type(&type_svc, "fora").await;
+    let t_b = common::create_root_type(&type_svc, "forb").await;
+    let t_c = common::create_root_type(&type_svc, "forc").await;
+    let a = common::create_root_group(&group_svc, &ctx, &t_a.code, "a", tenant_id).await;
+    let b = common::create_root_group(&group_svc, &ctx, &t_b.code, "b", tenant_id).await;
+    common::create_root_group(&group_svc, &ctx, &t_c.code, "c", tenant_id).await;
+
+    let page = group_svc
+        .list_groups(
+            &ctx,
+            &filter_query(&format!("type eq '{}' or type eq '{}'", t_a.code, t_b.code)),
+        )
+        .await
+        .expect("list_groups with an or-filter should succeed");
+
+    let mut ids: Vec<Uuid> = page.items.iter().map(|g| g.id).collect();
+    ids.sort();
+    let mut want = vec![a.id, b.id];
+    want.sort();
+    assert_eq!(ids, want, "both branches of the or, and nothing else");
+}
+
+#[tokio::test]
+async fn list_groups_filters_by_negated_type() {
+    // `not` wraps a single child; the walk descends through it in both
+    // passes, and a miss there would silently drop the substitution and leave
+    // a GTS path where the column wants a SMALLINT.
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t_a = common::create_root_type(&type_svc, "fnota").await;
+    let t_b = common::create_root_type(&type_svc, "fnotb").await;
+    common::create_root_group(&group_svc, &ctx, &t_a.code, "a", tenant_id).await;
+    let b = common::create_root_group(&group_svc, &ctx, &t_b.code, "b", tenant_id).await;
+
+    let page = group_svc
+        .list_groups(
+            &ctx,
+            &filter_query(&format!("not (type eq '{}')", t_a.code)),
+        )
+        .await
+        .expect("list_groups with a negated type filter should succeed");
+
+    let ids: Vec<Uuid> = page.items.iter().map(|g| g.id).collect();
+    assert_eq!(ids, vec![b.id], "everything except the excluded type");
+}
+
+#[tokio::test]
+async fn list_groups_rejects_an_unknown_type_in_the_filter() {
+    // The resolution map is built from the paths that exist. A path that is
+    // absent has no id to substitute, and the request is a client error --
+    // not an empty page, which would read as "no such groups" rather than
+    // "no such type", and not a 500.
+    let db = common::test_db().await;
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let err = group_svc
+        .list_groups(
+            &ctx,
+            &filter_query("type eq 'gts.cf.core.rg.type.v1~x.test.absent.v1~'"),
+        )
+        .await
+        .expect_err("an unresolvable type path must be refused");
+
+    assert!(
+        matches!(err, DomainError::Validation { .. }),
+        "expected a validation error, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("Unknown type in filter"),
+        "the message should name the problem: {err}"
+    );
+}
+
+#[tokio::test]
+async fn list_groups_leaves_a_filter_without_a_type_alone() {
+    // Nothing to resolve: the walk must pass the node through untouched
+    // rather than rewriting or rejecting it.
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t = common::create_root_type(&type_svc, "fnamed").await;
+    let a = common::create_root_group(&group_svc, &ctx, &t.code, "keep-me", tenant_id).await;
+    common::create_root_group(&group_svc, &ctx, &t.code, "drop-me", tenant_id).await;
+
+    let page = group_svc
+        .list_groups(&ctx, &filter_query("name eq 'keep-me'"))
+        .await
+        .expect("a non-type filter should pass through untouched");
+
+    let ids: Vec<Uuid> = page.items.iter().map(|g| g.id).collect();
+    assert_eq!(ids, vec![a.id]);
+}
