@@ -324,12 +324,24 @@ impl OpenApiRegistryImpl {
                 .collect::<Vec<_>>()
         });
 
-        let openapi = OpenApiBuilder::new()
+        let mut openapi = OpenApiBuilder::new()
             .info(openapi_info)
             .servers(servers)
             .paths(paths.build())
             .components(Some(components.build()))
             .build();
+
+        // Document-level vendor extension: this spec is generated from Rust
+        // contract traits + `schemars`/`utoipa` schemas, which cover a deliberate
+        // subset of REST (ADR-0002). It is the MINIMUM conformance contract —
+        // remote services may expose strictly more, never less. Downstream
+        // directory validators key their superset semantics off this marker.
+        let mut ext = utoipa::openapi::extensions::Extensions::default();
+        ext.insert(
+            "x-toolkit-spec-scope".to_owned(),
+            serde_json::json!("minimum-conformance"),
+        );
+        openapi.extensions = Some(ext);
 
         warn_dangling_refs_in_openapi(&openapi);
 
@@ -346,8 +358,24 @@ impl Default for OpenApiRegistryImpl {
 impl OpenApiRegistry for OpenApiRegistryImpl {
     fn register_operation(&self, spec: &operation_builder::OperationSpec) {
         let operation_key = format!("{}:{}", spec.method.as_str(), spec.path);
-        self.operation_specs
-            .insert(operation_key.clone(), spec.clone());
+        // Surface duplicate (method, path) registrations — e.g. a generated
+        // `register_<trait>_routes()` colliding with a hand-written route, or two
+        // SDKs registering the same path (M-13). Silently overwriting the earlier
+        // operation's OpenAPI spec is a hard-to-diagnose drift; the axum router
+        // itself will also panic on the duplicate route at bind time.
+        if let Some(prev) = self
+            .operation_specs
+            .insert(operation_key.clone(), spec.clone())
+            && prev.handler_id != spec.handler_id
+        {
+            tracing::warn!(
+                operation_key = %operation_key,
+                previous_handler = %prev.handler_id,
+                new_handler = %spec.handler_id,
+                "duplicate OpenAPI operation registration; the earlier operation spec was \
+                 overwritten - generated and manual routes must not share a (method, path)"
+            );
+        }
 
         tracing::debug!(
             handler_id = %spec.handler_id,

@@ -1,0 +1,5 @@
+error: rest_contract trait must declare its base contract as a supertrait (e.g. `pub trait PaymentServiceRest: PaymentService`)
+ --> tests/ui/fail/rest_missing_supertrait.rs:6:1
+  |
+6 | pub trait FooApiRest {
+  | ^^^

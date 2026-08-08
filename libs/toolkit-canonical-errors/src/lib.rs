@@ -16,7 +16,7 @@ pub use context::{
     Unauthenticated, UnauthenticatedV1, Unimplemented, UnimplementedV1, Unknown, UnknownV1,
 };
 pub use error::CanonicalError;
-pub use problem::{Problem, ProblemConversionError};
+pub use problem::{Problem, ProblemCategory, ProblemConversionError};
 pub use toolkit_canonical_errors_macro::resource_error;
 // Re-export the `gts_id!` helper so consumers using `#[resource_error(...)]`
 // can write `#[resource_error(gts_id!("cf.core.users.user.v1~"))]` without

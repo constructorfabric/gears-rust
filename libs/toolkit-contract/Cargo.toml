@@ -1,0 +1,119 @@
+[package]
+name = "cf-gears-toolkit-contract"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ToolKit contract IR, binding metadata, validation, policy stack, and proc-macro re-exports"
+rust-version.workspace = true
+
+[lib]
+name = "toolkit_contract"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+runtime-client = [
+    "canonical-errors",
+    "dep:toolkit-http",
+    "dep:http-body",
+    "dep:http-body-util",
+    "dep:tokio",
+    "dep:bytes",
+    "dep:futures-util",
+    "dep:futures-core",
+    "dep:rand",
+    "dep:async-stream",
+]
+# Used by rest_contract codegen to gate the generated client struct.
+rest-client = ["runtime-client"]
+# OpenTelemetry in generated clients. Activates `toolkit-http/otel`, which makes
+# the transport actually inject W3C `traceparent` (real distributed-trace
+# propagation) AND enables RED client metrics (`http.client.request.duration`)
+# via the builder's `with_metrics`. Without this feature the generated client
+# still opens per-method `tracing` spans, but emits no wire propagation or
+# metrics. Enable it through an SDK's own `otel` feature (which forwards here).
+otel = ["runtime-client", "toolkit-http/otel"]
+# Server-side REST route registration: gates the generated `register_<trait>_routes()` function
+# and server-side OperationBuilder integration. The generated routes live in the SDK crate and
+# use the SDK's own `axum`/`toolkit` deps + `OperationBuilder`/`OpenApiRegistry`; this feature
+# gates nothing in `toolkit-contract` itself, so it only forwards `canonical-errors` (the wire
+# `Problem` envelope shared with the generated server error path).
+rest-server = ["canonical-errors"]
+# Directory-resolving REST transport: a self-healing wrapper that resolves the
+# provider endpoint from the service directory per call and rebuilds the
+# generated REST client when the endpoint changes. Gates the generated
+# `<Trait>ResolvingClient` struct and the `runtime::resolving` module.
+directory-rest-client = ["rest-client"]
+# Conversion of `TransportError` into `toolkit_canonical_errors::CanonicalError`.
+# Pull this in when SDKs want their `Result<_, CanonicalError>` to absorb
+# transport-layer failures via `?` without per-call mapping.
+canonical-errors = ["dep:toolkit-canonical-errors"]
+# Runtime gRPC helpers (status mapping, bearer auth, retry plumbing).
+# Generated `<Trait>Client` structs from `#[toolkit::grpc_contract]` need this.
+# Pulls in canonical-errors so the wire `Problem` envelope is the single
+# canonical type across REST + gRPC + SSE.
+grpc-client = [
+    "runtime-client",
+    "canonical-errors",
+    "dep:tonic",
+    "dep:toolkit-security",
+    "dep:toolkit-transport-grpc",
+]
+
+[dependencies]
+toolkit-contract-macros.workspace = true
+toolkit-utils = { workspace = true, features = ["humantime-serde"] }
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+http.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+percent-encoding = "2"
+
+toolkit-http = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["time", "macros"], optional = true }
+bytes = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+futures-core = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+async-stream = { workspace = true, optional = true }
+tonic = { workspace = true, features = ["transport"], optional = true }
+toolkit-security = { workspace = true, optional = true }
+toolkit-transport-grpc = { workspace = true, optional = true }
+toolkit-canonical-errors = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+parking_lot.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+axum.workspace = true
+toolkit-http.workspace = true
+secrecy.workspace = true
+toolkit-security.workspace = true
+tower.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+# Dev-only cycle (Cargo permits dev-dependency cycles): `toolkit` regular-depends
+# on this crate, but the generated `register_<trait>_routes()` server codegen
+# (feature = "rest-server") references `::toolkit::api::{OperationBuilder,
+# OpenApiRegistry}`, so exercising that codegen in this crate's own tests needs
+# `toolkit` + `utoipa` (for the `ToSchema` bound on request/response DTOs).
+toolkit = { workspace = true }
+utoipa = { workspace = true }
+# otel_propagation.rs (feature = "otel"): builds an in-process (no exporter)
+# SdkTracerProvider to prove the generated client span's trace_id propagates
+# to the server via toolkit-http's OtelLayer. No collector/emulator needed —
+# dev-only, does not affect the library's `otel`-gated dependency footprint.
+tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true

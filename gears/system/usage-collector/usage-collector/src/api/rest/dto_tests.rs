@@ -397,6 +397,8 @@ fn create_usage_record_result_dto_serialises_rejected_with_lowercase_tag() {
         instance: None,
         trace_id: None,
         context: serde_json::json!({}),
+        error_code: None,
+        error_domain: None,
     };
     let dto = CreateUsageRecordResultDto::Rejected {
         index: 1,

@@ -51,6 +51,12 @@ pub struct ServiceInstanceInfo {
     /// Optional REST endpoint (HTTP base URL) for this instance.
     /// Not all gears expose a REST API.
     pub rest_endpoint: Option<ServiceEndpoint>,
+    /// Map of gRPC service name to endpoint published by this instance.
+    ///
+    /// Carried back by `list_instances` so a subsequent `register_instance`
+    /// (which replaces the entry wholesale) can augment — rather than clobber —
+    /// the previously-registered gRPC services when adding a REST endpoint.
+    pub grpc_services: Vec<(String, ServiceEndpoint)>,
 }
 
 /// Information for registering a new gear instance
@@ -69,6 +75,77 @@ pub struct RegisterInstanceInfo {
     /// Optional `OpenAPI` spec (JSON) published by the gear.
     pub openapi_spec: Option<String>,
 }
+
+/// A resolved gRPC service and the endpoint it is reachable at.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GrpcServiceInfo {
+    /// Fully-qualified gRPC service name (e.g. `payment.v1.PaymentApi`).
+    pub service_name: String,
+    /// Endpoint the service is reachable at.
+    pub endpoint: ServiceEndpoint,
+}
+
+impl GrpcServiceInfo {
+    pub fn new(service_name: impl Into<String>, endpoint: ServiceEndpoint) -> Self {
+        Self {
+            service_name: service_name.into(),
+            endpoint,
+        }
+    }
+}
+
+/// Sentinel error wrapped via `anyhow::Error` to signal "the requested gear or
+/// service is not registered (or has no live instance)" through the
+/// [`DirectoryClient`] trait. Consumers downcast to this type to distinguish a
+/// not-ready provider (eventual readiness) from a directory-backend failure —
+/// see `toolkit::discovery::DirectoryEndpointResolver`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryNotFound {
+    /// What was being looked up — e.g. `"gear foo"` or `"service foo.Bar"`.
+    pub resource: String,
+}
+
+impl DirectoryNotFound {
+    pub fn new(resource: impl Into<String>) -> Self {
+        Self {
+            resource: resource.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DirectoryNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "directory: not found: {}", self.resource)
+    }
+}
+
+impl std::error::Error for DirectoryNotFound {}
+
+/// Sentinel error wrapped via `anyhow::Error` to signal "client-supplied
+/// argument is malformed" (e.g. invalid UUID) through the [`DirectoryClient`]
+/// trait. Allows the gRPC server boundary to return `Status::invalid_argument`
+/// instead of mislabeling a client bug as an internal failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryInvalidArgument {
+    /// Human-readable description of what was invalid.
+    pub message: String,
+}
+
+impl DirectoryInvalidArgument {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DirectoryInvalidArgument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "directory: invalid argument: {}", self.message)
+    }
+}
+
+impl std::error::Error for DirectoryInvalidArgument {}
 
 /// Directory API trait for service discovery and instance management
 ///

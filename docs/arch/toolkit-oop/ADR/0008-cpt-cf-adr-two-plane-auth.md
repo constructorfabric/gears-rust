@@ -151,7 +151,7 @@ The two planes are carried by **two distinct types** — the tenant `SecurityCon
 or role on a single context: the type in the signature *is* the marker. This makes plane selection a **compile-time**
 property and keeps "this call has no tenant" unrepresentable-as-a-tenant (the separation-of-mechanisms goal above).
 
-This pins the convention for the contract-binding codegen (`#[toolkit_rest_contract]` /
+This pins the convention for the contract-binding codegen (`#[toolkit::rest_contract]` /
 [binding constraint `cpt-cf-binding-constraint-security-context`](../../toolkit-contract-binding/DESIGN.md)): a
 remote-capable method takes **exactly one** plane context as its first argument, and the generated client maps it to
 the matching carrier.

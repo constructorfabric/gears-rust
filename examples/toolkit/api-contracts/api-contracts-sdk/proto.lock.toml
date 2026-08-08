@@ -1,0 +1,36 @@
+version = 1
+
+[messages.ChargeRequest.fields]
+amount_cents = 1
+currency = 2
+description = 3
+
+[messages.ChargeResponse.fields]
+payment_id = 1
+status = 2
+
+[messages.GetInvoiceRequest.fields]
+invoice_id = 1
+
+[messages.Invoice.fields]
+amount_cents = 1
+currency = 2
+description = 3
+invoice_id = 4
+payment_id = 5
+status = 6
+
+[messages.ListPaymentsFilter.fields]
+currency = 1
+status = 2
+
+[messages.PaymentSummary.fields]
+amount_cents = 1
+currency = 2
+payment_id = 3
+status = 4
+
+[enums.PaymentStatus.variants]
+completed = 2
+failed = 3
+pending = 1

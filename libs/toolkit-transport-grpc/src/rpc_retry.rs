@@ -430,7 +430,7 @@ mod tests {
         );
 
         let start = Instant::now();
-        _ = call_with_retry(
+        let result = call_with_retry(
             &mut client,
             cfg,
             (),
@@ -443,12 +443,56 @@ mod tests {
         .await;
         let elapsed = start.elapsed();
 
-        // With max_backoff of 50ms and 2 retries, total backoff should be ~100ms max
-        // (50ms + 50ms, since both attempts would hit the cap)
-        // Without cap: 100ms + 200ms = 300ms
+        // Every attempt must actually run (a broken retry loop that gives up
+        // early or never retries would otherwise pass the timing check below).
+        assert!(result.is_err());
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "expected initial attempt + 2 retries"
+        );
+        // Upper bound only: delays use tokio-retry's *full* jitter
+        // (`computed * U(0, 1)`, see the comment on the strategy construction
+        // above), so a legitimate run can land arbitrarily close to 0ms — a
+        // lower-bound assertion here would be flaky by design, not a real
+        // check. Without the cap, two uncapped delays would be 100ms + 200ms =
+        // 300ms; with the 50ms cap the ceiling is 50ms + 50ms = 100ms.
         assert!(
             elapsed < Duration::from_millis(200),
-            "Backoff should be capped; elapsed: {elapsed:?}"
+            "backoff should be capped; elapsed: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn backoff_schedule_is_capped_and_increasing_before_jitter() {
+        // Full jitter (`.map(jitter)`) makes wall-clock delay assertions
+        // flaky by design (see the test above), so verify the CAP and the
+        // exponential SHAPE directly on the pre-jitter strategy — a broken
+        // `max_delay` (the thing `#13` exists to catch) or a broken/absent
+        // exponential growth is caught deterministically, with no timing
+        // dependency at all.
+        let cfg = RpcRetryConfig::new(4)
+            .with_backoff_base_ms(100)
+            .with_backoff_factor(1)
+            .with_max_backoff(Duration::from_millis(50));
+
+        let delays: Vec<Duration> = ExponentialBackoff::from_millis(cfg.backoff_base_ms)
+            .factor(cfg.backoff_factor)
+            .max_delay(cfg.max_backoff)
+            .take(cfg.max_retries as usize)
+            .collect();
+
+        assert_eq!(delays.len(), 4);
+        // Uncapped, base=100 factor=1 grows 100ms, 10_000ms, 1_000_000ms, ...
+        // (`ExponentialBackoff` raises `base` to the attempt power) — every
+        // one of those after the first must be clamped to exactly the cap.
+        assert!(
+            delays.iter().all(|d| *d <= cfg.max_backoff),
+            "every delay must be capped at max_backoff, got {delays:?}"
+        );
+        assert_eq!(
+            delays[1], cfg.max_backoff,
+            "second delay must hit the cap given these growth parameters, got {delays:?}"
         );
     }
 }
