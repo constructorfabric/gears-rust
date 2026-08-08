@@ -95,6 +95,17 @@ struct Inner {
     map: HashMap<String, Stored>,
     watchers: Vec<Watcher>,
     next_watch_id: u64,
+    /// Senders for prefix watches handed out by
+    /// [`MemoryCache::linearizable_with_silent_prefix_watch`], parked here
+    /// unregistered so nothing ever matches them.
+    ///
+    /// Held rather than dropped on purpose: a dropped sender ends the consumer's
+    /// stream, which makes a service-discovery maintainer exit and a later call
+    /// start a fresh one that reconciles from backend truth — the very path such a
+    /// fixture exists to keep closed. Keeping them alive means `recv` simply never
+    /// resolves, so the maintained view can only ever be populated by an explicit
+    /// reconcile.
+    parked_senders: Vec<CacheWatchSender>,
 }
 
 /// How a fixture's exact [`watch`](ClusterCacheBackend::watch) behaves, for the
@@ -111,34 +122,76 @@ enum WatchBehavior {
     Rotating,
 }
 
+/// How a fixture's [`watch_prefix`](ClusterCacheBackend::watch_prefix) behaves.
+///
+/// One enum rather than two booleans, because the three states are alternatives
+/// rather than independent switches — and because the declaration
+/// (`features().prefix_watch`) and the delivery behaviour have to agree, which two
+/// bools leave free to disagree.
+#[derive(Clone, Copy)]
+enum PrefixWatchBehavior {
+    /// A live prefix watch registered against the store, delivering on every
+    /// matching write. `features().prefix_watch` is `true`.
+    Native,
+    /// `features().prefix_watch` is `true` and `watch_prefix` succeeds, but the
+    /// watch **never delivers** — the stand-in for a *remote* prefix watch whose
+    /// events are still in flight.
+    ///
+    /// The distinction this exists to make testable: `features().prefix_watch`
+    /// says whether a backend *has* a native prefix watch, not whether its
+    /// delivery is synchronous. Every in-process cache conflates the two, because
+    /// delivery is a task yield; a Redis-backed one does not, because delivery is
+    /// a network round trip. See
+    /// [`linearizable_with_silent_prefix_watch`](MemoryCache::linearizable_with_silent_prefix_watch).
+    Silent,
+    /// `features().prefix_watch` is `false` and `watch_prefix` answers
+    /// [`ClusterError::Unsupported`] — the service-discovery degradation path.
+    Unsupported,
+}
+
 /// A functional in-memory cache backend for default-backend unit tests.
 pub struct MemoryCache {
     inner: Mutex<Inner>,
     consistency: CacheConsistency,
-    prefix_watch: bool,
+    prefix_watch: PrefixWatchBehavior,
     watch_behavior: WatchBehavior,
-    /// When `prefix_watch` is `false`, suspend once (`yield_now`) before
-    /// returning `Unsupported` from `watch_prefix`. Lets a test deterministically
-    /// interleave two concurrent `register`s at the maintainer-startup await.
+    /// When prefix watch is [`PrefixWatchBehavior::Unsupported`], suspend once
+    /// (`yield_now`) before returning `Unsupported` from `watch_prefix`. Lets a
+    /// test deterministically interleave two concurrent `register`s at the
+    /// maintainer-startup await.
     slow_unsupported_watch: bool,
 }
 
 impl MemoryCache {
     /// A linearizable cache with native prefix-watch support — the common case.
-    pub(super) fn linearizable() -> Arc<Self> {
-        Self::spawn(CacheConsistency::Linearizable, true)
+    /// `pub(crate)` for the same reason as
+    /// [`eventually_consistent`](Self::eventually_consistent): the wiring tests
+    /// build a *native* backend over a linearizable cache to stand beside a weak
+    /// one, proving a native binding needs no opt-in.
+    pub(crate) fn linearizable() -> Arc<Self> {
+        Self::spawn(CacheConsistency::Linearizable, PrefixWatchBehavior::Native)
     }
 
     /// An eventually-consistent cache, for exercising the constructor guard.
-    pub(super) fn eventually_consistent() -> Arc<Self> {
-        Self::spawn(CacheConsistency::EventuallyConsistent, true)
+    /// `pub(crate)` rather than `pub(super)` because the wiring's own tests need it
+    /// too: it is the stand-in for the Redis cache in the weak-consistency opt-in
+    /// tests (`config_tests.rs`, `wiring_tests.rs`), Redis being the first backend
+    /// in the workspace to declare `EventuallyConsistent`.
+    pub(crate) fn eventually_consistent() -> Arc<Self> {
+        Self::spawn(
+            CacheConsistency::EventuallyConsistent,
+            PrefixWatchBehavior::Native,
+        )
     }
 
     /// A linearizable cache that declares no native prefix watch, so
     /// `watch_prefix` returns [`ClusterError::Unsupported`] — for the
     /// service-discovery degradation path.
     pub fn linearizable_without_prefix_watch() -> Arc<Self> {
-        Self::spawn(CacheConsistency::Linearizable, false)
+        Self::spawn(
+            CacheConsistency::Linearizable,
+            PrefixWatchBehavior::Unsupported,
+        )
     }
 
     /// A linearizable cache whose exact `watch` ends immediately on every
@@ -147,7 +200,7 @@ impl MemoryCache {
     pub(super) fn linearizable_with_dead_watch() -> Arc<Self> {
         Self::spawn_with(
             CacheConsistency::Linearizable,
-            true,
+            PrefixWatchBehavior::Native,
             WatchBehavior::DeadImmediate,
         )
     }
@@ -158,18 +211,41 @@ impl MemoryCache {
     pub(super) fn linearizable_with_rotating_watch() -> Arc<Self> {
         Self::spawn_with(
             CacheConsistency::Linearizable,
-            true,
+            PrefixWatchBehavior::Native,
             WatchBehavior::Rotating,
         )
     }
 
-    fn spawn(consistency: CacheConsistency, prefix_watch: bool) -> Arc<Self> {
+    /// A linearizable cache that **declares** native prefix watch but whose
+    /// prefix watches never deliver an event — the stand-in for a remote backend
+    /// whose `Changed` notification has not arrived yet.
+    ///
+    /// The one property it isolates, deterministically and with no sleeps: a
+    /// service-discovery view maintained purely from prefix-watch events is not a
+    /// sound source for `discover`, because on a remote backend those events lag
+    /// the writes that produced them. A `discover` that trusted the view here
+    /// would never see an instance registered by another process at all; one that
+    /// reconciles from `scan_prefix` sees it immediately.
+    ///
+    /// Deliberately not modelled as a *slow* watch. A delay would make the test a
+    /// race that usually fails rather than a statement that always holds, and the
+    /// property under test is about the source of truth, not about latency.
+    pub fn linearizable_with_silent_prefix_watch() -> Arc<Self> {
+        Self::spawn_full(
+            CacheConsistency::Linearizable,
+            PrefixWatchBehavior::Silent,
+            WatchBehavior::Normal,
+            false,
+        )
+    }
+
+    fn spawn(consistency: CacheConsistency, prefix_watch: PrefixWatchBehavior) -> Arc<Self> {
         Self::spawn_with(consistency, prefix_watch, WatchBehavior::Normal)
     }
 
     fn spawn_with(
         consistency: CacheConsistency,
-        prefix_watch: bool,
+        prefix_watch: PrefixWatchBehavior,
         watch_behavior: WatchBehavior,
     ) -> Arc<Self> {
         Self::spawn_full(consistency, prefix_watch, watch_behavior, false)
@@ -177,7 +253,7 @@ impl MemoryCache {
 
     fn spawn_full(
         consistency: CacheConsistency,
-        prefix_watch: bool,
+        prefix_watch: PrefixWatchBehavior,
         watch_behavior: WatchBehavior,
         slow_unsupported_watch: bool,
     ) -> Arc<Self> {
@@ -186,6 +262,7 @@ impl MemoryCache {
                 map: HashMap::new(),
                 watchers: Vec::new(),
                 next_watch_id: 0,
+                parked_senders: Vec::new(),
             }),
             consistency,
             prefix_watch,
@@ -287,7 +364,10 @@ impl ClusterCacheBackend for MemoryCache {
     }
 
     fn features(&self) -> CacheFeatures {
-        CacheFeatures::new(self.prefix_watch)
+        CacheFeatures::new(!matches!(
+            self.prefix_watch,
+            PrefixWatchBehavior::Unsupported
+        ))
     }
 
     async fn get(&self, key: &str) -> Result<Option<CacheEntry>, ClusterError> {
@@ -486,17 +566,30 @@ impl ClusterCacheBackend for MemoryCache {
     }
 
     async fn watch_prefix(&self, prefix: &str) -> Result<CacheWatch, ClusterError> {
-        if !self.prefix_watch {
-            if self.slow_unsupported_watch {
-                // Suspend so a concurrent caller can observe the in-progress
-                // maintainer mark before this attempt fails and rolls it back.
-                tokio::task::yield_now().await;
+        match self.prefix_watch {
+            PrefixWatchBehavior::Native => {
+                Ok(self.register_watch(WatchKind::Prefix(prefix.to_owned())))
             }
-            return Err(ClusterError::Unsupported {
-                feature: "prefix_watch",
-            });
+            PrefixWatchBehavior::Silent => {
+                // A live-but-unregistered watch: the sender is parked in `Inner`
+                // (so the stream stays open and the consumer's maintainer task does
+                // not exit) but is not in `watchers`, so `broadcast` never selects
+                // it and no event is ever delivered.
+                let (sender, watch) = CacheWatch::channel(WATCH_CAPACITY);
+                self.lock().parked_senders.push(sender);
+                Ok(watch)
+            }
+            PrefixWatchBehavior::Unsupported => {
+                if self.slow_unsupported_watch {
+                    // Suspend so a concurrent caller can observe the in-progress
+                    // maintainer mark before this attempt fails and rolls it back.
+                    tokio::task::yield_now().await;
+                }
+                Err(ClusterError::Unsupported {
+                    feature: "prefix_watch",
+                })
+            }
         }
-        Ok(self.register_watch(WatchKind::Prefix(prefix.to_owned())))
     }
 
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<String>, ClusterError> {

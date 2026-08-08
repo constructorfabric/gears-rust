@@ -33,7 +33,7 @@ mod gear;
 mod provider;
 mod wiring;
 
-pub use config::{BackendBinding, ClusterConfig, ProfileConfig, SecretRef};
+pub use config::{BackendBinding, ClusterConfig, DEFAULT_PROVIDER, ProfileConfig, SecretRef};
 pub use provider::ProviderRegistry;
 pub use wiring::{ClusterHandle, ClusterWiring, ClusterWiringBuilder, ProfileBackends};
 

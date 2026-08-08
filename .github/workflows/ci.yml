@@ -328,6 +328,9 @@ jobs:
       - name: Test postgres-cluster-plugin (pg integration)
         run: make test-cluster-pg
 
+      - name: Test redis-cluster-plugin (redis integration)
+        run: make test-cluster-redis
+
       - name: Test toolkit-db (sqlite integration)
         run: make test-sqlite
 

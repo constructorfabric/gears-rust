@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+
+use cluster_sdk::ClusterCacheBackend;
 
 use super::CacheBasedServiceDiscoveryBackend;
 use crate::defaults::ShutdownRevoke;
@@ -373,6 +376,68 @@ async fn concurrent_registers_over_a_polyfill_cache_are_both_discoverable() {
         "both concurrent registrations must be discoverable via the polyfill maintainer"
     );
     backend.revoke().await;
+}
+
+#[tokio::test]
+async fn discover_reconciles_from_backend_truth_even_over_a_native_prefix_watch() {
+    // The regression test for the rule DESIGN.md §3.11 states: `discover`
+    // reconciles on every cache. Skipping the `reconcile_view` sweep whenever the
+    // cache declared `prefix_watch: true`, on the reasoning that an
+    // event-maintained view "is already current". That is true only while native
+    // prefix watch implies *in-process* delivery, where an event is a task yield
+    // away — and it stopped being true when the Redis plugin became the first
+    // remote backend to declare the capability. There, delivery is a network round
+    // trip, so a write that has already returned can have its event still in
+    // flight, and `SC-DISC-002` fails: an instance disabled a moment ago is still
+    // reported enabled.
+    //
+    // `linearizable_with_silent_prefix_watch` is the honest, sleep-free model of
+    // that: it declares the capability and never delivers, so the maintained view
+    // can be populated only by an explicit reconcile. Two backends over one cache
+    // stand for two processes, which is also the plainest statement of what
+    // service discovery is for.
+    let cache = MemoryCache::linearizable_with_silent_prefix_watch();
+    let here =
+        CacheBasedServiceDiscoveryBackend::new(Arc::clone(&cache) as Arc<dyn ClusterCacheBackend>);
+    let elsewhere =
+        CacheBasedServiceDiscoveryBackend::new(Arc::clone(&cache) as Arc<dyn ClusterCacheBackend>);
+
+    let Ok(mine) = here.register(registration("delivery", &[])).await else {
+        panic!("register in this process");
+    };
+    // Settle *before* the other process registers, and this ordering is the whole
+    // test. A maintainer reconciles from backend truth once at startup, so if
+    // `theirs` were written while this one's startup sweep had not yet been polled,
+    // that sweep would pick it up and the assertion below would pass without
+    // `discover` reconciling at all — which is exactly how a first draft of this
+    // test passed against the unfixed code.
+    settle().await;
+
+    let Ok(theirs) = elsewhere.register(registration("delivery", &[])).await else {
+        panic!("register in the other process");
+    };
+    settle().await;
+
+    let Ok(found) = here.discover("delivery", DiscoveryFilter::default()).await else {
+        panic!("discover must succeed");
+    };
+    let ids: std::collections::HashSet<&str> =
+        found.iter().map(|i| i.instance_id.as_str()).collect();
+    assert!(
+        ids.contains(mine.instance_id()),
+        "this process's own registration is pre-inserted locally and must always be discoverable"
+    );
+    assert!(
+        ids.contains(theirs.instance_id()),
+        "an instance registered by another process must be discoverable even though no \
+         prefix-watch event was ever delivered — `discover` has to read backend truth, not only \
+         its event-maintained view. Found: {ids:?}"
+    );
+
+    here.revoke().await;
+    elsewhere.revoke().await;
+    drop(mine);
+    drop(theirs);
 }
 
 #[test]
