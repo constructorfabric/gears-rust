@@ -586,10 +586,20 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         //
         // A non-force delete removes one leaf, and refuses if it has children
         // or memberships. The only thing it needs is for that refusal to
-        // still be true when the delete runs, which a row lock on the target
-        // gives it: a concurrent `create_group` under this parent has to wait
-        // for the lock, and then finds the row gone. No cross-row predicate,
-        // so nothing for SERIALIZABLE to protect that the lock does not.
+        // still be true when the delete runs. No cross-row predicate, so
+        // nothing for SERIALIZABLE to protect.
+        //
+        // What actually serializes it against a concurrent `create_group`
+        // under the same parent is not this row lock on its own -- a plain
+        // `SELECT` does not wait on `FOR UPDATE`, so the create reads the
+        // parent and proceeds. It is the foreign key: inserting a child takes
+        // `FOR KEY SHARE` on the parent row, and that conflicts with the
+        // `FOR UPDATE` taken here. Whichever arrives first, the other waits.
+        // If the delete won, the create fails on `ON DELETE RESTRICT`; if the
+        // create won, the delete re-reads and sees the child. The lock is what
+        // makes the ordering decidable rather than what does the blocking, and
+        // the same holds for memberships and closure rows -- every one of
+        // those foreign keys is `RESTRICT`.
         //
         // Unlike `update_group`, no hint is involved: `force` is a request
         // field, known before the transaction opens.

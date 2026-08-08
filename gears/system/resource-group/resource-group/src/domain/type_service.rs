@@ -118,9 +118,12 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
             Box::pin(async move {
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-8
                 // IF unique constraint violation → RETURN TypeAlreadyExists with
-                // conflicting schema_id. Performed in-tx so a concurrent create
-                // cannot slip a duplicate row in between this read and the
-                // insert below.
+                // conflicting schema_id. This read does not close the window
+                // against a concurrent create -- at the backend default a
+                // duplicate can commit between it and the insert below. It is
+                // here for the message; the invariant is held by
+                // `UNIQUE(schema_id)` and the classification in
+                // `TypeRepository::insert`, as the block above explains.
                 // Existence only: `find_by_code` assembles the full type,
                 // reading both junction tables to answer a question that the
                 // surrogate id alone settles (RG-13).
