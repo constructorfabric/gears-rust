@@ -224,29 +224,28 @@ async fn trace_create_root_group() {
         "create_group must run its writes inside a transaction:\n{}",
         rec.dump()
     );
-    // Exactly 1 resource_group SELECT: `create_group_inner`'s final
-    // `find_by_id` for the returned SDK model. SeaORM's non-RETURNING fallback
-    // re-select is gone as of SeaORM 2.0, which carries RETURNING on every
-    // backend, so this one is ours.
+    // No resource_group SELECT at all. `create_group_inner` used to read the
+    // row back to build a response it could assemble from the insert (RG-08),
+    // and SeaORM used to add a re-select of its own on SQLite; as of SeaORM
+    // 2.0 the insert carries RETURNING on every backend, so neither remains.
     let rg_selects = count_in(&rec.stats(), QueryKind::Select, "resource_group");
     assert_eq!(
         rg_selects,
-        1,
-        "RG-08 regression: expected exactly 1 resource_group SELECT (the final \
-         find_by_id), got {rg_selects}:
-{}",
+        0,
+        "RG-08 regression: the insert returns the row, so nothing should \
+         re-read it; got {rg_selects} resource_group SELECTs:\n{}",
         rec.dump()
     );
-    // Exactly 2 gts_type SELECTs: find_by_code_with_model's combined
-    // id+type lookup, plus create_group_inner's final resolve-by-id
-    // for the returned SDK model.
+    // Exactly 1 gts_type SELECT: `find_by_code_with_model`'s combined id+type
+    // lookup (RG-11). The second one belonged to the response read-back,
+    // which resolved the very code this request supplied -- it went with the
+    // read-back itself (RG-08).
     let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
     assert_eq!(
         type_selects,
-        2,
-        "RG-11 regression: expected exactly 2 gts_type SELECTs (the combined \
-         find_by_code_with_model lookup + the final resolve-by-id), got \
-         {type_selects}:\n{}",
+        1,
+        "RG-11 regression: expected exactly 1 gts_type SELECT (the combined \
+         find_by_code_with_model lookup), got {type_selects}:\n{}",
         rec.dump()
     );
 }
@@ -312,11 +311,14 @@ async fn trace_update_group() {
         "update_group must run its writes inside a transaction:\n{}",
         rec.dump()
     );
-    // Known defect RG-08 (redundant-io): the repo write ignores the model it
-    // just wrote and re-reads it by id immediately after.
+    // RG-08's `update` half, now closed: the write reported a row count and
+    // the row was read back twice -- once inside `update` to satisfy a return
+    // type nobody used, once by the caller to build the response. Both are
+    // gone; the response is assembled from what was written. This pinned the
+    // defect as present until it was fixed, and is a negative control now.
     assert!(
-        !rec.redundant_reads_after_write().is_empty(),
-        "expected a redundant read-after-write on resource_group (known defect RG-08):\n{}",
+        rec.redundant_reads_after_write().is_empty(),
+        "update_group must not read a row back after writing it (RG-08):\n{}",
         rec.dump()
     );
 }
