@@ -313,9 +313,11 @@ The point of the exercise. Nothing needs copying: the recorder lives in
 - **Membership ownership guard table** — a schema-level alternative to RG-01's
   fix. SSI plus retry is sufficient for correctness; the guard row would be
   stronger, opt-in hardening.
-- **RG-08's `update` re-read** — `update_many` returns only a row count, so
-  removing the follow-up read means restructuring the write to a read-then-
-  `ActiveModel::update` shape, trading one extra read for another.
+(RG-08's `update` re-read was listed here on the grounds that removing the
+follow-up read meant restructuring the write to a read-then-`ActiveModel::update`
+shape, trading one read for another. That was wrong about the callers: both
+already held the row and both discarded what `update` returned, then read a
+third time to build the response. No trade was needed — see the table above.)
 - **Two contract questions**, both pinned as executable `#[ignore]`d tests rather
   than silently accepted. They were written as drifts against DESIGN.md; since
   then DESIGN.md has been corrected to describe what the code actually does, so
