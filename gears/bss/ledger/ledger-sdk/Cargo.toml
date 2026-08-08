@@ -1,5 +1,6 @@
 [package]
 name = "bss-ledger-sdk"
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 description = "BSS Billing Ledger SDK: infrastructure-free contract for ClientHub consumers"
@@ -22,3 +23,11 @@ toolkit-canonical-errors = { workspace = true }
 toolkit-odata = { workspace = true }
 toolkit-security = { workspace = true }
 uuid = { workspace = true }
+# GTS PluginV1 base + `#[gts_type_schema]` for the rate-provider plugin spec the
+# ledger discovers (`RateProviderPluginSpecV1`).
+toolkit-gts = { workspace = true }
+gts = { workspace = true }
+# `#[gts_type_schema]` expands to `schemars`- + `serde`-derived JSON-schema code.
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

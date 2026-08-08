@@ -14,6 +14,7 @@ fn cfg(g10_hours: u64, default_days: u64, order: &[&str]) -> FxConfig {
         rate_sync_tick_secs: 3_600,
         revaluation_run_tick_secs: 86_400,
         provider_order: order.iter().map(|s| (*s).to_owned()).collect(),
+        provider_vendor: "cf.bss".to_owned(),
     }
 }
 

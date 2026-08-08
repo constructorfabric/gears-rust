@@ -30,6 +30,14 @@ otel = ["toolkit/otel"]
 account-management = ["dep:account_management"]
 static-idp = ["dep:static-idp-plugin"]
 file-storage = ["dep:file_storage"]
+# The FX rate-provider subsystem: the core gear + its source plugins. Independent
+# of bss-ledger — the ledger discovers the composite lazily at runtime via the
+# types-registry, so neither feature requires the other.
+bss-rate-provider = [
+    "dep:bss_rate_provider",
+    "dep:bss_rate_provider_ecb_plugin",
+    "dep:bss_rate_provider_http_json_plugin",
+]
 bss-ledger = ["dep:bss_ledger"]
 usage-collector = ["dep:usage_collector"]
 timescaledb-usage-collector = ["dep:timescaledb_usage_collector_plugin"]
@@ -87,6 +95,9 @@ static-idp-plugin = { package = "cf-gears-static-idp-plugin", path = "../../gear
 
 # Optional BSS Billing Ledger gear
 bss_ledger = { package = "bss-ledger", path = "../../gears/bss/ledger/ledger", optional = true }
+bss_rate_provider = { package = "bss-rate-provider", path = "../../gears/bss/rate-provider/rate-provider", optional = true }
+bss_rate_provider_ecb_plugin = { package = "bss-rate-provider-ecb-plugin", path = "../../gears/bss/rate-provider/plugins/ecb-plugin", optional = true }
+bss_rate_provider_http_json_plugin = { package = "bss-rate-provider-http-json-plugin", path = "../../gears/bss/rate-provider/plugins/http-json-plugin", optional = true }
 
 # Optional Usage Collector gear + its TimescaleDB storage plugin
 usage_collector = { package = "cf-gears-usage-collector", path = "../../gears/system/usage-collector/usage-collector", optional = true }
