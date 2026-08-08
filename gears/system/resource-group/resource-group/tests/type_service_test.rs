@@ -43,6 +43,38 @@ fn system_scope() -> AccessScope {
     AccessScope::allow_all()
 }
 
+/// A duplicate `schema_id` reaches the caller as a typed conflict, not as a
+/// database failure.
+///
+/// Tested against the repository directly on purpose. Through the service the
+/// in-transaction `resolve_id` check catches an ordinary duplicate first, so
+/// the constraint path only runs when two writers race -- exactly the case a
+/// single-threaded test cannot stage. What matters is that when the
+/// constraint does fire, the answer is `TypeAlreadyExists`; that used to
+/// depend on `SERIALIZABLE` aborting and retrying until one writer won, and
+/// `create_type` no longer runs at that level.
+#[tokio::test]
+async fn type_repo_insert_maps_duplicate_code_to_conflict() {
+    let db = common::test_db().await;
+    let conn = db.conn().expect("conn");
+    let repo = TypeRepository;
+    let code = type_code("dupe");
+
+    repo.insert(&conn, &code, None)
+        .await
+        .expect("first insert should succeed");
+
+    let err = repo
+        .insert(&conn, &code, None)
+        .await
+        .expect_err("a second insert of the same code must be refused");
+
+    assert!(
+        matches!(err, DomainError::TypeAlreadyExists { .. }),
+        "expected a typed conflict, got: {err:?}"
+    );
+}
+
 // =========================================================================
 // Type CRUD tests (TC-TYP-01..16)
 // =========================================================================
@@ -1748,5 +1780,79 @@ async fn security_metadata_schema_last_write_wins() {
     assert!(
         schema.get("extra").is_none(),
         "Previous update keys must not merge: {schema}"
+    );
+}
+
+/// `list_types` returns each type's memberships, attached to the right type.
+///
+/// The page is assembled by `load_full_types_batch`: two junction queries for
+/// the whole page, then the rows are grouped back by `type_id`. Grouping is
+/// where a batch load goes wrong -- one type's memberships landing on
+/// another, or on none -- and the scale test that covers this path only ever
+/// builds types with no memberships, so the grouping never ran.
+#[tokio::test]
+async fn list_types_attaches_memberships_to_their_own_type() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+
+    let m_a = common::create_root_type(&type_svc, "lmema").await;
+    let m_b = common::create_root_type(&type_svc, "lmemb").await;
+
+    let with_one = type_code("lwithone");
+    type_svc
+        .create_type(CreateTypeRequest {
+            code: with_one.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![m_a.code.clone()],
+            metadata_schema: None,
+        })
+        .await
+        .expect("create type with one membership");
+
+    let with_two = type_code("lwithtwo");
+    type_svc
+        .create_type(CreateTypeRequest {
+            code: with_two.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![m_a.code.clone(), m_b.code.clone()],
+            metadata_schema: None,
+        })
+        .await
+        .expect("create type with two memberships");
+
+    let page = type_svc
+        .list_types(&toolkit_odata::ODataQuery::new().with_limit(200))
+        .await
+        .expect("list_types should succeed");
+
+    let find = |code: &str| {
+        page.items
+            .iter()
+            .find(|t| t.code == code)
+            .unwrap_or_else(|| panic!("{code} should be in the page"))
+            .clone()
+    };
+
+    let one = find(&with_one);
+    assert_eq!(
+        one.allowed_membership_types,
+        vec![m_a.code.clone()],
+        "the single-membership type must carry exactly its own"
+    );
+
+    let mut two = find(&with_two).allowed_membership_types;
+    two.sort();
+    let mut want = vec![m_a.code.clone(), m_b.code.clone()];
+    want.sort();
+    assert_eq!(two, want, "both memberships, and only those");
+
+    // The membership targets themselves declare none -- so an over-eager
+    // grouping that spilled rows across the page would show up here.
+    assert!(
+        find(&m_a.code).allowed_membership_types.is_empty()
+            && find(&m_b.code).allowed_membership_types.is_empty(),
+        "a type with no memberships must come back with none"
     );
 }

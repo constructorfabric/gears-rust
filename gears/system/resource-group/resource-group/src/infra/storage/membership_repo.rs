@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 use resource_group_sdk::models::ResourceGroupMembership;
 use resource_group_sdk::odata::MembershipFilterField;
+use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use toolkit_db::odata::{LimitCfg, paginate_odata};
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt};
@@ -104,11 +105,13 @@ impl MembershipRepositoryTrait for MembershipRepository {
     ) -> Result<membership_entity::Model, DomainError> {
         let scope = system_scope();
 
+        let created_at = time::OffsetDateTime::now_utc();
+
         let model = membership_entity::ActiveModel {
             group_id: Set(group_id),
             gts_type_id: Set(gts_type_id),
             resource_id: Set(resource_id.to_owned()),
-            created_at: Set(time::OffsetDateTime::now_utc()),
+            created_at: Set(created_at),
         };
 
         toolkit_db::secure::secure_insert::<MembershipEntity>(model, &scope, db)
@@ -126,10 +129,17 @@ impl MembershipRepositoryTrait for MembershipRepository {
                 }
             })?;
 
-        // Read back the inserted model
-        self.find_by_composite_key(db, group_id, gts_type_id, resource_id)
-            .await?
-            .ok_or_else(|| DomainError::database("Insert succeeded but membership not found"))
+        // Assembled, not read back (RG-08). This table has four columns:
+        // three primary-key parts and `created_at`, and all four were just
+        // written from values held right here. The row the database now holds
+        // is fully determined, so the read this replaces could only return
+        // what is already in scope.
+        Ok(membership_entity::Model {
+            group_id,
+            gts_type_id,
+            resource_id: resource_id.to_owned(),
+            created_at,
+        })
     }
 
     /// Delete a membership by its composite key. Returns the number of affected rows.
@@ -187,25 +197,24 @@ impl MembershipRepositoryTrait for MembershipRepository {
 
         let scope = system_scope();
 
-        // Get all group_ids for this resource
-        let memberships = MembershipEntity::find()
-            .filter(membership_entity::Column::GtsTypeId.eq(gts_type_id))
-            .filter(membership_entity::Column::ResourceId.eq(resource_id))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+        // The group ids feeding the second query were exactly the first
+        // query's result, so the database can derive them: one statement with
+        // two bind parameters, not two statements the second of which bound
+        // one parameter per membership of the resource -- unbounded, and
+        // unchunked.
+        //
+        // `resource_group_membership` declares no scope columns, so this
+        // hand-built subquery skips no scope predicate: for that entity
+        // `build_scope_condition` is `Condition::all()` under any scope.
+        let member_group_ids = Query::select()
+            .column(membership_entity::Column::GroupId)
+            .from(MembershipEntity)
+            .and_where(Expr::col(membership_entity::Column::GtsTypeId).eq(gts_type_id))
+            .and_where(Expr::col(membership_entity::Column::ResourceId).eq(resource_id))
+            .to_owned();
 
-        if memberships.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let group_ids: Vec<Uuid> = memberships.iter().map(|m| m.group_id).collect();
-
-        // Get tenant_ids from those groups
         let groups = ResourceGroupEntity::find()
-            .filter(rg_entity::Column::Id.is_in(group_ids))
+            .filter(rg_entity::Column::Id.in_subquery(member_group_ids))
             .secure()
             .scope_with(&scope)
             .all(db)

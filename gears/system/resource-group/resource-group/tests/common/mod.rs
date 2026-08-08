@@ -19,6 +19,7 @@ use authz_resolver_sdk::{
     models::DenyReason,
 };
 use sea_orm_migration::MigratorTrait;
+use toolkit_db::test_support::QueryRecorder;
 use toolkit_db::{
     ConnectOpts, DBProvider, DbError, connect_db, migration_runner::run_migrations_for_testing,
 };
@@ -455,6 +456,87 @@ pub async fn assert_closure_count(
     );
 }
 
+/// Assert that `resource_group_closure` is exactly the transitive closure of
+/// the `parent_id` links in `resource_group`, depths included.
+///
+/// The strongest statement available about the closure table, and the one the
+/// concurrency analysis asks for: not "the rebuild wrote the rows we expected"
+/// but "whatever the rebuild wrote agrees with the hierarchy the group rows
+/// themselves describe". A rebuild that drops a path, leaves a stale one
+/// behind, or is off by one on depth fails here no matter which code path
+/// produced it -- a row-by-row loop, a batched insert, or an `INSERT SELECT`.
+#[allow(clippy::disallowed_methods)]
+pub async fn assert_closure_matches_parent_links(conn: &impl toolkit_db::secure::DBRunner) {
+    use resource_group::infra::storage::entity::resource_group::Entity as GroupEntity;
+    use resource_group::infra::storage::entity::resource_group_closure::Entity as ClosureEntity;
+    use sea_orm::EntityTrait;
+    use std::collections::{BTreeSet, HashMap};
+    use toolkit_db::secure::SecureEntityExt;
+
+    let scope = toolkit_security::AccessScope::allow_all();
+    let groups = GroupEntity::find()
+        .secure()
+        .scope_with(&scope)
+        .all(conn)
+        .await
+        .expect("query groups");
+    let rows = ClosureEntity::find()
+        .secure()
+        .scope_with(&scope)
+        .all(conn)
+        .await
+        .expect("query closure table");
+
+    let parent_of: HashMap<Uuid, Option<Uuid>> =
+        groups.iter().map(|g| (g.id, g.parent_id)).collect();
+
+    // Walk every node up to its root; each step is one closure row that must
+    // exist, at the distance walked. The self-row is the zeroth step.
+    let mut expected: BTreeSet<(Uuid, Uuid, i32)> = BTreeSet::new();
+    for g in &groups {
+        let mut ancestor = Some(g.id);
+        let mut depth = 0_i32;
+        while let Some(a) = ancestor {
+            expected.insert((a, g.id, depth));
+            ancestor = parent_of.get(&a).copied().flatten();
+            depth += 1;
+            assert!(
+                depth <= i32::try_from(groups.len()).unwrap_or(i32::MAX),
+                "parent_id links form a cycle reachable from {}",
+                g.id
+            );
+        }
+    }
+
+    let actual: BTreeSet<(Uuid, Uuid, i32)> = rows
+        .iter()
+        .map(|r| (r.ancestor_id, r.descendant_id, r.depth))
+        .collect();
+
+    // This helper's contract is "the closure table is *exactly* the transitive
+    // closure", and a set comparison cannot see a duplicated row. Today the
+    // schema makes one impossible -- `PRIMARY KEY (ancestor_id,
+    // descendant_id)`, declared in both backend branches of
+    // `m20260306_000001_initial.rs` (:72 Postgres, :149 SQLite) -- so this
+    // cannot fire. It stays because the invariant lives in string SQL that no
+    // compiler checks: a migration that weakened the key would otherwise
+    // silently collapse duplicates into the set below and pass.
+    assert_eq!(
+        rows.len(),
+        actual.len(),
+        "closure table holds duplicate (ancestor, descendant, depth) rows"
+    );
+
+    let missing: Vec<_> = expected.difference(&actual).collect();
+    let extra: Vec<_> = actual.difference(&expected).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "closure table disagrees with the parent_id links it should mirror\n  \
+         missing (ancestor, descendant, depth): {missing:?}\n  \
+         unexpected: {extra:?}"
+    );
+}
+
 /// Assert that a JSON value contains no surrogate integer IDs
 /// (e.g. `gts_type_id` SMALLINT fields should not leak to the API).
 pub fn assert_no_surrogate_ids(json: &serde_json::Value) {
@@ -470,6 +552,38 @@ pub fn assert_no_surrogate_ids(json: &serde_json::Value) {
 }
 
 // -- Service construction helpers --
+
+/// Build a `TypeService` from a DB provider.
+pub fn make_type_service(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
+    TypeService::new(db, Arc::new(TypeRepository))
+}
+
+/// In-memory SQLite with migrations applied and a [`QueryRecorder`] attached,
+/// for the DB-behaviour audit suites.
+///
+/// The callback goes on before the connection is wrapped, unlike [`test_db`]:
+/// `DBProvider`/`Db` never hand out the inner `SeaORM` connection, so
+/// attaching afterwards would miss every statement.
+pub async fn test_db_with_recorder() -> (Arc<DBProvider<DbError>>, QueryRecorder) {
+    let opts = ConnectOpts {
+        max_conns: Some(1),
+        min_conns: Some(1),
+        ..Default::default()
+    };
+    let (db, recorder) = toolkit_db::test_support::connect_with_recorder("sqlite::memory:", opts)
+        .await
+        .expect("connect to in-memory SQLite with recorder");
+
+    run_migrations_for_testing(&db, Migrator::migrations())
+        .await
+        .expect("run migrations");
+
+    // Migrations run their own DDL through the same callback -- start each
+    // test's trace from a clean slate.
+    recorder.clear();
+
+    (Arc::new(DBProvider::new(db)), recorder)
+}
 
 /// Build a `GroupService` from a DB provider using the allow-all enforcer.
 pub fn make_group_service(

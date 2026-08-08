@@ -84,6 +84,19 @@ Every important API endpoint should be called **at most once** across the entire
 
 **Corner case and edge-case coverage in E2E is only acceptable if it could not be achieved in unit tests.** Before adding an E2E test for an edge case, verify that the same scenario cannot be written as a unit test against SQLite or a mock. If it can — it goes there, not here.
 
+**Divergence between SQLite and PostgreSQL is on its own sufficient grounds for a PostgreSQL venue**, and is the most common reason a case legitimately cannot move down a tier. Which of the two venues below it selects depends on the seam the case actually needs — HTTP E2E when it needs the transport, a direct Rust integration suite when the divergence is in the SQL or the schema. Numeric column widths (`SMALLINT` vs `INTEGER` range and comparison), `CHECK` constraint enforcement, FK actions, domain types, isolation levels and type affinity all behave differently, and SQLite's dynamic typing hides mismatches rather than surfacing them. If you can name the way the two backends differ, the test belongs here.
+
+That permission does not loosen the restraint above it. E2E carries far fewer tests than the unit suite by design, and every case has to be justified by what a unit test cannot reach; where two cases would cover the same ground, the coverage checklist below is what removes the duplicate. "It is database-related" is not the criterion — "it behaves differently on PostgreSQL, and here is how" is.
+
+**Check which venue you actually have.** The definition above is normative: a suite is only an E2E suite if it runs against real PostgreSQL. A pytest harness that seeds SQLite directly and drives HTTP over it is a useful integration suite, but it **cannot discharge any PostgreSQL-specific claim** — the very divergences listed above are the ones it cannot see. So confirm before routing, and know that there are two venues, not one:
+
+- **This suite**, when it genuinely runs against PostgreSQL. Use it when the case needs the full HTTP chain as well as the real database.
+- **A feature-gated Rust suite against real PostgreSQL via `testcontainers`**, calling repository or service code directly — in-process, no HTTP, no running server. Use it when the divergence is in the SQL or the schema rather than in the transport, which is the common case: dialect rejections, column widths, `CHECK` and FK enforcement, isolation. It gives a far more precise diagnosis than an HTTP status can, and it costs seconds rather than a server boot.
+
+The second is in use, not hypothetical. The established wiring is a `--features integration` suite behind `#![cfg(feature = "integration")]`, a dedicated `test-<gear>-pg` `Makefile` target, and a matching step in `.github/workflows/ci.yml`'s `integration` job. `resource-group` is the worked example, and it writes the deviation from this guide down in its own docs rather than leaving it implicit — do the same if you adopt the pattern.
+
+Only when neither venue exists is the behaviour genuinely untested, and that is what belongs in the backlog rather than in an assumption.
+
 After adding or removing any E2E test, **check the coverage checklist**: verify which HTTP methods (GET, POST, PUT, PATCH, DELETE) are called across all tests in the gear suite. If a method is already exercised in test A, test B does not need to call it again. Remove redundant calls without hesitation.
 
 ### Priority Order (in case of conflict)
@@ -505,9 +518,9 @@ async def test_pagination_cursor_roundtrip(client, create_entities):
     all_ids = []
     cursor = None
     while True:
-        params = {"$top": 2}
+        params = {"limit": 2}
         if cursor:
-            params["$skiptoken"] = cursor
+            params["cursor"] = cursor
         r = await client.get("/cf/<gear>/v1/entities", params=params)
         assert r.status_code == 200
         page = r.json()
