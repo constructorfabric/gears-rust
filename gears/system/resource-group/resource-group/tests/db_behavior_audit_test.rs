@@ -1294,8 +1294,10 @@ async fn trace_delete_type() {
 // call inside a transaction closure), and the row lock a non-force delete
 // takes in place of SERIALIZABLE. Matched on call shape.
 //
-// Both service files are scanned for RG-03, because scanning only the one
-// that is already healthy is how a rule comes to pass by construction.
+// Both service files are scanned for RG-03. On the query-count branch this
+// file scanned only `group_service.rs`, which had never had the defect — so
+// the rule passed by construction and was blind to the two live violations in
+// `type_service.rs`. Those are fixed here, and both files are watched.
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
@@ -1320,37 +1322,6 @@ fn static_rule_passes_group_service_uses_retry() {
          transaction_with_retry, found {retried}"
     );
 }
-
-/// RG-03, pinned where it actually is.
-///
-/// `create_type` and `update_type` open SERIALIZABLE transactions with no
-/// retry wrapper, so a serialization failure surfaces as a 500 instead of a
-/// second attempt. The fix belongs to the isolation branch, not this one, and
-/// the audit's rule is to pin a defect as an executable assertion rather than
-/// describe it -- so this asserts the count that is there, not the count that
-/// ought to be.
-///
-/// It fails in both directions on purpose: fixing one of the two, or adding a
-/// third unretried transaction, both break it. Whoever lands the fix updates
-/// the expectation to 0 and this becomes the negative control its neighbour
-/// already is.
-#[test]
-fn static_rule_pins_type_service_serializable_without_retry() {
-    let src = include_str!("../src/domain/type_service.rs");
-    let unretried = count_occurrences(src, UNRETRIED_SERIALIZABLE);
-    let retried = count_occurrences(src, RETRIED_SERIALIZABLE);
-    assert_eq!(
-        unretried, 2,
-        "RG-03 is pinned at 2 unretried SERIALIZABLE transactions in \
-         type_service.rs (create_type, update_type); found {unretried}. \
-         If this dropped, the fix landed -- change the expectation to 0 and \
-         say so in the doc comment above."
-    );
-    assert_eq!(
-        retried, 0,
-        "type_service.rs is not expected to use transaction_with_retry yet; \
-         found {retried}. If it now does, RG-03 is being fixed and the \
-         assertion above needs updating in the same commit."
 
 #[test]
 fn static_rule_passes_type_service_uses_retry() {
