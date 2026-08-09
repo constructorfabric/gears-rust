@@ -168,14 +168,18 @@ Three mechanisms, all deterministic and CI-runnable:
 - **Scale invariance.** Run an operation at small and large N and compare the
   *slope*, not the offset: statement count must not grow with N. This is what
   makes N+1 detection mechanical rather than a matter of noticing a loop.
-- **Static source scans** for the two classes that leave no SQL trace
-  (`SERIALIZABLE` without retry; an external client call inside a transaction).
-  Text heuristics, explicitly interim until a dylint late lint replaces them.
-- **Real PostgreSQL races.** Barrier-synchronized task pairs on
-  `testcontainers`, each ending in a post-state invariant check against the
-  tables — closure agrees with `parent_id`, depths are right, no cycles, one
-  tenant per resource. Checking the two callers' return values is not enough:
-  both can return 200 while the closure table is corrupt.
+- **Static source scans** for the classes that leave no SQL trace. Text
+  heuristics, explicitly interim until a dylint late lint replaces them. This
+  branch carries the `SERIALIZABLE`-without-retry rule (Section 4 of the audit
+  suite), which both guards `group_service.rs` as a negative control and pins
+  the defect that is still present in `type_service.rs` at its current count;
+  the external-call-in-tx rule travels with the transaction-boundary fixes.
+- **Real PostgreSQL races** (not in this branch — see the deviation section
+  below). Barrier-synchronized task pairs on `testcontainers`, each ending in
+  a post-state invariant check against the tables — closure agrees with
+  `parent_id`, depths are right, no cycles, one tenant per resource. Checking
+  the two callers' return values is not enough: both can return 200 while the
+  closure table is corrupt.
 
 Validation, so the detector's output means something: all 10 previously known
 defects were rediscovered by general, class-based rules (no rule keyed to a
@@ -191,61 +195,28 @@ getting a clean `CycleDetected`, and force-delete races produced no orphans in
 
 ## Deviation from the unit/E2E testing guide
 
-**None of the PostgreSQL suites below are in this branch.** This branch
-carries the query-count half of the audit — SQLite plus the statement
-recorder — and the concurrency findings reported above were measured on the
-branch that carries the isolation half. The rationale is recorded here
-because it is the audit's, not that branch's, and the suites land against it.
-
-`pg_concurrency_test.rs` (this audit's own suite), and the three narrower
-repro suites that followed it — `pg_membership_filter_test.rs` and
-`pg_group_filter_test.rs` (both in this gear) and
-`secure_group_scope_postgres.rs` (in `libs/toolkit-db`) — are Rust
-`#[tokio::test]`s that talk to a real PostgreSQL via `testcontainers`. That
-is a deliberate, written-down deviation from the general testing guide:
+**Not in this branch.** The audit's full apparatus includes four Rust
+`testcontainers` suites against real PostgreSQL — `pg_concurrency_test.rs`,
+`pg_membership_filter_test.rs`, `pg_group_filter_test.rs` (this gear) and
+`secure_group_scope_postgres.rs` (`libs/toolkit-db`) — each a deliberate,
+written-down deviation from the testing guide:
 [`12_unit_testing.md`](../../../../docs/toolkit_unified_system/12_unit_testing.md)
-routes PostgreSQL-specific behavior (FK `RESTRICT`, `SERIALIZABLE`
-isolation, domain types) to E2E, and
+routes PostgreSQL-specific behavior to E2E, and
 [`13_e2e_testing.md`](../../../../docs/toolkit_unified_system/13_e2e_testing.md)
-defines E2E as pytest against a running `cf-gears-server`. None of these
-four suites are that: they call repository/service code directly,
-in-process, no HTTP, no running server.
+defines E2E as pytest against a running `cf-gears-server`. None of the four
+are that: they call repository/service code directly, in-process, no HTTP.
+Their justification — a real dialect rejection such as
+"operator does not exist: uuid = text" surfaces in the failure message,
+where a pytest test would only ever see the resulting 500 — is now part of
+the guide itself; see "Check which venue you actually have" in
+`13_e2e_testing.md`.
 
-Why the deviation stands:
-
-- **Precedent, not improvisation.** This audit (`pg_concurrency_test.rs`)
-  established the pattern first: a `--features integration` suite, a
-  dedicated `test-rg-pg` `Makefile` target, and a matching step in
-  `.github/workflows/ci.yml`'s `integration` job
-  ("Test resource-group (pg concurrency, integration)", `RG_PG_REQUIRE_DOCKER=1`).
-  The three later suites reuse that exact wiring rather than inventing a
-  new one.
-- **Feature-gated, not part of the default suite.** All four are behind
-  `#![cfg(feature = "integration")]` (`secure_group_scope_postgres.rs`
-  additionally requires `feature = "pg"`); `cargo nextest run -p
-  cf-gears-resource-group` with no `--features integration` neither builds
-  nor runs them. They do not count against the unit-testing guide's "full
-  suite < 5s" target — that target is measured without `--features
-  integration`.
-- **A diagnosis pytest cannot give.** Each of the three narrower suites
-  reproduces a real Postgres-dialect rejection —
-  `pg_membership_filter_test.rs` / `pg_group_filter_test.rs`: "operator
-  does not exist: smallint = text" (comparing the wire-level GTS
-  type-path string against the SMALLINT `gts_type_id` column);
-  `secure_group_scope_postgres.rs`: "operator does not exist: uuid = text"
-  (the `uuid = text` defect, comparing a `TEXT` membership column against a
-  `Uuid` resource column). A pytest test hitting the same regression
-  through HTTP would only ever observe the resulting 500 status code —
-  these tests surface, in the failure message should the guard ever
-  regress, the actual backend error text that an HTTP status code
-  swallows.
-
-This is scoped narrowly: it covers this specific pattern (dialect-rejection
-reproduction, plus the concurrency harness above), not a general license to
-write Rust-level Postgres tests instead of E2E. New PostgreSQL-dependent
-behavior should still default to E2E per the guide unless it has the same
-shape — a bug invisible above the SQL layer that would otherwise surface
-only as an opaque HTTP status code.
+Those suites live on the branch that carries the concurrency and
+tenant-scope fixes they exercise, along with the `test-rg-pg` Makefile
+target and its CI step. This branch carries the SQLite-backed
+statement-count suites only (`db_behavior_audit_test.rs`,
+`query_recorder_test.rs`), which run in the default `cargo nextest` pass and
+need no Docker and no feature flag.
 
 ## Running this audit on another module
 
