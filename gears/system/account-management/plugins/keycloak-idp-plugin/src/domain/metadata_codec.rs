@@ -78,7 +78,7 @@ pub enum DecodeError {
 }
 
 /// Stable metric-label form of a [`DecodeError`] variant, used by the
-/// `vp_idp_plugin_metadata_decode_failure_total` counter's `version_observed`
+/// `keycloak_idp_plugin_metadata_decode_failure_total` counter's `version_observed`
 /// label. Centralised so the three SDK-facing decode paths cannot drift.
 ///
 /// Returns `Cow::Borrowed` for the two static variants to avoid allocation on

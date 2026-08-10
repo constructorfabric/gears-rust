@@ -84,7 +84,7 @@ impl TokenCache {
 
     /// Scan + remove every entry whose `expires_at` has passed. Returns
     /// the number of entries dropped (useful as a metrics gauge once
-    /// the KC observability layer wires `vp_idp_plugin.kc_token_cache_evicted`).
+    /// the KC observability layer wires `keycloak_idp_plugin.kc_token_cache_evicted`).
     ///
     /// Read-time eviction in [`Self::get`] already keeps the cache
     /// bounded by *actively-fetched* realms; this method bounds it by

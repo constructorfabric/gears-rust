@@ -43,11 +43,11 @@ fn cfg_no_transport_retries(base: &str) -> KeycloakConfig {
         base_url: url::Url::parse(base).expect("valid base url"),
         bootstrap_admin: BootstrapAdminConfig {
             realm: "master".into(),
-            client_id: "vp-idp-plugin-bootstrap".into(),
+            client_id: "keycloak-idp-plugin-bootstrap".into(),
             client_secret: SecretFromEnv::from_literal_unchecked("topsecret"),
         },
         realm_admin: RealmAdminConfig {
-            client_id_default: "vp-idp-plugin-realm-admin".into(),
+            client_id_default: "keycloak-idp-plugin-realm-admin".into(),
             default_shared_realm_secret: SecretFromEnv::from_literal_unchecked("ra"),
             secret_ref_template: "vp-idp-realm-admin-{realm_name}-secret".into(),
         },
@@ -108,7 +108,7 @@ fn is_pre_warm_retryable_classifies_kc_statuses() {
     assert!(is_pre_warm_retryable(&mk(KcStatusKind::Transport)));
     assert!(is_pre_warm_retryable(&mk(KcStatusKind::Timeout)));
     // CredStoreRead transient — OpenBao readiness lag is a real
-    // deploy-ordering race vp-idp pods hit in practice.
+    // deploy-ordering race the plugin's pods hit in practice.
     assert!(is_pre_warm_retryable(&PluginError::CredStoreRead {
         detail: "openbao 503".into(),
     }));

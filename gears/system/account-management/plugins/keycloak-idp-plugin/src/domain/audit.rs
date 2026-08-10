@@ -1,4 +1,4 @@
-//! Structured audit-event emitters for `vp.idp.plugin.events`.
+//! Structured audit-event emitters for `keycloak_idp.events`.
 //!
 //! Until the platform audit sink lands these emit as plain `tracing::info!`
 //! records on the dedicated target (DESIGN §6.3 deferred wiring). The
@@ -25,8 +25,8 @@ use crate::domain::metadata_codec::RealmBinding;
 ///
 /// * `"am.system"` — AM-internal system actor (the `for_module_init` /
 ///   `for_bootstrap` shape).
-/// * `"vp.idp.plugin"` — this plugin's own system actor, identified by its
-///   stable [`VP_IDP_PLUGIN_ACTOR_UUID`] — NOT by its `subject_type` string.
+/// * `"keycloak_idp.plugin"` — this plugin's own system actor, identified by its
+///   stable [`KEYCLOAK_IDP_PLUGIN_ACTOR_UUID`] — NOT by its `subject_type` string.
 ///   The authz `subject_type` is now the canonical service-principal GTS (so
 ///   the resolver classifies + RBAC-authorizes it), which would otherwise
 ///   collapse this actor into the `"rest"` bucket; keying the audit class on
@@ -37,7 +37,7 @@ use crate::domain::metadata_codec::RealmBinding;
 ///
 /// `subject_type_raw` is the verbatim string from `SecurityContext::
 /// subject_type()` (or `"anonymous"` when none) so a future actor
-/// (e.g. `"vp.workflow.plugin"`) is still distinguishable in the
+/// (e.g. a future `"workflow.plugin"` actor) is still distinguishable in the
 /// operator audit stream — without that field, every new actor type
 /// silently collapses into the `"rest"` bucket and gets mis-attributed
 /// as REST-forwarded.
@@ -48,8 +48,8 @@ fn common_fields(actor: &SecurityContext) -> (Uuid, &'static str, String, Uuid) 
     // UUID rather than its `subject_type` string: the authz subject_type is
     // the canonical service-principal GTS now, so a string match would drop
     // it into `"rest"`. Check the UUID first; fall back to the string buckets.
-    let class: &'static str = if id == crate::domain::system_actor::VP_IDP_PLUGIN_ACTOR_UUID {
-        "vp.idp.plugin"
+    let class: &'static str = if id == crate::domain::system_actor::KEYCLOAK_IDP_PLUGIN_ACTOR_UUID {
+        "keycloak_idp.plugin"
     } else {
         match actor.subject_type() {
             Some("am.system") => "am.system",
@@ -85,7 +85,7 @@ pub(crate) fn emit_tenant_bound(
     let realm_binding_str = realm_binding_str(realm_binding);
     let created_realm = matches!(realm_binding, RealmBinding::Created);
     tracing::info!(
-        target: "vp.idp.plugin.events",
+        target: "keycloak_idp.events",
         kind = "tenant.bound",
         %actor_subject_id,
         actor_subject_type,
@@ -126,7 +126,7 @@ pub(crate) fn emit_tenant_unbound(
         realm_name
     };
     tracing::info!(
-        target: "vp.idp.plugin.events",
+        target: "keycloak_idp.events",
         kind = "tenant.unbound",
         %actor_subject_id,
         actor_subject_type,
@@ -156,7 +156,7 @@ pub(crate) fn emit_admin_user_bound(
     let (actor_subject_id, actor_subject_type, actor_subject_type_raw, actor_tenant_id) =
         common_fields(actor);
     tracing::info!(
-        target: "vp.idp.plugin.events",
+        target: "keycloak_idp.events",
         kind = "admin_user.bound",
         %actor_subject_id,
         actor_subject_type,
@@ -176,7 +176,7 @@ pub(crate) fn emit_realm_created(actor: &SecurityContext, tenant_id: Uuid, realm
     let (actor_subject_id, actor_subject_type, actor_subject_type_raw, actor_tenant_id) =
         common_fields(actor);
     tracing::info!(
-        target: "vp.idp.plugin.events",
+        target: "keycloak_idp.events",
         kind = "realm.created",
         %actor_subject_id,
         actor_subject_type,
@@ -195,7 +195,7 @@ pub(crate) fn emit_realm_removed(actor: &SecurityContext, tenant_id: Uuid, realm
     let (actor_subject_id, actor_subject_type, actor_subject_type_raw, actor_tenant_id) =
         common_fields(actor);
     tracing::info!(
-        target: "vp.idp.plugin.events",
+        target: "keycloak_idp.events",
         kind = "realm.removed",
         %actor_subject_id,
         actor_subject_type,
@@ -221,7 +221,7 @@ pub(crate) fn emit_user_provisioned(
         common_fields(actor);
     let realm_binding_str = realm_binding_str(realm_binding);
     tracing::info!(
-        target: "vp.idp.plugin.events",
+        target: "keycloak_idp.events",
         kind = "user.provisioned",
         %actor_subject_id,
         actor_subject_type,
@@ -251,7 +251,7 @@ pub(crate) fn emit_user_deprovisioned(
         common_fields(actor);
     let realm_binding_str = realm_binding_str(realm_binding);
     tracing::info!(
-        target: "vp.idp.plugin.events",
+        target: "keycloak_idp.events",
         kind = "user.deprovisioned",
         %actor_subject_id,
         actor_subject_type,
@@ -277,7 +277,7 @@ pub(crate) fn emit_service_principals_purged(
     let (actor_subject_id, actor_subject_type, actor_subject_type_raw, actor_tenant_id) =
         common_fields(actor);
     tracing::info!(
-        target: "vp.idp.plugin.events",
+        target: "keycloak_idp.events",
         kind = "service_principals.purged",
         %actor_subject_id,
         actor_subject_type,

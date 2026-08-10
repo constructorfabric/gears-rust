@@ -253,7 +253,7 @@ async fn invalidate_forces_token_refetch() {
     let calls_assert = Arc::clone(&calls);
     let factory = factory_for(&server);
     factory.bootstrap_client().await.expect("first acquire");
-    factory.invalidate("master", "vp-idp-plugin-bootstrap");
+    factory.invalidate("master", "keycloak-idp-plugin-bootstrap");
     factory
         .bootstrap_client()
         .await
@@ -525,7 +525,7 @@ async fn reactive_401_triggers_one_retry_after_invalidation() {
     let result = factory
         .with_reactive_401(
             "master",
-            "vp-idp-plugin-bootstrap",
+            "keycloak-idp-plugin-bootstrap",
             &SecretSource::Inline(SecretString::from("topsecret")),
             |client| {
                 let url = probe_url.clone();
@@ -576,7 +576,7 @@ async fn reactive_401_propagates_second_401() {
     let err = factory
         .with_reactive_401(
             "master",
-            "vp-idp-plugin-bootstrap",
+            "keycloak-idp-plugin-bootstrap",
             &SecretSource::Inline(SecretString::from("topsecret")),
             |client| {
                 let url = probe_url.clone();

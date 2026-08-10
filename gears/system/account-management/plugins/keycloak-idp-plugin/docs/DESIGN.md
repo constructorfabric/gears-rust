@@ -13,7 +13,7 @@ refs:
 
 **Owners:** @platform-iam-team
 
-**Scope:** Architecture of the shipped plugin implementation (crate `vp-idp-plugin`, ported from vhp-core). The implementation is authoritative; this document describes what the code does, deliberately mirroring implementation-level constants and behaviors (an implementation-mirror altitude) — a change to those constants in code owns the matching edit here. In-code comments citing `DESIGN §N` refer to the original vhp-core implementation specification (`DESIGN-vp-idp-plugin-202605192055`) from which this crate lineage descends, not to section numbers in this document.
+**Scope:** Architecture of the shipped plugin implementation (crate `cf-gears-keycloak-idp-plugin`, ported from vhp-core). The implementation is authoritative; this document describes what the code does, deliberately mirroring implementation-level constants and behaviors (an implementation-mirror altitude) — a change to those constants in code owns the matching edit here. In-code comments citing `DESIGN §N` refer to the original vhp-core implementation specification (`DESIGN-vp-idp-plugin-202605192055`) from which this crate lineage descends, not to section numbers in this document.
 
 <!-- toc -->
 
@@ -49,7 +49,7 @@ The adjacent [PRD](./PRD.md) is authoritative for WHAT, WHY, release priority, a
 
 ### 1.1 Architectural Vision
 
-The Keycloak IdP plugin is a provider adapter running as an in-process ToolKit gear (`vp-idp-plugin`) in the host process next to Account Management. It implements two ClientHub contracts:
+The Keycloak IdP plugin is a provider adapter running as an in-process ToolKit gear (`keycloak-idp-plugin`) in the host process next to Account Management. It implements two ClientHub contracts:
 
 - `account_management_sdk::idp::IdpPluginClient` — tenant and user identity lifecycle, registered **scoped** under its GTS catalogue instance id so Account Management selects it by vendor/priority.
 - `service_principal_sdk::ServicePrincipalClientV1` — tenant-scoped machine identities (confidential OAuth `client_credentials` clients), registered **unscoped** for trusted platform consumers.
@@ -64,14 +64,14 @@ Three realm bindings are supported: `shared` (default; tenants share an operator
 
 | Driver | Design allocation |
 |---|---|
-| Provider-neutral publication and selection | `PluginV1<IdpPluginSpecV1>` published to types-registry (vendor-namespaced instance segment `vz.virtuozzo.vp_idp.plugin.v1`; full catalogue id in §3.2, vendor `virtuozzo`, priority 50); scoped ClientHub registration keyed on the instance id; AM resolves via `choose_plugin_instance` against `idp.vendor` |
+| Provider-neutral publication and selection | `PluginV1<IdpPluginSpecV1>` published to types-registry (instance segment `cf.builtin.keycloak_idp.plugin.v1`; full catalogue id in §3.2, vendor `keycloak`, priority 50); scoped ClientHub registration keyed on the instance id; AM resolves via `choose_plugin_instance` against `idp.vendor` |
 | Fail-fast configuration errors | Init validates typed config (`deny_unknown_fields`), the `secret_ref_template`, and the service-principal section, then pre-warms the bootstrap admin token with a bounded retry budget; exhausting the budget fails `Gear::init` |
 | Shared-realm tenant isolation | Per-tenant Keycloak group under `/tenants`, immutable `tenant_id` user attribute (ADR-0006), and an ownership marker attribute (`vhp.provisioning.tenant_id`) on created realms and service-principal clients |
 | Safe external mutation | Parse-then-probe saga ordering, per-step reactive-401 wrapping, idempotent replay paths (probe-adopt realm ensure, 409 group reuse), and stage-attributed `AmbiguousCreated` classification with an `ambig:` prefix contract for reconciliation tooling |
 | Secret custody | `SecretFromEnv`/`SecretString` wrappers with redacted `Debug`, token cache redaction, `redact_secrets` on every error body, and Credential Store writes only for plugin-created realm-admin secrets |
 | Credential rotation without restart | Token cache keyed `(realm, client_id)` with single-flight refresh and an exactly-once reactive-401 retry that re-resolves the secret from its source (env or Credential Store) |
 | User query correctness | Full tenant-group member drain (hard cap 10,000) sorted `(createdTimestamp ASC, id ASC)`, client-side typed filters, `CursorV1` continuation with an FNV-1a filter hash |
-| Observability | Segregated metric ports over one OTel adapter (`vp_idp_plugin_*` instruments), realm-label cardinality cap, and structured audit events on the `vp.idp.plugin.events` tracing target |
+| Observability | Segregated metric ports over one OTel adapter (`keycloak_idp_plugin_*` instruments), realm-label cardinality cap, and structured audit events on the `keycloak_idp.events` tracing target |
 
 #### NFR Allocation
 
@@ -93,7 +93,7 @@ The significant decisions inherit these accepted records and standards:
 - [Use provider-enforced tenant binding](../../../docs/ADR/0006-cpt-cf-account-management-adr-idp-user-tenant-binding.md) — implemented as the `tenant_id` user attribute plus tenant-group membership.
 - Follow [ClientHub and plugin scoping](../../../../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md), [lifecycle rules](../../../../../../docs/toolkit_unified_system/08_lifecycle_stateful_tasks.md), the [Architecture Manifest](../../../../../../docs/ARCHITECTURE_MANIFEST.md), and [Security Guidelines](../../../../../../guidelines/SECURITY.md).
 
-Durable audit delivery remains owned by Account Management and the platform audit owner. The plugin's structured-event emitters (`vp.idp.plugin.events`) are an explicit development stand-in until the platform audit sink lands.
+Durable audit delivery remains owned by Account Management and the platform audit owner. The plugin's structured-event emitters (`keycloak_idp.events`) are an explicit development stand-in until the platform audit sink lands.
 
 ### 1.3 Architecture Layers
 
@@ -109,7 +109,7 @@ flowchart LR
   spc[Trusted platform consumers]
   subgraph host[Host process]
     am[Account Management]
-    subgraph plugin[vp-idp-plugin gear]
+    subgraph plugin[keycloak-idp-plugin gear]
       root[Plugin root: KeycloakIdpPlugin]
       facades[Tenant / User / Service-principal facades]
       kcc[KC admin client factory + token cache]
@@ -289,7 +289,7 @@ The provider metadata is the versioned, non-secret routing envelope `TenantIdpMe
 | `realm_binding` | `shared` \| `adopted` \| `created` (also a public metric label). |
 | `tenant_group_id` | Keycloak UUID of the plugin-owned per-tenant group. |
 | `admin_secret_ref` | `None` for the env-backed default shared realm; `Some(ref)` naming the Credential Store reference for adopted/created realms (template `vp-idp-realm-admin-{realm_name}-secret` by default). |
-| `admin_client_id` | OAuth2 `client_id` of the per-realm admin client (default `vp-idp-plugin-realm-admin`). |
+| `admin_client_id` | OAuth2 `client_id` of the per-realm admin client (default `keycloak-idp-plugin-realm-admin`). |
 
 Provider ownership is split as follows:
 
@@ -330,7 +330,7 @@ The plugin is one logical architecture component. The following entries are resp
 
 #### Deployment, Publication, and Readiness
 
-The plugin is an in-process gear (gear name `vp-idp-plugin`, with declared gear dependencies on `types-registry` and `credstore`) in each host replica. It opens no listener and owns no independent deployment or database.
+The plugin is an in-process gear (gear name `keycloak-idp-plugin`, with declared gear dependencies on `types-registry` and `credstore`) in each host replica. It opens no listener and owns no independent deployment or database.
 
 Initialization proceeds in phases:
 
@@ -339,10 +339,32 @@ Initialization proceeds in phases:
 3. **Static validation** — the `secret_ref_template` is validated by interpolating a 64-character synthetic realm name through `SecretRef::new`; the service-principal section is validated.
 4. **Transport construction** — the reqwest client is built; if `tls_ca_bundle_ref` is set, the PEM bundle is read from the Credential Store and added as a root certificate.
 5. **Bootstrap pre-warm** — the bootstrap admin token is acquired with bounded retry (default 5 × 3 s). Retryable causes: 5xx/429/transport/timeout and Credential Store read failures (deploy-ordering races). Permanent causes fail on the first attempt. Budget exhaustion fails init.
-6. **Catalogue publish** — `PluginV1<IdpPluginSpecV1>` is registered with types-registry under the full catalogue instance id `gts.cf.toolkit.plugins.plugin.v1~cf.core.idp.plugin.v1~vz.virtuozzo.vp_idp.plugin.v1` (base plugin type `gts.cf.toolkit.plugins.plugin.v1~`, derived IdP spec type `…~cf.core.idp.plugin.v1~`, vendor-namespaced instance segment `vz.virtuozzo.vp_idp.plugin.v1`), carrying the configured vendor/priority. `AlreadyExists` is accepted only when the stored spec is structurally equal JSON to the current registration.
+6. **Catalogue publish** — `PluginV1<IdpPluginSpecV1>` is registered with types-registry under the full catalogue instance id `gts.cf.toolkit.plugins.plugin.v1~cf.core.idp.plugin.v1~cf.builtin.keycloak_idp.plugin.v1` (base plugin type `gts.cf.toolkit.plugins.plugin.v1~`, derived IdP spec type `…~cf.core.idp.plugin.v1~`, instance segment `cf.builtin.keycloak_idp.plugin.v1`), carrying the configured vendor/priority. `AlreadyExists` is accepted only when the stored spec is structurally equal JSON to the current registration.
 7. **ClientHub registration** — `Arc<dyn IdpPluginClient>` scoped by the catalogue instance id; `Arc<dyn ServicePrincipalClientV1>` unscoped.
 
 After init, readiness is operation-based: every tenant provision/deprovision saga begins with an unauthenticated Keycloak health probe (`GET realms/master`), and every call re-resolves credentials on 401. Recovery from provider or Credential Store outages therefore needs no process restart.
+
+#### Operator Migration from the vhp-core Lineage
+
+The plugin's identifiers were moved onto this repository's conventions when the crate was ported. A deployment upgrading from the vhp-core `vp-idp-plugin` build must update the following, all of which are configuration or observability surfaces:
+
+| Surface | Was | Now | Action |
+|---|---|---|---|
+| Gear name (config section key) | `vp-idp-plugin` | `keycloak-idp-plugin` | Rename the module's config section |
+| Plugin vendor (selection key) | `virtuozzo` | `keycloak` | Set `account-management.idp.vendor = "keycloak"` |
+| GTS catalogue instance | `…~vz.virtuozzo.vp_idp.plugin.v1` | `…~cf.builtin.keycloak_idp.plugin.v1` | Retire the stale types-registry entry; tenants bound under the old instance need the operator migration described in `…-constraint-scoped-provider-selection` |
+| Bootstrap admin `client_id` default | `vp-idp-plugin-bootstrap` | `keycloak-idp-plugin-bootstrap` | Rename the Keycloak client, or pin the old value in config |
+| Realm-admin `client_id` default | `vp-idp-plugin-realm-admin` | `keycloak-idp-plugin-realm-admin` | Affects newly provisioned realms only — existing tenants replay `admin_client_id` from their metadata |
+| Metric prefix | `vp_idp_plugin_*` | `keycloak_idp_plugin_*` | Update dashboards and alert rules |
+| Tracing targets | `vp_idp_plugin.*`, `vp.idp.plugin.events` | `keycloak_idp.*`, `keycloak_idp.events` | Update log routing and audit collectors |
+
+Three identifiers are deliberately **unchanged**, because each names state that lives outside the process and renaming it would orphan existing resources:
+
+- `vhp.provisioning.tenant_id` — the ownership marker written onto plugin-created realms and service-principal clients in Keycloak. A rename would make the plugin read its own realms as foreign and refuse to administer them.
+- `vp-idp-realm-admin-{realm_name}-secret` — the default `secret_ref_template`, which names live Credential Store secrets for adopted and created realms.
+- The system-actor UUID value — Credential Store secret ownership is keyed to it (§4.1).
+
+Renaming any of the three requires a data migration plan and is out of scope for the port.
 
 ### 3.3 API Contracts
 
@@ -484,7 +506,7 @@ The continuation token is a `CursorV1` (the same envelope Account Management use
 
 HTTP-level retry is bounded (default 3 retries, exponential backoff 100 ms → 5 s cap, full jitter, `Retry-After` honored in delta-seconds form) and splits by what is known: retryable statuses (5xx/429) — where Keycloak answered — are retried for all methods, including administrative POSTs (create-path replays converge through the idempotent-ensure and 409-reuse paths); connect/timeout errors — where the outcome is unknown — are retried only for idempotent requests (GET/PUT/DELETE and the token form-POST), never for administrative POSTs. Reactive-401 re-mints credentials exactly once per call.
 
-Classification is closed: internal `PluginError` variants translate to SDK failures per the fixed tables in §3.3, and each variant has a stable metric label on `vp_idp_plugin_failure_total`. Ambiguous created-mode provisioning remains operator-owned: terminal evidence carries the `ambig:{stage}` token, the realm, and redacted provider detail. Production enablement requires a reconciliation runbook keyed on those stage tokens.
+Classification is closed: internal `PluginError` variants translate to SDK failures per the fixed tables in §3.3, and each variant has a stable metric label on `keycloak_idp_plugin_failure_total`. Ambiguous created-mode provisioning remains operator-owned: terminal evidence carries the `ambig:{stage}` token, the realm, and redacted provider detail. Production enablement requires a reconciliation runbook keyed on those stage tokens.
 
 #### Credentials, Token Cache, and Rotation
 
@@ -496,8 +518,8 @@ All Keycloak traffic authenticates with OAuth2 `client_credentials`. Secrets res
 
 | Tier | Client | Secret source |
 |---|---|---|
-| Bootstrap admin | `vp-idp-plugin-bootstrap` in `master` (defaults) | `${VAR}`-expanded configuration (`SecretFromEnv`) |
-| Shared-realm admin | `vp-idp-plugin-realm-admin` (default) | `${VAR}`-expanded configuration (`default_shared_realm_secret`) |
+| Bootstrap admin | `keycloak-idp-plugin-bootstrap` in `master` (defaults) | `${VAR}`-expanded configuration (`SecretFromEnv`) |
+| Shared-realm admin | `keycloak-idp-plugin-realm-admin` (default) | `${VAR}`-expanded configuration (`default_shared_realm_secret`) |
 | Adopted/created-realm admin | `admin_client_id` from metadata | Credential Store reference from `secret_ref_template` (created-mode secrets are written by the plugin during provisioning) |
 
 Service-principal administration always uses the bootstrap admin tier, against the dedicated service-principal realm (`service_principal.realm`, default `platform` — the shared realm whose issuer tenants trust), independent of any tenant's realm binding.
@@ -521,14 +543,14 @@ sequenceDiagram
 
   AM->>P: Invoke mutating contract
   P->>K: Admin REST (bearer, HTTPS)
-  P-->>P: tracing event on vp.idp.plugin.events
+  P-->>P: tracing event on keycloak_idp.events
   P-->>AM: Classified redacted outcome
   AM->>A: Durably correlate terminal outcome
 ```
 
-The plugin emits structured events on the `vp.idp.plugin.events` tracing target — `tenant.bound`, `realm.created`, `admin_user.bound`, `tenant.unbound`, `realm.removed`, `service_principals.purged`, `user.provisioned` (includes `username`), `user.deprovisioned` — each carrying the acting subject (id, closed-set type, raw type, tenant). This is an explicit development stand-in until the platform audit sink lands; durable one-outcome-per-call correlation is owned by Account Management and the platform audit owner. `list_users` and the service-principal read/mutate paths emit no plugin audit events of their own; the only service-principal audit signal is `service_principals.purged` on tenant deprovisioning.
+The plugin emits structured events on the `keycloak_idp.events` tracing target — `tenant.bound`, `realm.created`, `admin_user.bound`, `tenant.unbound`, `realm.removed`, `service_principals.purged`, `user.provisioned` (includes `username`), `user.deprovisioned` — each carrying the acting subject (id, closed-set type, raw type, tenant). This is an explicit development stand-in until the platform audit sink lands; durable one-outcome-per-call correlation is owned by Account Management and the platform audit owner. `list_users` and the service-principal read/mutate paths emit no plugin audit events of their own; the only service-principal audit signal is `service_principals.purged` on tenant deprovisioning.
 
-Metrics: `vp_idp_plugin_provision_tenant_duration_seconds`, `user_op_duration_seconds`, `sp_op_duration_seconds`, `kc_admin_request_duration_seconds` (declared, not yet wired), `failure_total{op,failure_variant}`, `kc_admin_token_refresh_total` and `credential_refresh_total` (`{outcome,tier,realm}`), `credstore_write_total`, `metadata_decode_failure_total{version_observed}`, `deprovision_missing_metadata_total`, `orphan_user_compensation_total`, `realms_bound{realm_binding,realm_name}`. Every label is a closed enum except `realm`/`realm_name`, which share a cardinality budget (default 500 distinct realms) after which the label is dropped and a warning is logged for each newly observed over-cap realm.
+Metrics: `keycloak_idp_plugin_provision_tenant_duration_seconds`, `user_op_duration_seconds`, `sp_op_duration_seconds`, `kc_admin_request_duration_seconds` (declared, not yet wired), `failure_total{op,failure_variant}`, `kc_admin_token_refresh_total` and `credential_refresh_total` (`{outcome,tier,realm}`), `credstore_write_total`, `metadata_decode_failure_total{version_observed}`, `deprovision_missing_metadata_total`, `orphan_user_compensation_total`, `realms_bound{realm_binding,realm_name}`. Every label is a closed enum except `realm`/`realm_name`, which share a cardinality budget (default 500 distinct realms) after which the label is dropped and a warning is logged for each newly observed over-cap realm.
 
 Operational signals: the reconciliation gate consumes `failure_total{failure_variant="ambiguous_created"}` and the `ambig:{stage}` warn events; dependency-health attribution splits `credential_refresh_total{outcome="error"}` (Credential Store) from `kc_admin_token_refresh_total{outcome="error"}` (Keycloak) plus `credstore_write_total{outcome="error"}`; metadata integrity consumes `metadata_decode_failure_total` (any increase is operator-actionable); list capacity consumes the drain-cap truncation warning. Alert thresholds against the PRD availability and latency targets are owned by the deployment repository's monitoring configuration, not by this design.
 
@@ -604,7 +626,7 @@ The release-qualification query matrix for the PRD latency NFR covers unfiltered
 - [`IdpPluginClient` user contract](../../../account-management-sdk/src/idp_user.rs)
 - [`ServicePrincipalClientV1` contract](../../../../service-principal/service-principal-sdk/src/api.rs)
 - [Unified ToolKit architecture](../../../../../../docs/toolkit_unified_system/README.md)
-- Implementation: [`plugins/keycloak-idp-plugin`](../src/lib.rs) (crate `vp-idp-plugin`)
+- Implementation: [`plugins/keycloak-idp-plugin`](../src/lib.rs) (crate `cf-gears-keycloak-idp-plugin`)
 
 ### 5.2 P1 Requirement Allocation
 

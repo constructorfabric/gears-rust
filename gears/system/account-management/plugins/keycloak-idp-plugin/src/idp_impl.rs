@@ -148,7 +148,7 @@ fn translate_provision_failure(e: PluginError) -> IdpProvisionFailure {
     // anchor (digest + len); this is a *complementary* breadcrumb upstream of it.
     if let PluginError::AmbiguousCreated { stage, .. } = &e {
         tracing::warn!(
-            target: "vp_idp_plugin.provision",
+            target: "keycloak_idp.provision",
             failure_variant = "ambiguous_created",
             stage = %stage,
             "Created-mode saga failed with Ambiguous outcome — operator must reconcile via reaper"

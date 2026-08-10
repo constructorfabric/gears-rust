@@ -5,7 +5,7 @@ use std::time::Duration;
 // only tests need them today, and DE1101 forbids `#[cfg(test)] fn` items
 // in a production file that has a companion test file. Promote back to
 // `pub(crate)` on the parent impl when the metrics layer wires the
-// `vp_idp_plugin.kc_token_cache_size` / `kc_inflight_locks` gauges in
+// `keycloak_idp_plugin.kc_token_cache_size` / `kc_inflight_locks` gauges in
 // the follow-up KC HTTP refactor.
 impl TokenCache {
     #[must_use]
@@ -103,10 +103,10 @@ fn debug_redacts_access_token() {
 #[test]
 fn inflight_forget_drops_entry() {
     let locks = InflightLocks::default();
-    let _l1 = locks.lock_for("partner-a", "vp-idp-plugin-realm-admin");
-    let _l2 = locks.lock_for("partner-b", "vp-idp-plugin-realm-admin");
+    let _l1 = locks.lock_for("partner-a", "keycloak-idp-plugin-realm-admin");
+    let _l2 = locks.lock_for("partner-b", "keycloak-idp-plugin-realm-admin");
     assert_eq!(locks.len(), 2);
-    locks.forget("partner-a", "vp-idp-plugin-realm-admin");
+    locks.forget("partner-a", "keycloak-idp-plugin-realm-admin");
     assert_eq!(locks.len(), 1);
     // Forgetting an absent entry is a no-op.
     locks.forget("ghost", "x");
@@ -116,8 +116,8 @@ fn inflight_forget_drops_entry() {
 #[test]
 fn inflight_lock_for_inserts_then_returns_same_arc() {
     let locks = InflightLocks::default();
-    let a = locks.lock_for("partner-a", "vp-idp-plugin-realm-admin");
-    let b = locks.lock_for("partner-a", "vp-idp-plugin-realm-admin");
+    let a = locks.lock_for("partner-a", "keycloak-idp-plugin-realm-admin");
+    let b = locks.lock_for("partner-a", "keycloak-idp-plugin-realm-admin");
     assert!(Arc::ptr_eq(&a, &b), "same key must hand back the same Arc");
 }
 

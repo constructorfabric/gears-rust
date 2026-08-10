@@ -609,7 +609,7 @@ impl UserFacade {
                 .map_err(user_translate_kc);
             if let Err(compensation_err) = compensation {
                 tracing::warn!(
-                    target: "vp_idp_plugin.user_facade",
+                    target: "keycloak_idp.user_facade",
                     user_uuid = %user_uuid,
                     realm = %metadata.realm_name,
                     primary_error = %group_err,
@@ -623,7 +623,7 @@ impl UserFacade {
                     .orphan_user_compensation(OrphanCompensationOutcome::Failed);
             } else {
                 tracing::info!(
-                    target: "vp_idp_plugin.user_facade",
+                    target: "keycloak_idp.user_facade",
                     user_uuid = %user_uuid,
                     realm = %metadata.realm_name,
                     primary_error = %group_err,
@@ -647,9 +647,9 @@ impl UserFacade {
     }
 
     /// Shared failure-recording helper for user-op sites. Increments both
-    /// the generic `vp_idp_plugin_failure_total` counter and (when the
+    /// the generic `keycloak_idp_plugin_failure_total` counter and (when the
     /// underlying error is a metadata-decode failure) the dedicated
-    /// `vp_idp_plugin_metadata_decode_failure_total` trigger metric.
+    /// `keycloak_idp_plugin_metadata_decode_failure_total` trigger metric.
     fn record_user_op_failure(&self, op: PluginOp, e: &PluginError) {
         if let PluginError::MetadataDecode(de) = e {
             self.metadata_metrics
@@ -1078,7 +1078,7 @@ impl UserFacade {
         // returns the same shape a "user already gone" path would, so the
         // caller cannot distinguish "wrong tenant" from "already
         // deprovisioned". A tracing WARN under
-        // `vp_idp_plugin.user_binding` records the rejection for
+        // `keycloak_idp_plugin.user_binding` records the rejection for
         // operator visibility without leaking the discriminator over the
         // wire.
         let expected_tid = req.tenant_context.tenant_id;
@@ -1100,7 +1100,7 @@ impl UserFacade {
             .map_err(user_translate_kc)?;
         if actual_tid != Some(expected_tid) {
             tracing::warn!(
-                target: "vp_idp_plugin.user_binding",
+                target: "keycloak_idp.user_binding",
                 user_id = %req.user_id,
                 expected_tenant_id = %expected_tid,
                 actual_tenant_id = ?actual_tid,
@@ -1316,7 +1316,7 @@ impl UserFacade {
                             // Loud safety valve — see cap rationale above.
                             if all.len() >= MEMBERS_DRAIN_HARD_CAP {
                                 tracing::warn!(
-                                    target: "vp_idp_plugin.user_facade",
+                                    target: "keycloak_idp.user_facade",
                                     tenant_id = %tenant_id,
                                     realm = %realm_name,
                                     drained = all.len(),
@@ -1424,7 +1424,7 @@ impl UserFacade {
             Ok((status, _)) => {
                 if !(200..=299).contains(&status) && status != 404 {
                     tracing::warn!(
-                        target: "vp.idp.plugin",
+                        target: "keycloak_idp",
                         %status,
                         %user_id,
                         realm = %realm_name,
@@ -1434,7 +1434,7 @@ impl UserFacade {
             }
             Err(e) => {
                 tracing::warn!(
-                    target: "vp.idp.plugin",
+                    target: "keycloak_idp",
                     error = %e,
                     %user_id,
                     realm = %realm_name,

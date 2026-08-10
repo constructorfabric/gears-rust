@@ -223,11 +223,11 @@ pub(crate) fn keycloak_cfg(base: &str) -> KeycloakConfig {
         base_url: url::Url::parse(base).expect("valid base url"),
         bootstrap_admin: BootstrapAdminConfig {
             realm: "master".into(),
-            client_id: "vp-idp-plugin-bootstrap".into(),
+            client_id: "keycloak-idp-plugin-bootstrap".into(),
             client_secret: SecretFromEnv::from_literal_unchecked("topsecret"),
         },
         realm_admin: RealmAdminConfig {
-            client_id_default: "vp-idp-plugin-realm-admin".into(),
+            client_id_default: "keycloak-idp-plugin-realm-admin".into(),
             default_shared_realm_secret: SecretFromEnv::from_literal_unchecked("ra"),
             secret_ref_template: "vp-idp-realm-admin-{realm_name}-secret".into(),
         },
@@ -271,7 +271,7 @@ pub(crate) fn noop_sp_metrics() -> Arc<dyn SpOpMetricsPort> {
 
 /// Build a `TenantIdpMetadataV1` JSON blob for use in test request fixtures.
 ///
-/// The `admin_client_id` is always `"vp-idp-plugin-realm-admin"` (the
+/// The `admin_client_id` is always `"keycloak-idp-plugin-realm-admin"` (the
 /// test-default from `keycloak_cfg`).
 pub(crate) fn make_metadata(
     realm: &str,
@@ -289,7 +289,7 @@ pub(crate) fn make_metadata(
         "realm_name": realm,
         "realm_binding": binding_str,
         "tenant_group_id": tenant_group_id.to_string(),
-        "admin_client_id": "vp-idp-plugin-realm-admin",
+        "admin_client_id": "keycloak-idp-plugin-realm-admin",
     });
     if let Some(secret) = admin_secret_ref {
         obj.as_object_mut().expect("json::Value is object").insert(

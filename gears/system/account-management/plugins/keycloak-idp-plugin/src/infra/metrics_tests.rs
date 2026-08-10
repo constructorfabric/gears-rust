@@ -21,20 +21,20 @@ fn adapter_builds_against_global_meter() {
 
 #[test]
 fn rename_helper_substitutes_namespace_token() {
-    // Leading `vp_idp_plugin` token is swapped for the prefix; the
+    // Leading `keycloak_idp_plugin` token is swapped for the prefix; the
     // already-suffixed remainder (`_failure_total`) is preserved.
     assert_eq!(
-        rename("vp_idp_plugin_failure_total", "my_plugin"),
+        rename("keycloak_idp_plugin_failure_total", "my_plugin"),
         "my_plugin_failure_total"
     );
     assert_eq!(
-        rename("vp_idp_plugin_provision_tenant_duration_seconds", "x"),
+        rename("keycloak_idp_plugin_provision_tenant_duration_seconds", "x"),
         "x_provision_tenant_duration_seconds"
     );
     // With the default prefix the substitution is a no-op.
     assert_eq!(
-        rename("vp_idp_plugin_realms_bound", DEFAULT_PREFIX),
-        "vp_idp_plugin_realms_bound"
+        rename("keycloak_idp_plugin_realms_bound", DEFAULT_PREFIX),
+        "keycloak_idp_plugin_realms_bound"
     );
     // A family that does not start with the default token falls into the
     // "{prefix}_{family}" arm.

@@ -1,10 +1,10 @@
-//! `vp-idp-plugin` observability ports — typed, segregated metric-emission
+//! `keycloak-idp-plugin` observability ports — typed, segregated metric-emission
 //! traits. Mirrors the AM pattern
 //! (`external/gears-rust/.../account-management/src/domain/ports/metrics.rs`).
 //!
 //! Each trait owns one cohesive subdomain of the plugin metric catalog
 //! declared in [`crate::domain::metrics`]. A single infra adapter
-//! ([`crate::infra::metrics::VpIdpPluginMetricsAdapter`]) implements every
+//! ([`crate::infra::metrics::KeycloakIdpPluginMetricsAdapter`]) implements every
 //! trait on one OpenTelemetry-backed struct; DI hands each facade the
 //! trait(s) it actually needs.
 //!
@@ -38,7 +38,7 @@ use crate::domain::metadata_codec::{DecodeError, RealmBinding, version_observed_
 //  Closed-set label enums
 // ════════════════════════════════════════════════════════════════════
 
-/// `op` label on `vp_idp_plugin_user_op_duration_seconds`.
+/// `op` label on `keycloak_idp_plugin_user_op_duration_seconds`.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserOp {
@@ -58,8 +58,8 @@ impl UserOp {
     }
 }
 
-/// `tier` label on `vp_idp_plugin_kc_admin_token_refresh_total` and
-/// `vp_idp_plugin_credential_refresh_total` (ADDENDUM §8).
+/// `tier` label on `keycloak_idp_plugin_kc_admin_token_refresh_total` and
+/// `keycloak_idp_plugin_credential_refresh_total` (ADDENDUM §8).
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenTier {
@@ -77,8 +77,8 @@ impl TokenTier {
     }
 }
 
-/// `outcome` label on `vp_idp_plugin_kc_admin_token_refresh_total` and
-/// `vp_idp_plugin_credential_refresh_total`.
+/// `outcome` label on `keycloak_idp_plugin_kc_admin_token_refresh_total` and
+/// `keycloak_idp_plugin_credential_refresh_total`.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenRefreshOutcome {
@@ -96,7 +96,7 @@ impl TokenRefreshOutcome {
     }
 }
 
-/// `op` label on `vp_idp_plugin_sp_op_duration_seconds`.
+/// `op` label on `keycloak_idp_plugin_sp_op_duration_seconds`.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpOp {
@@ -120,7 +120,7 @@ impl SpOp {
     }
 }
 
-/// `op` label on `vp_idp_plugin_credstore_write_total`.
+/// `op` label on `keycloak_idp_plugin_credstore_write_total`.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredstoreOp {
@@ -138,7 +138,7 @@ impl CredstoreOp {
     }
 }
 
-/// `outcome` label on `vp_idp_plugin_credstore_write_total`.
+/// `outcome` label on `keycloak_idp_plugin_credstore_write_total`.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredstoreOutcome {
@@ -156,7 +156,7 @@ impl CredstoreOutcome {
     }
 }
 
-/// `op` label on `vp_idp_plugin_failure_total`. Superset of all plugin-level
+/// `op` label on `keycloak_idp_plugin_failure_total`. Superset of all plugin-level
 /// operations: tenant lifecycle + user lifecycle + service-principal ops.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,9 +195,9 @@ impl PluginOp {
 //  Sealed-newtype label bridges
 // ════════════════════════════════════════════════════════════════════
 
-// ── vp_idp_plugin_failure_total ───────────────────────────────────────────
+// ── keycloak_idp_plugin_failure_total ───────────────────────────────────────────
 
-/// `failure_variant` label on `vp_idp_plugin_failure_total`.
+/// `failure_variant` label on `keycloak_idp_plugin_failure_total`.
 ///
 /// Sealed newtype: the closed set of literals lives as `pub const`
 /// associated constants, and `From<&PluginError>` bridges
@@ -237,9 +237,9 @@ impl From<&PluginError> for FailureVariant {
     }
 }
 
-// ── vp_idp_plugin_metadata_decode_failure_total ───────────────────────────
+// ── keycloak_idp_plugin_metadata_decode_failure_total ───────────────────────────
 
-/// `version_observed` label on `vp_idp_plugin_metadata_decode_failure_total`.
+/// `version_observed` label on `keycloak_idp_plugin_metadata_decode_failure_total`.
 ///
 /// Sealed newtype around `Cow<'static, str>`: static literals for the
 /// fixed `MissingVersion` / `Malformed` paths; `Cow::Owned` for the
@@ -266,9 +266,9 @@ impl From<&DecodeError> for VersionObserved {
     }
 }
 
-// ── vp_idp_plugin_kc_admin_request_duration_seconds ─────────────────────────
+// ── keycloak_idp_plugin_kc_admin_request_duration_seconds ─────────────────────────
 
-/// `endpoint_class` label on `vp_idp_plugin_kc_admin_request_duration_seconds`.
+/// `endpoint_class` label on `keycloak_idp_plugin_kc_admin_request_duration_seconds`.
 ///
 /// Sealed newtype reserved for the KC HTTP layer wiring (follow-up PR
 /// to VHP-1505). The literal set is intentionally left at one
@@ -308,7 +308,7 @@ pub trait TenantLifecycleMetricsPort: Send + Sync + 'static {
     fn deprovision_missing_metadata(&self);
 }
 
-/// `outcome` label on `vp_idp_plugin_orphan_user_compensation_total`. Two
+/// `outcome` label on `keycloak_idp_plugin_orphan_user_compensation_total`. Two
 /// terminal states for the best-effort `delete_user` compensation
 /// path; both fire from `UserFacade::provision_user_impl` when
 /// `add_user_to_group` fails after `create_user` already landed.

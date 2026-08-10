@@ -12,7 +12,7 @@ use toolkit::gts::PluginV1;
 use toolkit::{Gear, context::GearCtx};
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
-use crate::config::{VpIdpPluginConfig, VpIdpPluginEnabledProbe};
+use crate::config::{KeycloakIdpPluginConfig, KeycloakIdpPluginEnabledProbe};
 use crate::domain::credstore::{CredStoreReader, CredStoreWriter};
 use crate::domain::kc::factory::KeycloakAdminClientFactory;
 use crate::domain::metadata_codec::MetadataCodec;
@@ -33,7 +33,7 @@ use crate::infra::metrics::build_default_adapter;
 // at init and registers `Arc<dyn IdpPluginClient>` in ClientHub under
 // `register_scoped(scope = gts_id)`. AM's `Gear::init` resolves it
 // via `choose_plugin_instance` + `get_scoped` against the configured
-// `idp.vendor` (default `"cf"`, deploys override to `"virtuozzo"` to
+// `idp.vendor` (default `"cf"`, deploys override to `"keycloak"` to
 // pick this plugin).
 //
 // NO toolkit runtime `deps` entry for `account-management` because
@@ -41,23 +41,23 @@ use crate::infra::metrics::build_default_adapter;
 // dev/PoC build) and the plugin must still install. `types-registry`
 // IS declared as a dep because the catalogue publish is a hard
 // prerequisite of the AM-side scoped resolution.
-#[toolkit::gear(name = "vp-idp-plugin", deps = [types_registry, credstore])]
+#[toolkit::gear(name = "keycloak-idp-plugin", deps = [types_registry, credstore])]
 #[derive(Default)]
-pub struct VpIdpPluginGear;
+pub struct KeycloakIdpPluginGear;
 
 #[async_trait]
-impl Gear for VpIdpPluginGear {
+impl Gear for KeycloakIdpPluginGear {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         // Phase 1: read the `enabled` flag without requiring Keycloak fields.
         // Uses `config_or_default` so a missing module section → enabled = true
         // (production default). This mirrors the temporal-workflow-executor-plugin
         // pattern and allows test/CI configs to opt out with `enabled: false`.
-        let probe: VpIdpPluginEnabledProbe = ctx
-            .config_or_default()
-            .map_err(|e| anyhow::anyhow!("vp-idp-plugin: failed to read enabled flag: {e}"))?;
+        let probe: KeycloakIdpPluginEnabledProbe = ctx.config_or_default().map_err(|e| {
+            anyhow::anyhow!("keycloak-idp-plugin: failed to read enabled flag: {e}")
+        })?;
         if !probe.enabled {
             tracing::info!(
-                module = "vp-idp-plugin",
+                module = "keycloak-idp-plugin",
                 "disabled via config; skipping initialization"
             );
             return Ok(());
@@ -66,9 +66,9 @@ impl Gear for VpIdpPluginGear {
         // Phase 2: `config_expanded` runs toolkit's `${VAR}` substitution over
         // fields marked `#[expand_vars]` — the static admin secrets resolve here
         // (ADDENDUM §3.1 / §3.2), symmetric with the AM DB DSN's `${PGPASSWORD}`.
-        let cfg: VpIdpPluginConfig = ctx
+        let cfg: KeycloakIdpPluginConfig = ctx
             .config_expanded()
-            .map_err(|e| anyhow::anyhow!("vp-idp-plugin: failed to load config: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: failed to load config: {e}"))?;
 
         // DESIGN §4.0: validate the SecretRef template at init by interpolating
         // against a 64-char synthetic realm name and feeding the result through
@@ -81,7 +81,7 @@ impl Gear for VpIdpPluginGear {
             .replace("{realm_name}", &synthetic_realm);
         SecretRef::new(&probe).map_err(|e| {
             anyhow::anyhow!(
-                "vp-idp-plugin: secret_ref_template '{}' produces invalid SecretRef \
+                "keycloak-idp-plugin: secret_ref_template '{}' produces invalid SecretRef \
                  for synthetic realm of length 64: {e}",
                 cfg.keycloak.realm_admin.secret_ref_template,
             )
@@ -89,7 +89,7 @@ impl Gear for VpIdpPluginGear {
 
         cfg.service_principal
             .validate()
-            .map_err(|e| anyhow::anyhow!("vp-idp-plugin: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: {e}"))?;
 
         // ---- Plugin-owned system ctx (DESIGN §8.1). ----
         let system_ctx = build_system_ctx(cfg.security_context.platform_tenant_id);
@@ -98,7 +98,7 @@ impl Gear for VpIdpPluginGear {
         let cs_client: Arc<dyn credstore_sdk::CredStoreClientV1> = ctx
             .client_hub()
             .get::<dyn credstore_sdk::CredStoreClientV1>()
-            .map_err(|e| anyhow::anyhow!("vp-idp-plugin: get CredStoreClientV1: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: get CredStoreClientV1: {e}"))?;
         let cs_reader = CredStoreReader::new(Arc::clone(&cs_client), Arc::clone(&system_ctx));
         let cs_writer = CredStoreWriter::new(cs_client, Arc::clone(&system_ctx));
 
@@ -123,7 +123,9 @@ impl Gear for VpIdpPluginGear {
         let transport = Arc::new(
             ReqwestKcTransport::from_config(&cfg.keycloak, &cs_reader)
                 .await
-                .map_err(|e| anyhow::anyhow!("vp-idp-plugin: KC transport init failed: {e}"))?,
+                .map_err(|e| {
+                    anyhow::anyhow!("keycloak-idp-plugin: KC transport init failed: {e}")
+                })?,
         );
         let kc_factory = Arc::new(KeycloakAdminClientFactory::new(
             cfg.keycloak.clone(),
@@ -189,16 +191,16 @@ impl Gear for VpIdpPluginGear {
         // Build the `PluginV1<IdpPluginSpecV1>` instance carrying
         // (vendor, priority) so AM's `choose_plugin_instance` filter
         // can match against `account-management.idp.vendor`. The
-        // instance segment `vz.virtuozzo.vp_idp.plugin.v1` is the
+        // instance segment `cf.builtin.keycloak_idp.plugin.v1` is the
         // vendor-namespaced suffix that distinguishes this plugin
         // from the in-process `static-idp-plugin` (which publishes
         // as `cf.builtin.static_idp.plugin.v1`).
         let (instance_id, instance_json) = PluginV1::<IdpPluginSpecV1>::build_registration(
-            "vz.virtuozzo.vp_idp.plugin.v1",
+            "cf.builtin.keycloak_idp.plugin.v1",
             cfg.vendor.clone(),
             cfg.priority,
         )
-        .map_err(|e| anyhow::anyhow!("vp-idp-plugin: build_registration: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: build_registration: {e}"))?;
 
         // Publish to types-registry. Idempotent restart: treat
         // `AlreadyExists` as success ONLY when the stored spec
@@ -210,11 +212,11 @@ impl Gear for VpIdpPluginGear {
         let registry = ctx
             .client_hub()
             .get::<dyn TypesRegistryClient>()
-            .map_err(|e| anyhow::anyhow!("vp-idp-plugin: get TypesRegistryClient: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: get TypesRegistryClient: {e}"))?;
         let results = registry
             .register(vec![instance_json.clone()])
             .await
-            .map_err(|e| anyhow::anyhow!("vp-idp-plugin: types-registry register: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: types-registry register: {e}"))?;
         for result in &results {
             if let RegisterResult::Err { error, .. } = result {
                 if matches!(
@@ -226,17 +228,19 @@ impl Gear for VpIdpPluginGear {
                             .get_instance(instance_id.as_ref())
                             .await
                             .map_err(|e| {
-                                anyhow::anyhow!("vp-idp-plugin: verify existing instance: {e}")
+                                anyhow::anyhow!(
+                                    "keycloak-idp-plugin: verify existing instance: {e}"
+                                )
                             })?;
                     if existing.object != instance_json {
                         return Err(anyhow::anyhow!(
-                            "vp-idp-plugin: instance `{instance_id}` already registered \
+                            "keycloak-idp-plugin: instance `{instance_id}` already registered \
                              with a different spec — refusing to silently drift",
                         ));
                     }
                 } else {
                     return Err(anyhow::anyhow!(
-                        "vp-idp-plugin: types-registry registration failed: {error}"
+                        "keycloak-idp-plugin: types-registry registration failed: {error}"
                     ));
                 }
             }
@@ -264,7 +268,7 @@ impl Gear for VpIdpPluginGear {
             .register_scoped::<dyn IdpPluginClient>(ClientScope::gts_id(&instance_id), plugin_dyn);
 
         tracing::info!(
-            module = "vp-idp-plugin",
+            module = "keycloak-idp-plugin",
             keycloak_base_url = %cfg.keycloak.base_url,
             vendor = %cfg.vendor,
             priority = cfg.priority,
@@ -289,7 +293,7 @@ fn is_pre_warm_retryable(err: &crate::domain::error::PluginError) -> bool {
         // KC token endpoint: 5xx + 429 transient, transport/timeout transient,
         // 4xx-non-429 permanent (invalid_client, unauthorized_client, etc.).
         PluginError::KcRest { status, .. } => status.is_retryable(),
-        // OpenBao readiness lag is a real deploy-ordering transient — vp-idp
+        // OpenBao readiness lag is a real deploy-ordering transient — plugin
         // pods sometimes win the readiness race against credstore. Retry.
         PluginError::CredStoreRead { .. } => true,
         // Anything else reaching this path (`Config` from a malformed base URL,
@@ -318,7 +322,7 @@ async fn pre_warm_bootstrap_admin_with_retry(
             Ok(_) => {
                 if attempt > 1 {
                     tracing::info!(
-                        target: "vp_idp_plugin.init",
+                        target: "keycloak_idp.init",
                         attempt,
                         "bootstrap admin pre-warm succeeded after retry"
                     );
@@ -328,7 +332,7 @@ async fn pre_warm_bootstrap_admin_with_retry(
             Err(e) => {
                 let retryable = is_pre_warm_retryable(&e);
                 tracing::warn!(
-                    target: "vp_idp_plugin.init",
+                    target: "keycloak_idp.init",
                     attempt,
                     max_attempts,
                     error = %e,
@@ -362,7 +366,7 @@ async fn pre_warm_bootstrap_admin_with_retry(
         )
     });
     Err(anyhow::anyhow!(
-        "vp-idp-plugin: bootstrap admin pre-warm bailed after {attempts_used}/{max_attempts} attempt(s) ({backoff:?} backoff between attempts); last error: {final_err}"
+        "keycloak-idp-plugin: bootstrap admin pre-warm bailed after {attempts_used}/{max_attempts} attempt(s) ({backoff:?} backoff between attempts); last error: {final_err}"
     ))
 }
 

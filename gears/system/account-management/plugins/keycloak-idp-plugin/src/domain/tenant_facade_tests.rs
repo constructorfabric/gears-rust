@@ -629,7 +629,7 @@ async fn adopted_with_empty_realm_provisions_with_secret_ref() {
             "Adopted always carries the templated SecretRef",
         );
         assert_eq!(meta.tenant_group_id, group_uuid);
-        assert_eq!(meta.admin_client_id, "vp-idp-plugin-realm-admin");
+        assert_eq!(meta.admin_client_id, "keycloak-idp-plugin-realm-admin");
     })
     .await;
 }
@@ -1179,7 +1179,7 @@ async fn mount_created_downstream(
     // Step 4: lookup created realm-admin client by clientId.
     Mock::given(method("GET"))
         .and(path(format!("/admin/realms/{realm}/clients")))
-        .and(query_param("clientId", "vp-idp-plugin-realm-admin"))
+        .and(query_param("clientId", "keycloak-idp-plugin-realm-admin"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
             {"id": admin_client_uuid.to_string()}
         ])))
@@ -1352,7 +1352,7 @@ async fn created_happy_path_writes_secret_and_returns_created_metadata() {
         assert_eq!(meta.realm_binding, RealmBinding::Created);
         assert_eq!(meta.admin_secret_ref.as_deref(), Some(secret_key.as_str()),);
         assert_eq!(meta.tenant_group_id, group_uuid);
-        assert_eq!(meta.admin_client_id, "vp-idp-plugin-realm-admin");
+        assert_eq!(meta.admin_client_id, "keycloak-idp-plugin-realm-admin");
 
         let recorded = mutator.put_calls.lock().expect("stub lock poisoned");
         assert_eq!(
@@ -1818,7 +1818,7 @@ async fn created_kc_role_mapping_5xx_returns_ambiguous_kc_role_mapping() {
             .await;
         Mock::given(method("GET"))
             .and(path(format!("/admin/realms/{realm}/clients")))
-            .and(query_param("clientId", "vp-idp-plugin-realm-admin"))
+            .and(query_param("clientId", "keycloak-idp-plugin-realm-admin"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"id": admin_client_uuid.to_string()}
             ])))
@@ -1980,7 +1980,7 @@ async fn created_client_secret_read_failure_returns_ambiguous_kc_client_secret_r
             .await;
         Mock::given(method("GET"))
             .and(path(format!("/admin/realms/{realm}/clients")))
-            .and(query_param("clientId", "vp-idp-plugin-realm-admin"))
+            .and(query_param("clientId", "keycloak-idp-plugin-realm-admin"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"id": admin_client_uuid.to_string()}
             ])))
@@ -2088,7 +2088,7 @@ fn deprovision_req(
 /// Build a [`SecurityContext`] whose `subject_type` is `"am.system"`
 /// (mirrors AM's `for_module_init` / `for_bootstrap` shape). The
 /// missing-metadata branch keys on this string per DESIGN §9 /
-/// `vp_idp_plugin_deprovision_missing_metadata_total`.
+/// `keycloak_idp_plugin_deprovision_missing_metadata_total`.
 fn build_am_system_ctx() -> Arc<SecurityContext> {
     let ctx = SecurityContext::builder()
         .subject_id(uuid::uuid!("00000000-0000-cf01-0000-616d73797374"))
@@ -2511,7 +2511,7 @@ async fn deprovision_5xx_on_group_delete_returns_retryable() {
 
 /// Missing metadata + `am.system` ctx → `DeprovisionNotFound { realm_name = "unknown" }`.
 /// Also exercises the `tracing::warn!` placeholder for the
-/// `vp_idp_plugin_deprovision_missing_metadata_total` counter that Phase
+/// `keycloak_idp_plugin_deprovision_missing_metadata_total` counter that Phase
 /// 14 will wire to `OTel` (we can't easily assert the warn emission
 /// without a tracing subscriber, but exercising the branch keeps it
 /// reachable + clippy-clean).

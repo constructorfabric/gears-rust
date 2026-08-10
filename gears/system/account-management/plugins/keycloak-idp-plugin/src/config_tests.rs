@@ -47,10 +47,10 @@ keycloak:
   base_url: https://keycloak.example
   bootstrap_admin:
     realm: master
-    client_id: vp-idp-plugin-bootstrap
+    client_id: keycloak-idp-plugin-bootstrap
     client_secret: "${VP_IDP_BOOTSTRAP_CLIENT_SECRET}"
   realm_admin:
-    client_id_default: vp-idp-plugin-realm-admin
+    client_id_default: keycloak-idp-plugin-realm-admin
     default_shared_realm_secret: "${VP_IDP_REALM_ADMIN_PLATFORM_CLIENT_SECRET}"
     secret_ref_template: vp-idp-realm-admin-{realm_name}-secret
 tenant_facade:
@@ -62,7 +62,7 @@ user_facade:
   list_users_page_limit_max: 200
   session_revoke_on_deprovision: true
 "#;
-    let cfg: VpIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
+    let cfg: KeycloakIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
     // Pre-expansion: the `${VAR}` placeholder is verbatim on the parsed
     // struct. Expansion happens via `ctx.config_expanded::<T>()` at module
     // init; this test doesn't exercise that path.
@@ -96,7 +96,7 @@ keycloak:
 tenant_facade: {}
 user_facade: {}
 "#;
-    let cfg: VpIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
+    let cfg: KeycloakIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
     assert_eq!(
         cfg.keycloak.credential_refresh_interval,
         Some(std::time::Duration::from_mins(30))
@@ -115,7 +115,7 @@ keycloak:
 tenant_facade: {}
 user_facade: {}
 ";
-    let cfg: VpIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
+    let cfg: KeycloakIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
     assert_eq!(
         cfg.keycloak.metrics.drop_realm_label_at_cardinality, 500,
         "default cap must be 500"
@@ -135,7 +135,7 @@ keycloak:
 tenant_facade: {}
 user_facade: {}
 ";
-    let cfg: VpIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
+    let cfg: KeycloakIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
     assert_eq!(
         cfg.keycloak.metrics.drop_realm_label_at_cardinality, 0,
         "explicit 0 must be preserved"
@@ -155,7 +155,7 @@ keycloak:
 tenant_facade: {}
 user_facade: {}
 ";
-    let cfg: VpIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
+    let cfg: KeycloakIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
     assert_eq!(
         cfg.keycloak.http_retry_policy.max_retries, 3,
         "default max_retries must be 3"
@@ -189,7 +189,7 @@ keycloak:
 tenant_facade: {}
 user_facade: {}
 ";
-    let cfg: VpIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
+    let cfg: KeycloakIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
     let p = &cfg.keycloak.http_retry_policy;
     assert_eq!(p.max_retries, 5);
     assert_eq!(p.backoff, BackoffKind::Exponential);
@@ -202,7 +202,7 @@ user_facade: {}
 fn bootstrap_admin_debug_redacts_client_secret() {
     let cfg = BootstrapAdminConfig {
         realm: "master".into(),
-        client_id: "vp-idp-plugin-bootstrap".into(),
+        client_id: "keycloak-idp-plugin-bootstrap".into(),
         client_secret: SecretFromEnv::from_literal_unchecked("super-secret-hunter2"),
     };
     let dump = format!("{cfg:?}");
@@ -219,7 +219,7 @@ fn bootstrap_admin_debug_redacts_client_secret() {
 #[test]
 fn realm_admin_debug_redacts_default_shared_realm_secret() {
     let cfg = RealmAdminConfig {
-        client_id_default: "vp-idp-plugin-realm-admin".into(),
+        client_id_default: "keycloak-idp-plugin-realm-admin".into(),
         default_shared_realm_secret: SecretFromEnv::from_literal_unchecked("rotated-on-tuesdays"),
         secret_ref_template: "vp-idp-realm-admin-{realm_name}-secret".into(),
     };
@@ -270,7 +270,7 @@ keycloak:
 tenant_facade: {}
 user_facade: {}
 ";
-    let cfg: VpIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
+    let cfg: KeycloakIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
     assert_eq!(
         cfg.tenant_facade.provision_timeout_ms, 30_000,
         "default provision_timeout_ms must be 30000"
@@ -289,7 +289,7 @@ keycloak:
 tenant_facade: {}
 user_facade: {}
 ";
-    let cfg: VpIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
+    let cfg: KeycloakIdpPluginConfig = serde_yaml::from_str(yaml).expect("valid yaml");
     assert_eq!(cfg.service_principal.realm, "platform");
     assert!(cfg.service_principal.scope_allowlist.is_empty());
     assert_eq!(cfg.service_principal.per_tenant_quota, 10);

@@ -1,11 +1,12 @@
-//! VHP `IdP` Plugin (Keycloak) — implements `account_management_sdk::IdpPluginClient`.
+//! Keycloak `IdP` plugin — implements `account_management_sdk::IdpPluginClient`
+//! and `service_principal_sdk::ServicePrincipalClientV1`.
 //!
 //! Spec: [`docs/DESIGN.md`](../docs/DESIGN.md) / [`docs/PRD.md`](../docs/PRD.md)
 //! adjacent to this crate.
 
-// Ported verbatim from vhp-core (`crates/gears/plugins/vp-idp-plugin`), which
-// builds under a laxer clippy profile. These style lints are allowed crate-wide
-// to keep the port diffable against the vhp-core original; the same pattern is
+// Ported from vhp-core (`crates/gears/plugins/vp-idp-plugin`), which builds
+// under a laxer clippy profile. These style lints are allowed crate-wide to
+// keep the port diffable against the vhp-core original; the same pattern is
 // used by other ported crates (see `chat-engine`, `mini-chat`).
 #![allow(
     clippy::non_ascii_literal,
@@ -28,4 +29,4 @@ pub(crate) mod module;
 pub(crate) mod sp_impl;
 
 pub use idp_impl::KeycloakIdpPlugin;
-pub use module::VpIdpPluginGear;
+pub use module::KeycloakIdpPluginGear;

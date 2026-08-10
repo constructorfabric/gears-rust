@@ -397,7 +397,7 @@ impl TenantFacade {
                 // Saga was cancelled — its in-body `failure_metrics` /
                 // audit emissions never ran. Emit the failure counter
                 // here so dashboards see the timeout in
-                // `vp_idp_plugin_failure_total{op=provision_tenant,
+                // `keycloak_idp_plugin_failure_total{op=provision_tenant,
                 // failure_variant=ambiguous_created}` alongside the
                 // structured error returned to AM.
                 let err = PluginError::AmbiguousCreated {
@@ -520,7 +520,7 @@ impl TenantFacade {
     /// «orphan from prior Ambiguous» vs «normal already-cleaned cascade»
     /// — return [`PluginError::DeprovisionNotFound`] (success-equivalent
     /// at the AM boundary), and on `am.system` ctx increments the
-    /// `vp_idp_plugin_deprovision_missing_metadata_total` counter
+    /// `keycloak_idp_plugin_deprovision_missing_metadata_total` counter
     /// (DESIGN §9 trigger metric; wired to `OTel`).
     ///
     /// # Errors
@@ -1086,7 +1086,7 @@ impl TenantFacade {
         parsed: &ParsedInput,
     ) -> Result<TenantIdpMetadataV1, PluginError> {
         tracing::debug!(
-            target: "vp_idp_plugin.provision",
+            target: "keycloak_idp.provision",
             tenant_id = %req.tenant_id,
             realm = %parsed.realm_name,
             "provision_shared: step 1 — bootstrap_client + assert_realm_exists (reactive-401)"
@@ -1102,7 +1102,7 @@ impl TenantFacade {
             .await?;
 
         tracing::debug!(
-            target: "vp_idp_plugin.provision",
+            target: "keycloak_idp.provision",
             tenant_id = %req.tenant_id,
             "provision_shared: steps 2-4 — realm_client + ensure_tenant_group [+ bind_admin_user_to_tenant] (reactive-401)"
         );
@@ -1634,7 +1634,7 @@ impl TenantFacade {
         Ok(())
     }
 
-    /// Create the per-realm admin client (`vp-idp-plugin-realm-admin`) as
+    /// Create the per-realm admin client (`keycloak-idp-plugin-realm-admin`) as
     /// a confidential `client_credentials`-only client with a service
     /// account. Returns the client's Keycloak-assigned UUID, discovered via
     /// a follow-up `GET .../clients?clientId=...` (Keycloak returns no body
@@ -2297,7 +2297,7 @@ impl TenantFacade {
             let expected = tenant_id.to_string();
             if let Some(existing) = groups.into_iter().find(|g| g.name == expected) {
                 tracing::info!(
-                    target: "vp_idp_plugin.provision",
+                    target: "keycloak_idp.provision",
                     tenant_id = %tenant_id,
                     group_id = %existing.id,
                     "ensure_tenant_group: subgroup already exists (409 idempotent path)"

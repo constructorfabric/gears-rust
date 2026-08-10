@@ -222,7 +222,7 @@ pub enum PluginError {
     SpNotFound { detail: String },
 }
 
-/// Stable `failure_variant` label string for the `vp_idp_plugin_failure_total`
+/// Stable `failure_variant` label string for the `keycloak_idp_plugin_failure_total`
 /// metric (DESIGN §9). Must stay 1:1 with [`PluginError`] variants so dashboards
 /// and alerts don't drift when a new variant is added — every new variant adds
 /// one branch here.

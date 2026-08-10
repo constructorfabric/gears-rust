@@ -11,10 +11,6 @@ keywords = ["constructorfabric", "cf-gears"]
 categories = ["authentication"]
 metadata.docs.rs.all-features = true
 
-# The runtime identifiers stay on the `vp-idp-plugin` / `vp_idp_plugin` lineage
-# on purpose: the gear name is a deployment config key, and the metric prefix
-# and tracing targets are an operator-facing contract. Renaming the Cargo
-# package is a build-level change; renaming those would break existing deploys.
 [lib]
 name = "keycloak_idp_plugin"
 

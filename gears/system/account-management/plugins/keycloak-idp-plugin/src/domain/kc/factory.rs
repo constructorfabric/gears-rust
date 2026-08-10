@@ -220,7 +220,7 @@ impl KeycloakAdminClientFactory {
     /// # Scope and concurrency
     ///
     /// Drops only the `(bootstrap.realm, bootstrap.client_id)` cache entry —
-    /// per-realm admin tokens (`(realm_name, vp-idp-plugin-realm-admin)`) are
+    /// per-realm admin tokens (`(realm_name, keycloak-idp-plugin-realm-admin)`) are
     /// keyed differently and untouched, so the user-op path and per-realm
     /// admin work are unaffected.
     ///
@@ -540,7 +540,7 @@ impl KeycloakAdminClientFactory {
         let effective_lifetime = lifetime.saturating_sub(safety).max(MIN_TOKEN_TTL);
         if lifetime <= safety {
             tracing::warn!(
-                target: "vp_idp_plugin.factory",
+                target: "keycloak_idp.factory",
                 realm,
                 client_id,
                 kc_expires_in_secs = body.expires_in,

@@ -1,9 +1,9 @@
-//! OpenTelemetry-backed adapter for the `vp-idp-plugin` metric ports.
+//! OpenTelemetry-backed adapter for the `keycloak-idp-plugin` metric ports.
 //!
-//! [`VpIdpPluginMetricsAdapter`] owns all OpenTelemetry instruments
+//! [`KeycloakIdpPluginMetricsAdapter`] owns all OpenTelemetry instruments
 //! declared by the catalog in [`crate::domain::metrics`] and implements
 //! every port trait from [`crate::domain::ports::metrics`]. A single
-//! `Arc<VpIdpPluginMetricsAdapter>` is constructed at module init
+//! `Arc<KeycloakIdpPluginMetricsAdapter>` is constructed at module init
 //! ([`crate::module`]) and coerced into per-trait `Arc<dyn ...>` views
 //! by DI.
 //!
@@ -11,7 +11,7 @@
 //!
 //! Instrument names are **literal Prometheus** names with the wire-side
 //! suffix baked into the name: counters end with `_total`
-//! (`vp_idp_plugin_failure_total`), histograms end with their unit
+//! (`keycloak_idp_plugin_failure_total`), histograms end with their unit
 //! (`_seconds`, or `_ms` only where genuinely milliseconds), and
 //! gauges / up-down-counters carry no suffix. The adapter does **not**
 //! call `with_unit(...)` — the unit lives in the name. This matches the
@@ -37,12 +37,12 @@ use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
 
 use crate::domain::metadata_codec::RealmBinding;
 use crate::domain::metrics::{
-    DEFAULT_PREFIX, VP_IDP_PLUGIN_CREDENTIAL_REFRESH, VP_IDP_PLUGIN_CREDSTORE_WRITE,
-    VP_IDP_PLUGIN_DEPROVISION_MISSING_METADATA, VP_IDP_PLUGIN_FAILURE,
-    VP_IDP_PLUGIN_KC_ADMIN_REQUEST_DURATION, VP_IDP_PLUGIN_KC_ADMIN_TOKEN_REFRESH,
-    VP_IDP_PLUGIN_METADATA_DECODE_FAILURE, VP_IDP_PLUGIN_ORPHAN_USER_COMPENSATION,
-    VP_IDP_PLUGIN_PROVISION_TENANT_DURATION, VP_IDP_PLUGIN_REALMS_BOUND,
-    VP_IDP_PLUGIN_SP_OP_DURATION, VP_IDP_PLUGIN_USER_OP_DURATION,
+    DEFAULT_PREFIX, KEYCLOAK_IDP_PLUGIN_CREDENTIAL_REFRESH, KEYCLOAK_IDP_PLUGIN_CREDSTORE_WRITE,
+    KEYCLOAK_IDP_PLUGIN_DEPROVISION_MISSING_METADATA, KEYCLOAK_IDP_PLUGIN_FAILURE,
+    KEYCLOAK_IDP_PLUGIN_KC_ADMIN_REQUEST_DURATION, KEYCLOAK_IDP_PLUGIN_KC_ADMIN_TOKEN_REFRESH,
+    KEYCLOAK_IDP_PLUGIN_METADATA_DECODE_FAILURE, KEYCLOAK_IDP_PLUGIN_ORPHAN_USER_COMPENSATION,
+    KEYCLOAK_IDP_PLUGIN_PROVISION_TENANT_DURATION, KEYCLOAK_IDP_PLUGIN_REALMS_BOUND,
+    KEYCLOAK_IDP_PLUGIN_SP_OP_DURATION, KEYCLOAK_IDP_PLUGIN_USER_OP_DURATION,
 };
 use crate::domain::ports::metrics::{
     CredstoreMetricsPort, CredstoreOp, CredstoreOutcome, EndpointClass, FailureMetricsPort,
@@ -53,7 +53,7 @@ use crate::domain::ports::metrics::{
 
 /// OpenTelemetry adapter that owns one instrument per plugin metric
 /// family and implements every port trait.
-pub struct VpIdpPluginMetricsAdapter {
+pub struct KeycloakIdpPluginMetricsAdapter {
     // Histograms (4)
     provision_tenant_duration: Histogram<f64>,
     user_op_duration: Histogram<f64>,
@@ -77,13 +77,13 @@ pub struct VpIdpPluginMetricsAdapter {
     realm_label_cap: u32,
 }
 
-/// Substitute the leading `vp_idp_plugin` namespace token of a literal
+/// Substitute the leading `keycloak_idp_plugin` namespace token of a literal
 /// metric family name with the adapter's `prefix`, preserving the rest
 /// of the (already suffixed) name verbatim. With the default prefix
-/// (`"vp_idp_plugin"`) this is a no-op and the name is emitted exactly
+/// (`"keycloak_idp_plugin"`) this is a no-op and the name is emitted exactly
 /// as declared in the catalog.
 ///
-/// `"vp_idp_plugin_failure_total"` + `"my_plugin"` →
+/// `"keycloak_idp_plugin_failure_total"` + `"my_plugin"` →
 /// `"my_plugin_failure_total"`. A family that does not start with the
 /// default token (should not happen for catalog constants) is prefixed
 /// as `"{prefix}_{family}"` so the host prefix still shows up.
@@ -95,10 +95,10 @@ fn rename(family: &str, prefix: &str) -> String {
     }
 }
 
-impl VpIdpPluginMetricsAdapter {
+impl KeycloakIdpPluginMetricsAdapter {
     /// Build every instrument. `prefix` defaults to
-    /// [`crate::domain::metrics::DEFAULT_PREFIX`] (`"vp_idp_plugin"`)
-    /// and substitutes the leading `vp_idp_plugin` namespace token of
+    /// [`crate::domain::metrics::DEFAULT_PREFIX`] (`"keycloak_idp_plugin"`)
+    /// and substitutes the leading `keycloak_idp_plugin` namespace token of
     /// every literal metric family name (a no-op with the default
     /// prefix; the unit/`_total` suffix already baked into the name is
     /// preserved). `realm_label_cap` controls the cardinality watchdog
@@ -107,55 +107,64 @@ impl VpIdpPluginMetricsAdapter {
     pub fn new(meter: &Meter, prefix: &str, realm_label_cap: u32) -> Self {
         Self {
             provision_tenant_duration: meter
-                .f64_histogram(rename(VP_IDP_PLUGIN_PROVISION_TENANT_DURATION, prefix))
+                .f64_histogram(rename(
+                    KEYCLOAK_IDP_PLUGIN_PROVISION_TENANT_DURATION,
+                    prefix,
+                ))
                 .with_description("provision_tenant end-to-end latency in seconds by realm_binding")
                 .build(),
             user_op_duration: meter
-                .f64_histogram(rename(VP_IDP_PLUGIN_USER_OP_DURATION, prefix))
+                .f64_histogram(rename(KEYCLOAK_IDP_PLUGIN_USER_OP_DURATION, prefix))
                 .with_description("User-op latency in seconds by op")
                 .build(),
             kc_admin_request_duration: meter
-                .f64_histogram(rename(VP_IDP_PLUGIN_KC_ADMIN_REQUEST_DURATION, prefix))
+                .f64_histogram(rename(
+                    KEYCLOAK_IDP_PLUGIN_KC_ADMIN_REQUEST_DURATION,
+                    prefix,
+                ))
                 .with_description("Single KC Admin REST call latency in seconds by endpoint_class")
                 .build(),
             sp_op_duration: meter
-                .f64_histogram(rename(VP_IDP_PLUGIN_SP_OP_DURATION, prefix))
+                .f64_histogram(rename(KEYCLOAK_IDP_PLUGIN_SP_OP_DURATION, prefix))
                 .with_description("Service-principal op latency in seconds by op")
                 .build(),
             failure: meter
-                .u64_counter(rename(VP_IDP_PLUGIN_FAILURE, prefix))
+                .u64_counter(rename(KEYCLOAK_IDP_PLUGIN_FAILURE, prefix))
                 .with_description("Plugin failures by op x failure_variant")
                 .build(),
             kc_admin_token_refresh: meter
-                .u64_counter(rename(VP_IDP_PLUGIN_KC_ADMIN_TOKEN_REFRESH, prefix))
+                .u64_counter(rename(KEYCLOAK_IDP_PLUGIN_KC_ADMIN_TOKEN_REFRESH, prefix))
                 .with_description("Admin token refresh count by outcome x tier x realm")
                 .build(),
             credential_refresh: meter
-                .u64_counter(rename(VP_IDP_PLUGIN_CREDENTIAL_REFRESH, prefix))
+                .u64_counter(rename(KEYCLOAK_IDP_PLUGIN_CREDENTIAL_REFRESH, prefix))
                 .with_description(
                     "Admin client_secret re-resolution count by outcome x tier x realm",
                 )
                 .build(),
             credstore_write: meter
-                .u64_counter(rename(VP_IDP_PLUGIN_CREDSTORE_WRITE, prefix))
+                .u64_counter(rename(KEYCLOAK_IDP_PLUGIN_CREDSTORE_WRITE, prefix))
                 .with_description("OpenBao writes/deletes for per-realm admin secrets")
                 .build(),
             metadata_decode_failure: meter
-                .u64_counter(rename(VP_IDP_PLUGIN_METADATA_DECODE_FAILURE, prefix))
+                .u64_counter(rename(KEYCLOAK_IDP_PLUGIN_METADATA_DECODE_FAILURE, prefix))
                 .with_description("Malformed / unsupported-version metadata blob counter")
                 .build(),
             deprovision_missing_metadata: meter
-                .u64_counter(rename(VP_IDP_PLUGIN_DEPROVISION_MISSING_METADATA, prefix))
+                .u64_counter(rename(
+                    KEYCLOAK_IDP_PLUGIN_DEPROVISION_MISSING_METADATA,
+                    prefix,
+                ))
                 .with_description("deprovision_tenant with metadata=None and am.system ctx")
                 .build(),
             orphan_user_compensation: meter
-                .u64_counter(rename(VP_IDP_PLUGIN_ORPHAN_USER_COMPENSATION, prefix))
+                .u64_counter(rename(KEYCLOAK_IDP_PLUGIN_ORPHAN_USER_COMPENSATION, prefix))
                 .with_description(
                     "Orphan-user compensation outcome (after add_user_to_group failure) by outcome",
                 )
                 .build(),
             realms_bound: meter
-                .i64_up_down_counter(rename(VP_IDP_PLUGIN_REALMS_BOUND, prefix))
+                .i64_up_down_counter(rename(KEYCLOAK_IDP_PLUGIN_REALMS_BOUND, prefix))
                 .with_description("Active realm bindings by realm_binding x realm_name")
                 .build(),
             seen_realms: DashSet::new(),
@@ -220,10 +229,10 @@ impl VpIdpPluginMetricsAdapter {
         // We bound the warn to "this is the realm that wanted in but
         // couldn't" so operators see the proximate cause.
         tracing::warn!(
-            target: "vp_idp_plugin.metrics",
+            target: "keycloak_idp.metrics",
             cap = self.realm_label_cap,
             tripping_realm = realm,
-            "vp_idp_plugin realm_label_cap reached; `realm_name` label dropped for new realms across realms_bound + kc_admin_token_refresh + credential_refresh (shared budget)"
+            "keycloak_idp_plugin realm_label_cap reached; `realm_name` label dropped for new realms across realms_bound + kc_admin_token_refresh + credential_refresh (shared budget)"
         );
         false
     }
@@ -260,13 +269,13 @@ impl VpIdpPluginMetricsAdapter {
 }
 
 /// Convenience constructor used at module init: builds an
-/// `Arc<VpIdpPluginMetricsAdapter>` against the process-global
+/// `Arc<KeycloakIdpPluginMetricsAdapter>` against the process-global
 /// OpenTelemetry meter provider, scoped to the plugin instrumentation
 /// library, with the default prefix.
 #[must_use]
-pub fn build_default_adapter(realm_label_cap: u32) -> Arc<VpIdpPluginMetricsAdapter> {
-    let meter = opentelemetry::global::meter("vp-idp-plugin");
-    Arc::new(VpIdpPluginMetricsAdapter::new(
+pub fn build_default_adapter(realm_label_cap: u32) -> Arc<KeycloakIdpPluginMetricsAdapter> {
+    let meter = opentelemetry::global::meter("keycloak-idp-plugin");
+    Arc::new(KeycloakIdpPluginMetricsAdapter::new(
         &meter,
         DEFAULT_PREFIX,
         realm_label_cap,
@@ -277,7 +286,7 @@ pub fn build_default_adapter(realm_label_cap: u32) -> Arc<VpIdpPluginMetricsAdap
 //  Port-trait implementations
 // ════════════════════════════════════════════════════════════════════
 
-impl TenantLifecycleMetricsPort for VpIdpPluginMetricsAdapter {
+impl TenantLifecycleMetricsPort for KeycloakIdpPluginMetricsAdapter {
     fn provision_tenant_duration(&self, realm_binding: RealmBinding, secs: f64) {
         self.provision_tenant_duration.record(
             secs,
@@ -317,7 +326,7 @@ impl TenantLifecycleMetricsPort for VpIdpPluginMetricsAdapter {
     }
 }
 
-impl UserOpMetricsPort for VpIdpPluginMetricsAdapter {
+impl UserOpMetricsPort for KeycloakIdpPluginMetricsAdapter {
     fn user_op_duration(&self, op: UserOp, secs: f64) {
         self.user_op_duration
             .record(secs, &[KeyValue::new("op", op.as_str())]);
@@ -329,7 +338,7 @@ impl UserOpMetricsPort for VpIdpPluginMetricsAdapter {
     }
 }
 
-impl KcAdminMetricsPort for VpIdpPluginMetricsAdapter {
+impl KcAdminMetricsPort for KeycloakIdpPluginMetricsAdapter {
     fn kc_admin_request_duration(&self, endpoint_class: EndpointClass, secs: f64) {
         self.kc_admin_request_duration.record(
             secs,
@@ -360,7 +369,7 @@ impl KcAdminMetricsPort for VpIdpPluginMetricsAdapter {
     }
 }
 
-impl CredstoreMetricsPort for VpIdpPluginMetricsAdapter {
+impl CredstoreMetricsPort for KeycloakIdpPluginMetricsAdapter {
     fn credstore_write(&self, op: CredstoreOp, outcome: CredstoreOutcome) {
         self.credstore_write.add(
             1,
@@ -372,7 +381,7 @@ impl CredstoreMetricsPort for VpIdpPluginMetricsAdapter {
     }
 }
 
-impl MetadataCodecMetricsPort for VpIdpPluginMetricsAdapter {
+impl MetadataCodecMetricsPort for KeycloakIdpPluginMetricsAdapter {
     fn metadata_decode_failure(&self, version_observed: VersionObserved) {
         // VersionObserved holds Cow; the OTel KeyValue API needs an
         // owned String for non-static labels, so we allocate here. The
@@ -388,7 +397,7 @@ impl MetadataCodecMetricsPort for VpIdpPluginMetricsAdapter {
     }
 }
 
-impl FailureMetricsPort for VpIdpPluginMetricsAdapter {
+impl FailureMetricsPort for KeycloakIdpPluginMetricsAdapter {
     fn failure(&self, op: PluginOp, variant: FailureVariant) {
         self.failure.add(
             1,
@@ -400,7 +409,7 @@ impl FailureMetricsPort for VpIdpPluginMetricsAdapter {
     }
 }
 
-impl SpOpMetricsPort for VpIdpPluginMetricsAdapter {
+impl SpOpMetricsPort for KeycloakIdpPluginMetricsAdapter {
     fn sp_op_duration(&self, op: SpOp, secs: f64) {
         self.sp_op_duration
             .record(secs, &[KeyValue::new("op", op.as_str())]);

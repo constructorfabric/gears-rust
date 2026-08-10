@@ -1,7 +1,7 @@
 //! Plugin configuration.
 //!
 //! Mirrors the worked example at
-//! `docs/design/DESIGN-vp-idp-plugin-202605192055/vp-idp-plugin.config.example.yaml`.
+//! `docs/design/DESIGN-keycloak-idp-plugin-202605192055/keycloak-idp-plugin.config.example.yaml`.
 //! Per the ADDENDUM, static admin creds (`bootstrap_admin.client_secret`,
 //! `realm_admin.default_shared_realm_secret`) are templated `${VAR}` strings
 //! resolved at config-load time via toolkit's `ExpandVars` (symmetric with the
@@ -150,13 +150,13 @@ impl Default for HttpRetryPolicy {
 
 /// Lightweight probe struct used to read the `enabled` flag without requiring
 /// all mandatory Keycloak fields to be present. Deserialization of
-/// [`VpIdpPluginConfig`] is only attempted when the flag is `true` (default).
+/// [`KeycloakIdpPluginConfig`] is only attempted when the flag is `true` (default).
 ///
 /// This mirrors the pattern used by `temporal-workflow-executor-plugin`: read
-/// `enabled` via `ctx.config_or_default::<VpIdpPluginEnabledProbe>()`, then
+/// `enabled` via `ctx.config_or_default::<KeycloakIdpPluginEnabledProbe>()`, then
 /// proceed with the full config parse only when enabled.
 #[derive(Debug, Default, Deserialize)]
-pub struct VpIdpPluginEnabledProbe {
+pub struct KeycloakIdpPluginEnabledProbe {
     /// When `false` the module skips full init. Defaults to `true`.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -168,7 +168,7 @@ fn default_enabled() -> bool {
 
 #[derive(Debug, Clone, Deserialize, ExpandVars)]
 #[serde(deny_unknown_fields)]
-pub struct VpIdpPluginConfig {
+pub struct KeycloakIdpPluginConfig {
     pub security_context: SecurityContextConfig,
     #[expand_vars]
     pub keycloak: KeycloakConfig,
@@ -182,8 +182,8 @@ pub struct VpIdpPluginConfig {
     /// instance this module publishes to types-registry, and the key
     /// AM's `choose_plugin_instance` filter matches against
     /// `cfg.idp.vendor` to pick a candidate. Defaults to
-    /// `"virtuozzo"` — deploys that want this plugin to win
-    /// selection MUST set `account-management.idp.vendor = "virtuozzo"`
+    /// `"keycloak"` — deploys that want this plugin to win
+    /// selection MUST set `account-management.idp.vendor = "keycloak"`
     /// to align, otherwise AM falls back per `idp.required`.
     #[serde(default = "default_vendor")]
     pub vendor: String,
@@ -191,8 +191,8 @@ pub struct VpIdpPluginConfig {
     /// Plugin selection priority — lower wins on tie-breaks within
     /// the same vendor. Defaults to `50` (lower than
     /// `static-idp-plugin`'s `100`) so an environment that publishes
-    /// both under `vendor = "virtuozzo"` (e.g. a transitional canary
-    /// with two vp-idp-plugin versions) deterministically picks the
+    /// both under `vendor = "keycloak"` (e.g. a transitional canary
+    /// with two keycloak-idp-plugin versions) deterministically picks the
     /// newer one if it pins a lower number, while leaving headroom
     /// for emergency "force this plugin to win" overrides via
     /// `i16::MIN`.
@@ -201,7 +201,7 @@ pub struct VpIdpPluginConfig {
 }
 
 fn default_vendor() -> String {
-    "virtuozzo".to_owned()
+    "keycloak".to_owned()
 }
 
 const fn default_priority() -> i16 {
@@ -349,7 +349,7 @@ fn default_master_realm() -> String {
     "master".into()
 }
 fn default_bootstrap_client_id() -> String {
-    "vp-idp-plugin-bootstrap".into()
+    "keycloak-idp-plugin-bootstrap".into()
 }
 
 #[derive(Debug, Clone, Deserialize, ExpandVars)]
@@ -372,7 +372,7 @@ pub struct RealmAdminConfig {
 }
 
 fn default_realm_admin_client_id() -> String {
-    "vp-idp-plugin-realm-admin".into()
+    "keycloak-idp-plugin-realm-admin".into()
 }
 fn default_secret_ref_template() -> String {
     "vp-idp-realm-admin-{realm_name}-secret".into()
@@ -464,7 +464,7 @@ impl ServicePrincipalConfig {
     /// `realm` cannot be cross-validated against AM's shared realm here — that
     /// value lives in account-management's bootstrap config, not this plugin's.
     /// The field defaults to `platform` when the section is omitted (see the
-    /// `#[serde(default)]` on `VpIdpPluginConfig::service_principal`), so a
+    /// `#[serde(default)]` on `KeycloakIdpPluginConfig::service_principal`), so a
     /// deployment on a non-`platform` shared realm MUST set `realm` explicitly
     /// or principals are created/purged against the wrong realm. The check
     /// below only rejects an explicitly blank value.

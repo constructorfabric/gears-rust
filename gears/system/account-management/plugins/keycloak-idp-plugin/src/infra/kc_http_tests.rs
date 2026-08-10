@@ -58,7 +58,7 @@ async fn raw_request_injects_traceparent_header() {
     //    emit OTel context. `set_default` returns a guard that restores the
     //    previous default when dropped — safe to use in parallel tests.
     let provider = SdkTracerProvider::builder().build();
-    let tracer = provider.tracer("vp-idp-plugin-test");
+    let tracer = provider.tracer("keycloak-idp-plugin-test");
     let subscriber = tracing_subscriber::registry().with(OpenTelemetryLayer::new(tracer));
     let _guard = subscriber.set_default();
 

@@ -30,7 +30,8 @@ use uuid::Uuid;
 /// and upgrades** — changing it breaks secret ownership in `OpenBao` for
 /// tenants whose `Created` realm secrets were written under the previous
 /// value.
-pub const VP_IDP_PLUGIN_ACTOR_UUID: Uuid = uuid::uuid!("1d70b6d4-6e2e-4f3c-9aa3-7d8c2e3f5b91");
+pub const KEYCLOAK_IDP_PLUGIN_ACTOR_UUID: Uuid =
+    uuid::uuid!("1d70b6d4-6e2e-4f3c-9aa3-7d8c2e3f5b91");
 
 /// `subject_type` recorded on every `CredStore` op the plugin performs.
 ///
@@ -38,14 +39,14 @@ pub const VP_IDP_PLUGIN_ACTOR_UUID: Uuid = uuid::uuid!("1d70b6d4-6e2e-4f3c-9aa3-
 /// `subject_service` classifier pattern) so the authz-resolver classifies the
 /// plugin as a `ServicePrincipal` and authorizes its credstore writes through
 /// **ordinary RBAC** — an Owner/credstore grant seeded for
-/// [`VP_IDP_PLUGIN_ACTOR_UUID`] — rather than a PEP bypass. The resolver
+/// [`KEYCLOAK_IDP_PLUGIN_ACTOR_UUID`] — rather than a PEP bypass. The resolver
 /// rejects an unknown `subject_type` fail-closed (Internal/500), so this MUST
 /// stay a value `classify_subject_type` accepts (i.e. contains
 /// `subject_service`); keep it in sync with
-/// `VpIdpPluginConfig.service_principal.subject_type` (config default).
+/// `KeycloakIdpPluginConfig.service_principal.subject_type` (config default).
 ///
 /// Audit attribution back to the plugin is keyed on the stable
-/// [`VP_IDP_PLUGIN_ACTOR_UUID`], NOT on this string — see [`crate::domain::audit`].
+/// [`KEYCLOAK_IDP_PLUGIN_ACTOR_UUID`], NOT on this string — see [`crate::domain::audit`].
 pub const SUBJECT_TYPE: &str = gts_id!("cf.core.security.subject_service_principal.v1~");
 
 /// First-party wildcard token scope (`"*"`). The plugin's in-process system
@@ -60,7 +61,7 @@ const FIRST_PARTY_TOKEN_SCOPE: &str = "*";
 /// Build the plugin-owned system ctx.
 ///
 /// `platform_tenant_id` comes from
-/// `VpIdpPluginConfig.security_context.platform_tenant_id` (defaults to the
+/// `KeycloakIdpPluginConfig.security_context.platform_tenant_id` (defaults to the
 /// platform root tenant `…0001`, NOT nil — credstore's own-tenant gate
 /// requires a real tenant covered by the plugin's RBAC grant; see
 /// `SecurityContextConfig`).
@@ -76,13 +77,13 @@ const FIRST_PARTY_TOKEN_SCOPE: &str = "*";
 )]
 pub fn build_system_ctx(platform_tenant_id: Uuid) -> Arc<SecurityContext> {
     tracing::debug!(
-        target: "vp_idp_plugin.system_actor",
+        target: "keycloak_idp.system_actor",
         site = "module_init",
         platform_tenant_id = %platform_tenant_id,
-        "vp-idp-plugin system actor constructed",
+        "keycloak-idp-plugin system actor constructed",
     );
     let ctx = SecurityContext::builder()
-        .subject_id(VP_IDP_PLUGIN_ACTOR_UUID)
+        .subject_id(KEYCLOAK_IDP_PLUGIN_ACTOR_UUID)
         .subject_type(SUBJECT_TYPE)
         .subject_tenant_id(platform_tenant_id)
         // First-party wildcard scope: this in-process ctx carries no bearer
@@ -91,7 +92,7 @@ pub fn build_system_ctx(platform_tenant_id: Uuid) -> Arc<SecurityContext> {
         // still the authoritative gate. See FIRST_PARTY_TOKEN_SCOPE.
         .token_scopes(vec![FIRST_PARTY_TOKEN_SCOPE.to_owned()])
         .build()
-        .expect("VP_IDP_PLUGIN_ACTOR_UUID + platform_tenant_id are always present");
+        .expect("KEYCLOAK_IDP_PLUGIN_ACTOR_UUID + platform_tenant_id are always present");
     Arc::new(ctx)
 }
 
@@ -102,7 +103,7 @@ mod tests {
     #[test]
     fn ctx_has_expected_identity() {
         let ctx = build_system_ctx(Uuid::nil());
-        assert_eq!(ctx.subject_id(), VP_IDP_PLUGIN_ACTOR_UUID);
+        assert_eq!(ctx.subject_id(), KEYCLOAK_IDP_PLUGIN_ACTOR_UUID);
         assert_eq!(ctx.subject_type(), Some(SUBJECT_TYPE));
         assert_eq!(ctx.subject_tenant_id(), Uuid::nil());
         // First-party wildcard scope clears the resolver's token-scope enforcer
@@ -114,7 +115,7 @@ mod tests {
     fn ctx_carries_custom_platform_tenant_id() {
         let tid = uuid::uuid!("11111111-2222-3333-4444-555555555555");
         let ctx = build_system_ctx(tid);
-        assert_eq!(ctx.subject_id(), VP_IDP_PLUGIN_ACTOR_UUID);
+        assert_eq!(ctx.subject_id(), KEYCLOAK_IDP_PLUGIN_ACTOR_UUID);
         assert_eq!(ctx.subject_type(), Some(SUBJECT_TYPE));
         assert_eq!(ctx.subject_tenant_id(), tid);
     }
