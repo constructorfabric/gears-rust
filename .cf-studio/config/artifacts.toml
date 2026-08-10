@@ -61,22 +61,6 @@ patterns = ["gears/system/oagw/docs/adr-*.md"]
 
 
 [[ignore]]
-# Guardrail record (registry/autodetect ignore change).
-# Guardrail: gears/system/$system autodetect requires a PRD per module.
-# Rationale: 'service-principal' ships only the SDK contract crate (no gear
-#   implementation, no REST surface); its consumer-facing lifecycle owner is
-#   undecided, so no PRD/DESIGN can be authored yet. The
-#   contract is documented in the Keycloak IdP plugin's PRD §5.4 and DESIGN §3.2,
-#   which allocate every service-principal requirement.
-# Owner: @platform-iam-team (owner of record in the Keycloak IdP plugin DESIGN).
-# Validation: `make cfs-validate` passes with 0 errors; the ignore is scoped to
-#   this subtree only and does not widen any sibling module's scope.
-# Removal condition: drop this entry when the service-principal lifecycle owner
-#   is selected and the module gains its own PRD (tracked as PRD open question 4).
-reason = "Ignore module 'service-principal' (SDK-only contract crate; not SDLC-documented yet: missing required PRD/DESIGN). Owner: @platform-iam-team. Requirements are allocated in the Keycloak IdP plugin PRD §5.4 / DESIGN §3.2 until the lifecycle owner is selected."
-patterns = ["gears/system/service-principal/*"]
-
-[[ignore]]
 reason = "Ignore module 'tenant-resolver' (not SDLC-documented yet: missing required PRD/DESIGN)."
 patterns = ["gears/system/tenant-resolver/*"]
 
