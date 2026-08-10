@@ -138,8 +138,8 @@ flowchart LR
 
 | Layer | Responsibility |
 |---|---|
-| Module wiring (`module.rs`) | Config probe/expansion, static validation, bootstrap token pre-warm, facade construction, types-registry publication, ClientHub registration |
-| Plugin root (`idp_impl.rs`, `sp_impl.rs`) | SDK trait implementations, metadata encode, `PluginError` → SDK failure translation |
+| Module wiring | Config probe/expansion, static validation, bootstrap token pre-warm, facade construction, types-registry publication, ClientHub registration |
+| Plugin root | SDK trait implementations, metadata encode, `PluginError` → SDK failure translation |
 | Domain facades | Tenant/user/service-principal sagas, boundary enforcement, replay safety, error classification, audit emission |
 | KC client layer (`domain/kc`) | Token acquisition and caching, single-flight refresh, reactive-401, admin REST helpers |
 | Credential Store wrappers (`domain/credstore`) | System-context-bound read (secrets, CA bundle) and write (created-realm admin secrets) |
@@ -280,7 +280,7 @@ Keycloak does not guarantee stable ordering across group-member offset pages, so
 
 - [ ] `p3` - **ID**: `cpt-cf-keycloak-idp-plugin-entity-tenant-idp-metadata`
 
-The provider metadata is the versioned, non-secret routing envelope `TenantIdpMetadataV1` (Rust type and serde shape defined in the crate's `domain/metadata_codec.rs`), owned by the plugin and persisted opaquely by Account Management:
+The provider metadata is the versioned, non-secret routing envelope `TenantIdpMetadataV1`, whose Rust type and serde shape are owned by the plugin's metadata codec and persisted opaquely by Account Management:
 
 | Field | Meaning |
 |---|---|
@@ -314,19 +314,19 @@ Provider ownership is split as follows:
 
 The plugin is one logical architecture component. The following entries are responsibility partitions inside that component (concrete Rust modules), not independently deployed services.
 
-| Responsibility partition | Module | Architectural responsibility |
-|---|---|---|
-| Module wiring | `module.rs` | Enabled probe, typed config expansion, static validation, bootstrap pre-warm, DI, catalogue publish, ClientHub registration |
-| Plugin root | `idp_impl.rs`, `sp_impl.rs` | SDK trait surface; failure translation tables |
-| Tenant lifecycle coordinator | `domain/tenant_facade.rs` | Provision/deprovision sagas for all three bindings, saga timeout, idempotent replay, ambiguity staging, service-principal purge hook |
-| User lifecycle coordinator | `domain/user_facade.rs` | User provision/deprovision/list, tenant boundary guard, orphan compensation, cursor pagination |
-| Service-principal facade | `domain/service_principal_facade.rs` | Machine-identity lifecycle against the configured service-principal realm (`service_principal.realm`, default `platform`); ownership markers; quota and scope allowlist |
-| Metadata codec | `domain/metadata_codec.rs` | Versioned fail-closed envelope encode/decode |
-| KC admin client factory | `domain/kc/` | `client_credentials` token acquisition, `(realm, client_id)` token cache with single-flight refresh, reactive-401, health probe |
-| Credential Store wrappers | `domain/credstore/` | System-ctx-bound reader (secrets, CA bundle) and writer (create-or-replace, delete with absent-as-success) |
-| Transport | `infra/kc_http.rs` | Reqwest HTTPS client, per-request timeout, bounded retry with exponential backoff + full jitter + `Retry-After`, W3C trace propagation, body redaction/truncation |
-| Observability | `infra/metrics.rs`, `domain/audit.rs`, `domain/ports/` | One OTel adapter behind seven segregated metric ports; structured audit emitters |
-| System actor | `domain/system_actor.rs` | Stable plugin service-principal identity for Credential Store calls |
+| Responsibility partition | Architectural responsibility |
+|---|---|
+| Module wiring | Enabled probe, typed config expansion, static validation, bootstrap pre-warm, DI, catalogue publish, ClientHub registration |
+| Plugin root | SDK trait surface; failure translation tables |
+| Tenant lifecycle coordinator | Provision/deprovision sagas for all three bindings, saga timeout, idempotent replay, ambiguity staging, service-principal purge hook |
+| User lifecycle coordinator | User provision/deprovision/list, tenant boundary guard, orphan compensation, cursor pagination |
+| Service-principal facade | Machine-identity lifecycle against the configured service-principal realm (`service_principal.realm`, default `platform`); ownership markers; quota and scope allowlist |
+| Metadata codec | Versioned fail-closed envelope encode/decode |
+| KC admin client factory | `client_credentials` token acquisition, `(realm, client_id)` token cache with single-flight refresh, reactive-401, health probe |
+| Credential Store wrappers | System-ctx-bound reader (secrets, CA bundle) and writer (create-or-replace, delete with absent-as-success) |
+| Transport | Reqwest HTTPS client, per-request timeout, bounded retry with exponential backoff + full jitter + `Retry-After`, W3C trace propagation, body redaction/truncation |
+| Observability | One OTel adapter behind seven segregated metric ports; structured audit emitters |
+| System actor | Stable plugin service-principal identity for Credential Store calls |
 
 #### Deployment, Publication, and Readiness
 
@@ -348,7 +348,7 @@ After init, readiness is operation-based: every tenant provision/deprovision sag
 
 The current [`idp.rs`](../../../account-management-sdk/src/idp.rs) and [`idp_user.rs`](../../../account-management-sdk/src/idp_user.rs) contracts are authoritative for tenant/user work; `service-principal-sdk` is authoritative for machine identities. This boundary realizes the PRD interface contracts `cpt-cf-keycloak-idp-plugin-interface-idp-plugin-client`, `cpt-cf-keycloak-idp-plugin-interface-service-principal-client`, and `cpt-cf-keycloak-idp-plugin-interface-provider-instance`, under the external contracts `cpt-cf-keycloak-idp-plugin-contract-account-management`, `cpt-cf-keycloak-idp-plugin-contract-keycloak-admin`, and `cpt-cf-keycloak-idp-plugin-contract-credstore`.
 
-Contract invariants implemented at the boundary (`idp_impl.rs`, `sp_impl.rs`):
+Contract invariants implemented at the plugin's SDK boundary:
 
 - malformed or contradictory provisioning intent (`ProvisionInputRejected`, metadata decode failures) maps to `IdpProvisionFailure::InvalidInput` with `field = "provisioning_metadata"`, before provider mutation;
 - a foreign or unmarked existing realm in `created` mode is `CleanFailure` (no state was created); permanent provider 4xx and pre-saga failures are `CleanFailure`;
@@ -363,7 +363,7 @@ The plugin emits no public HTTP API.
 
 ### 3.4 Internal Dependencies
 
-Domain components depend on plugin-owned ports rather than transport types: `reqwest` is confined to `infra/kc_http.rs` behind the `KcTransport` trait, and metrics are consumed through seven segregated port traits implemented by one adapter.
+Domain components depend on plugin-owned ports rather than transport types: `reqwest` is confined to the transport adapter behind the `KcTransport` trait, and metrics are consumed through seven segregated port traits implemented by one adapter.
 
 | Internal dependency | Purpose |
 |---|---|
@@ -570,7 +570,7 @@ Keycloak is the sole user directory. The plugin holds request data only for the 
 | Level | Purpose |
 |---|---|
 | Unit (in-crate, 300+ tests) | Config parsing/defaults/validation, metadata codec compatibility, error classification and translation tables, redaction, cursor encode/decode incl. legacy fallback, filter lowering, boundary predicates, token cache/single-flight/reactive-401 (wiremock), transport retry/backoff/Retry-After (wiremock), metrics label and cardinality behavior, saga step ordering via configurable stubs |
-| SDK contract | Conformance to `IdpPluginClient` and `ServicePrincipalClientV1` failure enums and semantics; `tests/contract_am_sdk.rs` is the placeholder for the upstream AM-SDK conformance harness |
+| SDK contract | Conformance to `IdpPluginClient` and `ServicePrincipalClientV1` failure enums and semantics; the crate carries a placeholder awaiting the upstream AM-SDK conformance harness |
 | Real-Keycloak integration | Realm ensure idempotency, group lifecycle, role grants, user replay, cross-tenant denial, deletion ordering, provider failures, query behavior (owned by the deployment repository's E2E stacks) |
 | Lifecycle integration | Enabled/disabled init paths, pre-warm retry/fast-bail budgets, catalogue re-registration drift detection |
 | Cross-system audit contract | Account Management and the platform audit owner prove durable terminal outcomes; external production gate |
