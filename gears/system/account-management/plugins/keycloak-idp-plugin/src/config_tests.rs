@@ -48,10 +48,10 @@ keycloak:
   bootstrap_admin:
     realm: master
     client_id: keycloak-idp-plugin-bootstrap
-    client_secret: "${VP_IDP_BOOTSTRAP_CLIENT_SECRET}"
+    client_secret: "${KEYCLOAK_IDP_BOOTSTRAP_CLIENT_SECRET}"
   realm_admin:
     client_id_default: keycloak-idp-plugin-realm-admin
-    default_shared_realm_secret: "${VP_IDP_REALM_ADMIN_PLATFORM_CLIENT_SECRET}"
+    default_shared_realm_secret: "${KEYCLOAK_IDP_REALM_ADMIN_PLATFORM_CLIENT_SECRET}"
     secret_ref_template: keycloak-idp-realm-admin-{realm_name}-secret
 tenant_facade:
   realm_defaults: {}
@@ -68,7 +68,7 @@ user_facade:
     // init; this test doesn't exercise that path.
     assert_eq!(
         cfg.keycloak.bootstrap_admin.client_secret.expose(),
-        "${VP_IDP_BOOTSTRAP_CLIENT_SECRET}"
+        "${KEYCLOAK_IDP_BOOTSTRAP_CLIENT_SECRET}"
     );
 }
 

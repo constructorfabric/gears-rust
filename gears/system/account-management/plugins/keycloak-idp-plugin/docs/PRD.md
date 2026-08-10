@@ -75,7 +75,7 @@ The Keycloak IdP Plugin solves this gap for Keycloak. It owns the provider-facin
 | Realm | A Keycloak isolation and administration boundary containing identities and related configuration. |
 | Shared realm | An operator-owned realm that contains more than one tenant. The default binding; child tenants inherit their parent's realm. |
 | Adopted realm | An existing operator-owned realm bound to a single tenant without transferring realm ownership to the plugin. |
-| Created realm | A realm (`realm-{tenant_id}`) created and lifecycle-managed by the plugin, marked with a plugin ownership attribute. |
+| Created realm | A realm created and lifecycle-managed by the plugin, marked with a plugin ownership attribute. Child tenants get the generated name `realm-{tenant_id}`; a root-target created realm is operator-named. |
 | Tenant group | The plugin-owned Keycloak group (under `/tenants` by default) that forms a tenant's identity boundary inside a realm. |
 | Bootstrap admin | The operator-provisioned confidential client (default `keycloak-idp-plugin-bootstrap` in `master`) the plugin uses for realm-level administration. |
 | Realm admin | The per-realm confidential client (default `keycloak-idp-plugin-realm-admin`) used for tenant and user administration inside a bound realm. |
@@ -114,7 +114,7 @@ The Keycloak IdP Plugin solves this gap for Keycloak. It owns the provider-facin
 
 **ID**: `cpt-cf-keycloak-idp-plugin-actor-service-principal-consumer`
 
-- **Role**: A trusted platform module that resolves `ServicePrincipalClientV1` from ClientHub to manage tenant-scoped machine identities. It authorizes its own callers through RBAC/PDP before delegating; the plugin treats the forwarded security context as audit evidence only.
+- **Role**: The `service-principal` gear — the platform-owned REST product for machine identities — resolves `ServicePrincipalClientV1` from ClientHub and delegates to this plugin as its registered adapter. It authorizes its own callers through RBAC/PDP before delegating; the plugin treats the forwarded security context as audit evidence only.
 
 #### Keycloak
 
@@ -244,7 +244,7 @@ Provisioning intent arrives through the `IdpProvisionTenantRequest.metadata` val
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-shared-realm-admissibility`
 
-The target shared realm **MUST** already exist; the plugin verifies existence with the bootstrap admin before any mutation. A failed existence check **MUST** produce a no-side-effect outcome. The plugin **MUST NOT** create, repair, or reconfigure a shared realm.
+The target shared realm **MUST** already exist; the plugin verifies existence with the bootstrap admin before any mutation. A failed existence check performs no mutation. A provider 4xx **MUST** be reported as a clean failure and a 403 as unsupported; a 5xx, transport, or timeout failure **MUST** be reported conservatively as ambiguous, because the plugin cannot prove the provider was untouched. The plugin **MUST NOT** create, repair, or reconfigure a shared realm.
 
 - **Rationale**: The plugin must not claim an unknown realm or mutate operator-owned realm configuration.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`
@@ -262,7 +262,7 @@ An `adopted` target realm **MUST** already exist and **MUST** contain no existin
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-created-realm-admissibility`
 
-In `created` mode the plugin **MUST** probe the generated realm name first: an absent realm is created with the plugin ownership marker (`cf.provisioning.tenant_id = {tenant_id}`); a realm already marked for the same tenant **MUST** be adopted idempotently (provisioning replay); a realm owned by another tenant or lacking the marker **MUST** be rejected without mutation. Operator `realm_defaults` pass-through **MUST** be restricted to a fail-closed allowlist (`displayNameHtml`, `defaultLocale`, `supportedLocales`, `internationalizationEnabled`); any other key fails before provider access. A create attempt whose response is lost **MUST** reconcile by re-probing before classifying the outcome.
+In `created` mode the plugin **MUST** probe the target realm name first — generated as `realm-{tenant_id}` for a child tenant, operator-supplied for a root target: an absent realm is created with the plugin ownership marker (`cf.provisioning.tenant_id = {tenant_id}`); a realm already marked for the same tenant **MUST** be adopted idempotently (provisioning replay); a realm owned by another tenant or lacking the marker **MUST** be rejected without mutation. Operator `realm_defaults` pass-through **MUST** be restricted to a fail-closed allowlist (`displayNameHtml`, `defaultLocale`, `supportedLocales`, `internationalizationEnabled`); any other key fails before provider access. A create attempt whose response is lost **MUST** reconcile by re-probing before classifying the outcome.
 
 - **Rationale**: The plugin must not overwrite or assume ownership of an existing realm, and replayed provisioning must converge instead of failing or duplicating.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`
@@ -336,7 +336,7 @@ The plugin **MUST** distinguish invalid pre-mutation requests (`InvalidInput` wi
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-user-provision`
 
-The plugin **MUST** create a user inside the resolved tenant identity boundary: the created representation carries the immutable `tenant_id` attribute and `user_type = "user"`, the configured required actions (default `VERIFY_EMAIL`, plus `UPDATE_PASSWORD` for temporary initial passwords), a coupled `emailVerified` derivation, and the optional initial password embedded in the create request; the user is then joined to the tenant group. If the group join fails after creation, the plugin **MUST** attempt best-effort orphan compensation (delete the created identity), report the compensation outcome on a dedicated metric, and return the original failure. A provider uniqueness conflict **MUST** be returned as `DuplicateUser` with the conflicting field refined from provider evidence where possible (`Username`, `Email`, or `UsernameOrEmail`). On success the plugin returns the provider-issued user projection.
+The plugin **MUST** create a user inside the resolved tenant identity boundary: the created representation carries the immutable `tenant_id` attribute and `user_type = "user"`, the configured required actions (default `VERIFY_EMAIL`, plus `UPDATE_PASSWORD` for temporary initial passwords), a coupled `emailVerified` derivation, and the optional initial password embedded in the create request; the user is then joined to the tenant group. If the group join fails after creation, the plugin **MUST** attempt best-effort orphan compensation (delete the created identity), report the compensation outcome on a dedicated metric, and return the original failure. A provider uniqueness conflict **MUST** be returned as `DuplicateUser` with the conflicting field refined from provider evidence where possible (`Username`, `Email`, or `UsernameOrEmail`). On success the plugin returns the provider-issued user id together with the submitted profile fields; it does not read the created representation back, so provider-side normalization is not reflected.
 
 - **Rationale**: Account Management needs a provider-neutral way to create identities while Keycloak remains the identity source of truth and half-created identities do not linger unbound.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-tenant-admin`, `cpt-cf-keycloak-idp-plugin-actor-account-management`
@@ -372,7 +372,7 @@ Before any mutation, user deprovisioning **MUST** verify that the target user's 
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-user-query`
 
-The plugin **MUST** list only users belonging to the resolved tenant group. The supported filter surface is `eq` (exact) and `contains` (case-insensitive) over `username`, `email`, `first_name`, `last_name`, and `display_name`, an `id` point filter, and `and`/`or` composition; unsupported filter shapes **MUST** return `UnsupportedOperation` before any provider call. Results are globally sorted on `(created_at ASC, id ASC)` with the provider id as tiebreaker; requested orderings are not honored in this revision. Continuation **MUST** use a `CursorV1` token that pins the sort order, direction, last-emitted key, and a hash of the tenant, realm, and complete filter tree, so a cursor replayed with a different filter or tenant context is rejected as invalid. One bounded exception applies: cursors minted by the immediately preceding release **MUST** remain accepted during a rolling-deploy grace window under that release's weaker validation scope (tenant and id-filter only) until in-flight pagination drains, after which the fallback is retired (mechanism in [DESIGN §3.6](./DESIGN.md#36-interactions--sequences)). Page size **MUST** be capped (default cap 200). The per-request membership scan **MUST** be bounded by a hard cap (10,000 members); exceeding the cap truncates the scan and emits a loud operational warning rather than failing or silently hiding members.
+The plugin **MUST** list only users belonging to the resolved tenant group. The supported filter surface is `eq` (exact) and `contains` (case-insensitive) over `username`, `email`, `first_name`, `last_name`, and `display_name`, an `id` point filter, and `and`/`or` composition; unsupported filter shapes **MUST** return `UnsupportedOperation` before any provider call. Results are globally sorted on `(created_at ASC, id ASC)` with the provider id as tiebreaker; requested orderings are not honored in this revision. Continuation **MUST** use a `CursorV1` token that pins the sort order, direction, last-emitted key, and a hash of the tenant, realm, and complete filter tree, so a cursor replayed with a different filter or tenant context is rejected as invalid. One bounded exception applies: cursors minted by the immediately preceding release **MUST** remain accepted during a rolling-deploy grace window under that release's weaker validation scope (tenant, realm, and id-filter only — string filters are not revalidated) until in-flight pagination drains, after which the fallback is retired (mechanism in [DESIGN §3.6](./DESIGN.md#36-interactions--sequences)). Page size **MUST** be capped (default cap 200). The per-request membership scan **MUST** be bounded by a hard cap (10,000 members); exceeding the cap truncates the scan and emits a loud operational warning rather than failing or silently hiding members.
 
 - **Rationale**: Tenant administration and downstream membership checks need stable, correctly ordered queries without cross-tenant disclosure, with explicit and observable capacity bounds.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-tenant-admin`, `cpt-cf-keycloak-idp-plugin-actor-account-management`
@@ -405,6 +405,7 @@ The plugin **MUST** implement creation, secret rotation, revocation, and listing
 
 The final client id **MUST** be server-built as `svc-{tenant_id}-{name}`, where `name` is caller-chosen, non-empty, at most 40 characters, and restricted to lowercase alphanumerics and `-`. Successful creation **MUST** return a stable client id, the principal's subject id (the service-account user UUID, usable for RBAC bindings), the OAuth token endpoint, and the client secret. A taken client id **MUST** be rejected as invalid input without side effects — including a half-created principal left by an earlier ambiguous failure; recovery is revoke-then-create. After successful revocation, the principal **MUST** disappear from active listings; reusing the same name **MUST** create a distinct provider identity with a new credential.
 
+- **Realizes**: `cpt-cf-service-principal-fr-name-policy` (owning contract: service-principal PRD).
 - **Rationale**: Stable identity and explicit lifecycle outcomes prevent duplicate or accidentally resurrected machine credentials, and a name collision must never hand out another consumer's live secret.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-service-principal-consumer`
 
@@ -414,6 +415,7 @@ The final client id **MUST** be server-built as `svc-{tenant_id}-{name}`, where 
 
 Every service principal **MUST** be associated with exactly one tenant: the client carries the ownership marker (`cf.provisioning.tenant_id`), and its service-account user carries the `tenant_id` attribute and the configured service-principal subject type, so issued tokens identify the principal, its owning tenant, and the machine subject class through the realm's protocol mappers. Requested client scopes **MUST** be validated against the configured allowlist (empty allowlist = none attachable), and an allowlisted scope missing from the realm **MUST** fail cleanly with an operator-actionable message. A best-effort per-tenant quota (default 10) **MUST** bound creation; it is an operational guard, not a security boundary. Ownership **MUST** be enforced on every read and mutation: a principal that is absent or owned by another tenant is reported as not found, without distinguishing the two.
 
+- **Realizes**: `cpt-cf-service-principal-fr-scope-allowlist` and `cpt-cf-service-principal-fr-tenant-quota` (owning contract: service-principal PRD, which leaves both to the adapter).
 - **Rationale**: Explicit tenant ownership and authentication compatibility prevent cross-tenant machine access and cross-tenant existence disclosure.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-service-principal-consumer`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`, `cpt-cf-keycloak-idp-plugin-actor-keycloak`
 
@@ -430,7 +432,7 @@ Successful rotation **MUST** preserve the principal identity (client id, subject
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-list`
 
-Listing **MUST** return only principals owned by the requested tenant (prefix plus ownership-marker check enforced client-side over the provider's search results) and **MUST** omit credentials. The listing reports each principal's client id, enabled state, and attached client scopes as reported by the provider (including realm-default scopes). Cursor pagination and deterministic ordering for large principal sets are a p2 extension of the owning contract.
+Listing **MUST** return only principals owned by the requested tenant (prefix plus ownership-marker check enforced client-side over the provider's search results) and **MUST** omit credentials. The listing reports each principal's client id, enabled state, and attached client scopes as reported by the provider (including realm-default scopes). Listing is unpaginated by decision of the owning contract (service-principal PRD §4.2 places pagination out of scope); adding it would require an SPI change owned by the service-principal gear.
 
 - **Rationale**: A bounded query contract prevents cross-tenant disclosure; today's consumer population per tenant is small enough for unpaginated listing.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-service-principal-consumer`
@@ -522,7 +524,7 @@ The plugin **MUST** return a classified, redacted outcome for every supported ca
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-operational-metrics`
 
-The plugin **MUST** emit bounded-cardinality operational metrics (`keycloak_idp_plugin_*`): operation duration histograms, a failure counter labeled by operation and stable failure variant, token/credential refresh counters split by tier so Credential Store and Keycloak failures are separately attributable, credential-store write outcomes, metadata decode failures, orphan-compensation outcomes, and a bound-realms gauge. Every metric label **MUST** be a closed set except the realm label, which **MUST** be subject to a configurable cardinality cap (default 500) after which it is dropped with an observable warning. No metric **MUST** carry secrets or user profile values.
+The plugin **MUST** emit bounded-cardinality operational metrics (`keycloak_idp_plugin_*`): operation duration histograms, a failure counter labeled by operation and stable failure variant, token/credential refresh counters split by tier so Credential Store and Keycloak failures are separately attributable, credential-store write outcomes, metadata decode failures, orphan-compensation outcomes, and a bound-realms gauge. Every metric label **MUST** be a closed set except two: the realm label, which **MUST** be subject to a configurable cardinality cap (default 500) after which it is dropped with an observable warning; and `version_observed` on the metadata-decode counter, which carries the observed version string uncapped. No metric **MUST** carry secrets or user profile values.
 
 - **Rationale**: Bounded, stable-labeled metrics keep the operational surface alertable without cost or cardinality surprises.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-platform-operator`, `cpt-cf-keycloak-idp-plugin-actor-credstore`
@@ -617,7 +619,7 @@ When required dependencies meet their objectives, the plugin **MUST** support th
 
 | Quality category | Disposition | Product rationale or obligation |
 |------------------|-------------|---------------------------------|
-| Performance and capacity | Required here | V1 lifecycle latency and scan bounds are defined in §6.1. Service-principal listing capacity remains a p2 obligation. Owning gears carry public REST latency. |
+| Performance and capacity | Required here | V1 lifecycle latency and scan bounds are defined in §6.1. Service-principal listing is unpaginated by the owning contract's decision. Owning gears carry public REST latency. |
 | Reliability and availability | Required here | Failure classification, audit completeness, and availability recovery are defined in §6.1. |
 | Security and privacy | Required here and inherited | Tenant isolation, secret protection, and PII minimization are defined here; platform controls come from the Security Guidelines. |
 | Observability and operations | Required here | Releases must provide readiness, dependency-health, ambiguous-outcome, and audit signals plus operator alert guidance and a reconciliation runbook. |
@@ -711,7 +713,8 @@ When required dependencies meet their objectives, the plugin **MUST** support th
 - Later tenant and user operations route through the returned metadata.
 
 **Alternative Flows**:
-- **Realm missing or provider unreachable**: The plugin returns a classified clean failure without mutation.
+- **Realm missing**: The plugin returns a clean failure without mutation.
+- **Provider unreachable mid-saga**: A pre-saga probe failure is clean; a 5xx or transport failure on the existence check itself is reported ambiguous and blocks retry pending reconciliation.
 - **Admin user already bound elsewhere**: The plugin returns a stage-attributed ambiguous outcome for reconciliation without overwriting the binding.
 
 #### Adopt an Existing Tenant Realm
@@ -746,12 +749,12 @@ When required dependencies meet their objectives, the plugin **MUST** support th
 **Actor**: `cpt-cf-keycloak-idp-plugin-actor-account-management`
 
 **Preconditions**:
-- Account Management supplies valid `created` provisioning intent without a realm name.
+- Account Management supplies valid `created` provisioning intent: without a realm name for a child tenant, or with an explicit realm name for a root target.
 - The bootstrap admin has realm-creation authority.
 
 **Main Flow**:
 1. Account Management requests tenant provisioning with created-realm intent.
-2. The plugin probes `realm-{tenant_id}`: absent → creates it with the ownership marker and allowlisted operator defaults; already ours → adopts idempotently.
+2. The plugin probes the target realm (`realm-{tenant_id}` for a child tenant, the operator-supplied name for a root target): absent → creates it with the ownership marker and allowlisted operator defaults; already ours → adopts idempotently.
 3. The plugin creates the realm-admin client and grants it the least-privilege role set.
 4. The plugin places the realm-admin secret in the Credential Store under the templated reference before reporting success, then ensures the tenant group under the new realm admin.
 5. The plugin returns metadata carrying the realm binding and secret reference.
@@ -875,7 +878,7 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 ### V1 Acceptance
 
 - [ ] Account Management selects the plugin through its published catalogue instance and vendor/priority configuration; catalogue drift on restart fails initialization instead of silently rebinding.
-- [ ] Provisioning intent is parsed fail-closed: unknown modes and keys are rejected; absent mode defaults to shared; shared child tenants inherit the parent realm; created mode generates `realm-{tenant_id}` and rejects explicit realm names; adopted mode requires an existing empty realm.
+- [ ] Provisioning intent is parsed fail-closed: unknown modes and keys are rejected; absent mode defaults to shared; shared child tenants inherit the parent realm; created mode generates `realm-{tenant_id}` for child tenants and rejects an explicit realm name there, while a root target requires one; adopted mode requires an existing empty realm.
 - [ ] Metadata envelopes decode fail-closed (missing/unsupported version, malformed shape) with observable decode-failure metrics, and metadata from every version in the supported window remains readable for normal operations and hard deprovisioning.
 - [ ] Created-mode provisioning is replay-safe: a marked realm is adopted idempotently, a foreign realm is rejected cleanly, a lost create reconciles by re-probe, and the realm-admin secret lands in the Credential Store before success is reported.
 - [ ] Hard deprovisioning purges the tenant's service principals before boundary removal, deletes the tenant group, tears down created realms and their secrets on last-tenant retirement, and never deletes shared/adopted realms or other tenants' resources.
@@ -896,7 +899,6 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 - [ ] `update_user` implements the SDK contract (partial update semantics, immutable identity/tenant binding, duplicate/password-policy/not-found classification) and passes the provider contract suite.
 - [ ] A read-only realm authentication-profile verifier gates tenant binding on shared/adopted realms before promotion of profile verification.
 - [ ] A runtime provider-version gate fails affected operations deterministically on unsupported majors without preventing host startup.
-- [ ] Service-principal listing gains cursor pagination and deterministic ordering under the owning contract before large-population support is claimed.
 
 ## 10. Dependencies
 
@@ -907,7 +909,8 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 | Keycloak 26.x | Provides realm, group, user, session, client, and credential administration over Admin REST and OAuth token endpoints, reached directly over HTTPS. | p1 |
 | Credential Store | Holds adopted/created realm-admin secrets and the optional TLS CA bundle; written by the plugin for created realms under its stable system actor. | p1 |
 | types-registry | Hosts the provider catalogue instance; publication is a hard initialization prerequisite. | p1 |
-| service-principal-sdk | Platform-owned machine-identity contract implemented by this plugin and consumed by trusted platform modules. | p1 |
+| service-principal gear | Owns the machine-identity product (requirements, REST surface, authorization) and consumes this plugin as its registered `ServicePrincipalClientV1` adapter. See [service-principal PRD](../../../../service-principal/docs/PRD.md). | p1 |
+| service-principal-sdk | Platform-owned machine-identity contract implemented by this plugin. | p1 |
 | OIDC AuthN Resolver Plugin | Validates Keycloak-issued tokens offline and consumes the claims projected by the realm mappers. It does not manage sessions or check per-identity revocation state. | p1 |
 | Operator realm bootstrap / IaC | Provisions shared/adopted realms, their authentication profile and protocol mappers, admin clients and secrets, and service-principal realm scopes. | p1 |
 | RBAC / Policy Engine | Makes authorization decisions outside this plugin, including the plugin system actor's Credential Store grants. | p1 |
@@ -938,7 +941,7 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 | The plugin's init-time provider dependency breaks deployment ordering. | Host initialization fails when Keycloak is slow to become ready. | Bounded, tunable pre-warm budget with fast-bail on permanent errors; `enabled: false` escape hatch. |
 | Tenant-group membership grows past the scan cap. | Listings truncate (loudly) and hide the tail. | Hard-cap warning as the operational signal; realm-wide attribute-query evolution before larger populations are supported. |
 | An access JWT remains valid after user or tenant hard deprovisioning. | Access can continue until token expiry. | Limit v1 access-token lifetime to 15 minutes, revoke provider sessions, block refresh, and document the bounded exposure. |
-| Metric realm-label cardinality explodes in large fleets. | Metrics backend overload. | Configurable cardinality cap with label drop and a one-shot warning naming the tripping realm. |
+| Metric realm-label cardinality explodes in large fleets. | Metrics backend overload. | Configurable cardinality cap with label drop and a warning naming the tripping realm on every over-cap observation. |
 
 ## 13. Open Questions
 
@@ -951,14 +954,14 @@ The following questions gate only p2 promotion:
 | 1 | When is `update_user` promoted, and does it adopt JSON Merge Patch semantics end to end? | Determines profile-editing support through this provider. | Account Management Owner and Plugin Owner | Before user-update DESIGN |
 | 2 | Should realm authentication-profile verification become a plugin-side runtime gate, and what profile format does the operator publish for it? | Determines whether misconfigured realms fail binding deterministically. | Platform Architect and Plugin Owner | Before profile-verifier DESIGN |
 | 3 | Does a runtime Keycloak version gate replace release-time qualification as the compatibility guarantee? | Determines unsupported-version failure behavior. | Plugin Owner | Before compatibility-gate DESIGN |
-| 4 | What pagination, ordering, and quota semantics does service-principal listing adopt for large tenants? | Determines p2 listing and capacity tests. | Service-Principal Owner and Performance Architect | Before service-principal listing DESIGN |
-| 5 | Will a future authentication component enforce real-time token revocation? | Determines whether any future release can promise rejection before JWT expiry. | Security Architect and AuthN Owner | Before real-time revocation requirements are added |
+| 4 | Will a future authentication component enforce real-time token revocation? | Determines whether any future release can promise rejection before JWT expiry. | Security Architect and AuthN Owner | Before real-time revocation requirements are added |
 
 ## 14. Traceability
 
 - **Parent PRD**: [Account Management PRD](../../../docs/PRD.md)
 - **Identity Provider SDK**: [`idp.rs`](../../../account-management-sdk/src/idp.rs) and [`idp_user.rs`](../../../account-management-sdk/src/idp_user.rs)
 - **Service-Principal SDK**: [`service-principal-sdk`](../../../../service-principal/service-principal-sdk/src/api.rs)
+- **Service-Principal product (owning contract)**: [PRD](../../../../service-principal/docs/PRD.md) and [DESIGN](../../../../service-principal/docs/DESIGN.md)
 - **Implementation**: [`plugins/keycloak-idp-plugin`](../src/lib.rs) (crate `cf-gears-keycloak-idp-plugin`)
 - **OIDC AuthN contract**: [OIDC AuthN Resolver Plugin PRD](../../../../authn-resolver/plugins/oidc-authn-plugin/docs/PRD.md)
 - **Realm-strategy relationship**: V1 supports explicit `shared` (default, parent-inherited for children), `adopted`, and `created` provisioning intent with fail-closed parsing.

@@ -30,6 +30,7 @@ use uuid::Uuid;
 use crate::config::{RealmAdminConfig, TenantFacadeConfig};
 use crate::domain::audit;
 use crate::domain::credstore::CredStoreWriter;
+use crate::domain::error::redact_secrets;
 use crate::domain::error::{AmbiguousStage, KcStatusKind, PluginError};
 use crate::domain::kc::KcAdminClient;
 use crate::domain::kc::factory::{KeycloakAdminClientFactory, SecretSource};
@@ -956,7 +957,7 @@ impl TenantFacade {
             .raw_request("DELETE", url, None, path_template)
             .await
             .map_err(deprovision_translate_kc)?;
-        Ok((status, truncate_2kb(&body)))
+        Ok((status, redact_secrets(&truncate_2kb(&body))))
     }
 
     /// Decode `provisioning_metadata` and derive the EFFECTIVE realm from the
@@ -1530,7 +1531,7 @@ impl TenantFacade {
                 method: "GET",
                 path_template: "/admin/realms/{realm}".into(),
                 status: KcStatusKind::Http(status),
-                body_first_2kb: truncate_2kb(&body),
+                body_first_2kb: redact_secrets(&truncate_2kb(&body)),
             })
         }
     }
@@ -1627,7 +1628,7 @@ impl TenantFacade {
                 stage: AmbiguousStage::KcRealmCreate,
                 detail: format!(
                     "kc:POST /admin/realms -> {status}: {}",
-                    truncate_2kb(&body_text),
+                    redact_secrets(&truncate_2kb(&body_text)),
                 ),
             });
         }
@@ -1676,7 +1677,7 @@ impl TenantFacade {
                 stage: AmbiguousStage::KcClientCreate,
                 detail: format!(
                     "kc:POST /admin/realms/{{realm}}/clients -> {status}: {}",
-                    truncate_2kb(&body_text),
+                    redact_secrets(&truncate_2kb(&body_text)),
                 ),
             });
         }
@@ -1761,7 +1762,7 @@ impl TenantFacade {
                 stage: AmbiguousStage::KcRoleMapping,
                 detail: format!(
                     "kc:POST /admin/realms/{{realm}}/users/{{user_uuid}}/role-mappings/clients/{{rm_uuid}} -> {status}: {}",
-                    truncate_2kb(&body_text),
+                    redact_secrets(&truncate_2kb(&body_text)),
                 ),
             });
         }
@@ -1794,7 +1795,7 @@ impl TenantFacade {
                 stage,
                 detail: format!(
                     "kc:GET /admin/realms/{{realm}}/clients -> {status}: {}",
-                    truncate_2kb(&body_text),
+                    redact_secrets(&truncate_2kb(&body_text)),
                 ),
             });
         }
@@ -1845,7 +1846,7 @@ impl TenantFacade {
                 stage: AmbiguousStage::KcRoleMapping,
                 detail: format!(
                     "kc:GET /admin/realms/{{realm}}/clients/{{client_uuid}}/service-account-user -> {status}: {}",
-                    truncate_2kb(&body_text),
+                    redact_secrets(&truncate_2kb(&body_text)),
                 ),
             });
         }
@@ -1887,7 +1888,7 @@ impl TenantFacade {
                 stage: AmbiguousStage::KcRoleMapping,
                 detail: format!(
                     "kc:GET /admin/realms/{{realm}}/users/{{user_uuid}}/role-mappings/clients/{{rm_uuid}}/available -> {status}: {}",
-                    truncate_2kb(&body_text),
+                    redact_secrets(&truncate_2kb(&body_text)),
                 ),
             });
         }
@@ -1931,7 +1932,7 @@ impl TenantFacade {
                 stage: AmbiguousStage::KcClientSecretRead,
                 detail: format!(
                     "kc:GET /admin/realms/{{realm}}/clients/{{client_uuid}}/client-secret -> {status}: {}",
-                    truncate_2kb(&body_text),
+                    redact_secrets(&truncate_2kb(&body_text)),
                 ),
             });
         }
@@ -1981,7 +1982,7 @@ impl TenantFacade {
                 method: "GET",
                 path_template: "/admin/realms/{realm}".into(),
                 status: KcStatusKind::Http(status),
-                body_first_2kb: truncate_2kb(&body),
+                body_first_2kb: redact_secrets(&truncate_2kb(&body)),
             })
         }
     }
@@ -2057,7 +2058,7 @@ impl TenantFacade {
                 method: "GET",
                 path_template: "/admin/realms/{realm}/users/{user_uuid}".into(),
                 status: KcStatusKind::Http(401),
-                body_first_2kb: truncate_2kb(&get_body),
+                body_first_2kb: redact_secrets(&truncate_2kb(&get_body)),
             });
         }
         if !(200..=299).contains(&get_status) {
@@ -2071,7 +2072,7 @@ impl TenantFacade {
                 stage: AmbiguousStage::AdminUserBind,
                 detail: format!(
                     "kc:GET /admin/realms/{{realm}}/users/{{user_uuid}} -> {get_status}: {}",
-                    truncate_2kb(&get_body),
+                    redact_secrets(&truncate_2kb(&get_body)),
                 ),
             });
         }
@@ -2197,7 +2198,7 @@ impl TenantFacade {
                 method: "PUT",
                 path_template: "/admin/realms/{realm}/users/{user_uuid}".into(),
                 status: KcStatusKind::Http(401),
-                body_first_2kb: truncate_2kb(&put_body),
+                body_first_2kb: redact_secrets(&truncate_2kb(&put_body)),
             });
         }
         if !(200..=299).contains(&put_status) {
@@ -2205,7 +2206,7 @@ impl TenantFacade {
                 stage: AmbiguousStage::AdminUserBind,
                 detail: format!(
                     "kc:PUT /admin/realms/{{realm}}/users/{{user_uuid}} -> {put_status}: {}",
-                    truncate_2kb(&put_body),
+                    redact_secrets(&truncate_2kb(&put_body)),
                 ),
             });
         }
@@ -2284,7 +2285,7 @@ impl TenantFacade {
                     method: "GET",
                     path_template: "/admin/realms/{realm}/groups/{parent_uuid}/children".into(),
                     status: KcStatusKind::Http(lookup_status),
-                    body_first_2kb: truncate_2kb(&lookup_body),
+                    body_first_2kb: redact_secrets(&truncate_2kb(&lookup_body)),
                 });
             }
             let groups: Vec<GroupRep> =
@@ -2313,7 +2314,7 @@ impl TenantFacade {
                 status: KcStatusKind::Http(status),
                 body_first_2kb: format!(
                     "409 conflict but subgroup not found in parent listing: {}",
-                    truncate_2kb(&body_text),
+                    redact_secrets(&truncate_2kb(&body_text)),
                 ),
             });
         }
@@ -2322,7 +2323,7 @@ impl TenantFacade {
             method: "POST",
             path_template: "/admin/realms/{realm}/groups/{parent_uuid}/children".into(),
             status: KcStatusKind::Http(status),
-            body_first_2kb: truncate_2kb(&body_text),
+            body_first_2kb: redact_secrets(&truncate_2kb(&body_text)),
         })
     }
 
@@ -2346,7 +2347,7 @@ impl TenantFacade {
                 method: "GET",
                 path_template: "/admin/realms/{realm}/groups".into(),
                 status: KcStatusKind::Http(status),
-                body_first_2kb: truncate_2kb(&body_text),
+                body_first_2kb: redact_secrets(&truncate_2kb(&body_text)),
             });
         }
 
@@ -2397,7 +2398,7 @@ impl TenantFacade {
                 method: "POST",
                 path_template: "/admin/realms/{realm}/groups".into(),
                 status: KcStatusKind::Http(status),
-                body_first_2kb: truncate_2kb(&body_text),
+                body_first_2kb: redact_secrets(&truncate_2kb(&body_text)),
             });
         }
 
@@ -2414,7 +2415,7 @@ impl TenantFacade {
                 method: "GET",
                 path_template: "/admin/realms/{realm}/groups".into(),
                 status: KcStatusKind::Http(lookup_status),
-                body_first_2kb: truncate_2kb(&lookup_body),
+                body_first_2kb: redact_secrets(&truncate_2kb(&lookup_body)),
             });
         }
         let post_create: Vec<GroupRep> =
@@ -2476,7 +2477,7 @@ impl TenantFacade {
                 method: "GET",
                 path_template: "/admin/realms/{realm}/groups".into(),
                 status: KcStatusKind::Http(status),
-                body_first_2kb: truncate_2kb(&body_text),
+                body_first_2kb: redact_secrets(&truncate_2kb(&body_text)),
             });
         }
         let groups: Vec<GroupRep> =
@@ -2537,7 +2538,7 @@ impl TenantFacade {
                 method: "GET",
                 path_template: "/admin/realms/{realm}/groups/{parent_uuid}/children".into(),
                 status: KcStatusKind::Http(status),
-                body_first_2kb: truncate_2kb(&body_text),
+                body_first_2kb: redact_secrets(&truncate_2kb(&body_text)),
             });
         }
         let children: Vec<GroupRep> =

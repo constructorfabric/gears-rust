@@ -189,7 +189,7 @@ Unsupported operations (`update_user`, unsupported filters) return typed `Unsupp
 
 - [ ] `p3` - **ID**: `cpt-cf-keycloak-idp-plugin-principle-least-privilege`
 
-Realm-scoped work uses a per-realm admin client granted exactly seven `realm-management` roles (`view-realm`, `view-clients`, `query-groups`, `manage-realm`, `manage-users`, `query-users`, `manage-clients`). The bootstrap admin is used only where realm-level authority is required: realm existence probes, created-realm lifecycle, and service-principal client administration.
+Realm-scoped work uses a per-realm admin client granted exactly seven `realm-management` roles (`view-realm`, `view-clients`, `query-groups`, `manage-realm`, `manage-users`, `query-users`, `manage-clients`). The bootstrap admin is used only where realm-level authority is required: realm existence probes, created-realm lifecycle, service-principal client administration, and the tenant-group emptiness and sibling probes on adopted and created realms — which is why the bootstrap client also needs `query-groups` on those realms.
 
 #### Privacy-preserving evidence
 
@@ -357,7 +357,7 @@ Contract invariants implemented at the boundary (`idp_impl.rs`, `sp_impl.rs`):
 - tenant deprovisioning maps `DeprovisionNotFound` → `NotFound` (success-equivalent), `DeprovisionRetryable` → `Retryable`, and everything else — including metadata decode failures — → `Terminal`;
 - user failures use only `IdpUserOperationFailure` variants: KC 409 on create is `DuplicateUser` with the field refined from the provider message (`Username`/`Email`/`UsernameOrEmail`), password-policy rejections are `PasswordPolicy`, unsupported filters and the unimplemented `update_user` are `UnsupportedOperation`, provider/transport trouble is `Unavailable`;
 - service-principal failures use the closed `ServicePrincipalFailure` set: `InvalidInput` (bad name, disallowed scope, quota, taken client id), `NotFound` (absent or foreign principal — indistinguishable by design), `Ambiguous` (stage-attributed transport uncertainty; stage tokens tabulated in §3.6), `CleanFailure` (pre-mutation failures);
-- every mutating return carries redacted, truncated, grep-friendly detail (`kc:{METHOD} {path_template} -> {status}: {body≤2KiB}` or `internal:{component}: …`).
+- every mutating return carries redacted, truncated, grep-friendly detail: provider failures use `kc:{METHOD} {path_template} -> {status}: {body≤2KiB}`, internal component failures `internal:{component}: …`, and classified domain rejections a stable variant prefix (`ambig:{stage}: …`, `deprovision retryable: …`, `sp invalid input: …`, and so on).
 
 The plugin emits no public HTTP API.
 
@@ -455,7 +455,7 @@ User operations resolve realm, admin client, and tenant group from replayed meta
 
 Ordering: local metadata resolution → service-principal purge → tenant-group deletion → (created-mode only) last-tenant realm teardown → Credential Store secret deletion.
 
-- Missing metadata or an undecodable-but-absent blob returns `NotFound` (success-equivalent) with an `already_absent` audit event and a trigger metric when invoked by the AM system actor; a malformed blob is `Terminal`.
+- Missing metadata returns `NotFound` (success-equivalent) with an `already_absent` audit event and a trigger metric when invoked by the AM system actor. A blob that decodes to no metadata is also `NotFound` but records only the failure counter (the branch is unreachable in practice). A malformed blob is `Terminal`.
 - A pre-saga health-probe failure is `Retryable` — nothing was attempted.
 - The service-principal purge deletes every `svc-{tenant_id}-*` client owned by the tenant (ownership marker checked client-side); purge failures classify to `Retryable` (retryable provider status or staged ambiguity) or `Terminal` (permanent provider rejection) and abort the saga so no live machine credential survives its tenant.
 - Tenant-group deletion treats 404/410 as `NotFound`; other failures are `Retryable`.
@@ -502,7 +502,7 @@ All Keycloak traffic authenticates with OAuth2 `client_credentials`. Secrets res
 
 Service-principal administration always uses the bootstrap admin tier, against the dedicated service-principal realm (`service_principal.realm`, default `platform` — the shared realm whose issuer tenants trust), independent of any tenant's realm binding.
 
-Tokens are cached per `(realm, client_id)` with an expiry safety margin (default 30 s, floor 5 s), single-flight refresh (one concurrent mint per key), and read-time eviction. A 401 on any wrapped call invalidates the cache entry, re-resolves the secret from its source, and retries exactly once — so operator secret rotation converges without restart. Cache hits emit no metrics; real refreshes emit `credential_refresh_total` and `kc_admin_token_refresh_total` separately so "Credential Store unreachable" and "Keycloak rejected the secret" are distinguishable.
+Tokens are cached per `(realm, client_id)` with a configurable expiry safety margin (default 30 s) and a 5 s floor on the resulting cache TTL, single-flight refresh (one concurrent mint per key), and read-time eviction. A 401 on any wrapped call invalidates the cache entry, re-resolves the secret from its source, and retries exactly once — so operator secret rotation converges without restart. Cache hits emit no metrics; real refreshes emit `credential_refresh_total` and `kc_admin_token_refresh_total` separately so "Credential Store unreachable" and "Keycloak rejected the secret" are distinguishable.
 
 Optional TLS: `tls_ca_bundle_ref` names a Credential Store secret holding a PEM CA bundle added to the reqwest trust roots at init; otherwise the system trust store applies.
 
@@ -526,9 +526,9 @@ sequenceDiagram
   AM->>A: Durably correlate terminal outcome
 ```
 
-The plugin emits structured events on the `keycloak_idp.events` tracing target — `tenant.bound`, `realm.created`, `admin_user.bound`, `tenant.unbound`, `realm.removed`, `service_principals.purged`, `user.provisioned` (includes `username`), `user.deprovisioned` — each carrying the acting subject (id, closed-set type, raw type, tenant). This is an explicit development stand-in until the platform audit sink lands; durable one-outcome-per-call correlation is owned by Account Management and the platform audit owner. `list_users` and the service-principal read/mutate paths emit no plugin audit events of their own; the only service-principal audit signal is `service_principals.purged` on tenant deprovisioning.
+The plugin emits structured events on the `keycloak_idp.events` tracing target — `tenant.bound`, `realm.created`, `admin_user.bound`, `tenant.unbound`, `realm.removed`, `service_principals.purged`, `user.provisioned` (includes `username`), `user.deprovisioned` — each carrying the acting subject (id, closed-set type, raw type, tenant). `user.deprovisioned` is emitted on every successful `deprovision_user` return, including the non-mutating cross-tenant-guard and already-absent paths, and its `already_absent` field is currently always `false`. This is an explicit development stand-in until the platform audit sink lands; durable one-outcome-per-call correlation is owned by Account Management and the platform audit owner. `list_users` and the service-principal read/mutate paths emit no plugin audit events of their own; the only service-principal audit signal is `service_principals.purged` on tenant deprovisioning.
 
-Metrics: `keycloak_idp_plugin_provision_tenant_duration_seconds`, `user_op_duration_seconds`, `sp_op_duration_seconds`, `kc_admin_request_duration_seconds` (declared, not yet wired), `failure_total{op,failure_variant}`, `kc_admin_token_refresh_total` and `credential_refresh_total` (`{outcome,tier,realm}`), `credstore_write_total`, `metadata_decode_failure_total{version_observed}`, `deprovision_missing_metadata_total`, `orphan_user_compensation_total`, `realms_bound{realm_binding,realm_name}`. Every label is a closed enum except `realm`/`realm_name`, which share a cardinality budget (default 500 distinct realms) after which the label is dropped and a warning is logged for each newly observed over-cap realm.
+Metrics: `keycloak_idp_plugin_provision_tenant_duration_seconds`, `user_op_duration_seconds`, `sp_op_duration_seconds`, `kc_admin_request_duration_seconds` (declared, not yet wired), `failure_total{op,failure_variant}`, `kc_admin_token_refresh_total` and `credential_refresh_total` (`{outcome,tier,realm}`), `credstore_write_total`, `metadata_decode_failure_total{version_observed}`, `deprovision_missing_metadata_total`, `orphan_user_compensation_total`, `realms_bound{realm_binding,realm_name}`. Every label is a closed enum except `version_observed` (an uncapped observed version string) and `realm`/`realm_name`, which share a cardinality budget (default 500 distinct realms) after which the label is dropped and a warning is logged on every observation of an over-cap realm.
 
 Operational signals: the reconciliation gate consumes `failure_total{failure_variant="ambiguous_created"}` and the `ambig:{stage}` warn events; dependency-health attribution splits `credential_refresh_total{outcome="error"}` (Credential Store) from `kc_admin_token_refresh_total{outcome="error"}` (Keycloak) plus `credstore_write_total{outcome="error"}`; metadata integrity consumes `metadata_decode_failure_total` (any increase is operator-actionable); list capacity consumes the drain-cap truncation warning. Alert thresholds against the PRD availability and latency targets are owned by the deployment repository's monitoring configuration, not by this design.
 
@@ -561,7 +561,7 @@ Not applicable: the plugin owns no database schema, table, migration, audit stor
 
 Secret custody: the bootstrap and shared-realm admin secrets enter the process through `${VAR}` config expansion into redacted wrapper types; adopted/created realm secrets and the optional CA bundle live in the Credential Store; created-realm secrets are generated by Keycloak, read back once per provisioning, and stored under the templated reference with tenant sharing. Cached tokens are `SecretString`s with redacted debug output. Metadata envelopes carry reference names, never values.
 
-The plugin's system actor identity (`VP_IDP_PLUGIN_ACTOR_UUID`) must remain stable across releases — created-realm secret ownership in the Credential Store is keyed to it.
+The plugin's system actor identity (`KEYCLOAK_IDP_PLUGIN_ACTOR_UUID`) must remain stable across releases — created-realm secret ownership in the Credential Store is keyed to it.
 
 Keycloak is the sole user directory. The plugin holds request data only for the operation lifetime. Hard user deprovisioning deletes the provider identity; created-realm teardown removes the realm and its secret. Audit events use provider IDs, with `username` additionally present on `user.provisioned`.
 
@@ -603,6 +603,7 @@ The release-qualification query matrix for the PRD latency NFR covers unfiltered
 - [`IdpPluginClient` tenant contract](../../../account-management-sdk/src/idp.rs)
 - [`IdpPluginClient` user contract](../../../account-management-sdk/src/idp_user.rs)
 - [`ServicePrincipalClientV1` contract](../../../../service-principal/service-principal-sdk/src/api.rs)
+- [Service-principal product PRD](../../../../service-principal/docs/PRD.md) and [DESIGN](../../../../service-principal/docs/DESIGN.md) — the owning contract for machine identities; this plugin is its registered adapter
 - [Unified ToolKit architecture](../../../../../../docs/toolkit_unified_system/README.md)
 - Implementation: [`plugins/keycloak-idp-plugin`](../src/lib.rs) (crate `cf-gears-keycloak-idp-plugin`)
 
