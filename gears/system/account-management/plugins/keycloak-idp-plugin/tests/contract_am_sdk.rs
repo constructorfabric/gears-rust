@@ -32,6 +32,6 @@
 #[test]
 fn placeholder_until_am_sdk_conformance_harness_lands() {
     // No-op test to ensure the file compiles and is discovered by
-    // `cargo test -p vp-idp-plugin`. Replace with the wired
+    // `cargo test -p cf-gears-keycloak-idp-plugin`. Replace with the wired
     // conformance call when the upstream harness is published.
 }
