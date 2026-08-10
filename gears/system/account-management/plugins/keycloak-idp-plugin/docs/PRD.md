@@ -165,10 +165,10 @@ flowchart LR
 ### 3.1 Gear-Specific Environment Constraints
 
 - The deployment must provide a reachable Keycloak administration surface and the bootstrap admin client credentials. When the plugin is enabled, module initialization pre-warms the bootstrap admin token with a bounded retry budget and fails host initialization if the budget is exhausted; deployments that must start without Keycloak disable the plugin (`enabled: false`).
-- Operator realm bootstrap must provision the authentication profile of shared and adopted realms: required clients, client scopes, the `tenant_id`/`user_type` usermodel-attribute protocol mappers, signing/session/token policy, and the realm-admin client with its secret.
+- Operator realm bootstrap must provision the authentication profile of shared and adopted realms: required clients, client scopes, the protocol mappers that project the `tenant_id` and `user_type` claims, signing/session/token policy, and the realm-admin client with its secret.
 - Account Management must provide the tenant context and replayed provider-owned metadata required to route existing-tenant operations.
 - The Credential Store must be available for operations that resolve adopted/created realm-admin secrets, for created-realm provisioning and teardown, and at initialization when a TLS CA bundle reference is configured.
-- The deployment must select one unambiguous active provider (Account Management `idp.vendor` matching the plugin's configured vendor, default `virtuozzo`). Changing that provider while tenant metadata exists requires an explicit operator migration.
+- The deployment must select one unambiguous active provider. Account Management's `idp.vendor` defaults to `cf`, which selects the built-in static echo plugin — it **MUST** be explicitly set to this plugin's configured vendor (default `virtuozzo`); otherwise Account Management selects another provider or, with `idp.required = false`, silently falls back to the no-op provider without any error from this plugin. Changing the provider while tenant metadata exists requires an explicit operator migration.
 
 ## 4. Scope
 
@@ -316,7 +316,7 @@ Tenant deprovisioning **MUST** delete every service-principal client owned by th
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-tenant-user-access-termination`
 
-Account Management does not invoke this plugin for tenant suspension or soft deletion, so those transitions **MUST NOT** be presented as plugin-enforced access termination. Human identities are removed through per-user `deprovision_user` calls issued by Account Management's hard-delete pipeline before the tenant boundary is retired; tenant deprovisioning itself removes the boundary (group, service principals, and — for created bindings — the realm). `IdpDeprovisionFailure::Retryable` applies to failures where nothing was attempted (pre-saga probe failure) or where the failed step is safe to repeat; a malformed metadata blob or an unclassifiable purge failure **MUST** return `Terminal` for operator action. An access JWT issued before hard deprovisioning can remain valid until its `exp`, which **MUST NOT** exceed 15 minutes in the operator's v1 authentication profile.
+Account Management does not invoke this plugin for tenant suspension or soft deletion, so those transitions **MUST NOT** be presented as plugin-enforced access termination. Human identities are removed through per-user `deprovision_user` calls issued by Account Management's hard-delete pipeline before the tenant boundary is retired; tenant deprovisioning itself removes the boundary (group, service principals, and — for created bindings — the realm). Failure classification for the deprovisioning saga follows `cpt-cf-keycloak-idp-plugin-fr-tenant-failure-contract`. An access JWT issued before hard deprovisioning can remain valid until its `exp`, bounded per `cpt-cf-keycloak-idp-plugin-fr-offline-token-lifetime`.
 
 - **Rationale**: This contract matches Account Management's hard-deletion pipeline and the OIDC resolver's offline JWT model without promising an unavailable suspension or real-time revocation path.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-keycloak`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`
@@ -363,7 +363,7 @@ When user update is implemented, the plugin **MUST** distinguish an absent user,
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-user-deprovision`
 
-Before any mutation, user deprovisioning **MUST** verify that the target user's stored `tenant_id` attribute matches the resolved tenant; a mismatch **MUST** perform no mutation and **MUST** return success-equivalently without disclosing whether the identity exists (the cross-tenant deletion guard). It then revokes provider sessions (best-effort, configurable, default on) and deletes the identity. An already-absent provider identity (404/410) **MUST** produce a success-equivalent outcome. The plugin **MUST NOT** claim that it invalidates a previously issued access JWT; such a token can remain valid until its `exp`, which **MUST NOT** exceed 15 minutes in the operator's v1 authentication profile.
+Before any mutation, user deprovisioning **MUST** verify that the target user's stored `tenant_id` attribute matches the resolved tenant; a mismatch **MUST** perform no mutation and **MUST** return success-equivalently without disclosing whether the identity exists (the cross-tenant deletion guard). It then revokes provider sessions (best-effort, configurable, default on) and deletes the identity. An already-absent provider identity (404/410) **MUST** produce a success-equivalent outcome. The plugin **MUST NOT** claim that it invalidates a previously issued access JWT; such a token can remain valid until its `exp`, bounded per `cpt-cf-keycloak-idp-plugin-fr-offline-token-lifetime`.
 
 - **Rationale**: Deprovisioning blocks refresh and new provider sessions, stays idempotent, and cannot be used to delete another tenant's identity.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-tenant-admin`, `cpt-cf-keycloak-idp-plugin-actor-account-management`
@@ -372,7 +372,7 @@ Before any mutation, user deprovisioning **MUST** verify that the target user's 
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-user-query`
 
-The plugin **MUST** list only users belonging to the resolved tenant group. The supported filter surface is `eq` (exact) and `contains` (case-insensitive) over `username`, `email`, `first_name`, `last_name`, and `display_name`, an `id` point filter, and `and`/`or` composition; unsupported filter shapes **MUST** return `UnsupportedOperation` before any provider call. Results are globally sorted on `(created_at ASC, id ASC)` with the provider id as tiebreaker; requested orderings are not honored in this revision. Continuation **MUST** use a `CursorV1` token that pins the sort order, direction, last-emitted key, and a hash of the tenant, realm, and complete filter tree, so a cursor replayed with a different filter or tenant context is rejected as invalid. Page size **MUST** be capped (default cap 200). The per-request membership scan **MUST** be bounded by a hard cap (10,000 members); exceeding the cap truncates the scan and emits a loud operational warning rather than failing or silently hiding members.
+The plugin **MUST** list only users belonging to the resolved tenant group. The supported filter surface is `eq` (exact) and `contains` (case-insensitive) over `username`, `email`, `first_name`, `last_name`, and `display_name`, an `id` point filter, and `and`/`or` composition; unsupported filter shapes **MUST** return `UnsupportedOperation` before any provider call. Results are globally sorted on `(created_at ASC, id ASC)` with the provider id as tiebreaker; requested orderings are not honored in this revision. Continuation **MUST** use a `CursorV1` token that pins the sort order, direction, last-emitted key, and a hash of the tenant, realm, and complete filter tree, so a cursor replayed with a different filter or tenant context is rejected as invalid. One bounded exception applies: cursors minted by the immediately preceding release **MUST** remain accepted during a rolling-deploy grace window under that release's weaker validation scope (tenant and id-filter only) until in-flight pagination drains, after which the fallback is retired (mechanism in [DESIGN §3.6](./DESIGN.md#36-interactions--sequences)). Page size **MUST** be capped (default cap 200). The per-request membership scan **MUST** be bounded by a hard cap (10,000 members); exceeding the cap truncates the scan and emits a loud operational warning rather than failing or silently hiding members.
 
 - **Rationale**: Tenant administration and downstream membership checks need stable, correctly ordered queries without cross-tenant disclosure, with explicit and observable capacity bounds.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-tenant-admin`, `cpt-cf-keycloak-idp-plugin-actor-account-management`
@@ -477,7 +477,7 @@ The plugin **MUST** classify every failed service-principal call into the closed
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-administrator-credentials`
 
-The plugin **MUST** administer Keycloak through two confidential-client tiers with `client_credentials` grants: an operator-provisioned bootstrap admin (default `vp-idp-plugin-bootstrap` in `master`) for realm-level work, and a per-realm realm admin (default `vp-idp-plugin-realm-admin`) for tenant/user work. Realm-admin clients created by the plugin (created mode) **MUST** be granted exactly the least-privilege role set (`view-realm`, `view-clients`, `query-groups`, `manage-realm`, `manage-users`, `query-users`, `manage-clients`). Secrets **MUST** enter the process only through environment-expanded configuration (bootstrap, default shared realm) or the Credential Store (adopted/created realms), always inside redacted wrapper types. Operator secret rotation **MUST** converge without process restart: a provider 401 invalidates the cached token, re-resolves the secret from its source, and retries exactly once. Cached tokens **MUST** be redacted from all debug output.
+The plugin **MUST** administer Keycloak through two confidential-client tiers with `client_credentials` grants: an operator-provisioned bootstrap admin (default `vp-idp-plugin-bootstrap` in `master`) for realm-level work, and a per-realm realm admin (default `vp-idp-plugin-realm-admin`) for tenant/user work. Realm-admin clients created by the plugin (created mode) **MUST** be granted exactly the least-privilege role set (`view-realm`, `view-clients`, `query-groups`, `manage-realm`, `manage-users`, `query-users`, `manage-clients`). Secrets **MUST** enter the process only through environment-expanded configuration (bootstrap, default shared realm) or the Credential Store (adopted/created realms). Operator secret rotation **MUST** converge without process restart. Administrator secrets and cached tokens **MUST NOT** appear in any log, metric, or debug output (mechanism in [DESIGN §3.6](./DESIGN.md#36-interactions--sequences)).
 
 - **Rationale**: Provider administrator compromise can affect every identity in the authorized realm; tiered least privilege, typed secret custody, and reactive rotation bound that risk.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-platform-operator`, `cpt-cf-keycloak-idp-plugin-actor-keycloak`, `cpt-cf-keycloak-idp-plugin-actor-credstore`
@@ -486,7 +486,7 @@ The plugin **MUST** administer Keycloak through two confidential-client tiers wi
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-external-mutation-resilience`
 
-Automatic transport retry **MUST** be bounded (configurable policy; default 3 retries, exponential backoff with full jitter, `Retry-After` honored) and restricted to idempotent requests on retryable causes (provider 5xx/429, connect/timeout); administrative `POST`s **MUST NOT** be replayed on transport failure. Tenant provisioning **MUST** preserve the SDK distinction between clean and ambiguous outcomes and **MUST** stop automatic retry after an ambiguous result. User operations **MUST** return only outcomes exposed by `IdpUserOperationFailure`; the plugin **MUST NOT** invent an ambiguity variant. Repeated user deprovisioning remains idempotent, and provider diagnostics **MUST** be redacted and truncated before leaving the plugin.
+Automatic retry **MUST** be bounded by a configurable policy, and a request whose outcome is unknown (transport loss) **MUST NOT** be replayed unless it is idempotent; in particular, administrative `POST`s are never replayed on transport failure (retry mechanics in [DESIGN §3.6](./DESIGN.md#36-interactions--sequences)). Tenant provisioning **MUST** preserve the SDK distinction between clean and ambiguous outcomes and **MUST** stop automatic retry after an ambiguous result. User operations **MUST** return only outcomes exposed by `IdpUserOperationFailure`; the plugin **MUST NOT** invent an ambiguity variant. Repeated user deprovisioning remains idempotent, and provider diagnostics **MUST** be redacted and truncated before leaving the plugin.
 
 - **Rationale**: Unbounded or unsafe retry can duplicate resources, leak realms, or invalidate credentials.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-platform-operator`, `cpt-cf-keycloak-idp-plugin-actor-keycloak`, `cpt-cf-keycloak-idp-plugin-actor-credstore`
@@ -495,7 +495,7 @@ Automatic transport retry **MUST** be bounded (configurable policy; default 3 re
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-operator-reconciliation`
 
-For v1, ambiguous-state reconciliation **MUST** be an operator-owned workflow rather than a public mutation API. The plugin **MUST** provide sufficient non-secret evidence — the machine-parsable `ambig:{stage}` token (realm create, client create, role mapping, secret read, credential-store write, admin-user bind, scope attach, secret rotate, client delete, timeout), the realm, and redacted provider detail — to determine resource ownership and whether the mutation completed. The workflow **MUST** end in one audited outcome: compensated and safe to retry, accepted as complete, still blocked for further investigation, or escalated for controlled cleanup. Production enablement **MUST** include a reconciliation runbook keyed on the stage tokens.
+For v1, ambiguous-state reconciliation **MUST** be an operator-owned workflow rather than a public mutation API. The plugin **MUST** provide sufficient non-secret evidence — the machine-parsable `ambig:{stage}` token (realm create, client create, role mapping, secret read, credential-store write, admin-user bind, service-account attribute set, scope attach, secret rotate, client delete, timeout), the realm, and redacted provider detail — to determine resource ownership and whether the mutation completed. The workflow **MUST** end in one audited outcome: compensated and safe to retry, accepted as complete, still blocked for further investigation, or escalated for controlled cleanup. Production enablement **MUST** include a reconciliation runbook keyed on the stage tokens.
 
 - **Rationale**: Operators need a safe resolution path even where current contracts cannot automatically distinguish an orphan from an already-clean resource.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-platform-operator`, `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-keycloak`, `cpt-cf-keycloak-idp-plugin-actor-credstore`
@@ -509,14 +509,23 @@ The operator's v1 realm authentication profile **MUST** limit access-token lifet
 - **Rationale**: This bounded exposure matches the OIDC resolver's offline JWT validation contract and its explicit exclusion of session and revocation management.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-authn-resolver`, `cpt-cf-keycloak-idp-plugin-actor-keycloak`
 
-#### Audit and Metrics
+#### Audit Evidence
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-audit-metrics`
 
-The plugin **MUST** return a classified, redacted outcome for every supported call and **MUST** emit structured audit events on the dedicated `vp.idp.plugin.events` tracing target for every mutating tenant and user lifecycle transition: `tenant.bound`, `realm.created`, `admin_user.bound`, `tenant.unbound`, `realm.removed`, `service_principals.purged`, `user.provisioned`, and `user.deprovisioned`, each carrying the acting subject (id, classified type, raw type, tenant) and provider identifiers. `user.provisioned` additionally records the username as operational evidence; no event carries secrets, passwords, tokens, or raw provider bodies. These emitters are a development stand-in: Account Management and the platform audit owner **MUST** create and durably deliver the terminal audit outcome for each mutating plugin call before production enablement. The plugin **MUST** emit bounded-cardinality operational metrics (`vp_idp_plugin_*`): operation duration histograms, a failure counter labeled by operation and stable failure variant, token/credential refresh counters split by tier, credential-store write outcomes, metadata decode failures, orphan-compensation outcomes, and a bound-realms gauge — with the realm label subject to a configurable cardinality cap (default 500) after which it is dropped with a warning.
+The plugin **MUST** return a classified, redacted outcome for every supported call and **MUST** emit structured audit events on the dedicated `vp.idp.plugin.events` tracing target for every mutating tenant and user lifecycle transition: `tenant.bound`, `realm.created`, `admin_user.bound`, `tenant.unbound`, `realm.removed`, `service_principals.purged`, `user.provisioned`, and `user.deprovisioned`, each carrying the acting subject (id, classified type, raw type, tenant) and provider identifiers. `user.provisioned` additionally records the username as operational evidence; no event carries secrets, passwords, tokens, or raw provider bodies. These emitters are a development stand-in: Account Management and the platform audit owner **MUST** create and durably deliver the terminal audit outcome for each mutating plugin call before production enablement.
 
-- **Rationale**: A single owner for each durable record prevents duplicate or missing audit events while preserving plugin-level diagnostic evidence with bounded cost.
-- **Actors**: `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`, `cpt-cf-keycloak-idp-plugin-actor-credstore`
+- **Rationale**: A single owner for each durable record prevents duplicate or missing audit events while preserving plugin-level diagnostic evidence.
+- **Actors**: `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`
+
+#### Operational Metrics
+
+- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-operational-metrics`
+
+The plugin **MUST** emit bounded-cardinality operational metrics (`vp_idp_plugin_*`): operation duration histograms, a failure counter labeled by operation and stable failure variant, token/credential refresh counters split by tier so Credential Store and Keycloak failures are separately attributable, credential-store write outcomes, metadata decode failures, orphan-compensation outcomes, and a bound-realms gauge. Every metric label **MUST** be a closed set except the realm label, which **MUST** be subject to a configurable cardinality cap (default 500) after which it is dropped with an observable warning. No metric **MUST** carry secrets or user profile values.
+
+- **Rationale**: Bounded, stable-labeled metrics keep the operational surface alertable without cost or cardinality surprises.
+- **Actors**: `cpt-cf-keycloak-idp-plugin-actor-platform-operator`, `cpt-cf-keycloak-idp-plugin-actor-credstore`
 
 ## 6. Non-Functional Requirements
 
@@ -538,7 +547,7 @@ The plugin **MUST** prevent an operation resolved for one tenant from reading or
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-nfr-secret-nondisclosure`
 
-The plugin **MUST** prevent administrator tokens, administrator secrets, user passwords, and service-principal secrets from appearing in logs, metrics, audit events, list responses, or debug output. Concretely: secrets live in redacted wrapper types, the token cache redacts its debug output, and every provider error body passes secret-pattern redaction plus 2 KiB truncation before leaving the plugin.
+The plugin **MUST** prevent administrator tokens, administrator secrets, user passwords, and service-principal secrets from appearing in logs, metrics, audit events, list responses, or debug output. Provider diagnostics **MUST** be redacted and size-bounded before leaving the plugin (mechanism in [DESIGN §4.1](./DESIGN.md#41-security-and-data-protection)).
 
 - **Threshold**: Zero secret values detected by automated redaction tests and security scanning across all named output surfaces.
 - **Rationale**: These credentials can grant user or machine access across a tenant or realm.
@@ -548,7 +557,7 @@ The plugin **MUST** prevent administrator tokens, administrator secrets, user pa
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-nfr-lifecycle-latency`
 
-On the release qualification profile, shared-realm tenant provisioning **MUST** complete within 5 seconds at p95; created-realm provisioning within 10 seconds at p95. User creation, deprovisioning, and a full query page **MUST** each complete within 1 second at p95. The profile **MUST** use 20 concurrent operations, an operator-equivalent Keycloak 26.x node backed by PostgreSQL, at most 5 ms network round-trip time between the plugin and Keycloak, and up to 1,000 human identities, enabled or disabled, in one tenant group. Query runs **MUST** cover unfiltered results and filters matching approximately 100%, 10%, and 1% of the group, over cached-token and forced-token-refresh runs. Operational bounds enforced by the implementation and validated by the profile: per-request provider timeout (default 5 s), bounded retry policy, 30 s saga timeout, caller page size capped at 200, and the 10,000-member scan hard cap with loud truncation.
+On the release qualification profile, shared-realm tenant provisioning **MUST** complete within 5 seconds at p95; created-realm provisioning within 10 seconds at p95. User creation, deprovisioning, and a full query page **MUST** each complete within 1 second at p95. The profile **MUST** use 20 concurrent operations, an operator-equivalent Keycloak 26.x node backed by PostgreSQL, at most 5 ms network round-trip time between the plugin and Keycloak, and up to 1,000 human identities, enabled or disabled, in one tenant group. The query run matrix (filter-selectivity mix and token-cache states) is defined in [DESIGN §4.2](./DESIGN.md#42-verification-architecture). Operational bounds enforced by the implementation and validated by the profile: per-request provider timeout, bounded retry policy, saga timeout, caller page size cap, and the membership-scan hard cap with loud truncation (values in [DESIGN §§2.2, 3.6](./DESIGN.md#22-constraints)).
 
 - **Threshold**: Shared provisioning p95 ≤ 5 s; created provisioning p95 ≤ 10 s; each named user operation p95 ≤ 1 s; 20 concurrent operations; scan cap 10,000 members per tenant group with observable truncation.
 - **Rationale**: A fixed population, topology, filter mix, and bound set make the linear-scan acceptance test reproducible.
@@ -743,8 +752,8 @@ When required dependencies meet their objectives, the plugin **MUST** support th
 **Main Flow**:
 1. Account Management requests tenant provisioning with created-realm intent.
 2. The plugin probes `realm-{tenant_id}`: absent → creates it with the ownership marker and allowlisted operator defaults; already ours → adopts idempotently.
-3. The plugin creates the realm-admin client, grants the least-privilege role set, and reads back the generated secret.
-4. The plugin stores the secret in the Credential Store under the templated reference (point of no return), then ensures the tenant group under the new realm admin.
+3. The plugin creates the realm-admin client and grants it the least-privilege role set.
+4. The plugin places the realm-admin secret in the Credential Store under the templated reference before reporting success, then ensures the tenant group under the new realm admin.
 5. The plugin returns metadata carrying the realm binding and secret reference.
 
 **Postconditions**:
@@ -849,7 +858,7 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 - Automatic retries for the affected resource are blocked.
 
 **Main Flow**:
-1. The operator follows the reconciliation runbook, keyed on the stage token (realm create, client create, role mapping, secret read, credential-store write, admin-user bind, scope attach, secret rotate, client delete, timeout).
+1. The operator follows the reconciliation runbook, keyed on the stage token (realm create, client create, role mapping, secret read, credential-store write, admin-user bind, service-account attribute set, scope attach, secret rotate, client delete, timeout).
 2. The operator reviews non-secret evidence (stage, realm, redacted provider detail) to determine resource and ownership state.
 3. The operator applies an approved resolution and records the terminal outcome.
 
@@ -910,6 +919,7 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 - Account Management's hard-delete pipeline deprovisions a tenant's users before invoking tenant deprovisioning.
 - Operators provision the shared/adopted realms, their authentication profile (including the `tenant_id`/`user_type` mappers and 15-minute access-token lifetime), the bootstrap admin client, and the shared-realm admin secret they own.
 - Deployment ordering makes Keycloak's token endpoint reachable within the plugin's init pre-warm budget, or the plugin is disabled for that deployment.
+- Deployments explicitly set `account-management.idp.vendor` to this plugin's vendor; Account Management's default (`cf`) selects the static echo plugin, and misselection is silent.
 - Provider-owned metadata is persisted and replayed opaquely by Account Management.
 - The OIDC AuthN Resolver validates access tokens offline and does not depend on current per-identity revocation state.
 - Service-principal consumers are trusted platform modules that authorize their own callers and take immediate durable custody of returned credentials.
@@ -922,7 +932,7 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 | An external mutation completes after the caller loses the response. | Duplicate or orphaned identity resources or credentials. | Idempotent replay paths (realm ensure re-probe, group 409 reuse), stage-attributed ambiguous outcomes, no blind retry, reconciliation runbook. |
 | Administrator credentials grant broader access than required. | Compromise can affect unrelated tenants or realms. | Two-tier admin model, exact least-privilege role grants on created realms, typed secret custody, rotation convergence, and secret non-disclosure tests. |
 | Provider metadata becomes unreadable after upgrade or rollback. | Existing tenants cannot be administered or retired safely. | Versioned fail-closed envelope, decode-failure metrics, and compatibility coverage for supported upgrade paths. |
-| The Credential Store write fails after created-realm Keycloak state exists. | Realm exists without retrievable admin credentials. | Explicit `ambig:openbao_put_after_kc_success` stage, reconciliation runbook, replayable provisioning that overwrites the secret last-writer-wins. |
+| The Credential Store write fails after created-realm Keycloak state exists. | Realm exists without retrievable admin credentials. | A dedicated ambiguity stage token for the post-provider secret-write window, the reconciliation runbook, and replay-safe provisioning that restores the stored secret. |
 | A service principal survives tenant retirement. | Machine access remains active after tenant deletion. | Purge barrier ordered before boundary teardown; purge failure aborts deprovisioning with retryable/terminal classification. |
 | Keycloak 26.x administration behavior changes across releases. | Lifecycle operations fail or produce different outcomes. | Qualify every supported 26.x release before publication; p2 runtime version gate. |
 | The plugin's init-time provider dependency breaks deployment ordering. | Host initialization fails when Keycloak is slow to become ready. | Bounded, tunable pre-warm budget with fast-bail on permanent errors; `enabled: false` escape hatch. |
