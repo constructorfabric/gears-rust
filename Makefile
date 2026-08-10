@@ -294,8 +294,6 @@ lint:
 
 ## Validate GTS identifiers in .md and .json files (DE0903)
 # Uses gts-validator binary (install via: cargo install gts-validator)
-# docs/arch/ui-composition/ is excluded: it documents the FrontX frontend
-# ecosystem, whose GTS identifiers carry the external `frontx` vendor.
 
 gts-docs:
 	$(call check_tool,gts-validator)
@@ -304,7 +302,6 @@ gts-docs:
 		--exclude "target/*" \
 		--exclude "docs/api/*" \
 		--exclude "docs/web-docs/*" \
-		--exclude "docs/arch/ui-composition/*" \
 		--exclude "gears/chat-engine/*" \
 		--exclude "**/helm/*/templates/*" \
 		docs gears libs examples
