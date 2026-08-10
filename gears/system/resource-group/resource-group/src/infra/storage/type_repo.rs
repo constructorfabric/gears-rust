@@ -522,10 +522,11 @@ impl TypeRepositoryTrait for TypeRepository {
     /// Batch replacement for a removed-allowed-parent-types sweep -- see the
     /// trait doc comment for the full rationale (N+1 audit finding (b)).
     ///
-    /// Three queries regardless of how many `parent_codes` are checked:
-    /// resolve every candidate path to its surrogate id, load every group
-    /// of `child_type_id` once, then batch-match those groups' actual
-    /// parents against every candidate parent-type id at once.
+    /// A constant number of queries regardless of how many `parent_codes`
+    /// are checked: resolve every candidate path to its surrogate id, load
+    /// the groups whose parent is of a candidate type -- the database
+    /// decides which, so only actual violations are read -- then resolve
+    /// those parents' types for the message.
     async fn find_groups_violating_removed_parents<C: DBRunner>(
         &self,
         db: &C,
