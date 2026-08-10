@@ -22,7 +22,7 @@ Created: 2026-08-07 by Constructor Studio
   - [3.8 Deployment Topology](#38-deployment-topology)
 - [4. Additional Context](#4-additional-context)
   - [4.1 Failure Taxonomy and Wire Safety](#41-failure-taxonomy-and-wire-safety)
-  - [4.2 Operation-Key Reconciliation](#42-operation-key-reconciliation)
+  - [4.2 Ambiguous Outcome Handling](#42-ambiguous-outcome-handling)
   - [4.3 Configuration](#43-configuration)
   - [4.4 Security and Data Protection](#44-security-and-data-protection)
   - [4.5 Auditability and Observability](#45-auditability-and-observability)
@@ -34,24 +34,44 @@ Created: 2026-08-07 by Constructor Studio
   - [4.11 Explicit Non-Applicability](#411-explicit-non-applicability)
 - [5. Traceability](#5-traceability)
   - [Requirement Allocation Summary](#requirement-allocation-summary)
+- [Appendix A: Decision Rationale](#appendix-a-decision-rationale)
+  - [No by-id read on the item path](#no-by-id-read-on-the-item-path)
+  - [409 for ambiguous outcomes](#409-for-ambiguous-outcomes)
+  - [Supersession of pre-port drafts](#supersession-of-pre-port-drafts)
 
 <!-- /toc -->
 
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-design-provider-neutral-lifecycle`
+- [ ] `p1` - **ID**: `cpt-cf-service-principal-design-provider-neutral-facade`
 
 ## 1. Architecture Overview
 
 ### 1.1 Architectural Vision
 
-Service Principal is a stateless system gear for managing tenant-owned machine identities. It exposes stable REST and Rust contracts for create, list, rotate, and revoke. It authenticates and authorizes every request for an explicit tenant, applies provider-neutral policy, delegates to one configured identity-provider adapter, and maps the result to safe public responses.
+Service Principal is a stateless system gear that exposes create, list, rotate-secret, and revoke
+operations for tenant-owned machine identities (confidential OAuth 2.0 `client_credentials`
+clients). It is a thin authenticated REST facade: it holds no database and starts no background
+work. Its only logic is authorization and error mapping.
 
-The identity provider remains authoritative for principals, credentials, verifier material, and token issuance. The adapter owns any durable state needed to reconcile create or rotation after an uncertain provider result. Service Principal owns no principal database, operation repository, cleanup record, lease, retry scheduler, or background worker.
+Per request the gear acts as the local Policy Enforcement Point (PEP). It asks the platform's
+Policy Decision Point (PDP), the `authz-resolver` gear, for a decision and a tenant-scoped
+constraint through `authz_resolver_sdk::pep::PolicyEnforcer`, verifies that the returned scope
+actually covers the explicit target tenant, and only then resolves the registered
+`ServicePrincipalClientV1` provider adapter lazily from the `toolkit::ClientHub` and delegates.
+The provider adapter is not shipped in this repository; it is a pluggable implementation a
+deployment registers.
 
-Create and rotate require a caller-generated operation key. Service Principal validates and forwards the opaque key and canonical request identity. A repeated identical request with the same key is the only public reconciliation path. There is no recovery-status API, server-generated operation identifier, or public reconciliation handle. Plaintext credentials are returned only by a confirmed create or rotation response and are never persisted or replayed.
+The identity provider behind the adapter is authoritative for principal existence, credentials,
+and token issuance. The adapter enforces name syntax, the scope allowlist, and a best-effort
+per-tenant quota; Service Principal performs no independent validation of those fields before
+delegating. The adapter's four-category failure taxonomy
+(`InvalidInput`/`NotFound`/`CleanFailure`/`Ambiguous`) is mapped, together with the gear's own
+`AccessDenied` and `ProviderUnavailable` outcomes, onto canonical RFC-9457 problem responses at
+the REST boundary. An ambiguous provider outcome is surfaced as its own distinct failure; the gear
+performs no idempotency-key or operation-key based reconciliation of it.
 
-Tenant cleanup is part of the identity-provider tenant-deprovision contract, not the Service Principal API. The tenant lifecycle owner retains durable deprovision state and retries the whole operation after transient failure. The provider adapter deletes only principals authoritatively owned by the target tenant and returns success only after confirming that none remain.
-
-This multi-owner design is shown explicitly in the component and sequence diagrams. The diagrams are warranted because request authorization, provider reconciliation, and tenant cleanup have different state and retry owners.
+The component and sequence diagrams in this document are warranted because create, list, rotate,
+and revoke each cross three independent trust boundaries — the caller, the PDP, and the pluggable
+provider — and the diagrams make that boundary crossing explicit.
 
 ### 1.2 Architecture Drivers
 
@@ -59,90 +79,74 @@ This multi-owner design is shown explicitly in the component and sequence diagra
 
 | Requirement | Design Response |
 |-------------|-----------------|
-| `cpt-cf-service-principal-fr-create` | The application service authorizes the explicit tenant and delegates a keyed create to the provider adapter. |
-| `cpt-cf-service-principal-fr-client-credentials-only` | The provider contract accepts only confidential `client_credentials` identity requests. |
-| `cpt-cf-service-principal-fr-identity-context` | Provider conformance verifies tenant, subject, and service identity in issued tokens. |
-| `cpt-cf-service-principal-fr-name-policy` | Typed configuration supplies bounded name rules checked before provider invocation. |
-| `cpt-cf-service-principal-fr-scope-allowlist` | The application service rejects scopes outside the deployment allowlist. |
-| `cpt-cf-service-principal-fr-tenant-quota` | Provider-owned inventory supplies the observed count for best-effort quota checks. |
-| `cpt-cf-service-principal-fr-create-collision` | A collision is invalid input; create never adopts or modifies the occupied principal. |
-| `cpt-cf-service-principal-fr-list` | Listing delegates after tenant authorization and returns provider-authoritative summaries. |
-| `cpt-cf-service-principal-fr-secret-free-listing` | Summary models have no secret field and are distinct from credential models. |
-| `cpt-cf-service-principal-fr-ownership-addressing` | Item operations use `(tenant_id, client_id)` and do not distinguish foreign from absent principals publicly. |
-| `cpt-cf-service-principal-fr-rotate-secret` | Keyed rotation returns one transient credential result after confirmed invalidation. |
-| `cpt-cf-service-principal-fr-rotate-complete-state` | The adapter verifies tenant ownership and managed state before rotation. |
-| `cpt-cf-service-principal-fr-revoke` | Revocation uses a tenant-qualified provider address and confirms deletion or absence. |
-| `cpt-cf-service-principal-fr-revoke-idempotent` | Provider not-found is success-equivalent for revoke. |
-| `cpt-cf-service-principal-fr-authenticated-management` | REST routes are authenticated and Rust operations require `SecurityContext`. |
-| `cpt-cf-service-principal-fr-independent-permissions` | GTS permissions define create, read, rotate-secret, and revoke independently. |
-| `cpt-cf-service-principal-fr-tenant-authorization` | `PolicyEnforcer` evaluates the target tenant and the service verifies covering constraints. |
-| `cpt-cf-service-principal-fr-authz-fail-closed` | Missing identity, denial, evaluation failure, or mismatched constraints prevents provider access. |
-| `cpt-cf-service-principal-fr-provider-delegation` | A major-versioned provider SDK isolates provider-specific behavior. |
-| `cpt-cf-service-principal-fr-provider-required` | Missing provider registration maps to provider unavailable; success is never simulated. |
-| `cpt-cf-service-principal-fr-failure-categories` | Adapter outcomes map to the closed public taxonomy and canonical errors. |
-| `cpt-cf-service-principal-fr-ambiguous-create-recovery` | Same-key create retries reconcile in the adapter before any further mutation. |
-| `cpt-cf-service-principal-fr-ambiguous-rotate-recovery` | Same-key rotation retries reconcile; lost credentials are replaced by a new confirmed rotation. |
-| `cpt-cf-service-principal-fr-ambiguous-revoke-recovery` | Revoke remains safely repeatable until deletion or absence is confirmed. |
-| `cpt-cf-service-principal-fr-tenant-cleanup` | The identity-provider tenant-deprovision path performs cleanup while the lifecycle owner retains retry state. |
+| `cpt-cf-service-principal-fr-create` | `Service::create` authorizes the `create` action for the explicit tenant, then delegates to `ServicePrincipalClientV1::create`; the REST handler returns `201 Created` with `Location` and `Cache-Control: no-store`. |
+| `cpt-cf-service-principal-fr-client-credentials-only` | The SDK request/response models (`CreateServicePrincipalRequest`, `ServicePrincipalCredentials`) carry no field for an interactive or session-based flow. |
+| `cpt-cf-service-principal-fr-identity-context` | `CreateServicePrincipalRequest.tenant_id` is forwarded to the adapter; `ServicePrincipalCredentials.subject_id` returns the adapter-assigned subject. |
+| `cpt-cf-service-principal-fr-name-policy` | The gear forwards `name` unmodified; the registered adapter enforces bounded syntax and reports a violation as `ServicePrincipalFailure::InvalidInput`. |
+| `cpt-cf-service-principal-fr-scope-allowlist` | The gear forwards `scopes` unmodified; the registered adapter enforces its deployment-controlled allowlist and reports a violation as `InvalidInput`. |
+| `cpt-cf-service-principal-fr-tenant-quota` | The registered adapter may apply a best-effort maximum-per-tenant check; `Service` performs no counting of its own. |
+| `cpt-cf-service-principal-fr-create-collision` | A taken client identifier is reported by the adapter as `InvalidInput`; `Service` never resumes or modifies an existing principal. |
+| `cpt-cf-service-principal-fr-list` | `Service::list` authorizes `read` and returns `ServicePrincipalSummary` values in the adapter's own order; the REST handler wraps them in `ListServicePrincipalsResponseDto`. |
+| `cpt-cf-service-principal-fr-secret-free-listing` | `ServicePrincipalSummary` and `ServicePrincipalSummaryDto` declare no secret field. |
+| `cpt-cf-service-principal-fr-ownership-addressing` | `rotate_secret` and `revoke` take `(tenant_id, client_id)`; the adapter returns `NotFound` for an id that does not resolve within that tenant, without revealing whether it exists under another tenant. |
+| `cpt-cf-service-principal-fr-rotate-secret` | `Service::rotate_secret` authorizes `rotate_secret` and returns one new `ServicePrincipalCredentials`; the REST handler returns `200 OK` with `Cache-Control: no-store`. |
+| `cpt-cf-service-principal-fr-rotate-complete-state` | An unresolved `client_id` at rotation time is mapped from the adapter's `NotFound` to a `404` canonical problem, never a success. |
+| `cpt-cf-service-principal-fr-revoke` | `Service::revoke` authorizes `revoke`, delegates to `ServicePrincipalClientV1::revoke`, and the REST handler returns `204 No Content` carrying no body. |
+| `cpt-cf-service-principal-fr-revoke-idempotent` | `Service::revoke` maps both `Ok(())` and `ServicePrincipalFailure::NotFound` to success before any error conversion. |
+| `cpt-cf-service-principal-fr-authenticated-management` | All four `OperationBuilder` routes call `.authenticated()`; every handler takes a `SecurityContext` extension. |
+| `cpt-cf-service-principal-fr-independent-permissions` | `gts::permissions` declares four `AuthzPermissionV1` instances (`create`, `read`, `rotate_secret`, `revoke`) against the service-principal resource type. |
+| `cpt-cf-service-principal-fr-tenant-authorization` | `Service::authorize` builds an `AccessRequest` with `OWNER_TENANT_ID` and `require_constraints(true)`, then `authz::ensure_scope_permits` checks the returned `AccessScope` against the explicit tenant. |
+| `cpt-cf-service-principal-fr-authz-fail-closed` | `authz::map_enforcer_err` maps `Denied` and `CompileFailed` to `AccessDenied`, and `EvaluationFailed` to `Upstream`; no branch defaults to allow. |
+| `cpt-cf-service-principal-fr-provider-delegation` | Every lifecycle call goes through the versioned `ServicePrincipalClientV1` trait, resolved by `hub.get::<dyn ServicePrincipalClientV1>()`. |
+| `cpt-cf-service-principal-fr-provider-required` | `Service::sp_client` maps a `ClientHub` resolution failure to `DomainError::ProviderUnavailable` (`503`), logging the underlying `ClientHubError` rather than simulating success. |
+| `cpt-cf-service-principal-fr-failure-categories` | `From<ServicePrincipalFailure> for DomainError` and `From<DomainError> for CanonicalError` together render a distinct, machine-readable problem for each of the six outcomes. |
+| `cpt-cf-service-principal-fr-ambiguous-outcome-signaling` | `DomainError::Ambiguous` maps to `409 Aborted` with reason `AMBIGUOUS_OUTCOME`, distinct from the `503` used for `Upstream`/`ProviderUnavailable`. |
 
 #### NFR Allocation
 
-| NFR ID | Allocated To | Design Response | Verification Approach |
-|--------|--------------|-----------------|----------------------|
-| `cpt-cf-service-principal-nfr-secret-confidentiality` | Credential models, REST adapter, logging policy | Credential responses are non-cacheable and secret values are absent from all other contracts. | Secret-negative unit, route, conformance, and E2E tests |
-| `cpt-cf-service-principal-nfr-data-classification` | SDK models, adapter contract, audit boundary | Contract fields are classified; human profile fields are excluded. | Contract inspection and security review |
-| `cpt-cf-service-principal-nfr-no-secret-persistence` | Stateless service and adapter conformance | Service Principal persists nothing; adapters never retain credential responses for replay. | State-boundary inspection and secret-negative tests |
-| `cpt-cf-service-principal-nfr-tenant-isolation` | Authorization gate and provider adapter | PDP constraints cover the target tenant and provider addressing is tenant-qualified. | Cross-tenant security suite |
-| `cpt-cf-service-principal-nfr-credential-invalidation` | Provider adapter | Rotation and revoke success require superseded credentials to stop working. | Provider conformance and E2E tests |
-| `cpt-cf-service-principal-nfr-provider-conformance` | Provider SDK and conformance harness | Every adapter runs common lifecycle, ownership, reconciliation, and credential checks. | Mandatory adapter suite |
-| `cpt-cf-service-principal-nfr-contract-compatibility` | REST V1 and Rust V1 contracts | Breaking route, model, identifier, or category changes require a new major version. | API and SDK compatibility checks |
-| `cpt-cf-service-principal-nfr-auditability` | Service, adapter, and tenant lifecycle owner | Each layer records the facts it owns under shared correlation and tenant identity. | Layered audit-completeness tests |
-| `cpt-cf-service-principal-nfr-observability` | Service, adapter, and tenant lifecycle owner | API, reconciliation, and cleanup signals remain separated and correlatable. | Telemetry integration tests |
-| `cpt-cf-service-principal-nfr-stateless-recovery` | Provider adapter contract | Adapter reconciliation survives restart; Service Principal owns no durable state. | Restart and same-key retry tests |
-| `cpt-cf-service-principal-nfr-cleanup-reliability` | Tenant lifecycle owner and identity-provider integration | Lifecycle state survives restart and teardown remains blocked until zero principals are confirmed. | Deprovision retry and terminal-failure tests |
-| `cpt-cf-service-principal-nfr-performance-baseline` | Benchmark harness | Release evidence supplies measured objectives instead of invented values. | Versioned benchmark report |
-| `cpt-cf-service-principal-nfr-operational-documentation` | OpenAPI and operator guidance | Guidance covers secret handoff, same-key retry, rotation recovery, cleanup ownership, and alerts. | Release-readiness inspection |
+| NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
+|--------|-------------|--------------|-----------------|----------------------|
+| `cpt-cf-service-principal-nfr-secret-confidentiality` | No secret in listings, `Debug`, or cacheable responses | `ServicePrincipalCredentials`, `ServicePrincipalCredentialsDto`, REST handlers | `client_secret` is a `secrecy::SecretString`; the DTO hand-writes a redacting `Debug`; `create`/`rotate_secret` handlers set `Cache-Control: no-store`. | `dto_tests::credentials_debug_redacts_secret`; `models.rs::credentials_debug_hides_secret`; router `no-store` assertions |
+| `cpt-cf-service-principal-nfr-data-classification` | Restricted-vs-sensitive field classification | SDK models, DTOs | The secret is a redacting, non-`Serialize` wrapper; client id, subject id, tenant id, and scopes are plain fields carrying no human profile data. | Contract inspection; redaction tests |
+| `cpt-cf-service-principal-nfr-no-secret-persistence` | No gear-owned persistence of secrets or state | `domain::service::Service` | `Service` holds only a `PolicyEnforcer` and an `Arc<ClientHub>`; the crate declares no database or storage dependency. | Cargo.toml dependency inspection; `#[domain_model]` compile-time check |
+| `cpt-cf-service-principal-nfr-tenant-isolation` | No cross-tenant management success | `domain::authz` | `ensure_scope_permits` denies unless the PDP scope is unconstrained or explicitly covers the target tenant UUID. | `domain/authz.rs` unit tests; `service_tests::create_for_a_different_tenant_than_the_pdp_scope_is_access_denied` |
+| `cpt-cf-service-principal-nfr-stateless-recovery` | No authoritative state carried across requests | `ServicePrincipalGear`, `Service` | The gear declares no database, migration, or worker dependency in `Cargo.toml`; every field the `Service` holds is re-usable, not per-request state. | Dependency-graph inspection |
+| `cpt-cf-service-principal-nfr-contract-compatibility` | Explicit major-version markers | REST paths, `ServicePrincipalClientV1` | REST paths embed `v1`; the SDK crate name and trait carry `V1`; a breaking change requires a new major surface. | Route and SDK naming inspection |
+
+#### Key ADRs
+
+No ADR artifact exists for this gear. The body sections state the resulting architecture directly;
+the rationale behind three of those facts is recorded non-normatively in
+[Appendix A](#appendix-a-decision-rationale).
 
 ### 1.3 Architecture Layers
 
 ```mermaid
 graph TB
-    Caller[Administrator or Consuming Gear]
+    Caller[Tenant Automation Administrator or Consuming Gear]
     REST[REST and OpenAPI Adapter]
-    Local[Public Rust Local Client]
     Service[Stateless Application Service]
     AuthZ[Authorization Gate]
-    Provider[Provider Adapter Contract]
-    AdapterState[Adapter-Private Reconciliation State]
-    OAGW[Outbound API Gateway]
+    Hub[ClientHub]
+    SPI[Provider Adapter - ServicePrincipalClientV1]
     IdP[Identity Provider]
-    Lifecycle[Tenant Lifecycle Owner]
-    Audit[Layered Audit and Observability]
 
     Caller --> REST
-    Caller --> Local
     REST --> Service
-    Local --> Service
     Service --> AuthZ
-    Service --> Provider
-    Provider --> AdapterState
-    Provider --> OAGW
-    OAGW --> IdP
-    Lifecycle -->|tenant deprovision| Provider
-    Service --> Audit
-    Provider --> Audit
-    Lifecycle --> Audit
+    Service --> Hub
+    Hub --> SPI
+    SPI --> IdP
 ```
 
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-tech-layered-control-plane`
+- [ ] `p3` - **ID**: `cpt-cf-service-principal-tech-layered-facade`
 
 | Layer | Responsibility | Technology |
-|-------|----------------|------------|
-| Presentation | Authenticated routing, DTO conversion, `Idempotency-Key`, non-cacheable credential responses, canonical errors | Axum, `OperationBuilder`, OpenAPI |
-| Application | Validation, explicit-tenant authorization, provider delegation, public outcome mapping | Rust domain service, `PolicyEnforcer`, ClientHub |
-| Domain | Stable lifecycle models, operation-key binding, failure semantics | Rust SDK and domain models |
-| Provider integration | Provider protocol, authoritative state access, restart-safe reconciliation, tenant purge implementation | Provider adapter, adapter-private state, OAGW |
-| Tenant lifecycle | Durable deprovision operation, cleanup retry scheduling, terminal disposition | Tenant lifecycle contract and owner |
+|-------|-----------------|------------|
+| Presentation | Authenticated routing, DTO conversion, `Location`/`Cache-Control: no-store` headers, RFC-9457 rendering | `axum`, `toolkit::api::OperationBuilder`, OpenAPI |
+| Application | Explicit-tenant authorization, provider delegation, outcome mapping | `domain::service::Service`, `authz_resolver_sdk::pep::PolicyEnforcer` |
+| Domain | Domain error model, PEP resource type, permission catalog | `domain::error::DomainError`, `domain::authz`, `gts::permissions` |
+| Infrastructure | Transport-neutral SDK models and the pluggable provider contract, resolved through `ClientHub` | `service-principal-sdk`, `toolkit::ClientHub` |
 
 ## 2. Principles & Constraints
 
@@ -152,31 +156,42 @@ graph TB
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-principle-provider-authority`
 
-The identity provider is the sole authority for principal existence, credentials, verifier material, and token behavior. Service Principal does not copy provider inventory or retain reconciliation state.
+The registered identity-provider adapter is the sole authority for principal existence,
+credentials, and token issuance. Service Principal copies no provider inventory and retains no
+provider state between requests.
 
-#### One-Time Secret Boundary
+#### One-Time Secret Disclosure
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-principle-one-time-secret`
 
-Plaintext credentials cross the public boundary only after confirmed create or rotation. Lost credentials are replaced through a new rotation and are never retrieved or replayed.
+A plaintext client secret crosses the public boundary only in the response body of a successful
+`create` or `rotate_secret` call. It is never returned by `list`, and a lost secret is recovered
+only through a new rotation.
 
 #### Authorize the Explicit Tenant
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-principle-explicit-tenant-authorization`
 
-Every public request and same-key retry re-authenticates and authorizes its explicit target tenant before provider access. Prior authorization stored by another component never substitutes for the current decision.
+Every request re-authenticates and re-authorizes its explicit target tenant against the PDP
+before any provider delegation. A PDP decision that is `true` for a different tenant or a wider
+subtree never substitutes for a check against the requested tenant.
 
-#### Stateless Recovery Boundary
+#### Delegated Validation, Delegated Reconciliation
 
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-principle-safe-recovery`
+- [ ] `p1` - **ID**: `cpt-cf-service-principal-principle-delegated-validation`
 
-Service Principal forwards operation identity but owns no recovery execution. The adapter reconciles create and rotation before mutation. Revoke converges through repeated tenant-qualified deletion. Tenant cleanup converges through lifecycle-owned deprovision retries.
+Name syntax, scope allowlisting, and per-tenant quota are enforced entirely by the registered
+provider adapter. Service Principal performs no independent validation of those fields and
+performs no automatic recovery when the adapter reports an ambiguous outcome; recovery is left to
+the caller.
 
 #### Stable Contracts, Replaceable Providers
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-principle-versioned-contracts`
 
-Public and provider contracts are major-versioned and provider-neutral. Unknown result categories are always non-success and behave as ambiguous when mutation cannot be ruled out.
+The REST surface and the `ServicePrincipalClientV1` trait are each versioned, so a conforming
+provider adapter can be substituted without changing callers, and a breaking change to either
+surface requires a new major version.
 
 ### 2.2 Constraints
 
@@ -184,192 +199,172 @@ Public and provider contracts are major-versioned and provider-neutral. Unknown 
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-constraint-single-provider`
 
-The initial design resolves one provider adapter for the deployment. Selection does not vary by tenant or request. Missing registration is an explicit provider-unavailable failure.
+Exactly one `ServicePrincipalClientV1` implementation is resolved from the `ClientHub` per
+deployment. Selection does not vary by tenant or by request. No adapter implementation ships in
+this repository.
 
 #### No Distributed Transaction
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-constraint-no-distributed-transaction`
 
-Service Principal and the external identity provider do not share a transaction. Mutation uncertainty is represented by the adapter outcome and reconciled under the same operation key.
+Service Principal and the registered provider do not share a transaction. Transport uncertainty is
+reported by the adapter as `ServicePrincipalFailure::Ambiguous` and surfaced to the caller as a
+distinct `409` outcome; the gear applies no retry or reconciliation logic of its own.
 
-#### Provider Capability Floor
+#### No Adapter Conformance Harness
 
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-constraint-provider-capabilities`
+- [ ] `p2` - **ID**: `cpt-cf-service-principal-constraint-no-conformance-harness`
 
-A conforming adapter supports confidential client credentials, tenant-qualified ownership, immediate invalidation, collision detection, restart-safe keyed reconciliation, safe failure classification, and authoritative tenant-principal cleanup through the tenant-deprovision integration.
+This repository defines only the `ServicePrincipalClientV1` trait contract. No shared
+cross-adapter conformance test suite exists to validate a second adapter's ownership,
+invalidation, or failure-category behavior.
 
 #### Bounded Administrative Workload
 
 - [ ] `p2` - **ID**: `cpt-cf-service-principal-constraint-bounded-workload`
 
-Lifecycle calls are low-frequency administrative operations. Initial listing is unpaginated and bounded by the configured tenant quota. Pagination and strong quota serialization require measured evidence and a compatible contract extension.
+Lifecycle calls are low-frequency administrative operations, not request-path operations. Listing
+is unpaginated; the collection size is bounded by whatever quota the registered adapter enforces.
 
 ## 3. Technical Architecture
 
 ### 3.1 Domain Model
 
-**Technology**: GTS identifiers and transport-neutral Rust models
+**Technology**: Transport-neutral Rust structs and a `thiserror` domain error enum
 
-**Location**: `gears/system/service-principal/service-principal-sdk/src/`
+**Location**: `gears/system/service-principal/service-principal-sdk/src/models.rs`,
+`gears/system/service-principal/service-principal-sdk/src/error.rs`,
+`gears/system/service-principal/service-principal/src/domain/error.rs`
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-entity-lifecycle-model`
 
 | Entity | Description | Security Classification |
-|--------|-------------|-------------------------|
-| Create Request | Explicit tenant, bounded name, allowed scopes, and `OperationKey` | Security-sensitive control-plane metadata |
-| Rotate Request | Tenant-qualified principal and `OperationKey` | Security-sensitive control-plane metadata |
-| Service Principal Credentials | Client ID, one-time secret, token endpoint, stable subject ID | Secret is restricted; other fields are security-sensitive |
-| Service Principal Summary | Client ID, enabled state, scopes, stable subject when supported | Security-sensitive; never contains a secret |
-| Canonical Request Identity | Versioned identity of tenant, operation, and normalized non-secret input | Security-sensitive reconciliation metadata |
-| Provider Outcome | Stable category, mutation certainty, safe remediation, and optional confirmed principal identity | Security-sensitive operational metadata |
-| Provider Proof Classification | Adapter-private `exact_binding`, `authoritative_absence`, or `inconclusive` result | Security-sensitive adapter metadata; not public wire data |
-| Audit Fact | Actor, tenant, action, time, correlation, and outcome | Security-sensitive audit metadata |
+|--------|-------------|--------------------------|
+| `CreateServicePrincipalRequest` | Explicit `tenant_id`, caller-chosen `name`, and `scopes` for a create call | Security-sensitive control-plane metadata |
+| `ServicePrincipalCredentials` | `client_id`, `client_secret` (`SecretString`), `token_url`, `subject_id` | `client_secret` is restricted; other fields are security-sensitive |
+| `ServicePrincipalSummary` | `client_id`, `enabled`, `scopes`; no secret field | Security-sensitive; never contains a secret |
+| `ServicePrincipalFailure` | Closed four-variant adapter failure taxonomy: `InvalidInput`, `NotFound`, `CleanFailure`, `Ambiguous` | Security-sensitive operational metadata |
+| `DomainError` | Gear-level error enum: `InvalidInput`, `NotFound`, `AccessDenied`, `ProviderUnavailable`, `Upstream`, `Ambiguous` | Security-sensitive operational metadata |
 
 Relationships are bounded as follows:
 
-- An operation key is bound to one tenant, operation kind, and canonical request identity.
-- Credential models are returned only by confirmed create and rotation.
-- Provider proof classification maps to a public category and remediation without exposing provider evidence.
-- Service Principal retains none of these entities after request completion.
+- `ServicePrincipalCredentials` is produced only by `create` and `rotate_secret`.
+- `DomainError` is derived from `ServicePrincipalFailure` (via `From<ServicePrincipalFailure>`) for
+  every operation except `revoke`, which treats `NotFound` as success before that conversion runs.
+- `DomainError::AccessDenied` and `DomainError::ProviderUnavailable` originate in the gear, not in
+  the adapter.
+- Service Principal retains none of these values after a request completes.
 
 ### 3.2 Component Model
 
 ```mermaid
 graph LR
     API[REST Adapter]
-    SDK[Public Local Client]
-    SVC[Stateless Application Service]
+    SVC[Application Service]
     PEP[Authorization Gate]
-    SPI[Service Principal Provider Client V1]
-    TLS[Tenant Lifecycle Owner]
-    TDP[Tenant Deprovision Provider Contract]
-    CAT[GTS Catalog]
-    OBS[Layered Audit and Observability]
+    HUB[ClientHub]
+    SPI[Provider Adapter - ServicePrincipalClientV1]
+    CAT[GTS Permission Catalog]
 
     API --> SVC
-    SDK --> SVC
     SVC --> PEP
-    SVC --> SPI
-    TLS --> TDP
+    SVC --> HUB
+    HUB --> SPI
     CAT -. registers .-> PEP
-    SVC --> OBS
-    SPI --> OBS
-    TDP --> OBS
-    TLS --> OBS
 ```
 
 #### REST and OpenAPI Adapter
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-component-rest-adapter`
 
-**Purpose**: Expose the stable HTTP contract while keeping HTTP types outside domain and SDK layers.
+**Purpose**: Expose the stable HTTP contract while keeping HTTP types out of the domain and SDK
+layers.
 
 **Responsibilities**:
 
-- Register the four routes with `OperationBuilder`.
-- Require authentication and standard errors.
-- Require `Idempotency-Key` for create and rotate.
-- Convert DTOs and apply `Location` and `Cache-Control: no-store` where required.
-- Render canonical RFC-9457 Problems without provider diagnostics.
+- Register the four routes in `api::rest::routes::register_routes` through `OperationBuilder`.
+- Require `.authenticated()` and register standard errors and OpenAPI schemas for every route.
+- Convert DTOs (`api::rest::dto`) at the boundary and add `Location` (create) and
+  `Cache-Control: no-store` (create, rotate_secret).
+- Render `DomainError` as a canonical RFC-9457 problem via `api::rest::error`.
 
-**Boundaries**: It does not authorize, call the provider directly, persist state, expose status endpoints, or log credential-bearing bodies.
-
-#### Public Rust Local Client
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-component-public-client`
-
-**Purpose**: Give trusted gears the same four operations without REST coupling.
-
-**Responsibilities**: Propagate `SecurityContext`, explicit tenant identity, and `OperationKey` for create and rotate; delegate to the application service; map domain failures to the closed public taxonomy.
-
-**Boundaries**: It exposes no provider client, cleanup method, recovery lookup, retry scheduler, or provider proof model.
+**Boundaries**: It does not authorize, call the provider adapter directly, persist state, or
+expose a single-item `GET` (the item path registers only `rotate-secret` and `DELETE`).
 
 #### Application Service
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-component-application-service`
 
-**Purpose**: Enforce public lifecycle policy before provider access.
+**Purpose**: Enforce authorization before provider delegation and map provider outcomes.
 
 **Responsibilities**:
 
-- Validate names, scopes, quota policy, operation keys, and tenant-qualified addresses.
-- Authenticate and authorize the explicit tenant for every call, including same-key retries.
-- Derive the versioned canonical non-secret request identity.
-- Delegate lifecycle operations and map provider outcomes.
-- Return one-time credentials only on confirmed synchronous success.
-- Emit request-level audit and telemetry facts.
+- Authorize the explicit tenant for `create`, `read`, `rotate_secret`, or `revoke` via
+  `domain::service::Service::authorize` before any provider call.
+- Resolve `ServicePrincipalClientV1` lazily from the `ClientHub` per call.
+- Delegate the four lifecycle operations and map `ServicePrincipalFailure` to `DomainError`.
+- Treat a `revoke` against an absent principal as success.
 
-**Boundaries**: It has no database, durable operation model, cleanup method, worker, provider protocol, or plaintext-secret store.
+**Boundaries**: It performs no name, scope, or quota validation of its own; it holds no database,
+worker, or provider protocol logic.
 
 #### Authorization Gate
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-component-authorization-gate`
 
-**Purpose**: Enforce tenant object-level authorization for high-impact machine identities.
+**Purpose**: Enforce object-level (tenant) authorization for a high-impact machine-identity
+resource type.
 
-**Responsibilities**: Use `PolicyEnforcer` with `owner_tenant_id`, require constraints, and verify that `AccessScope` covers the explicit tenant for `create`, `read`, `rotate_secret`, or `revoke`.
+**Responsibilities**: Build an `AccessRequest` with `pep_properties::OWNER_TENANT_ID` and
+`require_constraints(true)`, call `PolicyEnforcer::access_scope_with` against the
+`SERVICE_PRINCIPAL` `ResourceType`, and verify with `ensure_scope_permits` that the returned
+`AccessScope` covers the explicit tenant UUID (or is unconstrained).
 
-**Boundaries**: It does not authorize tenant deprovisioning, infer tenant ownership from client identifiers, author policy, or expose PDP diagnostics.
+**Boundaries**: It does not author policy, does not infer tenant ownership from a `client_id`
+without an authoritative adapter lookup, and exposes no PDP diagnostics on the wire.
 
-#### Provider Boundary
+#### Provider Adapter Boundary
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-component-provider-boundary`
 
-**Purpose**: Isolate provider protocol, authoritative state, and reconciliation behavior.
+**Purpose**: Isolate provider-specific protocol and authoritative state behind a single trait.
 
-**Responsibilities**:
+**Responsibilities** (of a conforming, deployment-registered adapter):
 
-- Implement create, list, rotate, and revoke for tenant-qualified requests.
-- Bind create and rotate operation keys to canonical request identity.
-- Reconcile an identical same-key retry before any further mutation.
-- Preserve unresolved reconciliation across adapter restart.
-- Return stable provider outcomes and safe non-secret remediation data.
-- Keep proof evidence, provider identifiers, and private state behind the adapter boundary.
+- Implement `create`, `list`, `rotate_secret`, and `revoke` for a `(tenant_id, client_id)`-scoped
+  resource.
+- Enforce name syntax, the scope allowlist, and a best-effort per-tenant quota before mutation.
+- Return `NotFound` for an address that does not resolve within the given tenant.
+- Return the secret only from `create`/`rotate_secret`.
+- Report transport uncertainty as `Ambiguous`, never as success.
+- Delete a tenant's principals as part of that tenant's deprovisioning (a documented obligation of
+  the SPI contract, not an operation Service Principal exposes or verifies).
 
-**Boundaries**: It does not make Service Principal authorization decisions, return raw provider diagnostics, expose credential verifier material, or persist plaintext credential responses for replay.
-
-#### Tenant Lifecycle Cleanup Integration
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-component-tenant-lifecycle-cleanup`
-
-**Purpose**: Remove tenant-owned principals as part of authoritative tenant deprovisioning.
-
-**Responsibilities**:
-
-- The tenant lifecycle owner authenticates and authorizes deprovisioning and retains durable retry state.
-- The identity-provider integration enumerates and deletes only exact tenant-owned principals.
-- Already-absent principals are success-equivalent.
-- Retryable and terminal failures block subsequent tenant teardown.
-- Success requires a final authoritative zero-principal confirmation.
-
-**Boundaries**: Service Principal is not invoked and owns no cleanup API, permission, record, schedule, or status.
+**Boundaries**: No adapter implementation ships in this repository; `Service` makes no
+authorization decision on the adapter's behalf and exposes no provider diagnostics on the wire.
 
 #### GTS Resource and Permission Catalog
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-component-gts-catalog`
 
-The catalog defines the final managed-resource type `gts.cf.core.service_principal.service_principal.v1~` and final subject classification `gts.cf.core.security.subject_service.v1~`. Both are generated from Rust, registered through Types Registry inventory, and treated as closed V1 classifications.
+The catalog defines the managed-resource type
+`gts.cf.core.service_principal.service_principal.v1~` (`SERVICE_PRINCIPAL_RESOURCE_TYPE`,
+declared once in the SDK and mirrored by the gear's `ResourceType` and `#[resource_error(...)]`
+marker), registered with `types-registry` through the link-time GTS inventory. This type is
+distinct from the account-management `user` type and from the deployment-configured
+service-subject classification a token carries when it authenticates.
 
 Permissions are well-known instances of `gts.cf.toolkit.authz.permission.v1~`:
 
 | Permission Instance ID | Action |
-|------------------------|--------|
-| `gts.cf.toolkit.authz.permission.v1~cf.service_principal._.service_principal_create.v1` | `create` |
-| `gts.cf.toolkit.authz.permission.v1~cf.service_principal._.service_principal_read.v1` | `read` |
-| `gts.cf.toolkit.authz.permission.v1~cf.service_principal._.service_principal_rotate_secret.v1` | `rotate_secret` |
-| `gts.cf.toolkit.authz.permission.v1~cf.service_principal._.service_principal_revoke.v1` | `revoke` |
+|-------------------------|--------|
+| `gts.cf.toolkit.authz.permission.v1~cf.core.service_principal.create.v1` | `create` |
+| `gts.cf.toolkit.authz.permission.v1~cf.core.service_principal.read.v1` | `read` |
+| `gts.cf.toolkit.authz.permission.v1~cf.core.service_principal.rotate_secret.v1` | `rotate_secret` |
+| `gts.cf.toolkit.authz.permission.v1~cf.core.service_principal.revoke.v1` | `revoke` |
 
-The catalog defines identifiers, not grants or role assignments. Tenant deprovision authorization belongs to the tenant lifecycle contract and is not a Service Principal permission.
-
-#### Audit and Observability
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-component-audit-observability`
-
-**Purpose**: Provide incident-ready attribution and operational signals without secret leakage.
-
-**Responsibilities**: Service Principal emits authorization and public operation outcomes. The adapter emits provider mutation and reconciliation outcomes. The tenant lifecycle owner emits cleanup retries and final tenant disposition. All layers propagate correlation and explicit tenant identity.
-
-**Boundaries**: No layer records plaintext credentials, bearer tokens, raw provider responses, raw operation keys, or tenant/client identifiers as metric labels. Operation-key correlation uses a non-reversible fingerprint.
+The catalog defines identifiers, not grants or role assignments; role authoring and evaluation
+belong to the Authorization Resolver.
 
 ### 3.3 API Contracts
 
@@ -379,97 +374,120 @@ The catalog defines identifiers, not grants or role assignments. Tenant deprovis
 
 - **Contracts**: `cpt-cf-service-principal-interface-rest`, `cpt-cf-service-principal-contract-authorization`
 - **Technology**: REST, JSON, OpenAPI, RFC-9457 Problem Details
-- **Location**: Generated from `OperationBuilder` registrations
+- **Location**: `gears/system/service-principal/service-principal/src/api/rest/routes.rs`
 
 | Method | Path | Request Requirement | Success |
-|--------|------|---------------------|---------|
-| `POST` | `/service-principal/v1/tenants/{tenant_id}/service-principals` | `Idempotency-Key` | `201 Created`, `Location`, `Cache-Control: no-store` |
-| `GET` | `/service-principal/v1/tenants/{tenant_id}/service-principals` | None beyond authenticated tenant request | `200 OK` |
-| `POST` | `/service-principal/v1/tenants/{tenant_id}/service-principals/{client_id}/rotate-secret` | `Idempotency-Key` | `200 OK`, `Cache-Control: no-store` |
-| `DELETE` | `/service-principal/v1/tenants/{tenant_id}/service-principals/{client_id}` | None beyond authenticated tenant request | `204 No Content` |
+|--------|------|----------------------|---------|
+| `POST` | `/service-principal/v1/tenants/{tenant_id}/service-principals` | Authenticated; JSON body `{name, scopes}` | `201 Created`, `Location`, `Cache-Control: no-store` |
+| `GET` | `/service-principal/v1/tenants/{tenant_id}/service-principals` | Authenticated | `200 OK` |
+| `POST` | `/service-principal/v1/tenants/{tenant_id}/service-principals/{client_id}/rotate-secret` | Authenticated | `200 OK`, `Cache-Control: no-store` |
+| `DELETE` | `/service-principal/v1/tenants/{tenant_id}/service-principals/{client_id}` | Authenticated | `204 No Content` |
 
-No operation-status, recovery-retry, or tenant-cleanup endpoint is registered. No server operation identifier or reconciliation handle is returned. Platform trace context remains available through canonical errors and response tracing.
+The item path registers `rotate-secret` and `DELETE` only; there is deliberately no by-id read, and
+the SPI exposes none either. `Location` on `create` identifies the created resource without
+promising that it answers `GET` (rationale: [Appendix A](#appendix-a-decision-rationale)).
 
-A create or rotate retry must repeat the identical request with the same key. Key reuse with another tenant, operation kind, or canonical request identity is invalid input. When reconciliation confirms that the original mutation succeeded but its credential response was lost, the response is a `credentials_unavailable` failed precondition. It contains only safe confirmed identity and remediation and never claims a credential-bearing success.
+Errors render as canonical RFC-9457 problems: `400` (`InvalidInput`, with a field violation when
+the adapter attributes one), `403` (`AccessDenied`), `404` (`NotFound`, rotate-secret only), `409`
+(`Ambiguous`, reason `AMBIGUOUS_OUTCOME`), and `503` (`ProviderUnavailable` or `Upstream`). No
+recovery-status, reconciliation, or cleanup endpoint is registered.
 
-All routes use `.authenticated()`, explicit license posture, typed schemas, and registered standard errors. Gateway-owned CORS, timeout, compression, tracing, and body-limit middleware are not duplicated.
-
-#### Service Principal Rust SDK V1
+#### Service Principal Rust SDK and Provider SPI V1
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-interface-rust-v1`
 
-- **Contracts**: `cpt-cf-service-principal-interface-rust-sdk`
-- **Technology**: Async transport-neutral Rust trait registered in ClientHub
-- **Location**: `service-principal-sdk`
+- **Contracts**: `cpt-cf-service-principal-interface-rust-sdk`, `cpt-cf-service-principal-contract-provider-adapter`
+- **Technology**: Rust SDK crate (`service-principal-sdk`) containing transport-neutral models and
+  the `ServicePrincipalClientV1` provider trait resolved via `ClientHub`
+- **Location**: `gears/system/service-principal/service-principal-sdk/src/`
 
-The public client provides create, list, rotate-secret, and revoke. Every operation accepts `SecurityContext` and an explicit tenant. Create and rotate carry a validated `OperationKey` newtype. The SDK exposes no cleanup, recovery lookup, operation status, or explicit retry method; retry uses the original create or rotate method.
+The SDK exports `create`/`list`/`rotate_secret`/`revoke` request and response models, `TenantId`
+(re-exported from `tenant-resolver-sdk`), the closed `ServicePrincipalFailure` taxonomy, and the
+`ServicePrincipalClientV1` trait. It defines no separate public in-process management client for
+trusted callers; every caller resolves the same trait. `SecurityContext` is carried on every SPI
+method for audit; the SPI itself is not an authorization boundary, so every caller must satisfy
+its documented authorization precondition before invocation.
 
-Credential models use redacting secret wrappers and do not support general serialization. Public failures carry one of the six stable categories plus stable safe reason and remediation fields. `credentials_unavailable` is a reason under invalid input/failed precondition, not a seventh category. Unknown wire categories remain non-success and behave as ambiguous when mutation certainty is unavailable.
+Credential models wrap the secret in `secrecy::SecretString`, which redacts `Debug` and declares
+no `Serialize` implementation.
 
-#### Provider Adapter V1
+#### Provider Adapter Contract V1
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-interface-provider-v1`
 
 - **Contracts**: `cpt-cf-service-principal-contract-provider-adapter`
-- **Technology**: Async transport-neutral Rust provider trait registered in ClientHub
-- **Location**: `service-principal-sdk`
+- **Technology**: Async transport-neutral Rust trait (`ServicePrincipalClientV1`), registered in
+  the `ClientHub`
+- **Location**: `gears/system/service-principal/service-principal-sdk/src/api.rs`
 
-The provider client defines create, list, rotate, and revoke. Create and rotate receive the opaque operation key and versioned canonical request identity. Provider outcomes use invalid input, not found, clean failure, or ambiguous outcome; authorization failure and provider unavailability are added by the public service boundary.
-
-The adapter classifies reconciliation evidence internally as `exact_binding`, `authoritative_absence`, or `inconclusive`. Public contracts receive only stable category, reason, safe remediation, and confirmed non-secret identity when applicable. Provider proof material and provider-specific diagnostics never cross the boundary.
-
-#### Tenant Deprovision Contract
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-interface-tenant-deprovision`
-
-- **Contracts**: `cpt-cf-service-principal-contract-tenant-cleanup`
-- **Technology**: Tenant lifecycle to identity-provider integration contract
-
-The lifecycle owner supplies a validated security context and explicit tenant to the identity-provider tenant-deprovision contract. The integration returns success, success-equivalent absence, retryable failure, or terminal failure. Retry state and scheduling remain in the lifecycle owner. This contract is separate from Provider Adapter V1 and is not exposed through Service Principal REST or Rust APIs.
+The trait defines `create`, `rotate_secret`, `revoke`, and `list`. An implementation must address
+`(tenant_id, client_id)` as the scoped resource, return `NotFound` for an address outside the
+tenant, return the secret only from `create`/`rotate_secret`, and classify transport uncertainty as
+`Ambiguous` rather than success. Provider-specific diagnostics never cross into
+`ServicePrincipalFailure`.
 
 #### Managed Resource and Permissions
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-interface-managed-resource-v1`
 
+- **Contracts**: `cpt-cf-service-principal-interface-managed-resource`
+- **Technology**: GTS type schema and permission instances aggregated by `types-registry`
+- **Location**: `gears/system/service-principal/service-principal-sdk/src/gts.rs`,
+  `gears/system/service-principal/service-principal/src/gts/permissions.rs`
+
 | Action | Purpose |
 |--------|---------|
 | `create` | Mint a tenant-owned machine identity |
 | `read` | List tenant-owned principals |
-| `rotate_secret` | Replace an existing principal secret |
+| `rotate_secret` | Replace an existing principal's secret |
 | `revoke` | Remove a principal or confirm absence |
 
-Boundary identifiers use typed GTS IDs. Types Registry resolves and validates them before authorization or processing; SQL string matching and handler branching on raw GTS strings are prohibited.
+Boundary identifiers use typed GTS IDs generated with `gts_id!`; SQL string matching and handler
+branching on raw GTS strings are prohibited.
 
 ### 3.4 Internal Dependencies
 
-| Dependency | Interface Used | Purpose |
-|------------|----------------|---------|
-| AuthZ Resolver | `PolicyEnforcer` and resolver SDK | Evaluate independent actions and compile tenant constraints |
-| Types Registry | GTS inventory registration | Register resource, subject, and permission instances |
-| Tenant contracts | Canonical `TenantId` and hierarchy semantics | Preserve tenant identity across boundaries |
-| ToolKit runtime | Gear, REST, ClientHub, lifecycle registration | Register routes and public/provider clients |
-| Canonical errors | Canonical categories and Problem rendering | Produce safe public errors |
-| API Gateway | Authenticated route policy and OpenAPI registry | Authenticate and publish REST contracts |
-| Outbound API Gateway | OAGW upstream and route contracts | Apply egress policy and credential isolation to provider HTTP calls |
-| Platform observability | Tracing, metrics, and audit delivery | Collect layered correlation and outcomes |
+| Dependency Gear | Interface Used | Purpose |
+|-----------------|-----------------|---------|
+| `authz-resolver` | `authz_resolver_sdk::pep::PolicyEnforcer` | Evaluate `create`/`read`/`rotate_secret`/`revoke` and compile tenant-scoped constraints |
+| `types-registry` | Link-time GTS inventory aggregation | Register the managed-resource type and the four permission instances at startup |
+| `tenant-resolver-sdk` | `TenantId` | Supply the canonical tenant identifier type shared by the REST and provider contracts |
+| ToolKit runtime (`toolkit`) | `Gear`, `RestApiCapability`, `ClientHub`, `OperationBuilder` | Host the gear, mount REST routes, and resolve the provider adapter |
+| `toolkit-canonical-errors` | `CanonicalError`, `resource_error` | Map `DomainError` to RFC-9457 problem responses |
 
-Service Principal has no ToolKit database, migration, Secure ORM, task lease, or stateful-worker dependency. SDK contracts never depend on implementation types. Provider adapters are resolved through ClientHub and are not direct dependencies of consuming gears.
+**Dependency Rules** (per project conventions):
+
+- No circular dependencies.
+- Inter-gear communication uses only the `authz-resolver-sdk` and `service-principal-sdk` crates,
+  never internal types of another gear.
+- The provider adapter is resolved through `ClientHub`, not through a direct gear dependency, so it
+  stays substitutable.
+- `SecurityContext` is propagated from the REST handler through `Service` into every SPI call.
+
+Service Principal declares no database, migration, Secure ORM, task-lease, or stateful-worker
+dependency in its `Cargo.toml`.
 
 ### 3.5 External Dependencies
 
-#### Identity Provider
+#### Identity Provider (via the registered adapter)
 
 - **Contract**: `cpt-cf-service-principal-contract-provider-adapter`
 
-Only the adapter translates provider-neutral operations to provider administration calls. All provider HTTP or HTTPS traffic, including token-conformance requests, traverses OAGW with declared upstreams, routes, TLS policy, bounded timeouts, and credential references. A non-HTTP transport requires a separately approved boundary with equivalent controls.
+| Dependency Gear | Interface Used | Purpose |
+|-----------------|-----------------|---------|
+| Registered `ServicePrincipalClientV1` implementation | `ServicePrincipalClientV1` trait | Own authoritative principal, credential, and token-issuance state; enforce name/scope/quota policy |
 
-The adapter classifies uncertainty honestly. Timeout after request transmission is ambiguous unless non-mutation is established. The provider owns principal backup, residency, and credential-verifier storage. Adapter qualification is required before a supported release enables it.
+Only the adapter communicates with the identity provider. This repository defines no adapter
+implementation and therefore makes no claim about the adapter's transport, egress gateway, or TLS
+posture; those are the registered adapter's responsibility and are outside this gear's dependency
+graph.
 
-#### Tenant Lifecycle Owner
+**Dependency Rules** (per project conventions):
 
-- **Contract**: `cpt-cf-service-principal-contract-tenant-cleanup`
-
-The lifecycle owner owns durable deprovision state, retry scheduling, terminal parking, and final tenant disposition. Its identity-provider integration owns authoritative principal purge behavior. Service Principal has no dependency edge in this path.
+- No circular dependencies.
+- Only the provider adapter talks to the external identity provider; `Service` never does so
+  directly.
+- `SecurityContext` is passed to every SPI call for audit.
 
 ### 3.6 Interactions & Sequences
 
@@ -477,154 +495,149 @@ The lifecycle owner owns durable deprovision state, retry scheduling, terminal p
 
 **ID**: `cpt-cf-service-principal-seq-create`
 
+**Use cases**: `cpt-cf-service-principal-usecase-create`
+
+**Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`,
+`cpt-cf-service-principal-actor-authz-resolver`, `cpt-cf-service-principal-actor-provider-adapter`
+
 ```mermaid
 sequenceDiagram
     participant C as Caller
-    participant S as Stateless Service
-    participant Z as Authorization Resolver
+    participant S as Application Service
+    participant Z as Authorization Resolver (PDP)
     participant P as Provider Adapter
 
-    C->>S: Create tenant, request, Idempotency-Key
+    C->>S: POST create (tenant, name, scopes)
     S->>Z: Authorize create for tenant
-    Z-->>S: Decision and covering constraints
-    S->>P: Create with key and canonical request identity
-    alt Confirmed new success
-        P-->>S: One-time credentials and subject
-        S-->>C: 201, Location, no-store
-    else Confirmed prior success, response lost
-        P-->>S: Safe confirmed identity, no credential
-        S-->>C: credentials_unavailable failed precondition
-    else Authoritative absence
-        P-->>S: Safe fresh-attempt guidance
-        S-->>C: Non-success; new key permitted
-    else Inconclusive
-        P-->>S: Ambiguous outcome
-        S-->>C: Ambiguous; identical same-key retry only
+    Z-->>S: Decision and covering scope
+    alt Scope does not cover tenant
+        S-->>C: 403 access denied
+    else Scope covers tenant
+        S->>P: create(tenant, name, scopes)
+        alt Success
+            P-->>S: Credentials and subject id
+            S-->>C: 201, Location, no-store, credentials
+        else InvalidInput
+            P-->>S: Rejection detail
+            S-->>C: 400 invalid input
+        else Ambiguous
+            P-->>S: Uncertain outcome
+            S-->>C: 409 aborted (caller resolves manually)
+        else CleanFailure / provider absent
+            P-->>S: Clean failure or ClientHub miss
+            S-->>C: 503 service unavailable
+        end
     end
 ```
 
-The service holds only request-local state. Every retry re-authenticates and re-authorizes before adapter reconciliation. No credential or operation record is written by the gear.
+`Service` holds only request-local state. No credential or operation record is written by the
+gear; recovery from an ambiguous outcome (for example, `list` then revoke-and-retry) is the
+caller's responsibility.
 
 #### Inventory Tenant Principals
 
 **ID**: `cpt-cf-service-principal-seq-list`
 
+**Use cases**: `cpt-cf-service-principal-usecase-list`
+
+**Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`,
+`cpt-cf-service-principal-actor-authz-resolver`
+
 ```mermaid
 sequenceDiagram
     participant C as Caller
-    participant S as Stateless Service
-    participant Z as Authorization Resolver
+    participant S as Application Service
+    participant Z as Authorization Resolver (PDP)
     participant P as Provider Adapter
 
-    C->>S: List explicit tenant
-    S->>Z: Authorize read
-    Z-->>S: Covering constraints
-    S->>P: List tenant-owned principals
+    C->>S: GET list (tenant)
+    S->>Z: Authorize read for tenant
+    Z-->>S: Decision and covering scope
+    S->>P: list(tenant)
     P-->>S: Secret-free summaries
-    S-->>C: Secret-free list
+    S-->>C: 200, secret-free list
 ```
 
 #### Rotate Credential
 
 **ID**: `cpt-cf-service-principal-seq-rotate`
 
+**Use cases**: `cpt-cf-service-principal-usecase-rotate`
+
+**Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`,
+`cpt-cf-service-principal-actor-provider-adapter`
+
 ```mermaid
 sequenceDiagram
     participant C as Caller
-    participant S as Stateless Service
-    participant Z as Authorization Resolver
+    participant S as Application Service
+    participant Z as Authorization Resolver (PDP)
     participant P as Provider Adapter
 
-    C->>S: Rotate tenant principal, Idempotency-Key
-    S->>Z: Authorize rotate_secret
-    Z-->>S: Covering constraints
-    S->>P: Rotate with key and canonical request identity
-    alt Confirmed new success
-        P-->>S: Replacement secret and invalidation confirmation
-        S-->>C: Replacement once, no-store
-    else Confirmed prior success, response lost
-        P-->>S: Safe confirmed identity, no credential
-        S-->>C: credentials_unavailable; rotate with new key
-    else Inconclusive
+    C->>S: POST rotate-secret (tenant, client_id)
+    S->>Z: Authorize rotate_secret for tenant
+    Z-->>S: Decision and covering scope
+    S->>P: rotate_secret(tenant, client_id)
+    alt Success
+        P-->>S: New credentials
+        S-->>C: 200, no-store, new secret
+    else NotFound
+        P-->>S: Address does not resolve in tenant
+        S-->>C: 404 not found
+    else Ambiguous
         P-->>S: Credential state uncertain
-        S-->>C: Ambiguous; identical same-key retry only
+        S-->>C: 409 aborted
     end
 ```
 
-A caller adopts only credentials received by a confirmed rotation response. The service never delivers a secret asynchronously.
+The caller adopts only credentials received in a successful rotation response; the gear never
+delivers a secret asynchronously or through a separate lookup.
 
 #### Revoke Workload Identity
 
 **ID**: `cpt-cf-service-principal-seq-revoke`
 
+**Use cases**: `cpt-cf-service-principal-usecase-revoke`
+
+**Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`
+
 ```mermaid
 sequenceDiagram
     participant C as Caller
-    participant S as Stateless Service
-    participant Z as Authorization Resolver
+    participant S as Application Service
+    participant Z as Authorization Resolver (PDP)
     participant P as Provider Adapter
 
-    C->>S: Revoke tenant-qualified principal
-    S->>Z: Authorize revoke
-    Z-->>S: Covering constraints
-    S->>P: Delete tenant-owned principal
-    alt Deleted or absent
-        P-->>S: Confirmed success or not found
-        S-->>C: 204 No Content
-    else Ambiguous
-        P-->>S: Mutation uncertain
-        S-->>C: Ambiguous; repeat normal revoke
-    end
+    C->>S: DELETE revoke (tenant, client_id)
+    S->>Z: Authorize revoke for tenant
+    Z-->>S: Decision and covering scope
+    S->>P: revoke(tenant, client_id)
+    P-->>S: Ok(()) or NotFound
+    Note over S: Both map to success
+    S-->>C: 204 No Content
 ```
 
-Revoke requires no operation key. The caller repeats the tenant-qualified operation until deletion or absence is confirmed.
-
-#### Tenant Deprovision Cleanup
-
-**ID**: `cpt-cf-service-principal-seq-tenant-cleanup`
-
-```mermaid
-sequenceDiagram
-    participant T as Tenant Lifecycle Owner
-    participant P as Identity-Provider Integration
-    participant I as Identity Provider
-
-    T->>T: Authenticate and authorize tenant deprovision
-    T->>P: Deprovision explicit tenant
-    P->>I: Enumerate exact tenant-owned principals
-    P->>I: Delete each owned principal
-    P->>I: Confirm zero owned principals
-    alt Zero confirmed
-        P-->>T: Success
-        T->>T: Continue tenant teardown
-    else Transient failure
-        P-->>T: Retryable
-        T->>T: Retain durable state and retry whole operation
-    else Permanent failure
-        P-->>T: Terminal
-        T->>T: Block teardown and expose intervention state
-    end
-```
-
-Service Principal is absent from this sequence. Cleanup and its retries share the durable tenant-deprovision lifecycle.
+`Service::revoke` treats `Ok(())` and `ServicePrincipalFailure::NotFound` identically as success,
+so revoking an already-absent principal is indistinguishable from revoking a present one.
 
 ### 3.7 Database Schemas & Tables
 
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-db-state-ownership`
+- [ ] `p3` - **ID**: `cpt-cf-service-principal-db-state-ownership`
+
+Not applicable: Service Principal declares no schema, table, or migration. It does not lease work,
+persist an operation record, or restore state after restart.
 
 | State | Durable Owner | Service Principal Access |
-|-------|---------------|--------------------------|
-| Principal, credential, verifier, token behavior | Identity provider | Through provider adapter only |
-| Create/rotation reconciliation binding and outcome | Provider adapter or its provider-native facility | Forward key and canonical request identity; receive safe outcome |
-| Tenant-deprovision retry and terminal disposition | Tenant lifecycle owner | None |
-| Audit and telemetry retention | Platform observability and owning emitting layer | Emit through platform interfaces |
+|-------|-----------------|-----------------------------|
+| Principal, credential, and token-issuance state | Registered identity-provider adapter | Through `ServicePrincipalClientV1` only |
 | Plaintext credential response | No platform persistence owner | Request-local delivery only |
 
-Service Principal declares no schema or table and runs no migration. It does not lease work, retain resolved operations, restore state after restart, or define adapter-private retention. An adapter may use provider-native or private durable storage, but that storage is outside the gear boundary and must satisfy conformance without containing replayable plaintext credential responses.
+An adapter may use its own durable storage to satisfy the SPI contract, but that storage is
+outside this gear's boundary and outside this document's scope.
 
 ### 3.8 Deployment Topology
 
-- [ ] `p2` - **ID**: `cpt-cf-service-principal-topology-deployment-neutral`
+- [ ] `p3` - **ID**: `cpt-cf-service-principal-topology-deployment-neutral`
 
 ```mermaid
 graph LR
@@ -633,12 +646,8 @@ graph LR
     SP2[Service Principal Instance]
     AZ[AuthZ Resolver]
     HUB[ClientHub]
-    ADAPTER[Provider Adapter]
-    ASTATE[(Adapter-Private State)]
-    OAGW[Outbound API Gateway]
+    ADAPTER[Registered Provider Adapter]
     IDP[Identity Provider]
-    OBS[Observability and Audit]
-    TL[Tenant Lifecycle Owner]
 
     GW --> SP1
     GW --> SP2
@@ -647,17 +656,12 @@ graph LR
     SP1 --> HUB
     SP2 --> HUB
     HUB --> ADAPTER
-    ADAPTER --> ASTATE
-    ADAPTER --> OAGW
-    OAGW --> IDP
-    TL --> ADAPTER
-    SP1 --> OBS
-    SP2 --> OBS
-    ADAPTER --> OBS
-    TL --> OBS
+    ADAPTER --> IDP
 ```
 
-Instances are horizontally scalable and interchangeable. They require authorization, GTS, ClientHub, canonical error, gateway, and observability wiring. They do not require a database, migration, work lease, or worker readiness probe. Provider availability is reported separately so an outage produces an explicit failure rather than simulated success. Adapter-private reconciliation infrastructure is deployed and operated with the adapter, outside the Service Principal lifecycle.
+Instances are horizontally scalable and interchangeable. They require authorization, GTS, and
+`ClientHub` wiring, but no database, migration, or work-lease infrastructure. Provider absence
+produces an explicit `503`; it is never reported as a simulated success.
 
 ## 4. Additional Context
 
@@ -665,52 +669,41 @@ Instances are horizontally scalable and interchangeable. They require authorizat
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-design-failure-taxonomy`
 
-| Public Category | Source | Mutation Semantics | Retry Guidance | Canonical Mapping |
-|-----------------|--------|--------------------|----------------|-------------------|
-| Invalid input | Validation, provider, key mismatch, or `credentials_unavailable` | Current request retains no new state | Change invalid input; use a new rotation key after lost credential response | `InvalidArgument`, HTTP 400; failed precondition reason for `credentials_unavailable` |
-| Not found | Provider ownership lookup | No addressed tenant-owned principal | Revoke treats as success-equivalent | `NotFound`, HTTP 404; revoke returns 204 |
-| Clean failure | Provider | Provider confirms no new state | Follow safe remediation; a fresh mutation uses a new key | `ServiceUnavailable`, HTTP 503 |
-| Ambiguous outcome | Provider after possible mutation | State may have changed | Repeat only the identical request with the same key for create/rotate; repeat revoke normally | `Aborted`, HTTP 409 |
-| Authorization failure | Authentication or policy boundary | Provider not invoked | Retry only after identity or authorization changes | Canonical 401, 403, or fail-closed internal error |
-| Provider unavailable | Missing adapter or known pre-mutation outage | No provider mutation | Retry according to safe availability guidance | `ServiceUnavailable`, HTTP 503 |
+| `DomainError` Variant | Source | HTTP Status | Canonical Reason |
+|-------------------------|--------|--------------|---------------------|
+| `InvalidInput { detail, field }` | `ServicePrincipalFailure::InvalidInput` | `400` | `INVALID_INPUT`, with a field violation |
+| `NotFound` | `ServicePrincipalFailure::NotFound` (surfaces only outside `revoke`) | `404` | Not-found resource error |
+| `AccessDenied` | `authz::map_enforcer_err` (`Denied`, `CompileFailed`) or a scope that does not cover the tenant | `403` | `ACCESS_DENIED` |
+| `ProviderUnavailable` | No `ServicePrincipalClientV1` registered in `ClientHub` | `503` | Service-unavailable |
+| `Upstream { detail }` | `ServicePrincipalFailure::CleanFailure` or `authz::map_enforcer_err`'s `EvaluationFailed` | `503` | Service-unavailable |
+| `Ambiguous { detail }` | `ServicePrincipalFailure::Ambiguous` | `409` | `AMBIGUOUS_OUTCOME` |
 
-`credentials_unavailable` is a stable reason under invalid input/failed precondition, not a seventh category. It may contain confirmed non-secret principal identity and rotation guidance. It never contains a credential, raw operation key, adapter proof, or provider diagnostic.
+The taxonomy on both sides of the boundary (`ServicePrincipalFailure` and `DomainError`) is closed:
+neither type is `#[non_exhaustive]`, so every match is compile-checked to cover every variant.
+`Ambiguous` carries `409`, a status distinct from the `503` used for `Upstream` and
+`ProviderUnavailable` (rationale: [Appendix A](#appendix-a-decision-rationale)).
+Provider-specific diagnostic detail stays in the `detail` string surfaced by canonical error
+rendering; no adapter-internal state crosses the wire.
 
-Unknown categories remain non-success. If mutation certainty is unavailable, compatibility handling is ambiguous. Provider detail is sanitized before logging and never placed on the public wire.
+### 4.2 Ambiguous Outcome Handling
 
-Tenant cleanup uses the tenant-lifecycle contract's success, success-equivalent absence, retryable, and terminal outcomes. Those outcomes do not extend the Service Principal taxonomy.
+- [ ] `p1` - **ID**: `cpt-cf-service-principal-design-ambiguous-handling`
 
-### 4.2 Operation-Key Reconciliation
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-design-reconciliation`
-
-Create and rotation use these contract rules:
-
-1. The caller supplies `Idempotency-Key` or the Rust `OperationKey` equivalent.
-2. Service Principal validates the key, authenticates and authorizes the current caller, derives a canonical non-secret request identity, and forwards both values.
-3. The adapter binds the key to tenant, operation kind, and request identity and retains only a non-reversible key fingerprint plus private binding and outcome metadata.
-4. An identical same-key retry reconciles before any mutation. A changed tenant, operation, or request identity is invalid input.
-5. `exact_binding` maps to safe confirmed identity. If the one-time response was lost, the public result is `credentials_unavailable` and the caller performs a new rotation with a new key.
-6. `authoritative_absence` permits a fresh operation with a new key.
-7. `inconclusive` remains ambiguous and blocks conflicting mutation.
-
-The adapter's execution mechanism is private. Reconciliation may occur during the repeated request or through adapter-owned background execution. In both cases unresolved behavior survives adapter restart and Service Principal schedules nothing.
-
-No public status lookup exists. No server-generated operation ID or provider proof handle is returned. Platform correlation identifiers continue to correlate request, adapter, and audit records; operation-key telemetry uses only a non-reversible fingerprint.
+The gear defines no idempotency-key or operation-key mechanism. When the registered adapter
+reports `Ambiguous`, `Service` forwards it unchanged as `DomainError::Ambiguous`, and the REST
+layer renders `409` with reason `AMBIGUOUS_OUTCOME`. The caller is expected to inspect state
+through `list` and resolve manually — for example, `revoke` followed by a fresh `create` — since
+neither `Service` nor any adapter contract defined here performs automatic reconciliation.
+Introducing a caller-supplied key to make an ambiguous create or rotate safely retryable is target
+work tracked as an open question in the PRD, not part of the current contract.
 
 ### 4.3 Configuration
 
-- [ ] `p2` - **ID**: `cpt-cf-service-principal-design-configuration`
+- [ ] `p3` - **ID**: `cpt-cf-service-principal-design-configuration`
 
-Typed Service Principal configuration contains:
-
-- principal name length and accepted character policy;
-- allowed client scopes;
-- best-effort maximum principals per tenant;
-- provider request timeout;
-- benchmark-approved deployment envelope once established.
-
-Configuration is explicit under `gears.service-principal.config`. Secrets, provider administrator credentials, worker settings, lease periods, retry schedules, database settings, and reconciliation retention are absent. Provider-adapter and tenant-lifecycle configuration remain owned by those components.
+Not applicable: the gear declares no gear-specific configuration section or typed configuration
+struct. Name-syntax rules, the scope allowlist, and the per-tenant quota are configuration owned by
+the registered provider adapter, not by this gear.
 
 ### 4.4 Security and Data Protection
 
@@ -718,125 +711,190 @@ Configuration is explicit under `gears.service-principal.config`. Secrets, provi
 
 Security boundaries are:
 
-1. API Gateway authenticates REST callers and injects `SecurityContext`.
-2. Service Principal authorizes the explicit tenant for every public call and retry.
-3. The provider adapter accepts only the provider-neutral contract and enforces tenant-qualified ownership against authoritative provider state.
-4. The tenant lifecycle owner authorizes deprovisioning; the provider integration deletes only exact tenant-owned principals.
-5. The identity provider owns credentials, verifier material, and token issuance.
-6. Adapter-private reconciliation contains no plaintext credential response and exposes no provider proof publicly.
+1. The platform authenticates REST callers and attaches a validated `SecurityContext` before a
+   handler runs (`.authenticated()` on every route).
+2. `Service::authorize` requests a PDP decision and verifies, via `ensure_scope_permits`, that the
+   returned scope covers the explicit target tenant before any provider call.
+3. The registered provider adapter accepts only the provider-neutral SPI and is responsible for
+   tenant-qualified ownership checks against its own authoritative state.
+4. `secrecy::SecretString` wraps every client secret; `ServicePrincipalCredentialsDto` hand-writes
+   a redacting `Debug` so no formatting path exposes the secret.
+5. `create` and `rotate_secret` responses carry `Cache-Control: no-store`.
 
-Credential values use redacting wrappers until final response conversion. Create and rotation bodies are excluded from logging and tracing. Panic, debug, and error formatting cannot expose secret fields. Credential responses use `Cache-Control: no-store`, and upstream proxies must not cache them. Transport security follows platform TLS and FIPS posture without gear-specific cryptography.
+Transport security and any credential handling for the provider's own external calls are the
+registered adapter's responsibility; this repository makes no claim about them because no adapter
+ships here.
 
 ### 4.5 Auditability and Observability
 
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-design-operational-signals`
+- [ ] `p2` - **ID**: `cpt-cf-service-principal-design-operational-signals`
 
-Audit ownership is layered:
-
-| Layer | Audit and Signal Ownership |
-|-------|----------------------------|
-| Service Principal | Current caller, target tenant, public action, authorization result, correlation ID, provider invocation status, and public outcome |
-| Provider adapter | Provider mutation, reconciliation classification, provider availability, and adapter-private retry state |
-| Tenant lifecycle owner | Cleanup attempt, retryable or terminal disposition, initiating/system actor, and final tenant disposition |
-
-Every layer propagates platform correlation and explicit tenant identity. Raw operation keys are excluded; a non-reversible fingerprint may correlate adapter records. Audit content excludes plaintext credentials, bearer tokens, full credential-bearing request bodies, and raw provider responses.
-
-Service Principal metrics include operation latency and count by action and stable public outcome plus provider availability. Adapter metrics include ambiguity, reconciliation age, and adapter execution health. Tenant lifecycle metrics include cleanup retries, terminal failures, and blocked deprovisioning. Service Principal exposes no recovery backlog, cleanup backlog, lease, or worker-health metric. Tenant and principal identifiers are never metric labels.
+The gear emits one `tracing::info!` at successful `init` and one `tracing::warn!` when
+`Service::sp_client` fails to resolve the provider, logging the underlying `ClientHubError` for
+diagnosis. Beyond platform-wide request tracing and canonical-error correlation, the gear defines
+no dedicated audit trail, metric, or alert of its own; this matches the PRD's explicit NFR
+exclusion for bespoke auditability and observability.
 
 ### 4.6 Fault Tolerance
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-design-fault-tolerance`
 
-Service Principal fails closed before provider invocation when authentication, authorization, configuration, or required client resolution fails. A provider result that cannot exclude mutation is ambiguous. Restart loses only transient request context; a caller may reach any instance and repeat the identical keyed request.
-
-The adapter guarantees restart-safe reconciliation and prevents duplicate logical create or rotation mutation under concurrent or repeated same-key requests. Revoke converges through repeated deletion and success-equivalent absence.
-
-Tenant cleanup failure blocks tenant teardown. A retryable result keeps the lifecycle-owned operation eligible for retry after restart. A terminal result parks the lifecycle operation for intervention. No component reports deprovision success before authoritative zero-principal confirmation.
+Service Principal fails closed before any provider call when authentication is missing, the PDP
+denies the request, constraint compilation fails, or PDP evaluation itself fails. Provider absence
+is reported as `503`, never as simulated success. Because `Service` carries no per-request state
+across calls, a gear restart loses nothing a caller needs to retry; the caller may reach any
+instance and repeat an identical request. The gear applies no automatic recovery for an
+`Ambiguous` outcome — see §4.2.
 
 ### 4.7 Testability and Verification
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-design-test-strategy`
 
-Verification follows the repository test split:
+The current test suite, aligned with the repository's unit/service/router split:
 
-- Unit tests cover policy validation, canonical request identity, operation-key validation, secret redaction, DTO conversion, failure mapping, and permission identifiers.
-- Service tests verify authorize-before-provider ordering, re-authorization on retry, tenant-scope mismatch denial, provider absence, idempotent revoke, and absence of persistence or worker dependencies.
-- Router tests verify four operations, `Idempotency-Key` on create/rotate, OpenAPI metadata, `Location`, `no-store`, `credentials_unavailable`, RFC-9457 shape, and absence of recovery/status/cleanup routes.
-- Shared adapter conformance verifies same-key concurrency, post-restart resumption, tenant/request binding, four provider outcomes, all three proof classifications, no duplicate logical mutation, no secret replay, ownership, invalidation, and OAGW-mediated HTTP transport.
-- Tenant-lifecycle integration tests verify exact-owner purge, foreign-principal exclusion, success-equivalent absence, retryable failure, terminal failure, restart-safe lifecycle retry, and zero-principal confirmation before teardown.
-- Security tests attempt cross-tenant addressing, operation-key substitution, foreign-principal probing, scope escalation, cache disclosure, and log/telemetry disclosure.
-- E2E tests cover real REST/Rust wiring, real authorization, adapter restart seams, lost credential responses, provider integration, secret-negative surfaces, and tenant deprovisioning.
-- Benchmarks establish the PRD-required scale, latency, throughput, unavailable-provider behavior, and availability objectives before GA.
+- SDK unit tests (`service-principal-sdk/src/models.rs`, `error.rs`, `gts.rs`) cover secret
+  redaction in `Debug`, stable failure-category metric labels and `Display` shape, and the
+  managed-resource GTS id.
+- Domain unit tests (`domain/authz.rs`) cover `ensure_scope_permits` for unconstrained, matching,
+  mismatched, and deny-all scopes, and `map_enforcer_err` fail-closed mapping.
+- Service tests (`domain/service_tests.rs`) cover authorize-before-provider ordering, tenant-scope
+  mismatch denial, provider absence, and idempotent revoke on `NotFound`.
+- Permission catalog tests (`gts/permissions_tests.rs`) verify all four permissions register in the
+  link-time inventory, carry the SDK resource type, and match their action to their instance-id
+  verb.
+- DTO tests (`api/rest/dto_tests.rs`) verify secret redaction in `Debug`, unknown-field rejection,
+  and the default-empty `scopes` field.
+- Router tests (`api/rest/routes_tests.rs`) verify all four operations register in the OpenAPI
+  registry and exercise their success and error responses end-to-end through the router.
+- Error-mapping tests (`api/rest/error.rs`) verify every `DomainError` variant maps to its expected
+  HTTP status and that the resource-error literal matches the SDK's `SERVICE_PRINCIPAL_RESOURCE_TYPE`
+  constant.
+
+No cross-adapter provider-conformance suite and no performance benchmark exist in this repository;
+both are tracked as open PRD questions rather than as claims of this design.
 
 ### 4.8 Compliance and Privacy Posture
 
-- [ ] `p2` - **ID**: `cpt-cf-service-principal-design-compliance-posture`
+- [ ] `p3` - **ID**: `cpt-cf-service-principal-design-compliance-posture`
 
-The gear models machine identities and intentionally collects no human profile attributes. Subject, tenant, client, scope, operation-key fingerprint, and audit identifiers remain security-sensitive and may be personal data where they identify natural persons.
-
-The provider owns principal-record residency and backup. Adapter operators own private reconciliation retention and residency. The tenant lifecycle owner owns deprovision-operation retention. Platform observability owns telemetry and audit retention. Service Principal owns no durable data set. No gear-specific regulatory claim is made; deployment-specific privacy and industry controls remain applicable.
+The gear models machine identities and collects no human profile attributes. Client id, subject
+id, tenant id, and scope values remain security-sensitive control-plane metadata; the registered
+provider owns any residency or backup posture for the principal records it stores. No
+gear-specific regulatory claim is made.
 
 ### 4.9 Migration Impact
 
-- [ ] `p2` - **ID**: `cpt-cf-service-principal-design-migration-impact`
+- [ ] `p3` - **ID**: `cpt-cf-service-principal-design-migration-impact`
 
-No Service Principal data migration is required because the recovery schema, worker, cleanup API, and operation-status API described by the earlier design were not implemented. The revision removes planned components rather than migrating stored records.
-
-The four lifecycle paths and operations remain. Create and rotation gain required operation-key inputs before the V1 contract is declared production-stable. Introducing that requirement after V1 stabilization would require a compatible transition or a new major version. Existing one-time credential handoff remains unchanged.
-
-Each provider adapter owns migration of any private reconciliation state and must pass the revised conformance suite before qualification. Tenant lifecycle integration owns any migration of its deprovision state. No plaintext credential data is migrated.
+The `service-principal` and `service-principal-sdk` crates are new to this repository. No stored
+data migration applies because the gear owns no database. This gear defines no recovery schema,
+background worker, cleanup API, or operation-status API (supersession of earlier drafts:
+[Appendix A](#appendix-a-decision-rationale)). A future operation-key or idempotency-key retry
+mechanism (PRD open question) would need a compatible transition or a new major contract version,
+since it is not part of the current REST or SDK contract.
 
 ### 4.10 Assumptions and Baseline Deviations
 
-- [ ] `p2` - **ID**: `cpt-cf-service-principal-design-assumptions-deviations`
+- [ ] `p3` - **ID**: `cpt-cf-service-principal-design-assumptions-deviations`
 
 Assumptions:
 
-- One conforming provider adapter is configured per deployment.
-- The adapter can bind keyed create and rotation to authoritative provider evidence and preserve unresolved reconciliation across restart.
-- The identity provider can immediately invalidate superseded credentials and confirm tenant-owned principal absence.
-- The tenant lifecycle owner supplies durable deprovision retry state.
-- Production objectives are supplied by the benchmark release gate.
+- Exactly one conforming `ServicePrincipalClientV1` implementation is registered per deployment;
+  none ships with this repository.
+- The registered adapter enforces name syntax, scope allowlisting, and quota; this gear performs no
+  independent validation.
+- The platform attaches a validated `SecurityContext` before a route handler runs.
+- Lifecycle operations remain low-frequency administrative calls, not request-path traffic.
 
-Local architecture allocations:
+Baseline implementation status (not approved production deviations, but the current, verified
+state of this codebase):
 
-- Service Principal is a stateless authorization and provider-delegation boundary.
-- The adapter owns create and rotation reconciliation semantics and private state.
-- The tenant lifecycle owner and identity-provider integration own tenant cleanup durability and execution.
-- Service Principal emits public lifecycle audit facts in addition to platform request and authorization records.
-
-There are no approved deviations from SDK-first contracts, authenticated `OperationBuilder` routes, canonical RFC-9457 errors, OAGW-mediated HTTP egress, or fail-closed authorization.
+- There is no single-item `GET`; the collection listing and the `Location` header from `create` are
+  the only ways to learn a principal's non-secret state (PRD open question 4).
+- There is no idempotency-key or operation-key retry mechanism for an ambiguous create or rotate
+  outcome; the caller must resolve it manually (PRD open question 2).
+- No cross-adapter conformance harness exists to validate a second adapter (PRD open question 3).
+- Nothing in this repository demonstrates that a registered adapter actually deletes a tenant's
+  principals on tenant deprovisioning; the obligation is stated in the SPI contract only (PRD open
+  question 1).
+- No performance or scale benchmark exists in this repository (PRD NFR exclusion).
 
 ### 4.11 Explicit Non-Applicability
 
-- Frontend state, responsive design, accessibility, internationalization, and offline UI support are not applicable because the capability has no user interface.
-- Browser sessions, gear-owned MFA, and gear-owned SSO are not applicable because platform authentication owns management-call identity.
+- Frontend state, responsive design, accessibility, and internationalization are not applicable;
+  the capability has no user interface.
+- Browser sessions, gear-owned MFA, and gear-owned SSO are not applicable; platform authentication
+  owns management-call identity.
 - CDN and edge caching are not applicable; credential responses are explicitly non-cacheable.
-- Service Principal event sourcing, public lifecycle streaming, event replay, and broker dead-letter queues are not applicable.
-- Service Principal databases, schemas, migrations, Secure ORM repositories, task leases, retry workers, and recovery queues are not applicable.
-- Gear-owned Terraform, container manifests, service-mesh policy, canary logic, and blue/green orchestration are not applicable because the gear is deployment-neutral.
-- Provider-principal sharding, replication, backup, and point-in-time recovery are not applicable because the identity provider owns authoritative principal data.
-- A currency-denominated gear cost budget is not applicable; quotas and benchmark-approved deployment envelopes provide capacity inputs.
-- Industry-specific certification and consent-management workflows are not applicable because the capability introduces no human profile collection.
+- Event sourcing, lifecycle event streaming, and broker dead-letter queues are not applicable; this
+  gear defines none.
+- Databases, schemas, migrations, Secure ORM repositories, task leases, and retry workers are not
+  applicable; this gear declares none.
+- Gear-owned Terraform, container manifests, service-mesh policy, canary logic, and blue/green
+  orchestration are not applicable; the gear is deployment-neutral.
+- Tenant-deprovision cleanup orchestration is not applicable to this gear; it is a documented
+  obligation of the registered provider adapter, discharged outside this gear's API and outside its
+  dependency graph.
+- Gear-specific configuration (§4.3) is not applicable; there is no typed configuration section for
+  this gear beyond adapter-owned policy.
+- A currency-denominated cost budget is not applicable; the gear runs no capacity dimension of its
+  own beyond a single authorization check and one delegated provider call per request.
+- **Regulatory, data-residency, vendor/licensing, and resource constraints** are not applicable as
+  gear-specific constraints: the gear stores no data of its own and is provider-agnostic by
+  construction (§2.1 Provider Authority); legacy-system integration does not apply to a newly
+  ported gear; and budget, team, and time constraints are inherited from the platform-wide release
+  process rather than declared here.
 
 ## 5. Traceability
 
 - **PRD**: [PRD.md](./PRD.md)
 - **UPSTREAM_REQS**: No upstream requirements artifact exists for this gear.
-- **ADRs**: None. This DESIGN states architecture without embedding decision debates.
+- **ADRs**: None. The body sections state architecture without embedding decision debates; see
+  [Appendix A](#appendix-a-decision-rationale) for non-normative rationale.
 - **Features**: No feature artifact exists for this gear.
 - **Implementation allocation**: Feature decomposition and code traceability are downstream work.
 
 ### Requirement Allocation Summary
 
 | Design Area | PRD Coverage |
-|-------------|--------------|
+|-------------|---------------|
 | Stateless architecture and provider boundary | `cpt-cf-service-principal-fr-provider-delegation`, `cpt-cf-service-principal-fr-provider-required`, `cpt-cf-service-principal-interface-rust-sdk`, `cpt-cf-service-principal-contract-provider-adapter`, `cpt-cf-service-principal-nfr-stateless-recovery` |
-| REST and public SDK contracts | `cpt-cf-service-principal-fr-create`, `cpt-cf-service-principal-fr-list`, `cpt-cf-service-principal-fr-rotate-secret`, `cpt-cf-service-principal-fr-revoke`, `cpt-cf-service-principal-interface-rest`, `cpt-cf-service-principal-interface-rust-sdk` |
+| REST and Rust provider contracts | `cpt-cf-service-principal-fr-create`, `cpt-cf-service-principal-fr-list`, `cpt-cf-service-principal-fr-rotate-secret`, `cpt-cf-service-principal-fr-revoke`, `cpt-cf-service-principal-interface-rest`, `cpt-cf-service-principal-interface-rust-sdk` |
 | Authorization and GTS catalog | `cpt-cf-service-principal-fr-authenticated-management`, `cpt-cf-service-principal-fr-independent-permissions`, `cpt-cf-service-principal-fr-tenant-authorization`, `cpt-cf-service-principal-fr-authz-fail-closed`, `cpt-cf-service-principal-interface-managed-resource`, `cpt-cf-service-principal-contract-authorization` |
-| Secret safety and invalidation | `cpt-cf-service-principal-fr-client-credentials-only`, `cpt-cf-service-principal-fr-identity-context`, `cpt-cf-service-principal-fr-secret-free-listing`, `cpt-cf-service-principal-nfr-secret-confidentiality`, `cpt-cf-service-principal-nfr-no-secret-persistence`, `cpt-cf-service-principal-nfr-credential-invalidation` |
+| Secret safety and classification | `cpt-cf-service-principal-fr-client-credentials-only`, `cpt-cf-service-principal-fr-identity-context`, `cpt-cf-service-principal-fr-secret-free-listing`, `cpt-cf-service-principal-nfr-secret-confidentiality`, `cpt-cf-service-principal-nfr-no-secret-persistence`, `cpt-cf-service-principal-nfr-data-classification` |
 | Input, quota, collision, and ownership | `cpt-cf-service-principal-fr-name-policy`, `cpt-cf-service-principal-fr-scope-allowlist`, `cpt-cf-service-principal-fr-tenant-quota`, `cpt-cf-service-principal-fr-create-collision`, `cpt-cf-service-principal-fr-ownership-addressing`, `cpt-cf-service-principal-fr-rotate-complete-state` |
-| Failure and operation-key reconciliation | `cpt-cf-service-principal-fr-failure-categories`, `cpt-cf-service-principal-fr-ambiguous-create-recovery`, `cpt-cf-service-principal-fr-ambiguous-rotate-recovery`, `cpt-cf-service-principal-fr-ambiguous-revoke-recovery` |
-| Tenant lifecycle cleanup | `cpt-cf-service-principal-fr-revoke-idempotent`, `cpt-cf-service-principal-fr-tenant-cleanup`, `cpt-cf-service-principal-contract-tenant-cleanup`, `cpt-cf-service-principal-nfr-cleanup-reliability` |
-| Security, audit, and operations | `cpt-cf-service-principal-nfr-data-classification`, `cpt-cf-service-principal-nfr-tenant-isolation`, `cpt-cf-service-principal-nfr-auditability`, `cpt-cf-service-principal-nfr-observability` |
-| Conformance and release qualification | `cpt-cf-service-principal-nfr-provider-conformance`, `cpt-cf-service-principal-nfr-contract-compatibility`, `cpt-cf-service-principal-nfr-performance-baseline`, `cpt-cf-service-principal-nfr-operational-documentation` |
+| Failure handling and ambiguous outcomes | `cpt-cf-service-principal-fr-failure-categories`, `cpt-cf-service-principal-fr-ambiguous-outcome-signaling`, `cpt-cf-service-principal-fr-revoke-idempotent` |
+| Tenant isolation | `cpt-cf-service-principal-nfr-tenant-isolation` |
+| Compatibility | `cpt-cf-service-principal-nfr-contract-compatibility` |
+
+## Appendix A: Decision Rationale
+
+Non-normative. No ADR artifact exists for this gear, so the rationale behind three architectural
+facts stated above is recorded here rather than in the body sections, which state architecture
+only. Nothing in this appendix adds, removes, or qualifies a requirement.
+
+### No by-id read on the item path
+
+Adding a single-item `GET` would require a by-id read on the `ServicePrincipalClientV1` trait, an
+SDK trait change every registered adapter would have to implement, while the collection `GET`
+already enumerates a tenant's full principal set. The `Location` header on `create` therefore
+follows RFC 9110 §10.2.2, which requires only that the header identify the created resource, not
+that the identified URI answer `GET`. Whether to add a by-id read is tracked as PRD open question
+4 (see §4.10).
+
+### 409 for ambiguous outcomes
+
+`Ambiguous` is mapped to `409` rather than to the `503` used for `Upstream` and
+`ProviderUnavailable` because `503` invites a naive same-request retry, and a retried create after
+an ambiguous create can hit `InvalidInput` ("name taken") when the first attempt in fact succeeded.
+`409` signals instead that recovery is caller-driven — `revoke` followed by a fresh `create` — not a
+blind retry. Automating that recovery behind a caller-supplied idempotency key is tracked as PRD
+open question 2 (see §4.2 and §4.10).
+
+### Supersession of pre-port drafts
+
+Design drafts predating the port of this gear into this repository assumed a recovery schema, a
+background worker, a cleanup API, and an operation-status API. None of those exist in the
+implementation this document describes, and §3.7, §4.2, and §4.11 state their absence
+normatively. This entry records only that the earlier drafts are superseded, so that the body
+sections need carry no historical framing.

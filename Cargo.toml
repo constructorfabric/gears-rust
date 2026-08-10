@@ -98,6 +98,8 @@ members = [
     "gears/system/authz-resolver/authz-resolver",
     "gears/system/authz-resolver/plugins/static-authz-plugin",
     "gears/system/authz-resolver/plugins/tr-authz-plugin",
+    "gears/system/service-principal/service-principal-sdk",
+    "gears/system/service-principal/service-principal",
     "gears/system/oagw/oagw",
     "gears/system/oagw/oagw-sdk",
     "gears/system/usage-collector/usage-collector-sdk",
@@ -309,6 +311,10 @@ authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.1
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.2", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.5", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.2", path = "gears/system/usage-collector/usage-collector-sdk" }
+
+# Service Principal gear (ported from vhp-core)
+service-principal = { path = "gears/system/service-principal/service-principal" }
+service-principal-sdk = { path = "gears/system/service-principal/service-principal-sdk" }
 
 # BSS gears (ported from vhp-core)
 bss-ledger-sdk = { path = "gears/bss/ledger/ledger-sdk" }

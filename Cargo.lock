@@ -9495,6 +9495,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "service-principal"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "cf-gears-authz-resolver",
+ "cf-gears-authz-resolver-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "gts",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "service-principal-sdk",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "service-principal-sdk"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-tenant-resolver-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-security",
+ "gts",
+ "gts-macros",
+ "schemars 1.2.1",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "sfv"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

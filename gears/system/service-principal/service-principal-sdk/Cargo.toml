@@ -1,0 +1,27 @@
+[package]
+name = "service-principal-sdk"
+edition.workspace = true
+license.workspace = true
+description = "Service Principal SDK: contract types and client API for the service-principal gear"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+secrecy = { workspace = true }
+tenant-resolver-sdk = { workspace = true }
+toolkit-security = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+gts = { workspace = true }
+gts-macros = { workspace = true }
+toolkit-gts = { workspace = true }
+toolkit = { workspace = true }
+
+[package.metadata.cargo-shear]
+# `toolkit_gts::gts_type_schema` expands into code referencing `gts_macros`;
+# `cargo expand` hides it from cargo-shear, so declare it ignored.
+ignored = ["gts-macros"]

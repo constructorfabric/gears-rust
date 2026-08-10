@@ -1,0 +1,47 @@
+[package]
+name = "service-principal"
+edition.workspace = true
+license.workspace = true
+description = "Service Principal gear: machine identity lifecycle and credential management"
+
+[lints]
+workspace = true
+
+[dependencies]
+service-principal-sdk = { workspace = true }
+authz-resolver-sdk = { workspace = true }
+# Full gear crates for the `deps = [authz_resolver, types_registry]` gear-macro arg:
+# the macro re-exports `::<crate>` to force-link each dependency gear's inventory
+# registration, so the crates (not just the SDKs) must be direct deps.
+authz-resolver = { workspace = true }
+types-registry = { workspace = true }
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-gts = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+gts = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+# Required as a normal dependency (NOT dev-only): the `gts_instance!` macro in
+# `gts::permissions` expands to code that references `serde_json` at the crate
+# root, so the production build needs it even though no non-test source names it
+# literally. cargo-shear still sees the literal uses in the test modules, so it
+# is not reported as unused.
+serde_json = { workspace = true }
+utoipa = { workspace = true }
+uuid = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[package.metadata.cargo-shear]
+# `gts` is used only via `gts_instance!`/`gts_id!` macro expansion in
+# `gts::permissions`, which cargo-shear cannot see.
+ignored = ["gts"]
+
+[dev-dependencies]
+tower = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }

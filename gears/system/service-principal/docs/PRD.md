@@ -22,7 +22,7 @@ Created: 2026-08-06 by Constructor Studio
   - [5.2 Principal Discovery](#52-principal-discovery)
   - [5.3 Credential Rotation and Revocation](#53-credential-rotation-and-revocation)
   - [5.4 Authentication and Authorization](#54-authentication-and-authorization)
-  - [5.5 Provider Contract and Recovery](#55-provider-contract-and-recovery)
+  - [5.5 Provider Contract and Failure Handling](#55-provider-contract-and-failure-handling)
 - [6. Non-Functional Requirements](#6-non-functional-requirements)
   - [6.1 Gear-Specific NFRs](#61-gear-specific-nfrs)
   - [6.2 NFR Exclusions](#62-nfr-exclusions)
@@ -32,9 +32,8 @@ Created: 2026-08-06 by Constructor Studio
 - [8. Use Cases](#8-use-cases)
   - [8.1 Create Workload Identity](#81-create-workload-identity)
   - [8.2 Inventory Tenant Principals](#82-inventory-tenant-principals)
-  - [8.3 Rotate Compromised or Expiring Credential](#83-rotate-compromised-or-expiring-credential)
+  - [8.3 Rotate a Credential](#83-rotate-a-credential)
   - [8.4 Revoke Workload Identity](#84-revoke-workload-identity)
-  - [8.5 Deprovision Tenant Principals](#85-deprovision-tenant-principals)
 - [9. Acceptance Criteria](#9-acceptance-criteria)
 - [10. Dependencies](#10-dependencies)
 - [11. Assumptions](#11-assumptions)
@@ -48,50 +47,71 @@ Created: 2026-08-06 by Constructor Studio
 
 ### 1.1 Purpose
 
-Service Principal provides tenant-scoped machine identities for workloads that need to authenticate without using human credentials. It gives authorized administrators one provider-neutral contract to create, inspect, rotate, and revoke confidential OAuth 2.0 `client_credentials` identities.
+Service Principal is a thin, authenticated REST facade that gives authorized administrators tenant-scoped
+machine identities for workloads that must authenticate without human credentials. It exposes create, list,
+rotate-secret, and revoke operations for confidential OAuth 2.0 `client_credentials` identities, and delegates
+every lifecycle operation to a pluggable identity-provider adapter through a versioned Rust trait
+(`ServicePrincipalClientV1`) resolved at request time from the platform `ClientHub`.
 
-The capability separates machine-identity management from human-user management. It also separates the stable Gears contract from identity-provider-specific behavior. Each principal belongs to one tenant, receives independently grantable management permissions, and exposes its secret only after creation or rotation.
+The gear holds no database, no background workers, and no local business logic beyond authorization and error
+mapping. It separates the stable, provider-neutral contract that callers depend on from the identity-provider
+specific behavior that an adapter implementation owns.
 
 ### 1.2 Background / Problem Statement
 
-Platform workloads need identities for service-to-service access, automation, and unattended jobs. Reusing human accounts weakens accountability, complicates credential rotation, and ties workload availability to a person's lifecycle. Direct identity-provider administration also gives every consumer a different integration surface and error model.
+Platform workloads need identities for service-to-service access, automation, and unattended jobs. Reusing
+human accounts weakens accountability, complicates credential rotation, and ties workload availability to a
+person's lifecycle. Direct identity-provider administration also gives every consumer a different integration
+surface and error model.
 
-A shared Gears capability is needed to manage machine identities consistently across tenants and provider implementations. It must protect high-value client secrets, prevent cross-tenant access, distinguish safe failures from uncertain provider outcomes, and remove credentials when their owning tenant is deprovisioned.
+A shared Gears capability is needed to manage machine identities consistently across tenants without binding
+consumers to one identity provider. It must keep client secrets out of inventory responses, logs, and caches;
+prevent cross-tenant management; and give callers a stable, versioned contract regardless of which provider
+adapter a deployment registers.
+
+Service Principal answers this by staying a stateless authorization-and-delegation boundary. The gear itself is
+the local Policy Enforcement Point (PEP) for machine-identity management: it asks the platform's external Policy
+Decision Point (PDP) whether the caller may perform the action, enforces the returned tenant-scoped decision
+against the explicit target tenant, resolves whichever adapter a deployment has registered in the `ClientHub`,
+and maps that adapter's outcome to a canonical RFC-9457 response. No adapter implementation ships in this
+repository; the SDK crate defines only the contract an adapter must satisfy.
 
 ### 1.3 Goals (Business Outcomes)
 
-- Give authorized tenant administrators a complete machine-identity lifecycle without direct provider administration.
-- Prevent workloads from relying on shared or human credentials.
-- Provide one provider-neutral REST and Rust contract for machine-identity management.
-- Enforce tenant isolation and least-privilege permissions for every management operation.
-- Make credential rotation, revocation, uncertain outcomes, and tenant cleanup observable and testable.
+- Give authorized tenant administrators a REST-only machine-identity lifecycle (create, list, rotate, revoke)
+  without direct identity-provider administration.
+- Keep the REST contract provider-neutral so a deployment can substitute its identity-provider adapter without
+  changing callers.
+- Prevent workloads from relying on shared or human credentials by minting dedicated confidential
+  `client_credentials` clients per workload.
+- Enforce tenant isolation and independently grantable permissions for every management action.
+- Keep client secrets out of every non-credential response, log, and cache.
 
 **Success criteria:**
 
 | Measure | Baseline | Initial target | Timeframe |
 |---|---:|---:|---|
-| Required lifecycle workflows passing provider conformance tests | No accepted Gears implementation | 100% | Before initial GA |
-| Unauthorized cross-tenant management operations succeeding in security tests | No accepted Gears implementation | 0 | Before initial GA |
-| Successful rotations that invalidate the superseded secret | No accepted Gears implementation | 100% | Before initial GA |
-| Successful revocations that prevent subsequent token acquisition | No accepted Gears implementation | 100% | Before initial GA |
-| Secret disclosures through list, log, diagnostic, telemetry, or cacheable-response checks | No accepted Gears implementation | 0 | Before initial GA |
-| Conforming identity-provider adapters | 0 accepted | At least 1 | Before initial GA |
-| Tenant deprovisioning scenarios leaving live owned principals | No accepted Gears implementation | 0 | Before initial GA |
+| Cross-tenant management operations that succeed despite a PDP scope not covering the target tenant | Not measured | 0 | Ongoing, verified by the authorization test suite |
+| Client secrets present in list/summary responses or in `Debug`-formatted credential values | Not measured | 0 | Ongoing, verified by DTO and domain tests |
+| Successful create/rotate responses that are not marked non-cacheable | Not measured | 0 | Ongoing, verified by the router test suite |
+| Revoke calls against an absent principal that return a failure instead of a success-equivalent result | Not measured | 0 | Ongoing, verified by the domain and router test suites |
+| REST operations reachable without a validated security context | Not measured | 0 | Ongoing, verified by route registration (`.authenticated()`) |
 
 ### 1.4 Glossary
 
 | Term | Definition |
 |---|---|
 | Service Principal | A tenant-owned, non-human identity used by a workload. |
+| Policy Decision Point (PDP) | The platform authorization service (`authz-resolver`) that evaluates an access request and returns a decision together with a tenant-scoped constraint. |
+| Policy Enforcement Point (PEP) | The component that requests a decision from the PDP and enforces it before acting. This gear is the PEP for every service-principal management operation. |
 | Machine Workload | A service, job, agent, or automation process that authenticates without a human user. |
 | Client Credentials | OAuth 2.0 grant in which a confidential client authenticates with its client identifier and secret. |
-| Provider Adapter | A conforming implementation that maps provider-neutral lifecycle operations to an identity provider and owns any durable reconciliation state required by those operations. |
+| Provider SPI (`ServicePrincipalClientV1`) | The versioned Rust trait an identity-provider adapter implements and registers in the `ClientHub`; the gear resolves it lazily per request. |
 | Owning Tenant | The tenant that controls a service principal and defines its authorization boundary. |
-| Subject ID | Stable identifier represented by the authenticated principal's subject claim. |
-| Clean Failure | A known failure in which the provider retained no new state from the operation. |
-| Ambiguous Outcome | A failure where provider state may have changed, so success cannot be claimed and reconciliation is required. |
-| One-Time Disclosure | Plaintext secret exposure through the Service Principal public contract only after successful creation or rotation. |
-| Reconciliation | A follow-up action that establishes a known principal or credential state after an ambiguous outcome. |
+| Subject ID | The stable identifier carried by the principal's subject claim, used for RBAC bindings. |
+| Clean Failure | An SPI failure category in which the provider retained no new state from the operation. |
+| Ambiguous Outcome | An SPI failure category in which the provider may have retained state, so the operation cannot be reported as success. |
+| One-Time Disclosure | Plaintext secret exposure through the create/rotate-secret responses only. |
 
 ## 2. Actors
 
@@ -102,9 +122,10 @@ A shared Gears capability is needed to manage machine identities consistently ac
 **ID**: `cpt-cf-service-principal-actor-tenant-automation-admin`
 
 - **Role**: An authorized operator who manages machine identities within an allowed tenant scope.
-- **Needs**: Create workload identities, inspect their non-secret state, rotate credentials, revoke access, and recover safely from uncertain outcomes.
+- **Needs**: Create workload identities, inspect their non-secret state, rotate credentials, and revoke access.
 
-A platform administrator can perform the same workflow across broader tenant scopes when platform policy grants that access. This is not a separate product workflow.
+A platform administrator can perform the same workflow across broader tenant scopes when platform policy grants
+that access (an unconstrained or wider PDP scope). This is not a separate product workflow.
 
 ### 2.2 System Actors
 
@@ -113,104 +134,123 @@ A platform administrator can perform the same workflow across broader tenant sco
 **ID**: `cpt-cf-service-principal-actor-machine-workload`
 
 - **Role**: Uses issued credentials to request access tokens through the OAuth 2.0 `client_credentials` grant.
-- **Needs**: A stable tenant-scoped identity, valid credentials, and immediate invalidation of superseded or revoked credentials.
+- **Needs**: A stable tenant-scoped identity and valid credentials, with superseded or revoked credentials
+  becoming unusable.
 
 #### Authorization Resolver
 
 **ID**: `cpt-cf-service-principal-actor-authz-resolver`
 
-- **Role**: Decides whether a caller may perform a specific Service Principal action for the target tenant.
+- **Role**: The platform Policy Decision Point (PDP) (`authz-resolver`). The gear, acting as the Policy
+  Enforcement Point, asks it whether the caller may perform a given action, and it returns a tenant-scoped
+  constraint the gear checks against the explicit target tenant before delegating.
 
 #### Identity Provider Adapter
 
 **ID**: `cpt-cf-service-principal-actor-provider-adapter`
 
-- **Role**: Implements the provider-neutral lifecycle contract, owns restart-safe create and rotation reconciliation, and reports clean or ambiguous outcomes accurately.
+- **Role**: Implements `ServicePrincipalClientV1` and registers itself in the `ClientHub`. Owns authoritative
+  principal state, enforces provider-side input policy (name syntax, scope allowlist, per-tenant quota), and
+  classifies its own outcomes into the four SPI failure categories. No adapter implementation ships in this
+  repository.
 
 #### Consuming Gear
 
 **ID**: `cpt-cf-service-principal-actor-consuming-gear`
 
-- **Role**: Uses the public Rust interface to manage service principals as part of a wider platform workflow.
-
-#### Tenant Lifecycle Owner
-
-**ID**: `cpt-cf-service-principal-actor-tenant-lifecycle-owner`
-
-- **Role**: Owns durable tenant-deprovision state, invokes the identity-provider tenant-deprovision contract, and requires all machine identities owned by that tenant to be removed.
+- **Role**: Calls the authenticated REST interface to manage service principals as part of a wider platform
+  workflow. Behaves like any other authenticated REST caller; the gear defines no separate in-process client for
+  trusted callers.
 
 #### Types and Permission Registry
 
 **ID**: `cpt-cf-service-principal-actor-types-registry`
 
-- **Role**: Registers the managed-resource type, service-subject classification, and independently grantable actions.
+- **Role**: Aggregates, at startup, the managed-resource type and the four permission instances this gear
+  declares through the link-time GTS inventory (`types-registry` gear dependency).
 
 ## 3. Operational Concept & Environment
 
-Service Principal follows the project-wide Gears and ToolKit baselines in [ToolKit Architecture & Developer Guide](../../../../docs/toolkit_unified_system/README.md). This PRD records only capability-specific constraints.
+Service Principal follows the project-wide Gears and ToolKit baselines in
+[ToolKit Architecture & Developer Guide](../../../../docs/toolkit_unified_system/README.md). This PRD records
+only capability-specific constraints.
 
-The capability is an administrative control-plane surface. It does not participate in request-path token validation. Its provider-neutral contract is separate from the provider adapter that owns identity-provider state.
+The gear is an administrative control-plane surface with two hard `#[toolkit::gear]` dependencies
+(`types_registry`, `authz_resolver`) and one `rest` capability. It holds no database and starts no background
+task; per request it acts as the Policy Enforcement Point — obtaining a decision from the external Policy
+Decision Point and enforcing it against the explicit tenant — then resolves the registered
+`ServicePrincipalClientV1` implementation from the `ClientHub`, delegates, and maps the result to a canonical
+response.
 
 ```mermaid
 graph LR
-    Admin["Tenant Automation Administrator"] -->|manage tenant-owned identities| SP["Service Principal Capability"]
-    Gear["Consuming Gear"] -->|provider-neutral lifecycle contract| SP
-    SP -->|authorize action for tenant| AuthZ["Authorization Resolver"]
-    SP -->|delegate lifecycle operation| Provider["Identity Provider Adapter"]
-    Provider -->|manage confidential identity| IdP["Identity Provider"]
+    Admin["Tenant Automation Administrator"] -->|create, list, rotate, revoke| SP["Service Principal REST Facade"]
+    Gear["Consuming Gear"] -->|authenticated REST calls| SP
+    SP -->|request decision for explicit tenant| AuthZ["Authorization Resolver (PDP)"]
+    SP -->|resolve from ClientHub, delegate| Provider["Identity Provider Adapter (ServicePrincipalClientV1)"]
+    Provider -->|manage confidential client| IdP["Identity Provider"]
     Workload["Machine Workload"] -->|client_credentials| IdP
-    TenantOwner["Tenant Lifecycle Owner"] -->|authorized tenant deprovision| Provider
 ```
 
-The diagram is warranted because the capability coordinates several independent actors and trust boundaries.
+The diagram is warranted because the facade, as the Policy Enforcement Point, coordinates three independent trust
+boundaries: the caller, the Policy Decision Point, and the pluggable provider.
 
 ### 3.1 Gear-Specific Environment Constraints
 
-- A deployment must provide one conforming identity-provider adapter before lifecycle operations can succeed.
-- The identity provider must support confidential `client_credentials` identities and immediate credential invalidation.
-- Callers must have approved credential storage because the capability does not retain plaintext secrets for later retrieval.
+- A deployment must register one `ServicePrincipalClientV1` implementation in the `ClientHub` before any
+  lifecycle operation can succeed; absence is reported as the capability being unavailable rather than as a
+  simulated success.
+- Name syntax, scope allowlisting, and per-tenant quota are enforced by the registered provider adapter, not by
+  this gear; the gear performs no independent validation of those fields before delegating.
 - Lifecycle operations are low-frequency administrative operations, not high-volume request-path operations.
 
 ## 4. Scope
 
 ### 4.1 In Scope
 
-- Tenant-scoped service-principal creation.
-- Secret-free listing by owning tenant.
-- Secret rotation and superseded-secret invalidation.
-- Idempotent revocation and credential invalidation.
-- Independent authorization for create, read, rotate-secret, and revoke actions.
-- Provider-neutral REST and Rust interfaces.
-- Provider conformance and failure classification.
-- Configurable name, scope, and per-tenant quota policy.
-- Tenant-deprovision cleanup through the identity-provider tenant-lifecycle contract.
-- Lifecycle latency and categorized failure telemetry.
-- Stable managed-resource, subject, and permission identifiers.
+- Tenant-scoped creation of a confidential `client_credentials` service principal via REST, returning a client
+  identifier, one-time plaintext secret, token endpoint, and subject identifier.
+- Secret-free listing of a tenant's service principals in upstream order (no pagination).
+- Secret rotation returning a new one-time secret through a non-cacheable response.
+- Idempotent revocation: an already-absent principal is treated as a successful revoke.
+- Independent authorization of the `create`, `read`, `rotate_secret`, and `revoke` actions against the explicit
+  target tenant.
+- A versioned REST management interface and a versioned Rust provider SPI; the gear defines no separate public
+  in-process Rust management client.
+- Mapping of the SPI's four failure categories (invalid input, not found, clean failure, ambiguous), plus the
+  gear's own access-denied and provider-unavailable outcomes, to RFC-9457 canonical error responses.
+- Registration of a managed-resource GTS type and four independently grantable permission instances.
 
 ### 4.2 Out of Scope
 
 - Human-user identity, password, session, MFA, or interactive-login management.
-- Authorization policy authoring, role assignment, or policy evaluation implementation.
+- Authorization policy authoring, role assignment, or policy-evaluation implementation (owned by the
+  Authorization Resolver).
 - Long-term credential storage, secret distribution, or workload injection.
-- Retrieval of an existing plaintext client secret.
+- Retrieval of an existing plaintext client secret; the secret is returned only by create and rotate-secret.
 - Access-token validation, token exchange, refresh tokens, or authorization-code flows.
 - Workload-side token acquisition or token caching.
 - Get-by-ID, principal updates, enable/disable, search, filtering, sorting, or pagination.
 - Bulk lifecycle operations.
-- Multi-provider selection per tenant or request.
+- Multi-provider selection per tenant or request; exactly one adapter is resolved per deployment.
 - Provider migration or credential portability.
 - A dedicated CLI or graphical management interface.
-- A Service Principal-owned principal database, provider-state replica, recovery repository, retry worker, or cleanup coordinator.
-- Distributed transactions across the capability, provider, credential store, and workload.
-- Automatic repair of every ambiguous provider outcome.
-- Offline lifecycle mutations while the provider is unavailable.
-- Strongly serialized quota enforcement across concurrent requests.
-- Lifecycle event streaming in the initial version.
+- A Service Principal-owned principal database, provider-state replica, or retry/reconciliation worker.
+- Idempotency-key or operation-key based retry of ambiguous create/rotate outcomes; the gear surfaces an
+  ambiguous outcome as its own distinct failure and leaves recovery to the caller.
+- Name-syntax, scope-allowlist, and quota validation performed by this gear; these are delegated entirely to the
+  registered provider adapter.
+- Tenant-deprovision cleanup orchestration. Deleting a tenant's principals when that tenant is deprovisioned is
+  a documented obligation of the provider SPI contract, discharged by the registered adapter; this gear performs
+  no tenant-lifecycle orchestration of its own.
+- A common cross-adapter provider-conformance test harness; only the trait contract is defined here.
+- Lifecycle event streaming.
 - Provider-specific realm, mapper, account, or administration behavior.
 
 ## 5. Functional Requirements
 
-> **Testing strategy**: Functional requirements are verified through automated unit, contract, integration, security, and end-to-end tests unless a requirement states otherwise.
+> **Testing strategy**: Functional requirements are verified through automated unit, service, and router tests
+> in the `service-principal` and `service-principal-sdk` crates unless a requirement states otherwise.
 
 ### 5.1 Principal Creation
 
@@ -218,63 +258,80 @@ The diagram is warranted because the capability coordinates several independent 
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-create`
 
-The system **MUST** allow an authorized administrator to create a confidential service principal owned by an explicit target tenant. A successful operation **MUST** return a client identifier, plaintext client secret, token endpoint, and stable subject identifier.
+The system **MUST** allow an authorized administrator to create a confidential `client_credentials` service
+principal owned by an explicit target tenant. A successful creation **MUST** report the new principal's address
+and disclose, exactly once, everything the workload needs to authenticate: the client identifier, the plaintext
+client secret, the token endpoint, and the subject identifier. That credential-bearing response **MUST NOT** be
+cached or stored by intermediaries.
 
-- **Rationale**: Workloads need dedicated non-human credentials and stable identity for policy bindings.
+- **Rationale**: Workloads need dedicated non-human credentials and a stable identity for policy bindings.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-machine-workload`
+- **Acceptance Evidence**: `service-principal/src/api/rest/routes_tests.rs::create_returns_201_with_location_and_no_store_and_secret_body`
 
 #### Client Credentials Only
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-client-credentials-only`
 
-The system **MUST** create service principals that authenticate as confidential OAuth 2.0 `client_credentials` identities and **MUST NOT** enable interactive human authentication flows through this capability.
+The system **MUST** create service principals that authenticate only as confidential OAuth 2.0
+`client_credentials` identities. The create request and response models carry no field for an interactive or
+human authentication flow.
 
 - **Rationale**: Machine identities must remain separate from human login and session semantics.
 - **Actors**: `cpt-cf-service-principal-actor-machine-workload`
 
-#### Tenant and Subject Classification
+#### Tenant and Subject Identity Binding
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-identity-context`
 
-The system **MUST** ensure that an access token obtained through `client_credentials` using credentials returned by successful creation contains the target tenant, a subject exactly equal to the creation response's `Subject`, and `client_credentials` identity context. Every supported provider adapter **MUST** prove this credential-to-token binding through conformance tests.
+The system **MUST** pass the explicit target tenant to the provider adapter on create, and the create response
+**MUST** return the subject identifier the adapter assigned. Every registered provider adapter is responsible for
+issuing tokens that carry that tenant and subject as a non-human identity.
 
 - **Rationale**: Downstream authorization needs an unambiguous tenant and non-human subject classification.
 - **Actors**: `cpt-cf-service-principal-actor-machine-workload`, `cpt-cf-service-principal-actor-provider-adapter`
 
-#### Name Policy
+#### Provider-Enforced Name Policy
 
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-name-policy`
+- [ ] `p2` - **ID**: `cpt-cf-service-principal-fr-name-policy`
 
-The system **MUST** validate caller-selected principal names against a bounded deployment policy before requesting provider mutation.
+The registered provider adapter **MUST** reject a caller-selected principal name that violates its bounded
+syntax before any provider mutation. The gear forwards the caller-supplied name unmodified and surfaces the
+adapter's rejection as invalid input.
 
 - **Rationale**: Safe, bounded names prevent invalid provider resources and inconsistent public identifiers.
-- **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`
+- **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-provider-adapter`
 
-#### Scope Allowlist
+#### Provider-Enforced Scope Allowlist
 
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-scope-allowlist`
+- [ ] `p2` - **ID**: `cpt-cf-service-principal-fr-scope-allowlist`
 
-The system **MUST** reject any requested client scope that is not present in the deployment-controlled allowlist.
+The registered provider adapter **MUST** reject any requested client scope that is not present in its
+deployment-controlled allowlist. The gear forwards the caller-supplied scopes unmodified and surfaces the
+adapter's rejection as invalid input.
 
 - **Rationale**: Callers must not escalate workload privileges by requesting arbitrary provider scopes.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-provider-adapter`
 
-#### Configurable Tenant Quota
+#### Provider-Enforced Tenant Quota
 
-- [ ] `p2` - **ID**: `cpt-cf-service-principal-fr-tenant-quota`
+- [ ] `p3` - **ID**: `cpt-cf-service-principal-fr-tenant-quota`
 
-The system **MUST** support a configurable maximum number of service principals per tenant and reject creation when the observed count reaches that maximum. The quota is best-effort under concurrent creation and **MUST NOT** be presented as a security boundary.
+The registered provider adapter **MAY** enforce a best-effort maximum number of service principals per tenant
+and reject creation once that maximum is reached. The gear neither counts nor enforces a quota itself.
 
-- **Rationale**: A bounded initial collection limits accidental growth while preserving honest concurrency semantics.
+- **Rationale**: A bounded collection limits accidental growth while preserving honest concurrency semantics;
+  the gear stays a stateless facade with no principal inventory of its own.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-provider-adapter`
 
 #### Creation Collision Safety
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-create-collision`
 
-The system **MUST** reject a creation request when its provider-side identifier is already occupied and **MUST NOT** resume, reveal, or modify the existing principal as part of that request.
+The system **MUST** reject a creation request as invalid input when the provider reports its target identifier
+is already occupied, and **MUST NOT** resume, reveal, or modify the existing principal as part of that request.
 
-- **Rationale**: Reusing an existing identity could disclose credentials or attach privileges to the wrong workload.
+- **Rationale**: Reusing an existing identity could disclose credentials or attach privileges to the wrong
+  workload.
 - **Actors**: `cpt-cf-service-principal-actor-provider-adapter`
 
 ### 5.2 Principal Discovery
@@ -283,16 +340,19 @@ The system **MUST** reject a creation request when its provider-side identifier 
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-list`
 
-The system **MUST** list service principals owned by an authorized target tenant and return each principal's non-secret management state.
+The system **MUST** list the service principals owned by an authorized target tenant, returning each principal's
+client id, enabled state, and attached scopes in upstream order.
 
 - **Rationale**: Administrators need inventory for audit, rotation, and revocation workflows.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`
+- **Acceptance Evidence**: `service-principal/src/api/rest/routes_tests.rs::list_returns_200_with_summaries`
 
 #### Secret-Free Discovery
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-secret-free-listing`
 
-The system **MUST NOT** expose client secrets through list or future read operations.
+The system **MUST NOT** include a client secret field in the listing model or in any future read model derived
+from it.
 
 - **Rationale**: Inventory access must not grant credential access.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`
@@ -301,7 +361,9 @@ The system **MUST NOT** expose client secrets through list or future read operat
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-ownership-addressing`
 
-The system **MUST** treat a principal as addressable only when it belongs to the explicit target tenant. A missing or foreign principal **MUST NOT** disclose foreign ownership details.
+The system **MUST** treat a `client_id` as addressable, for rotate-secret and revoke, only when it resolves
+within the explicit target tenant. An address that does not resolve within that tenant **MUST** return not-found
+without disclosing whether the id exists under a different tenant.
 
 - **Rationale**: Tenant-qualified addressing prevents cross-tenant object access and information leakage.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-provider-adapter`
@@ -312,37 +374,48 @@ The system **MUST** treat a principal as addressable only when it belongs to the
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-rotate-secret`
 
-The system **MUST** allow an authorized administrator to rotate a tenant-owned principal's secret. A successful rotation **MUST** return the new secret and invalidate the superseded secret.
+The system **MUST** allow an authorized administrator to rotate a tenant-owned principal's secret without
+changing its identity. A successful rotation **MUST** disclose the new secret exactly once, in a response that
+**MUST NOT** be cached or stored by intermediaries.
 
-- **Rationale**: Workloads need regular and incident-driven credential replacement without replacing their identity.
+- **Rationale**: Workloads need regular and incident-driven credential replacement without replacing their
+  identity.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-machine-workload`
+- **Acceptance Evidence**: `service-principal/src/api/rest/routes_tests.rs::rotate_secret_returns_200_with_no_store_and_new_secret`
 
-#### Reject Incomplete Principal Rotation
+#### Reject Rotation for an Unresolved Principal
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-rotate-complete-state`
 
-The system **MUST** reject rotation when the provider cannot confirm the principal's ownership and required managed identity state.
+The system **MUST** return not-found, rather than succeeding, when the addressed `client_id` does not resolve
+within the target tenant at rotation time.
 
-- **Rationale**: Rotation must not issue a credential for a foreign, incomplete, or corrupted identity.
+- **Rationale**: Rotation must not issue a credential for a foreign or nonexistent identity.
 - **Actors**: `cpt-cf-service-principal-actor-provider-adapter`
+- **Acceptance Evidence**: `service-principal/src/api/rest/routes_tests.rs::rotate_secret_not_found_renders_canonical_problem`
 
 #### Revoke Principal
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-revoke`
 
-The system **MUST** allow an authorized administrator to revoke a tenant-owned service principal. Successful revocation **MUST** prevent subsequent token acquisition by that principal.
+The system **MUST** allow an authorized administrator to revoke a tenant-owned service principal, and **MUST**
+report the outcome as a success that carries no principal state and no credential material.
 
 - **Rationale**: Administrators need an immediate way to terminate workload access.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-machine-workload`
+- **Acceptance Evidence**: `service-principal/src/api/rest/routes_tests.rs::revoke_returns_204`
 
 #### Idempotent Revocation
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-revoke-idempotent`
 
-The system **MUST** treat revocation of an already-absent principal as success-equivalent.
+The system **MUST** treat revocation of an already-absent principal (a provider not-found outcome) as
+indistinguishable from revocation of a present one, not as a failure.
 
-- **Rationale**: Cleanup and reconciliation must converge without requiring callers to distinguish concurrent deletion from prior success.
-- **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-tenant-lifecycle-owner`
+- **Rationale**: Cleanup and reconciliation must converge without requiring callers to distinguish concurrent
+  deletion from prior success.
+- **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`
+- **Acceptance Evidence**: `service-principal/src/domain/service_tests.rs::revoke_is_idempotent_on_not_found`
 
 ### 5.4 Authentication and Authorization
 
@@ -350,7 +423,8 @@ The system **MUST** treat revocation of an already-absent principal as success-e
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-authenticated-management`
 
-The system **MUST** require a validated platform security context for every public management operation.
+The system **MUST** require a validated platform security context for every management route (`create`, `list`,
+`rotate_secret`, `revoke`).
 
 - **Rationale**: Anonymous callers must never manage machine credentials.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-authz-resolver`
@@ -359,36 +433,45 @@ The system **MUST** require a validated platform security context for every publ
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-independent-permissions`
 
-The system **MUST** authorize create, read, rotate-secret, and revoke as independently grantable actions.
+The system **MUST** authorize `create`, `read`, `rotate_secret`, and `revoke` as four independently grantable
+GTS permission instances against the service-principal managed-resource type.
 
 - **Rationale**: Credential minting and revocation require narrower delegation than general inventory access.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-authz-resolver`
+- **Acceptance Evidence**: `service-principal/src/gts/permissions_tests.rs`
 
 #### Explicit Tenant Authorization
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-tenant-authorization`
 
-The system **MUST** authorize each operation against the explicit owning tenant and verify that returned tenant constraints cover that target. Authorization for one tenant or subtree **MUST NOT** authorize an unrelated tenant.
+The system **MUST** authorize each operation against the explicit owning tenant and verify that the PDP's
+returned scope actually covers that tenant (or is unconstrained) before delegating. A decision that is `true`
+for a different tenant or subtree **MUST NOT** authorize the explicit target tenant.
 
 - **Rationale**: A broad or mismatched policy decision must not create a broken object-level authorization path.
 - **Actors**: `cpt-cf-service-principal-actor-authz-resolver`
+- **Acceptance Evidence**: `service-principal/src/domain/service_tests.rs::create_for_a_different_tenant_than_the_pdp_scope_is_access_denied`
 
 #### Fail-Closed Authorization
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-authz-fail-closed`
 
-The system **MUST** deny the operation when caller identity, policy evaluation, or required tenant constraints cannot be established.
+The system **MUST** deny the operation when the PDP denies the request, when constraint compilation fails, or
+when policy evaluation itself fails.
 
 - **Rationale**: Security dependency failures must not widen access.
 - **Actors**: `cpt-cf-service-principal-actor-authz-resolver`
+- **Acceptance Evidence**: `service-principal/src/domain/authz.rs` (`map_enforcer_err` tests)
 
-### 5.5 Provider Contract and Recovery
+### 5.5 Provider Contract and Failure Handling
 
 #### Provider-Neutral Delegation
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-provider-delegation`
 
-The system **MUST** delegate principal lifecycle operations through a versioned provider-neutral contract so conforming adapters can be substituted without changing callers.
+The system **MUST** delegate every lifecycle operation through the versioned `ServicePrincipalClientV1` trait,
+resolved lazily per request from the `ClientHub`, so a conforming adapter can be substituted without changing
+callers or the REST contract.
 
 - **Rationale**: The Gears capability must not bind consumers to one identity provider.
 - **Actors**: `cpt-cf-service-principal-actor-provider-adapter`, `cpt-cf-service-principal-actor-consuming-gear`
@@ -397,59 +480,45 @@ The system **MUST** delegate principal lifecycle operations through a versioned 
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-provider-required`
 
-The system **MUST** fail explicitly and without simulated success when no conforming provider adapter is available.
+The system **MUST** report the capability as unavailable, without attempting a simulated success, when no
+provider adapter is registered in the `ClientHub`.
 
 - **Rationale**: Provider absence means authoritative identity state cannot be created or changed safely.
 - **Actors**: `cpt-cf-service-principal-actor-provider-adapter`
+- **Acceptance Evidence**: `service-principal/src/domain/service_tests.rs::provider_absent_is_provider_unavailable`
 
 #### Stable Failure Categories
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-failure-categories`
 
-The system **MUST** define one six-category failure taxonomy for end-to-end classification of provider outcomes, REST responses, and Rust SDK errors: invalid input, not found, clean failure, ambiguous outcome, authorization failure, and provider unavailability. The provider contract's four outcomes **MUST** map directly to the first four categories. Authorization failure **MUST** identify failure to establish caller identity, policy approval, or matching tenant constraints before provider invocation. Provider unavailability **MUST** identify provider absence or an availability failure known to prevent mutation; if a provider request may have mutated state, the outcome **MUST** instead be ambiguous and **MUST NOT** be reported as success. REST and Rust consumers **MUST** receive the same category and retry or reconciliation semantics. Adding, renaming, or splitting a Rust SDK or provider category **MUST** require a new major contract version with migration guidance; older consumers encountering an unknown category **MUST** treat it as failure and as ambiguous whenever mutation cannot be ruled out.
+The system **MUST** map the SPI's four closed failure categories (invalid input, not found, clean failure,
+ambiguous) plus its own access-denied and provider-unavailable outcomes onto canonical RFC-9457 problem
+responses, such that a caller can distinguish invalid input, not found, access denied, an unavailable or cleanly
+failed provider, and an ambiguous outcome from one another without parsing free text.
 
-- **Rationale**: Callers need deterministic retry and reconciliation behavior.
+- **Rationale**: Callers need a deterministic, machine-readable response for every outcome the provider can
+  report.
 - **Actors**: `cpt-cf-service-principal-actor-provider-adapter`, `cpt-cf-service-principal-actor-consuming-gear`
+- **Acceptance Evidence**: `service-principal/src/api/rest/error.rs::variants_map_to_expected_statuses`
 
-#### Ambiguous Creation Recovery
+#### Ambiguous Outcome Signaling
 
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-ambiguous-create-recovery`
+- [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-ambiguous-outcome-signaling`
 
-Every create attempt **MUST** carry a caller-generated operation key bound to the explicit tenant and canonical request identity. After an ambiguous result, the caller **MUST** reconcile by repeating the identical request with the same key. The adapter **MUST** reconcile before further mutation and classify provider evidence as `exact_binding`, `authoritative_absence`, or `inconclusive`. `exact_binding` **MUST** return a non-secret `credentials_unavailable` failed-precondition result with the confirmed principal identity and rotation guidance. `authoritative_absence` **MAY** permit a fresh create with a new key. `inconclusive` **MUST** remain ambiguous and block conflicting mutation. Reusing a key for another tenant, operation, or request identity **MUST** be invalid input.
+The system **MUST** report a provider outcome the adapter classifies as ambiguous (state may have been retained)
+as its own distinct outcome — never as success and never as the same outcome used for a safely retryable
+provider failure — so a caller does not blindly retry a request that may have already mutated provider state.
 
-- **Rationale**: Ambiguous creation must not justify destructive action against a tenant principal whose relationship to the uncertain request is unproven.
+- **Rationale**: A half-applied create or rotation must not be indistinguishable from a transient, safely
+  retryable failure.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-provider-adapter`
-
-#### Ambiguous Rotation Recovery
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-ambiguous-rotate-recovery`
-
-Every rotation **MUST** carry a caller-generated operation key. After an ambiguous result, the caller **MUST** repeat only the identical request with the same key. The adapter **MUST** reconcile before further mutation. A confirmed prior rotation whose secret response was lost **MUST** return `credentials_unavailable`; the caller **MUST** use a new operation key for a subsequently confirmed rotation before adopting replacement credentials. Plaintext credentials **MUST NOT** be persisted or replayed.
-
-- **Rationale**: An uncertain rotation cannot establish which credential is safe to use.
-- **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-machine-workload`
-
-#### Ambiguous Revocation Recovery
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-ambiguous-revoke-recovery`
-
-When revocation has an ambiguous outcome, the system **MUST** allow repeated revocation until the principal is confirmed revoked or already absent.
-
-- **Rationale**: Repeated deletion is the safe convergence path after transport uncertainty.
-- **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-provider-adapter`
-
-#### Tenant Deprovision Cleanup
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-tenant-cleanup`
-
-The tenant lifecycle owner **MUST** authenticate and authorize tenant deprovisioning for an explicit target tenant, durably retain retryable lifecycle state, and invoke the identity-provider tenant-deprovision contract. The provider adapter **MUST** delete only principals authoritatively owned by that tenant and **MUST** confirm that no live owned principal remains before returning success. Already-absent principals are success-equivalent. A transient cleanup failure **MUST** block teardown and remain retryable through the tenant-lifecycle operation; a permanent failure **MUST** block teardown and remain operator-visible. Service Principal **MUST NOT** own cleanup state, scheduling, or a cleanup API.
-
-- **Rationale**: A machine credential must not outlive its authorization boundary, and cleanup must preserve the same tenant isolation and accountability as other lifecycle operations.
-- **Actors**: `cpt-cf-service-principal-actor-tenant-lifecycle-owner`, `cpt-cf-service-principal-actor-provider-adapter`
 
 ## 6. Non-Functional Requirements
 
-Architecture and engineering conventions are inherited from the [ToolKit Architecture & Developer Guide](../../../../docs/toolkit_unified_system/README.md) and [project guidelines](../../../../guidelines/README.md). The requirements below define Service Principal-specific obligations. Where a quantitative target still requires production evidence, this section defines an explicit release gate rather than assuming an undocumented baseline.
+Architecture and engineering conventions are inherited from the
+[ToolKit Architecture & Developer Guide](../../../../docs/toolkit_unified_system/README.md) and
+[project guidelines](../../../../guidelines/README.md). The requirements below define Service Principal-specific
+obligations grounded in the current implementation.
 
 ### 6.1 Gear-Specific NFRs
 
@@ -457,143 +526,120 @@ Architecture and engineering conventions are inherited from the [ToolKit Archite
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-nfr-secret-confidentiality`
 
-The system **MUST** prevent plaintext client secrets from appearing in list responses, logs, debug output, diagnostics, telemetry, and cacheable responses. Credential-bearing responses **MUST** be non-cacheable.
+The system **MUST** prevent plaintext client secrets from appearing in list responses or in the `Debug`
+representation of any credential-bearing type, and every credential-bearing response **MUST NOT** be cached or
+stored by intermediaries.
 
-- **Threshold**: Zero secret disclosures across automated negative checks for these surfaces.
+- **Threshold**: Zero secret disclosures across the DTO redaction tests and zero credential responses that are
+  not marked non-cacheable across the router test suite.
 - **Rationale**: A leaked client secret grants workload identity until rotation or revocation.
-- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation), [REST V1 contract](./DESIGN.md#service-principal-rest-v1), and [Security and Data Protection](./DESIGN.md#44-security-and-data-protection).
+- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation) and
+  [Security and Data Protection](./DESIGN.md#44-security-and-data-protection).
 
-#### Data Classification and Privacy
+#### Data Classification
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-nfr-data-classification`
 
-The system **MUST** treat plaintext client secrets and provider verifier material as restricted authentication credentials. It **MUST** treat client identifiers, subject identifiers, tenant ownership, scopes, operation keys and fingerprints, and lifecycle outcomes as security-sensitive control-plane metadata. The capability **MUST NOT** intentionally collect human profile attributes or unrelated personal data.
+The system **MUST** treat plaintext client secrets as restricted authentication credentials, wrapped in a
+redacting, non-serializable secret type. It **MUST** treat client identifiers, subject identifiers, tenant
+ownership, and scopes as security-sensitive control-plane metadata, distinct from and never mixed with human
+profile attributes.
 
-- **Threshold**: Every field in the public and provider contracts has an approved security classification before release, and conformance checks find zero human profile attributes or unrelated personal data.
-- **Rationale**: Explicit classification keeps credential controls, telemetry, retention, and privacy treatment aligned with actual data sensitivity.
-- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation), [Security and Data Protection](./DESIGN.md#44-security-and-data-protection), and [Compliance and Privacy Posture](./DESIGN.md#48-compliance-and-privacy-posture).
+- **Threshold**: Zero plaintext secret disclosures in debug-formatted output or serialized representations of
+  the credential model, verified by the redaction tests.
+- **Rationale**: Explicit classification keeps credential handling aligned with actual data sensitivity.
+- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation) and
+  [Security and Data Protection](./DESIGN.md#44-security-and-data-protection).
 
-#### No Plaintext Secret Persistence
+#### No Local Secret Persistence
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-nfr-no-secret-persistence`
 
-The Service Principal capability **MUST NOT** persist plaintext client secrets or operation-reconciliation state. A provider adapter **MUST NOT** persist or replay plaintext credential responses as part of reconciliation. The identity provider may retain verifier material according to its security contract.
+The Service Principal gear **MUST NOT** persist plaintext client secrets or any lifecycle state. The gear's
+domain `Service` holds only the PDP `PolicyEnforcer` and a `ClientHub` handle; it declares no database and no
+storage dependency.
 
-- **Threshold**: Zero Service Principal-owned plaintext secret records and zero adapter reconciliation records containing a plaintext or replayable credential response.
-- **Rationale**: The capability is a lifecycle facade, not a credential store.
-- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation), [Database Schemas and Tables](./DESIGN.md#37-database-schemas--tables), and [Security and Data Protection](./DESIGN.md#44-security-and-data-protection).
+- **Threshold**: Zero Service Principal-owned tables, files, or caches containing a plaintext or replayable
+  credential.
+- **Rationale**: The gear is a lifecycle facade, not a credential store.
+- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation) and
+  [Database Schemas and Tables](./DESIGN.md#37-database-schemas--tables).
 
 #### Tenant Isolation
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-nfr-tenant-isolation`
 
-The system **MUST** prevent management operations from crossing unauthorized tenant boundaries.
+The system **MUST** prevent management operations from crossing unauthorized tenant boundaries, even when the
+PDP grants an unconstrained or differently-scoped decision.
 
-- **Threshold**: Zero unauthorized successes in the cross-tenant security suite.
+- **Threshold**: Zero unauthorized successes in the cross-tenant authorization tests.
 - **Rationale**: Machine credentials are high-impact tenant resources.
-- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation), [Authorization Gate](./DESIGN.md#authorization-gate), and [Provider Boundary](./DESIGN.md#provider-boundary).
-
-#### Credential Invalidation
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-nfr-credential-invalidation`
-
-Successful rotation and revocation **MUST** make superseded credentials unusable without an additional grace period.
-
-- **Threshold**: 100% of successful rotation and revocation conformance scenarios reject superseded credentials.
-- **Rationale**: Security response depends on immediate credential termination.
-- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation), [Provider Boundary](./DESIGN.md#provider-boundary), and [Interactions and Sequences](./DESIGN.md#36-interactions--sequences).
-
-#### Provider Conformance
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-nfr-provider-conformance`
-
-Every supported identity-provider integration **MUST** pass the common conformance suite. Its Service Principal adapter coverage **MUST** include lifecycle, ownership, operation-key reconciliation, failure classification, and credential security. Its tenant-deprovision coverage **MUST** include exact-owner cleanup, retryable and terminal failures, and authoritative zero-principal confirmation.
-
-- **Threshold**: 100% of mandatory Service Principal adapter and tenant-deprovision scenarios pass for each supported identity-provider integration.
-- **Rationale**: Provider substitution is safe only when contract behavior is equivalent.
-- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation), [Provider Adapter V1](./DESIGN.md#provider-adapter-v1), and [Testability and Verification](./DESIGN.md#47-testability-and-verification).
-
-#### Contract Compatibility
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-nfr-contract-compatibility`
-
-REST and Rust contract changes within a major version **MUST** remain backward-compatible and additive. Breaking changes **MUST** use a new major contract version with migration guidance.
-
-- **Threshold**: Zero unversioned breaking changes in compatibility checks.
-- **Rationale**: Callers must remain independent of provider and implementation release cadence.
-- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation), [API Contracts](./DESIGN.md#33-api-contracts), and [Failure Taxonomy and Wire Safety](./DESIGN.md#41-failure-taxonomy-and-wire-safety).
-
-#### Security Auditability
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-nfr-auditability`
-
-Every management decision and lifecycle operation **MUST** produce an auditable record attributable to the validated initiating caller or approved system actor, target tenant, action, timestamp, correlation identifier, and terminal outcome without recording a plaintext client secret.
-
-- **Threshold**: 100% of lifecycle and authorization conformance scenarios produce complete attributable records, with zero plaintext client secrets in audit data.
-- **Rationale**: Credential administration must support incident investigation and accountability regardless of whether the platform or the gear emits the final audit record.
-- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation), [Audit and Observability component](./DESIGN.md#audit-and-observability), and [Auditability and Observability](./DESIGN.md#45-auditability-and-observability).
-
-#### Operational Observability
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-nfr-observability`
-
-The system **MUST** record latency and a stable outcome category for every Service Principal lifecycle operation. Operators **MUST** be able to distinguish invalid input, not found, clean failure, ambiguous outcome, authorization failure, and provider unavailability. Service Principal ambiguous outcomes and provider unavailability **MUST** produce adapter-correlated signals suitable for platform alerting. The tenant lifecycle owner **MUST** provide cleanup retry and terminal-failure signals.
-
-- **Threshold**: 100% of Service Principal lifecycle calls emit one latency observation and one public outcome category; 100% of tenant-cleanup attempts emit a lifecycle-native outcome; conformance tests demonstrate an alertable signal for each specified operational condition.
-- **Rationale**: Operators need to detect provider degradation and unresolved credential state.
-- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation), [Audit and Observability component](./DESIGN.md#audit-and-observability), and [Auditability and Observability](./DESIGN.md#45-auditability-and-observability).
+- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation) and
+  [Authorization Gate](./DESIGN.md#authorization-gate).
 
 #### Stateless Recovery
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-nfr-stateless-recovery`
 
-Service Principal restart **MUST** lose no authoritative principal or recovery state because the gear owns neither. Create and rotation operation keys **MUST** be forwarded to an adapter that provides restart-safe, tenant-bound reconciliation. The adapter may reconcile during a repeated request or through adapter-private execution, but Service Principal **MUST NOT** schedule or persist that work.
+The gear **MUST** hold no authoritative principal or session state across requests, so a gear restart requires no
+state restoration and loses no in-flight authorization decision.
 
-- **Threshold**: Restart tests prove that Service Principal requires no database restoration and that every supported adapter deterministically resumes an unresolved same-key create or rotation without duplicate logical mutation.
-- **Rationale**: The gear remains a stateless authorization and provider-delegation boundary while the integration closest to provider behavior owns reconciliation correctness.
-- **Architecture Allocation**: [Provider Boundary](./DESIGN.md#provider-boundary), [Database Schemas and Tables](./DESIGN.md#37-database-schemas--tables), and [Operation-Key Reconciliation](./DESIGN.md#42-operation-key-reconciliation).
+- **Threshold**: The gear crate declares no database, migration, or stateful-worker dependency.
+- **Rationale**: The gear is purely an authorization and provider-delegation boundary; authoritative state, if
+  any, belongs to the registered provider adapter.
+- **Architecture Allocation**: [Provider Adapter Boundary](./DESIGN.md#provider-adapter-boundary).
 
-#### Cleanup Reliability
+#### Contract Versioning
 
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-nfr-cleanup-reliability`
+- [ ] `p2` - **ID**: `cpt-cf-service-principal-nfr-contract-compatibility`
 
-Tenant-deprovision cleanup failures **MUST** remain durably visible and retryable in the tenant lifecycle owner's deprovision operation until the provider adapter confirms no live owned principal remains. Service Principal **MUST NOT** retain cleanup records or run cleanup retries.
+The REST surface and the provider contract **MUST** each carry an explicit major-version marker, so a breaking
+change requires a new major version rather than an in-place change to the existing surface.
 
-- **Threshold**: Zero cleanup failures are silently discarded; every retryable tenant-deprovision operation survives lifecycle-owner restart; permanent failures remain operator-visible; successful deprovisioning leaves zero live owned principals.
-- **Rationale**: Credential survival after tenant removal is a security incident, while retry durability belongs with the lifecycle operation that gates tenant removal.
-- **Architecture Allocation**: [Tenant Lifecycle Cleanup Integration](./DESIGN.md#tenant-lifecycle-cleanup-integration), [Auditability and Observability](./DESIGN.md#45-auditability-and-observability), and [Fault Tolerance](./DESIGN.md#46-fault-tolerance).
-
-#### Performance and Availability Qualification
-
-- [ ] `p2` - **ID**: `cpt-cf-service-principal-nfr-performance-baseline`
-
-Initial GA approval **MUST** be blocked until representative provider benchmarks establish and approve the supported tenant and principal envelope, p95 lifecycle latency, sustained administrative request rate, provider-unavailable behavior, and availability objective. Published service objectives **MUST** then be used as release-conformance thresholds.
-
-- **Threshold**: Before GA, a versioned benchmark report records approved values for all five dimensions; each subsequent supported release satisfies the published objectives or documents an approved revision.
-- **Rationale**: Provider latency dominates operations, so targets must be measurable without inventing unsupported values.
-- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation), [Configuration](./DESIGN.md#43-configuration), [Fault Tolerance](./DESIGN.md#46-fault-tolerance), and [Testability and Verification](./DESIGN.md#47-testability-and-verification).
-
-#### Operational Readiness Documentation
-
-- [ ] `p2` - **ID**: `cpt-cf-service-principal-nfr-operational-documentation`
-
-Each supported release **MUST** publish API and operator guidance covering one-time secret handling, approved credential-store handoff, stable outcome categories, ambiguous-outcome reconciliation, tenant-cleanup retry, alert interpretation, and troubleshooting without plaintext secrets.
-
-- **Threshold**: Release readiness evidence verifies that all seven topics are present and that documentation examples contain zero plaintext production credentials.
-- **Rationale**: Operators and API consumers need safe recovery instructions for credential-bearing and uncertain provider operations.
-- **Architecture Allocation**: [DESIGN NFR Allocation](./DESIGN.md#nfr-allocation), [API Contracts](./DESIGN.md#33-api-contracts), [Auditability and Observability](./DESIGN.md#45-auditability-and-observability), and [Testability and Verification](./DESIGN.md#47-testability-and-verification).
+- **Threshold**: Every published management operation and the provider contract expose a major-version marker;
+  zero breaking changes are applied in place within a published major version.
+- **Rationale**: Callers and adapters must remain independent of unrelated release cadence.
+- **Architecture Allocation**: [API Contracts](./DESIGN.md#33-api-contracts).
 
 ### 6.2 NFR Exclusions
 
-- **Authoritative principal-data RPO and backup**: Not applicable because the provider owns principal records and Service Principal owns no principal database, reconciliation repository, or plaintext secret store.
-- **Offline mutation availability**: Not applicable because authoritative lifecycle changes require a reachable provider.
-- **Physical safety**: Not applicable because this is an information-system control plane with no direct physical actuation.
-- **End-user accessibility and internationalization**: Not applicable to the initial server/API-only capability; future user interfaces must define their own requirements.
-- **Gear-specific disaster recovery**: No Service Principal data restoration is required. Authoritative principal recovery and adapter-private reconciliation durability remain provider-integration obligations; tenant-cleanup retry durability remains a tenant-lifecycle obligation.
-- **Personal-data privacy**: No gear-specific privacy regime applies because the capability intentionally processes machine identities rather than human profiles. This exclusion ceases to apply in deployments where tenant or account identifiers can identify natural persons.
-- **Industry-specific regulation**: No regulation is introduced by this provider-neutral capability. Deployment-specific regulatory controls remain mandatory where the platform, provider, tenant, or workload is subject to them.
-- **Data retention and residency**: The identity provider owns principal-record retention and residency, adapters own any private reconciliation-record policy, tenant lifecycle owns deprovision-operation retention, and platform observability owns telemetry retention and residency. Service Principal owns none of these durable records.
-- **Dedicated deployment and release process**: Not applicable; the capability uses the project-wide release process, with the additional benchmark and documentation gates defined above.
+- **Immediate credential invalidation on rotate/revoke**: Not verified by this codebase. Invalidating the
+  superseded credential is the registered provider adapter's responsibility; no adapter ships in this
+  repository to test against.
+- **Cross-adapter provider conformance suite**: Not applicable today. Only the `ServicePrincipalClientV1` trait
+  contract is defined here; a shared conformance harness across multiple adapters does not exist in this
+  repository.
+- **Bespoke auditability and observability**: Not applicable beyond the project baseline. The gear emits one
+  init-time log line and one `warn!` on provider absence; it defines no dedicated audit trail, metrics, or
+  alerting beyond platform-wide request tracing and canonical-error correlation.
+- **Tenant-deprovision cleanup and retry durability**: Not applicable to this gear. Removing a deprovisioned
+  tenant's principals is a documented obligation of the provider SPI contract, owned by the adapter behind
+  `ServicePrincipalClientV1`; the gear itself performs no tenant-lifecycle orchestration and keeps no durable
+  work queue to retry.
+- **Performance and scale benchmarking**: Not measured. No dedicated latency, throughput, or capacity code path
+  exists beyond delegating to the registered provider; project-wide platform baselines apply.
+- **Scalability targets**: Not applicable because the gear holds no state, runs no background work, and adds no
+  capacity dimension of its own — every lifecycle call is a single authorization check plus one delegated
+  provider call, so achievable throughput and tenant/principal volume are properties of the registered provider
+  adapter and the platform request path, not of this gear. No gear-specific scale target is stated, and none can
+  be verified from this codebase.
+- **API rate limiting**: Not applicable at the gear level; lifecycle operations are low-frequency administrative
+  calls (§3.1), and any rate limiting is enforced by the platform API gateway baseline.
+- **Authoritative principal-data RPO and backup**: Not applicable because the provider owns principal records and
+  Service Principal owns no principal database.
+- **Offline mutation availability**: Not applicable because authoritative lifecycle changes require a reachable
+  provider.
+- **Physical safety**: Not applicable because this is an information-system control plane with no physical
+  actuation.
+- **End-user accessibility and internationalization**: Not applicable to this server/API-only capability.
+- **Personal-data privacy**: No gear-specific privacy regime applies because the capability processes machine
+  identities rather than human profiles.
+- **Data retention and residency**: The identity provider owns principal-record retention and residency;
+  Service Principal owns no durable record of its own.
+- **Dedicated deployment and release process**: Not applicable; the capability uses the project-wide release
+  process.
+- **Documentation and support requirements**: Follow the project-wide platform documentation and support
+  baseline; no gear-specific deviation.
 
 ## 7. Public Library Interfaces
 
@@ -605,16 +651,25 @@ Each supported release **MUST** publish API and operator guidance covering one-t
 
 - **Type**: Versioned authenticated REST API.
 - **Stability**: Stable within a major version.
-- **Description**: Provides create, list, rotate-secret, and revoke operations for an explicit owning tenant. Create and rotate require the standard `Idempotency-Key` request header. Credential-bearing operations disclose plaintext secrets once and mark responses as non-cacheable; no recovery-status surface exists.
+- **Description**: Exposes exactly four operations — create, list, rotate-secret, and revoke — addressed by
+  owning tenant and, for rotate-secret and revoke, by client identifier. There is deliberately no single-item
+  read: the collection listing and the address returned by create are the only ways to learn a principal's
+  non-secret state. Credential-bearing responses are non-cacheable and disclose the plaintext secret exactly
+  once.
 - **Breaking Change Policy**: A breaking change requires a new major API version and migration guidance.
 
-#### Service Principal Rust Interface
+#### Service Principal Rust Provider Interface
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-interface-rust-sdk`
 
-- **Type**: Transport-neutral Rust SDK and service-provider contract.
+- **Type**: Transport-neutral Rust SDK models and a versioned provider SPI (`ServicePrincipalClientV1`), resolved
+  via `ClientHub`.
 - **Stability**: Stable within a major version.
-- **Description**: Provides the same four lifecycle operations, validated `OperationKey` values for create and rotate, one-time credentials, secret-free summaries, tenant identity, and a major-versioned failure taxonomy with non-success handling for unknown categories.
+- **Description**: Provides the four lifecycle methods (`create`, `list`, `rotate_secret`, `revoke`), a one-time
+  credentials model, a secret-free summary model, an explicit `TenantId`, and a closed four-variant failure
+  taxonomy (`InvalidInput`, `NotFound`, `CleanFailure`, `Ambiguous`). It is not a public authorization boundary:
+  every caller is a trusted platform module that must satisfy the SPI's documented authorization precondition
+  before invocation; `SecurityContext` is carried for audit, not enforcement.
 - **Breaking Change Policy**: A breaking change requires a new major SDK contract version and migration guidance.
 
 #### Service Principal Managed Resource
@@ -623,7 +678,10 @@ Each supported release **MUST** publish API and operator guidance covering one-t
 
 - **Type**: GTS managed-resource and permission catalog.
 - **Stability**: Stable within a major version.
-- **Description**: Defines Service Principal as a resource distinct from human users and exposes create, read, rotate-secret, and revoke permissions.
+- **Description**: Registers `gts.cf.core.service_principal.service_principal.v1~` as a resource distinct from
+  the account-management user type and from the service-principal subject-classification type, and exposes four
+  permission instances (`create`, `read`, `rotate_secret`, `revoke`) under
+  `gts.cf.toolkit.authz.permission.v1~cf.core.service_principal.<action>.v1`.
 - **Breaking Change Policy**: Resource and action identifiers cannot change within a major version.
 
 ### 7.2 External Integration Contracts
@@ -632,25 +690,22 @@ Each supported release **MUST** publish API and operator guidance covering one-t
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-contract-provider-adapter`
 
-- **Direction**: Required from provider implementations.
-- **Protocol/Format**: Versioned provider-neutral Rust contract.
-- **Compatibility**: Adapters must preserve lifecycle, ownership, operation-key reconciliation, one-time disclosure, invalidation, and failure semantics for the contract version they implement.
+- **Direction**: Required from provider implementations, registered in the `ClientHub`.
+- **Protocol/Format**: The `ServicePrincipalClientV1` Rust trait.
+- **Compatibility**: An adapter must implement all four methods, address `(tenant_id, client_id)` as the scoped
+  resource, return `NotFound` for an address that does not resolve within the tenant, return the secret only
+  from `create`/`rotate_secret`, delete a tenant's principals when that tenant is deprovisioned, and report
+  transport uncertainty as `Ambiguous` rather than as success.
 
 #### Authorization Contract
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-contract-authorization`
 
 - **Direction**: Required from the platform Authorization Resolver.
-- **Protocol/Format**: Authenticated action request with explicit tenant resource attributes and tenant constraints.
-- **Compatibility**: Decisions must support the stable managed-resource and action identifiers for the active major version.
-
-#### Tenant Lifecycle Cleanup Contract
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-contract-tenant-cleanup`
-
-- **Direction**: Required from the identity-provider integration by the tenant lifecycle owner; Service Principal does not provide or proxy this contract.
-- **Protocol/Format**: Versioned authenticated tenant-deprovision request with a validated platform security context, explicit target tenant, and lifecycle-native success-equivalent, retryable, or terminal outcome.
-- **Compatibility**: The tenant lifecycle owner **MUST** retain retryable state and block teardown after retryable or terminal failure. The adapter **MUST** enforce exact tenant ownership, treat already-absent principals as success-equivalent, and return success only after confirming removal or absence of every live principal owned by the target tenant.
+- **Protocol/Format**: An `AccessRequest` carrying the `OWNER_TENANT_ID` resource property and
+  `require_constraints(true)`, evaluated through `PolicyEnforcer::access_scope_with`.
+- **Compatibility**: The returned `AccessScope` must be checked against the explicit target tenant (or be
+  unconstrained) before any provider call proceeds.
 
 ## 8. Use Cases
 
@@ -661,23 +716,26 @@ Each supported release **MUST** publish API and operator guidance covering one-t
 **Actor**: `cpt-cf-service-principal-actor-tenant-automation-admin`
 
 **Preconditions**:
-- The caller is authenticated and authorized for the target tenant and create action.
-- A conforming provider adapter is available.
-- The request carries a new caller-generated operation key.
-- The requested name, scopes, and tenant quota satisfy deployment policy.
+- The caller is authenticated and the PDP's returned scope covers the target tenant for the `create` action.
+- A `ServicePrincipalClientV1` implementation is registered in the `ClientHub`.
+- The requested name and scopes satisfy the registered provider's policy.
 
 **Main Flow**:
-1. The administrator requests a tenant-owned service principal.
-2. The system creates the provider identity.
-3. The system returns its client identifier, one-time secret, token endpoint, and subject identifier.
-4. The administrator stores the secret in approved credential storage.
+1. The administrator submits a name and optional scopes for a tenant-owned service principal.
+2. The system authorizes the request, then delegates creation to the registered provider.
+3. The system reports the new principal's address and discloses, in a response that must not be cached or stored
+   by intermediaries, the client identifier, one-time secret, token endpoint, and subject identifier.
+4. The administrator stores the secret immediately, since it is never returned again except by rotation.
 
 **Postconditions**:
 - The principal can authenticate as a service subject owned by the target tenant.
 
 **Alternative Flows**:
-- **Invalid policy input**: The request is rejected without new provider state.
-- **Ambiguous provider outcome**: The caller repeats only the identical request with the same operation key. The adapter reconciles before mutation. Confirmed prior creation returns `credentials_unavailable` with non-secret identity and rotation guidance; authoritative absence permits a fresh create with a new key; inconclusive evidence remains ambiguous and blocks conflicting mutation.
+- **Invalid input** (bad name, disallowed scope, quota exceeded, or a taken identifier): the request is rejected
+  as invalid input and no provider state is created.
+- **Ambiguous provider outcome**: the system reports the outcome as ambiguous; the caller must investigate
+  through `list` and resolve manually (for example, revoke and retry) since the gear performs no automatic
+  reconciliation.
 
 ### 8.2 Inventory Tenant Principals
 
@@ -686,38 +744,40 @@ Each supported release **MUST** publish API and operator guidance covering one-t
 **Actor**: `cpt-cf-service-principal-actor-tenant-automation-admin`
 
 **Preconditions**:
-- The caller is authenticated and authorized for the target tenant and read action.
+- The caller is authenticated and the PDP's returned scope covers the target tenant for the `read` action.
 
 **Main Flow**:
 1. The administrator requests the tenant's service-principal inventory.
-2. The system returns only principals owned by that tenant.
+2. The system returns every principal the registered provider reports for that tenant.
 3. The response contains no client secrets.
 
 **Postconditions**:
 - The administrator has current non-secret state for audit and lifecycle management.
 
-### 8.3 Rotate Compromised or Expiring Credential
+### 8.3 Rotate a Credential
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-usecase-rotate`
 
 **Actor**: `cpt-cf-service-principal-actor-tenant-automation-admin`
 
 **Preconditions**:
-- The caller is authorized for the target tenant and rotate-secret action.
-- The provider confirms the principal's ownership and managed identity state.
-- The request carries a new caller-generated operation key.
+- The caller is authorized for the target tenant and the `rotate_secret` action.
+- The `client_id` resolves within the target tenant.
 
 **Main Flow**:
-1. The administrator requests secret rotation.
-2. The system invalidates the superseded secret.
-3. The system returns the new secret through a non-cacheable response.
-4. The administrator updates approved credential storage.
+1. The administrator requests secret rotation for a `client_id`.
+2. The system delegates to the registered provider and discloses the new secret in a response that must not be
+   cached or stored by intermediaries.
+3. The administrator updates the workload's stored credential.
 
 **Postconditions**:
-- The new secret authenticates and the superseded secret does not.
+- The workload can authenticate with the new secret.
 
 **Alternative Flows**:
-- **Ambiguous rotation**: The caller repeats only the identical request with the same operation key. A confirmed prior rotation whose response was lost returns `credentials_unavailable`; the caller performs a new rotation with a new key and adopts only its confirmed response.
+- **Unresolved principal**: the system reports not found when the `client_id` does not resolve within the target
+  tenant.
+- **Ambiguous provider outcome**: the system reports the outcome as ambiguous instead of as a silent success or a
+  safely retryable provider failure.
 
 ### 8.4 Revoke Workload Identity
 
@@ -726,139 +786,116 @@ Each supported release **MUST** publish API and operator guidance covering one-t
 **Actor**: `cpt-cf-service-principal-actor-tenant-automation-admin`
 
 **Preconditions**:
-- The caller is authorized for the target tenant and revoke action.
+- The caller is authorized for the target tenant and the `revoke` action.
 
 **Main Flow**:
-1. The administrator requests revocation.
-2. The system removes or confirms absence of the tenant-owned principal.
-3. Subsequent token acquisition fails.
+1. The administrator requests revocation of a `client_id`.
+2. The system delegates to the registered provider.
+3. The system concludes successfully, carrying no principal state and no credential material, whether the
+   principal was removed or was already absent.
 
 **Postconditions**:
 - The addressed principal no longer grants workload access.
 
 **Alternative Flows**:
-- **Already absent**: The operation is success-equivalent.
-- **Ambiguous revocation**: The administrator repeats revocation until success or confirmed absence.
-
-### 8.5 Deprovision Tenant Principals
-
-- [ ] `p1` - **ID**: `cpt-cf-service-principal-usecase-tenant-cleanup`
-
-**Actor**: `cpt-cf-service-principal-actor-tenant-lifecycle-owner`
-
-**Preconditions**:
-- The tenant lifecycle owner has authenticated and authorized tenant deprovisioning for the explicit target tenant.
-- The tenant lifecycle operation has durable retry state.
-- A conforming identity-provider integration is available.
-
-**Main Flow**:
-1. The tenant lifecycle owner invokes the identity-provider tenant-deprovision contract.
-2. The provider adapter selects only principals authoritatively owned by the explicit tenant.
-3. The adapter removes each owned principal, treating already-absent principals as success-equivalent.
-4. The adapter confirms that no live owned principal remains.
-5. The tenant lifecycle owner records final disposition and completes tenant deprovisioning.
-
-**Postconditions**:
-- Successful tenant deprovisioning leaves no live principal owned by that tenant.
-- Service Principal has stored no cleanup state and has not participated in the call.
-
-**Alternative Flows**:
-- **Transient provider failure**: The adapter returns retryable, teardown remains blocked, and the tenant lifecycle owner retries the whole deprovision operation from durable state.
-- **Permanent or configuration failure**: The adapter returns terminal, teardown remains blocked, and the tenant lifecycle owner keeps the operation visible for intervention.
+- **Already absent**: revoking an unknown principal still concludes successfully rather than reporting not found.
 
 ## 9. Acceptance Criteria
 
-- [ ] An authorized administrator can complete create, list, rotate, and revoke through the public contract without provider-specific administration.
-- [ ] Every supported provider adapter passes conformance tests proving that an access token obtained through `client_credentials` using credentials returned by successful creation contains the target tenant, a subject exactly equal to the creation response's `Subject`, and `client_credentials` identity context.
-- [ ] Unauthorized and cross-tenant management operations have zero successful outcomes in the security suite.
-- [ ] Credential-bearing responses are non-cacheable, and secret-negative checks find zero disclosures on prohibited surfaces.
-- [ ] Every successful rotation test rejects the superseded secret and accepts the confirmed replacement.
-- [ ] Every successful revocation test prevents later token acquisition.
-- [ ] Every supported provider adapter passes all mandatory conformance scenarios.
-- [ ] Conformance tests exercise all six Service Principal failure categories and verify consistent classification across applicable provider, REST, and Rust surfaces, including major-version compatibility and non-success handling for unknown or mutation-uncertain outcomes.
-- [ ] Concurrent and post-restart same-key create and rotation retries produce at most one logical mutation, reject cross-tenant or changed-request key reuse, and never persist or replay a plaintext credential.
-- [ ] `exact_binding`, `authoritative_absence`, and `inconclusive` adapter scenarios produce the required safe retry behavior without exposing provider proof material publicly.
-- [ ] Tenant cleanup deletes only principals authoritatively owned by the target tenant and never deletes foreign principals.
-- [ ] Transient tenant-cleanup failures block teardown and survive tenant-lifecycle restart; terminal failures remain operator-visible; successful tenant deprovisioning leaves zero live service principals owned by that tenant.
-- [ ] A security review classifies every public and provider-contract field and confirms that no human profile attributes or unrelated personal data are collected.
-- [ ] Every lifecycle and authorization scenario produces a complete attributable audit record with no plaintext client secret.
-- [ ] Initial GA evidence includes approved benchmark values for the supported scale envelope, p95 lifecycle latency, sustained request rate, provider-unavailable behavior, and availability objective.
-- [ ] API and operator documentation covers every required readiness topic without exposing plaintext production credentials.
-- [ ] REST, Rust SDK, GTS registration, authorization, provider conformance, security, and end-to-end evidence exist within the Gears artifact and implementation chain before completion is claimed.
+- [ ] An authorized administrator can complete create, list, rotate-secret, and revoke through the REST contract
+      without direct identity-provider administration.
+- [ ] Unauthorized and cross-tenant management requests have zero successful outcomes in the authorization test
+      suite.
+- [ ] Every create and rotate-secret success response is marked as not to be cached or stored by intermediaries,
+      and no listing or `Debug` output ever contains a plaintext client secret.
+- [ ] A revoke request against an already-absent principal concludes successfully, indistinguishably from a
+      revoke against a present one.
+- [ ] The SPI's four failure categories plus the gear's access-denied and provider-unavailable outcomes render as
+      distinguishable, machine-readable problem responses per the platform's error baseline (RFC-9457).
+- [ ] Exactly four management operations (create, list, rotate-secret, revoke) are exposed, and no
+      single-principal read operation exists.
+- [ ] All four service-principal permission instances (`create`, `read`, `rotate_secret`, `revoke`) are present
+      in the GTS link-time inventory and reference the service-principal managed-resource type.
+- [ ] A request against a `ClientHub` with no registered provider reports the capability as unavailable rather
+      than a simulated success.
 
 ## 10. Dependencies
 
 | Dependency | Description | Criticality |
 |---|---|---|
-| Gears ToolKit runtime | Hosts the gear and its authenticated public capability. | p1 |
-| Platform client registry | Resolves the configured provider-neutral adapter for trusted callers. | p1 |
-| Authorization Resolver | Supplies action decisions and tenant-scoped constraints. | p1 |
-| Tenant model and resolver contracts | Supply canonical tenant identity and hierarchy semantics. | p1 |
-| Types and Permission Registry | Registers resource, subject, and permission identifiers. | p1 |
-| Canonical error framework | Supplies standardized public error categories. | p1 |
-| API Gateway and OpenAPI registry | Routes and documents the versioned REST interface. | p1 |
-| Identity Provider Adapter | Owns authoritative principal state and implements lifecycle operations. | p1 |
-| Approved Credential Store | Retains one-time disclosed credentials for consuming workloads. | p1 |
-| Platform observability | Collects lifecycle latency, outcomes, logs, and alerts. | p2 |
+| Gears ToolKit runtime (`toolkit`) | Hosts the gear, mounts the REST routes, and provides the `ClientHub` used to resolve the provider adapter. | p1 |
+| Authorization Resolver (`authz-resolver`, `authz-resolver-sdk`) | Supplies action decisions and tenant-scoped constraints through `PolicyEnforcer`. | p1 |
+| Types and Permission Registry (`types-registry`) | Aggregates the GTS managed-resource type and permission catalog at startup. | p1 |
+| Tenant identity contract (`tenant-resolver-sdk::TenantId`) | Supplies the canonical tenant identifier type used across the REST and provider contracts. | p1 |
+| Canonical error framework (`toolkit-canonical-errors`) | Maps domain errors to RFC-9457 Problem responses. | p1 |
+| API Gateway / OpenAPI registry (`toolkit::api`) | Authenticates and publishes the versioned REST routes. | p1 |
+| Identity Provider Adapter (`ServicePrincipalClientV1` implementation) | Owns authoritative principal state and implements the four lifecycle operations; resolved through `ClientHub`, not shipped in this repository. | p1 |
+| Platform observability (`tracing`) | Collects the gear's init-time and provider-absence log events. | p3 |
 
 ## 11. Assumptions
 
-- The platform provides stable tenant identifiers and tenant hierarchy semantics.
-- The platform authenticates public API callers before Service Principal authorization.
-- Consuming workloads can protect credentials and perform OAuth 2.0 `client_credentials` requests.
-- One conforming provider adapter is configured for the initial deployment.
-- Identity-provider state is authoritative; Service Principal owns no principal database, recovery repository, cleanup state, or retry scheduler.
-- Administrators choose names and scopes according to deployment policy.
-- Lifecycle operations are low-frequency administrative operations.
-- The initial capability is server/API-facing and has no dedicated user interface.
+- The platform authenticates callers and attaches a validated `SecurityContext` before this gear's route
+  handlers run.
+- The platform supplies a stable `Uuid` tenant identifier used consistently across the authorization and
+  provider contracts.
+- Exactly one conforming `ServicePrincipalClientV1` implementation is registered in the `ClientHub` per
+  deployment; none ships with this repository.
+- The registered provider adapter enforces name syntax, scope allowlisting, and quota policy; this gear performs
+  no independent validation of those fields.
+- Consumers persist a returned client secret immediately, since only create and rotate-secret ever return it.
+- Lifecycle operations are low-frequency administrative calls, not request-path operations.
 
 ## 12. Risks
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Only one provider initially proves the contract | Hidden provider assumptions may limit future portability. | Keep contracts provider-neutral and require the same conformance suite for every adapter. |
-| Caller loses the one-time secret | The workload cannot authenticate. | Require immediate approved storage and recover through rotation. |
-| Secret leaks through diagnostics or caching | An attacker can impersonate a workload. | Enforce redaction, non-cacheability, and secret-negative tests. |
-| Cross-tenant object access | A caller can manage another tenant's credentials. | Authorize the explicit tenant and verify returned tenant constraints. |
-| Over-privileged administrators | Credential minting is delegated too broadly. | Keep lifecycle actions independently grantable. |
-| Scope escalation | A workload receives unintended privileges. | Restrict requested scopes to a deployment-controlled allowlist. |
-| Ambiguous provider mutation | Caller and provider disagree about principal or credential state. | Use stable ambiguity reporting and operation-specific reconciliation. |
-| Concurrent creation exceeds quota | Tenant count briefly exceeds the configured cap. | Document best-effort semantics, monitor counts, and reassess strong enforcement from measured need. |
-| Tenant cleanup fails | Credentials survive their tenant boundary. | Keep the tenant-lifecycle operation durable and visible, retry the whole deprovision workflow after transient failure, and block successful deprovisioning until the adapter confirms zero owned principals. |
-| Unpaginated listing grows too large | Administrative latency and payload size increase. | Start with bounded tenant quotas and define a measured trigger for pagination. |
-| Resource or permission identifiers drift | Authorization grants no longer match enforcement. | Pin identifiers and validate registry-to-enforcement consistency. |
+| No provider adapter ships with this repository | Lifecycle operations report the capability as unavailable until a deployment registers one | Treat provider absence as an explicit `ProviderUnavailable` failure rather than a simulated success; document the `ClientHub` registration requirement. |
+| Ambiguous provider outcomes require manual recovery | Operators may be uncertain whether a principal exists after an ambiguous outcome | Report `Ambiguous` as its own distinct outcome, separate from a safely retryable provider failure, so callers know to inspect state via `list` rather than retry blindly. |
+| Secret leaks through logs, `Debug`, or caching | An attacker can impersonate a workload | Enforce redacting `Debug` on credential types and ensure every credential-bearing response must not be cached or stored by intermediaries; verified by DTO and router tests. |
+| Cross-tenant object access | A caller can manage another tenant's credentials | Authorize the explicit tenant and verify the returned PDP scope actually covers it before any provider call. |
+| Name, scope, and quota policy are fully delegated to the provider | Enforcement can vary by adapter implementation | Document the delegation explicitly in the SPI contract so future adapters implement it consistently. |
+| Deletion of principals on tenant deprovision is an SPI obligation the adapter alone discharges | An adapter that does not honor the obligation leaves credentials alive after their owning tenant is removed, and the gear cannot detect it | State the obligation normatively in the provider SPI contract; treat verification of adapter conformance as open work before a deployment relies on this gear for tenant offboarding. |
+| No cross-adapter conformance suite exists | A future second adapter could diverge in ownership, invalidation, or failure-category behavior | Tracked as future qualification work before a second adapter is accepted. |
 
 ## 13. Open Questions
 
-1. **What production scale and lifecycle latency targets should the gear support?**
-   - **Owner**: Platform Performance and Operations.
-   - **Resolution target**: Before initial GA benchmark approval.
+1. **How will a registered adapter's conformance to the SPI obligation to delete a tenant's principals on
+   deprovision be verified?** The obligation is stated in the provider SPI contract and the gear performs no
+   tenant-lifecycle orchestration, so nothing in this repository demonstrates that an adapter actually honors it.
+   - **Owner**: Gears Architecture.
+   - **Resolution target**: Before this gear is relied upon for tenant offboarding.
 
-2. **When is a second provider adapter required to substantiate portability?**
+2. **Should create and rotate-secret gain an idempotency or operation-key mechanism to let a caller safely retry
+   after an ambiguous outcome?**
+   - **Owner**: Gears Architecture.
+   - **Resolution target**: Before a stronger consistency guarantee is offered to callers.
+
+3. **What common provider-conformance suite will validate a second adapter's ownership, invalidation, and
+   failure-category behavior?**
+   - **Owner**: Provider Integration Owners.
+   - **Resolution target**: Before a second adapter is accepted.
+
+4. **Should the REST surface add a single-principal read now that create returns an address for an otherwise
+   unreadable resource?**
    - **Owner**: Product and Gears Architecture.
-   - **Resolution target**: Before claiming multi-provider production support.
+   - **Resolution target**: Before the next breaking API version.
 
-3. **What measured tenant volume triggers pagination or strongly enforced quota semantics?**
+5. **What measured tenant volume should trigger enforced (rather than provider-delegated, best-effort) quota
+   semantics?**
    - **Owner**: Product and Capacity Engineering.
-   - **Resolution target**: Before raising the initial supported tenant limit.
-
-4. **Should adapter incompatibility fail registration or the first lifecycle operation?**
-   - **Owner**: Gears Architecture and Provider Integration Owners.
-   - **Resolution target**: Before provider-adapter contract freeze.
-
-5. **What retention policy applies to adapter-private reconciliation records?**
-   - **Owner**: Security, Operations, and Provider Integration Owners.
-   - **Resolution target**: Before initial adapter production qualification.
-
-Resolved during design: audit and operational signals use layered ownership. Service Principal records authorization and public lifecycle outcomes, provider adapters record provider mutation and reconciliation outcomes, and the tenant lifecycle owner records cleanup retries and final tenant disposition. The allocation is defined in [DESIGN §4.5](./DESIGN.md#45-auditability-and-observability).
+   - **Resolution target**: Before raising the supported tenant limit.
 
 ## 14. Traceability
 
 - **System slug**: `service-principal`
 - **ID prefix**: `cpt-cf-service-principal-*`
 - **UPSTREAM_REQS**: No upstream requirements artifact exists for this gear.
-- **DESIGN**: [DESIGN.md](./DESIGN.md) allocates every FR and NFR and defines the implementation boundaries.
-- **ADRs**: None. This artifact records requirements; DESIGN records the resulting architecture without embedding decision debates. Explicit-tenant authorization follows the shared platform PDP/PEP baseline.
+- **DESIGN**: [DESIGN.md](./DESIGN.md) allocates the FRs and NFRs above and defines the implementation
+  boundaries; DESIGN.md may describe additional target-state architecture beyond what this PRD requires of the
+  current implementation.
+- **ADRs**: None. This artifact records requirements; DESIGN records the resulting architecture without
+  embedding decision debates.
 - **DECOMPOSITION**: Not yet authored.
 - **FEATURES**: Not yet authored.
-- **CODE**: No Gears implementation is registered for this artifact yet. Implementation traceability begins when FEATURE and CODE artifacts are added.
+- **CODE**: `gears/system/service-principal/service-principal` (gear crate) and
+  `gears/system/service-principal/service-principal-sdk` (SDK/SPI crate).
