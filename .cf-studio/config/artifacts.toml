@@ -61,6 +61,10 @@ patterns = ["gears/system/oagw/docs/adr-*.md"]
 
 
 [[ignore]]
+reason = "Ignore module 'service-principal' (SDK-only contract crate ported from vhp-core; not SDLC-documented yet: missing required PRD/DESIGN)."
+patterns = ["gears/system/service-principal/*"]
+
+[[ignore]]
 reason = "Ignore module 'tenant-resolver' (not SDLC-documented yet: missing required PRD/DESIGN)."
 patterns = ["gears/system/tenant-resolver/*"]
 
