@@ -369,7 +369,7 @@ async fn provision_user_in_adopted_realm_uses_openbao_ref() {
     // OpenBao stub returns the per-realm admin secret keyed by the
     // templated SecretRef.
     let cs = Arc::new(ConfigurableStubCS::with_entry(
-        "vp-idp-realm-admin-partner-acme-secret",
+        "keycloak-idp-realm-admin-partner-acme-secret",
         "per-realm-ra-secret",
     ));
     let facade = build_facade_with_cs(&server, cs);
@@ -380,7 +380,7 @@ async fn provision_user_in_adopted_realm_uses_openbao_ref() {
             "partner-acme",
             RealmBinding::Adopted,
             group_uuid,
-            Some("vp-idp-realm-admin-partner-acme-secret"),
+            Some("keycloak-idp-realm-admin-partner-acme-secret"),
         )),
         "bob",
         None,
@@ -428,7 +428,7 @@ async fn provision_user_with_duplicate_username_returns_rejected() {
             .provision_user_inner(&ctx, &req)
             .await
             .expect_err("duplicate must error");
-        // VHP-2158: every 409 rides the typed duplicate lane. This mock
+        // every 409 rides the typed duplicate lane. This mock
         // returns a plain-text (non-JSON) body, so the attribution is the
         // honest unattributed token, not a misread field.
         assert!(
@@ -484,7 +484,7 @@ async fn provision_user_4xx_body_redacts_leaked_password() {
             .provision_user_inner(&ctx, &req)
             .await
             .expect_err("409 must error");
-        // VHP-2158 moved 409s to the typed duplicate lane; the B-H1
+        // 409s ride the typed duplicate lane; the B-H1
         // redaction guarantee must hold on its `detail` all the same.
         assert!(
             matches!(
@@ -1589,7 +1589,7 @@ async fn list_users_no_cursor_on_last_page() {
 
 #[tokio::test]
 async fn list_users_drains_members_past_first_page() {
-    // VHP-1973 regression: a member KC orders past the first members page
+    // Regression: a member KC orders past the first members page
     // must still be reachable via pagination. With
     // `list_users_page_limit_max = 2` the facade pages the group in windows
     // of 2; the third member lives in the SECOND KC window (first=2). The
@@ -1691,7 +1691,7 @@ async fn list_users_drains_members_past_first_page() {
 
 #[tokio::test]
 async fn list_users_filter_finds_member_past_first_page() {
-    // VHP-1973 regression: `$filter=username eq '<name>'` must find a user
+    // Regression: `$filter=username eq '<name>'` must find a user
     // even when KC orders it past the first members page. The filter is
     // applied client-side over the DRAINED set, so the drain must pull the
     // second window first; the pre-fix single-window fetch returned an
@@ -1817,7 +1817,7 @@ fn build_string_matcher_single_eq_on_username() {
 
 #[test]
 fn build_string_matcher_contains_on_username() {
-    // `contains` is the user-search operator (VHP-1957) — previously 501.
+    // `contains` is the user-search operator — previously 501.
     let node = FilterNode::binary(
         IdpUserFilterField::Username,
         FilterOp::Contains,
@@ -1889,7 +1889,7 @@ fn build_string_matcher_and_is_conjunction() {
 
 #[test]
 fn build_string_matcher_or_of_contains_is_disjunction() {
-    // The exact shape the Users-list search screen sends (VHP-1957):
+    // The exact shape the Users-list search screen sends:
     // `contains(username,'a') or contains(email,'a') or contains(display_name,'a')`.
     let node = FilterNode::or(vec![
         FilterNode::binary(
@@ -2272,7 +2272,7 @@ fn filter_hash_changes_when_realm_name_changes() {
 }
 
 // ---------------------------------------------------------------------------
-// VHP-2158: KC response classification for user-create rejections.
+// KC response classification for user-create rejections.
 // ---------------------------------------------------------------------------
 
 #[test]

@@ -229,7 +229,7 @@ pub(crate) fn keycloak_cfg(base: &str) -> KeycloakConfig {
         realm_admin: RealmAdminConfig {
             client_id_default: "keycloak-idp-plugin-realm-admin".into(),
             default_shared_realm_secret: SecretFromEnv::from_literal_unchecked("ra"),
-            secret_ref_template: "vp-idp-realm-admin-{realm_name}-secret".into(),
+            secret_ref_template: "keycloak-idp-realm-admin-{realm_name}-secret".into(),
         },
         tls_ca_bundle_ref: None,
         admin_token_lifetime_safety_ms: 30_000,

@@ -1,4 +1,4 @@
-//! Domain layer for the VHP `IdP` Plugin.
+//! Domain layer for the Keycloak `IdP` plugin.
 //!
 //! Contains the plugin-owned system
 //! [`SecurityContext`](toolkit_security::SecurityContext) ([`system_actor`])

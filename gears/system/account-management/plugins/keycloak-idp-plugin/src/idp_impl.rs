@@ -167,7 +167,7 @@ fn translate_provision_failure(e: PluginError) -> IdpProvisionFailure {
         },
 
         // ---- InvalidInput — caller-supplied `provisioning_metadata`
-        //      rejected by `parse_input` BEFORE any KC call (VHP-1836:
+        //      rejected by `parse_input` BEFORE any KC call (
         //      created+explicit-realm, shared with no parent metadata to
         //      inherit, bad mode/realm shape). Distinct from `Config`
         //      (which is also emitted post-KC), so this dedicated pre-KC
@@ -277,9 +277,9 @@ fn translate_deprovision_failure(e: PluginError) -> IdpDeprovisionFailure {
 ///
 /// * `UserOpRejected` → [`IdpUserOperationFailure::Rejected`] (validation).
 /// * `UserOpDuplicate` → [`IdpUserOperationFailure::DuplicateUser`]
-///   (VHP-2158: AM surfaces 409 `already_exists` attributed to the field).
+///   (AM surfaces 409 `already_exists` attributed to the field).
 /// * `UserOpPasswordPolicy` → [`IdpUserOperationFailure::PasswordPolicy`]
-///   (VHP-2158: AM surfaces the `password`/`PASSWORD_POLICY` violation).
+///   (AM surfaces the `password`/`PASSWORD_POLICY` violation).
 /// * `UserOpUnavailable` / any leaked `KcRest` →
 ///   [`IdpUserOperationFailure::Unavailable`] (provider unreachable — AM
 ///   surfaces `idp_unavailable`).
@@ -290,7 +290,7 @@ fn translate_deprovision_failure(e: PluginError) -> IdpDeprovisionFailure {
 fn translate_user_op_failure(e: PluginError) -> IdpUserOperationFailure {
     match e {
         PluginError::UserOpRejected { detail } => IdpUserOperationFailure::Rejected { detail },
-        // VHP-2158: classified rejections ride their typed SDK variants so
+        // classified rejections ride their typed SDK variants so
         // AM can surface 409 already_exists / the structured password
         // field-violation instead of the redacted generic reject.
         PluginError::UserOpDuplicate { field, detail } => {

@@ -45,11 +45,11 @@ fn kc_rest_with_timeout_status() {
 #[test]
 fn credstore_read_detail_format() {
     let e = PluginError::CredStoreRead {
-        detail: "timeout reading vp-idp-bootstrap-admin-secret".into(),
+        detail: "timeout reading keycloak-idp-bootstrap-admin-secret".into(),
     };
     assert_eq!(
         format!("{e}"),
-        "internal:CredStoreReader: timeout reading vp-idp-bootstrap-admin-secret"
+        "internal:CredStoreReader: timeout reading keycloak-idp-bootstrap-admin-secret"
     );
 }
 

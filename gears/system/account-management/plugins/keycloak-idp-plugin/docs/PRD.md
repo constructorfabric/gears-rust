@@ -262,7 +262,7 @@ An `adopted` target realm **MUST** already exist and **MUST** contain no existin
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-created-realm-admissibility`
 
-In `created` mode the plugin **MUST** probe the generated realm name first: an absent realm is created with the plugin ownership marker (`vhp.provisioning.tenant_id = {tenant_id}`); a realm already marked for the same tenant **MUST** be adopted idempotently (provisioning replay); a realm owned by another tenant or lacking the marker **MUST** be rejected without mutation. Operator `realm_defaults` pass-through **MUST** be restricted to a fail-closed allowlist (`displayNameHtml`, `defaultLocale`, `supportedLocales`, `internationalizationEnabled`); any other key fails before provider access. A create attempt whose response is lost **MUST** reconcile by re-probing before classifying the outcome.
+In `created` mode the plugin **MUST** probe the generated realm name first: an absent realm is created with the plugin ownership marker (`cf.provisioning.tenant_id = {tenant_id}`); a realm already marked for the same tenant **MUST** be adopted idempotently (provisioning replay); a realm owned by another tenant or lacking the marker **MUST** be rejected without mutation. Operator `realm_defaults` pass-through **MUST** be restricted to a fail-closed allowlist (`displayNameHtml`, `defaultLocale`, `supportedLocales`, `internationalizationEnabled`); any other key fails before provider access. A create attempt whose response is lost **MUST** reconcile by re-probing before classifying the outcome.
 
 - **Rationale**: The plugin must not overwrite or assume ownership of an existing realm, and replayed provisioning must converge instead of failing or duplicating.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`
@@ -412,7 +412,7 @@ The final client id **MUST** be server-built as `svc-{tenant_id}-{name}`, where 
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-safeguards`
 
-Every service principal **MUST** be associated with exactly one tenant: the client carries the ownership marker (`vhp.provisioning.tenant_id`), and its service-account user carries the `tenant_id` attribute and the configured service-principal subject type, so issued tokens identify the principal, its owning tenant, and the machine subject class through the realm's protocol mappers. Requested client scopes **MUST** be validated against the configured allowlist (empty allowlist = none attachable), and an allowlisted scope missing from the realm **MUST** fail cleanly with an operator-actionable message. A best-effort per-tenant quota (default 10) **MUST** bound creation; it is an operational guard, not a security boundary. Ownership **MUST** be enforced on every read and mutation: a principal that is absent or owned by another tenant is reported as not found, without distinguishing the two.
+Every service principal **MUST** be associated with exactly one tenant: the client carries the ownership marker (`cf.provisioning.tenant_id`), and its service-account user carries the `tenant_id` attribute and the configured service-principal subject type, so issued tokens identify the principal, its owning tenant, and the machine subject class through the realm's protocol mappers. Requested client scopes **MUST** be validated against the configured allowlist (empty allowlist = none attachable), and an allowlisted scope missing from the realm **MUST** fail cleanly with an operator-actionable message. A best-effort per-tenant quota (default 10) **MUST** bound creation; it is an operational guard, not a security boundary. Ownership **MUST** be enforced on every read and mutation: a principal that is absent or owned by another tenant is reported as not found, without distinguishing the two.
 
 - **Rationale**: Explicit tenant ownership and authentication compatibility prevent cross-tenant machine access and cross-tenant existence disclosure.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-service-principal-consumer`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`, `cpt-cf-keycloak-idp-plugin-actor-keycloak`
@@ -686,7 +686,7 @@ When required dependencies meet their objectives, the plugin **MUST** support th
 
 - **Direction**: required from client (`CredStoreClientV1` via ClientHub)
 - **Protocol/Format**: Platform secret-storage contract, invoked under the plugin's stable system actor
-- **Compatibility**: The plugin reads adopted/created realm-admin secrets and the optional TLS CA bundle, and writes/deletes created-realm admin secrets under the templated reference (`vp-idp-realm-admin-{realm_name}-secret` by default). References remain stable across rotation; secret values never enter provider metadata, logs, or metrics.
+- **Compatibility**: The plugin reads adopted/created realm-admin secrets and the optional TLS CA bundle, and writes/deletes created-realm admin secrets under the templated reference (`keycloak-idp-realm-admin-{realm_name}-secret` by default). References remain stable across rotation; secret values never enter provider metadata, logs, or metrics.
 
 ## 8. Use Cases
 
@@ -959,7 +959,7 @@ The following questions gate only p2 promotion:
 - **Parent PRD**: [Account Management PRD](../../../docs/PRD.md)
 - **Identity Provider SDK**: [`idp.rs`](../../../account-management-sdk/src/idp.rs) and [`idp_user.rs`](../../../account-management-sdk/src/idp_user.rs)
 - **Service-Principal SDK**: [`service-principal-sdk`](../../../../service-principal/service-principal-sdk/src/api.rs)
-- **Implementation**: [`plugins/keycloak-idp-plugin`](../src/lib.rs) (crate `cf-gears-keycloak-idp-plugin`, ported from vhp-core)
+- **Implementation**: [`plugins/keycloak-idp-plugin`](../src/lib.rs) (crate `cf-gears-keycloak-idp-plugin`)
 - **OIDC AuthN contract**: [OIDC AuthN Resolver Plugin PRD](../../../../authn-resolver/plugins/oidc-authn-plugin/docs/PRD.md)
 - **Realm-strategy relationship**: V1 supports explicit `shared` (default, parent-inherited for children), `adopted`, and `created` provisioning intent with fail-closed parsing.
 - **Migration requirements**: Tenant hard deprovisioning requires the service-principal purge barrier and boundary teardown ordering; user removal happens through per-user deprovisioning before tenant retirement.

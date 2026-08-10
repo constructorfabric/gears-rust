@@ -129,7 +129,7 @@ fn translate_provision_metadata_decode_is_invalid_input() {
     assert_eq!(field.as_deref(), Some("provisioning_metadata"));
 }
 
-/// VHP-1836: `ProvisionInputRejected` is the dedicated pre-KC caller-input
+/// `ProvisionInputRejected` is the dedicated pre-KC caller-input
 /// rejection (created+explicit-realm, shared-with-no-parent-metadata, bad
 /// mode/realm shape). Unlike `Config`, it is emitted only by `parse_input`
 /// before any KC call, so it maps cleanly to
@@ -152,7 +152,7 @@ fn provision_input_rejected_maps_to_invalid_input() {
 }
 
 /// `PluginError::Config` maps to `CleanFailure` (503), NOT `InvalidInput`
-/// (400). Since VHP-1836 the pre-KC caller-input rejections moved to
+/// (400). Pre-KC caller-input rejections moved to
 /// `ProvisionInputRejected` (→ 400); what still emits `Config` is the
 /// post-KC-creation paths (`SecretRef::new(...)` in
 /// `TenantFacade::provision_created` / `provision_shared`, AFTER realm +
@@ -263,7 +263,7 @@ fn translate_user_op_rejected_is_rejected() {
     assert_eq!(f.detail(), "user already exists");
 }
 
-// VHP-2158: classified rejections must ride their typed SDK variants —
+// classified rejections must ride their typed SDK variants —
 // a fallback to `Rejected`/`Unavailable` here would silently revert the
 // duplicate/password classification to the redacted generic envelope.
 #[test]
@@ -510,7 +510,7 @@ mod deprovision_cascade {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
                 "id": sp_uuid,
                 "clientId": format!("svc-{tenant}-metrics"),
-                "attributes": { "vhp.provisioning.tenant_id": [tenant.to_string()] },
+                "attributes": { "cf.provisioning.tenant_id": [tenant.to_string()] },
             }])))
             .mount(&server)
             .await;

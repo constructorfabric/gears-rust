@@ -52,7 +52,7 @@ keycloak:
   realm_admin:
     client_id_default: keycloak-idp-plugin-realm-admin
     default_shared_realm_secret: "${VP_IDP_REALM_ADMIN_PLATFORM_CLIENT_SECRET}"
-    secret_ref_template: vp-idp-realm-admin-{realm_name}-secret
+    secret_ref_template: keycloak-idp-realm-admin-{realm_name}-secret
 tenant_facade:
   realm_defaults: {}
   tenant_group_root: /tenants
@@ -75,7 +75,7 @@ user_facade:
 #[test]
 fn template_with_invalid_chars_is_rejected_via_secret_ref_validation() {
     // This template contains a colon, which SecretRef forbids.
-    let bad_template = "vhp:realm:{realm_name}";
+    let bad_template = "bad:template:{realm_name}";
     let synthetic = "a".repeat(64);
     let probe = bad_template.replace("{realm_name}", &synthetic);
     assert!(
@@ -221,7 +221,7 @@ fn realm_admin_debug_redacts_default_shared_realm_secret() {
     let cfg = RealmAdminConfig {
         client_id_default: "keycloak-idp-plugin-realm-admin".into(),
         default_shared_realm_secret: SecretFromEnv::from_literal_unchecked("rotated-on-tuesdays"),
-        secret_ref_template: "vp-idp-realm-admin-{realm_name}-secret".into(),
+        secret_ref_template: "keycloak-idp-realm-admin-{realm_name}-secret".into(),
     };
     let dump = format!("{cfg:?}");
     assert!(

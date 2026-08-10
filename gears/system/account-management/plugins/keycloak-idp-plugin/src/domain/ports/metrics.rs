@@ -271,11 +271,11 @@ impl From<&DecodeError> for VersionObserved {
 /// `endpoint_class` label on `keycloak_idp_plugin_kc_admin_request_duration_seconds`.
 ///
 /// Sealed newtype reserved for the KC HTTP layer wiring (follow-up PR
-/// to VHP-1505). The literal set is intentionally left at one
+/// to). The literal set is intentionally left at one
 /// placeholder; new endpoint classes will be added alongside the
 /// emitting call sites.
 ///
-/// **TODO (VHP-1505 follow-up — KC HTTP layer)**: when wiring real
+/// **TODO ( follow-up — KC HTTP layer)**: when wiring real
 /// emitters in `infra/kc_http.rs`, extend this sealed newtype with one
 /// `pub const` per endpoint family (e.g. `REALM_GET`, `USERS_LIST`,
 /// `GROUPS_PUT`, …). Do **not** introduce a free-`&str` constructor —

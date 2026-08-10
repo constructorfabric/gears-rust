@@ -86,7 +86,7 @@ pub(crate) fn method_static(m: &Method) -> &'static str {
 /// Whether a verb is safe to replay after a connect/timeout error — i.e.
 /// re-sending it cannot duplicate a side effect. GET/PUT/DELETE are
 /// idempotent; POST is not (re-POSTing a create can duplicate it, as the
-/// duplicate `POST /admin/realms` in run am-functional-22 showed). The
+/// duplicate `POST /admin/realms` in the duplicate-create incident showed). The
 /// token-endpoint `form_post` is also a POST but opts back into retry
 /// explicitly because re-fetching a token is harmless.
 fn idempotent_method(m: &Method) -> bool {
@@ -249,7 +249,7 @@ impl ReqwestKcTransport {
     /// `build()` itself fails.
     ///
     /// `retry_transport_errors` gates retrying connect/timeout failures
-    /// (VHP-190): a transport error does NOT prove the server skipped the
+    ///: a transport error does NOT prove the server skipped the
     /// request, so replaying a NON-idempotent verb can duplicate a side
     /// effect (the double `POST /admin/realms` → duplicate realm → false
     /// ambiguous 500). Callers pass `false` for non-idempotent POSTs and
@@ -403,7 +403,7 @@ impl KcTransport for ReqwestKcTransport {
         };
         // Non-idempotent verbs (POST) must NOT be replayed on a connect/
         // timeout error — the request may already have taken effect server
-        // side (VHP-190). Idempotent verbs are safe to retry.
+        // side. Idempotent verbs are safe to retry.
         let retry_transport = idempotent_method(&m);
         self.execute_with_retry(build, &m, path_template, retry_transport)
             .await
@@ -444,7 +444,7 @@ impl KcTransport for ReqwestKcTransport {
         };
         // A token fetch is a POST, but re-fetching a token has no durable
         // side effect, so it opts back into transport retry — important
-        // under load where the token endpoint is the bottleneck (VHP-190).
+        // under load where the token endpoint is the bottleneck.
         self.execute_with_retry(build, &Method::POST, path_template, true)
             .await
     }

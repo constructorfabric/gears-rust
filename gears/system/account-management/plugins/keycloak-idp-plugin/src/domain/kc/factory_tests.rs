@@ -135,7 +135,7 @@ async fn factory_with_tls_ca_bundle_ref_loads_bundle() {
     });
     let reader = CredStoreReader::new(stub, build_system_ctx(Uuid::nil()));
     let mut cfg = keycloak_cfg("https://kc.example/auth");
-    cfg.tls_ca_bundle_ref = Some("vhp-platform-ca-bundle".into());
+    cfg.tls_ca_bundle_ref = Some("platform-ca-bundle".into());
     // Transport construction is now where TLS bundle loading happens.
     let transport_result = ReqwestKcTransport::from_config(&cfg, &reader).await;
     assert!(
@@ -151,7 +151,7 @@ async fn factory_with_missing_tls_ca_bundle_ref_fails_init() {
     let stub: Arc<dyn CredStoreClientV1> = Arc::new(StubCredStore);
     let reader = CredStoreReader::new(stub, build_system_ctx(Uuid::nil()));
     let mut cfg = keycloak_cfg("https://kc.example/auth");
-    cfg.tls_ca_bundle_ref = Some("vhp-platform-ca-bundle".into());
+    cfg.tls_ca_bundle_ref = Some("platform-ca-bundle".into());
     let result = ReqwestKcTransport::from_config(&cfg, &reader)
         .await
         .map(|_| ());
@@ -188,7 +188,7 @@ async fn factory_with_invalid_tls_ca_bundle_fails_init() {
     });
     let reader = CredStoreReader::new(stub, build_system_ctx(Uuid::nil()));
     let mut cfg = keycloak_cfg("https://kc.example/auth");
-    cfg.tls_ca_bundle_ref = Some("vhp-platform-ca-bundle".into());
+    cfg.tls_ca_bundle_ref = Some("platform-ca-bundle".into());
     let result = ReqwestKcTransport::from_config(&cfg, &reader)
         .await
         .map(|_| ());

@@ -208,7 +208,7 @@ fn build_facade_with_unified_client(
 /// Build a Root-target request with the AM bootstrap saga's typical
 /// `root_tenant_metadata` forwarded as `provisioning_metadata` — mode
 /// = shared, realm = platform. This mirrors the production wiring after
-/// VHP-1505: the plugin no longer accepts `metadata = None`, so the AM
+/// the plugin no longer accepts `metadata = None`, so the AM
 /// deployer is required to set `bootstrap.root_tenant_metadata`.
 fn req_for_root(tenant_id: Uuid) -> IdpProvisionTenantRequest {
     IdpProvisionTenantRequest::for_root(
@@ -265,7 +265,7 @@ async fn mount_token_endpoints(server: &MockServer, realm_under_test: &str) {
 
 #[tokio::test]
 async fn absent_metadata_on_root_rejects_missing_realm_name() {
-    // VHP-1836: a Root provision with absent `provisioning_metadata` has no
+    // a Root provision with absent `provisioning_metadata` has no
     // realm to bind to — explicit `realm_name` is required for Root. This is
     // caller-input misconfiguration on the AM side, so it surfaces as
     // `PluginError::ProvisionInputRejected` (mapped to a clean 400), which the
@@ -333,7 +333,7 @@ async fn explicit_shared_mode_against_default_realm() {
 
             let facade = build_facade(&server);
             let ctx = build_system_ctx(Uuid::nil());
-            // VHP-1836: a shared child inherits its realm from the parent's
+            // a shared child inherits its realm from the parent's
             // idp_metadata (explicit `realm_name` is ignored). Supply a
             // parent_context whose decoded realm is `platform`.
             let req = IdpProvisionTenantRequest::new(
@@ -371,7 +371,7 @@ async fn explicit_shared_mode_against_default_realm() {
 
 #[tokio::test]
 async fn explicit_shared_mode_against_non_default_realm_uses_env_backed_admin() {
-    // VHP-1505: Shared is a single env-backed path regardless of realm
+    // Shared is a single env-backed path regardless of realm
     // name. The plugin no longer distinguishes a "non-default Shared
     // realm" sub-case; multi-region Shared is out-of-scope for v1 and
     // future work goes through Adopted.
@@ -415,7 +415,7 @@ async fn explicit_shared_mode_against_non_default_realm_uses_env_backed_admin() 
 
             let facade = build_facade(&server);
             let ctx = build_system_ctx(Uuid::nil());
-            // VHP-1836: shared child inherits the parent's realm (`region-eu`).
+            // shared child inherits the parent's realm (`region-eu`).
             let req = IdpProvisionTenantRequest::new(
                 tenant_uuid,
                 Uuid::new_v4(),
@@ -499,7 +499,7 @@ async fn malformed_metadata_surfaces_as_input_rejected() {
     // No HTTP mocks needed — the failure short-circuits before any KC call.
     let facade = build_facade(&server);
     let ctx = build_system_ctx(Uuid::nil());
-    // `mode` typed as a number — fails `WireMetadata` deserialisation. VHP-1836
+    // `mode` typed as a number — fails `WireMetadata` deserialisation.
     // surfaces wire-shape failures as `ProvisionInputRejected` ("malformed").
     let req = IdpProvisionTenantRequest::new(
         Uuid::new_v4(),
@@ -600,7 +600,7 @@ async fn adopted_with_empty_realm_provisions_with_secret_ref() {
 
         // Per-realm OpenBao response — keyed by the templated SecretRef.
         let cs = Arc::new(ConfigurableStubCS::with_entry(
-            "vp-idp-realm-admin-partner-acme-secret",
+            "keycloak-idp-realm-admin-partner-acme-secret",
             "per-realm-ra-secret",
         ));
         let facade = build_facade_with_cs(&server, cs);
@@ -625,7 +625,7 @@ async fn adopted_with_empty_realm_provisions_with_secret_ref() {
         assert_eq!(meta.realm_binding, RealmBinding::Adopted);
         assert_eq!(
             meta.admin_secret_ref.as_deref(),
-            Some("vp-idp-realm-admin-partner-acme-secret"),
+            Some("keycloak-idp-realm-admin-partner-acme-secret"),
             "Adopted always carries the templated SecretRef",
         );
         assert_eq!(meta.tenant_group_id, group_uuid);
@@ -698,7 +698,7 @@ async fn adopted_with_absent_parent_group_succeeds() {
             .await;
 
         let cs = Arc::new(ConfigurableStubCS::with_entry(
-            "vp-idp-realm-admin-partner-acme-secret",
+            "keycloak-idp-realm-admin-partner-acme-secret",
             "per-realm-ra-secret",
         ));
         let facade = build_facade_with_cs(&server, cs);
@@ -821,7 +821,7 @@ async fn shared_with_realm_probe_403_returns_bootstrap_perms_missing() {
 
             let facade = build_facade(&server);
             let ctx = build_system_ctx(Uuid::nil());
-            // VHP-1836: shared child inherits the parent's realm (`partner-acme`).
+            // shared child inherits the parent's realm (`partner-acme`).
             let req = IdpProvisionTenantRequest::new(
                 Uuid::new_v4(),
                 Uuid::new_v4(),
@@ -1300,7 +1300,7 @@ async fn mount_created_downstream(
 }
 
 fn created_request(tenant_uuid: Uuid) -> IdpProvisionTenantRequest {
-    // VHP-1836: created mode GENERATES `realm-<tenant_id>` — no `realm_name`
+    // created mode GENERATES `realm-<tenant_id>` — no `realm_name`
     // on the wire (supplying one is rejected).
     IdpProvisionTenantRequest::new(
         tenant_uuid,
@@ -1321,10 +1321,10 @@ fn created_request(tenant_uuid: Uuid) -> IdpProvisionTenantRequest {
 async fn created_happy_path_writes_secret_and_returns_created_metadata() {
     let server = MockServer::start().await;
     temp_env::async_with_vars([("TEST_BOOTSTRAP_SECRET", Some("topsecret"))], async {
-        // VHP-1836: created mode generates `realm-<tenant_id>`.
+        // created mode generates `realm-<tenant_id>`.
         let tenant_uuid = Uuid::new_v4();
         let realm = format!("realm-{tenant_uuid}");
-        let secret_key = format!("vp-idp-realm-admin-{realm}-secret");
+        let secret_key = format!("keycloak-idp-realm-admin-{realm}-secret");
         let (group_uuid, _parent_uuid) =
             mount_created_happy_path(&server, tenant_uuid, &realm, "the-generated-client-secret")
                 .await;
@@ -1400,7 +1400,7 @@ async fn created_saga_remints_bootstrap_token_after_realm_create() {
             mount_created_happy_path(&server, tenant_uuid, &realm, "the-generated-client-secret")
                 .await;
         let cs = Arc::new(ConfigurableStubCS::with_entry(
-            &format!("vp-idp-realm-admin-{realm}-secret"),
+            &format!("keycloak-idp-realm-admin-{realm}-secret"),
             "the-generated-client-secret",
         ));
         let facade = build_facade_with_cs(&server, cs);
@@ -1532,7 +1532,7 @@ async fn created_kc_realm_create_5xx_returns_ambiguous_kc_realm_create() {
 }
 
 // ---------------------------------------------------------------------
-// Created-mode realm-create idempotency (VHP-190 / run am-functional-22):
+// Created-mode realm-create idempotency (create-path idempotency):
 // the realm-create step must reconcile a 409 / lost-our-own-create against
 // an ownership marker instead of blanket-tagging `AmbiguousCreated`.
 // ---------------------------------------------------------------------
@@ -1542,11 +1542,11 @@ async fn created_kc_realm_create_5xx_returns_ambiguous_kc_realm_create() {
 fn realm_body_with_owner(realm: &str, tenant_id: Uuid) -> serde_json::Value {
     serde_json::json!({
         "realm": realm,
-        "attributes": { "vhp.provisioning.tenant_id": tenant_id.to_string() },
+        "attributes": { "cf.provisioning.tenant_id": tenant_id.to_string() },
     })
 }
 
-/// Regression (run am-functional-22): under KC load the realm-create POST
+/// Regression (the duplicate-create incident): under KC load the realm-create POST
 /// is retried after a timeout; the first POST already created the realm, so
 /// the retry hits KC's unique-name constraint → 409. The plugin MUST
 /// recognise the realm as its own (ownership marker on the re-GET) and treat
@@ -1586,7 +1586,7 @@ async fn created_realm_create_409_with_our_marker_reconciles_to_success() {
         let _ = mount_created_downstream(&server, realm, tenant_uuid, "sekret").await;
 
         let cs = Arc::new(ConfigurableStubCS::with_entry(
-            &format!("vp-idp-realm-admin-{realm}-secret"),
+            &format!("keycloak-idp-realm-admin-{realm}-secret"),
             "sekret",
         ));
         let facade = build_facade_with_cs(&server, cs);
@@ -1625,7 +1625,7 @@ async fn created_existing_realm_with_our_marker_is_adopted() {
         let _ = mount_created_downstream(&server, realm, tenant_uuid, "sekret").await;
 
         let cs = Arc::new(ConfigurableStubCS::with_entry(
-            &format!("vp-idp-realm-admin-{realm}-secret"),
+            &format!("keycloak-idp-realm-admin-{realm}-secret"),
             "sekret",
         ));
         let facade = build_facade_with_cs(&server, cs);
@@ -2176,7 +2176,7 @@ async fn deprovision_adopted_happy_path_returns_ok() {
             .await;
 
         let cs = Arc::new(ConfigurableStubCS::with_entry(
-            "vp-idp-realm-admin-partner-acme-secret",
+            "keycloak-idp-realm-admin-partner-acme-secret",
             "per-realm-ra-secret",
         ));
         let facade = build_facade_with_cs(&server, cs);
@@ -2187,7 +2187,7 @@ async fn deprovision_adopted_happy_path_returns_ok() {
                 "partner-acme",
                 RealmBinding::Adopted,
                 group_uuid,
-                Some("vp-idp-realm-admin-partner-acme-secret"),
+                Some("keycloak-idp-realm-admin-partner-acme-secret"),
             )),
         );
         facade
@@ -2250,7 +2250,7 @@ async fn deprovision_created_last_tenant_tears_down_realm_and_secret() {
 
         let mutator = Arc::new(ConfigurableStubOpenBao::default());
         mutator.seed_get(
-            "vp-idp-realm-admin-partner-created-secret",
+            "keycloak-idp-realm-admin-partner-created-secret",
             "per-realm-ra-secret",
         );
         let facade = build_facade_with_unified_client(
@@ -2264,7 +2264,7 @@ async fn deprovision_created_last_tenant_tears_down_realm_and_secret() {
                 "partner-created",
                 RealmBinding::Created,
                 group_uuid,
-                Some("vp-idp-realm-admin-partner-created-secret"),
+                Some("keycloak-idp-realm-admin-partner-created-secret"),
             )),
         );
         facade
@@ -2279,7 +2279,7 @@ async fn deprovision_created_last_tenant_tears_down_realm_and_secret() {
             "Created last-tenant teardown MUST issue exactly one OpenBao delete",
         );
         assert_eq!(
-            deletes[0], "vp-idp-realm-admin-partner-created-secret",
+            deletes[0], "keycloak-idp-realm-admin-partner-created-secret",
             "OpenBao delete MUST key on the templated realm-admin SecretRef",
         );
     })
@@ -2333,7 +2333,7 @@ async fn deprovision_created_with_remaining_tenants_keeps_realm() {
 
         let mutator = Arc::new(ConfigurableStubOpenBao::default());
         mutator.seed_get(
-            "vp-idp-realm-admin-partner-busy-secret",
+            "keycloak-idp-realm-admin-partner-busy-secret",
             "per-realm-ra-secret",
         );
         let facade = build_facade_with_unified_client(
@@ -2347,7 +2347,7 @@ async fn deprovision_created_with_remaining_tenants_keeps_realm() {
                 "partner-busy",
                 RealmBinding::Created,
                 group_uuid,
-                Some("vp-idp-realm-admin-partner-busy-secret"),
+                Some("keycloak-idp-realm-admin-partner-busy-secret"),
             )),
         );
         facade
@@ -2578,7 +2578,7 @@ async fn deprovision_with_malformed_metadata_returns_terminal() {
 // ── DESIGN §5.2: `realm_name` regex validation tests ────────────────────
 
 /// Helper: a Root request carrying explicit `{mode: shared, realm_name}` — the
-/// realm-regex validator runs on the explicit Root realm (VHP-1836).
+/// realm-regex validator runs on the explicit Root realm.
 fn root_req_with_realm(realm: &str) -> IdpProvisionTenantRequest {
     IdpProvisionTenantRequest::for_root(
         Uuid::new_v4(),
@@ -2719,7 +2719,7 @@ async fn provision_tenant_returns_ambiguous_timeout_when_saga_exceeds_provision_
     );
 }
 
-// ── VHP-76 §A — admin_user_id bind tests ────────────────────────────────────
+// ── admin_user_id bind tests ────────────────────────────────────
 
 /// Mount the Shared-mode happy-path KC calls (realm probe + token endpoints +
 /// parent group search + child group create) for `platform`. Returns
@@ -4243,7 +4243,7 @@ async fn provision_tenant_recovers_from_realm_admin_rotation_via_reactive_401() 
     .await;
 }
 
-// ── VHP-1836: effective-realm resolution in `parse_input` ───────────────────
+// ── effective-realm resolution in `parse_input` ───────────────────
 //
 // `parse_input` now takes the whole `IdpProvisionTenantRequest` and derives the
 // effective realm from `target` + mode:

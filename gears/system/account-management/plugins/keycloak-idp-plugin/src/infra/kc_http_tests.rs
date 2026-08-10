@@ -383,7 +383,7 @@ async fn raw_request_no_retry_on_404() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Method-aware transport retry (VHP-190 / run am-functional-22)
+// Method-aware transport retry (create-path idempotency)
 //
 // A connect/timeout error does NOT prove the server didn't process the
 // request. Retrying a NON-idempotent POST on such an error can therefore

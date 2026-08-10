@@ -167,7 +167,7 @@ pub enum PluginError {
     /// 15 boundary maps this to [`IdpUserOperationFailure::Rejected`]
     /// per DESIGN §5.5 — AM surfaces a generic validation envelope.
     /// Uniqueness conflicts never land here: every KC 409 rides
-    /// [`Self::UserOpDuplicate`] (VHP-2158).
+    /// [`Self::UserOpDuplicate`].
     #[error("user op rejected: {detail}")]
     UserOpRejected { detail: String },
 
@@ -177,7 +177,7 @@ pub enum PluginError {
     /// `errorMessage` when attributable, `UsernameOrEmail` otherwise
     /// (KC 26's combined constant, unparseable bodies). Boundary maps
     /// this to [`IdpUserOperationFailure::DuplicateUser`] so AM
-    /// surfaces HTTP 409 `already_exists` (VHP-2158) — wording drift
+    /// surfaces HTTP 409 `already_exists` — wording drift
     /// in KC can degrade the field token, never the status.
     #[error("user op duplicate {field:?}: {detail}")]
     UserOpDuplicate {
@@ -189,7 +189,7 @@ pub enum PluginError {
     /// recognised policy `errorMessage`). Boundary maps this to
     /// [`IdpUserOperationFailure::PasswordPolicy`] so AM can surface
     /// the structured `password` / `PASSWORD_POLICY` field violation
-    /// (VHP-2158). Previously this fell through the non-409 catch-all
+    ///. Previously this fell through the non-409 catch-all
     /// into `UserOpUnavailable` and mis-surfaced as a retryable 503.
     #[error("user op password policy: {detail}")]
     UserOpPasswordPolicy { detail: String },

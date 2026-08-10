@@ -1,4 +1,4 @@
-//! `toolkit` module wiring for the VHP `IdP` Plugin.
+//! `toolkit` module wiring for the Keycloak `IdP` plugin.
 
 use std::sync::Arc;
 

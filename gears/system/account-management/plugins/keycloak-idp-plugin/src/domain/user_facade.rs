@@ -76,7 +76,7 @@ fn user_translate_kc(e: PluginError) -> PluginError {
 }
 
 /// Attribute a KC 409 user-create body to the colliding unique field
-/// (VHP-2158). The HTTP 409 status itself is the machine signal that a
+///. The HTTP 409 status itself is the machine signal that a
 /// uniqueness invariant fired — on this endpoint it has no other cause
 /// — so the caller classifies EVERY 409 as a duplicate and this
 /// function only refines which field, never whether.
@@ -108,7 +108,7 @@ fn classify_kc_conflict(body_text: &str) -> account_management_sdk::IdpUserDupli
     }
 }
 
-/// Detect a KC 400 password-policy reject on user-create (VHP-2158).
+/// Detect a KC 400 password-policy reject on user-create.
 /// KC signals policy failures in two shapes depending on version/path:
 /// `{"errorMessage": "Password policy not met"}` (admin user-create with
 /// an embedded credential) and `{"error": "invalidPasswordMinLengthMessage",
@@ -722,7 +722,7 @@ impl UserFacade {
     /// payload (DESIGN §5.4). Returns success on any 2xx. Every 409 is
     /// [`PluginError::UserOpDuplicate`] — the status itself is the
     /// uniqueness signal; KC's `errorMessage` only refines the colliding
-    /// field (VHP-2158). A 400/422 carrying a KC password-policy reject
+    /// field. A 400/422 carrying a KC password-policy reject
     /// becomes [`PluginError::UserOpPasswordPolicy`], any other 400/422
     /// is a terminal [`PluginError::UserOpRejected`]; 5xx / transport /
     /// timeout re-tag as [`PluginError::UserOpUnavailable`] via
@@ -839,7 +839,7 @@ impl UserFacade {
         }
         let redacted = redact_secrets(&truncate_2kb(&body_text));
         if status == 409 {
-            // VHP-2158: on this endpoint a 409 has no cause other than a
+            // on this endpoint a 409 has no cause other than a
             // uniqueness collision, so the STATUS is the classification —
             // every 409 rides the typed duplicate lane and stays HTTP 409
             // at the AM boundary regardless of KC wording drift; the body
@@ -852,7 +852,7 @@ impl UserFacade {
                 ),
             });
         }
-        // VHP-2158: KC's payload-rejection statuses. A recognised
+        // KC's payload-rejection statuses. A recognised
         // password-policy reject surfaces the structured `password` /
         // `PASSWORD_POLICY` violation; every other 400/422 (invalid email
         // format, user-profile attribute validation, malformed payload) is
@@ -1189,7 +1189,7 @@ impl UserFacade {
         result
     }
 
-    // TODO(VHP-76 follow-up): the `order` clause is still dropped in
+    // TODO(follow-up): the `order` clause is still dropped in
     // favour of the hard-coded `(createdTimestamp ASC, id ASC)` cursor
     // sort, and the v1 client-side filter strategy fetches a single
     // page from KC's `/groups/{tenant_group_id}/members` endpoint
@@ -1273,7 +1273,7 @@ impl UserFacade {
         // member KC ordered past that window (KC orders group members by
         // username). Any tenant with more than one page of members lost
         // users from BOTH the listing and `$filter` — create-then-list
-        // returned 201 yet the user never appeared (VHP-1973).
+        // returned 201 yet the user never appeared.
         //
         // `MEMBERS_DRAIN_HARD_CAP` bounds the total pulled so a
         // pathological membership cannot pin unbounded memory; reaching it

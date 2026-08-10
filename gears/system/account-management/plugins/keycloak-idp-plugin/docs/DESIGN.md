@@ -13,7 +13,7 @@ refs:
 
 **Owners:** @platform-iam-team
 
-**Scope:** Architecture of the shipped plugin implementation (crate `cf-gears-keycloak-idp-plugin`, ported from vhp-core). The implementation is authoritative; this document describes what the code does, deliberately mirroring implementation-level constants and behaviors (an implementation-mirror altitude) — a change to those constants in code owns the matching edit here. In-code comments citing `DESIGN §N` refer to the original vhp-core implementation specification (`DESIGN-vp-idp-plugin-202605192055`) from which this crate lineage descends, not to section numbers in this document.
+**Scope:** Architecture of the shipped plugin implementation (crate `cf-gears-keycloak-idp-plugin`). The implementation is authoritative; this document describes what the code does, deliberately mirroring implementation-level constants and behaviors (an implementation-mirror altitude) — a change to those constants in code owns the matching edit here. In-code comments citing `DESIGN §N` refer to the implementation specification this crate lineage descends from, not to section numbers in this document.
 
 <!-- toc -->
 
@@ -66,7 +66,7 @@ Three realm bindings are supported: `shared` (default; tenants share an operator
 |---|---|
 | Provider-neutral publication and selection | `PluginV1<IdpPluginSpecV1>` published to types-registry (instance segment `cf.builtin.keycloak_idp.plugin.v1`; full catalogue id in §3.2, vendor `keycloak`, priority 50); scoped ClientHub registration keyed on the instance id; AM resolves via `choose_plugin_instance` against `idp.vendor` |
 | Fail-fast configuration errors | Init validates typed config (`deny_unknown_fields`), the `secret_ref_template`, and the service-principal section, then pre-warms the bootstrap admin token with a bounded retry budget; exhausting the budget fails `Gear::init` |
-| Shared-realm tenant isolation | Per-tenant Keycloak group under `/tenants`, immutable `tenant_id` user attribute (ADR-0006), and an ownership marker attribute (`vhp.provisioning.tenant_id`) on created realms and service-principal clients |
+| Shared-realm tenant isolation | Per-tenant Keycloak group under `/tenants`, immutable `tenant_id` user attribute (ADR-0006), and an ownership marker attribute (`cf.provisioning.tenant_id`) on created realms and service-principal clients |
 | Safe external mutation | Parse-then-probe saga ordering, per-step reactive-401 wrapping, idempotent replay paths (probe-adopt realm ensure, 409 group reuse), and stage-attributed `AmbiguousCreated` classification with an `ambig:` prefix contract for reconciliation tooling |
 | Secret custody | `SecretFromEnv`/`SecretString` wrappers with redacted `Debug`, token cache redaction, `redact_secrets` on every error body, and Credential Store writes only for plugin-created realm-admin secrets |
 | Credential rotation without restart | Token cache keyed `(realm, client_id)` with single-flight refresh and an exactly-once reactive-401 retry that re-resolves the secret from its source (env or Credential Store) |
@@ -77,7 +77,7 @@ Three realm bindings are supported: `shared` (default; tenants share an operator
 
 | NFR | Architectural response | Release verification |
 |---|---|---|
-| Tenant isolation | Tenant group membership scopes listing; the `tenant_id` user attribute guards user deprovision; `vhp.provisioning.tenant_id` markers guard realm and service-principal ownership | Negative-isolation unit and integration tests |
+| Tenant isolation | Tenant group membership scopes listing; the `tenant_id` user attribute guards user deprovision; `cf.provisioning.tenant_id` markers guard realm and service-principal ownership | Negative-isolation unit and integration tests |
 | Secret non-disclosure | Typed secret wrappers, redacted token cache, `redact_secrets` + 2 KiB truncation on every provider error body before it crosses the AM boundary | Redaction unit tests; log/metric scanning |
 | Failure classification | Closed `PluginError` taxonomy translated at the SDK boundary per fixed tables; `debug_assert` that provisioning never surfaces `MetadataDecode` | Exhaustive translation unit tests and failure injection |
 | Availability recovery | Per-call pre-saga health probe; reactive-401 secret re-resolution; no cached provider state besides tokens; recovery needs no restart once init has succeeded | Dependency loss/recovery tests |
@@ -288,7 +288,7 @@ The provider metadata is the versioned, non-secret routing envelope `TenantIdpMe
 | `realm_name` | Realm the tenant is bound to. |
 | `realm_binding` | `shared` \| `adopted` \| `created` (also a public metric label). |
 | `tenant_group_id` | Keycloak UUID of the plugin-owned per-tenant group. |
-| `admin_secret_ref` | `None` for the env-backed default shared realm; `Some(ref)` naming the Credential Store reference for adopted/created realms (template `vp-idp-realm-admin-{realm_name}-secret` by default). |
+| `admin_secret_ref` | `None` for the env-backed default shared realm; `Some(ref)` naming the Credential Store reference for adopted/created realms (template `keycloak-idp-realm-admin-{realm_name}-secret` by default). |
 | `admin_client_id` | OAuth2 `client_id` of the per-realm admin client (default `keycloak-idp-plugin-realm-admin`). |
 
 Provider ownership is split as follows:
@@ -296,7 +296,7 @@ Provider ownership is split as follows:
 | Resource | Owner | Plugin authority |
 |---|---|---|
 | Shared and adopted realms, their authentication profile, protocol mappers, and the bootstrap/realm-admin clients in them | Platform operator (IaC / realm bootstrap) | Assert existence (and emptiness for adopted); use the configured admin clients |
-| Created realms (child tenants: generated `realm-{tenant_id}`; root target: operator-named; all marked `vhp.provisioning.tenant_id`) | Plugin | Create, administer, and delete on last-tenant deprovisioning |
+| Created realms (child tenants: generated `realm-{tenant_id}`; root target: operator-named; all marked `cf.provisioning.tenant_id`) | Plugin | Create, administer, and delete on last-tenant deprovisioning |
 | Realm-admin client and its 7 `realm-management` roles in created realms | Plugin | Create and grant during created-mode provisioning |
 | Per-tenant group under `/tenants` and the `tenant_id`/`user_type` user attributes | Plugin | Create, inspect, delete for the owning tenant |
 | Human identities and sessions in the tenant boundary | Plugin through Account Management | Create, delete, revoke, and query after boundary verification; updates are unsupported in this revision |
@@ -343,28 +343,6 @@ Initialization proceeds in phases:
 7. **ClientHub registration** — `Arc<dyn IdpPluginClient>` scoped by the catalogue instance id; `Arc<dyn ServicePrincipalClientV1>` unscoped.
 
 After init, readiness is operation-based: every tenant provision/deprovision saga begins with an unauthenticated Keycloak health probe (`GET realms/master`), and every call re-resolves credentials on 401. Recovery from provider or Credential Store outages therefore needs no process restart.
-
-#### Operator Migration from the vhp-core Lineage
-
-The plugin's identifiers were moved onto this repository's conventions when the crate was ported. A deployment upgrading from the vhp-core `vp-idp-plugin` build must update the following, all of which are configuration or observability surfaces:
-
-| Surface | Was | Now | Action |
-|---|---|---|---|
-| Gear name (config section key) | `vp-idp-plugin` | `keycloak-idp-plugin` | Rename the module's config section |
-| Plugin vendor (selection key) | `virtuozzo` | `keycloak` | Set `account-management.idp.vendor = "keycloak"` |
-| GTS catalogue instance | `…~vz.virtuozzo.vp_idp.plugin.v1` | `…~cf.builtin.keycloak_idp.plugin.v1` | Retire the stale types-registry entry; tenants bound under the old instance need the operator migration described in `…-constraint-scoped-provider-selection` |
-| Bootstrap admin `client_id` default | `vp-idp-plugin-bootstrap` | `keycloak-idp-plugin-bootstrap` | Rename the Keycloak client, or pin the old value in config |
-| Realm-admin `client_id` default | `vp-idp-plugin-realm-admin` | `keycloak-idp-plugin-realm-admin` | Affects newly provisioned realms only — existing tenants replay `admin_client_id` from their metadata |
-| Metric prefix | `vp_idp_plugin_*` | `keycloak_idp_plugin_*` | Update dashboards and alert rules |
-| Tracing targets | `vp_idp_plugin.*`, `vp.idp.plugin.events` | `keycloak_idp.*`, `keycloak_idp.events` | Update log routing and audit collectors |
-
-Three identifiers are deliberately **unchanged**, because each names state that lives outside the process and renaming it would orphan existing resources:
-
-- `vhp.provisioning.tenant_id` — the ownership marker written onto plugin-created realms and service-principal clients in Keycloak. A rename would make the plugin read its own realms as foreign and refuse to administer them.
-- `vp-idp-realm-admin-{realm_name}-secret` — the default `secret_ref_template`, which names live Credential Store secrets for adopted and created realms.
-- The system-actor UUID value — Credential Store secret ownership is keyed to it (§4.1).
-
-Renaming any of the three requires a data migration plan and is out of scope for the port.
 
 ### 3.3 API Contracts
 

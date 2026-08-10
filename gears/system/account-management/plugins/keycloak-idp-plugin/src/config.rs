@@ -375,7 +375,7 @@ fn default_realm_admin_client_id() -> String {
     "keycloak-idp-plugin-realm-admin".into()
 }
 fn default_secret_ref_template() -> String {
-    "vp-idp-realm-admin-{realm_name}-secret".into()
+    "keycloak-idp-realm-admin-{realm_name}-secret".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]

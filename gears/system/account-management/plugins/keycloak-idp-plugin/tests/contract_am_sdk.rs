@@ -6,7 +6,7 @@
 //! conformance harness for the `IdpPluginClient` trait — `src/idp.rs`
 //! defines the trait + DTOs, and the SDK's only `*_tests.rs` modules
 //! cover DTO (de)serialisation, not plugin behaviour. When the harness
-//! lands upstream (tracked separately — see the VHP-1505 follow-up
+//! lands upstream (tracked separately — see the follow-up
 //! ticket), replace this placeholder with a wired test, roughly:
 //!
 //! ```ignore

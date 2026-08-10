@@ -66,12 +66,12 @@ const REALM_MANAGEMENT_CLIENT_ID: &str = "realm-management";
 
 /// Realm attribute key stamping the AM tenant that owns a Created-mode
 /// realm. Written into the `RealmRepresentation.attributes` map at
-/// realm-create time so that (VHP-190 / run am-functional-22):
+/// realm-create time so that (create-path idempotency):
 ///   * a retried / re-entrant realm-create recognises a realm as its own —
 ///     the unique-name 409 from a duplicate POST reconciles to idempotent
 ///     success instead of a false `AmbiguousCreated` → AM 500, and
 ///   * the orphan reaper can GC dedicated realms by owning tenant.
-pub(crate) const PROVISIONING_TENANT_ID_ATTR: &str = "vhp.provisioning.tenant_id";
+pub(crate) const PROVISIONING_TENANT_ID_ATTR: &str = "cf.provisioning.tenant_id";
 
 /// Outcome of probing whether a Created-mode realm already exists and who
 /// owns it, per the [`PROVISIONING_TENANT_ID_ATTR`] marker.
@@ -108,7 +108,7 @@ fn realm_owner_tenant_id(body: &str) -> Option<Uuid> {
 struct ParsedInput {
     realm_binding: RealmBinding,
     realm_name: String,
-    /// Optional Keycloak user UUID for admin-bind bootstrap (VHP-76 §A).
+    /// Optional Keycloak user UUID for admin-bind bootstrap.
     /// When present and `realm_binding = Shared`, `provision_shared` will
     /// PATCH that user's attributes with `tenant_id` and `user_type = "user"`.
     /// v1: bind only in Shared mode (DESIGN bump required to expand).
@@ -125,7 +125,7 @@ struct ParsedInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireMetadata {
-    /// Realm-binding mode. Optional now (VHP-1836): absent ⇒ `shared`. The
+    /// Realm-binding mode. Optional now: absent ⇒ `shared`. The
     /// effective realm is derived from `target` + mode in `parse_input`, so
     /// `mode` and `realm_name` are no longer mandatory on the wire.
     #[serde(default)]
@@ -134,7 +134,7 @@ struct WireMetadata {
     /// `shared` (inherited from the parent) and rejected for `created`.
     #[serde(default)]
     realm_name: Option<String>,
-    /// Optional Keycloak user UUID for admin-bind bootstrap (VHP-76 §A).
+    /// Optional Keycloak user UUID for admin-bind bootstrap.
     /// Missing field deserialises as `None` — backward compatible with
     /// existing call sites that omit the field.
     ///
@@ -960,7 +960,7 @@ impl TenantFacade {
     }
 
     /// Decode `provisioning_metadata` and derive the EFFECTIVE realm from the
-    /// provisioning `target` + mode (VHP-1836). Pre-KC caller-input rejections
+    /// provisioning `target` + mode. Pre-KC caller-input rejections
     /// surface as [`PluginError::ProvisionInputRejected`] (mapped to a clean
     /// 400) rather than the broad [`PluginError::Config`].
     ///
@@ -1255,7 +1255,7 @@ impl TenantFacade {
 
         // NOTE: `parsed.admin_user_id` is intentionally not acted upon in
         // Adopted mode. v1: bind only in Shared mode (DESIGN bump required
-        // to expand — see VHP-76 §A scope note).
+        // to expand — see §A scope note).
         Ok(TenantIdpMetadataV1 {
             version: "v1".into(),
             realm_name: parsed.realm_name.clone(),
@@ -1297,7 +1297,7 @@ impl TenantFacade {
         // retry narrowly scoped to the call whose token was rejected.
         //
         // Steps 1-2: idempotent realm ensure (probe → create → reconcile).
-        // DESIGN §5.2, hardened per VHP-190 (run am-functional-22): a
+        // DESIGN §5.2, hardened for create-path idempotency: a
         // `mode = created` against an existing realm that is OURS (same
         // tenant marker) is adopted idempotently; a foreign realm is a
         // CleanFailure; and a 409 / lost-response on our own create
@@ -1407,7 +1407,7 @@ impl TenantFacade {
 
         // NOTE: `parsed.admin_user_id` is intentionally not acted upon in
         // Created mode. v1: bind only in Shared mode (DESIGN bump required
-        // to expand — see VHP-76 §A scope note).
+        // to expand — see §A scope note).
         Ok(TenantIdpMetadataV1 {
             version: "v1".into(),
             realm_name: parsed.realm_name.clone(),
@@ -1418,7 +1418,7 @@ impl TenantFacade {
         })
     }
 
-    /// Idempotent realm-create step (DESIGN §5.2, hardened per VHP-190 / run
+    /// Idempotent realm-create step (DESIGN §5.2, hardened per / run
     /// am-functional-22). Folds the existence probe and the create into one
     /// reconciling step so a retried or re-entrant create is safe:
     ///
@@ -1603,7 +1603,7 @@ impl TenantFacade {
                 "displayName".into(),
                 serde_json::Value::String(req.name.clone()),
             );
-            // Ownership marker (VHP-190): stamp the AM tenant that owns this
+            // Ownership marker: stamp the AM tenant that owns this
             // realm so a retried / re-entrant create recognises it as ours
             // (`ensure_realm` reconcile) and the reaper can GC orphans by
             // owner. Plugin-set, after the allowlist gate — not operator-tunable.

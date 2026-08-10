@@ -190,7 +190,7 @@ async fn create_provisions_client_sa_attrs_scope_and_returns_secret() {
             "implicitFlowEnabled": false,
             "authorizationServicesEnabled": false,
             "clientAuthenticatorType": "client-secret",
-            "attributes": { "vhp.provisioning.tenant_id": tenant.to_string() },
+            "attributes": { "cf.provisioning.tenant_id": tenant.to_string() },
         })))
         .respond_with(ResponseTemplate::new(201))
         .expect(1)
@@ -301,7 +301,7 @@ async fn create_rejects_when_quota_reached() {
             json!({
                 "id": Uuid::new_v4(),
                 "clientId": format!("{prefix}sp{i}"),
-                "attributes": { "vhp.provisioning.tenant_id": [tenant.to_string()] },
+                "attributes": { "cf.provisioning.tenant_id": [tenant.to_string()] },
             })
         })
         .collect();
@@ -357,7 +357,7 @@ async fn create_409_yields_invalid_input_even_for_same_tenant_owner() {
         .and(query_param("clientId", client_id.clone()))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
             "id": CLIENT_UUID,
-            "attributes": { "vhp.provisioning.tenant_id": [tenant.to_string()] },
+            "attributes": { "cf.provisioning.tenant_id": [tenant.to_string()] },
         }])))
         .expect(0)
         .mount(&server)
@@ -727,7 +727,7 @@ async fn mount_owned_client_lookup(server: &MockServer, client_id: &str, owner: 
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
             "id": CLIENT_UUID,
             "clientId": client_id,
-            "attributes": { "vhp.provisioning.tenant_id": [owner.to_string()] },
+            "attributes": { "cf.provisioning.tenant_id": [owner.to_string()] },
         }])))
         .mount(server)
         .await;
@@ -1048,7 +1048,7 @@ async fn list_returns_tenant_principals_with_scopes() {
                 "clientId": format!("{prefix}metrics"),
                 "enabled": true,
                 "defaultClientScopes": ["mon:metrics:write"],
-                "attributes": { "vhp.provisioning.tenant_id": [tenant.to_string()] },
+                "attributes": { "cf.provisioning.tenant_id": [tenant.to_string()] },
             },
             {
                 "id": "44444444-4444-4444-4444-444444444444",
@@ -1212,18 +1212,18 @@ async fn purge_deletes_owned_clients_and_tolerates_races() {
             {
                 "id": owned_a,
                 "clientId": format!("{prefix}metrics"),
-                "attributes": { "vhp.provisioning.tenant_id": [tenant.to_string()] },
+                "attributes": { "cf.provisioning.tenant_id": [tenant.to_string()] },
             },
             {
                 "id": owned_b,
                 "clientId": format!("{prefix}push"),
-                "attributes": { "vhp.provisioning.tenant_id": [tenant.to_string()] },
+                "attributes": { "cf.provisioning.tenant_id": [tenant.to_string()] },
             },
             {
                 // substring noise: prefix matches but owner is foreign
                 "id": foreign,
                 "clientId": format!("{prefix}stray"),
-                "attributes": { "vhp.provisioning.tenant_id": [other.to_string()] },
+                "attributes": { "cf.provisioning.tenant_id": [other.to_string()] },
             },
         ])))
         .mount(&server)
@@ -1374,7 +1374,7 @@ async fn create_quota_reject_emits_failure_sp_create_sp_invalid_input() {
             json!({
                 "id": Uuid::new_v4(),
                 "clientId": format!("{prefix}sp{i}"),
-                "attributes": { "vhp.provisioning.tenant_id": [tenant.to_string()] },
+                "attributes": { "cf.provisioning.tenant_id": [tenant.to_string()] },
             })
         })
         .collect();

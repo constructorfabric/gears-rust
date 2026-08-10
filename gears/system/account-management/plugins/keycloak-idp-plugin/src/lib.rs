@@ -4,10 +4,9 @@
 //! Spec: [`docs/DESIGN.md`](../docs/DESIGN.md) / [`docs/PRD.md`](../docs/PRD.md)
 //! adjacent to this crate.
 
-// Ported from vhp-core (`crates/gears/plugins/vp-idp-plugin`), which builds
-// under a laxer clippy profile. These style lints are allowed crate-wide to
-// keep the port diffable against the vhp-core original; the same pattern is
-// used by other ported crates (see `chat-engine`, `mini-chat`).
+// These style lints are allowed crate-wide so the crate keeps building
+// unchanged against its upstream profile; the same pattern is used by
+// other ported crates (see `chat-engine`, `mini-chat`).
 #![allow(
     clippy::non_ascii_literal,
     clippy::str_to_string,

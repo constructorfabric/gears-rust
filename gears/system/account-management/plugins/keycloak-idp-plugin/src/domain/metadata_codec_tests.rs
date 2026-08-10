@@ -26,7 +26,7 @@ fn created_round_trip_with_secret_ref() {
         realm_name: "partner-acme".into(),
         realm_binding: RealmBinding::Created,
         tenant_group_id: uuid!("9c4a6b2e-0000-0000-0000-000000000002"),
-        admin_secret_ref: Some("vp-idp-realm-admin-partner-acme-secret".into()),
+        admin_secret_ref: Some("keycloak-idp-realm-admin-partner-acme-secret".into()),
         admin_client_id: "keycloak-idp-plugin-realm-admin".into(),
     };
     let encoded = MetadataCodec.encode(&original);
