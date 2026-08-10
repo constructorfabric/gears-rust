@@ -179,11 +179,13 @@ Three mechanisms, all deterministic and CI-runnable:
   *slope*, not the offset: statement count must not grow with N. This is what
   makes N+1 detection mechanical rather than a matter of noticing a loop.
 - **Static source scans** for the classes that leave no SQL trace. Text
-  heuristics, explicitly interim until a dylint late lint replaces them. This
-  branch carries the `SERIALIZABLE`-without-retry rule (Section 4 of the audit
-  suite), which both guards `group_service.rs` as a negative control and pins
-  the defect that is still present in `type_service.rs` at its current count;
-  the external-call-in-tx rule travels with the transaction-boundary fixes.
+  heuristics, explicitly interim until a dylint late lint replaces them.
+  Section 4 of the audit suite carries four rules here: retry on every
+  transaction in both service files (RG-03 is fixed in this branch, so both
+  scans are negative controls), the external call kept out of the transaction
+  (RG-09), and the row lock the non-force delete takes in place of
+  `SERIALIZABLE` — scoped to the function bodies they are about, because a
+  whole-file scan passes on someone else's code.
 - **Real PostgreSQL races** (not in this branch — see the deviation section
   below). Barrier-synchronized task pairs on `testcontainers`, each ending in
   a post-state invariant check against the tables — closure agrees with
