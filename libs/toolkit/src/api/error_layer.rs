@@ -63,15 +63,15 @@ pub fn map_error_to_canonical(error: &dyn Any) -> CanonicalError {
             ConfigError::InvalidConfig { gear, .. } => {
                 format!("Gear '{gear}' has invalid configuration")
             }
-            ConfigError::VarExpand { gear, source } => {
-                // The `source` carries the failing env-var name. It is logged
+            ConfigError::VarExpand { gear, cause } => {
+                // The `cause` carries the failing env-var name. It is logged
                 // locally for operators but intentionally NOT placed into the
                 // canonical's diagnostic — `diagnostic()` is exposed through
                 // `canonical_error_middleware` and we keep the env-var name
                 // out of any path that could reach a downstream consumer.
                 tracing::error!(
                     gear =  %gear,
-                    error = %source,
+                    error = %cause,
                     "Environment variable expansion failed in gear config"
                 );
                 format!("Gear '{gear}' has invalid environment-backed configuration")
@@ -171,7 +171,7 @@ mod tests {
         };
         let canonical = ConfigError::VarExpand {
             gear: "my_mod".to_owned(),
-            source,
+            cause: source,
         }
         .into_canonical();
 

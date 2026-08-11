@@ -123,16 +123,20 @@ async fn pg_life_002_build_and_start_is_idempotent() {
 /// `PG-LIFE-003`: after `stop`, the Postgres server shows zero connections
 /// from the plugin and any advisory locks it held are released.
 ///
-/// Regression guard for the `held`-drain fix (DESIGN.md §10 step 4): a lock's
-/// pinned connection lives in `PostgresLock`'s `held: DashMap`, checked out of
-/// the pool for the lock's full duration and outside the pool's own tracking.
-/// `sqlx::Pool::close()` blocks until every checked-out connection is returned,
-/// so before the fix a lock still held at `stop()` time made `stop()` hang
-/// forever (this was also the root cause of the previously-unresolved
-/// `PG-LOCK-007`/`PG-SPEC-004` hang). `stop()` now calls
-/// `PostgresLock::drain_held` (unlock + drop each pinned connection, reusing the
-/// TTL reaper's `reclaim`) before `pool.close()`, so a still-held lock is
-/// released and its connection returned — leaving zero plugin connections.
+/// Covers the shutdown ordering of DESIGN.md §10 step 4 — drain held locks,
+/// close the liveness beacon, close the pool — with a lock deliberately still
+/// held at `stop()` time. Both halves are asserted: zero plugin connections
+/// afterwards (the pool, the two LISTEN connections, *and* the beacon all
+/// closed), and zero advisory locks (`stop()` closes the beacon explicitly, after
+/// the drain has read its key, rather than leaving its release to whenever the
+/// connection happens to be dropped).
+///
+/// Historically this scenario existed as a hang regression guard: a held lock
+/// used to pin a pool connection outside the pool's tracking, so `pool.close()`
+/// blocked forever until `stop()` learned to drain first. That hazard is gone
+/// with the connection model (a held lock pins nothing), but the shutdown
+/// sequence still has an order that matters — the drain needs both the beacon
+/// and the pool open — so the scenario keeps its value.
 #[tokio::test]
 async fn pg_life_003_stop_closes_pool_and_listen_connection() {
     let (_container, config) = common::start_postgres().await;
@@ -185,14 +189,27 @@ async fn pg_life_003_stop_closes_pool_and_listen_connection() {
         after == 0
     })
     .await;
-    assert!(
-        drained,
-        "PG-LIFE-003: stop() must leave zero plugin connections open"
-    );
+    if !drained {
+        // Name the survivors: with four distinct connection kinds (pool, two
+        // LISTEN connections, and the liveness beacon — DESIGN.md §3.3), a bare
+        // count says nothing about which shutdown step failed to close its own.
+        let survivors: Vec<(i32, String, String)> = sqlx::query_as(
+            "SELECT pid, state, left(coalesce(query, ''), 60) FROM pg_stat_activity \
+             WHERE datname = 'cluster_test' AND application_name <> $1",
+        )
+        .bind(common::CONTROL_POOL_APPLICATION_NAME)
+        .fetch_all(&control_pool)
+        .await
+        .expect("pg_stat_activity query succeeds");
+        panic!(
+            "PG-LIFE-003: stop() must leave zero plugin connections open; still open: {survivors:?}"
+        );
+    }
 
-    // The advisory unlock runs synchronously inside `drain_held` *before*
-    // `pool.close()`, so unlike the connection count this is not subject to the
-    // backend-exit lag — assert it directly.
+    // The only advisory lock this plugin ever takes is the beacon, and the only
+    // thing that releases it is its connection closing (`lock::beacon`) — which
+    // `stop()` awaits. Unlike the connection count above this is not subject to
+    // backend-exit lag, so assert it directly.
     let advisory_locks: i64 =
         sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'")
             .fetch_one(&control_pool)
@@ -382,6 +399,50 @@ async fn pg_life_007_stop_then_drop_panics_neither() {
         .await
         .unwrap();
     handle2.stop().await; // same property, standalone handle
+}
+
+/// `PG-LIFE-009`: dropping a handle without a completed `stop()` must **cancel
+/// the shared token**, not merely complain about it.
+///
+/// This is the half `PG-LIFE-007` does not cover, and the gap is why the bug it
+/// guards against shipped: `PG-LIFE-007` asserts the *diagnostic* (the debug
+/// panic / release WARN), which `PostgresClusterHandle` emitted correctly while
+/// never cancelling the token at all. The operationally important case is not a
+/// forgotten handle but a `stop()` whose future was dropped part-way — exactly
+/// what `tokio::time::timeout(D, handle.stop())` does when its budget elapses,
+/// which is the supervisor pattern DESIGN.md §11 recommends. Without the cancel,
+/// both reapers and both LISTEN tasks run for the life of the process, each
+/// pinning a `PgPool` clone so the pool never closes either, and — because
+/// `Beacon::key` still reads the last-published key after `BeaconHandle::drop`
+/// aborts its task — `try_lock` would go on *handing out guards* from a plugin
+/// that believes it has shut down.
+///
+/// `ClusterError::Shutdown` from `try_lock` is the observable: `try_acquire`
+/// checks the token before any lock work (PGR-L2), so a cancelled token answers
+/// on the third statement without touching the pool. Deliberately **not**
+/// gated to release builds: the diagnostic panic fires *after* the cancel, so
+/// catching it leaves precisely the state a release build reaches without
+/// panicking at all — which lets one test cover the property in both profiles
+/// rather than only in the one CI is least likely to run.
+#[tokio::test]
+async fn pg_life_009_dropped_handle_cancels_the_shared_token() {
+    let (_container, config) = common::start_postgres().await;
+    let handle = PostgresClusterPlugin::builder(config)
+        .build_and_start()
+        .await
+        .unwrap();
+    // Taken before the drop: this `Arc` outlives the handle, which is what makes
+    // the token's post-drop state observable at all.
+    let lock = handle.lock();
+
+    let _diagnosed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(handle)));
+
+    let outcome = lock.try_lock("res", Duration::from_secs(30)).await;
+    assert!(
+        matches!(outcome, Err(ClusterError::Shutdown)),
+        "PG-LIFE-009: after a handle is dropped without a completed stop(), the shared token must \
+         be cancelled so lock work refuses immediately — got {outcome:?}"
+    );
 }
 
 /// `PG-LIFE-008`: a panic inside a task that owns an un-stopped handle must

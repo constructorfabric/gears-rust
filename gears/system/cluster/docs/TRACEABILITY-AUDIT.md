@@ -30,10 +30,21 @@ resolution of the two open questions.
   §2 ("Requirements Covered" per feature).
 - **Marker source**: `@cpt-dod:` markers grepped from `cluster-sdk/src`,
   `cluster-sdk/tests`, `cluster/examples`, and architecture lints (in `cargo-gears` CLI).
-- **Scope key**: `code` = realized by this change's shipped code; `follow-up` =
-  enabling contract shipped here, full realization deferred to the wiring crate /
-  parent host gear per PRD §4.1 (each still maps to a realizing ADR/DESIGN section,
-  so traceability is complete and implementation is staged).
+- **Realizing-code source**: where a row's scope column names an implementation
+  path instead of a feature, that path is read directly from `cluster-sdk/src`,
+  `cluster/src`, or `plugins/*/src`. These carry no `@cpt-dod:` markers — markers
+  annotate DoD items, not requirement rows — so the routing and lifecycle rows
+  below are verified against the cited code, not against the marker grep. The
+  wiring rows specifically resolve to `cluster/src/wiring.rs`
+  (`from_config` dispatch, `build_and_start` auto-fill), `cluster/src/provider.rs`
+  (`ProviderRegistry`), and `plugins/postgres-cluster-plugin/src/provider.rs`
+  (`PostgresLockProvider`), each covered by tests in
+  `cluster/src/config_tests.rs` and `cluster/tests/mixed_backend_integration.rs`.
+- **Scope key**: `code` = realized by this change's shipped code. (`follow-up` =
+  enabling contract shipped here with full realization deferred — no row carries
+  this scope any more; the last one, `cpt-cf-clst-fr-routing-per-primitive`,
+  became `code` once the wiring's YAML path dispatched non-cache primitives and
+  the Postgres plugin shipped a native lock provider.)
 
 ## 2. Requirement → DESIGN/ADR → Feature
 
@@ -72,19 +83,20 @@ resolution of the two open questions.
 | `cpt-cf-clst-nfr-bounded-critical-section` | ADR-002 | 10 lock-lint | code |
 | `cpt-cf-clst-nfr-observability` | §3.2; ADR-004; [OBSERVABILITY.md](OBSERVABILITY.md) | 09 registration-observability | code |
 | `cpt-cf-clst-nfr-cross-backend-stability` | §6; smoke-test baseline | 11 smoke-tests | code |
-| `cpt-cf-clst-fr-routing-per-primitive` | §3.2, §3.13; ADR-006 | `cluster/src/wiring.rs` (`reject_unsupported_native_bindings`) | follow-up (native non-cache binding rejected at config time) |
+| `cpt-cf-clst-fr-routing-per-primitive` | §3.2, §3.13; ADR-006 | `cluster/src/wiring.rs` (`from_config` per-primitive provider dispatch), `cluster/src/provider.rs` (`ProviderRegistry`), `plugins/postgres-cluster-plugin/src/provider.rs` (`PostgresLockProvider`) | code |
 | `cpt-cf-clst-fr-routing-omit-default` | §3.11; ADR-001, ADR-006 | `cluster/src/wiring.rs` (`build_and_start` auto-fill) | code |
 | `cpt-cf-clst-fr-lifecycle-owner` | §3.7, §3.13; ADR-006 | `cluster/src/gear.rs`, `cluster/src/wiring.rs` | code |
 | `cpt-cf-clst-fr-shutdown-revoke` | §3.13; ADR-006 | `cluster/src/wiring.rs` (`ClusterHandle::stop`), `cluster-sdk/src/defaults/leader.rs`, `cluster-sdk/src/defaults/lock.rs`, `cluster-sdk/src/defaults/discovery.rs` (`ShutdownRevoke`), `plugins/standalone-cluster-plugin/src/cache.rs` (`StandaloneCache::shutdown`) | code |
 | `cpt-cf-clst-fr-shutdown-ttl-cleanup` | §3.13; ADR-006 | `cluster/src/wiring.rs` (`ClusterHandle::stop`) | code |
 
 **Coverage**: 38/38 requirements map to a realizing DESIGN section or ADR and to
-a feature or realizing code. The only remaining follow-up is
-`cpt-cf-clst-fr-routing-per-primitive` (native non-cache backends per primitive),
-which the wiring rejects loudly at config time until those providers ship.
-`cpt-cf-clst-fr-shutdown-revoke` is now fully realized (leader, in-flight lock,
-service-discovery watch, and cache watch all observe a terminal `Shutdown`). No
-orphan requirements.
+a feature or realizing code, with no remaining follow-ups.
+`cpt-cf-clst-fr-routing-per-primitive` is now realized: the wiring's YAML path
+dispatches each non-cache primitive against its own provider registry, and the
+Postgres plugin's standalone `PostgresLockProvider` is the first shipped native
+non-cache backend to bind through it. `cpt-cf-clst-fr-shutdown-revoke` is fully
+realized (leader, in-flight lock, service-discovery watch, and cache watch all
+observe a terminal `Shutdown`). No orphan requirements.
 
 ## 3. Principles & Constraints → DESIGN/ADR → Feature
 

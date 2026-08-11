@@ -72,7 +72,7 @@ pub mod leader;
 pub mod lock;
 
 #[cfg(test)]
-mod test_cache;
+pub(crate) mod test_cache;
 
 #[cfg(test)]
 mod observability_tests;

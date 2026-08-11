@@ -133,6 +133,16 @@ pub(crate) mod pep {
         pub const LIST: &str = "list";
         pub const DELETE: &str = "delete";
         pub const UPDATE: &str = "update";
+
+        /// Every action in this vocabulary, in declaration order. The
+        /// permission-catalog test asserts one `AuthzPermissionV1` per
+        /// `(resource_type, action)` pair drawn from these slices, so an
+        /// action that is enforced at a PEP gate but never declared as a
+        /// grantable permission fails the test instead of silently
+        /// becoming ungrantable. Add new actions here as well as above.
+        /// Test-only: nothing in the production path enumerates actions.
+        #[cfg(test)]
+        pub const ALL: &[&str] = &[CREATE, LIST, DELETE, UPDATE];
     }
 }
 
@@ -638,6 +648,13 @@ impl UserService {
     ///   rejection (incl. rejected password).
     /// * [`DomainError::UserAlreadyExists`] -- a username rename
     ///   collided with an existing login (HTTP 409).
+    /// * [`DomainError::IdpFieldNotWritable`] -- the provider refused one
+    ///   or more patched attributes as `IdP`-managed and not overridable
+    ///   (HTTP 400, carrying every offending field as its own
+    ///   `field_violations[].field` with `reason =
+    ///   "IDP_MANAGED_FIELD"`). Distinct from
+    ///   [`DomainError::UnsupportedOperation`], which means the provider
+    ///   implements no `update_user` at all.
     /// * [`DomainError::UserNotFound`] -- the `IdP` reports the target
     ///   user absent in this tenant scope (HTTP 404).
     /// * [`DomainError::NotFound`] -- `tenant_id` does not resolve.

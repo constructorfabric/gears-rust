@@ -1252,6 +1252,62 @@
         ],
         "type": "object"
       },
+      "GearDto": {
+        "description": "Response DTO for a single registered gear",
+        "properties": {
+          "capabilities": {
+            "description": "Declared capabilities (e.g., \"rest\", \"grpc\", \"system\", \"db\")",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "dependencies": {
+            "description": "Gear dependencies (other gear names)",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "deployment_mode": {
+            "$ref": "#/components/schemas/DeploymentModeDto",
+            "description": "Whether the gear is compiled-in or out-of-process"
+          },
+          "instances": {
+            "description": "Running instances of this gear",
+            "items": {
+              "$ref": "#/components/schemas/GearInstanceDto"
+            },
+            "type": "array"
+          },
+          "name": {
+            "description": "Gear name",
+            "type": "string"
+          },
+          "plugins": {
+            "description": "Plugins provided by this gear (reserved for follow-up implementation)",
+            "items": {
+              "$ref": "#/components/schemas/PluginDto"
+            },
+            "type": "array"
+          },
+          "version": {
+            "description": "Gear version (if reported by a running instance)",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "capabilities",
+          "dependencies",
+          "deployment_mode",
+          "instances"
+        ],
+        "type": "object"
+      },
       "GearInstanceDto": {
         "description": "Response DTO for a running gear instance",
         "properties": {
@@ -2884,6 +2940,24 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/UserDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_UsersInfoUserDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/UsersInfoUserDto"
             },
             "type": "array"
           },
@@ -5500,77 +5574,41 @@
         },
         "type": "object"
       },
-      "Vec": {
-        "items": {
-          "properties": {
-            "cors": {
-              "oneOf": [
-                {
-                  "type": "null"
-                },
-                {
-                  "$ref": "#/components/schemas/CorsConfig"
-                }
-              ]
-            },
-            "enabled": {
-              "type": "boolean"
-            },
-            "id": {
-              "type": "string"
-            },
-            "match": {
-              "$ref": "#/components/schemas/MatchRules"
-            },
-            "plugins": {
-              "oneOf": [
-                {
-                  "type": "null"
-                },
-                {
-                  "$ref": "#/components/schemas/PluginsConfig"
-                }
-              ]
-            },
-            "priority": {
-              "format": "int32",
-              "type": "integer"
-            },
-            "rate_limit": {
-              "oneOf": [
-                {
-                  "type": "null"
-                },
-                {
-                  "$ref": "#/components/schemas/RateLimitConfig"
-                }
-              ]
-            },
-            "tags": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "tenant_id": {
-              "format": "uuid",
-              "type": "string"
-            },
-            "upstream_id": {
-              "type": "string"
-            }
+      "UsersInfoUserDto": {
+        "description": "REST DTO for user representation with serde/utoipa\n\nAliased in the `OpenAPI` components as `UsersInfoUserDto`: the\naccount-management gear ships an unrelated `UserDto` and both are mounted in\nthe same server, so the bare ident would collide in `components.schemas`.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
           },
-          "required": [
-            "id",
-            "tenant_id",
-            "upstream_id",
-            "match",
-            "priority",
-            "enabled"
-          ],
-          "type": "object"
+          "display_name": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
         },
-        "type": "array"
+        "required": [
+          "id",
+          "tenant_id",
+          "email",
+          "display_name",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
       },
       "VersionDto": {
         "description": "One content version (`GET /files/{id}/versions`).\n\nWire shape documented in `docs/api.md` (`hash_mode`/`part_count`/`manifest`\nfields, ADR-0006).\n\n@cpt-dod:cpt-cf-file-storage-dod-content-hash-modes-docs:p2",
@@ -8707,7 +8745,7 @@
     },
     "/account-management/v1/tenants/{tenant_id}/users": {
       "get": {
-        "description": "List users provisioned in the tenant via the configured IdP plugin. Filter via OData `$filter` over `id` (Uuid), `username`, `email`, `display_name`, `first_name`, `last_name` (String) with operators `eq`, `ne`, `in`, and `contains` / `startswith` / `endswith` on String fields (case-insensitive); combine via `and` / `or` / `not`. Sort via `$orderby` over the same fields (default: `username ASC, id ASC` with `id ASC` tiebreaker appended even when the caller supplies their own order). Point lookup is `$filter=id eq <uuid>` with `top=1`: empty page is the canonical \"user absent\" signal (no 404). Cursor pagination is opaque; caller MUST NOT change `$filter` or `$orderby` between continuation requests with the same cursor. AM persists no local user state; every read is a pass-through to the IdP.",
+        "description": "List users provisioned in the tenant via the configured IdP plugin. Filter via OData `$filter` over `id` (Uuid), `username`, `email`, `display_name`, `first_name`, `last_name` (String) with operators `eq`, `ne`, `in`, and `contains` / `startswith` / `endswith` on String fields (case-insensitive); combine via `and` / `or` / `not`. Sort via `$orderby` over the same fields (default: `username ASC, id ASC` with `id ASC` tiebreaker appended even when the caller supplies their own order). Point lookup is `$filter=id eq <uuid>` with `limit=1` (the toolkit-style page-size param; `$top` is not honoured): empty page is the canonical \"user absent\" signal (no 404). Cursor pagination is opaque; caller MUST NOT change `$filter` or `$orderby` between continuation requests with the same cursor. AM persists no local user state; every read is a pass-through to the IdP.",
         "operationId": "account_management.list_tenant_users",
         "parameters": [
           {
@@ -8715,6 +8753,24 @@
             "in": "path",
             "name": "tenant_id",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum number of users to return. Optional in general -- omitting it falls back to a server-chosen page size. Conditionally required: when combined with `$filter=id eq <uuid>` it MUST be exactly 1, or the request is rejected with 400 -- `$top` is not honoured as a substitute.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -8916,7 +8972,7 @@
         }
       },
       "post": {
-        "description": "Provision a user in the tenant via the configured IdP plugin. AM persists no local user state -- the IdP becomes the source of truth on success. Returns HTTP 201 Created with the projected user body. AM does NOT expose a per-user GET; clients that need to re-read the user use the filtered listing `GET /tenants/{tenant_id}/users?$filter=id eq <uuid>&$top=1`.",
+        "description": "Provision a user in the tenant via the configured IdP plugin. AM persists no local user state -- the IdP becomes the source of truth on success. Returns HTTP 201 Created with the projected user body. AM does NOT expose a per-user GET; clients that need to re-read the user use the filtered listing `GET /tenants/{tenant_id}/users?$filter=id eq <uuid>&limit=1`.",
         "operationId": "account_management.create_tenant_user",
         "parameters": [
           {
@@ -9183,7 +9239,7 @@
         ]
       },
       "patch": {
-        "description": "Apply a JSON Merge Patch (RFC 7396) to a user's mutable attributes via the configured IdP plugin. AM persists no local user state; the update is a pass-through and the IdP remains the source of truth. Omitted fields are left unchanged; an explicit `null` clears a nullable profile field (`email`, `display_name`, `first_name`, `last_name`); `username` may be renamed (send a value) but NOT cleared (an explicit `null` is rejected); `password` sets a new credential and is never echoed back. Returns 200 OK with the post-update user body projected through `gts.cf.core.am.user.v1~`. An empty patch is rejected with `code=validation`. Unlike DELETE, a patch against a user the IdP reports absent returns 404 -- it is NOT folded into success. A username rename that collides with an existing login returns 409.",
+        "description": "Apply a JSON Merge Patch (RFC 7396) to a user's mutable attributes via the configured IdP plugin. AM persists no local user state; the update is a pass-through and the IdP remains the source of truth. Omitted fields are left unchanged; an explicit `null` clears a nullable profile field (`email`, `display_name`, `first_name`, `last_name`); `username` may be renamed (send a value) but NOT cleared (an explicit `null` is rejected); `password` sets a new credential and is never echoed back. Returns 200 OK with the post-update user body projected through `gts.cf.core.am.user.v1~`. An empty patch is rejected with `code=validation`. Unlike DELETE, a patch against a user the IdP reports absent returns 404 -- it is NOT folded into success. A username rename that collides with an existing login returns 409. Attributes the provider manages and does not allow AM to override (e.g. federated from a read-only mapper) return 400 with one `context.field_violations[]` entry per refused property, each naming the refused request property in `.field` with `.reason=IDP_MANAGED_FIELD`, so a client can disable those inputs in one pass; this is deliberately NOT a 403, since writability is a property of the provider's schema rather than of the caller's grants.",
         "operationId": "account_management.update_tenant_user",
         "parameters": [
           {
@@ -12586,7 +12642,10 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Vec"
+                  "items": {
+                    "$ref": "#/components/schemas/GearDto"
+                  },
+                  "type": "array"
                 }
               }
             },
@@ -14757,7 +14816,10 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Vec"
+                  "items": {
+                    "$ref": "#/components/schemas/NodeDto"
+                  },
+                  "type": "array"
                 }
               }
             },
@@ -15004,7 +15066,10 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Vec"
+                  "items": {
+                    "$ref": "#/components/schemas/RouteResponse"
+                  },
+                  "type": "array"
                 }
               }
             },
@@ -15558,7 +15623,10 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Vec"
+                  "items": {
+                    "$ref": "#/components/schemas/UpstreamResponse"
+                  },
+                  "type": "array"
                 }
               }
             },
@@ -18519,7 +18587,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_UserDto"
+                  "$ref": "#/components/schemas/Page_UsersInfoUserDto"
                 }
               }
             },
@@ -18611,7 +18679,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UserDto"
+                  "$ref": "#/components/schemas/UsersInfoUserDto"
                 }
               }
             },
@@ -18811,7 +18879,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UserDto"
+                  "$ref": "#/components/schemas/UsersInfoUserDto"
                 }
               }
             },
@@ -18898,7 +18966,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UserDto"
+                  "$ref": "#/components/schemas/UsersInfoUserDto"
                 }
               }
             },

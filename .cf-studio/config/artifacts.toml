@@ -123,8 +123,14 @@ pattern = "PRD.md"
 traceability = "FULL"
 required = true
 
+# Glob (not a literal name) so a gear may ship companion design documents
+# alongside DESIGN.md — DESIGN-<aspect>.md, for an aspect large enough to
+# carve out of the main design and own its own artifact. Each match is
+# validated as a full DESIGN artifact against the kit constraints.
+# Files that are NOT standalone SDLC artifacts must be listed in [[ignore]]
+# above; ignore takes precedence over this pattern.
 [systems.autodetect.artifacts.DESIGN]
-pattern = "DESIGN.md"
+pattern = "DESIGN*.md"
 traceability = "FULL"
 required = false
 

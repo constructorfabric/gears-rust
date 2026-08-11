@@ -281,6 +281,13 @@ impl ProvisionFailureExt for IdpProvisionFailure {
 ///   mapping refinement is owned by `feature-errors-observability`
 ///   and may diverge per provider in a follow-up. The Validation
 ///   surface is the most conservative public envelope today.
+/// * `FieldNotWritable` → [`DomainError::IdpFieldNotWritable`] (HTTP
+///   400). The attributes are provider-managed and not overridable, so
+///   the envelope carries one set of structured `<field>` /
+///   `IDP_MANAGED_FIELD` field-violation tokens per refused attribute
+///   rather than the generic `request` / `VALIDATION` pair. An empty
+///   refused set is a provider contract violation and degrades to
+///   [`DomainError::Validation`].
 ///
 /// Provider-supplied detail strings are redacted via
 /// [`redact_provider_detail`] before reaching public envelopes:
@@ -396,6 +403,43 @@ impl UserOperationFailureExt for IdpUserOperationFailure {
                     detail: "the supplied password does not meet the identity provider's password policy"
                         .to_owned(),
                 }
+            }
+            // Classified non-writable-attribute reject: surface one
+            // structured `<field>` / `IDP_MANAGED_FIELD` violation per
+            // refused attribute so a client can disable the exact
+            // inputs, instead of collapsing into the redacted generic
+            // Validation. The typed attributes are safe to log
+            // un-redacted (they are AM's own field tokens, not vendor
+            // text); only the provider `detail` is digested.
+            Self::FieldNotWritable { fields, detail } => {
+                let (digest, len) = redact_provider_detail(&detail);
+                // A provider MUST name what it refused; an empty set
+                // carries no attribution, so it degrades to the generic
+                // rejection rather than a 400 pointing at nothing.
+                if fields.is_empty() {
+                    tracing::warn!(
+                        target: "am.idp",
+                        tenant_id = %tenant_id,
+                        provider_detail_digest = digest,
+                        provider_detail_len = len,
+                        "IdP user operation FieldNotWritable with an empty field set (provider contract violation); surfacing Validation, raw detail redacted"
+                    );
+                    return DomainError::Validation {
+                        detail: format!(
+                            "identity provider rejected the user operation (detail redacted; \
+                             digest=0x{digest:016x} len={len})"
+                        ),
+                    };
+                }
+                tracing::warn!(
+                    target: "am.idp",
+                    tenant_id = %tenant_id,
+                    fields = fields.iter().map(|f| f.as_field_token()).collect::<Vec<_>>().join(","),
+                    provider_detail_digest = digest,
+                    provider_detail_len = len,
+                    "IdP user operation FieldNotWritable; surfacing IDP_MANAGED_FIELD violations, raw detail redacted"
+                );
+                DomainError::IdpFieldNotWritable { fields }
             }
             // Absent target user. `update_user` surfaces this as a
             // `404`; the shared mapping here carries no `user_id`, so

@@ -21,17 +21,16 @@ pub enum ConfigError {
     InvalidGearStructure { gear: String },
     #[error("missing 'config' section in gear '{gear}'")]
     MissingConfigSection { gear: String },
-    #[error("invalid config for gear '{gear}': {source}")]
+    // Intentionally not named `source`; doing so would duplicate chained error output.
+    #[error("invalid config for gear '{gear}': {cause}")]
     InvalidConfig {
         gear: String,
-        #[source]
-        source: serde_json::Error,
+        cause: serde_json::Error,
     },
-    #[error("variable expansion failed for gear '{gear}': {source}")]
+    #[error("variable expansion failed for gear '{gear}': {cause}")]
     VarExpand {
         gear: String,
-        #[source]
-        source: toolkit_utils::var_expand::ExpandVarsError,
+        cause: toolkit_utils::var_expand::ExpandVarsError,
     },
 }
 
@@ -76,7 +75,7 @@ pub fn gear_config_or_default<T: DeserializeOwned + Default>(
     let config: T =
         serde_json::from_value(config_section.clone()).map_err(|e| ConfigError::InvalidConfig {
             gear: gear_name.to_owned(),
-            source: e,
+            cause: e,
         })?;
 
     Ok(config)
@@ -121,7 +120,7 @@ pub fn gear_config_required<T: DeserializeOwned>(
     let config: T =
         serde_json::from_value(config_section.clone()).map_err(|e| ConfigError::InvalidConfig {
             gear: gear_name.to_owned(),
-            source: e,
+            cause: e,
         })?;
 
     Ok(config)
@@ -385,5 +384,49 @@ mod tests {
             missing_config.to_string(),
             "missing 'config' section in gear 'test'"
         );
+    }
+
+    #[test]
+    fn test_invalid_config_message_is_not_duplicated_by_source_chain() {
+        let mut provider = MockConfigProvider::new();
+        provider.gears.insert(
+            "bad_config_gear".to_owned(),
+            json!({
+                "config": {
+                    "api_key": "secret123",
+                    "timeout_ms": "not_a_number",
+                    "enabled": true
+                }
+            }),
+        );
+        let result: Result<TestConfig, ConfigError> =
+            gear_config_required(&provider, "bad_config_gear");
+        let err = result.unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "invalid config for gear 'bad_config_gear': invalid type: string \"not_a_number\", expected u64"
+        );
+
+        assert!(std::error::Error::source(&err).is_none());
+        let anyhow_err: anyhow::Error = err.into();
+        assert_eq!(
+            format!("{anyhow_err:#}"),
+            "invalid config for gear 'bad_config_gear': invalid type: string \"not_a_number\", expected u64"
+        );
+    }
+
+    #[test]
+    fn test_var_expand_message_is_not_duplicated_by_source_chain() {
+        let err = ConfigError::VarExpand {
+            gear: "test".to_owned(),
+            cause: toolkit_utils::var_expand::ExpandVarsError::Regex("boom".to_owned()),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "variable expansion failed for gear 'test': env expansion regex error: boom"
+        );
+        assert!(std::error::Error::source(&err).is_none());
     }
 }

@@ -119,6 +119,9 @@ pub async fn bring_up_with(
     pool_size_max: u32,
     retention_secs: u64,
 ) -> anyhow::Result<TsHarness> {
+    // Keep this image tag in sync with `TimescaleDbSidecar.IMAGE` in
+    // `testing/e2e/lib/sidecars.py`. A skew means these migrations are
+    // validated against a different PostgreSQL major than E2E runs.
     let image = GenericImage::new("timescale/timescaledb", "2.17.2-pg16")
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",

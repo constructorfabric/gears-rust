@@ -101,8 +101,14 @@ async fn sweep_chunk(pool: &PgPool, table: &str) -> Result<usize, ClusterError> 
         .await
         .map_err(map_sqlx_error)?;
 
-    for key in &expired_keys {
-        watch::notify(&mut *tx, NotifyEvent::Expired, key).await?;
+    // One statement for the whole chunk, not one per key. Every one of those
+    // round-trips ran *inside* this transaction, so it added directly to the span
+    // over which the chunk's `DELETE ... RETURNING` holds a row lock on each key
+    // it claimed — the very cost the chunking exists to bound (module doc,
+    // "Chunking"). Mirrors `lock::notify::notify_released_many`, which the lock
+    // sweep has always used for exactly this reason.
+    if !expired_keys.is_empty() {
+        watch::notify_many(&mut *tx, NotifyEvent::Expired, &expired_keys).await?;
     }
 
     tx.commit().await.map_err(map_sqlx_error)?;

@@ -318,6 +318,7 @@ impl DomainError {
             Self::AlreadyExists { .. } => "already_exists",
             Self::UserAlreadyExists { .. } => "user_already_exists",
             Self::IdpPasswordPolicy { .. } => "idp_password_policy",
+            Self::IdpFieldNotWritable { .. } => "idp_field_not_writable",
             Self::Aborted { .. } => "aborted",
             Self::TypeNotAllowed { .. } => "type_not_allowed",
             Self::TenantDepthExceeded { .. } => "tenant_depth_exceeded",
@@ -368,6 +369,7 @@ impl DomainError {
             | Self::AlreadyResolved
             | Self::Conflict { .. }
             | Self::IdpPasswordPolicy { .. }
+            | Self::IdpFieldNotWritable { .. }
             | Self::FeatureDisabled { .. } => 400,
             Self::NotFound { .. }
             | Self::UserNotFound { .. }

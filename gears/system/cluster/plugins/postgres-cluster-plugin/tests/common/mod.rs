@@ -41,7 +41,10 @@ pub const CONTROL_POOL_APPLICATION_NAME: &str = "cluster_test_control";
 /// (DESIGN.md §7: `connection_string` has no sensible default), so this is
 /// the test-only equivalent TESTING.md §4.1's `..PostgresClusterConfig::default()`
 /// spread would have needed.
-fn cluster_config_json(
+/// `pub` for the same reason [`lock_config_json`] is: a scenario that needs a
+/// *second* config against a container someone else started (`pg_spec_011`
+/// rebuilds against the same container after mutating a database-level default).
+pub fn cluster_config_json(
     connection_string: &str,
     overrides: serde_json::Value,
 ) -> PostgresClusterConfig {
@@ -53,7 +56,13 @@ fn cluster_config_json(
     serde_json::from_value(base).expect("valid PostgresClusterConfig")
 }
 
-fn lock_config_json(connection_string: &str, overrides: serde_json::Value) -> PostgresLockConfig {
+/// A [`PostgresLockConfig`] against `connection_string` with `overrides` merged
+/// over the shared defaults. `pub` because a multi-instance scenario
+/// (`pg_lock_014`) needs a *second* instance on a container someone else started.
+pub fn lock_config_json(
+    connection_string: &str,
+    overrides: serde_json::Value,
+) -> PostgresLockConfig {
     let mut base = json!({
         "connection_string": connection_string,
         "pool_max_size": 5,
@@ -196,26 +205,22 @@ pub async fn isolated_schema_connection_string(
 /// must agree, or migrations land in one schema while queries look in
 /// another.
 ///
-/// `pool_max_size` defaults to 1 here: callers that pre-build many
-/// independent instances on one shared container (`tests/conformance.rs`)
-/// need to stay well under the server's global `max_connections` (the stock
-/// image's default is 100). Measured empirically (`pg_stat_activity`), a
-/// combined-plugin instance's *real* steady-state connection cost is `2
-/// (dedicated LISTEN connections — cache watch + lock release-wake) +
-/// pool_max_size` — **not** `pool_max_size + 1` as a first pass assumed,
-/// because the cache TTL reaper and the lock TTL reaper each grab their own
-/// pool connection on their first sweep and then sit idle-but-open in the
-/// pool afterward (normal pool reuse — sqlx doesn't close an idle pooled
-/// connection just because nothing is using it right now), so with
-/// `pool_max_size: 2` both reapers' connections alone consumed the *entire*
-/// per-instance pool budget: `4 * N` measured for `N` cache-conformance
-/// instances, not the originally-assumed `3 * N`. Cache/leader instances
-/// (this function) never hold a connection indefinitely the way a lock does
-/// (`PostgresLock`'s `held` map only pins connections for the standalone
-/// lock plugin's own `try_lock`/`lock`, which nothing calls when the
-/// combined plugin is only being used for its cache half here), so `1` is
-/// safe — see [`lock_config_for_schema`] for why the standalone lock plugin
-/// needs `2`.
+/// `pool_max_size` defaults to 1 here: callers that pre-build many independent
+/// instances on one shared container (`tests/conformance.rs`) need to stay well
+/// under the server's global `max_connections` (the stock image's default is
+/// 100). A combined-plugin instance's steady-state connection cost is
+/// `pool_max_size + 3` — the two dedicated LISTEN connections (cache watch +
+/// lock release-wake) plus the liveness beacon (DESIGN.md §3.3) — and the
+/// pool half of that really is used, not merely permitted: the cache TTL reaper
+/// and the lock TTL reaper each grab a pool connection on their first sweep and
+/// then sit idle-but-open (normal pool reuse — sqlx doesn't close an idle pooled
+/// connection just because nothing is using it right now). At `pool_max_size: 2`
+/// the two reapers alone would take the whole per-instance pool budget.
+///
+/// Nothing here holds a pool connection *indefinitely*: held locks no longer pin
+/// one at all (§3.3), so a lock-heavy scenario needs no extra pool headroom —
+/// only the fixed +1 for its beacon, which is per-instance and does not grow with
+/// the number of locks held.
 pub fn cluster_config_for_schema(connection_string: &str, schema: &str) -> PostgresClusterConfig {
     cluster_config_json(
         connection_string,
@@ -239,12 +244,15 @@ pub fn cluster_config_for_schema_with(
 }
 
 /// Like [`cluster_config_for_schema`], for the standalone lock-only plugin.
-/// Kept at `2`, not `1`: some `SC-LOCK-*` scenarios (`scenario_lock_004`)
-/// spawn a concurrent waiter that needs its own connection *while* the
-/// holder's connection is still pinned, so a given lock instance can
-/// legitimately need two connections at once (this doesn't apply to
-/// [`cluster_config_for_schema`]'s cache/leader use, which never pins a
-/// connection).
+///
+/// Kept at `2`, not `1`: the lock TTL reaper holds one pooled connection
+/// idle-but-open after its first sweep, and a scenario with a concurrent waiter
+/// (`scenario_lock_004`) has its own metadata writes in flight at the same time.
+/// That is now the *only* reason for the extra headroom — a held lock is a
+/// `cluster_lock` row, not an advisory lock on a connection (DESIGN.md §3.3), so
+/// holding it consumes nothing from the pool and held locks no longer figure into
+/// this number. The instance's liveness beacon is the sole advisory lock, and it
+/// sits on its own connection outside the pool.
 pub fn lock_config_for_schema(connection_string: &str, schema: &str) -> PostgresLockConfig {
     lock_config_json(
         connection_string,

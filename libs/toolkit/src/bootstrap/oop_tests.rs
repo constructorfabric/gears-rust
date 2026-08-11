@@ -350,6 +350,7 @@ mod database_merge {
                     max_lifetime: None,
                     test_before_acquire: None,
                 }),
+                lock_keepalive: None,
             },
         );
         GlobalDatabaseConfig {
@@ -372,6 +373,7 @@ mod database_merge {
             path: None,
             params: None,
             pool: None,
+            lock_keepalive: None,
         }
     }
 
@@ -551,6 +553,7 @@ mod database_merge {
                 path: None,
                 params: None,
                 pool: None,
+                lock_keepalive: None,
             },
         );
         local_config.database = Some(GlobalDatabaseConfig {

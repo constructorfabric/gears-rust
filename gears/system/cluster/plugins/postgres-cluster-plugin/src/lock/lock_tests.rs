@@ -4,69 +4,6 @@ use super::*;
 use crate::lock::notify::ReleaseWaiters;
 
 #[test]
-fn lock_key_is_stable_across_calls() {
-    assert_eq!(lock_key("orders/lock"), lock_key("orders/lock"));
-}
-
-#[test]
-fn lock_key_differs_for_different_names() {
-    assert_ne!(lock_key("orders/lock"), lock_key("inventory/lock"));
-}
-
-#[test]
-fn lock_key_handles_names_with_special_characters() {
-    // Must not panic on non-ASCII/punctuation-heavy names, and must still be
-    // stable for the same input.
-    let name = "tenant:\u{e1}\u{e7}\u{e7}/lock #1!";
-    assert_eq!(lock_key(name), lock_key(name));
-}
-
-#[test]
-fn lock_key_exercises_the_full_64_bit_hash() {
-    // `key1`/`key2` are independent halves of the same 64-bit hash, not a
-    // 32-bit hash duplicated into both halves — a regression collapsing back
-    // to `hashtext()`'s 32 bits (DESIGN.md §5.1) would very likely make one
-    // of a few sample names collide on `key1` while still differing on
-    // `key2`, or vice versa. This isn't a proof, but it would probably catch
-    // an accidental 32-bit-only regression.
-    let (key1_a, key2_a) = lock_key("a");
-    let (key1_b, key2_b) = lock_key("b");
-    assert!(key1_a != key1_b || key2_a != key2_b);
-}
-
-#[test]
-fn lock_key_split_preserves_the_full_64_bit_hash() {
-    // PGR-L4: the collision surface of `lock_key` is *exactly* xxh3_64's — the
-    // (high i32, low i32) split introduces no additional collisions, and any two
-    // names with the same 64-bit hash necessarily map to the same `(key1, key2)`
-    // advisory-lock argument pair (so they *would* contend on the same
-    // `pg_advisory_lock` slot). Reconstruct the u64 from the two halves and
-    // confirm it round-trips to the raw hash for a spread of names, including
-    // near-identical ones (a naive split bug — e.g. duplicating one half —
-    // would surface here). Because the split is thus a faithful bijection of the
-    // hash, no natural collision pair needs to be brute-forced out of xxh3's
-    // 64-bit space to exercise the collision path (DESIGN.md §5.1).
-    for name in [
-        "",
-        "a",
-        "collision-probe-a",
-        "collision-probe-b",
-        "svc/leader",
-        "svc/leadeR",
-    ] {
-        let (key1, key2) = lock_key(name);
-        let reconstructed =
-            (u64::from(key1.cast_unsigned()) << 32) | u64::from(key2.cast_unsigned());
-        assert_eq!(
-            reconstructed,
-            xxhash_rust::xxh3::xxh3_64(name.as_bytes()),
-            "lock_key must split the 64-bit hash losslessly into (high, low) i32 halves so \
-             its collision surface is exactly the hash's (DESIGN.md §5.1); name = {name:?}"
-        );
-    }
-}
-
-#[test]
 fn validate_lock_name_accepts_a_name_at_the_index_limit() {
     // Exactly MAX_LOCK_NAME_BYTES (2048) bytes must be accepted: it still fits
     // the `cluster_lock.name` btree tuple *and* the release NOTIFY payload, so
@@ -117,6 +54,45 @@ fn ttl_to_millis_rejects_values_beyond_i64_millis_range() {
     assert!(ttl_to_millis(Duration::MAX).is_err());
 }
 
+/// The acquire predicate must let the cheap indexed comparison short-circuit the
+/// `pg_locks` scan: `CASE`, never `OR`, whose operand evaluation order SQL does
+/// not guarantee. `PG-SPEC-012` holds the *runtime* behaviour to this with
+/// `EXPLAIN ANALYZE`; this is the cheap structural guard next to it.
+#[test]
+fn stealable_predicate_short_circuits_with_case_not_or() {
+    let sql = stealable_predicate("public.cluster_lock");
+    assert!(
+        sql.starts_with("CASE WHEN") && sql.contains("expires_at <= now()"),
+        "the expiry test must be the CASE's first branch: {sql}"
+    );
+    assert!(
+        !sql.contains(" OR "),
+        "an OR would let Postgres evaluate the pg_locks scan on the uncontended path: {sql}"
+    );
+    assert!(
+        sql.contains("objsubid = 2") && sql.contains("granted"),
+        "the liveness test must match the two-argument advisory form, granted only: {sql}"
+    );
+}
+
+/// The predicate reads the beacon halves off the *conflicting row*, not off a
+/// bind parameter: it is asking "is the current holder alive?", and binding our
+/// own key there would ask something else entirely.
+#[test]
+fn stealable_predicate_compares_against_the_rows_own_beacon() {
+    // Collapsed to single spaces so the assertion tests the correlation, not the
+    // column alignment `stealable_predicate`'s `format!` happens to use.
+    let sql = stealable_predicate("public.cluster_lock")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        sql.contains("classid = public.cluster_lock.holder_beacon_hi::oid")
+            && sql.contains("objid = public.cluster_lock.holder_beacon_lo::oid"),
+        "must correlate against the conflicting row's own beacon columns: {sql}"
+    );
+}
+
 #[test]
 fn expires_at_sql_uses_the_database_clock() {
     // PGR-C2: the deadline must be `now() + ttl` evaluated by Postgres, never a
@@ -163,4 +139,55 @@ async fn release_waiters_only_wakes_the_matching_name() {
     // closes its sender, so `await` resolves to `Err` rather than hanging.
     drop(waiters);
     assert!(waiter_b.await.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// `deadline_hint` gating (`should_hint`).
+//
+// The reaper's wake `select!` cannot be unit-tested from here — it lives inside
+// the spawned task — but the decision that made it pathological can be, and it is
+// the part with an exact rule behind it.
+// ---------------------------------------------------------------------------
+
+/// A TTL at or beyond the reaper's interval needs no hint: the reaper's own sleep
+/// is capped at `interval`, so it re-reads the table from scratch before that
+/// deadline can fall due. Signalling anyway is what pinned the reaper at its
+/// 100 ms wake floor permanently — `Notify` keeps a permit pending, so the
+/// `notified()` branch is always ready and always wins.
+#[test]
+fn should_not_hint_for_a_ttl_the_reaper_will_wake_for_anyway() {
+    let interval = Duration::from_secs(5);
+    assert!(!should_hint(interval, interval), "exactly at the cap");
+    assert!(
+        !should_hint(Duration::from_secs(30), interval),
+        "a typical lease TTL"
+    );
+    assert!(
+        !should_hint(Duration::from_secs(3_599), interval),
+        "an indefinitely-long lease"
+    );
+}
+
+/// The case the hint exists for: a lock whose entire lifetime fits inside one of
+/// the reaper's sleeps would otherwise go unreclaimed until that sleep ended. A
+/// missed hint costs latency, not correctness — the expired `cluster_lock` row
+/// stays in the table and its waiters stay unwoken until the reaper's next wake.
+#[test]
+fn should_hint_for_a_ttl_shorter_than_one_reaper_sleep() {
+    let interval = Duration::from_secs(5);
+    assert!(should_hint(Duration::from_millis(200), interval));
+    assert!(
+        should_hint(Duration::from_millis(4_999), interval),
+        "just inside the cap"
+    );
+    assert!(should_hint(Duration::ZERO, interval));
+}
+
+/// The rule is relative to the configured cadence, not to a fixed threshold: the
+/// same TTL flips sides when an operator tunes `lock_reaper_interval_ms`.
+#[test]
+fn the_hint_threshold_follows_the_configured_interval() {
+    let ttl = Duration::from_secs(1);
+    assert!(should_hint(ttl, Duration::from_secs(5)));
+    assert!(!should_hint(ttl, Duration::from_millis(500)));
 }

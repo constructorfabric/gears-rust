@@ -25,7 +25,7 @@ pub fn register_routes(
         .query_param("details", false, "Include detailed system information and capabilities")
         .query_param("force_refresh", false, "Force refresh syscap, ignoring cache (only applies when details=true)")
         .handler(handlers::list_nodes)
-        .json_response_with_schema::<Vec<NodeDto>>(openapi, http::StatusCode::OK, "List of nodes")
+        .json_array_response_with_schema::<NodeDto>(openapi, http::StatusCode::OK, "List of nodes")
         .error_500(openapi)
         .register(router, openapi);
 

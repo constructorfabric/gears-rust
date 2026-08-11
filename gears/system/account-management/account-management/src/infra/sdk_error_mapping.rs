@@ -70,6 +70,17 @@ pub(crate) struct TenantMetadataResource;
 #[resource_error(gts_id!("cf.core.am.conversion_request.v1~"))]
 pub(crate) struct ConversionRequestResource;
 
+/// Curated public `field_violations[].description` for one
+/// [`DomainError::IdpFieldNotWritable`] attribute. Derived from the typed
+/// attribute so the wording lives in exactly one place no matter how many
+/// attributes a single refusal carries, and no vendor text is echoed.
+fn idp_managed_field_description(attribute: account_management_sdk::IdpUserAttribute) -> String {
+    format!(
+        "the {} is managed by the identity provider and cannot be changed through this API",
+        attribute.as_human_phrase()
+    )
+}
+
 // ---------------------------------------------------------------------------
 // DomainError → CanonicalError (the single AIP-193 ladder).
 // ---------------------------------------------------------------------------
@@ -152,6 +163,48 @@ impl From<DomainError> for CanonicalError {
                     account_management_sdk::field::PASSWORD_POLICY,
                 )
                 .create(),
+            // IdP-managed attribute reject: each `field` token is the
+            // exact `UserUpdateRequest` property name, so a client keys
+            // form-field attribution off it and disables those inputs.
+            // One violation per refused attribute — a merge patch can
+            // touch several locked attributes at once and the client
+            // learns the whole refused set from this one response.
+            // The public description is derived from the typed attribute
+            // here (single source of wording — the variant carries no
+            // caller- or vendor-supplied string to echo). Duplicates a
+            // provider may repeat collapse to one violation each.
+            DomainError::IdpFieldNotWritable { fields } => {
+                let mut seen = std::collections::HashSet::new();
+                let mut refused = fields.into_iter().filter(|a| seen.insert(*a));
+                match refused.next() {
+                    Some(first) => {
+                        let mut builder = UserResource::invalid_argument().with_field_violation(
+                            first.as_field_token(),
+                            idp_managed_field_description(first),
+                            account_management_sdk::field::IDP_MANAGED_FIELD,
+                        );
+                        for attribute in refused {
+                            builder = builder.with_field_violation(
+                                attribute.as_field_token(),
+                                idp_managed_field_description(attribute),
+                                account_management_sdk::field::IDP_MANAGED_FIELD,
+                            );
+                        }
+                        builder.create()
+                    }
+                    // Contract violation — the variant documents a
+                    // non-empty set. A 400 whose `field_violations[]` is
+                    // empty attributes the refusal to nothing, so degrade
+                    // to the generic `request` / `VALIDATION` pair.
+                    None => UserResource::invalid_argument()
+                        .with_field_violation(
+                            field::REQUEST_FIELD,
+                            "the identity provider refused the update",
+                            field::VALIDATION,
+                        )
+                        .create(),
+                }
+            }
 
             // ---- NotFound (HTTP 404) — one resource per variant ----
             DomainError::NotFound { detail, resource } => TenantResource::not_found(detail)

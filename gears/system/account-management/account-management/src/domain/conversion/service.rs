@@ -351,6 +351,11 @@ pub(crate) mod pep {
         pub const APPROVE: &str = "approve";
         pub const LIST_OWN: &str = "list_own";
         pub const LIST_INBOUND: &str = "list_inbound";
+
+        /// Every action in this vocabulary — see the note on the user
+        /// service's `actions::ALL`. Add new actions here as well as above.
+        #[cfg(test)]
+        pub const ALL: &[&str] = &[REQUEST, CANCEL, REJECT, APPROVE, LIST_OWN, LIST_INBOUND];
     }
 }
 

@@ -86,7 +86,7 @@ impl RestApiCapability for TestUsersGear {
             .query_param("limit", false, "Maximum number of users to return")
             .query_param("offset", false, "Number of users to skip")
             .public()
-            .json_response_with_schema::<Vec<User>>(
+            .json_array_response_with_schema::<User>(
                 openapi,
                 http::StatusCode::OK,
                 "Users retrieved successfully",

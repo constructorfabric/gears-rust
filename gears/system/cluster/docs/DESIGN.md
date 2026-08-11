@@ -44,7 +44,7 @@
 
 Cluster is a platform-level system gear that provides cluster coordination and shared-state primitives to all Gears. It exposes four independent primitives — distributed cache (KV with TTL, version-based CAS, watch notifications), leader election, distributed locks with TTL-bounded mutual exclusion, and service discovery — each as a versioned public-API facade struct (`ClusterCacheV1`, `LeaderElectionV1`, `DistributedLockV1`, `ServiceDiscoveryV1`) wrapping a plugin-implemented backend trait (`ClusterCacheBackend`, `LeaderElectionBackend`, `DistributedLockBackend`, `ServiceDiscoveryBackend`). Plugins register their backend implementations in ClientHub per profile per primitive; consumers resolve via per-primitive fluent resolvers.
 
-The architecture follows the ToolKit Gateway + Plugins pattern (same as authn-resolver, authz-resolver, credstore, tenant-resolver). An SDK crate (`cf-cluster-sdk`) defines the facade structs, backend traits, and resolver builders. A wiring crate (`cf-cluster`, planned follow-up change) handles ClientHub registration and plugin orchestration via the outbox-style builder/handle pattern. Backend-specific implementations ship as plugin crates (also follow-up changes) under `plugins/`.
+The architecture follows the ToolKit Gateway + Plugins pattern (same as authn-resolver, authz-resolver, credstore, tenant-resolver). An SDK crate (`cf-cluster-sdk`) defines the facade structs, backend traits, and resolver builders. The wiring — delivered in the `cf-gears-cluster` gear crate (§3.7 amendment: collapsed rather than a separate `cf-cluster`) — handles ClientHub registration, per-primitive provider dispatch, and plugin orchestration via the outbox-style builder/handle pattern. Backend-specific implementations ship as plugin crates under `plugins/`; `standalone-cluster-plugin` and `postgres-cluster-plugin` are shipped, with K8s, Redis, NATS, and etcd as follow-up changes.
 
 The key architectural differentiator is **per-primitive backend routing as operator config**. Each profile in platform YAML maps each primitive to a specific plugin's backend impl independently. Operators can run Redis for cache, K8s Lease for leader election, and K8s Lease (per instance) for service discovery — all in the same profile, registered side-by-side in ClientHub under that profile's scope. There is no runtime compositor object; the wiring crate iterates the config and registers each backend independently.
 
@@ -159,12 +159,12 @@ Each non-functional requirement from the PRD maps to its design response and ver
 │  marker, *Capability and *Features enums/structs, SDK default   │
 │  backends, scoping helpers, polyfill, shared types.             │
 ├─────────────────────────────────────────────────────────────────┤
-│  cf-cluster wiring (follow-up change)                           │
+│  cf-gears-cluster wiring (delivered)                            │
 │  ClusterWiring::builder().build_and_start() -> ClusterHandle.   │
 │  Reads operator YAML; instantiates plugins; registers each      │
 │  Arc<dyn _Backend> per profile per primitive in ClientHub.      │
 ├─────────────────────────────────────────────────────────────────┤
-│  Plugin crates (follow-up changes)                              │
+│  Plugin crates (standalone + postgres shipped)                  │
 │  ┌────────────────┐ ┌──────────────┐ ┌────────────────┐         │
 │  │ standalone     │ │ postgres     │ │ k8s            │  ...    │
 │  │ (in-process)   │ │ (CRD+L/N)    │ │ (Lease+CRD)    │         │
@@ -180,8 +180,8 @@ Each non-functional requirement from the PRD maps to its design response and ver
 |-------|---------------|------------|
 | SDK | Public-API facade structs (`*V1`), backend traits (`*Backend`), per-primitive resolver builders, `ClusterProfile` marker trait, `*Capability` requirement enums, `*Features` characteristic structs, shared types, per-primitive `scoped()` helpers, `PollingPrefixWatch` polyfill, `register_*_backend` / `deregister_*_backend` helpers | Rust crate (`cf-cluster-sdk`) |
 | Cluster gear | SDK default backend implementations (`CasBasedLeaderElectionBackend`, `CasBasedDistributedLockBackend`, `CacheBasedServiceDiscoveryBackend`), `ShutdownRevoke` seam, wiring lifecycle (`ClusterHandle`) | Rust crate (`cf-gears-cluster`) |
-| Wiring (follow-up) | Operator YAML parsing, plugin orchestration, per-primitive ClientHub registration, builder/handle exposed to parent host gear | Rust crate (`cf-cluster`) |
-| Plugins (follow-up) | Backend-specific primitive implementations exposed as builder/handle pairs | Rust crates per backend |
+| Wiring | Operator YAML parsing, per-primitive provider dispatch (`ProviderRegistry` → `ClusterWiring::from_config`), plugin orchestration, per-primitive ClientHub registration, builder/handle exposed as library API. Each of `leader_election` / `lock` / `service_discovery` resolves against its own provider registry independently of the `cache` binding, so one profile can mix backends (`cpt-cf-clst-fr-routing-per-primitive`); an omitted primitive falls back to the SDK default over that profile's cache (`cpt-cf-clst-fr-routing-omit-default`) | Rust crate (`cf-gears-cluster`) — collapsed into the gear crate, see the §3.7 amendment |
+| Plugins | Backend-specific primitive implementations exposed as builder/handle pairs, plus the `Cluster*Provider` impls the wiring dispatches on. A plugin may ship a cache provider only, a native non-cache provider only, or both (the Postgres plugin ships a cache provider and a standalone lock provider) | Rust crates per backend (`standalone-cluster-plugin`, `postgres-cluster-plugin` today; K8s, Redis, NATS, etcd follow-up) |
 | External | Persistence, coordination, cluster state | PostgreSQL, K8s API server, Redis, NATS, etcd |
 
 ## 2. Principles & Constraints
@@ -865,7 +865,7 @@ Per-backend storage layout (e.g., the Postgres plugin's `cluster_cache` and `clu
 
 Cluster is an in-process Rust library SDK; it has no deployment topology of its own. The SDK is consumed by other gears in the same process; the `ClusterHandle` lifecycle is owned by a parent host gear's `RunnableCapability::start`/`stop` (see §3.7).
 
-The deployment shape that matters operationally is the **profile × backend** matrix mapped onto the parent host gear's deployment. §4.2 Recommended Deployment Combinations enumerates the supported shapes (single-instance dev/test, multi-instance non-K8s, K8s-low-throughput, K8s + Redis production, Redis-only). Each shape is realized by the parent host gear's deployment (Kubernetes pod, systemd unit, Docker container) plus the backend bindings declared in operator YAML and instantiated by the lifecycle wiring in the `cf-gears-cluster` gear crate. Today the wiring instantiates the cache provider and auto-fills the other three primitives with the SDK defaults; binding a native non-cache backend per primitive is rejected at config time pending the routing follow-up (`cpt-cf-clst-fr-routing-per-primitive`).
+The deployment shape that matters operationally is the **profile × backend** matrix mapped onto the parent host gear's deployment. §4.2 Recommended Deployment Combinations enumerates the supported shapes (single-instance dev/test, multi-instance non-K8s, K8s-low-throughput, K8s + Redis production, Redis-only). Each shape is realized by the parent host gear's deployment (Kubernetes pod, systemd unit, Docker container) plus the backend bindings declared in operator YAML and instantiated by the lifecycle wiring in the `cf-gears-cluster` gear crate. The wiring instantiates each primitive's bound provider independently and auto-fills only the primitives the operator omits with the SDK defaults over that profile's cache, so the mixed-backend shapes in the matrix below are expressible in YAML today (`cpt-cf-clst-fr-routing-per-primitive`) for whichever native providers the linked plugins ship.
 
 Cross-cluster / geo-distributed coordination is out of scope (§4.2 Out of Scope in PRD).
 
@@ -877,8 +877,8 @@ Cross-cluster / geo-distributed coordination is out of scope (§4.2 Out of Scope
 
 | Backend | Cache | Leader Election | Distributed Lock | Service Discovery |
 |---------|-------|----------------|-----------------|-------------------|
-| **Standalone** (in-process, follow-up) | Native (HashMap + AtomicU64) | Native (watch channel) | Native (Mutex + Notify) | Native (HashMap) |
-| **Postgres** (follow-up) | Native (table + LISTEN/NOTIFY) | SDK default (on PG cache) | Native (`pg_advisory_lock`) | SDK default (on PG cache) |
+| **Standalone** (in-process, shipped) | Native (HashMap + AtomicU64) | Native (watch channel) | Native (Mutex + Notify) | Native (HashMap) |
+| **Postgres** (shipped) | Native (table + LISTEN/NOTIFY) | SDK default (on PG cache) | Native (`pg_advisory_lock`) | SDK default (on PG cache) |
 | **K8s** (follow-up) | Native (CRD + `resourceVersion`) | Native (Lease API) | Native (Lease API) | Native (Lease per instance, annotations carry state + metadata) |
 | **Redis** (follow-up) | Native (GET/SET/Lua) | SDK default (on Redis cache) | Native (SET NX EX + Lua) | SDK default (on Redis cache) |
 | **NATS KV** (follow-up) | Native (KV bucket + revision) | SDK default (on NATS cache) | SDK default (on NATS cache) | SDK default (on NATS cache) |

@@ -180,10 +180,23 @@ gts_instance! {
         display_name: "Delete user".to_owned(),
     }
 }
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.user_update.v1"),
+        resource_type: USER_RESOURCE_TYPE.to_owned(),
+        action: user_actions::UPDATE.to_owned(),
+        display_name: "Update user".to_owned(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use toolkit_gts::{InventoryInstance, gts_id};
+
+    use super::{
+        CONVERSION_REQUEST_RESOURCE_TYPE, TENANT_METADATA_RESOURCE_TYPE, TENANT_RESOURCE_TYPE,
+        USER_RESOURCE_TYPE, conversion_actions, metadata_actions, tenant_actions, user_actions,
+    };
 
     const PERMISSION_TYPE_ID: &str = gts_id!("cf.toolkit.authz.permission.v1~");
     /// AM's instance-id namespace segment, appended after
@@ -212,6 +225,7 @@ mod tests {
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.user_create.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.user_list.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.user_delete.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.user_update.v1"),
     ];
 
     fn am_permission_instances() -> Vec<&'static InventoryInstance> {
@@ -243,6 +257,73 @@ mod tests {
                 entry.instance_id
             );
         }
+    }
+
+    /// Every `(resource_type, action)` pair an AM PEP gate can enforce,
+    /// assembled from the per-service action vocabularies rather than
+    /// restated by hand — the vocabularies are the same constants the
+    /// `PolicyEnforcer` call sites pass.
+    fn enforced_permission_pairs() -> std::collections::BTreeSet<(&'static str, &'static str)> {
+        let vocabularies: [(&'static str, &'static [&'static str]); 4] = [
+            (TENANT_RESOURCE_TYPE, tenant_actions::ALL),
+            (TENANT_METADATA_RESOURCE_TYPE, metadata_actions::ALL),
+            (CONVERSION_REQUEST_RESOURCE_TYPE, conversion_actions::ALL),
+            (USER_RESOURCE_TYPE, user_actions::ALL),
+        ];
+        vocabularies
+            .into_iter()
+            .flat_map(|(resource_type, actions)| {
+                actions.iter().map(move |action| (resource_type, *action))
+            })
+            .collect()
+    }
+
+    /// Reads the `(resource_type, action)` pair back out of each registered
+    /// instance's serialized payload.
+    fn declared_permission_pairs() -> std::collections::BTreeSet<(String, String)> {
+        am_permission_instances()
+            .iter()
+            .map(|entry| {
+                let payload = (entry.payload_fn)();
+                let field = |name: &str| {
+                    payload
+                        .get(name)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_else(|| {
+                            panic!("instance {} lacks a string `{name}`", entry.instance_id)
+                        })
+                        .to_owned()
+                };
+                (field("resource_type"), field("action"))
+            })
+            .collect()
+    }
+
+    /// Catalog-vs-enforcement drift guard.
+    ///
+    /// [`EXPECTED_PERMISSION_IDS`] pins instance *ids*, which only catches a
+    /// renamed or dropped instance; it cannot notice a service that starts
+    /// enforcing a brand-new action nobody declared as grantable. Comparing
+    /// the semantic `(resource_type, action)` pairs closes that gap in both
+    /// directions: an enforced-but-undeclared action leaves the permission
+    /// ungrantable to least-privilege roles, and a declared-but-unenforced
+    /// one advertises a grant that gates nothing.
+    #[test]
+    fn am_permission_catalog_matches_enforced_action_vocabulary() {
+        let declared = declared_permission_pairs();
+        let enforced: std::collections::BTreeSet<(String, String)> = enforced_permission_pairs()
+            .into_iter()
+            .map(|(resource_type, action)| (resource_type.to_owned(), action.to_owned()))
+            .collect();
+
+        let undeclared: Vec<_> = enforced.difference(&declared).collect();
+        let unenforced: Vec<_> = declared.difference(&enforced).collect();
+        assert!(
+            undeclared.is_empty() && unenforced.is_empty(),
+            "AM permission catalog drifted from the enforced action vocabulary; \
+             enforced but not declared as an AuthzPermissionV1: {undeclared:?}; \
+             declared but not in any pep::actions::ALL: {unenforced:?}"
+        );
     }
 
     #[test]

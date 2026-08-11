@@ -1,7 +1,7 @@
 [package]
 name = "cf-gears-oagw"
 description = "OAGW module - discovers and routes to plugins"
-version = "0.3.3"
+version = "0.3.5"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -100,7 +100,7 @@ credstore-sdk = { workspace = true, features = ["test-util"] }
 toolkit = { workspace = true, features = ["bootstrap"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "net"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "net", "test-util"] }
 tower = { workspace = true, features = ["util"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

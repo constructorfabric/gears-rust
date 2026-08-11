@@ -11,14 +11,42 @@ use tracing::warn;
 use crate::config::ReplicationMode;
 use crate::pg_error::map_sqlx_error;
 
-/// A [`PgPoolOptions`] with the `after_connect`/`before_acquire`/`after_release`
-/// hooks wired (DESIGN.md §3.4) — callers still need to chain
-/// `.max_connections(...)`, `.acquire_timeout(...)`, and `.connect(...)`.
+/// A [`PgPoolOptions`] with the `after_connect`/`before_acquire` hooks wired
+/// (DESIGN.md §3.4) — callers still need to chain `.max_connections(...)`,
+/// `.acquire_timeout(...)`, and `.connect(...)`.
 ///
 /// `after_connect` pins every connection's `search_path` to `schema` so the
 /// migrations' unqualified `CREATE TABLE`s land in the same schema the runtime
 /// queries target with their `{schema}.cluster_*` qualifiers (PGR-L4). `schema`
 /// must already have passed [`validate_schema`] — it is interpolated unquoted.
+///
+/// **No `after_release` hook.** An earlier revision swept every checked-in
+/// connection with `pg_advisory_unlock_all()`, because back then a lock
+/// acquisition ran `pg_try_advisory_lock` on a *pooled* connection and a cancelled
+/// acquisition could return one to the pool still holding a live lock. No lock
+/// takes an advisory lock at all now — the `cluster_lock` row is the arbiter
+/// (DESIGN.md §5.1) — so the sweep would be a pure per-checkin round-trip on the
+/// cache hot path, doubling the pool's per-operation hook overhead to protect
+/// against a state this crate can no longer produce. The one advisory lock this
+/// plugin still takes is the liveness beacon, which lives on its own connection
+/// outside the pool and must **never** be released while the process runs
+/// (`lock::beacon`); an `unlock_all` on a pooled connection could not reach it,
+/// and one that could would be catastrophic.
+///
+/// One caveat, stated precisely because it is easy to get wrong: `sqlx`'s own
+/// `Migrator::run` **does** take an advisory lock on a pooled connection, and it is
+/// the *blocking* single-`bigint` form. Reading `sqlx 0.8.6`
+/// (`sqlx-core/src/migrate/migrator.rs`), `conn.lock()` is taken first, every step
+/// after it is `?`-propagated, and `conn.unlock()` is reached **only on the success
+/// path** — so a migration that fails partway (dirty version, checksum mismatch,
+/// failing DDL) returns that connection to the pool still holding the migrator's
+/// lock, and neither builder here calls `pool.close()` on that path (the pool is
+/// merely dropped). Two things keep that from mattering today: the migrator's key
+/// uses the one-argument form (`pg_locks.objsubid = 1`) which cannot collide with
+/// this plugin's two-argument keys (`objsubid = 2`), and a failed
+/// `build_and_start` propagates to a caller that discards the whole handle, so the
+/// sockets do close. Anything that starts reusing a pool across a failed
+/// `build_and_start` would need to revisit this.
 pub fn base_pool_options(schema: &str) -> PgPoolOptions {
     let schema = schema.to_owned();
     PgPoolOptions::new()
@@ -36,7 +64,6 @@ pub fn base_pool_options(schema: &str) -> PgPoolOptions {
                 Ok(true)
             })
         })
-        .after_release(|conn, _meta| Box::pin(release_session_advisory_locks(conn)))
 }
 
 /// Validates that `schema` is a simple, safe SQL identifier (PGR-L4). The schema
@@ -97,41 +124,82 @@ pub async fn ensure_schema(pool: &sqlx::PgPool, schema: &str) -> Result<(), Clus
     Ok(())
 }
 
-/// Releases every session-level advisory lock still held on a connection being
-/// returned to the pool (PGR-L3 cancellation safety net).
+/// Rejects `pgbouncer_transaction_mode: true` at startup (DESIGN.md §5.4).
 ///
-/// A lock acquisition future can be cancelled after `pg_try_advisory_lock`
-/// succeeds but before the connection is pinned in `PostgresLock`'s `held` map
-/// (e.g. `lock()`'s per-attempt timeout elapsing mid-acquire): the pooled
-/// connection would otherwise return to the pool still carrying a live advisory
-/// lock, which the TTL reaper can never find (no `cluster_lock` row was
-/// committed) and which no other session can release (advisory locks are
-/// session-scoped) — wedging that lock name until the connection is recycled.
-/// `pg_advisory_unlock_all()` runs on every checkin as a defensive sweep. It is
-/// a no-op for connections that hold nothing (the common case, and every cache
-/// connection), and for a legitimately held lock it is *also* a no-op here:
-/// pinned lock connections are only returned to the pool after `release`/
-/// `reclaim` already unlocked them. Returns `Ok(true)` so the connection is
-/// kept; a failed sweep discards it rather than risk returning a locked
-/// connection to the pool.
-pub async fn release_session_advisory_locks(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
-    sqlx::query("SELECT pg_advisory_unlock_all()")
-        .execute(conn)
-        .await?;
-    Ok(true)
-}
-
-/// Rejects `pgbouncer_transaction_mode: true` at startup (DESIGN.md §5.4):
-/// session-level advisory locks are released the moment `PgBouncer` returns the
-/// connection to the pool between transactions in transaction-pooling mode,
-/// even though the Rust code still holds a `LockGuard` — silent, hard to
-/// diagnose mis-behaviour rather than a clear startup failure.
+/// Narrower than it once was, but not gone. Lock *operations* are now single
+/// statements against the pool and would tolerate transaction-mode pooling
+/// perfectly well. What cannot is the pair of connections this plugin opens
+/// outside the pool: the liveness beacon, whose session-scoped advisory lock
+/// transaction-mode pooling would release between transactions — asserting to
+/// the whole fleet that this instance is dead while it still holds live locks —
+/// and the `LISTEN` connections, whose subscriptions have the same session
+/// affinity.
+///
+/// Both are opened directly rather than through the pool, so in practice this
+/// guards an operator who has put `PgBouncer` in front of the DSN itself. Silent,
+/// hard-to-diagnose misbehaviour rather than a clear startup failure is exactly
+/// what it is worth refusing to start over.
 pub fn reject_pgbouncer_transaction_mode(enabled: bool) -> Result<(), ClusterError> {
     if enabled {
         return Err(ClusterError::InvalidConfig {
-            reason: "pg_advisory_lock requires session-mode pooling or a direct connection; \
-                      transaction-mode PgBouncer is incompatible with distributed locks"
+            reason: "the liveness beacon's advisory lock and the LISTEN subscriptions require \
+                      session-mode pooling or a direct connection; transaction-mode PgBouncer \
+                      would release the beacon between transactions, telling the fleet this \
+                      instance is dead while it still holds locks"
                 .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// The transaction isolation level this plugin's guarded upserts require, as
+/// `SHOW transaction_isolation` reports it.
+const REQUIRED_ISOLATION: &str = "read committed";
+
+/// Asserts the server hands this plugin `READ COMMITTED` transactions, failing
+/// startup with [`ClusterError::InvalidConfig`] otherwise.
+///
+/// Both primitives arbitrate a claim with the same idiom — an
+/// `INSERT ... ON CONFLICT DO UPDATE ... WHERE <may I take it?>` whose losing
+/// side must observe the winner's *already-committed* row. Postgres re-reads the
+/// latest committed version of a conflicting tuple only under `READ COMMITTED`;
+/// under `REPEATABLE READ` or `SERIALIZABLE` the transaction snapshot cannot
+/// advance, so instead of re-evaluating the predicate the statement raises
+/// SQLSTATE `40001` (`could not serialize access due to concurrent update`) and
+/// the caller is expected to retry. Neither `cache::put_if_absent` (the
+/// leader-election failover path, via `CasBasedLeaderElectionBackend::claim`)
+/// nor the lock's acquire does that, so a misconfigured server turns ordinary
+/// contention into a `Provider` error.
+///
+/// Asserted, not enforced. One
+/// `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED`
+/// in [`base_pool_options`]'s `after_connect` — beside the `synchronous_commit`
+/// enforcement — would make the property true regardless of the server default,
+/// and is available cheaply if wanted. It is deliberately not done: silently
+/// overriding an isolation level an operator set on purpose hides a mismatch
+/// that failing fast surfaces, and the failure this guards against is a loud,
+/// distinctively-coded error rather than silent misbehaviour. Same precedent as
+/// [`reject_pgbouncer_transaction_mode`] (DESIGN.md §5.4).
+///
+/// # Errors
+/// [`ClusterError::InvalidConfig`] if the effective isolation level is anything
+/// other than `read committed`; a genuine connectivity error propagates as
+/// itself.
+pub async fn assert_read_committed(pool: &sqlx::PgPool) -> Result<(), ClusterError> {
+    let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
+        .fetch_one(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+    if !isolation.eq_ignore_ascii_case(REQUIRED_ISOLATION) {
+        return Err(ClusterError::InvalidConfig {
+            reason: format!(
+                "transaction_isolation is {isolation:?}, but this plugin requires \
+                 {REQUIRED_ISOLATION:?}: both the lock's acquire and the cache's put_if_absent \
+                 are guarded upserts whose losing side must re-read the winner's committed row, \
+                 which stricter isolation levels answer with a serialization failure instead. Set \
+                 the server's default_transaction_isolation (or the DSN's options) to read \
+                 committed"
+            ),
         });
     }
     Ok(())

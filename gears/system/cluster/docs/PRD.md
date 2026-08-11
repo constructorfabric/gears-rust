@@ -204,8 +204,8 @@ In scope for this change:
 
 The following are out of scope for this change and ship as follow-ups:
 
-- External per-backend plugins (Postgres, K8s, Redis, NATS, etcd, Hazelcast). Each plugin is a separate change that builds against the contract this change establishes. The in-process standalone plugin shipped here is the reference backend, not a substitute for these.
-- Operator-YAML-driven instantiation of **non-cache** native backends. The wiring reads config and instantiates the cache provider, then auto-fills leader election, lock, and service discovery with the SDK defaults over that cache. Binding a native non-cache backend in YAML is **rejected at config time** (loud `InvalidConfig`) until the per-primitive routing follow-up lands — see `cpt-cf-clst-fr-routing-per-primitive`.
+- External per-backend plugins (K8s, Redis, NATS, etcd, Hazelcast). Each plugin is a separate change that builds against the contract this change establishes. The in-process standalone plugin shipped here is the reference backend, not a substitute for these. The **Postgres plugin is delivered** (cache provider plus a standalone native lock provider), and is the first plugin to exercise per-primitive routing end to end.
+- ~~Operator-YAML-driven instantiation of **non-cache** native backends.~~ **Delivered** (see `cpt-cf-clst-fr-routing-per-primitive`). The wiring's YAML path dispatches each of `leader_election` / `lock` / `service_discovery` against its own provider registry, so an operator can bind a native non-cache backend alongside — or independently of — the cache binding. A primitive left omitted still rides the SDK default over that profile's cache.
 - Active **remote release** of held lock and service-discovery state on shutdown. In-flight lock waiters and active service-discovery / cache watches now receive a terminal `Shutdown` (`cpt-cf-clst-fr-shutdown-revoke`), but **held** locks and live service registrations are not remotely deleted — they lapse via their backend TTL (`cpt-cf-clst-fr-shutdown-ttl-cleanup`).
 - Migration of existing per-gear coordination code (mini-chat's K8s leader election, toolkit-db's file locks, the nodes-registry). Each migration is a separate per-gear change.
 - Reliable pub/sub messaging with delivery guarantees, consumer groups, offsets, replay. The event broker gear owns reliable messaging; cluster's reactive cache notifications serve a different role (data-change observation, not message delivery).
@@ -407,13 +407,13 @@ The serving-intent signal **MUST NOT** be presented as health observation. A stu
 
 #### Per-Primitive Backend Selection
 
-- [ ] `p1` - **ID**: `cpt-cf-clst-fr-routing-per-primitive`
+- [x] `p1` - **ID**: `cpt-cf-clst-fr-routing-per-primitive`
 
 <!-- cpt-cf-id-content -->
 The system **MUST** allow operators to bind each coordination primitive to a different backend within one profile. For example: cache served by Redis, leader election served by K8s Lease, distributed lock served by Redis, service discovery served by K8s Lease-per-instance — all under the same profile. Consumer gears referencing this profile see four working primitives without knowing or caring that they're served by different backends.
 
 **Rationale**: Different backends excel at different things. Forcing one backend to serve all four primitives produces either suboptimal performance (Redis for leader election with weaker consistency than K8s Lease) or impossible-to-deploy combinations (K8s for cache when application throughput is too high).
-**Status (this change)**: Deferred. The wiring exposes `with_leader_election` / `with_lock` / `with_service_discovery` programmatically, but the YAML path **rejects** an explicit non-cache native binding at config time (loud `InvalidConfig` naming the primitive) rather than silently ignoring it. Operators get per-primitive backends once native non-cache providers ship; until then, omit the non-cache bindings to use the SDK defaults over the cache.
+**Status**: Realized. Both paths work: the wiring exposes `with_leader_election` / `with_lock` / `with_service_discovery` programmatically, and the YAML path resolves each non-cache primitive's `provider` against its own registry (`ProviderRegistry::with_leader_election_provider` and siblings), building that backend with its own options and its own stop hook. Naming a provider that isn't registered for that primitive still fails startup loudly with `InvalidConfig` — the registries are independent, so a plugin that ships only a cache provider cannot be bound to `lock` by mistake. Any primitive left omitted rides the SDK default over the profile's cache. Capability validation is unchanged and still applies per primitive, so a mixed-backend profile fails startup on a capability mismatch (`cpt-cf-clst-nfr-capability-validation`). First shipped native non-cache backend: the Postgres plugin's standalone `PostgresLockProvider`.
 **Actors**: `cpt-cf-clst-actor-operator`
 <!-- cpt-cf-id-content -->
 
@@ -810,11 +810,13 @@ This PRD does not enumerate these contracts. Each plugin's own PRD/DESIGN docume
 <!-- cpt-cf-id-content -->
 **Actor**: `cpt-cf-clst-actor-operator`
 
+**Status**: The per-primitive routing this use case depends on is realized (`cpt-cf-clst-fr-routing-per-primitive`). The Redis/K8s pairing in the main flow below is **illustrative of the target provider cohort** — those plugins have not shipped yet. The shipped-today realization of the same shape is a `standalone` (or Postgres) cache bound alongside the Postgres plugin's native lock provider; see the "Shipped-provider realization" alternative flow.
+
 **Preconditions**:
 - K8s deployment with Redis provisioned
 - Operator wants Redis for cache (high throughput) and K8s Lease for leader election (consistency)
 
-**Main Flow**:
+**Main Flow** *(target cohort; K8s and Redis plugins are follow-up work)*:
 1. Operator writes a profile with per-primitive bindings: cache → Redis, leader election → K8s Lease, lock → Redis, service discovery → K8s Lease (per instance)
 2. The cluster gear starts each plugin once and registers each backend under the profile
 3. Consumer gears referencing this profile resolve cache and lock through Redis, leader election and service discovery through K8s
@@ -823,6 +825,7 @@ This PRD does not enumerate these contracts. Each plugin's own PRD/DESIGN docume
 - Each primitive routes to the operator's chosen backend; consumer gears are unaware of the mix
 
 **Alternative Flows**:
+- **Shipped-provider realization**: Operator binds `cache` to the in-process `standalone` provider (or to Postgres) and `lock` to the Postgres plugin's native lock provider in one profile; leader election and service discovery ride the SDK defaults over that cache. Two providers, two backends, one profile — the same routing path the target cohort above will use.
 - **Single-backend convenience**: Operator binds only the cache primitive to Postgres for a profile; the system automatically provides leader election, lock, and service discovery via cluster-provided defaults built on the Postgres cache. Operator writes one config block instead of four.
 - **Capability mismatch at startup**: Operator binds an eventually-consistent cache and a consumer requires linearizable; startup fails with a specific error before traffic ever reaches the consumer gear.
 <!-- cpt-cf-id-content -->

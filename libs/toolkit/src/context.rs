@@ -264,7 +264,7 @@ impl GearCtx {
         let mut cfg: T = self.config()?;
         cfg.expand_vars().map_err(|e| ConfigError::VarExpand {
             gear: self.gear_name.to_string(),
-            source: e,
+            cause: e,
         })?;
         Ok(cfg)
     }
@@ -299,7 +299,7 @@ impl GearCtx {
         let mut cfg: T = self.config_or_default()?;
         cfg.expand_vars().map_err(|e| ConfigError::VarExpand {
             gear: self.gear_name.to_string(),
-            source: e,
+            cause: e,
         })?;
         Ok(cfg)
     }

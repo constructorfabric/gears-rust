@@ -378,13 +378,18 @@ async fn pg_cache_007_migration_idempotency() {
 }
 
 /// `PG-CACHE-008`: with the write pool constrained to a single connection and
-/// that one connection pinned by a held lock (the combined plugin shares one
-/// pool across cache and lock — DESIGN.md §3.3), a concurrent cache `put`
-/// *genuinely blocks* waiting for a connection, then completes once the lock
-/// releases the connection back to the pool. Pinning via a real held lock —
-/// rather than firing N short puts that merely serialize in microseconds —
-/// is what actually forces the "caller waits for a connection" behaviour this
-/// scenario is about.
+/// that one connection checked out, a concurrent cache `put` *genuinely blocks*
+/// waiting for a connection, then completes once it is returned. Holding a real
+/// checked-out connection — rather than firing N short puts that merely serialize
+/// in microseconds — is what actually forces the "caller waits for a connection"
+/// behaviour this scenario is about.
+///
+/// The connection is held via the `__test_pool` seam. An earlier version pinned
+/// the pool by *holding a lock*, which only worked because a held lock owned a
+/// pool connection; a held lock is now a `cluster_lock` row holding no connection
+/// at all (DESIGN.md §3.3), so it cannot exhaust the pool. Exercising pool
+/// exhaustion directly is also the better test — it no longer depends on the lock
+/// primitive to set up a cache-side condition.
 #[tokio::test]
 async fn pg_cache_008_blocked_acquire_succeeds_once_connection_frees() {
     let (_container, config) = common::start_postgres_with(json!({
@@ -397,13 +402,13 @@ async fn pg_cache_008_blocked_acquire_succeeds_once_connection_frees() {
         .await
         .unwrap();
     let cache = handle.cache();
-    let lock = handle.lock();
 
-    // Pin the single pool connection for the held lock's duration (§3.3).
-    let guard = lock
-        .try_lock("cache8-blocker", Duration::from_secs(30))
+    // Check the single pool connection out and hold it.
+    let pinned = handle
+        .__test_pool()
+        .acquire()
         .await
-        .expect("acquiring the lock pins the only pool connection");
+        .expect("checking out the only pool connection succeeds");
 
     // A cache `put` now has no connection available and must block.
     let put_cache = cache.clone();
@@ -419,11 +424,11 @@ async fn pg_cache_008_blocked_acquire_succeeds_once_connection_frees() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         !put.is_finished(),
-        "PG-CACHE-008: the put must genuinely block while the only connection is pinned"
+        "PG-CACHE-008: the put must genuinely block while the only connection is checked out"
     );
 
-    // Releasing the lock returns the connection; the blocked put then completes.
-    guard.release().await.expect("release frees the connection");
+    // Returning the connection unblocks the queued put.
+    drop(pinned);
     let result = tokio::time::timeout(Duration::from_secs(5), put)
         .await
         .expect("the unblocked put resolves within the timeout")
@@ -437,9 +442,9 @@ async fn pg_cache_008_blocked_acquire_succeeds_once_connection_frees() {
 }
 
 /// `PG-CACHE-008b`: pool exhaustion that outlasts `pool_acquire_timeout_ms`
-/// surfaces as `Provider { kind: Timeout }` (the timeout-exceeded error path
-/// the happy-path scenario above does not cover). Same single-connection,
-/// lock-pinned setup, but a short acquire timeout the blocked op cannot beat.
+/// surfaces as `Provider { kind: Timeout }` (the timeout-exceeded error path the
+/// happy-path scenario above does not cover). Same single-connection,
+/// checked-out setup, but a short acquire timeout the blocked op cannot beat.
 #[tokio::test]
 async fn pg_cache_008b_pool_exhaustion_times_out_as_provider_timeout() {
     let (_container, config) = common::start_postgres_with(json!({
@@ -452,12 +457,12 @@ async fn pg_cache_008b_pool_exhaustion_times_out_as_provider_timeout() {
         .await
         .unwrap();
     let cache = handle.cache();
-    let lock = handle.lock();
 
-    let guard = lock
-        .try_lock("cache8b-blocker", Duration::from_secs(30))
+    let pinned = handle
+        .__test_pool()
+        .acquire()
         .await
-        .expect("acquiring the lock pins the only pool connection");
+        .expect("checking out the only pool connection succeeds");
 
     // No connection can be obtained within 250ms → sqlx `PoolTimedOut` →
     // `Provider { Timeout }` (DESIGN.md §9).
@@ -480,7 +485,7 @@ async fn pg_cache_008b_pool_exhaustion_times_out_as_provider_timeout() {
          pool_acquire_timeout_ms must return Provider{{Timeout}}, got {result:?}"
     );
 
-    guard.release().await.expect("release");
+    drop(pinned);
     handle.stop().await;
 }
 

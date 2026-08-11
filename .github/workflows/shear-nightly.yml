@@ -1,0 +1,219 @@
+name: Unused Deps (nightly)
+
+# Workspace-wide unused-dependency scan with cargo-shear.
+#
+# `make shear` runs `cargo shear --expand`, which macro-expands the entire
+# workspace on a pinned nightly toolchain. That is effectively a full second
+# build (~1h) with no reusable target cache, which made it the longest job in
+# the PR pipeline while being advisory-only. Unused dependencies are a
+# slow-moving property, so this runs nightly instead.
+#
+# A failure implicates every commit merged that day, but attribution is cheap:
+# cargo-shear names the offending package and dependency, which points at one
+# manifest, and `git log --since=yesterday -- path/to/Cargo.toml` finds the
+# author. No bisect required.
+#
+# Because nothing surfaces a red `main` to a person on its own, a scheduled
+# failure opens (or comments on) a tracking issue quoting that output, and a
+# scheduled success closes it again. The open issue is therefore a live
+# statement that shear is currently broken — not a log that accumulates
+# forever. SHEAR_ISSUE_MENTION below controls who gets notified.
+#
+# To run it against a branch before merging: Actions → Unused Deps (nightly) →
+# Run workflow → pick the branch. Manual runs never touch issues.
+on:
+  schedule:
+    - cron: '0 3 * * *'   # 03:00 UTC daily (after the 02:00 clippy/e2e nightlies)
+  workflow_dispatch:
+
+# No concurrency group: cron runs are 24h apart and the job caps out well under
+# that, so the only way to overlap is a manual dispatch landing inside the ~1h
+# window a scheduled run is active. Not worth guarding against.
+
+permissions:
+  contents: read
+  issues: write   # required by the failure/success issue steps below
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+  CARGO_INCREMENTAL: "0"
+  # Pinned nightly required by `cargo shear --expand`. Authoritative for CI:
+  # passed through to `make shear` below so the toolchain this job installs and
+  # caches is provably the one that compiles. The Makefile's RUST_NIGHTLY
+  # default only covers local runs.
+  RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-04-16
+  # Notified in the issue body when the nightly fails. A username or team;
+  # empty still files the issue, but nothing would actively alert anyone.
+  SHEAR_ISSUE_MENTION: '@MikeFalcon77'
+  # Exact title both issue steps match on to find the previous run's issue.
+  # This is the dedup key — deliberately not a label, since creating a new
+  # label needs repo rights we don't assume. Changing this string orphans any
+  # currently-open issue (it would be left open and a new one filed).
+  SHEAR_ISSUE_TITLE: 'Unused deps (nightly) failed'
+
+jobs:
+  shear:
+    name: Unused Deps (cargo-shear)
+    runs-on: ubuntu-latest
+    # Measured ~57m. Generous headroom on purpose: a false timeout costs the
+    # only signal of the day and stays invisible for another 24h, while an
+    # over-long cap on a genuinely hung job costs runner minutes once.
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # No extra components: `--expand` needs only a nightly rustc for
+      # -Zunpretty=expanded. llvm-tools-preview belongs to cargo-llvm-cov and
+      # rustc-dev to the dylint drivers; neither is used here.
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: nightly-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-shear
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - name: Probe sccache & set RUSTC_WRAPPER
+        shell: bash
+        run: |
+          if sccache --start-server >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          else
+            echo "sccache failed, falling back to plain rustc"
+          fi
+
+      # Keep this version in sync with SHEAR_VERSION in the Makefile, so a local
+      # `make shear` and this job reach the same verdict.
+      - name: Install cargo-shear
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: cargo-shear@1.13.1
+
+      # `shell: bash` runs with -eo pipefail, so make's exit status survives the
+      # pipe into tee. Without pipefail this would report success on failure.
+      - name: cargo shear (workspace root)
+        shell: bash
+        run: make shear RUST_NIGHTLY="$RUSTUP_TOOLCHAIN_NIGHTLY" 2>&1 | tee "$RUNNER_TEMP/shear.txt"
+
+      - name: Open or update issue on nightly failure
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const title = process.env.SHEAR_ISSUE_TITLE;
+            const mention = (process.env.SHEAR_ISSUE_MENTION || '').trim();
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            // Quoting cargo-shear's own output is what makes triage a single
+            // `git log` away — it names the package and the dependency.
+            let captured = '';
+            try {
+              captured = fs.readFileSync(`${process.env.RUNNER_TEMP}/shear.txt`, 'utf8');
+            } catch (e) {
+              core.info(`No shear output captured: ${e.message}`);
+            }
+            const MAX = 3000;
+            const tail = (captured.length > MAX
+              ? `…(truncated, see run log)\n${captured.slice(-MAX)}`
+              : captured).trim();
+
+            const details = tail
+              ? ['<details><summary>cargo-shear output</summary>', '', '```', tail, '```', '</details>'].join('\n')
+              : '_No output captured — the job failed before `cargo shear` ran. See the run log._';
+
+            const lines = [];
+            if (mention) lines.push(mention, '');
+            lines.push(
+              '`cargo shear` failed on `main`.',
+              '',
+              `- Commit: ${context.sha}`,
+              `- Run: ${runUrl}`,
+              '',
+              'A missing `[workspace.metadata.cargo-shear] ignored` entry is the usual',
+              'cause — see the gear-dependencies section of CONTRIBUTING.md. To find the',
+              'commit: `git log --since=yesterday -- path/to/Cargo.toml`.',
+              '',
+              details,
+            );
+            const body = lines.join('\n');
+
+            // Find the previous run's issue by exact title. listForRepo rather
+            // than the search API: no index lag, no separate rate limit. The
+            // `creator` filter narrows to bot-authored issues so this is
+            // normally one request; paginate keeps it correct even if that
+            // filter is ignored. listForRepo returns PRs too, hence the guard.
+            const candidates = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', creator: 'github-actions[bot]', per_page: 100,
+            });
+            const existing = candidates.filter((i) => !i.pull_request && i.title === title);
+
+            if (existing.length > 0) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing[0].number, body,
+              });
+              core.info(`Commented on #${existing[0].number}`);
+            } else {
+              // Only pre-existing labels: creating a new one needs rights we
+              // don't assume, and an unknown label would be a needless failure.
+              const created = await github.rest.issues.create({
+                owner, repo, title, body, labels: ['bug', 'ci'],
+              });
+              core.info(`Created #${created.data.number}`);
+            }
+
+      # Without this the issue outlives the breakage and stops meaning anything.
+      - name: Close nightly issue on success
+        if: success() && github.event_name == 'schedule'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const title = process.env.SHEAR_ISSUE_TITLE;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            const candidates = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', creator: 'github-actions[bot]', per_page: 100,
+            });
+            const open = candidates.filter((i) => !i.pull_request && i.title === title);
+
+            for (const issue of open) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: `Resolved — \`cargo shear\` passed on ${context.sha}.\n\n- Run: ${runUrl}`,
+              });
+              await github.rest.issues.update({
+                owner, repo, issue_number: issue.number, state: 'closed',
+              });
+              core.info(`Closed #${issue.number}`);
+            }

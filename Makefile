@@ -12,6 +12,17 @@ OPENAPI_OUT ?= docs/api/api.json
 E2E_FEATURES ?= $(strip $(shell cat config/e2e-features.txt 2>/dev/null))
 E2E_ARGS ?= $(if $(E2E_FEATURES),--features $(E2E_FEATURES),)
 
+# Nightly toolchain for targets that need unstable rustc flags (currently only
+# `shear`, which drives -Zunpretty=expanded). This default serves local runs;
+# CI overrides it via `make shear RUST_NIGHTLY=...` so the toolchain it installs
+# and caches cannot drift from the one that actually compiles.
+RUST_NIGHTLY ?= nightly-2026-04-16
+
+# cargo-shear version installed by `make setup`. Pinned because an unused-dep
+# verdict that disagrees with CI is worse than no local check at all.
+# Keep in sync with the `Install cargo-shear` step in shear-nightly.yml.
+SHEAR_VERSION ?= 1.13.1
+
 # -------- Utility macros --------
 
 define check_tool
@@ -151,6 +162,7 @@ setup: .setup-stamp
 	cargo install cargo-gears
 	cargo install cargo-fuzz
 	cargo install cargo-hack
+	cargo install --locked cargo-shear --version $(SHEAR_VERSION)
 	cargo install gts-validator
 	@if echo "$$OS" | grep -iq windows || [ -n "$$COMSPEC" ]; then \
 		echo "NOTE: kani-verifier is not supported on Windows; skipping (use WSL2/Docker for Kani)."; \
@@ -318,7 +330,7 @@ dylint:
 # Check for unused dependencies with cargo-shear.
 shear:
 	$(call check_tool,cargo-shear)
-	cargo +nightly-2026-04-16 shear --expand --deny-warnings
+	cargo +$(RUST_NIGHTLY) shear --expand --deny-warnings
 
 # Run all code safety checks
 safety: clippy kani lint dylint # geiger
@@ -444,7 +456,7 @@ dev: dev-fmt dev-clippy dev-test
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-cluster-pg test-fips
 
 # Run all tests
 test: install-tools
@@ -481,6 +493,19 @@ test-users-info-pg: install-tools
 ## the suite spins up its own timescale/timescaledb container via testcontainers)
 test-usage-collector-pg: install-tools
 	cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres
+
+## Run the Postgres cluster plugin's conformance (Layer 2) and Layer 3
+## integration suites (Docker required;
+## each spins up its own postgres container per test via testcontainers —
+## see gears/system/cluster/plugins/postgres-cluster-plugin/docs/TESTING.md §7).
+##
+## `--retries 1` because the container/pool *setup* in tests/common/mod.rs is
+## load-sensitive on a busy host: it already retries `Postgres::start()` itself,
+## and exhausting that budget surfaces as a failure in whichever test drew the
+## short straw. A genuine logic regression fails both attempts, so this absorbs
+## Docker churn without masking one.
+test-cluster-pg: install-tools
+	cargo nextest run -p cf-postgres-cluster-plugin --features integration --retries 1
 
 ## Run FIPS-mode integration tests (requires Go for aws-lc-fips-sys).
 ## Covers:
@@ -573,7 +598,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector
 
 E2E_TARGET ?=
 
@@ -613,6 +638,14 @@ e2e-mini-chat:
 	cargo build --bin cf-gears-example-server --features=$(MINI_CHAT_FEATURES)
 	E2E_BINARY=target/debug/cf-gears-example-server \
 		$(PYTHON) -m pytest testing/e2e/gears/mini_chat/ --mode offline -vv
+
+UC_E2E_FEATURES = usage-collector,timescaledb-usage-collector,static-tenants,static-authn,static-authz
+
+## Run usage-collector E2E tests (dedicated binary + TimescaleDB container; Docker required)
+e2e-usage-collector:
+	cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES)
+	E2E_BINARY=target/debug/cf-gears-example-server \
+		$(PYTHON) -m pytest testing/e2e/gears/usage_collector/ -vv
 
 # -------- Code coverage --------
 

@@ -31,7 +31,8 @@ env:
   SCCACHE_CACHE_SIZE: "2G"
   # Usually better determinism and smaller cache churn in CI.
   CARGO_INCREMENTAL: "0"
-  # Pinned nightly toolchain used by coverage, dylint, and shear jobs.
+  # Pinned nightly toolchain used by the coverage job. Independent of the pin in
+  # shear-nightly.yml — they happen to match today but need not.
   RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-04-16
 
 jobs:
@@ -324,6 +325,9 @@ jobs:
       - name: Test timescaledb usage-collector plugin (pg integration)
         run: make test-usage-collector-pg
 
+      - name: Test postgres-cluster-plugin (pg integration)
+        run: make test-cluster-pg
+
       - name: Test toolkit-db (sqlite integration)
         run: make test-sqlite
 
@@ -541,13 +545,31 @@ jobs:
           cargo llvm-cov clean --workspace
           cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
 
-      # Upload to Codecov; do not fail CI if Codecov is down/misconfigured.
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
+      # Upload LCOV report as a GitHub Actions artifact so it is always
+      # available, even when Codecov is unavailable or rejects the upload.
+      - name: Upload LCOV artifact
+        if: always()
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
+          name: rust-coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 14
+
+      # Upload to Codecov. OIDC is used for non-fork events (push, dispatch);
+      # for fork PRs the action auto-detects the fork and falls back to
+      # tokenless upload (GitHub does not grant id-token:write for forks).
+      # fail_ci_if_error is true for non-fork events so upload failures are
+      # visible; for fork PRs it is best-effort (tokenless can be rate-limited).
+      # disable_search prevents auto-discovery of unrelated files (e.g.
+      # coverage_guard.rs) — only lcov.info is sent.
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          use_oidc: ${{ github.event_name != 'pull_request' }}
           files: lcov.info
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}  # Uncomment if required for private repos
+          disable_search: true
+          fail_ci_if_error: ${{ github.event_name != 'pull_request' }}
 
   lint:
     name: Architecture Lints (cargo gears lint)
@@ -573,75 +595,3 @@ jobs:
 
       - name: Run architecture lints
         run: cargo gears lint --dylint
-
-  shear:
-    name: Unused Deps (cargo-shear)
-    needs: changes
-    if: >-
-      !cancelled()
-      && (needs.changes.result != 'success'
-      || needs.changes.outputs.rust == 'true'
-      || needs.changes.outputs.ci == 'true'
-      || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    # Advisory only — unused-dep warnings should not block PRs.
-    continue-on-error: true
-    steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install Rust nightly toolchain
-        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
-          components: llvm-tools-preview,rustc-dev
-
-      # Override rust-toolchain.toml (which pins stable) for all cargo
-      # commands in this job.
-      - name: Pin nightly for all cargo commands
-        run: echo "RUSTUP_TOOLCHAIN=${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}" >> "$GITHUB_ENV"
-
-      - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-        with:
-          cache-bin: false
-          cache-targets: false
-          shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-shear
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
-
-      - name: Install cargo-shear
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
-        with:
-          tool: cargo-shear@1.13.1
-
-      - name: cargo shear (workspace root)
-        run: make shear

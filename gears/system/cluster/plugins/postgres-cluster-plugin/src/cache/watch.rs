@@ -129,6 +129,43 @@ where
     Ok(())
 }
 
+/// [`notify`] for a batch of keys sharing one `event`, in **one** round-trip —
+/// the cache TTL sweeper's form (`cache::reaper::sweep_chunk`).
+///
+/// `unnest` rather than a loop of single `pg_notify` calls, mirroring what
+/// `lock::notify::notify_released_many` already does for the lock sweep. The
+/// point of chunking that sweep was to bound how long one transaction holds row
+/// locks on every key it is deleting, and a sequential `pg_notify` round-trip per
+/// deleted key inside that transaction worked directly against it: a chunk's
+/// lock-hold time scaled with the number of expired keys rather than staying flat
+/// (DESIGN.md §11 lists this as an open improvement).
+///
+/// Payloads are formatted here rather than concatenated in SQL, so the
+/// `<event_type>:<key>` format lives in exactly one place ([`NotifyEvent::code`]).
+/// Postgres de-duplicates identical `(channel, payload)` pairs within a
+/// transaction; keys come from a `RETURNING` on a primary-key column, so there are
+/// no duplicates to fold anyway.
+pub async fn notify_many<'e, E>(
+    executor: E,
+    event: NotifyEvent,
+    keys: &[String],
+) -> Result<(), ClusterError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let payloads: Vec<String> = keys
+        .iter()
+        .map(|key| format!("{}:{key}", event.code()))
+        .collect();
+    sqlx::query("SELECT pg_notify($1, payload) FROM unnest($2::text[]) AS t(payload)")
+        .bind(CHANNEL)
+        .bind(&payloads)
+        .execute(executor)
+        .await
+        .map_err(map_sqlx_error)?;
+    Ok(())
+}
+
 /// A parsed NOTIFY payload (DESIGN.md §2.3): `<event_type>:<key>`, where
 /// `<event_type>` is one of `C` (Changed), `D` (Deleted), `E` (Expired). An
 /// empty or otherwise unrecognized payload — a bare `NOTIFY channel` with no
@@ -173,6 +210,9 @@ pub fn parse_notification(payload: &str) -> ParsedNotification {
 /// contract — "the backend should record the drop and emit a `Lagged` once
 /// the buffer drains").
 struct WatcherSlot {
+    /// Process-unique, so [`WatchRegistry::register`] can withdraw *its own* slot
+    /// when it loses the race against a terminal close — see there.
+    id: u64,
     sender: CacheWatchSender,
     dropped: AtomicU64,
 }
@@ -203,11 +243,73 @@ fn deliver(slot: &WatcherSlot, event: CacheWatchEvent) -> bool {
     }
 }
 
+/// The DESIGN.md §8-contracted watch-reset signals — `cluster_watch_resets_total`
+/// plus the `cluster.watch.reset` WARN — bundled so they can be handed to the
+/// detached `Reset` fan-out and emitted *there*, once delivery has happened.
+///
+/// A value rather than a closure because it has to be `Clone + Send + 'static`:
+/// one is moved into each spawned broadcast. The `RestartingWatch` combinator in
+/// `cluster-sdk` does not cover any of this — it reacts only to a terminal
+/// `Closed`, never to the listener's own internal `Reset`.
+#[derive(Clone)]
+pub struct WatchResetSignal {
+    metrics: Arc<dyn ClusterMetrics>,
+    provider: &'static str,
+}
+
+impl WatchResetSignal {
+    fn emit(&self) {
+        self.metrics.watch_reset(primitive::CACHE);
+        tracing::warn!(
+            name: logs::WATCH_RESET,
+            provider = %self.provider,
+            primitive = primitive::CACHE,
+            "cluster watch reset"
+        );
+    }
+}
+
 /// Registry of active per-key watchers, keyed by the exact key being watched.
 /// The LISTEN fan-out task (spawned by [`spawn_listen_task`]) routes each
 /// parsed notification to every sender registered under the notified key.
 pub struct WatchRegistry {
     watchers: DashMap<String, Vec<WatcherSlot>>,
+    /// Source of [`WatcherSlot::id`].
+    next_id: AtomicU64,
+    /// Serializes every terminal broadcast — the `Reset` fan-out and
+    /// [`close_all`](Self::close_all) — against each other.
+    ///
+    /// Without it those two interleave, and both interleavings are wrong. A
+    /// `Reset` broadcast that had already collected its senders when `close_all`
+    /// ran would `send` on the same channels *after* the terminal
+    /// `Closed(Shutdown)`, which the SDK's `CacheWatch` contract forbids
+    /// (`cluster-sdk/src/cache/watch.rs`: nothing follows a `Closed`). The other
+    /// order is no better: the `Reset` empties the map first, so `close_all` finds
+    /// nothing and delivers no terminal event at all — DESIGN.md §10 step 2 /
+    /// `PG-LIFE-004`.
+    ///
+    /// It also gives `stop()` something to wait on. The `Reset` fan-out is
+    /// deliberately run in a detached task (see
+    /// [`dispatch_from_listener`](Self::dispatch_from_listener)), so nothing else
+    /// joins it, and it can hold `TERMINAL_GRACE` past `stop()`. `close_all`
+    /// blocking on this mutex is what turns that into a bounded wait `stop()`
+    /// actually observes.
+    terminal: tokio::sync::Mutex<()>,
+    /// Set, under `terminal`, by the first terminal broadcast, to the very error
+    /// that broadcast delivered. A registry that has closed stays closed: later
+    /// `Reset` broadcasts are suppressed, and a `watch` arriving afterwards is
+    /// handed its terminal event immediately rather than registering into a map
+    /// nothing will ever dispatch to again.
+    ///
+    /// It holds the error rather than a bare flag because *which* error closed the
+    /// registry is load-bearing: `close_all` closes with
+    /// [`ClusterError::Shutdown`], while an exhausted LISTEN retry budget closes
+    /// with `Provider { kind: ConnectionLost, .. }`, and only the latter is
+    /// [`ClusterError::is_retryable`]. A late registration answered with a
+    /// hardcoded `Shutdown` would tell `RestartingWatch` the subsystem is going
+    /// away when the truth is a lost connection, so the consumer's own retry
+    /// policy never gets to run and the reported cause is wrong.
+    closed: std::sync::OnceLock<ClusterError>,
 }
 
 impl WatchRegistry {
@@ -215,22 +317,83 @@ impl WatchRegistry {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             watchers: DashMap::new(),
+            next_id: AtomicU64::new(0),
+            terminal: tokio::sync::Mutex::new(()),
+            closed: std::sync::OnceLock::new(),
         })
     }
 
     /// Registers a new exact-key watch, returning the [`CacheWatch`] handed
     /// back to the caller of
     /// [`ClusterCacheBackend::watch`](cluster_sdk::cache::ClusterCacheBackend::watch).
+    ///
+    /// A `watch()` landing during or after [`close_all`](Self::close_all) must not
+    /// produce a watcher that silently receives nothing forever, so registration
+    /// is a check-insert-recheck against the [`closed`](Self::closed) flag. The
+    /// recheck is what makes it airtight: this method is synchronous and cannot
+    /// take the async `terminal` mutex, so the flag can be set between the first
+    /// check and the insert. Losing that race is detected afterwards, and resolved
+    /// by *whoever actually holds the slot* — [`take_slot`](Self::take_slot)
+    /// returns `true` only if this call removed it, which means the terminal
+    /// broadcast did not collect it and this call owes the watcher its terminal
+    /// event. `false` means the broadcast took it and has already sent one, so
+    /// sending again here would be the duplicate.
+    ///
+    /// The terminal event handed over on that path is the one the closing
+    /// broadcast used, not a fixed `Shutdown` — see
+    /// [`closed`](Self::closed) for why the distinction matters to the caller.
     pub fn register(&self, key: &str) -> CacheWatch {
         let (sender, watch) = CacheWatch::channel(64);
-        self.watchers
-            .entry(key.to_owned())
-            .or_default()
-            .push(WatcherSlot {
-                sender,
-                dropped: AtomicU64::new(0),
-            });
+        if !self.is_closed() {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            self.watchers
+                .entry(key.to_owned())
+                .or_default()
+                .push(WatcherSlot {
+                    id,
+                    sender: sender.clone(),
+                    dropped: AtomicU64::new(0),
+                });
+            if !self.is_closed() || !self.take_slot(key, id) {
+                return watch;
+            }
+        }
+        // The registry is closed and this watcher's slot is ours to answer for.
+        // `try_send` on a channel with an empty 64-slot buffer always has room.
+        let _delivered = sender.try_send(CacheWatchEvent::Closed(self.terminal_error()));
         watch
+    }
+
+    /// Whether a terminal broadcast has already run.
+    fn is_closed(&self) -> bool {
+        self.closed.get().is_some()
+    }
+
+    /// The error the terminal broadcast closed with, for replaying to a
+    /// registration that arrived too late to be collected by it.
+    ///
+    /// Falls back to [`ClusterError::Shutdown`] only for the unreachable case of
+    /// being called before any terminal broadcast ran: every caller reaches this
+    /// through an [`is_closed`](Self::is_closed) check, and `closed` is set under
+    /// `terminal` before the broadcast collects a single sender.
+    fn terminal_error(&self) -> ClusterError {
+        self.closed.get().cloned().unwrap_or(ClusterError::Shutdown)
+    }
+
+    /// Removes the slot with `id` under `key`, reporting whether it was still
+    /// there. See [`register`](Self::register) for why the answer matters.
+    fn take_slot(&self, key: &str, id: u64) -> bool {
+        let Some(mut slots) = self.watchers.get_mut(key) else {
+            return false;
+        };
+        let before = slots.len();
+        slots.retain(|slot| slot.id != id);
+        let removed = slots.len() != before;
+        if slots.is_empty() {
+            drop(slots);
+            self.watchers.remove(key);
+        }
+        removed
     }
 
     /// Fans a parsed notification out to every watcher on the affected key, or
@@ -241,7 +404,80 @@ impl WatchRegistry {
     /// branch guarantees delivery (see [`broadcast_and_clear`](Self::broadcast_and_clear));
     /// the per-key `Changed`/`Deleted`/`Expired` fan-out is still a non-blocking
     /// `try_send` and never awaits.
+    ///
+    /// **Test-only.** Production dispatch goes through
+    /// [`dispatch_from_listener`](Self::dispatch_from_listener), which must not
+    /// await the `Reset` path. This awaited form is what the unit tests want:
+    /// spawning the broadcast would make "assert every watcher received `Reset`"
+    /// a race against a detached task rather than a fact on return.
+    #[cfg(test)]
     pub async fn dispatch(&self, notification: &ParsedNotification) {
+        if matches!(notification, ParsedNotification::Reset) {
+            let _broadcast = self.broadcast_and_clear(None).await;
+            return;
+        }
+        self.deliver_event(notification);
+    }
+
+    /// [`dispatch`](Self::dispatch) as the **LISTEN reader loop** must call it:
+    /// the per-key fan-out inline, a terminal `Reset` broadcast spawned.
+    ///
+    /// The reader loop must not `await` the `Reset` path. `broadcast_and_clear`
+    /// is bounded by `TERMINAL_GRACE` (5s) per watcher that is alive but not
+    /// draining, and for however long it runs this session reads *no*
+    /// notifications. A `LISTEN` session that stops reading pins the tail of the
+    /// notify queue — which is **cluster-wide**, shared by every database in the
+    /// Postgres instance, and truncated only as far as its slowest listener
+    /// allows. So a single non-draining consumer here could stall the queue for
+    /// the whole cluster, and once it filled, *every* notifying commit anywhere
+    /// on that server would start failing with "too many notifications in the
+    /// NOTIFY queue". Not stalling the drain is the part this plugin controls
+    /// (DESIGN.md §11).
+    ///
+    /// Spawning costs the strict ordering between a `Reset` and the events after
+    /// it, which is sound because `Reset` is a superset signal, not a positional
+    /// one: a watcher that receives a later `Changed` *before* the `Reset` still
+    /// re-reads on the `Reset`. What is *not* spawned is `close_all` on the
+    /// shutdown path — nothing needs draining then, and `stop()` genuinely wants
+    /// to await delivery.
+    ///
+    /// What spawning must **not** cost is the terminal ordering, and that is what
+    /// [`terminal`](Self::terminal) enforces: a `Reset` task that started before
+    /// `stop()` cancelled either wins the mutex and completes before `close_all`
+    /// collects anything, or loses it and is suppressed outright — never `Reset`
+    /// after `Closed`, and never an emptied registry for `close_all` to find.
+    ///
+    /// `signal` is invoked only once the broadcast has actually been delivered, so
+    /// `cluster_watch_resets_total` counts resets watchers were given rather than
+    /// resets that were merely scheduled. Emitting it at the call site (as this
+    /// used to) counted a reset before the fan-out was even spawned, including the
+    /// ones a concurrent shutdown then suppressed.
+    pub fn dispatch_from_listener(
+        self: &Arc<Self>,
+        notification: &ParsedNotification,
+        signal: &WatchResetSignal,
+    ) {
+        if matches!(notification, ParsedNotification::Reset) {
+            let registry = Arc::clone(self);
+            let signal = signal.clone();
+            tokio::spawn(async move {
+                if registry.broadcast_and_clear(None).await {
+                    signal.emit();
+                }
+            });
+            return;
+        }
+        self.deliver_event(notification);
+    }
+
+    /// The non-terminal half of [`dispatch`](Self::dispatch): per-key fan-out for
+    /// `Changed`/`Deleted`/`Expired`.
+    ///
+    /// Synchronous, because every send on this path is a non-blocking `try_send`
+    /// — which is precisely what makes it safe to run inline in the reader loop.
+    /// `Reset` is not a per-key event and is a no-op here; both callers above
+    /// handle it themselves.
+    fn deliver_event(&self, notification: &ParsedNotification) {
         match notification {
             ParsedNotification::Changed { key } => {
                 self.deliver_to_key(
@@ -261,9 +497,7 @@ impl WatchRegistry {
                     &CacheWatchEvent::Event(CacheEvent::Expired { key: key.clone() }),
                 );
             }
-            ParsedNotification::Reset => {
-                self.broadcast_and_clear(|| CacheWatchEvent::Reset).await;
-            }
+            ParsedNotification::Reset => {}
         }
     }
 
@@ -300,44 +534,86 @@ impl WatchRegistry {
     /// blocking `send` used to hang `stop()` forever in that case. After the
     /// grace the sender is dropped and that consumer observes end-of-stream
     /// (`None`); it was not reading, so a reserved slot would not have reached it
-    /// either. Senders are cloned out first so no `DashMap` shard lock is held
-    /// across an `.await`; the map is cleared before the awaits, and the cloned
-    /// senders keep each channel open until the terminal event lands or the grace
-    /// elapses. A watcher that already dropped its [`CacheWatch`] returns an error
-    /// from `send` immediately and is skipped.
-    async fn broadcast_and_clear(&self, make_event: impl Fn() -> CacheWatchEvent) {
+    /// either. Senders are taken out first so no `DashMap` shard lock is held
+    /// across an `.await`, and they keep each channel open until the terminal
+    /// event lands or the grace elapses. A watcher that already dropped its
+    /// [`CacheWatch`] returns an error from `send` immediately and is skipped.
+    ///
+    /// `Some(err)` makes this a terminal `Closed(err)` — an event nothing may
+    /// follow. It latches [`closed`](Self::closed) to `err`, which suppresses
+    /// every later broadcast and hands `err` itself to later registrations;
+    /// `None` is the non-terminal `Reset` fan-out. Returns whether the broadcast
+    /// ran at all; `false` means the registry was already closed and the caller's
+    /// event was deliberately dropped.
+    async fn broadcast_and_clear(&self, terminal: Option<ClusterError>) -> bool {
         /// Upper bound on how long a single terminal delivery waits for a full
         /// consumer to free a buffer slot before giving up (PGR-C4).
         const TERMINAL_GRACE: Duration = Duration::from_secs(5);
 
-        let senders: Vec<CacheWatchSender> = self
-            .watchers
-            .iter()
-            .flat_map(|entry| {
-                entry
-                    .value()
-                    .iter()
-                    .map(|slot| slot.sender.clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        self.watchers.clear();
+        // Held across the whole broadcast — collection *and* delivery. See
+        // [`terminal`](Self::terminal) for the two interleavings this excludes.
+        let _serialized = self.terminal.lock().await;
+        if self.is_closed() {
+            return false;
+        }
+        if let Some(err) = terminal.clone() {
+            let _latched = self.closed.set(err);
+        }
 
+        let senders = self.drain_senders();
         let mut deliveries = tokio::task::JoinSet::new();
         for sender in senders {
-            let event = make_event();
+            let event = match &terminal {
+                Some(err) => CacheWatchEvent::Closed(err.clone()),
+                None => CacheWatchEvent::Reset,
+            };
             deliveries.spawn(async move {
                 let _delivered = tokio::time::timeout(TERMINAL_GRACE, sender.send(event)).await;
             });
         }
         while deliveries.join_next().await.is_some() {}
+        true
+    }
+
+    /// Removes every registered watcher and returns their senders.
+    ///
+    /// Key by key via [`DashMap::remove`], **not** `iter()` then `clear()`. Those
+    /// two are separate operations with no atomicity between them, and
+    /// [`register`](Self::register) coordinates with neither: a watcher registering
+    /// in the gap was collected by neither the iteration nor — having been
+    /// inserted after it — spared by the clear. It was simply removed, with no
+    /// event ever delivered, so its consumer saw end-of-stream `None` instead of
+    /// `Reset`. `None` documents as "the sender was dropped", which gives a
+    /// consumer handling `Reset` no reason to resubscribe: a raw [`CacheWatch`]
+    /// user (no `auto_restart`) stopped receiving events permanently. The race
+    /// predates spawning the `Reset` fan-out but that widened it from an inline
+    /// section to a scheduling boundary.
+    ///
+    /// `remove` is atomic per key against `entry().or_default().push()`, which
+    /// holds the same shard lock, so every registration now falls cleanly on one
+    /// side: either it is collected here and receives the event, or it lands under
+    /// an already-removed key and stays registered for whatever comes next.
+    /// Neither outcome silently drops it.
+    fn drain_senders(&self) -> Vec<CacheWatchSender> {
+        let keys: Vec<String> = self
+            .watchers
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        let mut senders = Vec::new();
+        for key in keys {
+            if let Some((_, slots)) = self.watchers.remove(&key) {
+                senders.extend(slots.into_iter().map(|slot| slot.sender));
+            }
+        }
+        senders
     }
 
     /// Closes every active watch terminally with [`ClusterError::Shutdown`]
-    /// (DESIGN.md §10 step 2, `PG-LIFE-004`) before the LISTEN task exits.
+    /// (DESIGN.md §10 step 2, `PG-LIFE-004`) before the LISTEN task exits, and
+    /// latches the registry closed so nothing can follow it.
     pub async fn close_all(&self) {
-        self.broadcast_and_clear(|| CacheWatchEvent::Closed(ClusterError::Shutdown))
-            .await;
+        let _broadcast = self.broadcast_and_clear(Some(ClusterError::Shutdown)).await;
     }
 }
 
@@ -424,20 +700,9 @@ pub async fn spawn_listen_task(
     let mut listener = connect_and_listen(&connection_string).await?;
 
     Ok(tokio::spawn(async move {
-        // Emits the DESIGN.md §8-contracted watch-reset signals
-        // (`cluster_watch_resets_total` / `cluster.watch.reset` WARN) for
-        // every `Reset` this task dispatches — the `RestartingWatch`
-        // combinator (`cluster-sdk`) does not cover this: it only reacts to a
-        // terminal `Closed`, never this task's own internal `Reset`.
-        let emit_watch_reset = || {
-            metrics.watch_reset(primitive::CACHE);
-            tracing::warn!(
-                name: logs::WATCH_RESET,
-                provider = %provider,
-                primitive = primitive::CACHE,
-                "cluster watch reset"
-            );
-        };
+        // Carried into each spawned `Reset` fan-out and emitted there, once the
+        // broadcast has actually been delivered — see `dispatch_from_listener`.
+        let reset_signal = WatchResetSignal { metrics, provider };
 
         let mut attempt: u32 = 0;
         loop {
@@ -450,26 +715,25 @@ pub async fn spawn_listen_task(
                         // (DESIGN.md §4.3's "empty/unrecognized payload"
                         // trigger, distinct from the connection-loss trigger
                         // below) — §8 contracts the watch-reset signals for
-                        // both.
+                        // both, and `dispatch_from_listener` emits them on the
+                        // `Reset` branch only.
                         let parsed = parse_notification(notification.payload());
-                        if matches!(parsed, ParsedNotification::Reset) {
-                            emit_watch_reset();
-                        }
-                        registry.dispatch(&parsed).await;
+                        // Never `await`ed from this loop — see
+                        // `dispatch_from_listener` for why a stalled drain is a
+                        // cluster-wide problem, not a local one.
+                        registry.dispatch_from_listener(&parsed, &reset_signal);
                     }
                     Ok(None) => {
                         // `PgListener`'s own transparent reconnect just ran and
                         // succeeded; events during the gap may have been missed.
                         attempt = 0;
-                        emit_watch_reset();
-                        registry.dispatch(&ParsedNotification::Reset).await;
+                        registry.dispatch_from_listener(&ParsedNotification::Reset, &reset_signal);
                     }
                     Err(_lost) => {
                         match reconnect_with_backoff(&connection_string, &ListenRetryPolicy::DEFAULT, &mut attempt, &cancel).await {
                             Some(reconnected) => {
                                 listener = reconnected;
-                                emit_watch_reset();
-                                registry.dispatch(&ParsedNotification::Reset).await;
+                                registry.dispatch_from_listener(&ParsedNotification::Reset, &reset_signal);
                             }
                             // `None` means either the retry budget is exhausted
                             // or `cancel` fired mid-backoff (graceful shutdown,
@@ -477,13 +741,18 @@ pub async fn spawn_listen_task(
                             // is a real `Closed(ConnectionLost)`.
                             None if cancel.is_cancelled() => return,
                             None => {
-                                registry.broadcast_and_clear(|| {
-                                    CacheWatchEvent::Closed(ClusterError::Provider {
+                                // Terminal: latches the registry closed on this
+                                // error, so a `Reset` still in flight cannot
+                                // follow it and a later `watch()` is answered
+                                // immediately — with this same retryable
+                                // `ConnectionLost`, not a `Shutdown`.
+                                let _broadcast = registry.broadcast_and_clear(Some(
+                                    ClusterError::Provider {
                                         kind: ProviderErrorKind::ConnectionLost,
                                         message: "LISTEN connection reconnect retry budget exhausted"
                                             .to_owned(),
-                                    })
-                                }).await;
+                                    },
+                                )).await;
                                 return;
                             }
                         }

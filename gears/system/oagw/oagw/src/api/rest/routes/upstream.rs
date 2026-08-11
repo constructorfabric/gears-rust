@@ -49,7 +49,7 @@ pub(super) fn register(
         .authenticated()
         .require_license_features::<License>([])
         .handler(handlers::upstream::list_upstreams)
-        .json_response_with_schema::<Vec<dto::UpstreamResponse>>(
+        .json_array_response_with_schema::<dto::UpstreamResponse>(
             openapi,
             http::StatusCode::OK,
             "List of upstreams",

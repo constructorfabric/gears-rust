@@ -41,6 +41,9 @@ make e2e-docker            # E2E — Docker environment
 make e2e-docker-smoke      # E2E — Docker environment (smoke subset only)
 make e2e-local             # E2E — local server (builds + starts automatically)
 make e2e-local-smoke       # E2E — smoke subset only
+make e2e-mini-chat         # E2E — mini-chat lane (dedicated binary, offline mode)
+make e2e-tr-authz          # E2E — AuthZ -> TR -> RG chain (local mode, e2e-tr-authz.yaml)
+make e2e-usage-collector   # E2E — usage-collector lane (dedicated binary; needs Docker)
 make fuzz                  # fuzz — 30 s smoke per target
 make check                 # full quality gate (fmt + clippy + test + security)
 make all                   # full pipeline (build + check + test-sqlite + e2e-local)
@@ -164,8 +167,21 @@ The `e2e.yml` workflow runs:
 - **On PRs to `main`**: full E2E suite (local mode).
 - **Nightly**: full E2E suite. Failures auto-create a GitHub issue assigned to the last commit author.
 - **Manual dispatch**: smoke or full, selectable.
-- **Specialized lanes**: the same workflow also runs the mini-chat E2E suite and the
-  RG + AuthZ end-to-end chain tests.
+- **Specialized lanes**: the same workflow also runs the mini-chat E2E suite, the
+  RG + AuthZ end-to-end chain tests, and the usage-collector suite.
+
+The `tr-authz` lane is ordinary local mode with a different config
+(`config/e2e-tr-authz.yaml`) and a `-k resource_group` selection. The `mini-chat` and
+`usage-collector` lanes each build their own `cf-gears-example-server` with a feature
+set the default local-mode binary does not carry, so a plain `make e2e-local` collects
+their tests but skips them all: both gate on `E2E_BINARY`, which only their own make
+target sets.
+
+The usage-collector lane additionally needs a reachable Docker daemon — its storage
+plugin connects and migrates a real TimescaleDB at gear init, which `lib/sidecars.py`
+supplies as a throwaway container on a dynamically mapped port. When Docker is
+unreachable the suite skips rather than fails, so verify the skip count before reading
+a green run as coverage.
 
 Other quality-related GitHub Actions under `.github/workflows` complement the E2E
 workflow:
@@ -301,7 +317,8 @@ PR opened / updated
   ├── docs.yml            — Markdown link checking for docs changes
   ├── gts-validation.yml  — GTS identifier validation for docs / schema changes
   └── e2e.yml (PRs to main only)
-        └── e2e           — full E2E suite (local mode), plus mini-chat and TR/AuthZ E2E lanes
+        └── e2e           — full E2E suite (local mode), plus mini-chat, TR/AuthZ
+                            and usage-collector E2E lanes
 
 Additional quality workflows
   ├── codeql.yml          — security and quality code scanning

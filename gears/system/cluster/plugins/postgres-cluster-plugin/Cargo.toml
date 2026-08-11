@@ -88,12 +88,6 @@ sqlx = { workspace = true, features = [
     "chrono",
     "uuid",
 ] }
-# `lock_key`'s deterministic name -> (key1, key2) hash (DESIGN.md §5.1): xxh3
-# is a well-known, fast, non-cryptographic 64-bit hash, and already a
-# workspace dependency (used by `libs/toolkit-db`) — the specific algorithm is
-# an implementation detail per DESIGN.md §5.1 as long as it stays fixed once
-# shipped.
-xxhash-rust = { workspace = true }
 # Full-jitter on the LISTEN reconnect backoff (cache/watch.rs): without it,
 # every fleet instance retries a shared-database blip on the same deterministic
 # schedule, aligning reconnect attempts into bursts.

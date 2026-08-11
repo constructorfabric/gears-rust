@@ -43,18 +43,49 @@
 -- 16-byte comparison rather than a collation-aware string one, and makes the
 -- contract the column's own rather than an implicit convention.
 --
+-- `holder_beacon_hi`/`holder_beacon_lo` are the two `int4` halves of the
+-- liveness beacon vouching for this row (DESIGN.md §5.1): the single
+-- per-incarnation advisory lock the holding instance took at startup on a
+-- dedicated connection. They are what makes a row's ownership *checkable* by
+-- anyone rather than only by its writer — the acquire predicate joins them
+-- against `pg_locks`, so a row whose beacon is no longer granted is stealable
+-- the instant Postgres notices the holder's connection is gone, without waiting
+-- out `expires_at`. Nothing renews or maintains them: the beacon is released
+-- only by its connection closing, which is precisely the event they exist to
+-- detect.
+--
+-- Two `int4` halves rather than one `bigint`, and `NOT NULL` with a
+-- non-negative CHECK, both for the predicate's sake. `pg_locks` exposes the
+-- two-argument advisory key as `classid`/`objid`, which are `oid` (unsigned) —
+-- keeping both halves non-negative makes the comparison a plain
+-- `classid = holder_beacon_hi::oid` with no sign reinterpretation, and `NOT
+-- NULL` keeps the predicate free of a `NULL` branch. The columns are declared
+-- here rather than added by a follow-on migration exactly so that no schema
+-- version ever exists in which a row can lack a beacon.
+--
 -- `name` is the PRIMARY KEY, so — exactly as with `cluster_cache.key`, see
 -- `0001_cluster_cache.sql` — it lands in a btree bound by the ~2704 byte
 -- index-tuple limit. `validate_lock_name` rejects an over-long name in Rust
 -- before any lock state is mutated; this CHECK is the backstop. Keep the bound
 -- in sync with `limits::MAX_INDEXED_KEY_BYTES`.
+--
+-- No index on `(holder_beacon_hi, holder_beacon_lo)`, deliberately. Three
+-- statements filter on that pair — the reaper's orphan sweep, the shutdown
+-- drain, and the post-reconnect cleanup — but the table holds only *active*
+-- locks, so at the cardinality `cluster_postgres_lock_active_names` reports a
+-- sequential scan is trivial and the index would be pure write amplification on
+-- the acquire path. Revisit against that gauge, not up front.
 CREATE TABLE cluster_lock (
-    name        TEXT        NOT NULL,
-    holder_id   UUID        NOT NULL,
-    acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at  TIMESTAMPTZ NOT NULL,
+    name             TEXT        NOT NULL,
+    holder_id        UUID        NOT NULL,
+    acquired_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at       TIMESTAMPTZ NOT NULL,
+    holder_beacon_hi INT4        NOT NULL,
+    holder_beacon_lo INT4        NOT NULL,
     PRIMARY KEY (name),
-    CONSTRAINT cluster_lock_name_len_check CHECK (octet_length(name) <= 2048)
+    CONSTRAINT cluster_lock_name_len_check CHECK (octet_length(name) <= 2048),
+    CONSTRAINT cluster_lock_beacon_nonneg_check
+        CHECK (holder_beacon_hi >= 0 AND holder_beacon_lo >= 0)
 );
 
 CREATE INDEX cluster_lock_expires_idx ON cluster_lock (expires_at);

@@ -30,6 +30,7 @@ fn test_dbconnconfig_serialization() {
             acquire_timeout: Some(Duration::from_secs(30)),
             ..Default::default()
         }),
+        lock_keepalive: Some(Duration::from_secs(5)),
         server: Some("test_server".to_owned()),
     };
 
@@ -53,6 +54,25 @@ fn test_dbconnconfig_serialization() {
     assert_eq!(deserialized.server, config.server);
     assert_eq!(deserialized.host, config.host);
     assert_eq!(deserialized.port, config.port);
+    assert_eq!(deserialized.lock_keepalive, config.lock_keepalive);
+}
+
+/// `lock_keepalive` is `#[serde(default)]`, so configs written before the field existed must still
+/// deserialize — and must land on `None` so the caller resolves the crate default rather than
+/// silently getting a zero interval.
+#[test]
+fn test_dbconnconfig_lock_keepalive_omitted_defaults_to_none() {
+    let json = r#"{
+        "dsn": "postgresql://user:pass@localhost/db",
+        "host": "localhost",
+        "port": 5432
+    }"#;
+
+    let config: DbConnConfig = serde_json::from_str(json).expect("Failed to deserialize from JSON");
+
+    assert!(config.lock_keepalive.is_none());
+    assert_eq!(config.host.as_deref(), Some("localhost"));
+    assert_eq!(config.port, Some(5432));
 }
 
 #[test]
@@ -69,6 +89,7 @@ fn test_dbconnconfig_defaults() {
     assert!(config.file.is_none());
     assert!(config.path.is_none());
     assert!(config.pool.is_none());
+    assert!(config.lock_keepalive.is_none());
     assert!(config.server.is_none());
 }
 

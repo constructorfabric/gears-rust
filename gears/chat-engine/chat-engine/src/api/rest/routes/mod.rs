@@ -120,7 +120,7 @@ pub fn register_routes(
         .authenticated()
         .require_license_features([&ChatEngineLicense])
         .handler(handlers::session_types::list_session_types)
-        .json_response_with_schema::<Vec<SessionTypeDto>>(
+        .json_array_response_with_schema::<SessionTypeDto>(
             openapi,
             StatusCode::OK,
             "Session type list",

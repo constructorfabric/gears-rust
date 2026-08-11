@@ -108,7 +108,7 @@ pub(super) fn register(
         .authenticated()
         .require_license_features::<License>([])
         .handler(handlers::route::list_routes)
-        .json_response_with_schema::<Vec<dto::RouteResponse>>(
+        .json_array_response_with_schema::<dto::RouteResponse>(
             openapi,
             http::StatusCode::OK,
             "List of routes",

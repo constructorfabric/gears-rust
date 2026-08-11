@@ -133,6 +133,7 @@ impl DbDeduplication {
         }
     }
 
+    #[cfg(feature = "outbox")]
     pub(crate) fn mode(&self) -> ProducerMode {
         match self {
             Self::Stateless => ProducerMode::Stateless,

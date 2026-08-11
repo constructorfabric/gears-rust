@@ -103,8 +103,22 @@ dependency crates as unused.
 
 **When adding a new gear dependency**, add the crate name to the
 `[workspace.metadata.cargo-shear] ignored` list in the workspace `Cargo.toml`.
-Forgetting this will cause the `shear` CI job to fail with an error unrelated to
-your actual change.
+
+`cargo-shear` does not run on pull requests — the scan takes about an hour, so it
+runs once nightly (`.github/workflows/shear-nightly.yml`). Forgetting the `ignored`
+entry therefore breaks `main` after your PR merges rather than failing your PR. The
+nightly opens a tracking issue quoting the offending package and dependency, and
+closes it once a later run passes.
+
+Before merging a change that adds or removes dependencies, check it against
+cargo-shear. The cheapest route needs no local setup and uses the same pinned
+toolchain and cargo-shear version as CI: Actions → Unused Deps (nightly) → Run
+workflow → select your branch.
+
+To check offline instead, run `make shear`. It needs `cargo-shear` on your `PATH`
+(`make setup` installs it, pinned to the version CI uses) plus the nightly toolchain
+named by `RUST_NIGHTLY` in the Makefile, which rustup downloads on first use. Budget
+about an hour for the scan.
 
 Always include unit tests when introducing new code.
 

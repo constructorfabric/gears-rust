@@ -53,7 +53,7 @@ fn assert_standard_errors_registered(spec: &OperationSpec) {
         let found = spec.responses.iter().any(|r| {
             r.status == *status
                 && r.content_type == "application/problem+json"
-                && r.schema_name.is_some()
+                && r.schema_name().is_some()
         });
         assert!(
             found,
@@ -116,7 +116,7 @@ async fn create_usage_records_route_is_registered_with_documented_contract() {
             .unwrap_or_else(|| panic!("create-records route MUST declare a {status} response"));
         assert_eq!(response.content_type, "application/json");
         assert_eq!(
-            response.schema_name.as_deref(),
+            response.schema_name(),
             Some(expected_response.as_str()),
             "create-records {status} MUST point at `CreateUsageRecordsResponse`",
         );
@@ -157,7 +157,7 @@ async fn get_usage_record_route_is_registered_with_documented_contract() {
         .expect("get route MUST declare a 200 OK response");
     assert_eq!(ok_resp.content_type, "application/json");
     assert_eq!(
-        ok_resp.schema_name.as_deref(),
+        ok_resp.schema_name(),
         Some(expected_response.as_str()),
         "get 200 MUST point at `UsageRecordDto`",
     );
@@ -199,7 +199,7 @@ async fn deactivate_usage_record_route_is_registered_with_documented_contract() 
         .find(|r| r.status == StatusCode::NO_CONTENT.as_u16())
         .expect("deactivate route MUST declare a 204 No Content response");
     assert!(
-        no_content.schema_name.is_none(),
+        no_content.schema_name().is_none(),
         "deactivate 204 MUST NOT carry a body schema",
     );
 

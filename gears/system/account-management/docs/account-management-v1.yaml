@@ -274,16 +274,20 @@ paths:
       summary: List users provisioned in a tenant
       description: |
         Lists users provisioned in the tenant via the configured IdP plugin.
-        Supplying `user_id` turns the response into an authoritative existence
+        There is no per-user GET. A point lookup is
+        `?$filter=id eq <uuid>&limit=1`, which is an authoritative existence
         check — the page contains at most one element and an empty page is the
         canonical "user absent" signal (no 404). AM persists no local user
         state; every read is a pass-through to the IdP.
 
-        When `user_id` is supplied the server pins `top=1` and ignores any
-        client-provided `limit` / `cursor` — the filtered shape is an
-        existence check, not a paginated query.
+        With `id eq` the caller MUST supply `limit=1` and MUST NOT supply a
+        `cursor`; either violation is rejected with 400 rather than silently
+        corrected. `limit` is the page-size parameter — `$top` is not honoured
+        as a substitute. Filterable / sortable columns: `id`, `username`,
+        `email`, `display_name`, `first_name`, `last_name`.
       parameters:
-        - $ref: '#/components/parameters/UserIdFilter'
+        - $ref: '#/components/parameters/ODataFilter'
+        - $ref: '#/components/parameters/ODataOrderBy'
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
       responses:
@@ -348,6 +352,19 @@ paths:
         (`code=already_exists`). Unsupported by a legacy provider surfaces as
         `code=idp_unsupported_operation` (501); IdP transport failure as
         `code=idp_unavailable` (503).
+
+        An attribute the IdP manages and does not allow AM to override — e.g.
+        federated from a read-only LDAP mapper, or marked non-writable in the
+        provider's user-profile configuration — is refused with
+        `code=validation` (400) whose `context.field_violations[0]` carries
+        `field` = the refused request property (`username`, `email`,
+        `display_name`, `first_name`, or `last_name`) and
+        `reason=IDP_MANAGED_FIELD`. Clients key form-field attribution off
+        `field` and disable exactly that input. Deliberately NOT a 403:
+        writability is a property of the provider's schema, identical for
+        every caller, so no additional grant would let the write succeed. The
+        refusal is scoped to attributes the patch actually touches — a patch
+        that omits a locked attribute still applies.
       requestBody:
         required: true
         content:
@@ -742,14 +759,6 @@ components:
       schema:
         type: string
         description: Full chained GTS schema identifier.
-    UserIdFilter:
-      name: user_id
-      in: query
-      required: false
-      schema:
-        type: string
-        format: uuid
-        description: Optional UUID user identifier filter for point lookup behavior.
     Limit:
       name: limit
       in: query

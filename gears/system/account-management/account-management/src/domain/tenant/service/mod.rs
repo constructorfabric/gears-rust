@@ -67,6 +67,11 @@ pub(crate) mod pep {
         pub const UPDATE: &str = "update";
         pub const DELETE: &str = "delete";
         pub const LIST_CHILDREN: &str = "list_children";
+
+        /// Every action in this vocabulary — see the note on the user
+        /// service's `actions::ALL`. Add new actions here as well as above.
+        #[cfg(test)]
+        pub const ALL: &[&str] = &[CREATE, READ, UPDATE, DELETE, LIST_CHILDREN];
     }
 }
 

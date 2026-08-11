@@ -27,11 +27,11 @@ fn normalize_path(path: &Path) -> String {
 pub enum VendorConfigError {
     #[error("vendor '{vendor}' not found in configuration")]
     NotFound { vendor: String },
-    #[error("invalid config for vendor '{vendor}': {source}")]
+    // Intentionally not named `source`; doing so would duplicate chained error output.
+    #[error("invalid config for vendor '{vendor}': {cause}")]
     InvalidConfig {
         vendor: String,
-        #[source]
-        source: serde_json::Error,
+        cause: serde_json::Error,
     },
 }
 
@@ -472,7 +472,7 @@ impl AppConfig {
             })?;
         T::deserialize(raw).map_err(|e| VendorConfigError::InvalidConfig {
             vendor: vendor_name.to_owned(),
-            source: e,
+            cause: e,
         })
     }
 
@@ -490,7 +490,7 @@ impl AppConfig {
         };
         T::deserialize(raw).map_err(|e| VendorConfigError::InvalidConfig {
             vendor: vendor_name.to_owned(),
-            source: e,
+            cause: e,
         })
     }
 
@@ -2113,6 +2113,7 @@ logging:
                 pool: None,
                 file: None,
                 path: None,
+                lock_keepalive: None,
                 server: None,
             },
         );
@@ -3271,10 +3272,11 @@ vendor:
 
         let invalid = VendorConfigError::InvalidConfig {
             vendor: "bad".to_owned(),
-            source: serde_json::from_str::<TestVendorConfig>("invalid").unwrap_err(),
+            cause: serde_json::from_str::<TestVendorConfig>("invalid").unwrap_err(),
         };
         let msg = invalid.to_string();
         assert!(msg.starts_with("invalid config for vendor 'bad':"));
+        assert!(std::error::Error::source(&invalid).is_none());
     }
 
     #[test]

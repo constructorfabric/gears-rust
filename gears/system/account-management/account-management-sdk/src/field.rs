@@ -51,6 +51,19 @@ pub const IDP_INVALID_INPUT: &str = "IDP_INVALID_INPUT";
 /// password input; the raw policy text stays provider-side.
 pub const PASSWORD_POLICY: &str = "PASSWORD_POLICY";
 
+/// The patched attribute is managed by the `IdP` and not overridable
+/// through AM (federated from a read-only mapper, or marked
+/// non-writable in the provider's user-profile configuration). The
+/// accompanying `field` is the exact `UserUpdateRequest` property the
+/// caller tried to write, sourced from
+/// [`crate::IdpUserAttribute::as_field_token`], so a client can
+/// attribute the refusal to one input and disable it.
+///
+/// A capability fact about the field, not an authorization decision
+/// about the caller — hence `InvalidArgument` (400) rather than
+/// `PermissionDenied` (403): no grant would make the write succeed.
+pub const IDP_MANAGED_FIELD: &str = "IDP_MANAGED_FIELD";
+
 // ---------------------------------------------------------------------------
 // `field_violations[].field` attribution keys.
 //
@@ -96,7 +109,14 @@ pub const PROVISIONING_METADATA_FIELD: &str = "provisioning_metadata";
 /// catch-all because every `reason` AM emits under `InvalidArgument` is
 /// one of the modeled codes — the catch-all only fires for a future code
 /// added after this SDK version, keeping the projection forward-compatible.
+///
+/// `#[non_exhaustive]`: AM grows its `InvalidArgument` reason vocabulary
+/// over time, so a downstream `match` MUST keep a wildcard arm and a new
+/// reason code is not a breaking SDK release. [`Self::Unknown`] covers the
+/// same growth on the *value* side (an older SDK reading a newer wire
+/// string); this attribute covers it on the *type* side.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ValidationReason {
     /// See [`INVALID_TENANT_TYPE`].
     InvalidTenantType,
@@ -112,6 +132,8 @@ pub enum ValidationReason {
     IdpInvalidInput,
     /// See [`PASSWORD_POLICY`].
     PasswordPolicy,
+    /// See [`IDP_MANAGED_FIELD`].
+    IdpManagedField,
     /// Unmodeled / future reason — preserves the raw wire string.
     Unknown(String),
 }
@@ -130,6 +152,7 @@ impl ValidationReason {
             ROOT_TENANT_CANNOT_CHANGE_STATUS => Self::RootTenantCannotChangeStatus,
             IDP_INVALID_INPUT => Self::IdpInvalidInput,
             PASSWORD_POLICY => Self::PasswordPolicy,
+            IDP_MANAGED_FIELD => Self::IdpManagedField,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -146,6 +169,7 @@ impl ValidationReason {
             Self::RootTenantCannotChangeStatus => ROOT_TENANT_CANNOT_CHANGE_STATUS,
             Self::IdpInvalidInput => IDP_INVALID_INPUT,
             Self::PasswordPolicy => PASSWORD_POLICY,
+            Self::IdpManagedField => IDP_MANAGED_FIELD,
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -180,6 +204,7 @@ mod tests {
             ),
             (IDP_INVALID_INPUT, ValidationReason::IdpInvalidInput),
             (PASSWORD_POLICY, ValidationReason::PasswordPolicy),
+            (IDP_MANAGED_FIELD, ValidationReason::IdpManagedField),
         ] {
             assert_eq!(ValidationReason::from_wire(wire), expected);
             assert_eq!(expected.as_wire(), wire);

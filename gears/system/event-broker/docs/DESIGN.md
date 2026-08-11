@@ -78,7 +78,7 @@ The **producer client library** (`cf-gears-event-broker-sdk`) is built on top of
 
 **Architecture Decision Records**:
 
-- future ADR (service-decomposition) — Multi-service composite (ingest, delivery, dispatcher, storage backends)
+- `cpt-cf-evbk-adr-service-decomposition` — Multi-service composite (ingest, delivery, dispatcher, storage backends); single-binary/multi-mode process shape; per-mode `cluster` gear resolution. See [`ADR/0007-service-decomposition.md`](ADR/0007-service-decomposition.md).
 - future ADR (storage-backend-plugin) — Storage backends as ModKit plugins with GTS discovery and self-describing config schemas
 - `cpt-cf-evbk-design-sequence-assignment` — Three-sequence model: producer chain (`previous`, `sequence`) for ingest-side dedup (chained / monotonic / stateless modes); outbox sequence (toolkit-db) for in-pipeline order preservation; offset (backend) for consumer-visible ordering
 - future ADR (idempotent-producers) — Idempotent producers via Producer-Id + per-`(producer_id, topic, partition)` sequence tracking. No epoch fencing — sequence ordering itself acts as the fence.
@@ -603,9 +603,9 @@ modules/system/event-broker/
         │   │       └── memory.rs  # InMemoryStorageBackend
         │   ├── cluster/           # ClusterCapabilities integration
         │   │   └── notifications.rs # Event notification via cluster.publish/subscribe
-        │   ├── workers/           # Background workers
-        │   │   ├── cleaner.rs     # Fully-consumed event cleanup
-        │   │   ├── retention.rs   # Retention policy enforcement
+        │   ├── workers/           # Background workers (broker-owned only;
+        │   │   │                 # event deletion is the storage backend's
+        │   │   │                 # responsibility, see §3.7 Key Invariants)
         │   │   └── reaper.rs      # Expired subscription + idempotency cleanup
         │   ├── dispatcher/        # Optional HTTP gateway
         │   │   ├── proxy.rs       # Proxy handler (routes to ingest service)
@@ -2239,7 +2239,7 @@ In cluster mode:
   - The dispatcher resolves `subscription_id` → `consumer_group` via the subscription resolution cache (§3.2 Subscription Resolution Cache). JOIN endpoints (`POST /v1/subscriptions`) carry `consumer_group` and `topics` in the body so the first lookup is skipped.
   - Dispatchers discover ingest/delivery instances via `cluster.discover_shards()`. All dispatcher instances see the same shard membership.
 - **Event notifications** flow directly from ingest to delivery via `cluster.publish()` / `cluster.subscribe()` — they do NOT pass through the dispatcher. This means multiple dispatcher instances require no shared state for notifications.
-- **Worker leader election** uses `cluster.leader_election()` — only one node runs the cleaner for a given `(topic, partition)`, etc.
+- **Worker leader election** uses `cluster.leader_election()` — only one node runs the `reaper` cluster-wide (`evbk.worker.reaper`).
 - All instances share the same database. The ClusterCapabilities provider is the only external dependency beyond the database.
 
 #### Deployment Variants
@@ -2385,8 +2385,6 @@ modules:
       min_session_timeout: PT1S
 
     workers:
-      cleaner_interval_secs: 60
-      retention_interval_secs: 300
       reaper_interval_secs: 60
 ```
 
@@ -2577,6 +2575,7 @@ This DESIGN traces back to the [PRD.md](PRD.md) functional and non-functional re
 - [ADR/0002-partition-selection.md](ADR/0002-partition-selection.md) — `cpt-cf-evbk-adr-partition-selection`. **Revised** to drop the explicit `partition` producer override; the broker is now authoritative for partition assignment, deriving from `partition_key` (when present) or `tenant_id` (default). Realizes the Event-schema partition derivation referenced in §3.1 Event Schema and §3.6 Two Sequences. Native Kafka producer partitioner compatibility is not a supported producer contract.
 - [ADR/0003-event-schema.md](ADR/0003-event-schema.md) — `cpt-cf-evbk-adr-event-schema`. Defines the canonical event schema: single JSON Schema with field-level `readOnly` / `writeOnly` markers (no separate read-side file), optional versioned `meta` block for transport mechanics (marked `writeOnly`), `tenant_id` as producer-supplied, `subject_type` retained, `created_at` dropped, `offset`/`offset_time` renamed to `sequence`/`sequence_time` (`readOnly`), broker-native naming (no CloudEvents conformance), ASCII event-field encoding rule. Realized by `schemas/event.v1.schema.json`.
 - [ADR/0004-idempotent-producer-protocol.md](ADR/0004-idempotent-producer-protocol.md) — `cpt-cf-evbk-adr-idempotent-producer-protocol`. Mode declared at registration (`POST /v1/producers { mode }`), enforced per request. Mode-shape hard errors at the wire boundary. Producer-registration TTL + operator-driven `POST :reset`. Single-writer concurrency. Realized by §3.2 Producer Modes (shrunk) and `docs/features/0001-idempotent-producers.md`.
+- [ADR/0007-service-decomposition.md](ADR/0007-service-decomposition.md) — `cpt-cf-evbk-adr-service-decomposition`. Single binary, multi-mode (not a three-binary split); `domain/cluster.rs` resolves the platform `cluster` gear's real `cluster-sdk` facades directly rather than a bespoke `ClusterCapabilities` abstraction; no dispatcher is constructed in standalone mode. Realized by the `event-broker` crate skeleton and `DeploymentMode`'s per-mode activation predicates (`ingest_active()` etc.) - structure and mode-decision scaffolding only; real service construction and route gating land with #4345/#4346/#4347.
 
 The remaining ADR identifiers referenced in §1.2 (future ADR (cluster-capabilities), future ADR (long-polling), future ADR (topic-sharding), future ADR (dispatcher), `cpt-cf-evbk-design-sequence-assignment`, future ADR (outbox-ingest)) are documented inline in this DESIGN.md and will be extracted into standalone canonical ADR files in follow-up design iterations.
 

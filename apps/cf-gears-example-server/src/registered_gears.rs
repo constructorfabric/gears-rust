@@ -76,3 +76,9 @@ use account_management as _;
 
 #[cfg(feature = "bss-ledger")]
 use bss_ledger as _;
+
+#[cfg(feature = "usage-collector")]
+use usage_collector as _;
+
+#[cfg(feature = "timescaledb-usage-collector")]
+use timescaledb_usage_collector_plugin as _;

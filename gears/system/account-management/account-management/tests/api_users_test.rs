@@ -671,6 +671,185 @@ async fn update_user_rename_collision_returns_409() {
 }
 
 #[tokio::test]
+async fn update_user_idp_managed_field_returns_400_naming_the_locked_field() {
+    // A provider that federates `email` from a read-only mapper refuses
+    // the write. AM MUST surface a 400 whose `field_violations[0]` names
+    // the exact request property (`email`) with reason
+    // `IDP_MANAGED_FIELD`, so the caller can disable that one input
+    // rather than guessing from `detail`.
+    //
+    // Explicitly NOT 403: writability is a property of the provider's
+    // schema, identical for every caller — no grant makes it succeed.
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let services = build_services_full(
+        &h,
+        fake_idp_with_locked_attribute(account_management_sdk::IdpUserAttribute::Email),
+        empty_metadata_registry(),
+        types_registry_for_users(),
+    );
+    let router = build_test_router(&services);
+
+    let id = provision_and_id(&router, root, serde_json::json!({ "username": "alice" })).await;
+
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{root}/users/{id}"),
+        Some(serde_json::json!({ "email": "new@example.com" })),
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    let (status, body) = response_problem(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "IdP-managed field reject MUST be 400, not 403/422: {body}"
+    );
+    assert_eq!(
+        body["context"]["field_violations"][0]["field"], "email",
+        "the violation MUST name the patched property so a client can disable that input: {body}"
+    );
+    assert_eq!(
+        body["context"]["field_violations"][0]["reason"], "IDP_MANAGED_FIELD",
+        "reason MUST be the stable IDP_MANAGED_FIELD token: {body}"
+    );
+}
+
+#[tokio::test]
+async fn update_user_idp_managed_field_refuses_an_explicit_null_clear() {
+    // The refusal is scoped to attributes the patch *touches*, and an
+    // explicit `null` (clear) touches the attribute just as much as a
+    // value does. This is the shape where the REST-DTO lowering could
+    // silently collapse `Some(None)` to `None` and bypass the refusal
+    // entirely, so the clear path is pinned to the same 400 / `email` /
+    // `IDP_MANAGED_FIELD` triple as the set-a-value path.
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let services = build_services_full(
+        &h,
+        fake_idp_with_locked_attribute(account_management_sdk::IdpUserAttribute::Email),
+        empty_metadata_registry(),
+        types_registry_for_users(),
+    );
+    let router = build_test_router(&services);
+
+    let id = provision_and_id(&router, root, serde_json::json!({ "username": "alice" })).await;
+
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{root}/users/{id}"),
+        Some(serde_json::json!({ "email": null })),
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    let (status, body) = response_problem(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "clearing a locked attribute MUST be refused exactly like setting it: {body}"
+    );
+    assert_eq!(
+        body["context"]["field_violations"][0]["field"], "email",
+        "the explicit-null clear MUST survive DTO lowering and name `email`: {body}"
+    );
+    assert_eq!(
+        body["context"]["field_violations"][0]["reason"], "IDP_MANAGED_FIELD",
+        "reason MUST be the stable IDP_MANAGED_FIELD token: {body}"
+    );
+}
+
+#[tokio::test]
+async fn update_user_idp_managed_fields_are_all_reported_in_one_response() {
+    // A realm that federates a block of profile attributes locks several
+    // at once. A patch touching more than one MUST come back naming every
+    // offender, so the caller disables them in one pass instead of
+    // rediscovering the next one on each retry.
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let services = build_services_full(
+        &h,
+        fake_idp_with_locked_attributes([
+            account_management_sdk::IdpUserAttribute::Email,
+            account_management_sdk::IdpUserAttribute::FirstName,
+            account_management_sdk::IdpUserAttribute::LastName,
+        ]),
+        empty_metadata_registry(),
+        types_registry_for_users(),
+    );
+    let router = build_test_router(&services);
+
+    let id = provision_and_id(&router, root, serde_json::json!({ "username": "alice" })).await;
+
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{root}/users/{id}"),
+        Some(serde_json::json!({
+            "email": "new@example.com",
+            "first_name": "Alice",
+            "display_name": "Alice A."
+        })),
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    let (status, body) = response_problem(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let violations = body["context"]["field_violations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("field_violations MUST be an array: {body}"));
+    let refused: Vec<&str> = violations
+        .iter()
+        .map(|v| v["field"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        refused,
+        ["email", "first_name"],
+        "every touched locked attribute MUST be named -- and only those: \
+         `last_name` is locked but untouched, `display_name` is touched but writable: {body}"
+    );
+    assert!(
+        violations
+            .iter()
+            .all(|v| v["reason"] == "IDP_MANAGED_FIELD"),
+        "every violation MUST carry the stable IDP_MANAGED_FIELD token: {body}"
+    );
+}
+
+#[tokio::test]
+async fn update_user_untouched_locked_field_still_succeeds() {
+    // The refusal is scoped to *touched* attributes: with `email`
+    // locked, a patch that only sets `first_name` MUST still apply.
+    // Guards against a guard that rejects on provider policy alone
+    // rather than on the intersection with the patch.
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let services = build_services_full(
+        &h,
+        fake_idp_with_locked_attribute(account_management_sdk::IdpUserAttribute::Email),
+        empty_metadata_registry(),
+        types_registry_for_users(),
+    );
+    let router = build_test_router(&services);
+
+    let id = provision_and_id(&router, root, serde_json::json!({ "username": "alice" })).await;
+
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{root}/users/{id}"),
+        Some(serde_json::json!({ "first_name": "Alice" })),
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    let (status, body) = response_problem(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["first_name"], "Alice");
+}
+
+#[tokio::test]
 async fn update_user_unknown_user_returns_404() {
     // Unlike DELETE, a PATCH against an absent user is a 404 — the
     // provider's NotFound is NOT folded into success.

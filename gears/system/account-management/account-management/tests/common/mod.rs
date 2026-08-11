@@ -726,7 +726,7 @@ use account_management::infra::storage::repo_impl::{ConversionRepoImpl, Metadata
 use account_management_sdk::{
     IdpDeprovisionTenantRequest, IdpDeprovisionUserRequest, IdpListUsersRequest, IdpPluginClient,
     IdpProvisionFailure, IdpProvisionResult, IdpProvisionTenantRequest, IdpProvisionUserRequest,
-    IdpUpdateUserRequest, IdpUser, IdpUserDuplicateField, IdpUserFilterField,
+    IdpUpdateUserRequest, IdpUser, IdpUserAttribute, IdpUserDuplicateField, IdpUserFilterField,
     IdpUserOperationFailure,
 };
 use axum::Router;
@@ -795,6 +795,14 @@ pub struct FakeIdpPlugin {
     users: parking_lot::Mutex<
         std::collections::HashMap<Uuid, std::collections::HashMap<Uuid, IdpUser>>,
     >,
+    /// Attributes this provider refuses to write, standing in for a
+    /// realm that federates them from a read-only LDAP mapper (or marks
+    /// them non-writable in its user-profile config). Empty by default
+    /// so every existing test sees a fully-writable provider; opt in via
+    /// [`Self::with_locked_attribute`]. A `HashSet` — the natural shape
+    /// for a provider's non-writable set, and what the `Hash` bound on
+    /// the public SDK enum exists for.
+    locked_attributes: std::collections::HashSet<IdpUserAttribute>,
 }
 
 impl FakeIdpPlugin {
@@ -802,7 +810,40 @@ impl FakeIdpPlugin {
     pub fn new() -> Self {
         Self {
             users: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            locked_attributes: std::collections::HashSet::new(),
         }
+    }
+
+    /// Mark `attribute` as IdP-managed: `update_user` then refuses any
+    /// patch touching it with
+    /// [`IdpUserOperationFailure::FieldNotWritable`].
+    #[must_use]
+    pub fn with_locked_attribute(mut self, attribute: IdpUserAttribute) -> Self {
+        self.locked_attributes.insert(attribute);
+        self
+    }
+
+    /// Every locked attribute the patch tries to write. Checked against
+    /// the *touched* fields (`Some(_)`, including an explicit clear) —
+    /// refusing a locked attribute does not depend on whether the caller
+    /// set or cleared it. Returns the full set (not the first hit) so a
+    /// patch touching several locked attributes is refused in one
+    /// round-trip, matching the `FieldNotWritable` contract.
+    fn locked_attributes_in(
+        &self,
+        patch: &account_management_sdk::IdpUserPatch,
+    ) -> Vec<IdpUserAttribute> {
+        [
+            (IdpUserAttribute::Username, patch.username.is_some()),
+            (IdpUserAttribute::Email, patch.email.is_some()),
+            (IdpUserAttribute::DisplayName, patch.display_name.is_some()),
+            (IdpUserAttribute::FirstName, patch.first_name.is_some()),
+            (IdpUserAttribute::LastName, patch.last_name.is_some()),
+        ]
+        .into_iter()
+        .filter(|(attribute, touched)| *touched && self.locked_attributes.contains(attribute))
+        .map(|(attribute, _)| attribute)
+        .collect()
     }
 
     fn build_user(tenant_id: Uuid, req: &IdpProvisionUserRequest) -> IdpUser {
@@ -897,6 +938,24 @@ impl IdpPluginClient for FakeIdpPlugin {
                 detail: format!("user {} not found in tenant {tenant_id}", req.user_id),
             });
         }
+        // Refuse IdP-managed attributes before the uniqueness check: a
+        // locked field cannot be written whatever the new value is, so
+        // whether it would also collide is moot.
+        let locked = self.locked_attributes_in(&req.patch);
+        if !locked.is_empty() {
+            let detail = format!(
+                "attributes {} are read-only (federated from a read-only mapper)",
+                locked
+                    .iter()
+                    .map(|a| a.as_field_token())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return Err(IdpUserOperationFailure::FieldNotWritable {
+                fields: locked,
+                detail,
+            });
+        }
         // Username uniqueness on rename, checked against OTHER users.
         if let Some(new_username) = &req.patch.username
             && scope
@@ -988,6 +1047,28 @@ impl IdpPluginClient for FakeIdpPlugin {
 #[must_use]
 pub fn fake_idp() -> Arc<dyn IdpPluginClient> {
     Arc::new(FakeIdpPlugin::new())
+}
+
+/// [`fake_idp`] with `attribute` marked IdP-managed, so any patch
+/// touching it is refused with
+/// [`IdpUserOperationFailure::FieldNotWritable`].
+#[must_use]
+pub fn fake_idp_with_locked_attribute(attribute: IdpUserAttribute) -> Arc<dyn IdpPluginClient> {
+    Arc::new(FakeIdpPlugin::new().with_locked_attribute(attribute))
+}
+
+/// [`fake_idp`] with several attributes marked IdP-managed, standing in
+/// for a realm that federates a whole block of profile attributes from a
+/// read-only mapper. A patch touching more than one of them is refused
+/// once, naming every offender.
+#[must_use]
+pub fn fake_idp_with_locked_attributes(
+    attributes: impl IntoIterator<Item = IdpUserAttribute>,
+) -> Arc<dyn IdpPluginClient> {
+    let plugin = attributes
+        .into_iter()
+        .fold(FakeIdpPlugin::new(), FakeIdpPlugin::with_locked_attribute);
+    Arc::new(plugin)
 }
 
 // ── Inert collaborators (resource checker, types registry) ───────────

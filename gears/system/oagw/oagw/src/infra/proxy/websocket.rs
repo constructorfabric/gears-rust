@@ -308,6 +308,11 @@ async fn frame_relay(
     let deadline = tokio::time::sleep(idle_timeout);
     tokio::pin!(deadline);
 
+    // Once the shutdown sender is gone no signal can ever arrive, and
+    // `changed()` would resolve `Err` on every poll — spinning the loop at
+    // full CPU. Disable the branch instead.
+    let mut shutdown_closed = false;
+
     // Main relay loop (Open state).
     loop {
         tokio::select! {
@@ -410,13 +415,19 @@ async fn frame_relay(
                 let _ = write_frame(upstream_write, WsOpcode::Close, &close, true, true).await;
                 return RelayOutcome::IdleTimeout;
             }
-            result = shutdown_rx.changed() => {
-                // Graceful server shutdown — close both sides cleanly.
-                if result.is_ok() && *shutdown_rx.borrow() {
-                    let close = make_close_payload(1001, "Going Away");
-                    let _ = write_frame(client_write, WsOpcode::Close, &close, false, true).await;
-                    let _ = write_frame(upstream_write, WsOpcode::Close, &close, true, true).await;
-                    return RelayOutcome::Shutdown;
+            result = shutdown_rx.changed(), if !shutdown_closed => {
+                match result {
+                    // Graceful server shutdown — close both sides cleanly.
+                    Ok(()) if *shutdown_rx.borrow() => {
+                        let close = make_close_payload(1001, "Going Away");
+                        let _ = write_frame(client_write, WsOpcode::Close, &close, false, true).await;
+                        let _ = write_frame(upstream_write, WsOpcode::Close, &close, true, true).await;
+                        return RelayOutcome::Shutdown;
+                    }
+                    // Changed back to `false` — keep relaying.
+                    Ok(()) => {}
+                    // Sender dropped; no shutdown signal can arrive from here on.
+                    Err(_) => shutdown_closed = true,
                 }
             }
         }
@@ -1555,7 +1566,10 @@ mod tests {
 
     // -- Idle timer reset on activity --
 
-    #[tokio::test]
+    // Virtual clock: the 60ms/100ms margin is far too tight for wall-clock
+    // time under a loaded test runner — a single late wakeup lets the idle
+    // timeout fire and the relay answers with Close instead of the frame.
+    #[tokio::test(start_paused = true)]
     async fn relay_idle_timer_resets_on_data() {
         // With a 100ms idle timeout, send a frame every 60ms to keep the
         // connection alive — verify it survives past the original deadline.

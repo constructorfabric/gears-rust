@@ -2,17 +2,17 @@
 //!
 //! `postgres_cluster_plugin` is the Postgres backend plugin for the cluster
 //! gear (DESIGN.md §1). It provides a native `ClusterCacheBackend` over a
-//! `sqlx::PgPool` and a native `DistributedLockBackend` over `PostgreSQL`
-//! session-level advisory locks. Leader election and service discovery are
-//! derived from the SDK default backends over the Postgres cache — no
-//! additional tables or connections are required for those two primitives
-//! (DESIGN.md §6).
+//! `sqlx::PgPool` and a native `DistributedLockBackend` over a `cluster_lock`
+//! lease row, with one per-instance advisory lock kept purely as a liveness
+//! beacon (DESIGN.md §5). Leader election and service discovery are derived
+//! from the SDK default backends over the Postgres cache — no additional
+//! tables or connections are required for those two primitives (DESIGN.md §6).
 //!
 //! This is the recommended deployment for **multi-instance, no-K8s**
 //! environments (DESIGN.md §1): Postgres is already deployed in every Gears
-//! environment, zero new infrastructure is required, and the native
-//! `pg_advisory_lock` gives ACID-correct mutual exclusion without a
-//! distributed lock service.
+//! environment, zero new infrastructure is required, and a conditional upsert
+//! under `synchronous_commit = on` gives ACID-correct mutual exclusion without
+//! a distributed lock service.
 //!
 //! ## Lifecycle (outbox-style builder/handle, ADR-006)
 //!
@@ -39,9 +39,10 @@
 //!
 //! ## Why `sqlx` directly, not `libs/toolkit-db`
 //!
-//! See DESIGN.md §3.1 — this plugin needs session-pinned advisory locks,
-//! `LISTEN`/`NOTIFY` streaming, and `PgPoolOptions` connect/acquire hooks that
-//! have no Sea-ORM equivalent. This is a documented, deliberate architectural
+//! See DESIGN.md §3.1 — this plugin needs an owned, long-lived connection for
+//! the liveness beacon (and a `pg_locks` join inside the acquire predicate that
+//! reads it), `LISTEN`/`NOTIFY` streaming, and `PgPoolOptions` connect/acquire
+//! hooks that have no Sea-ORM equivalent. This is a documented, deliberate architectural
 //! exception, not a convenience shortcut — hence the crate-level
 //! `#![allow(de0706_no_direct_sqlx)]` below. It used to be a lint-sanctioned
 //! exclusion baked into this repo's own `tools/dylint_lints` (via
@@ -54,9 +55,7 @@
 //!
 //! `PostgresCache`, `PostgresLock`, and both builders' `build_and_start` are
 //! implemented per DESIGN.md §3.1's crate structure — this is not scaffolding.
-//! The `synchronous_commit = on` re-assertion on pinned lock connections (on
-//! each guard task's own interval, §3.4) and the plugin-local
-//! `cluster_postgres_lock_active_names` gauge /
+//! The plugin-local `cluster_postgres_lock_active_names` gauge /
 //! `cluster_postgres_reaper_sweep_duration_seconds` histogram (DESIGN.md §8) are
 //! now implemented (see `docs/GAP-SOLUTIONS.md` §5/§6). Layer 4 fault-injection
 //! tests (`docs/TESTING.md` §5) against a real Postgres container are not yet
@@ -79,6 +78,7 @@ mod pg_error;
 mod pg_setup;
 mod plugin;
 mod provider;
+mod shutdown;
 
 pub use cache::PostgresCache;
 pub use config::{PostgresClusterConfig, PostgresLockConfig, ReplicationMode};

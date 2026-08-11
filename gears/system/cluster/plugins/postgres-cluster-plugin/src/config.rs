@@ -88,6 +88,14 @@ pub struct PostgresClusterConfig {
     pub connection_string: String,
 
     /// Maximum pool size (write pool). Default: 5.
+    ///
+    /// Sizes the *write pool* only — cache operations, `cluster_lock` row
+    /// writes, `pg_notify`, migrations, and the reapers' queries. It does not
+    /// bound how many locks this instance can hold: a held lock occupies no
+    /// connection between operations, and its acquire/renew/release statements
+    /// ride this pool like any other write, briefly (DESIGN.md §3.3). The
+    /// liveness beacon and the LISTEN connections are each additional to this
+    /// number.
     #[serde(default = "default_pool_size")]
     pub pool_max_size: u32,
 
@@ -109,8 +117,7 @@ pub struct PostgresClusterConfig {
     /// its `cluster_postgres_lock_active_names` gauge — an imminent `expires_at`
     /// shortens an individual sleep so an expired lock is reclaimed near its
     /// actual deadline (`lock::reaper`'s "Wake schedule", DESIGN.md §5.2). Also
-    /// the cadence at which each lock's guard task re-asserts
-    /// `synchronous_commit = on` on its pinned connection (DESIGN.md §3.4).
+    /// the cadence at which the reaper's orphan audit runs (§5.2).
     #[serde(default = "default_lock_reaper_interval")]
     pub lock_reaper_interval_ms: u64,
 

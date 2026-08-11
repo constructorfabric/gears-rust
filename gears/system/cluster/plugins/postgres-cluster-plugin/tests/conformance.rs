@@ -12,16 +12,15 @@
 //! the handle before the next scenario is built.
 //!
 //! A genuinely fresh backend per scenario is required, not cosmetic — confirmed
-//! empirically: a single shared backend failed `SC-CACHE-004`, exhausted the
-//! lock pool via intentionally-leaked advisory locks, and left stale leader
-//! candidate tasks running across scenarios. All three suites isolate each
-//! scenario into its **own Postgres schema** on **one shared container**
+//! empirically: a single shared backend failed `SC-CACHE-004`, accumulated
+//! intentionally-leaked locks across scenarios, and left stale leader candidate
+//! tasks running across scenarios. All three suites isolate each scenario into
+//! its **own Postgres schema** on **one shared container**
 //! (`PostgresClusterConfig::schema`, DESIGN.md §7 — routed to an isolated
-//! `search_path` via `common::isolated_schema_connection_string`). The lock
-//! suite additionally relies on per-scenario teardown draining held advisory
-//! locks (`PostgresLock::drain_held`) before the next scenario's handle is
-//! built, since `pg_advisory_lock`'s key space is server-wide, not schema-scoped
-//! (see `lock_conformance`).
+//! `search_path` via `common::isolated_schema_connection_string`), which now
+//! isolates the locks themselves: a lock is a row in that schema's
+//! `cluster_lock` table (DESIGN.md §5.1), not an entry in a server-wide advisory
+//! key space (see `lock_conformance`).
 //!
 //! # Time-sensitive scenarios run under `TimeControl::Real`, not virtual time
 //!
@@ -132,16 +131,15 @@ async fn cache_conformance() {
 ///
 /// The async factory shares **one** container across scenarios (like cache /
 /// leader), each scenario in its own schema (`isolated_schema_connection_string`).
-/// This previously used a fresh container **per scenario**: `pg_advisory_lock`'s
-/// key space is server-wide (`SET search_path` has no effect on it), and the
-/// scenarios reuse the same lock names (`"res"`, `"m"`), so a lock still held
-/// past a scenario's teardown would collide with the next. That no longer
-/// happens: `PostgresLockHandle::stop` now drains every held lock
-/// (`PostgresLock::drain_held`, the `PG-LIFE-003`/§1 fix) — `pg_advisory_unlock`
-/// on each pinned connection, synchronously, before `pool.close()` — so the
-/// server's advisory locks are clear before the next scenario's fresh handle
-/// acquires them. Per-scenario schemas isolate the `cluster_lock` **table**;
-/// the drain isolates the server-wide advisory **locks**. Confirmed clean and
+/// This previously used a fresh container **per scenario**, back when locks were
+/// `pg_advisory_lock`s: that key space is server-wide (`SET search_path` has no
+/// effect on it), and the scenarios reuse the same lock names (`"res"`, `"m"`),
+/// so a lock still held past a scenario's teardown collided with the next. Two
+/// things have since removed the hazard, in order: `PostgresLockHandle::stop`
+/// hands back every held lock before returning (the `PG-LIFE-003`/§1 fix), and
+/// locks are no longer keyed in a server-wide namespace at all — a lock is a row
+/// in *this schema's* `cluster_lock` table (DESIGN.md §5.1), so per-scenario
+/// schemas now isolate the locks themselves rather than only their metadata. Confirmed clean and
 /// ~3× faster (1 container, not 6). A short `lock_reaper_interval_ms` (25ms)
 /// lets the TTL-reclaim scenarios reclaim within their real waits (harmless for
 /// the non-reclaim ones).

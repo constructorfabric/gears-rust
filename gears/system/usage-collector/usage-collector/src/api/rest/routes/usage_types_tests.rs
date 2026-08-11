@@ -58,7 +58,7 @@ fn assert_standard_errors_registered(spec: &OperationSpec) {
         let found = spec.responses.iter().any(|r| {
             r.status == *status
                 && r.content_type == "application/problem+json"
-                && r.schema_name.is_some()
+                && r.schema_name().is_some()
         });
         assert!(
             found,
@@ -122,7 +122,7 @@ async fn create_usage_type_route_is_registered_with_documented_contract() {
         .expect("create-usage-type route MUST declare a 201 Created response");
     assert_eq!(created.content_type, "application/json");
     assert_eq!(
-        created.schema_name.as_deref(),
+        created.schema_name(),
         Some(expected_response.as_str()),
         "create-usage-type 201 MUST point at `UsageTypeDto`",
     );
@@ -188,7 +188,7 @@ async fn list_usage_types_route_is_registered_with_documented_contract() {
         .expect("list route MUST declare a 200 OK response");
     assert_eq!(ok.content_type, "application/json");
     assert!(
-        ok.schema_name.is_some(),
+        ok.schema_name().is_some(),
         "list 200 MUST be bound to a registered schema",
     );
 
@@ -233,7 +233,7 @@ async fn get_usage_type_route_is_registered_with_documented_contract() {
         .expect("get route MUST declare a 200 OK response");
     assert_eq!(ok.content_type, "application/json");
     assert_eq!(
-        ok.schema_name.as_deref(),
+        ok.schema_name(),
         Some(expected_response.as_str()),
         "get 200 MUST point at `UsageTypeDto`",
     );
@@ -277,7 +277,7 @@ async fn delete_usage_type_route_is_registered_with_documented_contract() {
         .find(|r| r.status == StatusCode::NO_CONTENT.as_u16())
         .expect("delete route MUST declare a 204 No Content response");
     assert!(
-        no_content.schema_name.is_none(),
+        no_content.schema_name().is_none(),
         "delete 204 MUST NOT carry a body schema",
     );
 

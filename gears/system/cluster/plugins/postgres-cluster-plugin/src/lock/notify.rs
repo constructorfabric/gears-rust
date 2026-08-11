@@ -26,15 +26,24 @@ use crate::pg_error::map_sqlx_error;
 
 pub const RELEASE_CHANNEL: &str = "cluster_lock_released";
 
-/// Issues `NOTIFY cluster_lock_released, '<name>'` via `pg_notify` (avoids any
-/// literal-quoting concern for names containing `'`).
-pub async fn notify_released<'e, E>(executor: E, name: &str) -> Result<(), ClusterError>
+/// `NOTIFY cluster_lock_released, '<name>'` for a batch of names in **one**
+/// round-trip — the TTL sweep's form, and the orphan sweep's and the shutdown
+/// drain's.
+///
+/// `pg_notify` rather than a literal `NOTIFY`, which avoids any quoting concern
+/// for names containing `'`. `unnest` rather than a loop of single calls: a sweep
+/// batch is up to `reaper::SWEEP_BATCH` names, and the whole point of chunking
+/// the sweep was to stop per-row work from stretching how long one statement's
+/// worth of table locks is held. Postgres de-duplicates identical `(channel, payload)` pairs
+/// within a transaction, so a batch containing the same name twice — impossible
+/// today, since `name` is the table's primary key — would still notify once.
+pub async fn notify_released_many<'e, E>(executor: E, names: &[String]) -> Result<(), ClusterError>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    sqlx::query("SELECT pg_notify($1, $2)")
+    sqlx::query("SELECT pg_notify($1, name) FROM unnest($2::text[]) AS t(name)")
         .bind(RELEASE_CHANNEL)
-        .bind(name)
+        .bind(names)
         .execute(executor)
         .await
         .map_err(map_sqlx_error)?;
@@ -272,31 +281,63 @@ async fn reconnect_with_backoff(
     None
 }
 
-/// Spawns the dedicated LISTEN connection for `cluster_lock_released`
-/// (DESIGN.md §5.3). Mirrors `cache/watch.rs::spawn_listen_task`'s
-/// reconnect/backoff shape; unlike the cache channel there is no `Reset`
-/// concept here to broadcast on reconnect — a lost wake-up during a gap only
-/// costs a waiter its heartbeat-interval latency (`lock/mod.rs`), never
-/// correctness, so silently resuming is sufficient.
-pub fn spawn_release_listen_task(
+/// Opens the dedicated LISTEN connection for `cluster_lock_released` and spawns
+/// its fan-out task (DESIGN.md §5.3). Mirrors `cache/watch.rs::spawn_listen_task`'s
+/// reconnect/backoff shape; unlike the cache channel there is no `Reset` concept
+/// here to broadcast on reconnect — a lost wake-up during a gap only costs a
+/// waiter its heartbeat-interval latency (`lock/mod.rs`), never correctness, so
+/// silently resuming is sufficient.
+///
+/// **The initial `LISTEN` is awaited before returning**, so by the time
+/// `build_and_start` resolves this channel is subscribed. Spawning it
+/// fire-and-forget instead left a startup window in which a `release()` — and the
+/// reaper sweep's cross-instance notifications — produced a `NOTIFY` with nobody
+/// yet listening: every blocked `lock()` caller in that window silently fell back
+/// to the 250 ms heartbeat poll, which is exactly the degradation the channel
+/// exists to avoid (and `PG-LOCK-003` measures). The cache watch listener already
+/// had this guarantee (DESIGN.md §3.2 step 5); this one now matches it.
+///
+/// Unlike the cache listener, a failed initial connect is **not** a startup
+/// error: the task falls into the same cancellation-aware backoff retry the
+/// mid-stream path uses, since the heartbeat fallback keeps `lock()` correct in
+/// the meantime. So this is a readiness guarantee on the happy path, not a new
+/// way for `build_and_start` to fail.
+///
+/// Each notification does exactly one thing: wake local `lock()` waiters for that
+/// name, which is a synchronous, allocation-free registry hit. The reader loop
+/// therefore never awaits I/O — a hard requirement rather than a nicety, since a
+/// `LISTEN` session that stops draining pins the tail of Postgres's
+/// **cluster-wide** notify queue, shared by every database on the server
+/// (DESIGN.md §11).
+///
+/// It used to do a second thing: nudge the reaper to reconcile locks whose rows
+/// another instance's sweep had deleted. That existed because only the owning
+/// instance could release its own advisory locks, so a sweep it did not run left
+/// a name wedged fleet-wide. With the lease row as the arbiter there is nothing
+/// to reconcile — whoever deletes the row frees the name for everyone.
+pub(super) async fn spawn_release_listen_task(
     connection_string: String,
     waiters: Arc<ReleaseWaiters>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
+    // Awaited here, outside the spawned task, so the caller cannot resolve before
+    // the channel is subscribed. `None` (cancelled mid-connect) and `Err` are both
+    // handled inside the task, which keeps this function infallible.
+    let connected = connect_and_listen_cancellable(&connection_string, &cancel).await;
+
     tokio::spawn(async move {
         let policy = RetryPolicy::DEFAULT;
         let mut attempt: u32 = 0;
 
-        // Initial connect: try once immediately (no backoff), interruptible by
-        // `cancel`. On failure, fall into the *same* cancellation-aware backoff
-        // retry the mid-stream reconnect path uses — a Postgres blip at startup
-        // no longer permanently disables NOTIFY wakeups (they'd otherwise
-        // silently degrade to `lock/mod.rs`'s heartbeat-only fallback forever).
-        let mut listener = match connect_and_listen_cancellable(&connection_string, &cancel).await {
+        let mut listener = match connected {
             // Cancelled before we ever connected: shutdown, stop here.
             None => return,
             Some(Ok(listener)) => listener,
             Some(Err(_lost)) => {
+                // A Postgres blip at startup must not permanently disable NOTIFY
+                // wakeups (they would otherwise silently degrade to
+                // `lock/mod.rs`'s heartbeat-only fallback forever), so fall into
+                // the same backoff retry the mid-stream reconnect path uses.
                 if let Some(reconnected) =
                     reconnect_with_backoff(&connection_string, &policy, &mut attempt, &cancel).await
                 {
@@ -315,6 +356,8 @@ pub fn spawn_release_listen_task(
                 received = listener.try_recv() => match received {
                     Ok(Some(notification)) => {
                         attempt = 0;
+                        // A registry hit and nothing else — no I/O, no spawn.
+                        // This loop must never stop draining (§11).
                         waiters.notify(notification.payload());
                     }
                     Ok(None) => {

@@ -15,10 +15,11 @@ use crate::config::PostgresClusterConfig;
 use crate::lock::PostgresLock;
 use crate::pg_error::map_sqlx_error;
 use crate::pg_setup::{
-    base_pool_options, cache_migrator, ensure_schema, lock_migrator,
+    assert_read_committed, base_pool_options, cache_migrator, ensure_schema, lock_migrator,
     reject_pgbouncer_transaction_mode, run_migrator, warn_if_async_replication,
 };
 use crate::provider::PROVIDER_NAME;
+use crate::shutdown::{DropDiagnosis, cancel_and_diagnose_drop, close_pool};
 
 /// Entry point for constructing the combined Postgres cluster plugin.
 ///
@@ -104,6 +105,11 @@ impl PostgresClusterBuilder {
             .await
             .map_err(map_sqlx_error)?;
 
+        // Before any DDL: both primitives' guarded upserts are `READ COMMITTED`
+        // idioms, so a stricter server default is a startup error rather than a
+        // per-operation serialization failure later (§3.2).
+        assert_read_committed(&pool).await?;
+
         // Create the configured schema (if non-`public`) before the migrators'
         // unqualified `CREATE TABLE`s run — the pool's `search_path` already
         // points every connection at it (PGR-L4).
@@ -124,14 +130,22 @@ impl PostgresClusterBuilder {
         let shutdown = CancellationToken::new();
 
         let cache = PostgresCache::new(pool.clone(), &config.schema);
-        let lock = PostgresLock::new(
-            pool.clone(),
-            &config.schema,
-            config.lock_reaper_interval(),
-            Arc::clone(&metrics),
-            PROVIDER_NAME,
-            shutdown.clone(),
-        );
+        // Establishes this instance's liveness beacon (DESIGN.md §3.3, §5.1)
+        // eagerly, so an unreachable database fails here rather than on the first
+        // `try_lock`. Its handle is shut down in `stop`, after the drain.
+        let crate::lock::LockRuntime {
+            lock,
+            beacon: lock_beacon,
+        } = PostgresLock::start(crate::lock::LockInit {
+            pool: pool.clone(),
+            connection_string: config.connection_string.clone(),
+            schema: config.schema.clone(),
+            reaper_interval: config.lock_reaper_interval(),
+            metrics: Arc::clone(&metrics),
+            provider: PROVIDER_NAME,
+            guard_shutdown: shutdown.clone(),
+        })
+        .await?;
         let cache_dyn = instrumented_cache(&cache, Arc::clone(&metrics));
         // Both TTL reapers emit the plugin-local, non-contract signals of
         // DESIGN.md §8 (the reaper-sweep-duration histogram, plus the lock
@@ -150,7 +164,6 @@ impl PostgresClusterBuilder {
             shutdown.clone(),
         );
         let lock_reaper = lock.spawn_reaper(
-            config.lock_reaper_interval(),
             crate::lock::reaper::LockReaperMetrics::new(
                 &reaper_meter,
                 PROVIDER_NAME,
@@ -184,20 +197,26 @@ impl PostgresClusterBuilder {
                 shutdown.cancel();
                 let _cache_reaper_exited = cache_reaper.await;
                 let _lock_reaper_exited = lock_reaper.await;
-                pool.close().await;
+                // The beacon does not observe `shutdown` (it has to outlive it,
+                // for the drain), so it is ended explicitly here too — otherwise
+                // this early return would leak its task and its connection until
+                // process exit (PGR-L5).
+                lock_beacon.shutdown().await;
+                // Bounded for the same reason as `stop()`'s close below: this
+                // path is reached because the database is already misbehaving.
+                close_pool(&pool).await;
                 return Err(err);
             }
         };
-        let release_listener = crate::lock::notify::spawn_release_listen_task(
-            config.connection_string.clone(),
-            lock.release_waiters(),
-            shutdown.clone(),
-        );
+        let release_listener = lock
+            .spawn_release_listener(config.connection_string.clone(), shutdown.clone())
+            .await;
 
         Ok(PostgresClusterHandle {
             cache,
             cache_dyn,
             lock,
+            lock_beacon: Some(lock_beacon),
             pool,
             cache_reaper: Some(cache_reaper),
             lock_reaper: Some(lock_reaper),
@@ -221,6 +240,13 @@ pub struct PostgresClusterHandle {
     /// crate (DESIGN.md §8).
     cache_dyn: Arc<dyn ClusterCacheBackend>,
     lock: Arc<PostgresLock>,
+    /// This instance's liveness beacon (`lock::beacon`, DESIGN.md §3.3), owned
+    /// here rather than by `PostgresLock` and shut down *after* the drain — the
+    /// drain deletes this instance's rows by beacon key, so the key must still be
+    /// readable when it runs, and releasing the beacon early would assert to the
+    /// fleet that this instance is dead. `Option` for the same `Drop`-impl reason
+    /// as the join handles below.
+    lock_beacon: Option<crate::lock::beacon::BeaconHandle>,
     pool: PgPool,
     // `Option`, not bare `JoinHandle`s: `PostgresClusterHandle` owns a `Drop`
     // impl below, and you cannot move a field out of a type that implements
@@ -260,13 +286,33 @@ impl PostgresClusterHandle {
         Arc::clone(&self.cache)
     }
 
+    /// Test-only access to the write pool, so `PG-CACHE-008`/`008b` can exhaust it
+    /// by checking a connection out and holding it.
+    ///
+    /// Those scenarios used to pin the pool by *holding a lock*, which worked only
+    /// because a held lock owned a pool connection. It no longer does (DESIGN.md
+    /// §3.3) — and a pool-exhaustion test that depends on the lock primitive to
+    /// create the exhaustion was conflating two unrelated things anyway.
+    ///
+    /// Gated behind `--features integration` (PGR-M8).
+    #[cfg(feature = "integration")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __test_pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+
     /// Shuts the plugin down (DESIGN.md §10):
     /// 1. Cancels the shared `CancellationToken`; awaits each background task.
     /// 2. Sends `CacheWatchEvent::Closed(ClusterError::Shutdown)` to all active
     ///    watchers.
-    /// 3. Closes the LISTEN connection (`UNLISTEN *` then close).
-    /// 4. Closes the `sqlx::PgPool` — releases all pinned connections, causing
-    ///    Postgres to auto-release any outstanding advisory locks.
+    /// 3. Closes both dedicated LISTEN connections — awaiting the cancelled tasks
+    ///    in step 1 drops each `PgListener`, which closes its socket. No explicit
+    ///    `UNLISTEN *` is issued, because ending the session is equivalent: a
+    ///    closed backend cannot deliver further notifications (§10 step 3).
+    /// 4. Hands back every still-held lock in one beacon-scoped statement, then
+    ///    closes the beacon connection — which stops this instance vouching for
+    ///    anything the drain somehow missed — and finally the `sqlx::PgPool`.
     pub async fn stop(mut self) {
         self.shutdown.cancel();
         // Close all active cache watches terminally *before* awaiting the
@@ -286,13 +332,22 @@ impl PostgresClusterHandle {
         {
             let _exited = task.await;
         }
-        // Drain any lock still held at shutdown before closing the pool: a
-        // pinned lock connection lives in `PostgresLock`'s `held` map (checked
-        // out, outside the pool's tracking), and `pool.close()` blocks until
-        // every checked-out connection is returned — so a still-held lock would
-        // otherwise hang `stop()` forever (DESIGN.md §10 step 4, `PG-LIFE-003`).
-        self.lock.drain_held().await;
-        self.pool.close().await;
+        // Hand back every still-held lock while the beacon key and the pool are
+        // both still live — the drain deletes and announces this instance's rows
+        // in one statement, so the rest of the fleet gets each name back
+        // immediately instead of waiting out its TTL (DESIGN.md §10 step 4,
+        // `PG-LIFE-003`).
+        self.lock.drain_beacon_rows().await;
+        // After the drain, never before: releasing the beacon while this process
+        // is still running asserts that the instance is dead (`lock::beacon`).
+        if let Some(beacon) = self.lock_beacon.take() {
+            beacon.shutdown().await;
+        }
+        // Bounded, not a bare `close()`: the guard tasks are detached and share
+        // this pool with every cache operation, so an unresponsive backend could
+        // otherwise hold `stop()` here indefinitely — see
+        // `shutdown::POOL_CLOSE_TIMEOUT`.
+        close_pool(&self.pool).await;
         self.stopped = true;
     }
 }
@@ -304,23 +359,29 @@ impl PostgresClusterHandle {
 /// loudly (debug-build panic / release-build warn-log) rather than silently.
 impl Drop for PostgresClusterHandle {
     fn drop(&mut self) {
-        if self.stopped {
-            return;
-        }
-        if std::thread::panicking() {
-            tracing::warn!(
+        // Cancels the shared token *before* the diagnosis below — which this
+        // handle previously did not do at all, so a `stop()` future dropped by a
+        // supervisor's `timeout(D, handle.stop())` left both reapers and both
+        // LISTEN tasks running for the life of the process, each pinning a
+        // `PgPool` clone so the pool never closed either. See
+        // `shutdown::cancel_and_diagnose_drop` for the full argument; the beacon
+        // is deliberately not on this token and is ended by `BeaconHandle::drop`.
+        match cancel_and_diagnose_drop(self.stopped, &self.shutdown) {
+            DropDiagnosis::StoppedCleanly => {}
+            DropDiagnosis::DuringPanic => tracing::warn!(
                 "PostgresClusterHandle dropped during panic unwind without stop(); \
                  skipping debug panic to avoid double-panic abort"
-            );
-            return;
+            ),
+            DropDiagnosis::Unstopped => {
+                #[cfg(debug_assertions)]
+                panic!("PostgresClusterHandle dropped without stop() - programming error");
+                #[cfg(not(debug_assertions))]
+                tracing::warn!(
+                    "PostgresClusterHandle dropped without stop() - programming error; \
+                     background tasks may leak"
+                );
+            }
         }
-        #[cfg(debug_assertions)]
-        panic!("PostgresClusterHandle dropped without stop() - programming error");
-        #[cfg(not(debug_assertions))]
-        tracing::warn!(
-            "PostgresClusterHandle dropped without stop() - programming error; \
-             background tasks may leak"
-        );
     }
 }
 
