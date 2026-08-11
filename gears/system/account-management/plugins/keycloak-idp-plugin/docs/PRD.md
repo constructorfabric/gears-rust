@@ -942,6 +942,7 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 | Tenant-group membership grows past the scan cap. | Listings truncate (loudly) and hide the tail. | Hard-cap warning as the operational signal; realm-wide attribute-query evolution before larger populations are supported. |
 | An access JWT remains valid after user or tenant hard deprovisioning. | Access can continue until token expiry. | Limit v1 access-token lifetime to 15 minutes, revoke provider sessions, block refresh, and document the bounded exposure. |
 | Metric realm-label cardinality explodes in large fleets. | Metrics backend overload. | Configurable cardinality cap with label drop and a warning naming the tripping realm on every over-cap observation. |
+| The `version_observed` metadata-decode label carries a value taken from replayed metadata, so a malformed or hostile blob can mint unbounded time series. | Metrics backend overload from a caller-influenced label. | Emitted only on decode failure, so volume is low in normal operation; the label is not capped today. Bounding it to a closed classification is tracked as a follow-up against the implementation. |
 
 ## 13. Open Questions
 
