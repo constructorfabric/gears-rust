@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use token_issuer_sdk::TokenIssuerError;
+
 use super::*;
 
 #[derive(Default)]

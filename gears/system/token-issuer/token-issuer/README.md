@@ -89,10 +89,13 @@ token-issuer:
 ```
 
 Unknown keys are rejected. Validated invariants: `issuer_base_url` must be non-blank,
-`clock_skew_secs <= cap_reuse_floor_secs < cap_ttl_secs`, and
-`clock_skew_secs < obo_ttl_secs <= 60`.
+`clock_skew_secs <= cap_reuse_floor_secs < cap_ttl_secs <= 86400`,
+`clock_skew_secs < obo_ttl_secs <= 60`, and `0 < grant_ttl_secs <= 86400`. Explicit grant TTLs
+have the same 24-hour issuer ceiling, and expiration arithmetic fails instead of saturating.
 
-Each token class gets its own Transit key — `cap`, `obo`, and `grant` keys are never shared.
+Each token class gets its own Transit key — `cap`, `obo`, and `grant` keys are never shared. The gear
+registers a composite REST healthcheck, so `/readyz` remains unhealthy until all required JWKS
+documents are warm.
 
 ## Related Crates
 

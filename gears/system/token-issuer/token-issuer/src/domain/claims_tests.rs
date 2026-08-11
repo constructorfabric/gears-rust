@@ -32,7 +32,7 @@ fn cache_key_hashes_canonical_scopes() {
         operation: None,
         resource_type: None,
     };
-    let c = build_cap_claims(&test_ctx(&["b", "a"]), &req, "iss", 300, 1000);
+    let c = build_cap_claims(&test_ctx(&["b", "a"]), &req, "iss", 300, 1000).unwrap();
     let key = cache_key_for(&c);
     assert_eq!(key.scopes_hash, scopes_hash("a b"));
     assert_eq!(key.aud, "aud");
@@ -48,7 +48,7 @@ fn cache_key_differs_on_operation_and_resource_type() {
             operation: op.map(str::to_owned),
             resource_type: rt.map(str::to_owned),
         };
-        cache_key_for(&build_cap_claims(&test_ctx(&["a"]), &req, "iss", 300, 1000))
+        cache_key_for(&build_cap_claims(&test_ctx(&["a"]), &req, "iss", 300, 1000).unwrap())
     };
     // operation/resource_type are baked into the signed claims, so requests that
     // differ in either must not collapse onto the same cached token.
@@ -76,10 +76,17 @@ fn builds_cap_claims_from_context() {
         "https://core.example.com/issuers/cap",
         300,
         1_000,
-    );
+    )
+    .unwrap();
     assert_eq!(c.aud, req.audience);
     assert_eq!(c.context_tenant, Uuid::from_u128(42));
     assert_eq!(c.scopes, "a b"); // canonicalized
     assert_eq!(c.exp - c.iat, 300);
     assert_eq!(c.iss, "https://core.example.com/issuers/cap");
+}
+
+#[test]
+fn rejects_expiration_timestamp_overflow() {
+    assert!(checked_expiration(i64::MAX, 1).is_err());
+    assert_eq!(checked_expiration(1_000, 300).unwrap(), 1_300);
 }

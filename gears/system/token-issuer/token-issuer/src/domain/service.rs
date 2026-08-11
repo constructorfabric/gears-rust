@@ -24,7 +24,7 @@ use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 use tracing::warn;
 
-use crate::config::TokenIssuerConfig;
+use crate::config::{MAX_TOKEN_TTL_SECS, TokenIssuerConfig};
 use crate::domain::cache::{CacheOutcome, CapCache};
 use crate::domain::cap_verify::verify_cap;
 use crate::domain::claims::{
@@ -208,10 +208,11 @@ impl CapIssuer {
         }
 
         validate_mint_request(&req)?;
+        validate_token_ttl(self.ttl_secs)?;
 
         let started = Instant::now();
         let now = (self.clock)();
-        let claims = build_cap_claims(ctx, &req, &self.issuer, self.ttl_secs, now);
+        let claims = build_cap_claims(ctx, &req, &self.issuer, self.ttl_secs, now)?;
         let key = cache_key_for(&claims);
         let signer = Arc::clone(&self.signer);
         let cap_key = &self.key;
@@ -359,8 +360,9 @@ impl OboIssuer {
     ///    (a cap `*` grants the whole allowlist), optionally narrowed to
     ///    `requested`; a non-subset request or an empty final grant is
     ///    `OboNotGranted` (403). An empty grant is never minted.
-    /// 6. **Idempotency** — keyed by `(cap jti, canonical grant)`; a retry with
-    ///    the same cap and grant returns the byte-identical OBO token.
+    /// 6. **Per-replica idempotency** — keyed by `(cap jti, canonical grant)`;
+    ///    a retry routed to this replica with the same cap and grant returns the
+    ///    byte-identical OBO token.
     ///
     /// # Errors
     /// Returns the [`DomainError`] for whichever gate fails (see above).
@@ -426,6 +428,7 @@ impl OboIssuer {
             .saturating_add(i64::try_from(self.clock_skew_secs).unwrap_or(i64::MAX));
         let signer = Arc::clone(&self.signer);
         let obo_key = &self.key;
+        let obo_jwks = &self.jwks;
         let obo_issuer = &self.issuer;
         let obo_audience = &self.audience;
         let obo_ttl = self.ttl_secs;
@@ -444,18 +447,27 @@ impl OboIssuer {
                     obo_audience,
                     obo_ttl,
                     now,
-                );
+                )?;
                 let jwt = sign_obo(signer.as_ref(), &system_ctx(), obo_key, &claims).await?;
+                // Fail closed before the cache stores the token. A rotation can
+                // make the fresh `kid` unknown to the warmed OBO JWKS; return an
+                // error rather than cache a credential offline verifiers cannot
+                // validate.
+                let kid = kid_of_jwt(&jwt)
+                    .ok_or_else(|| DomainError::internal("minted OBO token has no kid"))?;
+                obo_jwks.refresh_for_kid(signer.as_ref(), &kid).await;
+                if !obo_jwks.has_kid(&kid).await {
+                    warn!(
+                        target: "token_issuer.jwks",
+                        kid,
+                        "refusing OBO mint because its kid is not publishable"
+                    );
+                    return Err(DomainError::NotReady);
+                }
                 Ok((jwt, claims.exp))
             })
             .await?;
         self.metrics.record_mint_duration("obo", started.elapsed());
-
-        // A fresh sign may carry an unseen key version (Transit rotated);
-        // rebuild the OBO JWKS so the new token stays verifiable.
-        if let Some(kid) = kid_of_jwt(&jwt) {
-            self.jwks.refresh_for_kid(self.signer.as_ref(), &kid).await;
-        }
 
         Ok(jwt)
     }
@@ -538,10 +550,11 @@ impl GrantIssuer {
         if req.ttl_secs == 0 {
             req.ttl_secs = self.default_ttl_secs;
         }
+        validate_token_ttl(req.ttl_secs)?;
 
         let started = Instant::now();
         let now = (self.clock)();
-        let claims = build_grant_claims(ctx, &req, &self.issuer, now);
+        let claims = build_grant_claims(ctx, &req, &self.issuer, now)?;
         let metrics = &self.metrics;
         let jwt = assemble_and_sign(
             self.signer.as_ref(),
@@ -787,6 +800,16 @@ fn validate_grant_request(req: &MintGrantRequest) -> Result<(), TokenIssuerError
     }
     if req.operations.iter().any(|op| !is_valid_field(op)) {
         return Err(reject("operation"));
+    }
+    Ok(())
+}
+
+/// Validates the issuer-wide hard lifetime ceiling.
+fn validate_token_ttl(ttl_secs: u64) -> Result<(), TokenIssuerError> {
+    if !(1..=MAX_TOKEN_TTL_SECS).contains(&ttl_secs) {
+        return Err(TokenIssuerError::InvalidRequest {
+            reason: format!("ttl_secs must be between 1 and {MAX_TOKEN_TTL_SECS}"),
+        });
     }
     Ok(())
 }

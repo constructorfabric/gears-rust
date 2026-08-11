@@ -1,8 +1,9 @@
 //! OBO idempotency cache (DESIGN.md § 3.6).
 //!
-//! Keyed by `(cap jti, canonical scope set)`: re-minting with the same cap token
-//! and the same down-scoped grant returns the byte-identical OBO token, so a
-//! retried adapter callback does not churn fresh tokens. An entry lives until
+//! Per-process and keyed by `(cap jti, canonical scope set)`: re-minting on the
+//! same replica with the same cap token and the same down-scoped grant returns
+//! the byte-identical OBO token, so a retried adapter callback pinned to that
+//! replica does not churn fresh tokens. An entry lives until
 //! the cap's Gate-1 acceptance horizon (`cap_valid_until` = cap `exp` +
 //! `clock_skew_secs`), not bare cap `exp`: Gate 1 still accepts the cap during
 //! the skew window, so the cache must too, or a retry in that window would
@@ -16,8 +17,6 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
-
-use token_issuer_sdk::TokenIssuerError;
 
 /// Identity of a cached OBO token: the cap token's `jti` plus the SHA-256 of the
 /// canonical down-scoped scope set (so different grants from the same cap
@@ -88,16 +87,16 @@ impl OboCache {
     ///
     /// # Errors
     /// Propagates any error returned by `mint`.
-    pub async fn get_or_mint<F, Fut>(
+    pub async fn get_or_mint<F, Fut, E>(
         &self,
         key: &OboCacheKey,
         cap_valid_until: i64,
         now: i64,
         mint: F,
-    ) -> Result<String, TokenIssuerError>
+    ) -> Result<String, E>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<(String, i64), TokenIssuerError>>,
+        Fut: Future<Output = Result<(String, i64), E>>,
     {
         let slot = {
             let mut map = self.map.write().await;

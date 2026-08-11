@@ -11,7 +11,9 @@
 )]
 
 use sha2::{Digest, Sha256};
-use token_issuer_sdk::{CapabilityClaims, GrantClaims, MintCapabilityRequest, MintGrantRequest};
+use token_issuer_sdk::{
+    CapabilityClaims, GrantClaims, MintCapabilityRequest, MintGrantRequest, TokenIssuerError,
+};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -70,15 +72,17 @@ pub fn cache_key_for(c: &CapabilityClaims) -> CacheKey {
 /// By design the cap carries the caller's *full* token scopes — it is not
 /// down-scoped here. Narrowing to what an adapter may act on happens at OBO
 /// re-mint time (Gate 2, see [`crate::domain::downscope`]).
-#[must_use]
+///
+/// # Errors
+/// Returns [`TokenIssuerError::Internal`] if the expiration timestamp overflows.
 pub fn build_cap_claims(
     ctx: &SecurityContext,
     req: &MintCapabilityRequest,
     issuer: &str,
     ttl_secs: u64,
     now: i64,
-) -> CapabilityClaims {
-    CapabilityClaims {
+) -> Result<CapabilityClaims, TokenIssuerError> {
+    Ok(CapabilityClaims {
         iss: issuer.to_owned(),
         aud: req.audience.clone(),
         sub: ctx.subject_id(),
@@ -89,11 +93,11 @@ pub fn build_cap_claims(
         scopes: canonical_scopes(&ctx.token_scopes().join(" ")),
         jti: Uuid::new_v4(),
         iat: now,
-        exp: now.saturating_add(i64::try_from(ttl_secs).unwrap_or(i64::MAX)),
+        exp: checked_expiration(now, ttl_secs)?,
         act: None,
         operation: req.operation.clone(),
         resource_type: req.resource_type.clone(),
-    }
+    })
 }
 
 /// Builds grant claims from the verified caller context and mint request.
@@ -103,14 +107,16 @@ pub fn build_cap_claims(
 /// and audience come from the request. `exp` is `now + ttl_secs` (the gear has
 /// already clamped `ttl_secs` to the smallest per-operation `max_ttl`). The token
 /// carries no `nbf`.
-#[must_use]
+///
+/// # Errors
+/// Returns [`TokenIssuerError::Internal`] if the expiration timestamp overflows.
 pub fn build_grant_claims(
     ctx: &SecurityContext,
     req: &MintGrantRequest,
     issuer: &str,
     now: i64,
-) -> GrantClaims {
-    GrantClaims {
+) -> Result<GrantClaims, TokenIssuerError> {
+    Ok(GrantClaims {
         iss: issuer.to_owned(),
         aud: req.audience.clone(),
         sub: ctx.subject_id(),
@@ -122,9 +128,21 @@ pub fn build_grant_claims(
         resource_type: req.resource_type.clone(),
         operations: req.operations.clone(),
         iat: now,
-        exp: now.saturating_add(i64::try_from(req.ttl_secs).unwrap_or(i64::MAX)),
+        exp: checked_expiration(now, req.ttl_secs)?,
         jti: Uuid::new_v4(),
-    }
+    })
+}
+
+/// Converts a bounded TTL to an absolute expiration without saturating.
+///
+/// # Errors
+/// Returns [`TokenIssuerError::Internal`] when the clock plus TTL cannot be
+/// represented as an `i64` Unix timestamp.
+pub(crate) fn checked_expiration(now: i64, ttl_secs: u64) -> Result<i64, TokenIssuerError> {
+    let ttl = i64::try_from(ttl_secs)
+        .map_err(|_| TokenIssuerError::Internal("token TTL is not representable".to_owned()))?;
+    now.checked_add(ttl)
+        .ok_or_else(|| TokenIssuerError::Internal("token expiration timestamp overflow".to_owned()))
 }
 
 #[cfg(test)]

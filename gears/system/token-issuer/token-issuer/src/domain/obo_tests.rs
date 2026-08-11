@@ -68,7 +68,8 @@ fn build_obo_claims_copies_and_downscopes() {
         "public-api",
         60,
         1_100,
-    );
+    )
+    .unwrap();
     assert_eq!(claims.iss, OBO_ISS);
     assert_eq!(claims.aud, "public-api");
     assert_eq!(claims.sub, cap.sub); // copied verbatim
@@ -95,7 +96,8 @@ fn build_obo_claims_exp_is_decoupled_from_cap_exp() {
         "public-api",
         60,
         1_290,
-    );
+    )
+    .unwrap();
     assert_eq!(
         claims.exp, 1_350,
         "OBO exp must be now + ttl, not clamped to the cap's exp"
@@ -113,7 +115,8 @@ fn obo_scope_is_space_joined_and_never_wildcard() {
         "public-api",
         60,
         1_100,
-    );
+    )
+    .unwrap();
     assert_eq!(claims.scope, "a:b c:d");
     assert!(!claims.scope.split(' ').any(|s| s == "*"));
 }
@@ -132,7 +135,8 @@ async fn sign_obo_produces_es256_obo_jwt_with_versioned_kid() {
         "public-api",
         60,
         1_100,
-    );
+    )
+    .unwrap();
 
     let jwt = sign_obo(&signer, &ctx, &key, &claims).await.unwrap();
     let parts: Vec<&str> = jwt.split('.').collect();

@@ -70,10 +70,10 @@ Both caches are optimizations whose loss costs signing calls, never correctness.
 | `cpt-cf-token-issuer-fr-obo-provenance` | `verify_cap` against the shared capability `JwksState` |
 | `cpt-cf-token-issuer-fr-obo-peer-binding` | `PeerIdentityResolver::resolve` then `cap.aud == peer_gts` |
 | `cpt-cf-token-issuer-fr-obo-downscope` | `downscope(allowlist, cap_scopes, requested)` — intersection, wildcard expansion, subset check |
-| `cpt-cf-token-issuer-fr-obo-idempotency` | `OboCache` keyed on `(cap jti, canonical scope hash)`, retained to `cap.exp + clock_skew_secs` |
+| `cpt-cf-token-issuer-fr-obo-idempotency` | Per-replica `OboCache` keyed on `(cap jti, canonical scope hash)`, retained to `cap.exp + clock_skew_secs`; sticky routing is required for cluster-wide byte identity |
 | `cpt-cf-token-issuer-fr-stable-kid` | Two-phase sign in `assemble_and_sign` with bounded version-stabilization retry |
-| `cpt-cf-token-issuer-fr-jwks-refresh-on-rotation` | `JwksState::refresh_for_kid` on all three classes, plus a publishability check that refuses the mint on the capability and grant paths |
-| `cpt-cf-token-issuer-fr-readiness-gate` | `warm_jwks_until_ready` in the gear's `serve` entry point, gating `ReadySignal` |
+| `cpt-cf-token-issuer-fr-jwks-refresh-on-rotation` | `JwksState::refresh_for_kid` plus a pre-return/pre-cache publishability check that refuses an unpublishable mint on all three classes |
+| `cpt-cf-token-issuer-fr-readiness-gate` | `warm_jwks_until_ready` gates both `ReadySignal` and the token-issuer `RestApiCapability::healthcheck` state consumed by `/readyz` |
 | `cpt-cf-token-issuer-fr-plugin-selection` | `GtsSigningPluginSelector` implements the port itself and resolves the scoped client lazily |
 | `cpt-cf-token-issuer-fr-error-mapping` | `From<DomainError> for CanonicalError` collapsing all authorization refusals |
 | `cpt-cf-token-issuer-fr-class-key-isolation` | Three independent `JwksState` instances, one `SigningKeyRef` each |
@@ -87,7 +87,7 @@ Both caches are optimizations whose loss costs signing calls, never correctness.
 | `cpt-cf-token-issuer-nfr-class-isolation` | Cross-class forgery resistance | `CapIssuer` / `GrantIssuer` / `OboIssuer`, each owning a `SigningKeyRef` and `JwksState` | Disjoint Transit keys mean no `kid` is shared, so a grant token's key is absent from the capability JWKS and vice versa. `typ` is checked too, but is not the load-bearing control. | `grant_kid_is_isolated_from_the_cap_jwks`, `obo_remint_rejects_grant_jwt_cross_class` |
 | `cpt-cf-token-issuer-nfr-bounded-signing` | Bounded signing amplification | `domain::jws::assemble_and_sign`; `CapCache` | Cache hit → zero signs. Miss → two signs (learn version, then final with `kid`). Rotation race → bounded retry, then a retryable failure. | `kid_matches_stable_signing_version`, `re_signs_when_version_rotates_once`, `fails_closed_when_version_never_stabilizes` |
 | `cpt-cf-token-issuer-nfr-opaque-denials` | Non-enumerable authorization failures | `infra::sdk_error_mapping` | Six distinct `DomainError` variants collapse to one `permission_denied` with a single fixed reason, discarding the variant. | `maps_obo_remint_variants_to_expected_status` |
-| `cpt-cf-token-issuer-nfr-idempotent-retry` | Idempotent retry under skew | `domain::obo_cache::OboCache` | Entry lifetime is the capability token's Gate-1 acceptance horizon (`exp + clock_skew_secs`), not bare `exp`, so retries in the skew window still hit. | `reuses_entry_within_cap_skew_window`, `remint_idempotent_within_cap_skew_window` |
+| `cpt-cf-token-issuer-nfr-idempotent-retry` | Per-replica idempotent retry under skew | `domain::obo_cache::OboCache` | Entry lifetime is the capability token's Gate-1 acceptance horizon (`exp + clock_skew_secs`), not bare `exp`, so same-replica retries in the skew window still hit. | `reuses_entry_within_cap_skew_window`, `remint_idempotent_within_cap_skew_window` |
 
 #### Key ADRs
 
@@ -516,7 +516,8 @@ than by a bearer middleware. There is no user bearer token on that path to authe
 
 **Error responses.** Per `cpt-cf-token-issuer-fr-error-mapping`: 400 invalid request; 401 capability-token
 provenance or expiry failure; 403 any peer, adapter, or loop-guard refusal, indistinguishable; 404 OBO
-disabled; 500 internal; 503 signing failure or not-ready.
+disabled; 500 internal; 503 signing failure or not-ready. Signing-plugin diagnostics are logged only
+server-side; the public RFC-9457 `detail` is the fixed string `token signing temporarily unavailable`.
 
 ### 3.4 Internal Dependencies
 
@@ -609,12 +610,10 @@ The publishability check runs **before** the cache stores the token, and this or
 cached token whose `kid` is absent from the JWKS would be rejected by every verifier for the entire
 reuse window. Refusing one mint is strictly cheaper than poisoning the cache.
 
-The three classes are deliberately not symmetric here. The **capability** and **grant** paths both
-refuse the mint if the `kid` is still unpublishable after the rebuild. The **OBO** re-mint path
-refreshes its JWKS on an unseen `kid` but does **not** refuse — so an OBO token can be returned whose
-key is momentarily absent from the OBO JWKS. That is a narrower risk than it looks (the surface is
-gated off by default, and the presenting adapter re-fetches the JWKS), but it is an asymmetry to be
-aware of rather than an oversight to rely on.
+All three classes apply the same fail-closed rule. The **capability** and **OBO** paths perform the
+publishability check inside their get-or-mint closures, before the token enters a cache; the
+non-cached **grant** path performs it before returning. If rebuilding still does not expose the fresh
+`kid`, that mint fails and no unverifiable credential crosses the service boundary.
 
 #### OBO re-mint gate pipeline
 
@@ -633,6 +632,7 @@ sequenceDiagram
     participant P as PeerIdentityResolver
     participant R as RmsAdapterRegistry
     participant OC as OboCache
+    participant OJ as OBO JwksState
 
     A->>H: POST re-mint, Bearer cap+jwt
     H->>O: remint_obo(peer, cap_jwt, requested?)
@@ -652,7 +652,13 @@ sequenceDiagram
     alt live entry
         OC-->>O: byte-identical token
     else
-        OC->>OC: build claims, sign, store
+        OC->>OC: build claims and sign
+        OC->>OJ: refresh_for_kid + has_kid
+        alt kid publishable
+            OC->>OC: store token
+        else
+            OC-->>O: error; do not store
+        end
     end
     O-->>H: OBO token
     H-->>A: 200 with token
@@ -674,9 +680,11 @@ oracle*.
 
 **Use cases**: `cpt-cf-token-issuer-usecase-obo-remint`
 
-**Description**: Keyed on `(capability jti, canonical granted scope set)`. A retried adapter callback
-with the same capability token and the same computed grant returns the **byte-identical** token, so a
-retry storm does not mint a fresh live credential per attempt.
+**Description**: Keyed on `(capability jti, canonical granted scope set)`. Within one replica, a
+retried adapter callback with the same capability token and the same computed grant returns the
+**byte-identical** token, so a retry storm pinned to that replica does not mint a fresh live credential
+per attempt. The cache is not shared; a retry routed to another replica may receive a distinct,
+correctly scoped token.
 
 The entry's retention horizon is `cap.exp + clock_skew_secs` — the capability token's **Gate-1
 acceptance horizon**, not its bare `exp`. This is the subtle part: Gate 1 still accepts the capability
@@ -719,8 +727,9 @@ sequenceDiagram
             G->>G: warn, sleep backoff (capped), or exit on cancel
         end
     end
+    G->>G: set REST readiness state healthy
     G->>RT: ready.notify()
-    Note over G,RT: serving 503 until this point
+    Note over G,RT: lifecycle and /readyz remain not-ready until this point
 ```
 
 **Description**: Readiness requires that the signing keys are readable and that a non-empty JWKS is
@@ -729,8 +738,10 @@ buildable — for the **capability and grant** classes always, and for OBO addit
 but whose `grant-token-sign` key is missing will never become ready, because the `grants` gear depends
 on the grant class and so its key is treated as equally load-bearing. An empty or invalid JWKS is never published: fail closed and keep serving 503. The retry
 uses capped exponential backoff rather than a one-shot warm, because the signing backend may register
-asynchronously after boot — a single attempt would brick the issuer permanently on that race. The sleep
-races cancellation so shutdown is prompt.
+asynchronously after boot — a single attempt would brick the issuer permanently on that race. The
+same atomic state is exposed as the gear's composite REST healthcheck, so `/readyz` reports unhealthy
+until warming succeeds and becomes unhealthy again during shutdown. The sleep races cancellation so
+shutdown is prompt.
 
 ### 3.7 Database schemas & tables
 
@@ -804,11 +815,16 @@ Unknown keys are rejected (`deny_unknown_fields`) so a typo fails startup instea
 default. Validated invariants:
 
 - `issuer_base_url` non-blank — it becomes `iss` and the discovery URL.
-- `clock_skew_secs <= cap_reuse_floor_secs < cap_ttl_secs` — a reuse floor below the skew allowance
-  would hand out tokens a verifier may already consider expired.
+- `clock_skew_secs <= cap_reuse_floor_secs < cap_ttl_secs <= 86400` — a reuse floor below the skew
+  allowance would hand out tokens a verifier may already consider expired; the 24-hour hard ceiling
+  prevents effectively unbounded credentials.
 - `0 < obo_ttl_secs <= 60` and `clock_skew_secs < obo_ttl_secs` — an OBO token must outlive the skew
   window it is checked within.
-- `grant_ttl_secs > 0`.
+- `0 < grant_ttl_secs <= 86400`; explicit grant mint TTLs have the same issuer-wide 24-hour ceiling,
+  independent of any smaller per-operation policy maximum.
+
+All claim builders use checked timestamp addition and fail the mint on overflow rather than
+saturating `exp`.
 
 Issuer identifiers derive as `{issuer_base_url}/issuers/{cap|grant|obo}`, tolerating a trailing slash,
 so the `iss` claim and the discovery path cannot disagree.

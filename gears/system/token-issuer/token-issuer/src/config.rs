@@ -3,6 +3,12 @@
 use serde::Deserialize;
 use toolkit_macros::ExpandVars;
 
+/// Hard upper bound for capability and grant token lifetimes (24 hours).
+///
+/// Per-operation grant policy may impose a smaller maximum; this issuer-wide
+/// ceiling is defense in depth and prevents effectively unbounded credentials.
+pub const MAX_TOKEN_TTL_SECS: u64 = 24 * 60 * 60;
+
 /// Token-issuer configuration.
 ///
 /// Deserialized from the gear config block; every field has a default so a
@@ -83,8 +89,9 @@ impl TokenIssuerConfig {
     /// # Errors
     /// Returns `Err` with a description if `issuer_base_url` is blank, the TTL
     /// ordering `clock_skew_secs <= cap_reuse_floor_secs < cap_ttl_secs` is
-    /// violated, or `obo_ttl_secs` is out of bounds (`0 < obo_ttl_secs <= 60`
-    /// and `clock_skew_secs < obo_ttl_secs`).
+    /// violated, capability/grant TTLs exceed [`MAX_TOKEN_TTL_SECS`], or
+    /// `obo_ttl_secs` is out of bounds (`0 < obo_ttl_secs <= 60` and
+    /// `clock_skew_secs < obo_ttl_secs`).
     pub fn validate(&self) -> Result<(), String> {
         if self.issuer_base_url.trim().is_empty() {
             return Err("issuer_base_url required".to_owned());
@@ -96,14 +103,19 @@ impl TokenIssuerConfig {
                 "require clock_skew_secs <= cap_reuse_floor_secs < cap_ttl_secs".to_owned(),
             );
         }
+        if self.cap_ttl_secs > MAX_TOKEN_TTL_SECS {
+            return Err(format!("require cap_ttl_secs <= {MAX_TOKEN_TTL_SECS}"));
+        }
         if !(self.obo_ttl_secs > 0 && self.obo_ttl_secs <= 60) {
             return Err("require 0 < obo_ttl_secs <= 60".to_owned());
         }
         if self.clock_skew_secs >= self.obo_ttl_secs {
             return Err("require clock_skew_secs < obo_ttl_secs".to_owned());
         }
-        if self.grant_ttl_secs == 0 {
-            return Err("require grant_ttl_secs > 0".to_owned());
+        if !(1..=MAX_TOKEN_TTL_SECS).contains(&self.grant_ttl_secs) {
+            return Err(format!(
+                "require 0 < grant_ttl_secs <= {MAX_TOKEN_TTL_SECS}"
+            ));
         }
         Ok(())
     }

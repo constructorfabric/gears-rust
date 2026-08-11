@@ -22,10 +22,19 @@ impl From<DomainError> for CanonicalError {
             DomainError::InvalidRequest { detail } => TokenResource::invalid_argument()
                 .with_field_violation("request", detail, "INVALID_REQUEST")
                 .create(),
-            // Signing/NotReady are transient: the caller can retry.
-            DomainError::Signing { detail } => CanonicalError::service_unavailable()
-                .with_detail(detail)
-                .create(),
+            // Signing/NotReady are transient: the caller can retry. Keep the raw
+            // signing diagnostic server-side; plugin IDs, backend paths, and key
+            // metadata must never cross into the public RFC-9457 detail.
+            DomainError::Signing { detail } => {
+                tracing::warn!(
+                    target: "token_issuer.signing",
+                    diagnostic = %detail,
+                    "token signing failed"
+                );
+                CanonicalError::service_unavailable()
+                    .with_detail("token signing temporarily unavailable")
+                    .create()
+            }
             DomainError::NotReady => CanonicalError::service_unavailable()
                 .with_detail("token issuer not ready")
                 .create(),
@@ -79,6 +88,16 @@ mod tests {
         );
         assert_eq!(status_of(DomainError::NotReady), 503);
         assert_eq!(status_of(DomainError::internal("boom")), 500);
+    }
+
+    #[test]
+    fn signing_diagnostics_are_redacted() {
+        let err = CanonicalError::from(DomainError::Signing {
+            detail: "plugin vault-prod failed at secret/transit/key".to_owned(),
+        });
+        assert_eq!(err.detail(), "token signing temporarily unavailable");
+        assert!(!err.detail().contains("vault-prod"));
+        assert!(!err.detail().contains("secret/transit/key"));
     }
 
     #[test]

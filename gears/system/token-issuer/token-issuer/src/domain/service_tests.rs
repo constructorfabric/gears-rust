@@ -36,6 +36,42 @@ impl SigningClientV1 for MockSigner {
         _ctx: &SecurityContext,
         _key: &SigningKeyRef,
     ) -> Result<Vec<PublicKeyVersion>, SigningError> {
+        let key = SigningKey::random(&mut OsRng);
+        let pem = p256::PublicKey::from(key.verifying_key())
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        Ok(vec![PublicKeyVersion {
+            version: self.key_version,
+            alg: SigAlg::Es256,
+            public_key_pem: pem,
+        }])
+    }
+}
+
+/// Signer that can mint but has no publishable keys.
+struct EmptyKeySigner {
+    key_version: u32,
+}
+
+#[async_trait]
+impl SigningClientV1 for EmptyKeySigner {
+    async fn sign(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SigningKeyRef,
+        _signing_input: &[u8],
+    ) -> Result<SignatureResult, SigningError> {
+        Ok(SignatureResult {
+            signature: vec![0xAB; 64],
+            key_version: self.key_version,
+        })
+    }
+
+    async fn public_keys(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SigningKeyRef,
+    ) -> Result<Vec<PublicKeyVersion>, SigningError> {
         Ok(vec![])
     }
 }
@@ -218,9 +254,18 @@ async fn mint_capability_produces_es256_cap_jwt() {
 
 #[tokio::test]
 async fn warm_jwks_fails_closed_on_empty_key_set() {
-    // MockSigner yields no public keys → empty key set → fail closed (NotReady),
-    // and the cache stays unwarmed.
-    let svc = service(1);
+    // EmptyKeySigner yields no public keys → fail closed (NotReady), and the
+    // cache stays unwarmed.
+    let svc = Service::new(
+        Arc::new(EmptyKeySigner { key_version: 1 }),
+        Arc::new(MockPeerResolver {
+            gts_id: "gts.unset".to_owned(),
+        }),
+        Arc::new(MockRegistry { record: None }),
+        &config(),
+        Arc::new(TokenIssuerMetrics::from_global()),
+    )
+    .unwrap();
     assert!(matches!(svc.cap_jwks().await, Err(DomainError::NotReady)));
     assert!(matches!(svc.warm_jwks().await, Err(DomainError::NotReady)));
     assert!(matches!(svc.cap_jwks().await, Err(DomainError::NotReady)));
@@ -437,6 +482,36 @@ async fn remint_happy_path_mints_downscoped_obo() {
     assert_eq!(claims.act, ADAPTER_GTS);
     // allowlist {quotas:read} ∩ cap {quotas:read, quotas:write} = {quotas:read}
     assert_eq!(claims.scope, "quotas:read");
+    let obo_jwks = svc.obo_jwks().await.unwrap();
+    assert_eq!(obo_jwks["keys"][0]["kid"], "obo-token-sign-v3");
+}
+
+#[tokio::test]
+async fn remint_refuses_unpublishable_kid_before_caching() {
+    let (cap_jwt, cap_jwks) = sign_cap_jwt(CAP_ISS, real_now() + 300);
+    let cfg = obo_config();
+    let svc = Service::new(
+        Arc::new(EmptyKeySigner { key_version: 3 }),
+        Arc::new(MockPeerResolver {
+            gts_id: ADAPTER_GTS.to_owned(),
+        }),
+        Arc::new(MockRegistry {
+            record: Some(granted_adapter(&["quotas:read"])),
+        }),
+        &cfg,
+        Arc::new(TokenIssuerMetrics::from_global()),
+    )
+    .unwrap()
+    .with_clock(Arc::new(|| 1_000));
+    install_cap_jwks(&svc, cap_jwks).await;
+
+    for _ in 0..2 {
+        assert!(matches!(
+            svc.remint_obo(&peer(), &cap_jwt, None).await,
+            Err(DomainError::NotReady)
+        ));
+    }
+    assert!(matches!(svc.obo_jwks().await, Err(DomainError::NotReady)));
 }
 
 #[tokio::test]
@@ -774,6 +849,17 @@ async fn mint_grant_rejects_empty_operations() {
     let svc = pubkey_service(Arc::new(PubKeySigner::new(1)));
     let mut req = sample_grant_req();
     req.operations.clear();
+    assert!(matches!(
+        svc.mint_grant(&test_ctx(), req).await,
+        Err(TokenIssuerError::InvalidRequest { .. })
+    ));
+}
+
+#[tokio::test]
+async fn mint_grant_rejects_ttl_above_hard_limit() {
+    let svc = pubkey_service(Arc::new(PubKeySigner::new(1)));
+    let mut req = sample_grant_req();
+    req.ttl_secs = MAX_TOKEN_TTL_SECS + 1;
     assert!(matches!(
         svc.mint_grant(&test_ctx(), req).await,
         Err(TokenIssuerError::InvalidRequest { .. })

@@ -1,4 +1,4 @@
-use super::TokenIssuerConfig;
+use super::{MAX_TOKEN_TTL_SECS, TokenIssuerConfig};
 
 fn base() -> TokenIssuerConfig {
     TokenIssuerConfig {
@@ -82,10 +82,18 @@ fn issuer_helpers_trim_trailing_slash() {
 }
 
 #[test]
-fn validate_requires_positive_grant_ttl() {
+fn validate_bounds_cap_and_grant_ttls() {
     let mut c = base();
     c.grant_ttl_secs = 0;
     assert!(c.validate().is_err());
+
+    c.grant_ttl_secs = MAX_TOKEN_TTL_SECS + 1;
+    assert!(c.validate().is_err());
+
     c.grant_ttl_secs = 300;
+    c.cap_ttl_secs = MAX_TOKEN_TTL_SECS + 1;
+    assert!(c.validate().is_err());
+
+    c.cap_ttl_secs = MAX_TOKEN_TTL_SECS;
     assert!(c.validate().is_ok());
 }

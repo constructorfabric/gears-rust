@@ -12,6 +12,7 @@ use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
+use crate::domain::claims::checked_expiration;
 use crate::domain::jws::assemble_and_sign;
 
 /// JOSE `typ` header for OBO tokens.
@@ -56,7 +57,9 @@ pub struct OboClaims {
 /// § 3.1, § 2.1): the OBO carries identity, not authorization — the PDP re-checks live
 /// permissions — so a re-mint near cap expiry still yields a full-TTL OBO instead
 /// of a near-zero (or, within clock skew, already-expired) one.
-#[must_use]
+///
+/// # Errors
+/// Returns [`TokenIssuerError::Internal`] if the expiration timestamp overflows.
 pub fn build_obo_claims(
     cap: &CapabilityClaims,
     granted: &[String],
@@ -65,12 +68,12 @@ pub fn build_obo_claims(
     aud: &str,
     ttl: u64,
     now: i64,
-) -> OboClaims {
+) -> Result<OboClaims, TokenIssuerError> {
     debug_assert!(
         !granted.iter().any(|s| s == "*"),
         "OBO scope must never contain the wildcard"
     );
-    OboClaims {
+    Ok(OboClaims {
         iss: obo_iss.to_owned(),
         aud: aud.to_owned(),
         sub: cap.sub,
@@ -80,8 +83,8 @@ pub fn build_obo_claims(
         scope: granted.join(" "),
         jti: Uuid::new_v4(),
         iat: now,
-        exp: now.saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX)),
-    }
+        exp: checked_expiration(now, ttl)?,
+    })
 }
 
 /// Assembles and ES256-signs an OBO JWT for `claims` using the `obo_key` via the

@@ -491,14 +491,16 @@ The system **MUST** refuse a re-mint whose presented token was itself minted by 
 
 - [ ] `p1` - **ID**: `cpt-cf-token-issuer-fr-obo-idempotency`
 
-The system **MUST** return the byte-identical OBO token for a repeated re-mint with the same
-capability token and the same computed scope set, for as long as that capability token remains
-acceptable — including throughout the clock-skew window past its expiry. A differing scope set
-**MUST** produce a distinct entry.
+Within one token-issuer replica, the system **MUST** return the byte-identical OBO token for a
+repeated re-mint with the same capability token and the same computed scope set, for as long as that
+capability token remains acceptable — including throughout the clock-skew window past its expiry. A
+differing scope set **MUST** produce a distinct entry. Cluster-wide byte identity requires the caller
+or load balancer to route retries to the same replica.
 
-- **Rationale**: A retried adapter callback must not churn fresh credentials. Keying the entry's
-  lifetime to the capability token's acceptance horizon rather than its bare expiry is what makes the
-  guarantee hold for a retry inside the skew window.
+- **Rationale**: A retried adapter callback routed to the same replica must not churn fresh
+  credentials. Keying the entry's lifetime to the capability token's acceptance horizon rather than
+  its bare expiry is what makes the guarantee hold for a retry inside the skew window. The cache is
+  intentionally in-process; shared persistence is outside this gear's stateless deployment model.
 - **Actors**: `cpt-cf-token-issuer-actor-adapter`
 - **Acceptance Evidence**: `domain::service::tests::remint_is_idempotent_by_cap_jti_and_scope`,
   `domain::service::tests::remint_idempotent_within_cap_skew_window`,
@@ -575,16 +577,16 @@ version.
 - [ ] `p1` - **ID**: `cpt-cf-token-issuer-fr-jwks-refresh-on-rotation`
 
 When a mint produces a token whose `kid` is absent from the published JWKS, the system **MUST**
-rebuild that JWKS. For **capability** tokens it **MUST** refuse the mint — before caching the token —
-and for **grant** tokens it **MUST** refuse the mint, if the `kid` still cannot be published
-afterwards. The **OBO** re-mint path refreshes its JWKS but does not refuse.
+rebuild that JWKS and **MUST** refuse the mint if the `kid` still cannot be published. For cached
+capability and OBO paths, this check **MUST** complete before insertion.
 
-- **Rationale**: Caching a capability token whose key a verifier cannot find would guarantee downstream
-  rejection for the whole reuse window, and a grant token is verified offline by an adapter that has no
-  recourse. Failing the single mint is strictly cheaper than either. The OBO path's weaker guarantee is
-  documented in DESIGN.md § 3.6.
+- **Rationale**: A token whose key a verifier cannot find is unusable for offline verification.
+  Failing one mint is strictly cheaper and safer than returning or caching an unverifiable
+  credential.
 - **Actors**: `cpt-cf-token-issuer-actor-verifier`
-- **Acceptance Evidence**: `domain::service::tests::mint_rebuilds_cap_jwks_on_unseen_key_version`
+- **Acceptance Evidence**: `domain::service::tests::mint_rebuilds_cap_jwks_on_unseen_key_version`,
+  `domain::service::tests::remint_happy_path_mints_downscoped_obo`,
+  `domain::service::tests::remint_refuses_unpublishable_kid_before_caching`
 
 #### Gate readiness on a buildable JWKS
 
@@ -604,7 +606,8 @@ does.
 - **Actors**: `cpt-cf-token-issuer-actor-operator`
 - **Acceptance Evidence**: `domain::service::tests::warm_jwks_caches_nonempty_cap_document`,
   `domain::service::tests::warm_jwks_fails_closed_on_empty_key_set`,
-  `domain::service::tests::warm_jwks_fails_closed_when_signer_errors`
+  `domain::service::tests::warm_jwks_fails_closed_when_signer_errors`,
+  `module::tests::readiness_check_tracks_lifecycle_state`
 
 ### 5.5 Signing Plugin Selection
 
@@ -660,9 +663,11 @@ construction and on deserialization.
 - [ ] `p1` - **ID**: `cpt-cf-token-issuer-fr-config-validation`
 
 The system **MUST** fail initialization unless `issuer_base_url` is non-blank,
-`clock_skew_secs <= cap_reuse_floor_secs < cap_ttl_secs`, `0 < obo_ttl_secs <= 60`,
-`clock_skew_secs < obo_ttl_secs`, and `grant_ttl_secs > 0`. Unknown configuration keys **MUST** be
-rejected.
+`clock_skew_secs <= cap_reuse_floor_secs < cap_ttl_secs <= 86400`,
+`0 < obo_ttl_secs <= 60`, `clock_skew_secs < obo_ttl_secs`, and
+`0 < grant_ttl_secs <= 86400`. Explicit grant mint lifetimes **MUST** also be at most 86400 seconds,
+and expiration timestamp construction **MUST** fail rather than saturate. Unknown configuration keys
+**MUST** be rejected.
 
 - **Rationale**: These orderings are what make reuse and skew handling coherent; a violated invariant
   yields tokens that are reused past usability or rejected on arrival. Rejecting unknown keys catches
@@ -670,7 +675,9 @@ rejected.
 - **Actors**: `cpt-cf-token-issuer-actor-operator`
 - **Acceptance Evidence**: `config::tests::validate_enforces_reuse_floor_invariant`,
   `config::tests::validate_bounds_obo_ttl`,
-  `config::tests::validate_requires_positive_grant_ttl`,
+  `config::tests::validate_bounds_cap_and_grant_ttls`,
+  `domain::service::tests::mint_grant_rejects_ttl_above_hard_limit`,
+  `domain::claims::tests::rejects_expiration_timestamp_overflow`,
   `config::tests::default_config_values`
 
 #### Derive issuer identifiers from the base URL
@@ -793,12 +800,16 @@ indistinguishable from one another.
 
 - [ ] `p2` - **ID**: `cpt-cf-token-issuer-nfr-idempotent-retry`
 
-A repeated re-mint with unchanged inputs **MUST** yield the byte-identical token for the full window
-during which the presented capability token is still accepted, including the clock-skew tail.
+A repeated re-mint with unchanged inputs routed to the same replica **MUST** yield the byte-identical
+token for the full window during which the presented capability token is still accepted, including
+the clock-skew tail.
 
-- **Threshold**: Byte equality across retries until capability `exp + clock_skew_secs`.
-- **Rationale**: An adapter retrying a callback must not accumulate distinct live credentials. Scoping
-  the guarantee to bare `exp` would break it precisely in the skew window, where retries concentrate.
+- **Threshold**: Per-replica byte equality across retries until capability
+  `exp + clock_skew_secs`.
+- **Rationale**: An adapter retrying a callback against one replica must not accumulate distinct live
+  credentials. Scoping the guarantee to bare `exp` would break it precisely in the skew window, where
+  retries concentrate. Cross-replica byte equality requires sticky routing or shared idempotency
+  storage and is not provided by the in-process cache.
 - **Architecture Allocation**: See DESIGN.md § 1.2 NFR Allocation.
 
 ### 6.2 NFR Exclusions
@@ -962,8 +973,8 @@ during which the presented capability token is still accepted, including the clo
 **Alternative Flows**:
 - **Version never stabilizes**: The mint fails with a retryable error rather than returning an
   unverifiable token.
-- **`kid` still unpublishable after rebuild**: The capability mint is refused before the token is
-  cached.
+- **`kid` still unpublishable after rebuild**: The capability or OBO mint is refused before the token
+  is cached; a grant mint is refused before return.
 
 #### Re-mint a down-scoped OBO token for an adapter callback
 
@@ -990,8 +1001,10 @@ during which the presented capability token is still accepted, including the clo
 - The adapter holds a credential strictly narrower than the one it presented.
 
 **Alternative Flows**:
-- **Retry with identical inputs**: The byte-identical token is returned, including within the
-  clock-skew tail past the capability token's expiry.
+- **Retry with identical inputs on the same replica**: The byte-identical token is returned,
+  including within the clock-skew tail past the capability token's expiry.
+- **Retry routed to a different replica**: A distinct, correctly scoped token may be returned; use
+  sticky retry routing when cluster-wide byte identity is required.
 - **Audience does not match the peer**: Refused with an opaque 403.
 - **Presented token is an OBO token**: Refused with an opaque 403.
 - **Intersection empty, or request not a subset**: Refused with an opaque 403.
@@ -1029,8 +1042,8 @@ during which the presented capability token is still accepted, including the clo
 - [ ] Every OBO refusal path — disabled, loop guard, provenance, peer mismatch, unknown peer, inactive
   adapter, ungranted adapter, empty intersection, over-broad request — is externally
   indistinguishable from the others except for the documented 401 and 404 cases.
-- [ ] A repeated OBO re-mint with unchanged inputs returns the byte-identical token, including within
-  the clock-skew window past the presented token's expiry.
+- [ ] A repeated OBO re-mint with unchanged inputs routed to the same replica returns the
+  byte-identical token, including within the clock-skew window past the presented token's expiry.
 - [ ] With no signing backend available, the gear serves 503 and never publishes a JWKS.
 - [ ] Every configuration invariant violation prevents startup, and an unknown configuration key is
   rejected rather than ignored.
@@ -1064,7 +1077,7 @@ during which the presented capability token is still accepted, including the clo
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | Signing backend unavailable or slow | No tokens can be minted; dependent flows stall | Readiness gate keeps the gear out of rotation; signing failures map to 503 so callers retry; `token_issuer_sign_errors_total` surfaces the condition |
-| Key rotation races a mint | A token could carry a `kid` naming the wrong version and be unverifiable | Two-phase signing with bounded retry until the version stabilizes; JWKS rebuilt on an unseen `kid`; capability mint refused if the `kid` remains unpublishable |
+| Key rotation races a mint | A token could carry a `kid` naming the wrong version and be unverifiable | Two-phase signing with bounded retry until the version stabilizes; JWKS rebuilt on an unseen `kid`; every token class refuses a mint whose `kid` remains unpublishable |
 | `issuer_base_url` misconfigured | Verifiers resolve keys from a location that serves nothing; every token is rejected | Non-blank validation at startup; issuer identifiers and discovery URLs derived from the single configured value so they cannot disagree |
 | OBO surface enabled without mTLS wired | Every re-mint is refused, appearing as an outage | Peer resolution fails closed and the surface is off by default; the coupling is documented in the configuration reference |
 | Reuse floor set too close to the TTL | Tokens handed out shortly before expiry, causing downstream rejections | Startup invariant `clock_skew_secs <= cap_reuse_floor_secs < cap_ttl_secs` |
@@ -1087,9 +1100,8 @@ during which the presented capability token is still accepted, including the clo
 - `transit_mount` is accepted and validated as configuration but is never read by this gear — the
   signing plugin owns the mount path. Should it be removed from this gear's config, or wired through to
   the plugin so the value has an effect?
-- The OBO re-mint path refreshes its JWKS on an unseen `kid` but, unlike the capability and grant
-  paths, does not refuse an unpublishable one. Should it be made symmetric before the surface is
-  enabled in any deployment?
+- Should OBO retries require sticky routing, or should a shared idempotency store be introduced if
+  cluster-wide byte identity becomes a product requirement?
 - `validate_grant_request` applies the field contract to `audience`, `resource_name`, `resource_type`,
   and each operation id, but only the empty-operations branch has a test. The length and charset
   branches on the grant path are unverified — should they be covered before the grant class is

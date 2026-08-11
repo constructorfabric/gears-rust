@@ -1,6 +1,7 @@
 //! `toolkit` gear wiring for the token-issuer: init, the readiness-gated serve
 //! loop, and the public REST capability.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -9,13 +10,33 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::lifecycle::ReadySignal;
-use toolkit::{Gear, GearCtx, RestApiCapability};
+use toolkit::{Gear, GearCtx, Healthcheck, HealthcheckResult, RestApiCapability};
 use tracing::{info, warn};
 
 /// Initial delay between JWKS warm attempts.
 const WARM_RETRY_BASE: Duration = Duration::from_millis(500);
 /// Cap on the exponential warm-retry backoff.
 const WARM_RETRY_MAX: Duration = Duration::from_secs(15);
+
+/// REST readiness check backed by the same state that gates [`ReadySignal`].
+struct TokenIssuerReadiness {
+    ready: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Healthcheck for TokenIssuerReadiness {
+    fn name(&self) -> &'static str {
+        "token-issuer-readiness"
+    }
+
+    async fn check(&self) -> HealthcheckResult {
+        if self.ready.load(Ordering::Acquire) {
+            HealthcheckResult::healthy()
+        } else {
+            HealthcheckResult::unhealthy("token issuer JWKS not warmed").with_code("jwks_not_ready")
+        }
+    }
+}
 
 use crate::config::TokenIssuerConfig;
 use crate::domain::metrics::TokenIssuerMetrics;
@@ -34,12 +55,15 @@ use crate::infra::rms_registry::LazyRmsAdapterRegistry;
 )]
 pub struct TokenIssuerGear {
     service: OnceLock<Arc<Service>>,
+    /// Shared by the lifecycle gate and REST readiness aggregation.
+    ready: Arc<AtomicBool>,
 }
 
 impl Default for TokenIssuerGear {
     fn default() -> Self {
         Self {
             service: OnceLock::new(),
+            ready: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -70,10 +94,14 @@ impl TokenIssuerGear {
             return Ok(());
         }
 
+        // Publish readiness to both lifecycle startup and the REST healthcheck
+        // aggregate. Store first so `/readyz` cannot observe a false healthy gap.
+        self.ready.store(true, Ordering::Release);
         ready.notify();
         info!(target: "token_issuer.lifecycle", "token-issuer ready; JWKS warmed");
 
         cancel.cancelled().await;
+        self.ready.store(false, Ordering::Release);
         info!(target: "token_issuer.lifecycle", "token-issuer cancelled");
         Ok(())
     }
@@ -164,6 +192,12 @@ impl Gear for TokenIssuerGear {
 }
 
 impl RestApiCapability for TokenIssuerGear {
+    fn healthcheck(&self, _ctx: &GearCtx) -> Option<Arc<dyn Healthcheck>> {
+        Some(Arc::new(TokenIssuerReadiness {
+            ready: Arc::clone(&self.ready),
+        }))
+    }
+
     fn register_rest(
         &self,
         _ctx: &GearCtx,
@@ -179,5 +213,26 @@ impl RestApiCapability for TokenIssuerGear {
         let router = crate::api::rest::register_routes(router, openapi, svc);
         info!("token-issuer REST routes registered");
         Ok(router)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use toolkit::HealthcheckStatus;
+
+    #[tokio::test]
+    async fn readiness_check_tracks_lifecycle_state() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let check = TokenIssuerReadiness {
+            ready: Arc::clone(&ready),
+        };
+
+        let cold = check.check().await;
+        assert_eq!(cold.status, HealthcheckStatus::Unhealthy);
+        assert_eq!(cold.code.as_deref(), Some("jwks_not_ready"));
+
+        ready.store(true, Ordering::Release);
+        assert_eq!(check.check().await.status, HealthcheckStatus::Healthy);
     }
 }
