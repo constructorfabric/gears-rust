@@ -2,127 +2,52 @@
 
 <!-- toc -->
 
-- [PRD — GitHub Mirror](#prd--github-mirror)
-  - [1. Overview](#1-overview)
-    - [1.1 Purpose](#11-purpose)
-    - [1.2 Background / Problem Statement](#12-background--problem-statement)
-    - [1.3 Goals (Business Outcomes)](#13-goals-business-outcomes)
-    - [1.4 Glossary](#14-glossary)
-  - [2. Actors](#2-actors)
-    - [2.1 Human Actors](#21-human-actors)
-      - [API Consumer](#api-consumer)
-      - [Library Consumer](#library-consumer)
-      - [Python Consumer](#python-consumer)
-      - [CLI Operator](#cli-operator)
-      - [Platform Administrator](#platform-administrator)
-    - [2.2 System Actors](#22-system-actors)
-      - [GitHub REST API](#github-rest-api)
-      - [GitHub GraphQL API](#github-graphql-api)
-      - [Storage Backend](#storage-backend)
-      - [Filesystem Cache](#filesystem-cache)
-      - [Downstream API Client](#downstream-api-client)
-  - [3. Operational Concept \& Environment](#3-operational-concept--environment)
-    - [3.1 Gear-Specific Environment Constraints](#31-gear-specific-environment-constraints)
-  - [4. Scope](#4-scope)
-    - [4.1 In Scope](#41-in-scope)
-    - [4.2 Out of Scope](#42-out-of-scope)
-  - [5. Functional Requirements](#5-functional-requirements)
-    - [5.1 Synchronization Engine](#51-synchronization-engine)
-      - [Session Initialization](#session-initialization)
-      - [Session Resumability](#session-resumability)
-    - [5.2 Entity Coverage](#52-entity-coverage)
-      - [Configurable Entity Scope](#configurable-entity-scope)
-      - [Issue-PR Detection](#issue-pr-detection)
-      - [Security and Dependabot Synchronization](#security-and-dependabot-synchronization)
-      - [Contributor Derivation](#contributor-derivation)
-    - [5.3 Synchronization Quality Attributes](#53-synchronization-quality-attributes)
-      - [Cost-Efficient Synchronization](#cost-efficient-synchronization)
-      - [Memory-Efficient Processing](#memory-efficient-processing)
-      - [Low-Latency Parallel Synchronization](#low-latency-parallel-synchronization)
-      - [Rate-Limit Compliance](#rate-limit-compliance)
-      - [Idempotent and Resumable Operations](#idempotent-and-resumable-operations)
-    - [5.4 Storage and Persistence](#54-storage-and-persistence)
-      - [Raw Response Preservation](#raw-response-preservation)
-      - [Normalized Entity Storage](#normalized-entity-storage)
-      - [Multi-Engine Database Support](#multi-engine-database-support)
-      - [Pluggable Persistence Layer](#pluggable-persistence-layer)
-    - [5.5 Synchronization Phases](#55-synchronization-phases)
-      - [Repo Discovery and Base Metadata](#repo-discovery-and-base-metadata)
-      - [Issue Refinement](#issue-refinement)
-      - [PR Refinement](#pr-refinement)
-      - [Commit and CI Refinement](#commit-and-ci-refinement)
-      - [Synchronization Order and Date Window](#synchronization-order-and-date-window)
-    - [5.6 Completeness Verification](#56-completeness-verification)
-      - [Post-Synchronization Verification](#post-synchronization-verification)
-    - [5.7 Configurable Freshness Policies](#57-configurable-freshness-policies)
-      - [Stale-Aware Refresh](#stale-aware-refresh)
-    - [5.8 REST API — Standard GitHub-Compatible Surface](#58-rest-api--standard-github-compatible-surface)
-      - [GitHub-Compatible Read API](#github-compatible-read-api)
-    - [5.9 REST API — Extended Analytics and Query Surface](#59-rest-api--extended-analytics-and-query-surface)
-      - [Extended Query API](#extended-query-api)
-    - [5.10 Write-Back Operations](#510-write-back-operations)
-      - [Queued Write Operations](#queued-write-operations)
-    - [5.11 Multi-Tenancy and Access Control](#511-multi-tenancy-and-access-control)
-      - [Multi-Tenant Isolation](#multi-tenant-isolation)
-      - [Access Control](#access-control)
-    - [5.12 Token Pool Management](#512-token-pool-management)
-      - [Token Pool Support](#token-pool-support)
-    - [5.13 Public Library API](#513-public-library-api)
-      - [Library API Requirements](#library-api-requirements)
-    - [5.14 Python Bindings](#514-python-bindings)
-      - [PyO3 Python Module](#pyo3-python-module)
-    - [5.15 Logging and Observability](#515-logging-and-observability)
-      - [Layered Structured Logging](#layered-structured-logging)
-      - [Composite Synchronization Summary](#composite-synchronization-summary)
-      - [Progress Counter and Duration](#progress-counter-and-duration)
-    - [5.16 Telemetry](#516-telemetry)
-      - [Synchronization Session Telemetry](#synchronization-session-telemetry)
-    - [5.17 Environment Independence](#517-environment-independence)
-      - [Library Environment Independence](#library-environment-independence)
-    - [5.18 State Change Events](#518-state-change-events)
-      - [Entity Lifecycle Events](#entity-lifecycle-events)
-    - [5.19 CLI Tool](#519-cli-tool)
-      - [CLI Binary Crate](#cli-binary-crate)
-      - [CLI Synchronization Commands](#cli-synchronization-commands)
-      - [CLI Query Commands](#cli-query-commands)
-      - [CLI Management Commands](#cli-management-commands)
-      - [CLI TOML Configuration](#cli-toml-configuration)
-      - [CLI Global Options](#cli-global-options)
-      - [CLI Output Formats](#cli-output-formats)
-      - [CLI Access Control](#cli-access-control)
-  - [6. Non-Functional Requirements](#6-non-functional-requirements)
-    - [6.1 Gear-Specific NFRs](#61-gear-specific-nfrs)
-      - [Reliability and Idempotency](#reliability-and-idempotency)
-      - [Rate-Limit Compliance](#rate-limit-compliance-1)
-      - [Memory Efficiency](#memory-efficiency)
-      - [Code Coverage](#code-coverage)
-      - [Security](#security)
-      - [Parallel Synchronization Efficiency](#parallel-synchronization-efficiency)
-    - [6.2 NFR Exclusions](#62-nfr-exclusions)
-  - [7. Public Library Interfaces](#7-public-library-interfaces)
-    - [7.1 Public API Surface](#71-public-api-surface)
-      - [REST API — GitHub-Compatible](#rest-api--github-compatible)
-      - [REST API — Extended Analytics](#rest-api--extended-analytics)
-      - [Rust Library API](#rust-library-api)
-      - [Rust SDK Client](#rust-sdk-client)
-      - [Python Bindings Module](#python-bindings-module)
-      - [CacheStore Trait](#cachestore-trait)
-      - [MetadataStore Trait](#metadatastore-trait)
-    - [7.2 External Integration Contracts](#72-external-integration-contracts)
-      - [GitHub REST API Contract](#github-rest-api-contract)
-      - [GitHub GraphQL API Contract](#github-graphql-api-contract)
-      - [Mirror API Contract](#mirror-api-contract)
-  - [8. Use Cases](#8-use-cases)
-      - [Full Repository Synchronization](#full-repository-synchronization)
-      - [Incremental Refresh](#incremental-refresh)
-      - [Write-Back Operation](#write-back-operation)
-      - [Dashboard Consuming Mirror API](#dashboard-consuming-mirror-api)
-  - [9. Acceptance Criteria](#9-acceptance-criteria)
-  - [10. Dependencies](#10-dependencies)
-  - [11. Assumptions](#11-assumptions)
-  - [12. Risks](#12-risks)
-  - [13. Open Questions](#13-open-questions)
-  - [14. Traceability](#14-traceability)
+- [1. Overview](#1-overview)
+  - [1.1 Purpose](#11-purpose)
+  - [1.2 Background / Problem Statement](#12-background--problem-statement)
+  - [1.3 Goals (Business Outcomes)](#13-goals-business-outcomes)
+  - [1.4 Glossary](#14-glossary)
+- [2. Actors](#2-actors)
+  - [2.1 Human Actors](#21-human-actors)
+  - [2.2 System Actors](#22-system-actors)
+- [3. Operational Concept & Environment](#3-operational-concept--environment)
+  - [3.1 Gear-Specific Environment Constraints](#31-gear-specific-environment-constraints)
+- [4. Scope](#4-scope)
+  - [4.1 In Scope](#41-in-scope)
+  - [4.2 Out of Scope](#42-out-of-scope)
+- [5. Functional Requirements](#5-functional-requirements)
+  - [5.1 Synchronization Engine](#51-synchronization-engine)
+  - [5.2 Entity Coverage](#52-entity-coverage)
+  - [5.3 Synchronization Quality Attributes](#53-synchronization-quality-attributes)
+  - [5.4 Storage and Persistence](#54-storage-and-persistence)
+  - [5.5 Synchronization Phases](#55-synchronization-phases)
+  - [5.6 Completeness Verification](#56-completeness-verification)
+  - [5.7 Configurable Freshness Policies](#57-configurable-freshness-policies)
+  - [5.8 REST API — Standard GitHub-Compatible Surface](#58-rest-api--standard-github-compatible-surface)
+  - [5.9 REST API — Extended Analytics and Query Surface](#59-rest-api--extended-analytics-and-query-surface)
+  - [5.10 Write-Back Operations](#510-write-back-operations)
+  - [5.11 Multi-Tenancy and Access Control](#511-multi-tenancy-and-access-control)
+  - [5.12 Token Pool Management](#512-token-pool-management)
+  - [5.13 Public Library API](#513-public-library-api)
+  - [5.14 Python Bindings](#514-python-bindings)
+  - [5.15 Logging and Observability](#515-logging-and-observability)
+  - [5.16 Telemetry](#516-telemetry)
+  - [5.17 Environment Independence](#517-environment-independence)
+  - [5.18 State Change Events](#518-state-change-events)
+  - [5.19 CLI Tool](#519-cli-tool)
+- [6. Non-Functional Requirements](#6-non-functional-requirements)
+  - [6.1 Gear-Specific NFRs](#61-gear-specific-nfrs)
+  - [6.2 NFR Exclusions](#62-nfr-exclusions)
+- [7. Public Library Interfaces](#7-public-library-interfaces)
+  - [7.1 Public API Surface](#71-public-api-surface)
+  - [7.2 External Integration Contracts](#72-external-integration-contracts)
+- [8. Use Cases](#8-use-cases)
+- [9. Acceptance Criteria](#9-acceptance-criteria)
+- [10. Dependencies](#10-dependencies)
+- [11. Assumptions](#11-assumptions)
+- [12. Risks](#12-risks)
+- [13. Open Questions](#13-open-questions)
+- [14. Traceability](#14-traceability)
 
 <!-- /toc -->
 
@@ -290,6 +215,7 @@ A full local mirror that synchronizes incrementally with GitHub, serves a GitHub
 
 - Git repository cloning or source-code analysis
 - GitHub App authentication (PAT-only for v1.0)
+- GitHub mirror sync workers scalability across nodes
 - Non-GitHub forges (GitLab, Bitbucket, Gitea)
 - Dedicated people/user collection via user-profile endpoints (deferred; v1.0 derives contributors from synchronized entities only)
 - GitHub webhook ingestion or real-time event streaming (future consideration)
@@ -421,6 +347,8 @@ All synchronization operations **MUST** be idempotent — running the same synch
 The system **MUST** preserve every raw API response before normalization, together with its metadata (URL, HTTP status, conditional-request validators, fetch timestamp, content hash, schema version, rate-limit metadata, pagination metadata, and compression algorithm). Raw responses **MUST** be available for re-normalization, debugging, and audit.
 
 The raw-response store **MUST** support configurable body compression modes: `none`, `gzip`, and `zstd`. The content hash **MUST** be computed over the uncompressed response body so integrity checks are independent of the chosen compression mode.
+
+The raw-response store **MUST** use visibility-aware cache partitioning. Public repository responses **MAY** be cached once per canonical org/repo/request key and reused across tenants and tokens. Private or visibility-unknown repository responses **MUST** be cached in a tenant-scoped partition and **MUST NOT** be reused across tenants. API consumers **MUST NOT** receive raw cache entries directly; tenant-specific access is enforced by the GitHub Mirror API over normalized data.
 
 - **Rationale**: Raw responses are the source of truth; normalized data can always be regenerated from them.
 - **Actors**: `cpt-cf-github-mirror-actor-lib-consumer`, `cpt-cf-github-mirror-actor-storage-backend`
@@ -605,7 +533,7 @@ Each operation **MUST** be enqueued in a durable queue with a unique operation I
 
 - [ ] `p1` - **ID**: `cpt-cf-github-mirror-fr-multi-tenancy`
 
-The gear **MUST** implement standard gears multi-tenancy: tenant-scoped data isolation in the database, tenant-aware API routing, and tenant-scoped configuration (synchronization targets, token pools, cache policies). Each tenant **MUST** only access repositories and data belonging to that tenant.
+The gear **MUST** implement standard gears multi-tenancy: tenant-scoped data isolation in the database, tenant-aware API routing, and tenant-scoped configuration (synchronization targets, token pools, cache policies). Each tenant **MUST** only access repositories and data authorized for that tenant. Public repository raw cache entries **MAY** be shared across tenants, but private or visibility-unknown repository raw cache entries **MUST** remain tenant-partitioned.
 
 - **Rationale**: Server deployments serve multiple teams or organizations; data isolation is a security and operational requirement.
 - **Actors**: `cpt-cf-github-mirror-actor-platform-admin`, `cpt-cf-github-mirror-actor-api-consumer`
@@ -614,7 +542,7 @@ The gear **MUST** implement standard gears multi-tenancy: tenant-scoped data iso
 
 - [ ] `p1` - **ID**: `cpt-cf-github-mirror-fr-access-control`
 
-The gear **MUST** implement standard gears access control for both the HTTP server and the CLI tool. API endpoints **MUST** enforce authentication and authorization consistent with the platform's security model. The CLI **MUST** support the same access control model adapted for command-line usage.
+The gear **MUST** implement standard gears access control for both the HTTP server and the CLI tool. API endpoints **MUST** enforce authentication and authorization consistent with the platform's security model. The CLI **MUST** support the same access control model adapted for command-line usage. The raw cache **MUST NOT** be exposed as a consumer-facing authorization surface; all consumer reads are mediated by GitHub Mirror API tenancy and access checks.
 
 - **Rationale**: Both server and CLI need access control to prevent unauthorized data access.
 - **Actors**: `cpt-cf-github-mirror-actor-platform-admin`, `cpt-cf-github-mirror-actor-api-consumer`, `cpt-cf-github-mirror-actor-cli-operator`
@@ -878,7 +806,7 @@ The library crate **MUST** achieve at least 85% line coverage. Combined Rust + P
 
 - [ ] `p1` - **ID**: `cpt-cf-github-mirror-nfr-security`
 
-The system **MUST NOT** log, persist, or expose GitHub tokens in any output, cache file, database record, telemetry log, or error message. Tokens **MUST** be provided by the caller; the library **MUST NOT** read tokens from environment variables or configuration files.
+The system **MUST NOT** log, persist, or expose GitHub tokens in any output, cache file, database record, telemetry log, or error message. Tokens **MUST** be provided by the caller; the library **MUST NOT** read tokens from environment variables or configuration files. Private or visibility-unknown repository raw response bodies and validators **MUST NOT** cross tenant cache partitions.
 
 When a platform credential store gear is available, the gear **MUST** use it for storing and retrieving GitHub tokens and other secrets. The gear **MUST NOT** implement its own credential storage — it **MUST** delegate to the existing credential store gear.
 
@@ -955,7 +883,7 @@ The system **MUST** support parallel synchronization of multiple repositories wi
 
 - **Type**: Rust trait
 - **Stability**: unstable (pre-1.0)
-- **Description**: Async trait defining `get`, `put`, and `metadata` operations for cache backends. Implemented by filesystem, database, hybrid, and plugin cache modules.
+- **Description**: Async trait defining visibility-aware `get`, validator-only `peek`, `put`, and metadata operations for cache backends. Public repositories use shared org/repo/request cache keys; private or visibility-unknown repositories use tenant-scoped cache keys. Implemented by filesystem, database, hybrid, and plugin cache modules.
 - **Breaking Change Policy**: Semver; trait changes are breaking.
 
 #### MetadataStore Trait
