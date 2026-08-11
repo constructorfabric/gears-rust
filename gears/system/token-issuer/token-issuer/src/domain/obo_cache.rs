@@ -10,9 +10,10 @@
 //! break the byte-identical guarantee. If the cached OBO has expired but its
 //! cap is still acceptable, the next re-mint replaces it in place.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{Mutex, RwLock};
 use toolkit_macros::domain_model;
@@ -54,17 +55,38 @@ struct Cached {
 /// Per-key slot guarding the read-check-mint-insert sequence (empty until first mint).
 type Slot = Arc<Mutex<Option<Cached>>>;
 
+/// Maximum number of due deadline records processed by one cleanup pass.
+const CLEANUP_BATCH_SIZE: usize = 64;
+/// Run bounded cleanup at least once per this many lookups, including hits.
+const CLEANUP_INTERVAL: u64 = 16;
+
+#[derive(Clone)]
+struct DeadlineRecord {
+    key: OboCacheKey,
+    /// `None` indexes a newly installed empty slot; `Some` validates a value.
+    expected_deadline: Option<i64>,
+}
+
+#[derive(Default)]
+struct CacheState {
+    slots: HashMap<OboCacheKey, Slot>,
+    /// Records are keyed by retry time, separately from their real deadline.
+    deadlines: BTreeMap<i64, Vec<DeadlineRecord>>,
+}
+
 /// Idempotency cache for OBO tokens.
 ///
 /// Each key owns its own [`Mutex`] so the read-check-mint-insert sequence is
 /// atomic per key: concurrent re-mints for the same `(cap_jti, scope_hash)`
 /// serialize on that lock and the first mint's token is reused, preserving the
-/// idempotency guarantee. Distinct keys never contend. Cap-expired entries are
-/// pruned on each call so the map stays bounded under steady traffic.
+/// idempotency guarantee. Distinct keys can briefly contend while inserting
+/// slots or performing bounded deadline cleanup, but signing is never performed
+/// under the global state lock.
 #[domain_model]
 #[derive(Default)]
 pub struct OboCache {
-    map: RwLock<HashMap<OboCacheKey, Slot>>,
+    state: RwLock<CacheState>,
+    operations: AtomicU64,
 }
 
 impl OboCache {
@@ -72,6 +94,70 @@ impl OboCache {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Removes a bounded number of entries past their cap acceptance horizon.
+    /// Records retain the value's real deadline while busy retries move to a
+    /// later scheduling key, preventing one full busy batch from starving later
+    /// due records. `None` records reclaim failed or cancelled pending slots.
+    fn cleanup_expired(state: &mut CacheState, now: i64) {
+        enum Action {
+            Remove,
+            Retry,
+            Discard,
+        }
+
+        let retry_at = now.saturating_add(1);
+        for _ in 0..CLEANUP_BATCH_SIZE {
+            let Some(mut entry) = state.deadlines.first_entry() else {
+                break;
+            };
+            if *entry.key() > now {
+                break;
+            }
+            let Some(record) = entry.get_mut().pop() else {
+                entry.remove();
+                continue;
+            };
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+
+            let action = match state.slots.get(&record.key) {
+                None => Action::Discard,
+                Some(slot) if Arc::strong_count(slot) > 1 => Action::Retry,
+                Some(slot) => match slot.try_lock() {
+                    Err(_) => Action::Retry,
+                    Ok(inner) => match record.expected_deadline {
+                        None if inner.is_none() => Action::Remove,
+                        Some(expected)
+                            if inner.as_ref().is_some_and(|cached| {
+                                cached.cap_valid_until == expected && cached.cap_valid_until <= now
+                            }) =>
+                        {
+                            Action::Remove
+                        }
+                        _ => Action::Discard,
+                    },
+                },
+            };
+
+            match action {
+                Action::Remove => {
+                    state.slots.remove(&record.key);
+                }
+                Action::Retry => state.deadlines.entry(retry_at).or_default().push(record),
+                Action::Discard => {}
+            }
+        }
+    }
+
+    async fn cleanup_if_due(&self, now: i64) {
+        let operation = self.operations.fetch_add(1, Ordering::Relaxed);
+        if operation.wrapping_add(1).is_multiple_of(CLEANUP_INTERVAL) {
+            let mut state = self.state.write().await;
+            Self::cleanup_expired(&mut state, now);
+        }
     }
 
     /// Returns the cached OBO token for `key` while it is still valid; otherwise
@@ -98,16 +184,36 @@ impl OboCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<(String, i64), E>>,
     {
-        let slot = {
-            let mut map = self.map.write().await;
-            // Bounded growth: drop entries past their cap's Gate-1 acceptance
-            // horizon. Skip slots currently locked (in-flight mint or live reader).
-            map.retain(|_, v| {
-                v.try_lock().map_or(true, |inner| {
-                    inner.as_ref().is_none_or(|c| c.cap_valid_until > now)
-                })
-            });
-            Arc::clone(map.entry(key.clone()).or_default())
+        // Amortized cleanup runs before acquiring a slot, so hit-only traffic
+        // also drives bounded reclamation without ever scanning the slot map.
+        self.cleanup_if_due(now).await;
+
+        // Existing-key lookups clone the slot under a read lock. Only a missing
+        // key needs the global write lock to atomically install both the empty
+        // slot and its provisional cleanup record.
+        let existing = {
+            let state = self.state.read().await;
+            state.slots.get(key).cloned()
+        };
+        let slot = if let Some(slot) = existing {
+            slot
+        } else {
+            let mut state = self.state.write().await;
+            if let Some(slot) = state.slots.get(key) {
+                Arc::clone(slot)
+            } else {
+                let slot = Arc::new(Mutex::new(None));
+                state.slots.insert(key.clone(), Arc::clone(&slot));
+                state
+                    .deadlines
+                    .entry(now)
+                    .or_default()
+                    .push(DeadlineRecord {
+                        key: key.clone(),
+                        expected_deadline: None,
+                    });
+                slot
+            }
         };
 
         // Per-key lock: the read-check-mint-insert below is atomic for this key.
@@ -118,12 +224,33 @@ impl OboCache {
         {
             return Ok(c.jwt.clone());
         }
+
+        // Process only a fixed number of indexed deadlines, and release the
+        // state lock before signing so distinct-key misses do not serialize.
+        {
+            let mut state = self.state.write().await;
+            Self::cleanup_expired(&mut state, now);
+        }
         let (jwt, obo_exp) = mint().await?;
+
+        // Lock ordering is slot then state. Cleanup takes state but only uses
+        // non-awaiting try_lock on slots, so it cannot deadlock this path. Once
+        // the state lock is acquired, publication and final indexing are
+        // synchronous: cancellation cannot expose an unindexed value.
+        let mut state = self.state.write().await;
         *inner = Some(Cached {
             jwt: jwt.clone(),
             obo_exp,
             cap_valid_until,
         });
+        state
+            .deadlines
+            .entry(cap_valid_until)
+            .or_default()
+            .push(DeadlineRecord {
+                key: key.clone(),
+                expected_deadline: Some(cap_valid_until),
+            });
         Ok(jwt)
     }
 }

@@ -541,9 +541,9 @@ server-side; the public RFC-9457 `detail` is the fixed string `token signing tem
 
 - **Contract**: `cpt-cf-token-issuer-interface-signing-port`
 
-The gear never speaks to the backend directly. The plugin owns the protocol, the credentials, and the
-`transit_mount` path; the gear supplies a key name and signing input and receives a signature plus the
-key version used.
+The gear never speaks to the backend directly. The signing plugin owns backend routing and
+configuration, including protocol, credentials, and mount or path selection. The gear supplies the
+logical key name and signing input and receives the signature plus the key version used.
 
 #### mTLS terminator
 
@@ -806,7 +806,6 @@ token-issuer:
   obo_audience: public-api
   grant_ttl_secs: 300
   grant_key_name: grant-token-sign
-  transit_mount: transit
   obo:
     enabled: false
 ```
@@ -829,9 +828,8 @@ saturating `exp`.
 Issuer identifiers derive as `{issuer_base_url}/issuers/{cap|grant|obo}`, tolerating a trailing slash,
 so the `iss` claim and the discovery path cannot disagree.
 
-One caveat on `transit_mount`: it is accepted and validated as configuration, but **no code in this
-gear reads it** — the signing plugin owns the mount path. It is carried here for operator-facing
-completeness, and changing it has no effect on the issuer's own behaviour.
+Backend mount and path configuration belongs to the selected signing plugin and is intentionally
+absent from token-issuer configuration.
 
 ### 4.3 Decisions that warrant an ADR
 

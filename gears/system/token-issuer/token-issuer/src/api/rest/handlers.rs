@@ -92,8 +92,9 @@ pub async fn obo_discovery(
 /// forwarded header (e.g. `X-Forwarded-Client-Cert`), which a caller can spoof.
 ///
 /// # Errors
-/// Maps the [`DomainError`] from `remint_obo` to RFC 9457: `401` (cap provenance
-/// / expiry), `403` (peer / adapter / scope / loop-guard), `404` (OBO disabled).
+/// Maps the [`DomainError`] from `remint_obo` to RFC 9457: `400` (malformed
+/// scope request), `401` (cap provenance / expiry), `403` (peer / adapter /
+/// scope / loop-guard), `404` (OBO disabled), or `503` (issuer not ready).
 pub async fn remint_obo(
     Extension(svc): Extension<Arc<Service>>,
     headers: axum::http::HeaderMap,
@@ -141,10 +142,52 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Result<String, DomainError> 
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| DomainError::cap_invalid("missing Authorization header"))?;
-    raw.strip_prefix("Bearer ")
-        .or_else(|| raw.strip_prefix("bearer "))
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| DomainError::cap_invalid("Authorization is not a Bearer token"))
+    let (scheme, token) = raw
+        .split_once(' ')
+        .ok_or_else(|| DomainError::cap_invalid("Authorization is not a Bearer token"))?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return Err(DomainError::cap_invalid(
+            "Authorization is not a Bearer token",
+        ));
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(DomainError::cap_invalid(
+            "Authorization is not a Bearer token",
+        ));
+    }
+    Ok(token.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bearer_token;
+
+    #[test]
+    fn bearer_scheme_is_ascii_case_insensitive() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("BEARER header.payload.signature"),
+        );
+
+        assert!(matches!(
+            bearer_token(&headers).as_deref(),
+            Ok("header.payload.signature")
+        ));
+    }
+
+    #[test]
+    fn bearer_extractor_rejects_missing_malformed_and_empty_headers() {
+        assert!(bearer_token(&axum::http::HeaderMap::new()).is_err());
+
+        for value in ["Bearer", "Basic token", "Bearer   ", "Bearer\ttoken"] {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_static(value),
+            );
+            assert!(bearer_token(&headers).is_err(), "accepted {value:?}");
+        }
+    }
 }

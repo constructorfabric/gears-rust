@@ -139,9 +139,11 @@ fn register_obo_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router 
         .json_request::<RemintRequest>(openapi, "Optional requested scope subset")
         .handler(handlers::remint_obo)
         .json_response_with_schema::<RemintResponse>(openapi, StatusCode::OK, "Minted OBO token")
+        .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)
+        .error_503(openapi)
         .register(router, openapi)
 }
 

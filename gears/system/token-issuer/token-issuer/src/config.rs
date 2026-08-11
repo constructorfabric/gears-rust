@@ -46,8 +46,6 @@ pub struct TokenIssuerConfig {
     /// Transit key name used to sign grant tokens (`grant+jwt`). One class, one
     /// issuer, one Transit key — never shared with `cap`/`obo`.
     pub grant_key_name: String,
-    /// `OpenBao` Transit mount path the signing plugin uses.
-    pub transit_mount: String,
     /// OBO feature gate.
     pub obo: OboGate,
 }
@@ -77,7 +75,6 @@ impl Default for TokenIssuerConfig {
             obo_audience: "public-api".to_owned(),
             grant_ttl_secs: 300,
             grant_key_name: "grant-token-sign".to_owned(),
-            transit_mount: "transit".to_owned(),
             obo: OboGate::default(),
         }
     }

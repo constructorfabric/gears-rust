@@ -855,6 +855,21 @@ async fn mint_grant_rejects_empty_operations() {
     ));
 }
 
+#[test]
+fn grant_operation_count_is_bounded() {
+    let mut req = sample_grant_req();
+    req.operations = (0..MAX_GRANT_OPERATIONS)
+        .map(|index| format!("operation-{index}"))
+        .collect();
+    assert!(validate_grant_request(&req).is_ok());
+
+    req.operations.push("one-too-many".to_owned());
+    assert!(matches!(
+        validate_grant_request(&req),
+        Err(TokenIssuerError::InvalidRequest { .. })
+    ));
+}
+
 #[tokio::test]
 async fn mint_grant_rejects_ttl_above_hard_limit() {
     let svc = pubkey_service(Arc::new(PubKeySigner::new(1)));

@@ -203,6 +203,36 @@ async fn obo_jwks_served_when_enabled() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+#[test]
+fn remint_openapi_registers_all_canonical_errors() {
+    let svc = Arc::new(
+        Service::new(
+            Arc::new(PubKeySigner::new()),
+            Arc::new(NoPeer),
+            Arc::new(EmptyRegistry),
+            &config(true),
+            Arc::new(TokenIssuerMetrics::from_global()),
+        )
+        .unwrap(),
+    );
+    let openapi = OpenApiRegistryImpl::new();
+    let _router = register_routes(Router::new(), &openapi, svc);
+    let spec = openapi
+        .operation_specs
+        .get("POST:/internal/v1/issuers/obo/tokens")
+        .expect("re-mint operation registered");
+
+    for status in [400, 401, 403, 404, 503] {
+        assert!(
+            spec.responses
+                .iter()
+                .any(|response| response.status == status
+                    && response.content_type == "application/problem+json"),
+            "missing canonical {status} response"
+        );
+    }
+}
+
 #[tokio::test]
 async fn remint_without_bearer_is_401() {
     let r = router(true).await;

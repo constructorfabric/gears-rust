@@ -111,8 +111,8 @@ the issuer process never sees them.
 **ID**: `cpt-cf-token-issuer-actor-operator`
 
 - **Role**: Configures the gear per deployment — the public issuer base URL, the per-class signing key
-  names and Transit mount, token lifetimes, clock-skew allowance, the signing-plugin vendor, and
-  whether OBO issuance is enabled at all.
+  names, token lifetimes, clock-skew allowance, the signing-plugin vendor, and whether OBO issuance is
+  enabled at all.
 - **Needs**: Configuration that fails fast and loudly on a nonsensical combination rather than
   producing tokens with unsafe lifetimes; a deployment that refuses traffic rather than serving an
   unverifiable JWKS.
@@ -1097,9 +1097,6 @@ the clock-skew tail.
   deployment, and should it be configurable?
 - Should the gear expose a way for operators to force a JWKS rebuild without a restart, for a rotation
   that the mint path has not yet observed?
-- `transit_mount` is accepted and validated as configuration but is never read by this gear — the
-  signing plugin owns the mount path. Should it be removed from this gear's config, or wired through to
-  the plugin so the value has an effect?
 - Should OBO retries require sticky routing, or should a shared idempotency store be introduced if
   cluster-wide byte identity becomes a product requirement?
 - `validate_grant_request` applies the field contract to `audience`, `resource_name`, `resource_type`,

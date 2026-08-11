@@ -20,8 +20,18 @@ fn default_config_values() {
     assert_eq!(c.obo_audience, "public-api");
     assert_eq!(c.grant_ttl_secs, 300);
     assert_eq!(c.grant_key_name, "grant-token-sign");
-    assert_eq!(c.transit_mount, "transit");
     assert!(!c.obo.enabled);
+}
+
+#[test]
+fn legacy_transit_mount_is_rejected() {
+    let result = serde_json::from_value::<TokenIssuerConfig>(serde_json::json!({
+        "transit_mount": "transit"
+    }));
+    assert!(matches!(
+        result,
+        Err(error) if error.to_string().contains("unknown field `transit_mount`")
+    ));
 }
 
 #[test]

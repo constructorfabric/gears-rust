@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use p256::pkcs8::{EncodePublicKey, LineEnding};
@@ -224,20 +225,17 @@ async fn tampered_signature_fails_verification() {
     )
     .expect("decoding key");
 
-    // Flip one character in the signature segment (third part).
+    // Flip a significant bit in the raw ES256 signature, then encode it
+    // canonically. Mutating the final base64url character could change only
+    // unused padding bits and leave the decoded signature unchanged.
     let mut parts: Vec<String> = jwt.split('.').map(str::to_owned).collect();
     assert_eq!(parts.len(), 3, "JWT has three segments");
-    let sig = &parts[2];
-    let last = sig.chars().next_back().expect("non-empty signature");
-    // Pick a different base64url char so the signature really changes.
-    let replacement = if last == 'A' { 'B' } else { 'A' };
-    let tampered_sig: String = {
-        let mut s: Vec<char> = sig.chars().collect();
-        let n = s.len();
-        s[n - 1] = replacement;
-        s.into_iter().collect()
-    };
-    parts[2] = tampered_sig;
+    let mut signature = URL_SAFE_NO_PAD
+        .decode(&parts[2])
+        .expect("decode ES256 signature");
+    assert_eq!(signature.len(), 64, "ES256 signature is raw r||s");
+    signature[32] ^= 0x01;
+    parts[2] = URL_SAFE_NO_PAD.encode(signature);
     let tampered = parts.join(".");
 
     // Sanity: header still decodes (we only touched the signature).

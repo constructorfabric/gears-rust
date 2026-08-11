@@ -775,8 +775,9 @@ impl Service {
 }
 
 /// Validates a [`MintGrantRequest`] before minting: bounded/charset-safe audience,
-/// resource name, and resource type, plus a non-empty operation set with each id
-/// bounded/charset-safe. Mirrors [`validate_mint_request`]'s posture.
+/// resource name, and resource type, plus an operation set of at most
+/// [`MAX_GRANT_OPERATIONS`] entries with each id bounded/charset-safe. Mirrors
+/// [`validate_mint_request`]'s posture.
 ///
 /// # Errors
 /// Returns [`TokenIssuerError::InvalidRequest`] on the first violation.
@@ -798,6 +799,11 @@ fn validate_grant_request(req: &MintGrantRequest) -> Result<(), TokenIssuerError
             reason: "operations must not be empty".to_owned(),
         });
     }
+    if req.operations.len() > MAX_GRANT_OPERATIONS {
+        return Err(TokenIssuerError::InvalidRequest {
+            reason: format!("operations must contain at most {MAX_GRANT_OPERATIONS} entries"),
+        });
+    }
     if req.operations.iter().any(|op| !is_valid_field(op)) {
         return Err(reject("operation"));
     }
@@ -813,6 +819,9 @@ fn validate_token_ttl(ttl_secs: u64) -> Result<(), TokenIssuerError> {
     }
     Ok(())
 }
+
+/// Maximum number of operations accepted in one grant mint request.
+const MAX_GRANT_OPERATIONS: usize = 64;
 
 /// Max length for free-form mint-request string fields (cap + grant).
 const MAX_FIELD_LEN: usize = 256;

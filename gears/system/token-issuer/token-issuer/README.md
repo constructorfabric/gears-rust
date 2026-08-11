@@ -83,7 +83,6 @@ token-issuer:
   obo_audience: public-api
   grant_ttl_secs: 300
   grant_key_name: grant-token-sign
-  transit_mount: transit
   obo:
     enabled: false
 ```
