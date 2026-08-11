@@ -1,0 +1,64 @@
+[package]
+name = "cf-gears-token-issuer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Token issuer gear - mints signed ES256 capability tokens and serves JWKS/discovery"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["authentication"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "token_issuer"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+token-issuer-sdk = { package = "cf-gears-token-issuer-sdk", version = "0.1.0", path = "../token-issuer-sdk" }
+types-registry-sdk = { workspace = true }
+# Full types-registry gear crate for the `deps = [types_registry]` gear-macro arg
+# (force-linked via the macro's `::types_registry` re-export).
+types-registry = { workspace = true }
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+p256 = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+opentelemetry = { workspace = true, features = ["metrics"] }
+# Cap-token (re-mint) ES256 verification. The jsonwebtoken CryptoProvider comes
+# from the workspace dep's single backend (`aws_lc_rs`, matching
+# oidc-authn-plugin). Do NOT add `rust_crypto` here: enabling a second backend
+# makes jsonwebtoken 10.4 unable to auto-select a provider and panics on the
+# first verify in the full core-server build (both backends unified).
+jsonwebtoken = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+# Infra selector tests mock the types-registry client + scoped plugin clients.
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+# Local ES256 test signer: `ecdsa` for SigningKey + signature::Signer; `pem`/
+# `pkcs8` come from the workspace base feature set.
+p256 = { workspace = true, features = ["ecdsa"] }
+rand_core = { workspace = true, features = ["getrandom"] }
+# Route-level tests drive the registered axum Router via `oneshot`.
+tower = { workspace = true }

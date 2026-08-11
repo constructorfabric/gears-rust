@@ -114,6 +114,8 @@ members = [
     "gears/bss/ledger/ledger-sdk",
     "gears/bss/libs/coord",
     "gears/system/event-broker/event-broker-sdk",
+    "gears/system/token-issuer/token-issuer-sdk",
+    "gears/system/token-issuer/token-issuer",
 ]
 exclude = ["tools/fuzz"]
 resolver = "3"
@@ -294,6 +296,7 @@ credstore = { package = "cf-gears-credstore", version = "0.2.2", path = "gears/c
 oagw = { package = "cf-gears-oagw", version = "0.3.3", path = "gears/system/oagw/oagw" }
 account-management = { package = "cf-gears-account-management", version = "0.4.3", path = "gears/system/account-management/account-management" }
 usage-collector = { package = "cf-gears-usage-collector", version = "0.2.3", path = "gears/system/usage-collector/usage-collector" }
+token-issuer = { package = "cf-gears-token-issuer", version = "0.1.0", path = "gears/system/token-issuer/token-issuer" }
 
 cf-gears-cluster-sdk = { version = "0.1.3", path = "gears/system/cluster/cluster-sdk" }
 cf-gears-cluster-conformance = { version = "0.1.3", path = "gears/system/cluster/cluster-conformance" }
@@ -307,6 +310,7 @@ authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.1
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.2", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.5", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.1", path = "gears/system/usage-collector/usage-collector-sdk" }
+token-issuer-sdk = { package = "cf-gears-token-issuer-sdk", version = "0.1.0", path = "gears/system/token-issuer/token-issuer-sdk" }
 
 # BSS gears (ported from vhp-core)
 bss-ledger-sdk = { path = "gears/bss/ledger/ledger-sdk" }
@@ -509,6 +513,11 @@ time = { version = "0.3.47", features = ["serde", "formatting", "parsing"] }
 # Cryptographic utilities
 sha2 = "0.10"
 hex = "0.4"
+# NIST P-256 key/JWK handling for the token-issuer ES256 signing path. The
+# `ecdsa` feature is opt-in per crate (dev-only local test signer); production
+# signing happens in the credstore signing plugin, not here.
+p256 = { version = "0.13", features = ["pem", "pkcs8"] }
+rand_core = { version = "0.6", default-features = false }
 
 # JWT and authentication
 jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs", "use_pem"] }
