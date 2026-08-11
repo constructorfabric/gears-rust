@@ -1,33 +1,32 @@
 <!--
 Created:  2026-05-14 by Constructor Tech
-Updated:  2026-05-20 by Constructor Tech
+Updated:  2026-08-11 by Constructor Tech
 -->
 # Feature: Gear Scaffold
 
 
 <!-- toc -->
 
-- [Feature: Gear Scaffold](#feature-gear-scaffold)
-  - [Feature Status](#feature-status)
-  - [1. Feature Context](#1-feature-context)
-    - [1.1 Overview](#11-overview)
-    - [1.2 Purpose](#12-purpose)
-    - [1.3 Actors](#13-actors)
-    - [1.4 References](#14-references)
-  - [2. Actor Flows (CDSL)](#2-actor-flows-cdsl)
-  - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
-    - [ToolKit Gear Registration](#toolkit-gear-registration)
-    - [Smoke Test — Gear Loads](#smoke-test--gear-loads)
-  - [4. States (CDSL)](#4-states-cdsl)
-  - [5. Definitions of Done](#5-definitions-of-done)
-    - [Cargo Crate Wired Into Workspace](#cargo-crate-wired-into-workspace)
-    - [ToolKit Gear Declaration](#toolkit-gear-declaration)
-    - [Layer Skeleton Directories](#layer-skeleton-directories)
-    - [Baseline DomainError Enum](#baseline-domainerror-enum)
-    - [Gear Registers In Example Server](#gear-registers-in-example-server)
-    - [Smoke Test](#smoke-test)
-  - [6. Acceptance Criteria](#6-acceptance-criteria)
-  - [7. Non-Functional Considerations](#7-non-functional-considerations)
+- [Feature Status](#feature-status)
+- [1. Feature Context](#1-feature-context)
+  - [1.1 Overview](#11-overview)
+  - [1.2 Purpose](#12-purpose)
+  - [1.3 Actors](#13-actors)
+  - [1.4 References](#14-references)
+- [2. Actor Flows (CDSL)](#2-actor-flows-cdsl)
+- [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
+  - [ToolKit Gear Registration](#toolkit-gear-registration)
+  - [Smoke Test — Gear Loads](#smoke-test--gear-loads)
+- [4. States (CDSL)](#4-states-cdsl)
+- [5. Definitions of Done](#5-definitions-of-done)
+  - [Cargo Crate Wired Into Workspace](#cargo-crate-wired-into-workspace)
+  - [ToolKit Gear Declaration](#toolkit-gear-declaration)
+  - [Layer Skeleton Directories](#layer-skeleton-directories)
+  - [Baseline DomainError Enum](#baseline-domainerror-enum)
+  - [Gear Registers In Example Server](#gear-registers-in-example-server)
+  - [Smoke Test](#smoke-test)
+- [6. Acceptance Criteria](#6-acceptance-criteria)
+- [7. Non-Functional Considerations](#7-non-functional-considerations)
 
 <!-- /toc -->
 

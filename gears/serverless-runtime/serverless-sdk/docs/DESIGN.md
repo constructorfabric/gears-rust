@@ -1,6 +1,6 @@
 <!--
 Created: 2026-07-30 by Constructor Tech
-Updated: 2026-07-30 by Constructor Tech
+Updated: 2026-08-11 by Constructor Tech
 -->
 
 # Technical Design — CF/Gears Serverless Runtime SDK
@@ -432,7 +432,8 @@ address, each for a stated reason rather than by oversight:
 
 - **Requirements**: [PRD.md](./PRD.md)
 - **ADRs**: none of this crate's own yet; host ADRs are referenced inline above
-- **Features**: not yet written
+- **Decomposition**: [DECOMPOSITION.md](./DECOMPOSITION.md)
+- **Feature artifacts**: intentionally deferred until the decomposition is accepted
 - **Gear design**: [`../../docs/DESIGN.md`](../../docs/DESIGN.md),
   [`../../docs/DESIGN_RUST_TYPES.md`](../../docs/DESIGN_RUST_TYPES.md)
 - **Plugin contract**: owned by a separate plugin-facing SDK, not yet designed. Intentionally

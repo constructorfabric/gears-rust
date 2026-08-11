@@ -1,6 +1,6 @@
 <!--
 Created:  2026-05-14 by Constructor Tech
-Updated:  2026-05-20 by Constructor Tech
+Updated:  2026-08-11 by Constructor Tech
 -->
 # Decomposition: Serverless Runtime
 
@@ -29,12 +29,12 @@ Updated:  2026-05-20 by Constructor Tech
 
 The Serverless Runtime is decomposed into four crates that map directly to the host/SDK/plugin boundary established by [ADR-0005](../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md) (Thin Host Gear, Fat Runtime Plugins), the contract crate having since been split by audience:
 
-- `serverless-runtime/serverless-sdk/` — **Consumer contract crate** (`serverless-runtime-sdk`). Defines the client trait other gears use to invoke callables and observe runs, the value types it exchanges, and its error taxonomy. Carries nothing plugin-facing. Details live in `serverless-sdk/docs/PRD.md` + `DESIGN.md`.
+- `serverless-runtime/serverless-sdk/` — **Consumer contract crate** (`serverless-runtime-sdk`). Defines the client trait other gears use to invoke callables and observe runs, the value types it exchanges, and its error taxonomy. Carries nothing plugin-facing. Details live in [`serverless-sdk/docs/PRD.md`](../../serverless-sdk/docs/PRD.md), [`DESIGN.md`](../../serverless-sdk/docs/DESIGN.md), and [`DECOMPOSITION.md`](../../serverless-sdk/docs/DECOMPOSITION.md).
 - `serverless-runtime/serverless-plugin-sdk/` — **Plugin contract crate** (`serverless-runtime-plugin-sdk`). Will define the plugin trait, the notification-only plugin → host event port, the authoring traits, and the adapter conformance harness. Not yet designed: the directory currently holds only `BACKUP-pre-split-sdk-docs/`, a backup of the pre-split SDK documents kept for reference and excluded from validation.
 - `serverless-runtime/` — **Host implementation crate** (this DECOMPOSITION). Owns Function Registry, Tenant Policy Manager, REST + JSON-RPC + MCP transports (per [ADR-0002](../../docs/ADR/0002-cpt-cf-serverless-runtime-adr-jsonrpc-mcp-protocol-surfaces-v1.md)), Plugin Dispatcher + invocation index, audit aggregation, and RFC-9457 error mapping. The host MUST NOT depend on any plugin crate at compile time.
 - `plugins/serverless-runtime-temporal-plugin/` — **First runtime plugin**, owning the fat plugin tier per ADR-0005. Uses Temporal as the durable execution backend ([ADR-0004](../../docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md)) and the CNCF Serverless Workflow Spec as DSL ([ADR-0003](../../docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md)). Future plugins (Lambda, Azure Durable, Starlark) will sit alongside as siblings under `plugins/`.
 
-This DECOMPOSITION covers **only the host implementation crate** (`serverless-runtime/`). The two contract crates — `serverless-runtime-sdk/` (consumer) and `serverless-runtime-plugin-sdk/` (plugin) — and the Temporal plugin crate (`plugins/serverless-runtime-temporal-plugin/`) are tracked as separate work items and will get their own DECOMPOSITION documents inside their respective crate directories once their docs trees are populated. Consumer-SDK PRD + DESIGN live at `gears/serverless-runtime/serverless-sdk/docs/`; that crate's own DECOMPOSITION has not yet been written. The plugin-facing SDK has no documents yet — `gears/serverless-runtime/serverless-plugin-sdk/BACKUP-pre-split-sdk-docs/` holds only a backup of the pre-split SDK documents, kept for reference and excluded from validation.
+This DECOMPOSITION covers **only the host implementation crate** (`serverless-runtime/`). The consumer SDK is tracked separately in its own [`DECOMPOSITION.md`](../../serverless-sdk/docs/DECOMPOSITION.md); its FEATURE artifacts are intentionally deferred until that decomposition is accepted. The plugin-facing SDK and Temporal plugin remain separate future work items and will get their own DECOMPOSITION documents when their docs trees are populated. The plugin-facing SDK has no current documents — `gears/serverless-runtime/serverless-plugin-sdk/BACKUP-pre-split-sdk-docs/` holds only a backup of the pre-split SDK documents, kept for reference and excluded from validation.
 
 The 8 host features below are **ordered by core-first** (§2.1–2.4) followed by **additional layers** (§2.5–2.8: alternative transports, governance, observability). A separate **MVP / Deferred** dimension cross-cuts this ordering:
 
@@ -57,7 +57,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
 - **Out of scope**:
   - Any feature-specific code (REST endpoints, persistence, plugin dispatch, etc. — all later features)
-  - SDK crate scaffolding (covered by the SDK crate's own future DECOMPOSITION)
+  - SDK crate scaffolding (covered by the SDK crate's own [`DECOMPOSITION.md`](../../serverless-sdk/docs/DECOMPOSITION.md))
 
 - **Requirements Covered**:
 
@@ -436,9 +436,9 @@ F-08 cpt-cf-serverless-runtime-feature-audit-error-mapping
 
 **Foundation feature**: `cpt-cf-serverless-runtime-feature-gear-scaffold` (F-01). No upstream deps; start here.
 
-**Cross-crate dependencies** (out of scope of this DECOMPOSITION; will be tracked in the SDK and Temporal-plugin DECOMPOSITIONs when those crates' docs trees are populated):
+**Cross-crate dependencies** (out of scope of this DECOMPOSITION; consumer-SDK allocation is tracked in its own DECOMPOSITION, while the plugin SDK and Temporal plugin will be tracked when their docs trees are populated):
 
-- Consumer contract crate (`serverless-runtime-sdk`, docs at `gears/serverless-runtime/serverless-sdk/`): the consumer client trait, the invocation value types, and its error taxonomy. Concrete inventory lives in `serverless-sdk/docs/PRD.md` + `DESIGN.md`.
+- Consumer contract crate (`serverless-runtime-sdk`): the consumer client trait, invocation value types, and error taxonomy. Its allocation and concrete inventory live in [`serverless-sdk/docs/DECOMPOSITION.md`](../../serverless-sdk/docs/DECOMPOSITION.md), [`PRD.md`](../../serverless-sdk/docs/PRD.md), and [`DESIGN.md`](../../serverless-sdk/docs/DESIGN.md).
 - Plugin contract crate (`serverless-runtime-plugin-sdk`): the plugin trait surface, the plugin → host event port, shared domain types, and the conformance test suite. Not yet designed; no current documents exist for it.
 - Temporal plugin crate (`plugins/serverless-runtime-temporal-plugin`, future): concrete `RuntimeAdapter` implementation with Temporal-native primitives so the dispatcher can resolve a real backend.
 
