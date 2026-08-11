@@ -81,7 +81,8 @@ const WATCH_CAPACITY: usize = 256;
 ///
 /// Each instance is stored under a per-instance key `"svc/{name}/{instance_id}"`
 /// with a heartbeat TTL (`put`); a background task renews it on
-/// [`DEFAULT_RENEWAL`] so a live instance stays discoverable and a crashed one
+/// `DEFAULT_RENEWAL` — a third of the TTL, so ten seconds against the
+/// thirty-second default — so a live instance stays discoverable and a crashed one
 /// lapses within the TTL. The `svc/` namespace (ADR-001) keeps SD keys from
 /// colliding with the leader (`election/`) and lock (`lock/`) keyspaces when an
 /// omit-primitive profile shares one cache across all four defaults. Discovery
@@ -109,7 +110,7 @@ const WATCH_CAPACITY: usize = 256;
 /// the cache declares no native prefix watch (`prefix_watch == false`, e.g. the
 /// Postgres plugin's cache), the backend transparently falls back to the
 /// [`PollingPrefixWatch`] polyfill over `scan_prefix`
-/// ([`open_prefix_watch`](Self::open_prefix_watch)) — so a maintainer runs and
+/// (`open_prefix_watch`) — so a maintainer runs and
 /// `register`'s local pre-insert is safe (it is reaped on TTL expiry /
 /// deregistration through the polling stream) over either kind of cache. The
 /// polyfill path pays the documented poll-interval latency and `N+1`
@@ -172,7 +173,7 @@ impl CacheBasedServiceDiscoveryBackend {
     /// Sets the poll interval for the [`PollingPrefixWatch`] fallback (used only
     /// over a cache with no native prefix watch). Mirrors
     /// [`with_observability`](Self::with_observability); without it the backend
-    /// uses [`DEFAULT_PREFIX_WATCH_POLL`].
+    /// uses `DEFAULT_PREFIX_WATCH_POLL`, five seconds.
     #[must_use]
     pub fn with_prefix_watch_polling(mut self, interval: Duration) -> Self {
         self.prefix_watch_poll = interval;
@@ -404,17 +405,38 @@ impl ServiceDiscoveryBackend for CacheBasedServiceDiscoveryBackend {
         let out = async {
             // Best-effort: ensure the membership view is being maintained.
             let _maintainer = self.ensure_maintainer(name).await;
-            // Over a cache with no native prefix watch, the maintained view is
-            // only as fresh as the last `PollingPrefixWatch` tick — up to a poll
-            // interval stale, and a change made moments ago (e.g. a `set_state`)
-            // is not yet reflected. Refresh from a fresh `scan_prefix` sweep of
-            // backend truth so `discover` is current regardless of poll cadence
-            // (the cost the operator accepted by choosing a polling backend). A
-            // native prefix-watch backend keeps its event-maintained view, which
-            // is already current, so this scan is skipped there.
-            if !self.cache.features().prefix_watch {
-                reconcile_view(&self.cache, &self.shared, name, &Self::prefix(name)).await;
-            }
+            // Always refresh from a `scan_prefix` sweep of backend truth, whatever
+            // the cache's watch capability. The maintained view exists to serve
+            // `watch` — a stream, where being one event behind is what a stream
+            // *is* — and it is not a sound source for `discover`, which is a point
+            // query callers expect to reflect writes that have already returned.
+            //
+            // Two ways it can be stale, and only one of them used to be handled:
+            //
+            // - **No native prefix watch**: the view is as fresh as the last
+            //   `PollingPrefixWatch` tick, so up to a poll interval behind.
+            // - **Native prefix watch on a *remote* backend**: the view is as
+            //   fresh as the last delivered event, and delivery is a network round
+            //   trip. A `set_state` that has already returned has published its
+            //   event and not yet had it applied.
+            //
+            // This used to skip the sweep in the second case, on the reasoning that
+            // an event-maintained view "is already current". That held only while
+            // every prefix-watch-capable cache was in-process, where delivery is a
+            // task yield: the Redis plugin is the first remote backend to declare
+            // `prefix_watch: true`, and it fails `SC-DISC-002` under the old
+            // condition — the disabled instance is still reported enabled, because
+            // the `Changed` event is in flight (redis-cluster-plugin
+            // DESIGN.md §3.11). Nothing in the SDK can ask a
+            // cache whether its watch is local, and a correctness property should
+            // not rest on the answer anyway.
+            //
+            // The cost is one cursor-based `scan_prefix` plus a `get` per instance
+            // per `discover` call, over a single service's prefix. `reconcile_view`
+            // already snapshots the view's revision and discards its rebuilt map if
+            // a maintainer `apply` or a `register` pre-insert raced it (PGR-D2), so
+            // running it on this path needs no new concurrency reasoning.
+            reconcile_view(&self.cache, &self.shared, name, &Self::prefix(name)).await;
             let registry = self.shared.lock();
             let instances = registry.instances.get(name).map_or_else(Vec::new, |map| {
                 map.values()
