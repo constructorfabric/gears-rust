@@ -189,6 +189,8 @@ need for their own boundaries.
 | `InvokeRequest` | What to run and how: `callable_id`, `mode`, `params`, `dry_run`, `idempotency_key`. |
 | `InvocationMode` | `Sync` or `Async`. Adopted from the gear's model unchanged. |
 | `InvocationSummary` | One row of the gear's invocation index — see below. |
+| `InvocationErrorSummary` | Stable failure type and retry category stored in the gear's index. |
+| `InvocationErrorCategory` | Bounded classification a caller uses when deciding whether to replay. |
 | `InvocationOutcome` | What starting or replaying a run returns — see below. |
 | `InvocationStatus` | The nine run states, adopted verbatim from the gear's `gts.cf.core.sless.status.v1~` schema: `Queued`, `Running`, `Suspended`, `Succeeded`, `Failed`, `Canceled`, `Compensating`, `Compensated`, `DeadLettered`. |
 | `ControlAction` | `Cancel`, `Suspend`, `Resume`, `Retry` — the in-place interventions. |
@@ -200,6 +202,10 @@ callable id, the backend that ran it, tenant, owner, status, timestamps (created
 suspended, finished), and an error summary populated only in failure states. The full record —
 inputs, results, observability, step history — exists only with the executing backend and is
 not reachable through this crate.
+
+The plugin port carries the same safe fields in its own crate-local type; the host maps them into
+`InvocationErrorSummary`, so neither SDK depends on the other. Backend messages and arbitrary
+details remain plugin-local and are available through observability APIs.
 
 **`InvocationOutcome`** wraps the summary and adds what a caller cannot otherwise learn:
 

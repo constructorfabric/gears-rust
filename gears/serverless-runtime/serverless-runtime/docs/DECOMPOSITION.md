@@ -92,7 +92,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
 - **Purpose**: Owns callable-definition lifecycle — CRUD, versioning, lifecycle state, host-side schema validation, and version resolution. Single source of truth for function/workflow definition persistence; consults tenant-policy at the dispatch boundary.
 
-- **Depends On**: `cpt-cf-serverless-runtime-feature-gear-scaffold`. Depends on the host-owned domain type model (function and workflow definitions, registry projections) documented in [`DESIGN_RUST_TYPES.md`](../../docs/DESIGN_RUST_TYPES.md) — these are host types, not consumer-SDK types; the consumer SDK carries invocation value types only.
+- **Depends On**: `cpt-cf-serverless-runtime-feature-gear-scaffold` and the host-owned function/workflow model in [`DESIGN_RUST_TYPES.md`](../../docs/DESIGN_RUST_TYPES.md). The consumer SDK carries invocation types only.
 
 - **Scope**: Persistent function/workflow definition store with CRUD, versioning, lifecycle state, and host-side schema validation. Delegates adapter-specific validation to plugins. Concrete entity schema, state-machine transitions, validation hooks, and version-resolution rules live in F-02 FEATURE.md.
 
@@ -304,7 +304,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
 - **Purpose**: **Deferred (post-MVP governance layer)** — built when core host flow (F-01..F-04) is functional. Owns tenant runtime policy (quotas, retention, allowed adapters, default limits, idempotency defaults). Enforced at the plugin-dispatch boundary before any plugin call.
 
-- **Depends On**: `cpt-cf-serverless-runtime-feature-gear-scaffold`. Depends on the host-owned domain type model (function and workflow definitions, registry projections) documented in [`DESIGN_RUST_TYPES.md`](../../docs/DESIGN_RUST_TYPES.md) — these are host types, not consumer-SDK types; the consumer SDK carries invocation value types only.
+- **Depends On**: `cpt-cf-serverless-runtime-feature-gear-scaffold` and `cpt-cf-serverless-runtime-feature-plugin-dispatcher`. F-07 owns the tenant-policy model and inserts its enforcement before plugin dispatch; neither contract SDK owns these types.
 
 - **Scope**: Tenant-policy persistence + CRUD, pre-dispatch enforcement middleware (adapter allowlist, quota check, default-limit injection). Concrete entity schema, enforcement-middleware hooks, and quota-tracking strategy live in F-07 FEATURE.md.
 
@@ -328,7 +328,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
   - None
 
-- **Domain Model Entities**: SDK tenant-policy family (quotas, retention, defaults, idempotency, usage; concrete list in F-07 FEATURE.md).
+- **Domain Model Entities**: host-owned tenant-policy family (quotas, retention, defaults, idempotency, usage), defined in [`DESIGN_RUST_TYPES.md`](../../docs/DESIGN_RUST_TYPES.md) and detailed in F-07 FEATURE.md.
 
 - **Design Components**:
 

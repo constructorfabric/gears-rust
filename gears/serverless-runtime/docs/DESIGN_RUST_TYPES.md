@@ -360,9 +360,26 @@ pub struct InvocationSummary {
     pub owner: OwnerRef,
     pub status: InvocationStatus,
     pub timestamps: InvocationTimestamps,
-    /// Populated when `status` is a failure state. The full error detail stays with
-    /// the plugin.
-    pub error_summary: Option<RuntimeErrorPayload>,
+    /// Populated when `status` is a failure state.
+    pub error_summary: Option<InvocationErrorSummary>,
+}
+
+/// Redacted failure data stored in the consumer-readable host index.
+/// Backend messages and arbitrary details remain plugin-local.
+#[derive(Clone, Debug)]
+pub struct InvocationErrorSummary {
+    pub error_type_id: GtsId,
+    pub category: InvocationErrorCategory,
+}
+
+/// Consumer-facing retry classification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InvocationErrorCategory {
+    Retryable,
+    NonRetryable,
+    ResourceLimit,
+    Timeout,
+    Canceled,
 }
 
 #[derive(Clone, Debug)]
@@ -525,6 +542,14 @@ pub struct RuntimeErrorPayload {
     pub message: String,
     pub category: RuntimeErrorCategory,
     pub details: serde_json::Value,
+}
+
+/// Redacted plugin-to-host index update. The host maps this into the consumer SDK's
+/// `InvocationErrorSummary`; neither SDK depends on the other.
+#[derive(Clone, Debug)]
+pub struct InvocationIndexError {
+    pub error_type_id: GtsId,
+    pub category: RuntimeErrorCategory,
 }
 ```
 
@@ -830,14 +855,13 @@ pub trait ServerlessRuntimeService: Send + Sync {
 pub trait InvocationIndexPort: Send + Sync {
     /// Notify the host of an invocation status transition. Plugins call this on
     /// every status change so the host invocation index stays current.
-    /// `error_summary` carries the human-readable failure reason for terminal
-    /// failure statuses; it is `None` for non-terminal transitions and successes.
+    /// `error` is present for failure statuses; full error data remains plugin-local.
     async fn publish_invocation_status(
         &self,
         ctx: &SecurityContext,
         invocation_id: &InvocationId,
         status: InvocationStatus,
-        error_summary: Option<String>,
+        error: Option<InvocationIndexError>,
     ) -> Result<(), RuntimeErrorPayload>;
 
     /// Notify the host of a timeline-relevant event for downstream subscribers
