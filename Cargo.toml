@@ -279,7 +279,10 @@ rustls-cng-crypto = { version = "0.1", default-features = false, features = ["fi
 # field of SEC1 (rather than derived from the scalar in non-FIPS code),
 # preserving the FIPS-validated boundary at corecrypto for every
 # cryptographic operation. See ADR 0004.
-pkcs8 = "0.10"
+# The `pem` feature is additive (der/pem + spki/pem, via pem-rfc7468 which is
+# already in the graph) and is required by token-issuer's JWKS builder, which
+# receives public keys as PEM. Parsing remains structural: no crypto primitives.
+pkcs8 = { version = "0.10", features = ["pem"] }
 sec1 = { version = "0.7", default-features = false, features = ["alloc", "der"] }
 
 
@@ -513,9 +516,13 @@ time = { version = "0.3.47", features = ["serde", "formatting", "parsing"] }
 # Cryptographic utilities
 sha2 = "0.10"
 hex = "0.4"
-# NIST P-256 key/JWK handling for the token-issuer ES256 signing path. The
-# `ecdsa` feature is opt-in per crate (dev-only local test signer); production
-# signing happens in the credstore signing plugin, not here.
+# DEV-ONLY. `p256` is a pure-Rust P-256 implementation and is listed as a
+# ban candidate in deny-fips.toml ("bypasses validated module"), so it must not
+# reach a shipped crate's [dependencies]. It is used solely by token-issuer's
+# tests, which stand up a local ES256 signer in place of the signing plugin;
+# `rand_core` supplies that test signer's `OsRng`. Production JWKS publication
+# parses public keys with `pkcs8`/`spki` instead — structural DER only, per
+# ADR 0004 — and production signing happens in the signing plugin, never here.
 p256 = { version = "0.13", features = ["pem", "pkcs8"] }
 rand_core = { version = "0.6", default-features = false }
 
