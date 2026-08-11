@@ -442,7 +442,7 @@ After synchronization, the system **MUST** compare expected entity counts from l
 
 #### Stale-Aware Refresh
 
-- [ ] `p1` - **ID**: `cpt-cf-github-mirror-fr-stale-refresh`
+- [ ] `p2` - **ID**: `cpt-cf-github-mirror-fr-stale-refresh`
 
 The system **MUST** support configurable per-entity-type freshness policies that control how aggressively previously-synchronized entities are re-checked. Active entities (open PRs, open issues, pending CI) **MUST** be refreshed more frequently than stable entities (closed items, labels, releases). Freshness intervals **MUST** be configurable by the operator.
 
@@ -653,7 +653,7 @@ The CLI tool **MAY** read environment variables (e.g., `GITHUB_TOKEN`), access c
 
 #### Entity Lifecycle Events
 
-- [ ] `p1` - **ID**: `cpt-cf-github-mirror-fr-state-events`
+- [ ] `p2` - **ID**: `cpt-cf-github-mirror-fr-state-events`
 
 The system **MUST** emit events on key entity state changes detected during synchronization:
 

@@ -78,7 +78,7 @@ The architecture supports two deployment modes: an **in-process gear** within th
 | `p2` | `cpt-cf-github-mirror-fr-commit-ci-refinement` | Commit/CI refinement plus cost-governed GraphQL PR child extraction where batching reduces requests; see `ALGORITHMS.md` |
 | `p1` | `cpt-cf-github-mirror-fr-sync-order` | Priority tiers: open PRs > open issues > global metrics > closed PRs > closed issues; `--since` bounds only closed |
 | `p1` | `cpt-cf-github-mirror-fr-completeness-check` | Verification compares stored vs expected counts; bounded convergence repair and final report persistence |
-| `p1` | `cpt-cf-github-mirror-fr-stale-refresh` | Per-endpoint-family freshness TTLs based on entity lifecycle state |
+| `p2` | `cpt-cf-github-mirror-fr-stale-refresh` | Per-endpoint-family freshness TTLs based on entity lifecycle state |
 | `p1` | `cpt-cf-github-mirror-fr-github-compat-api` | GitHub v3 compatible REST API from normalized store |
 | `p2` | `cpt-cf-github-mirror-fr-extended-api` | Extended analytics API under `/github-mirror/v1/` |
 | `p3` | `cpt-cf-github-mirror-fr-write-back` | Durable write-back queue; executes against GitHub when capacity available |
