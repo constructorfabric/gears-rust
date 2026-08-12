@@ -15,10 +15,10 @@ use toolkit_transport_grpc::extract_internal_token_grpc;
 use cf_system_sdks::directory::{
     DeregisterInstanceRequest, DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound,
     DirectoryService, DirectoryServiceServer, GetOpenApiSpecRequest, GetOpenApiSpecResponse,
-    HeartbeatRequest, InstanceInfo, ListAllInstancesRequest, ListAllInstancesResponse,
-    ListInstancesRequest, ListInstancesResponse, RegisterInstanceInfo, RegisterInstanceRequest,
-    ResolveGrpcServiceRequest, ResolveGrpcServiceResponse, ResolveRestServiceRequest,
-    ResolveRestServiceResponse, ServiceEndpoint, ServiceInstanceInfo,
+    GrpcServiceEndpoint, HeartbeatRequest, InstanceInfo, ListAllInstancesRequest,
+    ListAllInstancesResponse, ListInstancesRequest, ListInstancesResponse, RegisterInstanceInfo,
+    RegisterInstanceRequest, ResolveGrpcServiceRequest, ResolveGrpcServiceResponse,
+    ResolveRestServiceRequest, ResolveRestServiceResponse, ServiceEndpoint, ServiceInstanceInfo,
 };
 
 /// Map a lookup failure onto a gRPC status, keeping "not registered" distinct
@@ -224,6 +224,7 @@ impl DirectoryService for DirectoryServiceImpl {
             },
             rest_endpoint: req.rest_endpoint_uri.map(ServiceEndpoint::new),
             openapi_spec: req.openapi_spec,
+            labels: req.labels.into_iter().collect(),
         };
 
         self.api
@@ -272,6 +273,15 @@ fn domain_instance_to_proto(i: ServiceInstanceInfo) -> InstanceInfo {
         rest_endpoint_uri: i.rest_endpoint.map(|ep| ep.uri),
         openapi_spec: i.openapi_spec,
         openapi_spec_hash: i.openapi_spec_hash,
+        labels: i.labels.into_iter().collect(),
+        grpc_services: i
+            .grpc_services
+            .into_iter()
+            .map(|(service_name, ep)| GrpcServiceEndpoint {
+                service_name,
+                endpoint_uri: ep.uri,
+            })
+            .collect(),
     }
 }
 
@@ -318,6 +328,7 @@ mod tests {
             version: "1.0.0".to_owned(),
             rest_endpoint_uri: Some("http://billing:8080".to_owned()),
             openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
+            labels: std::collections::HashMap::new(),
         }))
         .await
         .unwrap();
@@ -420,6 +431,7 @@ mod tests {
                 version: Some("1.0.0".to_owned()),
                 rest_endpoint: Some(ServiceEndpoint::http("billing", 8080)),
                 openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
+                labels: std::collections::BTreeMap::new(),
             })
             .await
             .unwrap();
@@ -430,6 +442,101 @@ mod tests {
 
         let spec = client.get_openapi_spec("billing").await.unwrap();
         assert!(spec.contains("openapi"));
+    }
+
+    /// `labels` declared at registration survive the
+    /// full proto round-trip and drive `resolve_by_labels` targeting end-to-end
+    /// over gRPC (register-with-labels -> `list_instances` on the wire -> the
+    /// default `resolve_by_labels` selector filter).
+    #[tokio::test]
+    async fn grpc_round_trip_labels_drive_resolve_by_labels() {
+        use cf_system_sdks::directory::{DirectoryGrpcClient, LabelSelector};
+        use std::collections::BTreeMap;
+        use tonic::transport::Server;
+
+        let manager = Arc::new(GearManager::new());
+        let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
+        let grpc_service = make_directory_service(api, None);
+
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(grpc_service)
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+
+        let client: Arc<dyn DirectoryClient> = Arc::new(
+            DirectoryGrpcClient::connect(format!("http://{addr}"))
+                .await
+                .unwrap(),
+        );
+
+        // Two shards of one directory name, distinguished only by a label. Each
+        // also advertises a per-instance gRPC endpoint so we can prove targeted
+        // gRPC-endpoint resolution survives the wire.
+        for shard in ["0", "1"] {
+            client
+                .register_instance(RegisterInstanceInfo {
+                    gear: "event-broker-ingest".to_owned(),
+                    instance_id: Uuid::new_v4().to_string(),
+                    grpc_services: vec![(
+                        "ingest.v1.Ingest".to_owned(),
+                        ServiceEndpoint::new(format!("http://ingest-{shard}:9090")),
+                    )],
+                    version: Some("1.0.0".to_owned()),
+                    rest_endpoint: Some(ServiceEndpoint::new(format!(
+                        "http://ingest-{shard}:8080"
+                    ))),
+                    openapi_spec: None,
+                    labels: BTreeMap::from([("shard".to_owned(), shard.to_owned())]),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Targeted resolve pinpoints exactly the labelled shard, proving the
+        // labels crossed the wire on both register and list.
+        let matched = client
+            .resolve_by_labels(
+                "event-broker-ingest",
+                &LabelSelector::new().with("shard", "1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(
+            matched[0].labels.get("shard").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            matched[0].rest_endpoint.as_ref().map(|e| e.uri.as_str()),
+            Some("http://ingest-1:8080")
+        );
+        // The targeted instance's gRPC endpoint also survives the round-trip, so
+        // a caller can dial it by service name (effective key `(name, selector, service_name)`).
+        let (svc_name, svc_ep) = matched[0]
+            .grpc_services
+            .iter()
+            .find(|(name, _)| name == "ingest.v1.Ingest")
+            .expect("targeted instance advertises its gRPC service over the wire");
+        assert_eq!(svc_name, "ingest.v1.Ingest");
+        assert_eq!(svc_ep.uri, "http://ingest-1:9090");
+
+        // An empty selector still returns the whole set over the wire.
+        assert_eq!(
+            client
+                .resolve_by_labels("event-broker-ingest", &LabelSelector::new())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     /// `list_all_instances` returns every registered gear (across gears) with
@@ -448,6 +555,7 @@ mod tests {
                 version: "1.0.0".to_owned(),
                 rest_endpoint_uri: Some(format!("http://{gear}:{port}")),
                 openapi_spec: Some(format!("{{\"openapi\":\"3.1.0\",\"x\":\"{gear}\"}}")),
+                labels: std::collections::HashMap::new(),
             }))
             .await
             .unwrap();
@@ -544,6 +652,7 @@ mod tests {
                 version: Some("1.0.0".to_owned()),
                 rest_endpoint: Some(ServiceEndpoint::http("billing", 8080)),
                 openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
+                labels: std::collections::BTreeMap::new(),
             })
             .await
             .expect("authenticated register should succeed");

@@ -80,7 +80,7 @@ OoP gear lifecycle, discovery coordination, and gateway registration. The archit
 | `cpt-cf-adr-platform-plane-auth`   | Platform-plane authentication: SA tokens (Profile 3) / bootstrap token (Profile 2) first, mTLS + SPIFFE next |
 | `cpt-cf-adr-rest-first-oop`         | REST as primary OoP protocol; each gear runs its own HTTP server                                     |
 | `cpt-cf-adr-gateway-abstraction`    | GatewayProvider trait abstracts built-in and external gateways                                         |
-| `cpt-cf-adr-instance-addressable-discovery` | Target a specific gear instance (role/shard) via additive directory metadata + targeted resolve; RR stays the default |
+| `cpt-cf-adr-instance-addressable-discovery` | Roles use role-qualified directory names; additive directory labels + targeted resolve select a specific shard/peer within a directory name; RR stays the default |
 
 ### 1.3 Architecture Layers
 

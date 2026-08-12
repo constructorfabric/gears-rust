@@ -1,0 +1,11 @@
+error: gear `name = "event-broker"` must be one of the declared `roles`; got roles = ["event-broker-ingest", "event-broker-delivery"]
+ --> tests/ui/fail/gear_name_not_in_roles.rs:5:1
+  |
+5 | / #[toolkit::gear(
+6 | |     name = "event-broker",
+7 | |     roles = ["event-broker-ingest", "event-broker-delivery"],
+8 | |     capabilities = []
+9 | | )]
+  | |__^
+  |
+  = note: this error originates in the attribute macro `toolkit::gear` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -366,6 +366,7 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        labels: std::collections::BTreeMap::new(),
         directory: Arc::clone(&directory),
         bearer_authenticator: None,
         internal_authenticator: None,
@@ -442,6 +443,7 @@ async fn ephemeral_listen_port_updates_advertise_uri() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        labels: std::collections::BTreeMap::new(),
         directory: Arc::new(E2eDirectory {
             fail_resolve: AtomicUsize::new(0),
             deregistered: AtomicUsize::new(0),
@@ -488,6 +490,7 @@ async fn user_advertise_uri_is_not_overwritten_by_ephemeral_bind_port() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        labels: std::collections::BTreeMap::new(),
         directory: Arc::new(E2eDirectory {
             fail_resolve: AtomicUsize::new(0),
             deregistered: AtomicUsize::new(0),
@@ -535,6 +538,7 @@ async fn gear_handler_receives_connect_info_through_fallback() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        labels: std::collections::BTreeMap::new(),
         directory: Arc::new(E2eDirectory {
             fail_resolve: AtomicUsize::new(0),
             deregistered: AtomicUsize::new(0),

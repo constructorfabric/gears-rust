@@ -79,6 +79,7 @@ fn info() -> RegisterInstanceInfo {
         version: Some("1.0.0".to_owned()),
         rest_endpoint: Some(ServiceEndpoint::new("http://billing:8080")),
         openapi_spec: Some("{}".to_owned()),
+        labels: std::collections::BTreeMap::new(),
     }
 }
 

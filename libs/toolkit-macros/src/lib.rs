@@ -23,6 +23,11 @@ struct GearConfig {
     ctor: Option<Expr>,           // arbitrary constructor expression
     client: Option<Path>,         // trait path for client DX helpers
     lifecycle: Option<LcGearCfg>, // optional lifecycle config (on type)
+    /// Closed set of role-qualified directory names this gear may register
+    /// under (`cpt-cf-adr-instance-addressable-discovery` section 1). Empty for
+    /// a single-role gear; when non-empty the bare `name` MUST be a member, and
+    /// the macro emits a `ROLES` const.
+    roles: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -205,12 +210,14 @@ impl Parse for GearConfig {
         let mut ctor: Option<Expr> = None;
         let mut client: Option<Path> = None;
         let mut lifecycle: Option<LcGearCfg> = None;
+        let mut roles: Vec<String> = Vec::new();
 
         let mut seen_name = false;
         let mut seen_deps = false;
         let mut seen_caps = false;
         let mut seen_ctor = false;
         let mut seen_client = false;
+        let mut seen_roles = false;
         let mut seen_lifecycle = false;
 
         let punctuated: Punctuated<Meta, Token![,]> =
@@ -377,6 +384,50 @@ impl Parse for GearConfig {
                         }
                     }
                 }
+                Meta::NameValue(nv) if nv.path.is_ident("roles") => {
+                    if seen_roles {
+                        return Err(syn::Error::new_spanned(
+                            nv.path,
+                            "duplicate `roles` parameter",
+                        ));
+                    }
+                    seen_roles = true;
+                    match nv.value.clone() {
+                        Expr::Array(arr) => {
+                            for elem in arr.elems {
+                                match elem {
+                                    Expr::Lit(syn::ExprLit {
+                                        lit: Lit::Str(s), ..
+                                    }) => {
+                                        let role = s.value();
+                                        if let Err(err) = validate_kebab_case(&role) {
+                                            return Err(syn::Error::new_spanned(s, err));
+                                        }
+                                        if roles.contains(&role) {
+                                            return Err(syn::Error::new_spanned(
+                                                s,
+                                                format!("duplicate role name `{role}` in `roles`"),
+                                            ));
+                                        }
+                                        roles.push(role);
+                                    }
+                                    other => {
+                                        return Err(syn::Error::new_spanned(
+                                            other,
+                                            "roles must be string literals, e.g. roles = [\"event-broker\", \"event-broker-ingest\"]",
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(syn::Error::new_spanned(
+                                other,
+                                "roles must be an array of string literals, e.g. roles = [\"event-broker\", \"event-broker-ingest\"]",
+                            ));
+                        }
+                    }
+                }
                 // Accept `lifecycle(...)` and also namespaced like `toolkit::gear::lifecycle(...)`
                 Meta::List(list) if path_last_is(&list.path, "lifecycle") => {
                     if seen_lifecycle {
@@ -404,6 +455,19 @@ impl Parse for GearConfig {
             )
         })?;
 
+        // `cpt-cf-adr-instance-addressable-discovery` section 1: a declared role
+        // set makes the bare `name` (the front door) MUST be a member, keeping
+        // the mode->name mapping structural.
+        if !roles.is_empty() && !roles.iter().any(|r| r == &name) {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                format!(
+                    "gear `name = \"{name}\"` must be one of the declared `roles`; \
+                     got roles = {roles:?}"
+                ),
+            ));
+        }
+
         Ok(GearConfig {
             name,
             deps,
@@ -411,6 +475,7 @@ impl Parse for GearConfig {
             ctor,
             client,
             lifecycle,
+            roles,
         })
     }
 }
@@ -516,6 +581,7 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
     let ctor_expr_opt: Option<Expr> = config.ctor.clone();
     let client_trait_opt: Option<Path> = config.client.clone();
     let lifecycle_cfg_opt: Option<LcGearCfg> = config.lifecycle;
+    let roles_owned: Vec<String> = config.roles;
 
     // Prepare string literals for name/deps
     let name_lit = LitStr::new(&name_owned, Span::call_site());
@@ -524,6 +590,40 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|ident| LitStr::new(&ident.to_string().replace('_', "-"), Span::call_site()))
         .collect();
+
+    // `cpt-cf-adr-instance-addressable-discovery` section 1: emit the declared
+    // role set as a `ROLES` const the OoP `main.rs` forwards to
+    // `OopRunOptions.role_names` (single source of truth). Emitted only when
+    // declared, so single-role gears are unaffected.
+    let roles_const = if roles_owned.is_empty() {
+        quote! {}
+    } else {
+        let role_lits: Vec<LitStr> = roles_owned
+            .iter()
+            .map(|r| LitStr::new(r, Span::call_site()))
+            .collect();
+        quote! {
+            impl #impl_generics #struct_ident #ty_generics #where_clause {
+                /// Closed set of role-qualified directory names this gear may
+                /// register under (`cpt-cf-adr-instance-addressable-discovery`
+                /// section 1). Also submitted to the `DeclaredRoles` inventory
+                /// so OoP bootstrap enforces the role/front-door split with no
+                /// `main.rs` wiring.
+                pub const ROLES: &'static [&'static str] = &[#(#role_lits),*];
+            }
+
+            // Self-register the closed role set (with its declaring gear
+            // identity) so bootstrap can discover it from the linked binary
+            // (no `main.rs` forwarding required) and validate the booted name
+            // against this gear's own roles, not a cross-gear union.
+            ::toolkit::inventory::submit! {
+                ::toolkit::registry::DeclaredRoles {
+                    gear: #name_lit,
+                    roles: &[#(#role_lits),*],
+                }
+            }
+        }
+    };
 
     // Constructor expression (provided or Default::default())
     let constructor = if let Some(expr) = &ctor_expr_opt {
@@ -814,6 +914,9 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // Re-export gear dependencies to force-link their inventory registrations
         #(#dep_reexports)*
+
+        // `cpt-cf-adr-instance-addressable-discovery` sec.1 role-qualified names: gear-declared closed set (if any)
+        #roles_const
 
         // Registrator that targets the *builder*, not the final registry
         #[doc(hidden)]
@@ -1299,4 +1402,122 @@ pub fn domain_model(_attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn derive_expand_vars(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     TokenStream::from(expand_vars::derive(&input))
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    fn parse_gear(attr: &str) -> syn::Result<GearConfig> {
+        syn::parse_str::<GearConfig>(attr)
+    }
+
+    #[test]
+    fn roles_valid_with_name_as_front_door() {
+        let cfg =
+            parse_gear(r#"name = "event-broker", roles = ["event-broker", "event-broker-ingest"]"#)
+                .expect("valid role-split gear");
+        assert_eq!(cfg.name, "event-broker");
+        assert_eq!(
+            cfg.roles,
+            vec!["event-broker".to_owned(), "event-broker-ingest".to_owned()]
+        );
+    }
+
+    #[test]
+    fn roles_reject_duplicate_element() {
+        let err = parse_gear(r#"name = "x", roles = ["x", "x-a", "x-a"]"#)
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("duplicate role name `x-a`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn roles_reject_non_kebab_element() {
+        let err = parse_gear(r#"name = "x", roles = ["x", "X-A"]"#)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("lowercase"), "got: {err}");
+    }
+
+    #[test]
+    fn roles_reject_non_string_element() {
+        let err = parse_gear(r#"name = "x", roles = ["x", 1]"#).err().unwrap();
+        assert!(
+            err.to_string().contains("roles must be string literals"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn roles_reject_non_array_value() {
+        let err = parse_gear(r#"name = "x", roles = "x""#).err().unwrap();
+        assert!(
+            err.to_string().contains("roles must be an array"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn roles_reject_name_not_a_member() {
+        let err = parse_gear(r#"name = "event-broker", roles = ["event-broker-ingest"]"#)
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string()
+                .contains("must be one of the declared `roles`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn roles_reject_duplicate_param() {
+        let err = parse_gear(r#"name = "x", roles = ["x"], roles = ["x"]"#)
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("duplicate `roles` parameter"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_kebab_case_covers_all_rejection_shapes() {
+        assert!(validate_kebab_case("").is_err());
+        assert!(
+            validate_kebab_case("file_parser")
+                .unwrap_err()
+                .contains("kebab-case")
+        );
+        assert!(
+            validate_kebab_case("Parser")
+                .unwrap_err()
+                .contains("lowercase letter")
+        );
+        assert!(
+            validate_kebab_case("-parser")
+                .unwrap_err()
+                .contains("lowercase letter")
+        );
+        assert!(
+            validate_kebab_case("parser-")
+                .unwrap_err()
+                .contains("end with a hyphen")
+        );
+        assert!(
+            validate_kebab_case("a--b")
+                .unwrap_err()
+                .contains("consecutive hyphens")
+        );
+        assert!(
+            validate_kebab_case("a.b")
+                .unwrap_err()
+                .contains("only lowercase")
+        );
+        assert!(validate_kebab_case("event-broker-1").is_ok());
+    }
 }

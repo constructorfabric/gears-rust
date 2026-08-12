@@ -74,6 +74,8 @@ message InstanceInfo {
   optional string rest_endpoint_uri = 5;
   optional string openapi_spec = 6;
   optional string openapi_spec_hash = 7;
+  map<string, string> labels = 8;
+  repeated GrpcServiceEndpoint grpc_services = 9;
 }
 
 message ListInstancesResponse {
@@ -99,6 +101,7 @@ message RegisterInstanceRequest {
   string version = 4;
   optional string rest_endpoint_uri = 5;
   optional string openapi_spec = 6;
+  map<string, string> labels = 7;
 }
 
 message DeregisterInstanceRequest {

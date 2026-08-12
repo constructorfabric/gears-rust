@@ -10,7 +10,7 @@ mod api;
 mod grpc;
 
 pub use api::{
-    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, GrpcServiceInfo,
+    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, GrpcServiceInfo, LabelSelector,
     RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
 };
 #[cfg(feature = "grpc")]

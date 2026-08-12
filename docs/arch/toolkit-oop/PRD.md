@@ -142,7 +142,7 @@ application code remains deployment-agnostic. ToolKit Distributed Gears bring th
 - Deployment Profile 3: K8s Native (each gear = pod, external gateway, k8s DNS discovery)
 - Two-plane auth — gateway validates the JWT at the edge; OoP gears **re-validate it per hop** (tenant plane) and use a tenant-less identity for infra calls (platform plane). See [ADR-0008](ADR/0008-cpt-cf-adr-two-plane-auth.md)
 - Direct gear-to-gear REST communication (not routed through gateway)
-- Instance-addressable discovery — target a specific gear instance (role/shard) via additive directory metadata + targeted resolve, with round-robin remaining the default. Targeted selection does **not** expand the Toolkit's load-balancing scope beyond round-robin: the directory only enumerates/pinpoints instances; any pick-one over a matched set (e.g. consistent-hash sharding) is application-owned policy in the consuming gear. See [ADR-0009](ADR/0009-cpt-cf-adr-instance-addressable-discovery.md)
+- Instance-addressable discovery — roles use role-qualified directory names, while additive directory labels + targeted resolve select a specific shard/peer within a directory name, with round-robin remaining the default. Targeted selection does **not** expand the Toolkit's load-balancing scope beyond round-robin: the directory only enumerates/pinpoints instances; any pick-one over a matched set (e.g. consistent-hash sharding) is application-owned policy in the consuming gear. See [ADR-0009](ADR/0009-cpt-cf-adr-instance-addressable-discovery.md)
 - Public vs. internal API distinction in route registration
 - REST client generation from annotated Rust traits (trait-first, `#[toolkit::rest_contract]` proc-macro)
 - Gateway abstraction trait with built-in ToolKit implementation

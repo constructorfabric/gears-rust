@@ -570,6 +570,267 @@ mod database_merge {
 }
 
 // =============================================================================
+// advertise_uri fail-fast (`cpt-cf-adr-instance-addressable-discovery` §5)
+// =============================================================================
+
+mod advertise_uri_reachability {
+    use super::*;
+
+    #[test]
+    fn bind_only_addresses_are_unreachable() {
+        for uri in [
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://0.0.0.0:8080",
+            "http://[::1]:8080",
+            "http://[::]:8080",
+            "https://LOCALHOST:8443",
+        ] {
+            assert!(
+                !advertise_uri_is_reachable(uri),
+                "{uri} should be treated as bind-only / unreachable"
+            );
+        }
+    }
+
+    #[test]
+    fn routable_addresses_are_reachable() {
+        for uri in [
+            // k8s pod FQDN / Service DNS
+            "http://ingest-0.ingest.default.svc:8080",
+            "http://billing.default.svc.cluster.local:8080",
+            // a concrete non-loopback IP
+            "http://10.1.2.3:8080",
+            "http://[2001:db8::1]:8080",
+            // UDS is inherently instance-addressable (single-node Profile 2)
+            "unix:///run/toolkit/ingest.sock",
+        ] {
+            assert!(
+                advertise_uri_is_reachable(uri),
+                "{uri} should be treated as reachable"
+            );
+        }
+    }
+
+    async fn serve_options_with(
+        advertise_uri: Option<&str>,
+        require_reachable: bool,
+    ) -> Result<OopServeOptions> {
+        let cfg = crate::bootstrap::config::OopHttpConfig {
+            listen_addr: "0.0.0.0:8080".to_owned(),
+            probe_bind_addr: None,
+            drain_timeout_secs: 30,
+            healthcheck_timeout_ms: 500,
+            advertise_uri: advertise_uri.map(ToOwned::to_owned),
+            require_reachable_advertise_uri: require_reachable,
+            labels: std::collections::BTreeMap::new(),
+            internal_auth: None,
+        };
+        let dir: Arc<dyn DirectoryClient> = Arc::new(crate::directory::LocalDirectoryClient::new(
+            Arc::new(crate::runtime::GearManager::new()),
+        ));
+        build_oop_serve_options(
+            &cfg,
+            "svc",
+            Uuid::new_v4(),
+            None,
+            Duration::from_secs(5),
+            dir,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn fails_fast_on_loopback_default_when_required() {
+        // advertise_uri unset -> defaults to loopback (0.0.0.0 rewritten to
+        // 127.0.0.1); with the flag set this MUST refuse to start.
+        let err = serve_options_with(None, true).await.unwrap_err();
+        assert!(
+            err.to_string().contains("advertise_uri"),
+            "expected a fail-fast advertise_uri error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn starts_with_reachable_uri_when_required() {
+        let opts = serve_options_with(Some("http://svc.default.svc:8080"), true)
+            .await
+            .expect("reachable advertise_uri should start");
+        assert_eq!(opts.advertise_uri, "http://svc.default.svc:8080");
+    }
+
+    #[tokio::test]
+    async fn loopback_is_allowed_when_not_required() {
+        // Default (flag off) preserves Profile 1 / local-dev behaviour.
+        let opts = serve_options_with(None, false)
+            .await
+            .expect("loopback default is fine when not required");
+        assert!(opts.advertise_uri.contains("127.0.0.1"));
+    }
+}
+
+// =============================================================================
+// role-qualified-name closed-set guard (`cpt-cf-adr-instance-addressable-discovery` §1)
+// =============================================================================
+
+mod role_name_guard {
+    use super::*;
+
+    #[test]
+    fn none_is_a_single_role_gear_and_always_passes() {
+        assert!(validate_role_name("anything", None).is_ok());
+    }
+
+    #[test]
+    fn a_member_of_the_declared_set_passes() {
+        let roles = [
+            "event-broker".to_owned(),
+            "event-broker-ingest".to_owned(),
+            "event-broker-delivery".to_owned(),
+        ];
+        assert!(validate_role_name("event-broker-ingest", Some(&roles)).is_ok());
+        assert!(validate_role_name("event-broker", Some(&roles)).is_ok());
+    }
+
+    #[test]
+    fn a_name_outside_the_declared_set_is_rejected() {
+        let roles = ["event-broker".to_owned(), "event-broker-ingest".to_owned()];
+        // A mis-set boot mode producing an undeclared name must fail fast.
+        let err = validate_role_name("event-broker-typo", Some(&roles)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not in the declared role-name set")
+        );
+    }
+
+    #[test]
+    fn effective_role_names_prefers_explicit_override() {
+        // An explicit `OopRunOptions.role_names` wins over discovery.
+        let explicit = vec!["a".to_owned(), "b".to_owned()];
+        let discovered = vec!["x".to_owned()];
+        assert_eq!(
+            effective_role_names(Some(explicit.clone()), discovered),
+            Some(explicit)
+        );
+    }
+
+    #[test]
+    fn effective_role_names_falls_back_to_discovered() {
+        // No explicit set -> use the inventory-discovered role set.
+        let discovered = vec!["event-broker".to_owned(), "event-broker-ingest".to_owned()];
+        assert_eq!(
+            effective_role_names(None, discovered.clone()),
+            Some(discovered)
+        );
+    }
+
+    #[test]
+    fn effective_role_names_none_when_nothing_declared() {
+        // No explicit set and no gear declared roles -> single-role, no constraint.
+        assert_eq!(effective_role_names(None, Vec::new()), None);
+    }
+
+    #[test]
+    fn two_linked_gears_do_not_cross_validate() {
+        // Two role-split gears linked into one binary. Each declares its own
+        // closed set; selection must key on the declaring identity so a name is
+        // validated against *its own* gear's roles, never the cross-gear union
+        // (`cpt-cf-adr-instance-addressable-discovery` §1).
+        let broker: (&str, &[&str]) = ("broker", &["broker", "broker-ingest"]);
+        let cluster: (&str, &[&str]) = ("cluster", &["cluster", "cluster-follower"]);
+        let decls = [broker, cluster];
+
+        // A booted name selects ONLY its own gear's declared set.
+        let broker_roles =
+            crate::registry::select_roles_for(decls.iter().copied(), "broker-ingest").unwrap();
+        assert_eq!(
+            broker_roles,
+            vec!["broker".to_owned(), "broker-ingest".to_owned()]
+        );
+        assert!(!broker_roles.contains(&"cluster".to_owned()));
+
+        let cluster_roles =
+            crate::registry::select_roles_for(decls.iter().copied(), "cluster-follower").unwrap();
+        assert_eq!(
+            cluster_roles,
+            vec!["cluster".to_owned(), "cluster-follower".to_owned()]
+        );
+
+        // The booted name passes against its own gear's roles ...
+        assert!(validate_role_name("broker-ingest", Some(&broker_roles)).is_ok());
+        // ... but must NOT validate against the *other* gear's roles: a union
+        // would have accepted it, per-gear selection rejects the cross-check.
+        assert!(validate_role_name("broker-ingest", Some(&cluster_roles)).is_err());
+
+        // A name declared by neither gear belongs to no role-split gear -> no
+        // constraint (single-role / non-role gear), rather than being wrongly
+        // constrained by another gear's roles.
+        assert_eq!(
+            crate::registry::select_roles_for(decls.iter().copied(), "unrelated"),
+            None
+        );
+    }
+}
+
+// =============================================================================
+// instance labels: config -> OopServeOptions (`cpt-cf-adr-instance-addressable-discovery` §2)
+// =============================================================================
+
+mod instance_labels {
+    use super::*;
+
+    fn cfg_with(
+        labels: std::collections::BTreeMap<String, String>,
+    ) -> crate::bootstrap::config::OopHttpConfig {
+        crate::bootstrap::config::OopHttpConfig {
+            listen_addr: "0.0.0.0:8080".to_owned(),
+            probe_bind_addr: None,
+            drain_timeout_secs: 30,
+            healthcheck_timeout_ms: 500,
+            advertise_uri: None,
+            require_reachable_advertise_uri: false,
+            labels,
+            internal_auth: None,
+        }
+    }
+
+    async fn serve_options_for(cfg: &crate::bootstrap::config::OopHttpConfig) -> OopServeOptions {
+        let dir: Arc<dyn DirectoryClient> = Arc::new(crate::directory::LocalDirectoryClient::new(
+            Arc::new(crate::runtime::GearManager::new()),
+        ));
+        build_oop_serve_options(
+            cfg,
+            "event-broker-ingest",
+            Uuid::new_v4(),
+            None,
+            Duration::from_secs(5),
+            dir,
+        )
+        .await
+        .expect("build should succeed")
+    }
+
+    #[tokio::test]
+    async fn config_labels_thread_through_to_serve_options() {
+        // Config labels surface verbatim on OopServeOptions.labels (which the
+        // presence loop registers with the directory).
+        let cfg = cfg_with(std::collections::BTreeMap::from([
+            ("role".to_owned(), "ingest".to_owned()),
+            ("shard".to_owned(), "3".to_owned()),
+        ]));
+        let opts = serve_options_for(&cfg).await;
+        assert_eq!(opts.labels.get("role").map(String::as_str), Some("ingest"));
+        assert_eq!(opts.labels.get("shard").map(String::as_str), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn no_labels_is_empty() {
+        let opts = serve_options_for(&cfg_with(std::collections::BTreeMap::new())).await;
+        assert!(opts.labels.is_empty());
+    }
+}
+
+// =============================================================================
 // Full OoP Config Build Tests
 // =============================================================================
 

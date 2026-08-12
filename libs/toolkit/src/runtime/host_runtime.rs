@@ -1145,13 +1145,16 @@ impl HostRuntime {
             // (gear, instance_id) with gRPC services during the start phase, so
             // carry those forward instead of clobbering them to empty — adding
             // the REST endpoint must augment, not replace, the entry.
-            let (grpc_services, version) = match dir.list_instances(gear).await {
+            // Carry forward grpc_services, version, AND labels from the existing
+            // entry (`cpt-cf-adr-instance-addressable-discovery` §2: labels MUST survive re-registration) so adding
+            // the REST endpoint augments rather than clobbers the entry.
+            let (grpc_services, version, labels) = match dir.list_instances(gear).await {
                 Ok(insts) => insts
                     .into_iter()
                     .find(|i| i.instance_id == instance_id)
-                    .map(|i| (i.grpc_services, i.version))
+                    .map(|i| (i.grpc_services, i.version, i.labels))
                     .unwrap_or_default(),
-                Err(_) => (Vec::new(), None),
+                Err(_) => (Vec::new(), None, std::collections::BTreeMap::new()),
             };
             let info = crate::RegisterInstanceInfo {
                 gear: gear.to_owned(),
@@ -1162,6 +1165,7 @@ impl HostRuntime {
                 // OpenAPI spec is published separately (grpc-hub start phase);
                 // the REST-augmentation registration does not carry it.
                 openapi_spec: None,
+                labels,
             };
             match dir.register_instance(info).await {
                 Ok(()) => {

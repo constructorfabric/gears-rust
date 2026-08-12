@@ -2890,6 +2890,7 @@ dependencies = [
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-sdk",
  "cf-gears-toolkit-security",
+ "cf-gears-toolkit-stable-hash",
  "cf-gears-toolkit-transport-grpc",
  "cf-gears-toolkit-utils",
  "chrono",

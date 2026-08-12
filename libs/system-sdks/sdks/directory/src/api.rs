@@ -4,6 +4,59 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::BTreeMap;
+
+/// An equality-AND label selector (Kubernetes `matchLabels` style).
+///
+/// An instance matches iff it carries **every** requested `key=value` pair; an
+/// empty selector matches all instances of a name. A struct (not a bare map) so
+/// future filters (e.g. `matchExpressions`) stay additive.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LabelSelector {
+    match_labels: BTreeMap<String, String>,
+}
+
+impl LabelSelector {
+    /// An empty selector - matches every instance of a name.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a selector from a `matchLabels` map.
+    #[must_use]
+    pub fn from_match_labels(match_labels: BTreeMap<String, String>) -> Self {
+        Self { match_labels }
+    }
+
+    /// Add one `key=value` equality requirement (builder).
+    #[must_use]
+    pub fn with(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.match_labels.insert(key.into(), value.into());
+        self
+    }
+
+    /// The `matchLabels` equality requirements.
+    #[must_use]
+    pub fn match_labels(&self) -> &BTreeMap<String, String> {
+        &self.match_labels
+    }
+
+    /// Whether this selector has no requirements (matches everything).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.match_labels.is_empty()
+    }
+
+    /// AND-match: `labels` satisfies this selector iff it carries **every**
+    /// requested `key=value` pair. An empty selector always matches.
+    #[must_use]
+    pub fn matches(&self, labels: &BTreeMap<String, String>) -> bool {
+        self.match_labels
+            .iter()
+            .all(|(k, v)| labels.get(k).is_some_and(|lv| lv == v))
+    }
+}
 
 /// Represents an endpoint where a service can be reached
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -61,6 +114,10 @@ pub struct ServiceInstanceInfo {
     /// (which replaces the entry wholesale) can augment — rather than clobber —
     /// the previously-registered gRPC services when adding a REST endpoint.
     pub grpc_services: Vec<(String, ServiceEndpoint)>,
+    /// Consumer-defined, opaque instance labels for within-contract targeting
+    /// (`cpt-cf-adr-instance-addressable-discovery` §2), e.g. `shard`, `pod`. The directory only stores and
+    /// filters on them via [`resolve_by_labels`](DirectoryClient::resolve_by_labels).
+    pub labels: BTreeMap<String, String>,
 }
 
 /// Information for registering a new gear instance
@@ -78,6 +135,9 @@ pub struct RegisterInstanceInfo {
     pub rest_endpoint: Option<ServiceEndpoint>,
     /// Optional `OpenAPI` spec (JSON) published by the gear.
     pub openapi_spec: Option<String>,
+    /// Consumer-defined, opaque instance labels (`cpt-cf-adr-instance-addressable-discovery` §2). MUST survive the
+    /// idempotent re-registration path (see `GearManager::register_instance`).
+    pub labels: BTreeMap<String, String>,
 }
 
 /// A resolved gRPC service and the endpoint it is reachable at.
@@ -174,6 +234,28 @@ pub trait DirectoryClient: Send + Sync {
     /// List all service instances for a given gear
     async fn list_instances(&self, gear: &str) -> Result<Vec<ServiceInstanceInfo>>;
 
+    /// Resolve the instances of `name` matching `selector` (`cpt-cf-adr-instance-addressable-discovery` §6).
+    ///
+    /// Returns the **full** matching set **regardless of health** (each entry
+    /// carrying its `labels`, `instance_id`, and endpoints); zero matches is
+    /// `Ok(vec![])`, not an error. Health filtering and "pick one from the set"
+    /// are caller-owned policy, not toolkit load balancing.
+    ///
+    /// The default is `list_instances(name)` filtered by the selector's
+    /// equality-AND semantics. Backends may override to push the filter
+    /// server-side but MUST preserve these semantics.
+    async fn resolve_by_labels(
+        &self,
+        name: &str,
+        selector: &LabelSelector,
+    ) -> Result<Vec<ServiceInstanceInfo>> {
+        let instances = self.list_instances(name).await?;
+        Ok(instances
+            .into_iter()
+            .filter(|inst| selector.matches(&inst.labels))
+            .collect())
+    }
+
     /// List every service instance across all registered gears.
     ///
     /// Used by the edge gateway to discover which gears (and their REST
@@ -216,6 +298,66 @@ mod tests {
     }
 
     #[test]
+    fn label_selector_and_semantics() {
+        let labels = BTreeMap::from([
+            ("shard".to_owned(), "1".to_owned()),
+            ("az".to_owned(), "a".to_owned()),
+        ]);
+
+        // Empty selector matches everything (`cpt-cf-adr-instance-addressable-discovery` §6).
+        assert!(LabelSelector::new().matches(&labels));
+
+        // Single requirement present.
+        assert!(LabelSelector::new().with("shard", "1").matches(&labels));
+
+        // AND semantics: every requested pair must be present.
+        assert!(
+            LabelSelector::new()
+                .with("shard", "1")
+                .with("az", "a")
+                .matches(&labels)
+        );
+
+        // A requested pair with the wrong value does not match.
+        assert!(!LabelSelector::new().with("shard", "2").matches(&labels));
+
+        // A requested key absent from the instance does not match.
+        assert!(!LabelSelector::new().with("region", "eu").matches(&labels));
+    }
+
+    #[test]
+    fn label_selector_builders_and_accessors() {
+        // `new()` / default is empty and matches everything.
+        assert!(LabelSelector::new().is_empty());
+        assert!(LabelSelector::default().match_labels().is_empty());
+
+        // `from_match_labels` round-trips the map and reports non-empty.
+        let map = BTreeMap::from([("shard".to_owned(), "3".to_owned())]);
+        let sel = LabelSelector::from_match_labels(map.clone());
+        assert!(!sel.is_empty());
+        assert_eq!(sel.match_labels(), &map);
+    }
+
+    #[test]
+    fn grpc_service_info_new() {
+        let info =
+            GrpcServiceInfo::new("payment.v1.PaymentApi", ServiceEndpoint::http("pay", 50051));
+        assert_eq!(info.service_name, "payment.v1.PaymentApi");
+        assert_eq!(info.endpoint.uri, concat!("http", "://pay:50051"));
+    }
+
+    #[test]
+    fn directory_sentinels_construct_and_display() {
+        let not_found = DirectoryNotFound::new("gear foo");
+        assert_eq!(not_found.resource, "gear foo");
+        assert_eq!(not_found.to_string(), "directory: not found: gear foo");
+
+        let invalid = DirectoryInvalidArgument::new("bad uuid");
+        assert_eq!(invalid.message, "bad uuid");
+        assert_eq!(invalid.to_string(), "directory: invalid argument: bad uuid");
+    }
+
+    #[test]
     fn test_register_instance_info() {
         let info = RegisterInstanceInfo {
             gear: "test_gear".to_owned(),
@@ -227,6 +369,7 @@ mod tests {
             version: Some("1.0.0".to_owned()),
             rest_endpoint: None,
             openapi_spec: None,
+            labels: BTreeMap::new(),
         };
 
         assert_eq!(info.gear, "test_gear");
@@ -245,6 +388,7 @@ mod tests {
             version: Some("2.0.0".to_owned()),
             rest_endpoint: Some(ServiceEndpoint::http("billing", 8080)),
             openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
+            labels: BTreeMap::new(),
         };
 
         assert_eq!(info.gear, "billing");

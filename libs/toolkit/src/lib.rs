@@ -166,6 +166,11 @@ pub use healthcheck::{
 pub mod discovery;
 pub use discovery::{ConsumerRegistration, DirectoryEndpointResolver};
 
+// Instance-addressable targeting helpers (`cpt-cf-adr-instance-addressable-discovery` §6): label-keyed membership
+// view + consistent-hash pick, and the stale-owner fencing signal.
+pub mod topology;
+pub use topology::{NOT_SHARD_OWNER_PROBLEM_TYPE, NotShardOwner, TopologyView};
+
 // GTS schema support
 pub mod gts;
 

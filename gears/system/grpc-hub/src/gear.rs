@@ -536,6 +536,7 @@ impl GrpcHub {
                     version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                     rest_endpoint: None,
                     openapi_spec: None,
+                    labels: std::collections::BTreeMap::new(),
                 };
 
                 directory.register_instance(info).await?;

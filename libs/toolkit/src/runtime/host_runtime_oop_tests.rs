@@ -193,6 +193,7 @@ async fn e2e_oop_gear_boots_serves_registers_and_shuts_down() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        labels: std::collections::BTreeMap::new(),
         directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
         bearer_authenticator: None,
         internal_authenticator: None,

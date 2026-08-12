@@ -1,7 +1,7 @@
 //! Gear Manager - tracks and manages all live gear instances in the runtime
 
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -95,6 +95,9 @@ pub struct GearInstance {
     pub version: Option<String>,
     pub rest_endpoint: Option<Endpoint>,
     pub openapi_spec: Option<String>,
+    /// Consumer-defined instance labels for within-contract targeting
+    /// (`cpt-cf-adr-instance-addressable-discovery` §2), e.g. `shard`, `pod`.
+    pub labels: BTreeMap<String, String>,
     inner: Arc<parking_lot::RwLock<InstanceRuntimeState>>,
 }
 
@@ -108,6 +111,7 @@ impl Clone for GearInstance {
             version: self.version.clone(),
             rest_endpoint: self.rest_endpoint.clone(),
             openapi_spec: self.openapi_spec.clone(),
+            labels: self.labels.clone(),
             inner: Arc::clone(&self.inner),
         }
     }
@@ -127,6 +131,7 @@ impl GearInstance {
             version: other.version.clone(),
             rest_endpoint: other.rest_endpoint.clone(),
             openapi_spec: other.openapi_spec.clone(),
+            labels: other.labels.clone(),
             inner: Arc::clone(&self.inner),
         }
     }
@@ -142,6 +147,7 @@ impl GearInstance {
             version: None,
             rest_endpoint: None,
             openapi_spec: None,
+            labels: BTreeMap::new(),
             inner: Arc::new(parking_lot::RwLock::new(InstanceRuntimeState {
                 last_heartbeat: Instant::now(),
                 state: InstanceState::Registered,
@@ -171,6 +177,12 @@ impl GearInstance {
 
     pub fn with_openapi_spec(mut self, spec: impl Into<String>) -> Self {
         self.openapi_spec = Some(spec.into());
+        self
+    }
+
+    /// Attach consumer-defined instance labels (`cpt-cf-adr-instance-addressable-discovery` §2).
+    pub fn with_labels(mut self, labels: BTreeMap<String, String>) -> Self {
+        self.labels = labels;
         self
     }
 
@@ -408,23 +420,33 @@ impl GearManager {
         &self,
         service_name: &str,
     ) -> Option<(String, Arc<GearInstance>, Endpoint)> {
-        // Collect all instances that provide this service
-        let mut candidates = Vec::new();
+        // Collect every instance that provides this service, regardless of
+        // health, then prefer serving instances below.
+        let mut all = Vec::new();
         for entry in &self.inner {
             let gear = entry.key().clone();
             for inst in entry.value() {
                 if let Some(ep) = inst.grpc_services.get(service_name) {
-                    let state = inst.state();
-                    if matches!(state, InstanceState::Healthy | InstanceState::Ready) {
-                        candidates.push((gear.clone(), inst.clone(), ep.clone()));
-                    }
+                    all.push((gear.clone(), inst.clone(), ep.clone()));
                 }
             }
         }
 
-        if candidates.is_empty() {
+        if all.is_empty() {
             return None;
         }
+
+        // Prefer serving (`Healthy`/`Ready`) instances, else fall back to the
+        // full not-ready set — same contract as `pick_rest_endpoint_round_robin`
+        // (a non-empty candidate set never yields `None`).
+        let healthy: Vec<_> = all
+            .iter()
+            .filter(|(_, inst, _)| {
+                matches!(inst.state(), InstanceState::Healthy | InstanceState::Ready)
+            })
+            .cloned()
+            .collect();
+        let candidates = if healthy.is_empty() { all } else { healthy };
 
         // Use a counter keyed by service name for round-robin
         let len = candidates.len();
@@ -968,6 +990,31 @@ mod tests {
         assert_ne!(inst1.instance_id, inst2.instance_id);
         // Endpoints should differ
         assert_ne!(ep1, ep2);
+    }
+
+    #[test]
+    fn pick_service_round_robin_falls_back_to_unhealthy() {
+        // `cpt-cf-adr-instance-addressable-discovery` §6: gRPC name-based RR must fall back to the not-ready set
+        // rather than dropping the last route (aligning with the REST helper).
+        let dir = GearManager::new();
+        let id = Uuid::new_v4();
+        let inst = Arc::new(
+            GearInstance::new("svc_gear", id)
+                .with_grpc_service("svc.Service", Endpoint::http("127.0.0.1", 9100)),
+        );
+        dir.register_instance(inst);
+        // Never heartbeat -> stays `Registered` (not serving); quarantine it too.
+        dir.mark_quarantined("svc_gear", id);
+
+        let picked = dir.pick_service_round_robin("svc.Service");
+        assert!(
+            picked.is_some(),
+            "a non-empty candidate set must never yield None, even all-quarantined"
+        );
+        assert_eq!(picked.unwrap().1.instance_id, id);
+
+        // A service with no providing instance still yields None.
+        assert!(dir.pick_service_round_robin("absent.Service").is_none());
     }
 
     #[test]

@@ -1,0 +1,5 @@
+error: duplicate role name `event-broker-ingest` in `roles`
+ --> tests/ui/fail/gear_roles_duplicate.rs:7:53
+  |
+7 |     roles = ["event-broker", "event-broker-ingest", "event-broker-ingest"],
+  |                                                     ^^^^^^^^^^^^^^^^^^^^^

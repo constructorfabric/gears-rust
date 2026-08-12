@@ -449,6 +449,7 @@ mod tests {
             version: None,
             rest_endpoint: Some(ServiceEndpoint::new(uri)),
             openapi_spec: Some(spec),
+            labels: std::collections::BTreeMap::new(),
         })
         .await
         .unwrap();
@@ -526,6 +527,7 @@ mod tests {
             version: None,
             rest_endpoint: Some(ServiceEndpoint::new("http://calc:8080")),
             openapi_spec: Some(public_spec("calc", "/calc/v1/sub")),
+            labels: std::collections::BTreeMap::new(),
         })
         .await
         .unwrap();
@@ -589,6 +591,7 @@ mod tests {
             version: None,
             rest_endpoint: None,
             openapi_spec: None,
+            labels: std::collections::BTreeMap::new(),
         })
         .await
         .unwrap();
@@ -615,6 +618,7 @@ mod tests {
             version: None,
             rest_endpoint: Some(ServiceEndpoint::new("http://specless:8080")),
             openapi_spec: None,
+            labels: std::collections::BTreeMap::new(),
         })
         .await
         .unwrap();
@@ -894,6 +898,7 @@ mod tests {
             version: None,
             rest_endpoint: Some(ServiceEndpoint::new("http://calc:8080")),
             openapi_spec: Some(public_spec("calc", "/calc/v1/sub")),
+            labels: std::collections::BTreeMap::new(),
         })
         .await
         .unwrap();
@@ -958,6 +963,7 @@ mod tests {
             openapi_spec: None,
             openapi_spec_hash: hash.map(ToOwned::to_owned),
             grpc_services: Vec::new(),
+            labels: std::collections::BTreeMap::new(),
         }
     }
 

@@ -37,6 +37,7 @@
 //!         print_config: false,
 //!         heartbeat_interval_secs: 5,
 //!         version: None,
+//!         role_names: None,
 //!     };
 //!
 //!     run_oop_with_options(opts).await
@@ -91,6 +92,17 @@ pub struct OopRunOptions {
     /// Gear version (used for `DirectoryService` registration and `OpenAPI` version).
     /// Defaults to `None`.
     pub version: Option<String>,
+
+    /// Optional **override** of the closed set of role-qualified directory names
+    /// this gear binary may register under (`cpt-cf-adr-instance-addressable-discovery`).
+    /// When the resolved [`gear_name`](Self::gear_name) is not a member, bootstrap
+    /// **refuses to start**, making the role / front-door split structural.
+    ///
+    /// Normally left `None`: the set is auto-discovered from the linked gear's
+    /// `#[toolkit::gear(roles = [...])]` declaration (via the `DeclaredRoles`
+    /// inventory), so it cannot be forgotten in `main.rs`. Set `Some(..)` only to
+    /// override that discovery.
+    pub role_names: Option<Vec<String>>,
 }
 
 impl Default for OopRunOptions {
@@ -112,6 +124,7 @@ impl Default for OopRunOptions {
             print_config: false,
             heartbeat_interval_secs: 5,
             version: None,
+            role_names: None,
         }
     }
 }
@@ -389,6 +402,7 @@ fn merge_json_objects(target: &mut serde_json::Value, source: &serde_json::Value
 ///         print_config: false,
 ///         heartbeat_interval_secs: 5,
 ///         version: None,
+///         role_names: None,
 ///     };
 ///
 ///     run_oop_with_options(opts).await
@@ -409,6 +423,19 @@ fn merge_json_objects(target: &mut serde_json::Value, source: &serde_json::Value
 pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
     // Generate instance ID if not provided
     let instance_id = opts.instance_id.unwrap_or_else(Uuid::new_v4);
+
+    // Structural role-name guard (`cpt-cf-adr-instance-addressable-discovery` §1):
+    // fail fast if the resolved `gear_name` is not a member of the gear's
+    // declared role set, rather than registering under an undeclared name. The
+    // role set is discovered from the booted gear's own `#[toolkit::gear(roles =
+    // [...])]` declaration (via inventory), selected by declaring identity so a
+    // binary linking several role-split gears validates each against *its own*
+    // roles, never the cross-gear union. An explicit `opts.role_names` overrides.
+    let role_names = effective_role_names(
+        opts.role_names.clone(),
+        crate::registry::declared_roles_for(&opts.gear_name).unwrap_or_default(),
+    );
+    validate_role_name(&opts.gear_name, role_names.as_deref())?;
 
     // Create root cancellation token for the entire process.
     // This token drives shutdown for the gear runtime and all background tasks.
@@ -665,6 +692,20 @@ async fn build_oop_serve_options(
         .clone()
         .unwrap_or_else(|| default_advertise_uri(listen_addr));
 
+    // `cpt-cf-adr-instance-addressable-discovery` §5 fail-fast: in multi-host Profile 2 / Profile 3 the runtime
+    // MUST refuse to start rather than register a bind-only (loopback /
+    // `0.0.0.0` / `localhost`) endpoint that other gears cannot reach. Gated by
+    // config so Profile 1 and single-node Profile 2 over UDS start normally.
+    if cfg.require_reachable_advertise_uri && !advertise_uri_is_reachable(&advertise_uri) {
+        anyhow::bail!(
+            "oop_http.advertise_uri {advertise_uri:?} is a bind-only address \
+             (loopback / 0.0.0.0 / localhost) but require_reachable_advertise_uri is set: \
+             in multi-host Profile 2 / Profile 3, set advertise_uri to an address other gears \
+             can reach (e.g. the pod FQDN `$(HOSTNAME).<service>.$(POD_NAMESPACE).svc:<port>` or \
+             the Service DNS name), per cpt-cf-adr-instance-addressable-discovery §5"
+        );
+    }
+
     let internal_authenticator = build_internal_authenticator(cfg.internal_auth.as_ref()).await?;
 
     Ok(OopServeOptions {
@@ -677,6 +718,9 @@ async fn build_oop_serve_options(
         drain_timeout: Duration::from_secs(cfg.drain_timeout_secs),
         heartbeat_interval,
         healthcheck_timeout: Duration::from_millis(cfg.healthcheck_timeout_ms),
+        // Deployment-sourced instance labels (`cpt-cf-adr-instance-addressable-discovery` §2), from config /
+        // `APP__OOP_HTTP__LABELS__*` env overrides.
+        labels: cfg.labels.clone(),
         directory,
         bearer_authenticator: None,
         internal_authenticator,
@@ -726,6 +770,77 @@ async fn build_internal_authenticator(
     }
 
     Ok(None)
+}
+
+/// Resolve the effective role set to guard against: an explicit
+/// `OopRunOptions.role_names` wins (back-compat / override); otherwise the set
+/// auto-discovered from the linked gear's `#[toolkit::gear(roles = [...])]`
+/// declaration is used. An empty discovered set means no gear declared roles (a
+/// single-role binary), which maps to `None` — no constraint.
+fn effective_role_names(
+    explicit: Option<Vec<String>>,
+    discovered: Vec<String>,
+) -> Option<Vec<String>> {
+    match explicit {
+        Some(roles) => Some(roles),
+        None => (!discovered.is_empty()).then_some(discovered),
+    }
+}
+
+/// Validate the resolved directory `gear_name` against the gear binary's
+/// declared closed set of role-qualified names (`cpt-cf-adr-instance-addressable-discovery` §1).
+///
+/// `None` (single-role gear) always passes. When `Some`, membership is required
+/// — a name outside the set is a hard start-time error, so a mis-set boot mode
+/// cannot register under an undeclared (or the bare front-door) name.
+fn validate_role_name(gear_name: &str, role_names: Option<&[String]>) -> Result<()> {
+    if let Some(roles) = role_names
+        && !roles.iter().any(|r| r == gear_name)
+    {
+        anyhow::bail!(
+            "OoP gear_name {gear_name:?} is not in the declared role-name set {roles:?} \
+             (cpt-cf-adr-instance-addressable-discovery §1): a role-split gear's boot mode must map to one of its \
+             manifest-declared role-qualified names — refusing to start rather than \
+             registering under an undeclared name"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `advertise_uri` points at an address other gears can actually reach
+/// (`cpt-cf-adr-instance-addressable-discovery` §5) — i.e. **not** a bind-only address.
+///
+/// * `unix://…` (UDS) is inherently instance-addressable (single-node Profile 2)
+///   and therefore **reachable/exempt**.
+/// * `localhost`, IPv4/IPv6 **loopback**, and **unspecified** (`0.0.0.0` / `::`)
+///   hosts are **not** reachable.
+/// * Any other host — including a DNS name such as a k8s pod FQDN / Service DNS —
+///   is treated as reachable (the runtime cannot resolve arbitrary DNS at
+///   config time; the operator owns correctness of a concrete name).
+fn advertise_uri_is_reachable(uri: &str) -> bool {
+    if uri.starts_with("unix://") {
+        return true;
+    }
+    let after_scheme = uri.split_once("://").map_or(uri, |(_, rest)| rest);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    // Extract the host, handling bracketed IPv6 (`[::1]:8080`) and `host:port`.
+    let host = authority.strip_prefix('[').map_or_else(
+        || {
+            authority
+                .rsplit_once(':')
+                .map_or(authority, |(host, _port)| host)
+        },
+        |rest| rest.split_once(']').map_or(rest, |(host, _rest)| host),
+    );
+
+    if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return !(ip.is_loopback() || ip.is_unspecified());
+    }
+    // A non-IP DNS name (pod FQDN / Service DNS) is considered reachable.
+    true
 }
 
 /// Derive a default advertise URI from the bind address. Unspecified hosts

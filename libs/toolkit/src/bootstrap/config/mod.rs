@@ -165,6 +165,23 @@ pub struct OopHttpConfig {
     /// unspecified host (`0.0.0.0`) rewritten to `127.0.0.1`.
     #[serde(default)]
     pub advertise_uri: Option<String>,
+    /// Fail fast (refuse to start) when the effective `advertise_uri` is unset
+    /// or resolves to a bind-only address (loopback / `0.0.0.0` / `localhost`)
+    /// rather than an address reachable by *other* gears (`cpt-cf-adr-instance-addressable-discovery` §5).
+    ///
+    /// Defaults to `false` so Profile 1 and single-node Profile 2 over UDS (and
+    /// local demos on loopback) start normally. Set `true` in **multi-host
+    /// Profile 2** and **Profile 3**, where a silently-registered loopback
+    /// endpoint is a registered-but-unreachable instance; there, supply the pod
+    /// FQDN / Service DNS as `advertise_uri`. UDS advertise URIs are exempt.
+    #[serde(default)]
+    pub require_reachable_advertise_uri: bool,
+    /// Deployment-sourced instance labels (`cpt-cf-adr-instance-addressable-discovery` §2) registered with the
+    /// directory for targeting via `resolve_by_labels` (e.g. `shard: "1"`).
+    /// Settable in config or via `APP__OOP_HTTP__LABELS__<key>` env overrides, so
+    /// a deployment can inject per-pod identity without baking it into the YAML.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
     /// Platform-plane (`InternalAuthenticator`) configuration. When present it
     /// drives both the *inbound* HTTP validator on the gear's own routes and
     /// the *outbound* credential attached to the gear's `DirectoryService`

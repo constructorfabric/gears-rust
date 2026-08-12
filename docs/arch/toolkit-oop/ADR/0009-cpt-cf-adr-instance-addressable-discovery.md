@@ -59,13 +59,6 @@ axis is solved by directory **labels + targeted resolution**. Concretely, today 
 We need to decide how (and whether) the platform supports targeting a specific instance, and where that lives
 relative to the directory contract and the REST contract-codegen client-wiring layer.
 
-> **This ADR is the platform's single service-discovery layer.** The cluster gear's in-SDK
-> `ServiceDiscoveryV1` (instance registration, serving intent, metadata filtering, TTL heartbeat, and topology
-> watch as a follow-up) is **superseded** by the directory and its capability consolidated here so there is exactly **one**
-> source of topology truth. The actual code removal is **out of scope for this ADR** - it is executed by the
-> cluster gear's own decomposition as a separate, coordinated change; this ADR is the *design* that replaces
-> it. See [Relationship to cluster `ServiceDiscoveryV1`](#relationship-to-cluster-servicediscoveryv1).
-
 ## Decision Drivers
 
 * **Correctness of split gears must be structural, not flag-dependent** - a role-split or sharded gear must
@@ -154,6 +147,69 @@ Naming cannot express this (they are the same service), so it is solved by direc
 The two axes are orthogonal and compose: **role selects the name, label selects the instance within it** (the
 second resolve line above targets an ingest shard the first line cannot reach).
 
+**Mechanism: the manifest declares a closed set of role-names; the boot mode maps into it (decision).** The
+structural guarantee above ("a forgotten flag cannot misroute, because there is no flag") rests on *where* the
+registration name comes from, and two names must not be conflated:
+
+* `#[toolkit::gear(name = "...")]` is a **compile-time string literal** validated at macro expansion
+  (`libs/toolkit-macros`), fixing the gear's **identity** - one binary cannot declare three identities this
+  way, nor should it.
+* The name that actually reaches the directory is a **runtime** value (`OopRunOptions.gear_name`, supplied by
+  `main.rs` via `libs/toolkit/src/bootstrap/oop.rs`). If that were a *free-form* runtime string, a mis-set boot
+  mode could register an `ingest` instance under `event-broker`, and a front-door caller would round-robin
+  straight into it - the **same fail-open the `entrypoint` field was rejected for**, merely moved from a
+  boolean to a string. "No flag" would not hold.
+
+The property is kept structural by **not** taking the directory name as a free runtime string. Instead: **the
+gear manifest declares the closed set of role-qualified directory names the gear may register under, together
+with the `DeploymentMode -> role-name` map; the boot mode selects a name from that closed set; and bootstrap
+refuses to start on a mode whose resolved name is not in the declared set.** Concretely:
+
+* A role-split gear declares its role-names **once, at the manifest / gear-declaration level** (e.g. a
+  `roles = ["event-broker", "event-broker-ingest", "event-broker-delivery"]` set alongside
+  `#[toolkit::gear(...)]`, plus the `DeploymentMode -> role-name` mapping). The bare gear identity
+  (`event-broker`) is one entry in that set - the front door.
+* At boot, `OopRunOptions.gear_name` is **derived** from `(declared map, boot mode)` and **validated against the
+  declared closed set**. A mode with no mapping, or a name outside the set, is a **hard start-time error**
+  (fail-fast) - never a silent default to the bare name.
+* The residual fail-open is therefore removed: a mis-wired mode **cannot invent a name**. The worst case is a
+  mode that maps to a valid *internal* role-name, which surfaces as that role being **absent from the front
+  door** (the §1b readiness verdict / §6 not-ready), not as an internal instance cross-routed under the bare
+  name.
+
+This is the single mechanism the whole role axis rests on, so it is specified here rather than deferred to the
+implementing change.
+
+### 1b. Dependencies and readiness across role-qualified names
+
+Splitting one gear into several directory names splits its **dependency graph** too, so `deps` is stated in
+terms of *names*, not gear identity:
+
+* **A consumer** declares `deps` on the **name it actually calls** - normally the front door
+  (`deps = [event-broker]`), which gates only on dispatcher readiness. A consumer that legitimately targets an
+  internal role declares that **role-name** explicitly (`deps = [event-broker-ingest]`); nothing gates on an
+  internal role-name a consumer never named.
+* **A role-split gear** declares, in its manifest, the role-names it depends on **as directory names**,
+  including its **own other role-names**: the `dispatcher` front door depends on `event-broker-ingest` /
+  `event-broker-delivery`. Because those are **distinct directory names** - not the gear's own identity - this
+  is **not** a self-dependency in the topo-sort's sense (a name never depends on itself) and introduces **no
+  cycle**: the deps topo-sort operates on directory names throughout, so "a gear depending on its own other
+  role-names" is just a normal edge between two names that happen to be produced by one binary.
+* **Readiness gating** (ADR-0005) is **per name**: `deps = [event-broker-ingest]` gates until at least one
+  healthy instance registers under `event-broker-ingest`, exactly as for any other name.
+
+**Permanent-unresolvable verdict (decision).** `Ok(empty)` reads as "not ready yet" (§6), which is correct
+*transiently* but wrong *forever*: a **misconfigured or never-deployed** role-name (wrong boot mode, missing
+workload, typo) also returns `Ok(empty)` indefinitely, indistinguishable from a fleet still coming up. This is
+the residual of the §6 gap the ownership-fencing contract closes for *stale targets* but not for *absent names*.
+The platform therefore MUST, for a name a consumer declared a **dependency** on (not for ad-hoc
+`resolve_by_labels` probes), emit a distinct **unresolvable-dependency** readiness verdict once a
+**configurable grace window** elapses with **zero** registered instances: readiness gating flips that
+dependency from "not-ready" to a **hard, surfaced error** (a failed `/readyz` naming the unresolved name)
+rather than a perpetual silent 503. It is owned by the readiness layer (ADR-0005) and is keyed on the
+**declared-dependency** name set so an ad-hoc empty label result stays a benign `Ok(empty)`. The grace-window
+default and per-dep override are readiness-layer implementation details.
+
 ### 2. Enabling mechanism: instance labels + targeted resolution
 
 Within a directory name, addressing is keyed on **`(name, selector) -> endpoint`**: *which name* (already
@@ -174,7 +230,8 @@ Add **one** targeted lookup to `DirectoryClient`, backed by selection in `GearMa
 clients:
 
 * `resolve_by_labels(name, selector)` - the set of instances of `name` matching a `LabelSelector` (see §6),
-  each carrying its `instance_id`, `labels`, readiness state, and endpoints.
+  each carrying its `instance_id`, `labels`, and endpoints - with **no** readiness/health annotation. Unhealthy
+  matches remain in the set; liveness is the caller's responsibility (health contract in §6).
 
 There is deliberately **no** `resolve_instance(gear, instance_id)`. The only live `instance_id` a caller can
 hold comes from a prior `resolve_by_labels` result (which already carries the endpoint), so a
@@ -321,8 +378,9 @@ There is one targeted lookup (§2); its cardinality and health contract, and the
 contract, are:
 
 * **`resolve_by_labels(name, selector)` -> a set (array)** - effectively `list_instances(name)` filtered by the
-  selector, returning each match's `instance_id`, `labels`, readiness state, and endpoints (gRPC
-  `endpoint` and/or `rest_endpoint`). The selector is a **`LabelSelector` struct** wrapping a **map of equality
+  selector, returning each match's `instance_id`, `labels`, and endpoints (gRPC
+  `endpoint` and/or `rest_endpoint`) - i.e. **addresses**, with **no** per-result health annotation. The selector
+  is a **`LabelSelector` struct** wrapping a **map of equality
   requirements matched with AND semantics** (Kubernetes `matchLabels` style): an instance matches only if it
   carries **every** requested `key=value` pair (e.g. `shard=7`); an empty selector matches
   all instances of the name. Passing a **struct rather than a bare map** keeps future filters (e.g.
@@ -330,8 +388,8 @@ contract, are:
   RPC request message is already additively extensible, but the Rust trait signature is not unless the argument
   is a struct. This is the enumeration form the broker dispatcher uses to build/refresh a partition->instance
   map, and that fan-out/broadcast consumers use to reach every match. Set-based / inequality **expression**
-  selectors (`in`, `notin`, `!=`) are out of scope for Layer 1 (equality-AND only); **health filtering stays
-  caller-side** (health contract below), so the selector carries no `only_serving`-style flag.
+  selectors (`in`, `notin`, `!=`) are out of scope for Layer 1 (equality-AND only); the selector carries no
+  `only_serving`-style flag - **liveness is the caller's concern** (health contract below).
 * **"pick one from the matched set"** is an **application-owned selector** over an already-targeted label set
   (first / consistent-hash / caller policy) - **not** toolkit load balancing. The toolkit's only load-balancing
   primitive is round-robin over name resolution (§3-§4); `resolve_by_labels` merely returns the set,
@@ -348,29 +406,26 @@ contract, are:
 * **Empty-set semantics**: zero matches is `Ok(empty)`, kept distinct from a
   directory-backend error - preserving the not-found vs. failure contract of ADR-0005, so an empty result reads
   as "not ready yet," not "outage."
-* **Health contract (decision):** every lookup annotates each returned instance with its readiness state
-  (`InstanceState`: `Registered` / `Ready` / `Healthy` / `Quarantined` / `Draining`; only `Ready` / `Healthy`
-  are **serving**, the rest are **not-ready**). This is the **directory's annotation of a resolution result** and
-  is **derived from** the instance's readiness signal ([ADR-0005](0005-cpt-cf-adr-eventual-readiness.md)), not a
-  second health system; it is *not* the same enum as ADR-0005's readiness-probe `state`. Mapping to ADR-0005:
-  `Ready`/`Healthy` correspond to ADR-0005 `Ready`/`Degraded` (serving / `200`); `Registered` to `Starting`
-  (registered, deps not yet resolved); `Quarantined` to a failing readiness probe (`Unhealthy`->`Starting`); and
-  `Draining` to `Draining`. A caller can thus always distinguish **no match** (`Ok(empty)`)
-  from **matched-but-not-ready**. The two modes share these error semantics and differ only in health
-  *filtering*:
-  * **Name round-robin** (`resolve_rest_service` / `resolve_grpc_service`) rotates over the resolved name,
-    **preferring** serving (`Ready` / `Healthy`) instances but, when none are serving, **falling back to RR
-    over the full not-ready set - `Quarantined` *and* `Draining` included**. Draining instances are
-    graceful-shutdown targets upstreams stop routing to, but the toolkit still prefers a draining endpoint over
-    `None` rather than dropping the last route. Concretely: a name whose instances are **all `Quarantined`**
-    resolves to a quarantined endpoint, and a name whose instances are **all `Draining`** likewise resolves to a
-    draining endpoint. `None` is returned **only** when the candidate set is **empty** - i.e. no instance
-    registered under the name exposes the requested endpoint at all - never merely because every instance is
-    not-ready. *(One transport asymmetry - gRPC service-scoped resolution does **not** yet fall back and instead
-    returns `None` when none are serving - is tracked in Implementation notes.)*
-  * **`resolve_by_labels(name, selector)`** returns the **full** matching set **regardless of health**, each
-    entry carrying its readiness state; an all-unhealthy match is still `Ok(non-empty)`, distinct from
-    `Ok(empty)` and from a backend error.
+* **Health contract (decision): the directory returns addresses, not a per-result health verdict.** A resolution
+  result carries **no readiness annotation** — the directory is an addressing layer, not a second health system.
+  `Ok(empty)` means **no match** (distinct from a backend error); a **matched-but-not-serving** instance is
+  discovered by the caller **dialing it** and corrected via the stale-owner path below, not by a directory flag.
+  Health-aware selection is confined to **name round-robin**, where it is a **server-side selection detail** of
+  the resolving directory (computed over its own instance health, `InstanceState`, derived from
+  [ADR-0005](0005-cpt-cf-adr-eventual-readiness.md) readiness) and **never appears on `resolve_by_labels`
+  results**. The two resolution modes therefore differ as follows:
+  * **Name round-robin** (`resolve_rest_service` / `resolve_grpc_service`) returns a **single already-selected
+    endpoint**: the directory **prefers** serving (`Ready` / `Healthy`) instances but, when none are serving,
+    **falls back to RR over the full not-ready set** (`Quarantined` *and* `Draining` included) so a non-empty
+    name never yields `None` merely because nothing is serving. `None` is returned **only** when the candidate
+    set is **empty**. This preference is uniform across transports (REST and gRPC service-scoped resolution
+    both fall back; see Implementation notes) and is entirely internal to the resolving directory — it is not
+    surfaced as result metadata.
+  * **`resolve_by_labels(name, selector)`** returns the **full matched set as addresses, regardless of health**.
+    For sharding / leadership the caller MUST target the **owner** of the key; health-filtering here would
+    misroute to a **non-owner**, so a not-serving owner is handled by the call outcome + the stale-owner
+    correction below, never by dropping it from the set. An all-unhealthy match is still `Ok(non-empty)`,
+    distinct from `Ok(empty)` and from a backend error.
 
 * **Stale-ownership correction path (required contract).** A poll-refreshed shard/owner map (§2) is inherently
   stale between refreshes, so ownership is **not** established by the directory result alone - it must be
@@ -408,22 +463,15 @@ REST contract codegen. This ADR fixes the **contract shape** (Layer 1) so it can
 with that codegen's directory edits (which also modify `ServiceInstanceInfo` / `grpc/client.rs`) rather than in
 a merge scramble.
 
-**Relationship to the event-broker's current primitive.** event-broker ADR-0007 (Accepted) has
-`domain/cluster.rs` resolve the cluster gear's `ServiceDiscoveryV1` via `ClientHub` under the `evbk` prefix -
-so the broker has a *working* targeting primitive today. That primitive is exactly the cluster
-`ServiceDiscoveryV1` this ADR **supersedes and replaces** (see [Relationship to cluster
-`ServiceDiscoveryV1`](#relationship-to-cluster-servicediscoveryv1)); Layer 1 is therefore not "unblocking
-something new" but **the successor substrate** the broker's dispatcher->ingest targeting must move onto once
-cluster discovery is retired (by the cluster gear's own decomposition, not this ADR). The broker's
-decomposition already assumes one binary with mode-selected wiring, so its `ingest` / `delivery` modes register
-their **role-qualified directory names** (§1) - no `entrypoint` marker is needed, and the wrong-role failure
-mode is structurally impossible.
+**event-broker adoption.** The event-broker's `dispatcher -> ingest` / `delivery` targeting resolves through the
+directory (Layer 1) with plain HTTP/gRPC clients: its `ingest` / `delivery` modes register **role-qualified
+directory names** (§1) and the dispatcher builds a shard map via `resolve_by_labels`. No `entrypoint` marker is
+needed and the wrong-role failure mode is structurally impossible. Routing a *generated typed* client to a
+specific instance waits on REST contract codegen (Layer 2).
 
-**Watch / change-notification (required follow-up, owned here).** The cluster `ServiceDiscoveryV1` being
-removed included a **topology `watch`** (unfiltered `Joined`/`Left`/`Updated` stream). Because this ADR is that
-capability's single successor, a directory-level change-notification API is a **required follow-up owned by
-this design** (not the cluster gear), so removing cluster discovery is not a silent regression. It is
-sequenced *after* Layer 1 (poll + the §6 fencing contract already make correctness *specified*); watch is a
+**Watch / change-notification (follow-up owned here).** A directory-level change-notification API — a topology
+`watch` stream (instance `Joined` / `Left` / `Updated`) — is a **follow-up owned by this design**, sequenced
+*after* Layer 1: poll + the §6 fencing contract already make correctness *specified*, so watch is a
 convergence-latency optimization, not a correctness prerequisite. Until it lands, consumers poll
 `list_instances` / `resolve_by_labels`.
 
@@ -536,41 +584,6 @@ convergence-latency optimization, not a correctness prerequisite. Until it lands
 
 ## More Information
 
-### Relationship to cluster `ServiceDiscoveryV1`
-
-**This ADR supersedes and absorbs the cluster gear's `ServiceDiscoveryV1`; the code removal is executed by the
-cluster gear's own decomposition as a separate, coordinated change, not by this ADR.** There is **one**
-service-discovery layer - the directory - not a directory layer plus a competing cluster layer. The prior
-concern that this ADR added a "second, weaker discovery layer next to a merged one" is resolved by
-*consolidation*: the cluster in-SDK discovery primitive
-(`gears/system/cluster/cluster-sdk/src/discovery/`, its default/standalone/Postgres backends, conformance
-suite, GTS specs, and wiring) will be **retired** by that decomposition work, after which the cluster gear
-keeps only its other three backend traits (cache, distributed lock, leader election). The dependency direction
-is therefore **not** inverted - cluster is not a shipped provider this ADR races; its discovery capability is
-the thing being consolidated here. The event-broker `domain/cluster.rs` `ServiceDiscoveryV1` handle and every
-cluster-side user are retired by that decomposition; until the directory replacement (Layer 1) lands the
-capability still exists in cluster, so there is **no functional gap** during the transition.
-
-Concept mapping (cluster -> directory):
-
-| Cluster `ServiceDiscoveryV1`                             | Directory (this ADR)                                             |
-|----------------------------------------------------------|------------------------------------------------------------------|
-| `ServiceRegistration.metadata: HashMap<String,String>`   | `labels` map on `InstanceInfo` / `ServiceInstanceInfo` (§2)      |
-| `DiscoveryFilter` (AND-conjoined `MetaMatch::{Equals,OneOf}`) | `resolve_by_labels` `LabelSelector` (equality-AND; `OneOf`/expressions are the deferred `matchExpressions`, §6) |
-| `InstanceState::{Enabled, Disabled}` (serving intent)    | readiness state on results (`Registered`/`Ready`/`Healthy`/`Quarantined`/`Draining`, §6) - `Draining` == cluster `Disabled` |
-| `StateFilter::{Enabled, Disabled, Any}` (server-side serving-state filter) | **caller-side** health filtering (§6) - `resolve_by_labels` returns the full set annotated with readiness state; there is no server-side `only_serving` flag |
-| `ServiceHandle::set_state` (runtime serving-intent flip / drain) | no dedicated intent-flip RPC; an instance signals `Draining` through **readiness** (ADR-0005), which name round-robin de-prefers (§6) - the deliberate "intent, not health" split (cluster ADR-008) is folded into the readiness axis |
-| `ServiceHandle::update_metadata` (runtime metadata mutation) | no dedicated update RPC; label changes ride **re-registration** (labels MUST survive re-registration, §2 / Implementation notes) |
-| `ServiceDiscoveryV1::scoped(prefix)` (name sub-namespacing) | not carried over - the directory uses flat, manifest-declared role-qualified names (§1); coordination-namespace scoping is a cluster-internal concern, not a directory primitive |
-| TTL heartbeat / lapse                                    | directory registration + heartbeat loop (§5) / readiness gating (ADR-0005) |
-| `ServiceDiscoveryBackend::watch` (topology stream)       | change-notification **follow-up owned here** (§7, Consequences) - poll `list_instances` / `resolve_by_labels` until it lands; **not** a cluster-scoped layer |
-
-**Boundary (why this is the directory's job, not a gear's):** the directory is a **toolkit-level** primitive
-that every gear (and the edge) already depends on; a gear cannot be the source of topology truth the toolkit
-resolves against without a dependency inversion (the toolkit cannot depend on a gear). Consolidating discovery
-here keeps a single source of truth **and** the correct layering; the cluster gear becomes a *consumer* of this
-layer for its coordinator's shard/leader targeting, like any other gear.
-
 ### Cross-references & required amendments
 
 **Sibling ADRs / PRD.** Some of these are true **amendments** (this ADR changes a shape they assert), not just
@@ -608,7 +621,7 @@ references; the amendment notes are recorded inline in each target document:
   gating ([ADR-0005 Consequences](0005-cpt-cf-adr-eventual-readiness.md#consequences)).
 * **[event-broker service decomposition](../../../../gears/system/event-broker/docs/ADR/0007-service-decomposition.md)**
   (the *event-broker's* ADR-0007, Accepted - distinct from the toolkit-oop ADR-0007 above) is the consuming
-  design - see §7's *Relationship to the event-broker's current primitive*.
+  design - see §7's *event-broker adoption*.
 
 **REST contract codegen (PRD §4.1).** The trait-first REST client generation roadmap item - *"REST client
 generation from annotated Rust traits (trait-first, `#[toolkit::rest_contract]` proc-macro)"* in

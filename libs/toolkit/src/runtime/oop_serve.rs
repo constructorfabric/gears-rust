@@ -94,6 +94,10 @@ pub struct OopServeOptions {
     /// [`Healthcheck`](crate::healthcheck::Healthcheck) that exceeds this is
     /// reported `Unhealthy`. Mirrors the `api-gateway` `healthcheck_timeout_ms`.
     pub healthcheck_timeout: Duration,
+    /// Deployment-sourced instance labels registered with the
+    /// directory for targeting via `resolve_by_labels` (e.g. `shard`, `pod`).
+    /// From `oop_http.labels`; empty for untargeted gears.
+    pub labels: std::collections::BTreeMap<String, String>,
     /// Directory client used for self-registration and dependency resolution.
     pub directory: Arc<dyn DirectoryClient>,
     /// Tenant-plane authenticator; when `Some`, `security_context_middleware`
@@ -116,6 +120,7 @@ impl std::fmt::Debug for OopServeOptions {
             .field("drain_timeout", &self.drain_timeout)
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("healthcheck_timeout", &self.healthcheck_timeout)
+            .field("labels", &self.labels)
             .field("bearer_authenticator", &self.bearer_authenticator.is_some())
             .field(
                 "internal_authenticator",
@@ -639,6 +644,7 @@ impl OopHttpServer {
             version: self.options.version.clone(),
             rest_endpoint: Some(ServiceEndpoint::new(self.options.advertise_uri.clone())),
             openapi_spec: Some(openapi_arc.to_string()),
+            labels: self.options.labels.clone(),
         };
         self.registration_task = Some(tokio::spawn(super::oop_registration::presence_loop(
             Arc::clone(&self.options.directory),

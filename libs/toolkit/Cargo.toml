@@ -111,6 +111,7 @@ toolkit-db = { workspace = true, optional = true }
 sea-orm-migration = { workspace = true, optional = true }
 toolkit-odata = { workspace = true }
 toolkit-sdk = { workspace = true }
+toolkit-stable-hash = { workspace = true }
 cf-gears-system-sdks = { workspace = true, features = ["directory"] }
 # `rest-client` is not optional: `discovery` and the runtime proxy-wiring phase
 # use `toolkit_contract::runtime::resolving`, which lives behind it.

@@ -259,6 +259,59 @@ pub struct Registrator(pub fn(&mut RegistryBuilder));
 
 inventory::collect!(Registrator);
 
+/// A gear's declared closed set of role-qualified directory names, submitted by
+/// `#[toolkit::gear(roles = [...])]` (`cpt-cf-adr-instance-addressable-discovery`
+/// section 1) and collected via `inventory`. Retains the declaring gear identity
+/// (`gear`) so the booted gear is validated against only its own role set.
+pub struct DeclaredRoles {
+    /// Bare `#[toolkit::gear(name = ...)]` identity that declared this set.
+    pub gear: &'static str,
+    /// Closed set of role-qualified directory names the gear may register under.
+    pub roles: &'static [&'static str],
+}
+
+inventory::collect!(DeclaredRoles);
+
+/// Deduplicated union of every gear-declared role set linked into this binary.
+/// Whole-binary view only; use [`declared_roles_for`] to scope to the booted gear.
+#[must_use]
+pub fn discovered_role_names() -> Vec<String> {
+    let mut roles: Vec<String> = Vec::new();
+    for declared in ::inventory::iter::<DeclaredRoles> {
+        for &role in declared.roles {
+            if !roles.iter().any(|r| r == role) {
+                roles.push(role.to_owned());
+            }
+        }
+    }
+    roles
+}
+
+/// The role set of the declaration owning `gear_name` (its declaring identity or
+/// one of its role names) — that gear's roles alone, never a union. `None` when
+/// no declaration claims the name (single-role / non-role gear — no constraint).
+pub(crate) fn select_roles_for<'a, I>(declarations: I, gear_name: &str) -> Option<Vec<String>>
+where
+    I: IntoIterator<Item = (&'a str, &'a [&'a str])>,
+{
+    declarations.into_iter().find_map(|(gear, roles)| {
+        (gear == gear_name || roles.contains(&gear_name))
+            .then(|| roles.iter().map(|&r| r.to_owned()).collect())
+    })
+}
+
+/// [`select_roles_for`] over the linked [`DeclaredRoles`] inventory: the booted
+/// gear's own role set, so one gear's name is never validated against another's.
+#[must_use]
+pub fn declared_roles_for(gear_name: &str) -> Option<Vec<String>> {
+    select_roles_for(
+        ::inventory::iter::<DeclaredRoles>
+            .into_iter()
+            .map(|d| (d.gear, d.roles)),
+        gear_name,
+    )
+}
+
 /// The final, topo-sorted runtime registry.
 pub struct GearRegistry {
     gears: Vec<GearEntry>, // topo-sorted

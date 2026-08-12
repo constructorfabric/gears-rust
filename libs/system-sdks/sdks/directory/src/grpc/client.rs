@@ -283,6 +283,7 @@ impl DirectoryClient for DirectoryGrpcClient {
             version: info.version.unwrap_or_default(),
             rest_endpoint_uri: info.rest_endpoint.map(|ep| ep.uri),
             openapi_spec: info.openapi_spec,
+            labels: info.labels.into_iter().collect(),
         };
 
         client
@@ -340,11 +341,12 @@ fn proto_instance_to_domain(proto: InstanceInfo) -> ServiceInstanceInfo {
         rest_endpoint: proto.rest_endpoint_uri.map(ServiceEndpoint::new),
         openapi_spec: proto.openapi_spec,
         openapi_spec_hash: proto.openapi_spec_hash,
-        // The list-instances proto response does not break the instance down
-        // per gRPC service, so nothing to carry back over the OoP directory
-        // transport. The in-process `LocalDirectoryClient` populates this from
-        // the live `GearInstance`.
-        grpc_services: Vec::new(),
+        grpc_services: proto
+            .grpc_services
+            .into_iter()
+            .map(|svc| (svc.service_name, ServiceEndpoint::new(svc.endpoint_uri)))
+            .collect(),
+        labels: proto.labels.into_iter().collect(),
     }
 }
 
@@ -391,9 +393,15 @@ mod tests {
             rest_endpoint_uri: Some("http://calc:8080".to_owned()),
             openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
             openapi_spec_hash: None,
+            labels: std::collections::HashMap::from([("shard".to_owned(), "1".to_owned())]),
+            grpc_services: vec![GrpcServiceEndpoint {
+                service_name: "calc.v1.Calculator".to_owned(),
+                endpoint_uri: "http://calc:9090".to_owned(),
+            }],
         };
         let domain = proto_instance_to_domain(proto);
         assert_eq!(domain.gear, "calc");
+        assert_eq!(domain.labels.get("shard").map(String::as_str), Some("1"));
         assert_eq!(domain.instance_id, "calc-1");
         assert_eq!(domain.endpoint.uri, "http://calc:8080");
         assert_eq!(domain.version.as_deref(), Some("1.2.3"));
@@ -402,6 +410,11 @@ mod tests {
             Some("http://calc:8080".to_owned())
         );
         assert!(domain.openapi_spec.is_some());
+        // gRPC services survive the proto -> domain mapping so a targeted
+        // resolve can dial the instance's gRPC endpoint by service name.
+        assert_eq!(domain.grpc_services.len(), 1);
+        assert_eq!(domain.grpc_services[0].0, "calc.v1.Calculator");
+        assert_eq!(domain.grpc_services[0].1.uri, "http://calc:9090");
     }
 
     #[test]
@@ -414,9 +427,13 @@ mod tests {
             rest_endpoint_uri: None,
             openapi_spec: None,
             openapi_spec_hash: None,
+            labels: std::collections::HashMap::new(),
+            grpc_services: Vec::new(),
         };
         let domain = proto_instance_to_domain(proto);
         // An empty proto version string maps to `None` rather than an empty string.
+        assert!(domain.labels.is_empty());
+        assert!(domain.grpc_services.is_empty());
         assert!(domain.version.is_none());
         assert!(domain.rest_endpoint.is_none());
         assert!(domain.openapi_spec.is_none());
