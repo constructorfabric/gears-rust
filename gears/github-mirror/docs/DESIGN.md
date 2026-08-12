@@ -679,11 +679,15 @@ Does NOT own subscriber installation.
 
 ### 3.4 Internal Dependencies
 
-| Dependency Gear | Interface Used | Purpose |
-|-----------------|----------------|---------|
-| ToolKit | OperationBuilder, OpenAPI | REST route wiring |
-| SecurityContext | Platform auth path | Authenticated request context |
-| ClientHub | SDK client registration | In-process SDK contract |
+| Dependency | Interface Used | Purpose |
+|------------|----------------|---------|
+| ToolKit | OperationBuilder, OpenAPI | REST route wiring and contract registration |
+| ToolKit security / secure ORM | `SecurityContext`, `SecureConn`, `AccessScope`, `Scopable`, `pep_properties` | Propagates authenticated request context and applies fail-closed row-level authorization constraints to normalized-store queries |
+| AuthN Resolver gear | Platform auth middleware integration | Validates inbound bearer tokens and produces `SecurityContext` for protected HTTP and CLI entry paths |
+| AuthZ Resolver gear | `AuthZResolverClient`, `PolicyEnforcer` | Retrieves PDP decisions and query constraints for read/write authorization enforcement |
+| Tenant Resolver gear | Tenant hierarchy / subtree / barrier queries | Supplies tenant-scope semantics used by multi-tenant authorization flows |
+| Resource Group Resolver gear | Resource-group hierarchy / membership queries | Supplies group-scoped authorization inputs when mirror policies depend on resource-group membership |
+| ClientHub | SDK and resolver client registration | In-process SDK contract and resolver-client lookups |
 | Credential Store gear | Secret reference lookup | Secure storage/retrieval of GitHub PATs, token-pool entries, and other secrets; the mirror does not implement credential storage |
 | Event Manager / Event Broker gear | Entity lifecycle event publication | Delivers entity lifecycle state-change events to platform subscribers; when unavailable, events remain on the standard gear-local event path |
 | Canonical error library | RFC-9457 problem details | Standardized errors |
@@ -701,6 +705,21 @@ HTTPS/REST, JSON, Link-header pagination, ETag/Last-Modified conditional request
 **Contract**: `cpt-cf-github-mirror-contract-github-graphql`
 
 HTTPS/POST `/graphql`, JSON, cursor-based pagination, point-based rate limiting, 500k node limit.
+
+#### Technical Libraries and Runtimes
+
+| Dependency | Role in design |
+|------------|----------------|
+| tokio | Async runtime for HTTP I/O, database I/O, worker scheduling, and API serving |
+| reqwest | GitHub API HTTP client, including conditional requests and header handling |
+| SeaORM | DB-agnostic persistence layer for SQLite, PostgreSQL, and MariaDB |
+| tracing | Structured logging and telemetry emission |
+| serde / serde_json | JSON serialization and deserialization for API payloads, cache bodies, and telemetry |
+| toml | Configuration parsing for sync, cache, token-pool, and API settings |
+| zstd / flate2 | Raw-response compression support for cache and archival storage |
+| sha2 | Canonical request and content hash computation |
+| PyO3 / maturin | Python binding surface and wheel build pipeline |
+| clap | Dedicated CLI crate command parsing and UX |
 
 ### 3.6 Interactions & Sequences
 

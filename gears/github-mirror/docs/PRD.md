@@ -1030,20 +1030,10 @@ The system **MUST** support parallel synchronization of multiple repositories wi
 |------------|-------------|-------------|
 | GitHub REST API v3 | Primary upstream data source for synchronization and write-back | p1 |
 | GitHub GraphQL API v4 | Alternative data source for cost-optimized batch queries | p2 |
-| ToolKit `OperationBuilder` | Standard REST route wiring and OpenAPI registration | p1 |
-| `SecurityContext` propagation | Authenticated request context for API endpoints | p1 |
-| `ClientHub` | Registers the SDK client for in-process consumers | p1 |
-| Canonical error library | RFC-9457 problem details for error responses | p1 |
-| tokio | Async runtime for HTTP, database, and API serving | p1 |
-| reqwest | HTTP client for GitHub API requests | p1 |
-| SeaORM | Async, DB-agnostic ORM (SQLite, PostgreSQL, MariaDB) | p1 |
-| tracing | Structured logging framework | p1 |
-| serde / serde_json | JSON serialization/deserialization | p1 |
-| toml | TOML configuration parsing | p1 |
-| zstd / flate2 | Response body compression | p2 |
-| sha2 | Content hash computation | p2 |
-| PyO3 / maturin | Python bindings and wheel building | p3 |
-| clap | CLI command parsing (CLI crate only) | p1 |
+| AuthN Resolver gear | Validates bearer tokens and produces `SecurityContext` for protected HTTP and CLI entry paths | p1 |
+| AuthZ Resolver gear | Provides authorization decisions and query constraints for API reads, sync control, and write-back operations | p1 |
+| Tenant Resolver gear | Provides tenant hierarchy, subtree, and barrier semantics used by multi-tenant authorization flows | p1 |
+| Resource Group Resolver gear | Provides resource-group hierarchy and membership inputs when authorization policies are group-scoped | p2 |
 | Credential Store gear | Secure storage and retrieval of GitHub tokens and secrets | p2 |
 | Event Broker gear (future) | Event delivery for entity lifecycle state changes | p2 |
 
