@@ -1,7 +1,7 @@
 [package]
 name = "cf-gears-llm-gateway-sdk"
 description = "SDK for the LLM Gateway: Open Responses domain models"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -31,4 +31,4 @@ toolkit-gts = { workspace = true }
 toolkit = { workspace = true }
 
 # Model Registry SDK: the GTS `ModelInfoV1` carried in `ProviderCallCtx`
-model-registry-sdk = { package = "cf-gears-model-registry-sdk", version = "0.1.3", path = "../../model-registry/model-registry-sdk" }
+model-registry-sdk = { package = "cf-gears-model-registry-sdk", version = "0.1.4", path = "../../model-registry/model-registry-sdk" }

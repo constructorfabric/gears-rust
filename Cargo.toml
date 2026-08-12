@@ -245,22 +245,22 @@ verbose_file_reads = "deny"
 
 [workspace.dependencies]
 # libs
-toolkit = { package = "cf-gears-toolkit", version = "0.6.20", path = "libs/toolkit" }
+toolkit = { package = "cf-gears-toolkit", version = "0.6.21", path = "libs/toolkit" }
 toolkit-http = { package = "cf-gears-toolkit-http", version = "0.6.9", path = "libs/toolkit-http" }
-toolkit-http-middleware = { package = "cf-gears-toolkit-http-middleware", version = "0.1.0", path = "libs/toolkit-http-middleware" }
+toolkit-http-middleware = { package = "cf-gears-toolkit-http-middleware", version = "0.1.2", path = "libs/toolkit-http-middleware" }
 toolkit-k8s-auth = { package = "cf-gears-toolkit-k8s-auth", version = "0.1.0", path = "libs/toolkit-k8s-auth" }
 toolkit-auth = { package = "cf-gears-toolkit-auth", version = "0.7.3", path = "libs/toolkit-auth" }
-toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", version = "0.7.6", path = "libs/toolkit-canonical-errors" }
+toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", version = "0.8.0", path = "libs/toolkit-canonical-errors" }
 toolkit-canonical-errors-macro = { package = "cf-gears-toolkit-canonical-errors-macro", version = "0.6.2", path = "libs/toolkit-canonical-errors-macro" }
-toolkit-db = { package = "cf-gears-toolkit-db", version = "0.11.1", path = "libs/toolkit-db" }
+toolkit-db = { package = "cf-gears-toolkit-db", version = "0.11.2", path = "libs/toolkit-db" }
 toolkit-db-macros = { package = "cf-gears-toolkit-db-macros", version = "0.6.4", path = "libs/toolkit-db-macros" }
 toolkit-gts = { package = "cf-gears-toolkit-gts", version = "0.1.4", path = "libs/toolkit-gts" }
 toolkit-gts-macros = { package = "cf-gears-toolkit-gts-macros", version = "0.1.3", path = "libs/toolkit-gts-macros" }
 toolkit-macros = { package = "cf-gears-toolkit-macros", version = "0.6.5", path = "libs/toolkit-macros" }
 toolkit-node-info = { package = "cf-gears-toolkit-node-info", version = "0.6.5", path = "libs/toolkit-node-info" }
-toolkit-odata = { package = "cf-gears-toolkit-odata", version = "0.9.0", path = "libs/toolkit-odata" }
-toolkit-odata-macros = { package = "cf-gears-toolkit-odata-macros", version = "0.6.10", path = "libs/toolkit-odata-macros" }
-toolkit-sdk = { package = "cf-gears-toolkit-sdk", version = "0.7.3", path = "libs/toolkit-sdk" }
+toolkit-odata = { package = "cf-gears-toolkit-odata", version = "0.9.1", path = "libs/toolkit-odata" }
+toolkit-odata-macros = { package = "cf-gears-toolkit-odata-macros", version = "0.6.11", path = "libs/toolkit-odata-macros" }
+toolkit-sdk = { package = "cf-gears-toolkit-sdk", version = "0.7.4", path = "libs/toolkit-sdk" }
 toolkit-security = { package = "cf-gears-toolkit-security", version = "0.7.3", path = "libs/toolkit-security" }
 toolkit-stable-hash = { package = "cf-gears-toolkit-stable-hash", version = "0.1.0", path = "libs/toolkit-stable-hash" }
 toolkit-transport-grpc = { package = "cf-gears-toolkit-transport-grpc", version = "0.7.0", path = "libs/toolkit-transport-grpc" }
@@ -286,29 +286,29 @@ cf-gears-system-sdks = { version = "0.1.40", path = "libs/system-sdks" }
 cf-gears-system-sdk-directory = { version = "0.1.40", path = "libs/system-sdks/sdks/directory" }
 
 # System gears
-types-registry = { package = "cf-gears-types-registry", version = "0.1.30", path = "gears/system/types-registry/types-registry" }
-authn-resolver = { package = "cf-gears-authn-resolver", version = "0.2.25", path = "gears/system/authn-resolver/authn-resolver" }
-authz-resolver = { package = "cf-gears-authz-resolver", version = "0.1.32", path = "gears/system/authz-resolver/authz-resolver" }
-tenant-resolver = { package = "cf-gears-tenant-resolver", version = "0.1.29", path = "gears/system/tenant-resolver/tenant-resolver" }
-resource-group = { package = "cf-gears-resource-group", version = "0.2.6", path = "gears/system/resource-group/resource-group" }
-credstore = { package = "cf-gears-credstore", version = "0.2.5", path = "gears/credstore/credstore" }
-oagw = { package = "cf-gears-oagw", version = "0.3.6", path = "gears/system/oagw/oagw" }
-account-management = { package = "cf-gears-account-management", version = "0.5.2", path = "gears/system/account-management/account-management" }
-usage-collector = { package = "cf-gears-usage-collector", version = "0.2.6", path = "gears/system/usage-collector/usage-collector" }
-cluster = { package = "cf-gears-cluster", version = "0.1.4", path = "gears/system/cluster/cluster" }
+types-registry = { package = "cf-gears-types-registry", version = "0.1.31", path = "gears/system/types-registry/types-registry" }
+authn-resolver = { package = "cf-gears-authn-resolver", version = "0.2.26", path = "gears/system/authn-resolver/authn-resolver" }
+authz-resolver = { package = "cf-gears-authz-resolver", version = "0.1.33", path = "gears/system/authz-resolver/authz-resolver" }
+tenant-resolver = { package = "cf-gears-tenant-resolver", version = "0.1.30", path = "gears/system/tenant-resolver/tenant-resolver" }
+resource-group = { package = "cf-gears-resource-group", version = "0.2.7", path = "gears/system/resource-group/resource-group" }
+credstore = { package = "cf-gears-credstore", version = "0.2.6", path = "gears/credstore/credstore" }
+oagw = { package = "cf-gears-oagw", version = "0.3.7", path = "gears/system/oagw/oagw" }
+account-management = { package = "cf-gears-account-management", version = "0.5.3", path = "gears/system/account-management/account-management" }
+usage-collector = { package = "cf-gears-usage-collector", version = "0.2.7", path = "gears/system/usage-collector/usage-collector" }
+cluster = { package = "cf-gears-cluster", version = "0.1.5", path = "gears/system/cluster/cluster" }
 
-cf-gears-cluster-sdk = { version = "0.1.6", path = "gears/system/cluster/cluster-sdk" }
-cf-gears-cluster-conformance = { version = "0.2.0", path = "gears/system/cluster/cluster-conformance" }
+cf-gears-cluster-sdk = { version = "0.1.7", path = "gears/system/cluster/cluster-sdk" }
+cf-gears-cluster-conformance = { version = "0.2.1", path = "gears/system/cluster/cluster-conformance" }
 
 # System gears SDKs
-account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.5.2", path = "gears/system/account-management/account-management-sdk" }
-cluster-sdk = { package = "cf-gears-cluster-sdk", version = "0.1.6", path = "gears/system/cluster/cluster-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.2", path = "gears/system/types-registry/types-registry-sdk" }
-tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.16", path = "gears/system/tenant-resolver/tenant-resolver-sdk" }
-authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.16", path = "gears/system/authz-resolver/authz-resolver-sdk" }
-resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.3", path = "gears/system/resource-group/resource-group-sdk" }
-oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.5", path = "gears/system/oagw/oagw-sdk" }
-usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.4", path = "gears/system/usage-collector/usage-collector-sdk" }
+account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.5.3", path = "gears/system/account-management/account-management-sdk" }
+cluster-sdk = { package = "cf-gears-cluster-sdk", version = "0.1.7", path = "gears/system/cluster/cluster-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.3", path = "gears/system/types-registry/types-registry-sdk" }
+tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.17", path = "gears/system/tenant-resolver/tenant-resolver-sdk" }
+authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.17", path = "gears/system/authz-resolver/authz-resolver-sdk" }
+resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.4", path = "gears/system/resource-group/resource-group-sdk" }
+oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.6", path = "gears/system/oagw/oagw-sdk" }
+usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.5", path = "gears/system/usage-collector/usage-collector-sdk" }
 
 # BSS gears (ported from vhp-core)
 bss-ledger-sdk = { path = "gears/bss/ledger/ledger-sdk" }
@@ -317,13 +317,13 @@ coord = { path = "gears/bss/libs/coord" }
 aws-lc-rs = "1.17"
 
 # credstore
-credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.5", path = "gears/credstore/credstore-sdk" }
+credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.6", path = "gears/credstore/credstore-sdk" }
 
 # mini-chat
-mini-chat-sdk = { package = "cf-gears-mini-chat-sdk", version = "0.10.15", path = "gears/mini-chat/mini-chat-sdk" }
+mini-chat-sdk = { package = "cf-gears-mini-chat-sdk", version = "0.10.16", path = "gears/mini-chat/mini-chat-sdk" }
 
 # System gears
-grpc_hub = { package = "cf-gears-grpc-hub", version = "0.2.15", path = "gears/system/grpc-hub" }
+grpc_hub = { package = "cf-gears-grpc-hub", version = "0.2.16", path = "gears/system/grpc-hub" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
