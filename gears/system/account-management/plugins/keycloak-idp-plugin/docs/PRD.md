@@ -61,7 +61,7 @@ The Keycloak IdP Plugin solves this gap for Keycloak. It owns the provider-facin
 
 - Pass 100% of the Account Management `IdpPluginClient` contract suite for the supported operations of every v1 release.
 - Produce zero successful cross-tenant reads or mutations across the automated negative-isolation suite.
-- Produce expected SDK outcomes for 100% of failure-injection cases, with zero ambiguous tenant-provisioning outcomes classified as clean failures.
+- Produce expected SDK outcomes for 100% of failure-injection cases, with zero ambiguous tenant-provisioning outcomes classified as clean failures and zero pre-mutation failures classified as ambiguous.
 - Expose zero administrator secrets, user passwords, or service-principal secrets across automated log, metric, audit, and debug-output scans.
 - Qualify every plugin release against the supported Keycloak 26.x releases before publication.
 - Meet the v1 lifecycle latency budgets in §6.1 on the release qualification profile.
@@ -244,7 +244,7 @@ Provisioning intent arrives through the `IdpProvisionTenantRequest.metadata` val
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-shared-realm-admissibility`
 
-The target shared realm **MUST** already exist; the plugin verifies existence with the bootstrap admin before any mutation. A failed existence check performs no mutation. A provider 4xx **MUST** be reported as a clean failure and a 403 as unsupported; a 5xx, transport, or timeout failure **MUST** be reported conservatively as ambiguous, because the plugin cannot prove the provider was untouched. The plugin **MUST NOT** create, repair, or reconfigure a shared realm.
+The target shared realm **MUST** already exist; the plugin verifies existence with the bootstrap admin before any mutation. A failed existence check performs no mutation. A provider 4xx **MUST** be reported as a clean failure and a 403 as unsupported; a 5xx, transport, or timeout failure on the check **MUST** also be reported as a clean failure, because the check is a read: its answer is unknown but no provider state can have been retained, so retry is harmless and no reconciliation is owed. The plugin **MUST NOT** create, repair, or reconfigure a shared realm.
 
 - **Rationale**: The plugin must not claim an unknown realm or mutate operator-owned realm configuration.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`
@@ -325,7 +325,7 @@ Account Management does not invoke this plugin for tenant suspension or soft del
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-tenant-failure-contract`
 
-The plugin **MUST** distinguish invalid pre-mutation requests (`InvalidInput` with a field reference), clean failures proven to retain no provider state (`CleanFailure`, including permanent provider 4xx and pre-saga failures), ambiguous provisioning outcomes (`Ambiguous`, stage-attributed with an `ambig:` token, covering provider 5xx, transport loss, saga timeout, and the Credential-Store-write-after-Keycloak-success window), unsupported operations, retryable deprovisioning failures, terminal deprovisioning failures, and already-absent resources (`NotFound`, success-equivalent). It **MUST NOT** invite blind retry after an ambiguous result.
+The plugin **MUST** distinguish invalid pre-mutation requests (`InvalidInput` with a field reference), clean failures proven to retain no provider state (`CleanFailure`, including permanent provider 4xx, pre-saga failures, and every failure — 5xx, transport loss, or timeout included — occurring before the saga attempts its first provider mutation, such as health probes and existence checks), ambiguous provisioning outcomes (`Ambiguous`, stage-attributed with an `ambig:` token, covering provider 5xx, transport loss, and timeout once a mutation has been attempted and may have landed, plus the Credential-Store-write-after-Keycloak-success window), unsupported operations, retryable deprovisioning failures, terminal deprovisioning failures, and already-absent resources (`NotFound`, success-equivalent). It **MUST NOT** invite blind retry after an ambiguous result.
 
 - **Rationale**: External administration can fail after side effects, so callers need deterministic recovery behavior.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`
@@ -569,9 +569,9 @@ On the release qualification profile, shared-realm tenant provisioning **MUST** 
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-nfr-failure-classification`
 
-The plugin **MUST** classify every failed supported lifecycle call into an outcome exposed by the applicable SDK contract, through its closed internal error taxonomy and fixed translation tables. Tenant provisioning **MUST** preserve `Ambiguous` whenever retained external state cannot be ruled out (provider 5xx, transport loss, saga timeout, post-Keycloak credential-store failure). User operations **MUST** use the available `IdpUserOperationFailure` variants and rely on idempotent replay where that contract has no ambiguity variant. Every failure variant **MUST** carry a stable metric label.
+The plugin **MUST** classify every failed supported lifecycle call into an outcome exposed by the applicable SDK contract, through its closed internal error taxonomy and fixed translation tables. Tenant provisioning **MUST** preserve `Ambiguous` whenever retained external state cannot be ruled out — that is, whenever a provider 5xx, transport loss, or timeout strikes after a mutation has been attempted, and for the post-Keycloak credential-store failure. The same causes arising before the first attempted mutation **MUST** be `CleanFailure`. User operations **MUST** use the available `IdpUserOperationFailure` variants and rely on idempotent replay where that contract has no ambiguity variant. Every failure variant **MUST** carry a stable metric label.
 
-- **Threshold**: 100% of automated failure-injection cases produce an expected SDK category; zero ambiguous tenant-provisioning cases are classified as clean failures.
+- **Threshold**: 100% of automated failure-injection cases produce an expected SDK category; zero ambiguous tenant-provisioning cases are classified as clean failures, and zero failures injected before the saga's first mutation are classified as ambiguous.
 - **Rationale**: Correct recovery depends on the difference between safe retry and reconciliation.
 - **Architecture Allocation**: See [DESIGN.md §3.3](./DESIGN.md#33-api-contracts) and [§3.6](./DESIGN.md#36-interactions--sequences).
 
@@ -714,7 +714,7 @@ When required dependencies meet their objectives, the plugin **MUST** support th
 
 **Alternative Flows**:
 - **Realm missing**: The plugin returns a clean failure without mutation.
-- **Provider unreachable mid-saga**: A pre-saga probe failure is clean; a 5xx or transport failure on the existence check itself is reported ambiguous and blocks retry pending reconciliation.
+- **Provider unreachable mid-saga**: A pre-saga probe failure is clean, and so is a 5xx or transport failure on the existence check itself — both precede any mutation, so retry is harmless and neither blocks on reconciliation. Only a failure after the tenant-group mutation is attempted is reported ambiguous.
 - **Admin user already bound elsewhere**: The plugin returns a stage-attributed ambiguous outcome for reconciliation without overwriting the binding.
 
 #### Adopt an Existing Tenant Realm

@@ -351,8 +351,8 @@ The current [`idp.rs`](../../../account-management-sdk/src/idp.rs) and [`idp_use
 Contract invariants implemented at the plugin's SDK boundary:
 
 - malformed or contradictory provisioning intent (`ProvisionInputRejected`, metadata decode failures) maps to `IdpProvisionFailure::InvalidInput` with `field = "provisioning_metadata"`, before provider mutation;
-- a foreign or unmarked existing realm in `created` mode is `CleanFailure` (no state was created); permanent provider 4xx and pre-saga failures are `CleanFailure`;
-- provider 5xx, transport/timeout, saga timeout, and every staged `AmbiguousCreated` map to `IdpProvisionFailure::Ambiguous` for the provisioning reaper;
+- a foreign or unmarked existing realm in `created` mode is `CleanFailure` (no state was created); permanent provider 4xx and pre-saga failures are `CleanFailure`; so is any 5xx, transport, or timeout failure raised before the saga attempts its first mutation — the health probe and the shared/adopted existence checks are reads, so their outcome may be unknown while the provider is provably untouched;
+- provider 5xx, transport/timeout, saga timeout, and every staged `AmbiguousCreated` map to `IdpProvisionFailure::Ambiguous` for the provisioning reaper **once a mutation has been attempted** — the mutation boundary, not the error class, is what separates this row from the one above;
 - missing bootstrap permissions (`BootstrapPermsMissing`) map to `UnsupportedOperation` with an operator-runbook detail;
 - tenant deprovisioning maps `DeprovisionNotFound` → `NotFound` (success-equivalent), `DeprovisionRetryable` → `Retryable`, and everything else — including metadata decode failures — → `Terminal`;
 - user failures use only `IdpUserOperationFailure` variants: KC 409 on create is `DuplicateUser` with the field refined from the provider message (`Username`/`Email`/`UsernameOrEmail`), password-policy rejections are `PasswordPolicy`, unsupported filters and the unimplemented `update_user` are `UnsupportedOperation`, provider/transport trouble is `Unavailable`;
@@ -393,7 +393,7 @@ Domain components depend on plugin-owned ports rather than transport types: `req
 
 **Use cases**: `cpt-cf-keycloak-idp-plugin-usecase-bind-shared-tenant`, `cpt-cf-keycloak-idp-plugin-usecase-adopt-tenant-realm`, `cpt-cf-keycloak-idp-plugin-usecase-create-tenant-realm` — **Actors**: `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-keycloak`, `cpt-cf-keycloak-idp-plugin-actor-credstore`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`
 
-`provision_tenant` runs under a 30 s (configurable) timeout; a timeout is `AmbiguousCreated { Timeout }`. The saga parses intent first (fail-fast, no provider round-trip), then health-probes Keycloak (failure = clean `Config` error — nothing mutated), then dispatches on the binding:
+`provision_tenant` runs under a 30 s (configurable) timeout; a timeout is `AmbiguousCreated { Timeout }` once the saga has attempted a mutation, and a clean failure if it expires while the saga is still in its read-only prologue. The saga parses intent first (fail-fast, no provider round-trip), then health-probes Keycloak (failure = clean `Config` error — nothing mutated), then dispatches on the binding:
 
 - **Shared** (default; child tenants inherit the parent's realm from replayed parent metadata; root bootstrap must name the realm): assert the realm exists (bootstrap admin), then under the env-backed realm-admin ensure the per-tenant group `/tenants/{tenant_id}` and optionally bind the operator-declared admin user's `tenant_id`/`user_type` attributes (idempotent; a foreign or multi-valued existing binding is rejected as a hijack attempt).
 - **Adopted**: assert the realm exists and is empty of tenant boundaries (no subgroups under the group root), then ensure the tenant group using the operator-provisioned Credential Store secret reference.
