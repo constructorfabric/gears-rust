@@ -43,7 +43,7 @@
 
 ### 1.1 Purpose
 
-The Keycloak IdP Plugin (crate `cf-gears-keycloak-idp-plugin`) is a provider plugin for Account Management. It translates tenant and user lifecycle requests into administrative operations against Keycloak, and additionally provides tenant-scoped machine-identity (service-principal) lifecycle to trusted platform consumers through the `ServicePrincipalClientV1` contract. The plugin gives deployments a production provider while keeping Account Management independent of provider-specific behavior.
+The Keycloak IdP Plugin (crate `cf-gears-keycloak-idp-plugin`) is a provider plugin for Account Management. It translates tenant and user lifecycle requests into administrative operations against Keycloak, and is specified to additionally provide tenant-scoped machine-identity (service-principal) lifecycle to trusted platform consumers through the `ServicePrincipalClientV1` contract — a p2 surface held out of v1 until `service-principal-sdk` publishes that contract (§4.2, §5.4). The plugin gives deployments a production provider while keeping Account Management independent of provider-specific behavior.
 
 The plugin runs as a Gear in the host process. Account Management remains the public control-plane boundary. The plugin exposes no public REST API and does not authenticate requests, issue tokens, validate tokens, or make authorization decisions. It administers Keycloak directly over HTTPS using OAuth2 `client_credentials` administrator clients, with secret custody split between environment-expanded configuration and the platform Credential Store.
 
@@ -178,14 +178,13 @@ flowchart LR
 - Tenant binding to shared (default, inherited by child tenants), adopted (single-tenant, operator-owned), and created (plugin-owned, per-tenant) realms.
 - Tenant identity-boundary creation, binding, and cleanup, including created-realm lifecycle and Credential Store custody of created-realm admin secrets.
 - Tenant-scoped user creation, deletion, provider-session revocation, listing, filtering, and cursor pagination.
-- Tenant-scoped service-principal creation, secret rotation, revocation, listing, and purge-on-tenant-deprovision through `ServicePrincipalClientV1`.
 - Two-tier administrator credential handling (bootstrap admin, per-realm admin) with rotation convergence via reactive re-authentication, without process restart.
 - Deterministic failure classification, retry safety, and stage-attributed ambiguous-outcome reconciliation signals.
 - Privacy-conscious outcome evidence, bounded-cardinality metrics, and structured audit events (development stand-in pending the platform audit sink).
 
 ### 4.2 Out of Scope
 
-The user-update, realm-profile-verification, and provider-version-gate bullets below are out of v1 scope but retained as p2 requirements. All other bullets are product-level exclusions.
+The service-principal, user-update, realm-profile-verification, and provider-version-gate bullets below are out of v1 scope but retained as p2 requirements. All other bullets are product-level exclusions.
 
 - Starting, deploying, upgrading, backing up, or scaling Keycloak.
 - Running code inside Keycloak or packaging Keycloak server extensions.
@@ -193,6 +192,7 @@ The user-update, realm-profile-verification, and provider-version-gate bullets b
 - Validating incoming JWTs; the OIDC AuthN Resolver Plugin owns validation.
 - Making authorization decisions; RBAC and the Policy Engine own authorization.
 - Exposing public REST endpoints; Account Management and other owning gears expose public APIs.
+- Tenant-scoped service-principal creation, secret rotation, revocation, listing, and purge-on-tenant-deprovision through `ServicePrincipalClientV1` (§5.4, p2). The `service-principal-sdk` crate that publishes this trait is developed in parallel and is not present in this workspace, so the surface cannot be implemented, compiled, or qualified for v1; §5.4 specifies the target behavior for promotion once the contract lands (§10, §12, §13).
 - User profile updates through `IdpPluginClient::update_user`; the current implementation returns `UnsupportedOperation` (p2).
 - Runtime verification of the operator-provisioned realm authentication profile; operator realm bootstrap owns the profile (verification is p2).
 - A runtime Keycloak version gate; release qualification owns the compatibility matrix (a runtime gate is p2).
@@ -298,14 +298,14 @@ The plugin **MUST** return versioned, provider-owned tenant metadata after provi
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-tenant-deprovision`
 
-During hard deprovisioning the plugin **MUST** remove the tenant's provider-owned resources in a safe order: first purge the tenant's service principals, then delete the tenant group. For `created` bindings only, when no other tenant group remains, the plugin **MUST** then delete the plugin-owned realm and its Credential Store secret. It **MUST NOT** delete operator-owned shared or adopted realms, and **MUST NOT** delete resources belonging to another tenant. Missing metadata and already-absent resources **MUST** be success-equivalent.
+During hard deprovisioning the plugin **MUST** remove the tenant's provider-owned resources in a safe order: delete the tenant group, preceded — once the p2 service-principal surface lands — by the service-principal purge barrier of `cpt-cf-keycloak-idp-plugin-fr-tenant-service-principal-cleanup`. In v1 the plugin creates no service principals, so there are none to purge and the barrier is vacuous; it **MUST NOT** be treated as satisfied once that surface is promoted. For `created` bindings only, when no other tenant group remains, the plugin **MUST** then delete the plugin-owned realm and its Credential Store secret. It **MUST NOT** delete operator-owned shared or adopted realms, and **MUST NOT** delete resources belonging to another tenant. Missing metadata and already-absent resources **MUST** be success-equivalent.
 
-- **Rationale**: Cleanup must remove retired tenant access — including machine credentials — without destroying operator-owned or other-tenant resources.
+- **Rationale**: Cleanup must remove retired tenant access — including machine credentials once those exist — without destroying operator-owned or other-tenant resources.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`
 
 #### Service-Principal Cleanup Ordering
 
-- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-tenant-service-principal-cleanup`
+- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-tenant-service-principal-cleanup`
 
 Tenant deprovisioning **MUST** delete every service-principal client owned by the retiring tenant (identified by the `svc-{tenant_id}-` prefix and the ownership marker) before removing the tenant identity boundary. A purge failure **MUST** abort the deprovisioning saga with a retryable or terminal classification — it **MUST NOT** be reported as success-equivalent — so that no live machine credential survives its tenant.
 
@@ -388,11 +388,13 @@ The plugin **MUST** read and mutate user state in Keycloak and **MUST NOT** main
 
 ### 5.4 Service-Principal Lifecycle
 
+> **P2, blocked on an external contract.** Every requirement in this section is p2 and out of v1 scope (§4.2). The `ServicePrincipalClientV1` trait they implement is published by `service-principal-sdk`, which is developed in parallel and absent from this workspace, so none of this can be implemented, compiled, or qualified today. The behavior is specified here so promotion is a matter of binding to the published contract; where the trait as shipped differs from what is anticipated below, the shipped contract wins and this section is revised to match.
+
 Service-principal lifecycle is provided in v1 through the platform-owned `service-principal-sdk` contract (`ServicePrincipalClientV1`), registered unscoped in ClientHub for trusted platform consumers. Account Management's `IdpPluginClient` does not expose it; consumer-side authorization happens in the consumer's RBAC/PDP before delegation.
 
 #### Complete Service-Principal Operations
 
-- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-lifecycle`
+- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-lifecycle`
 
 The plugin **MUST** implement creation, secret rotation, revocation, and listing of tenant-scoped service principals as confidential OAuth `client_credentials` clients in the configured service-principal realm (default `platform` — the shared realm whose issuer tenants trust). Regular product consumers **MUST NOT** depend on this plugin directly; they use the owning platform module that consumes `ServicePrincipalClientV1`.
 
@@ -401,7 +403,7 @@ The plugin **MUST** implement creation, secret rotation, revocation, and listing
 
 #### Service-Principal Identity and State
 
-- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-state`
+- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-state`
 
 The final client id **MUST** be server-built as `svc-{tenant_id}-{name}`, where `name` is caller-chosen, non-empty, at most 40 characters, and restricted to lowercase alphanumerics and `-`. Successful creation **MUST** return a stable client id, the principal's subject id (the service-account user UUID, usable for RBAC bindings), the OAuth token endpoint, and the client secret. A taken client id **MUST** be rejected as invalid input without side effects — including a half-created principal left by an earlier ambiguous failure; recovery is revoke-then-create. After successful revocation, the principal **MUST** disappear from active listings; reusing the same name **MUST** create a distinct provider identity with a new credential.
 
@@ -411,7 +413,7 @@ The final client id **MUST** be server-built as `svc-{tenant_id}-{name}`, where 
 
 #### Service-Principal Tenant and Scope Safeguards
 
-- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-safeguards`
+- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-safeguards`
 
 Every service principal **MUST** be associated with exactly one tenant: the client carries the ownership marker (`cf.provisioning.tenant_id`), and its service-account user carries the `tenant_id` attribute and the configured service-principal subject type, so issued tokens identify the principal, its owning tenant, and the machine subject class through the realm's protocol mappers. Requested client scopes **MUST** be validated against the configured allowlist (empty allowlist = none attachable), and an allowlisted scope missing from the realm **MUST** fail cleanly with an operator-actionable message. A best-effort per-tenant quota (default 10) **MUST** bound creation; it is an operational guard, not a security boundary. Ownership **MUST** be enforced on every read and mutation: a principal that is absent or owned by another tenant is reported as not found, without distinguishing the two.
 
@@ -421,7 +423,7 @@ Every service principal **MUST** be associated with exactly one tenant: the clie
 
 #### Secret Rotation and Token Consequences
 
-- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-rotation`
+- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-rotation`
 
 Successful rotation **MUST** preserve the principal identity (client id, subject id) and tenant association, disclose the replacement credential in the rotation result, and prevent the old credential from obtaining new tokens. Rotation of a principal whose managed attributes are incomplete or corrupt **MUST** be rejected as invalid input with revoke-and-recreate guidance rather than returning a credential for a partially repaired identity. Successful revocation **MUST** prevent new token issuance; revocation of an already-absent principal is success-equivalent (`NotFound`). Tokens issued before rotation or revocation can remain valid until their configured expiry and **MUST NOT** exceed the platform maximum access-token lifetime.
 
@@ -430,7 +432,7 @@ Successful rotation **MUST** preserve the principal identity (client id, subject
 
 #### Service-Principal Listing
 
-- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-list`
+- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-list`
 
 Listing **MUST** return only principals owned by the requested tenant (prefix plus ownership-marker check enforced client-side over the provider's search results) and **MUST** omit credentials. The listing reports each principal's client id, enabled state, and attached client scopes as reported by the provider (including realm-default scopes). Listing is unpaginated by decision of the owning contract (service-principal PRD §4.2 places pagination out of scope); adding it would require an SPI change owned by the service-principal gear.
 
@@ -439,7 +441,7 @@ Listing **MUST** return only principals owned by the requested tenant (prefix pl
 
 #### Service-Principal Mutation Safety
 
-- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-mutation-safety`
+- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-mutation-safety`
 
 Repeating a creation with a taken name **MUST NOT** apply a second provider mutation or disclose another credential (it is rejected as invalid input). An uncertain creation, rotation, or revocation outcome **MUST** be reported as ambiguous with a stage token, **MUST NOT** contain a credential, and **MUST NOT** invite blind retry until the external outcome is resolved. A service-account user found already bound to a different tenant during creation **MUST** abort without overwriting (hijack guard).
 
@@ -448,7 +450,7 @@ Repeating a creation with a taken name **MUST NOT** apply a second provider muta
 
 #### One-Time Secret Disclosure
 
-- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-secret-disclosure`
+- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-secret-disclosure`
 
 A service-principal credential **MUST** be disclosed to consumers only in a successful creation or rotation result, carried in a redacted secret wrapper. The plugin **MUST NOT** persist, cache, log, or audit the plaintext credential; Keycloak holds the authoritative credential. Listing, reconciliation evidence, and failure results **MUST NOT** return it. The consumer owns durable custody (typically the Credential Store); a lost secret is recovered by explicit rotation, never by re-disclosure.
 
@@ -457,7 +459,7 @@ A service-principal credential **MUST** be disclosed to consumers only in a succ
 
 #### Service-Principal Recovery
 
-- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-recovery`
+- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-recovery`
 
 After reconciliation confirms provider state, an absent identity **MUST** permit a new creation attempt. A valid identity with an undelivered credential **MUST** be recovered by explicitly authorized rotation. An incomplete identity (taken name, missing or corrupt managed attributes) **MUST** require revoke-then-create before another creation attempt. An unresolved ambiguous state **MUST** remain blocked for operator action.
 
@@ -466,7 +468,7 @@ After reconciliation confirms provider state, an absent identity **MUST** permit
 
 #### Service-Principal Failure Contract
 
-- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-failure-contract`
+- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-principal-failure-contract`
 
 The plugin **MUST** classify every failed service-principal call into the closed `ServicePrincipalFailure` taxonomy: `InvalidInput` (bad name, disallowed scope, quota exceeded, taken client id — permanent, no vendor state retained by the call), `NotFound` (absent or foreign target; success-equivalent for revoke), `CleanFailure` (pre-mutation failure, retry harmless), and `Ambiguous` (transport uncertainty after a mutation may have landed — never reported as success, never containing a credential).
 
@@ -648,11 +650,11 @@ When required dependencies meet their objectives, the plugin **MUST** support th
 
 #### Service-Principal Lifecycle Contract
 
-- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-interface-service-principal-client`
+- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-interface-service-principal-client`
 
 - **Type**: Rust SDK trait (`ServicePrincipalClientV1` from `service-principal-sdk`), registered unscoped in ClientHub
-- **Stability**: stable
-- **Description**: Provides tenant-scoped creation, secret rotation, revocation, and listing of machine identities to trusted platform modules. Consumers authorize their own callers before delegation; deployments without this plugin simply have no registration.
+- **Stability**: not yet published — `service-principal-sdk` is absent from this workspace, so this contract is p2 and unimplemented in v1; it becomes stable when the owning gear publishes the trait
+- **Description**: Provides tenant-scoped creation, secret rotation, revocation, and listing of machine identities to trusted platform modules. Consumers authorize their own callers before delegation; deployments without this plugin simply have no registration. V1 registers nothing under this contract.
 - **Breaking Change Policy**: Incompatible behavior or data changes require a versioned contract and a consumer migration path.
 
 #### Provider Instance Contract
@@ -777,7 +779,7 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 
 #### Create and Rotate a Service Principal
 
-- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-usecase-service-principal-credentials`
+- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-usecase-service-principal-credentials`
 
 **Actor**: `cpt-cf-keycloak-idp-plugin-actor-service-principal-consumer`
 
@@ -805,7 +807,7 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 
 #### List and Revoke Service Principals
 
-- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-usecase-list-revoke-service-principals`
+- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-usecase-list-revoke-service-principals`
 
 **Actor**: `cpt-cf-keycloak-idp-plugin-actor-service-principal-consumer`
 
@@ -881,13 +883,12 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 - [ ] Provisioning intent is parsed fail-closed: unknown modes and keys are rejected; absent mode defaults to shared; shared child tenants inherit the parent realm; created mode generates `realm-{tenant_id}` for child tenants and rejects an explicit realm name there, while a root target requires one; adopted mode requires an existing empty realm.
 - [ ] Metadata envelopes decode fail-closed (missing/unsupported version, malformed shape) with observable decode-failure metrics, and metadata from every version in the supported window remains readable for normal operations and hard deprovisioning.
 - [ ] Created-mode provisioning is replay-safe: a marked realm is adopted idempotently, a foreign realm is rejected cleanly, a lost create reconciles by re-probe, and the realm-admin secret lands in the Credential Store before success is reported.
-- [ ] Hard deprovisioning purges the tenant's service principals before boundary removal, deletes the tenant group, tears down created realms and their secrets on last-tenant retirement, and never deletes shared/adopted realms or other tenants' resources.
+- [ ] Hard deprovisioning deletes the tenant group, tears down created realms and their secrets on last-tenant retirement, and never deletes shared/adopted realms or other tenants' resources. (The service-principal purge barrier that precedes boundary removal is p2, gated with §5.4.)
 - [ ] User provisioning binds `tenant_id`/`user_type` attributes and group membership, compensates orphans on group-join failure, and classifies duplicates with field refinement; user deprovisioning enforces the tenant-attribute guard, revokes sessions best-effort, and treats 404/410 as success-equivalent.
 - [ ] `update_user` deterministically returns `UnsupportedOperation`.
 - [ ] User queries return only tenant-group members, honor the supported filter surface (rejecting unsupported shapes with `UnsupportedOperation` before provider access), sort on the requested order over the orderable field set (Account-Management default `username ASC, id ASC`), page via `CursorV1` with order- and filter-hash validation and the rolling-deploy legacy fallback, and truncate loudly at the scan hard cap.
-- [ ] Service-principal create/rotate/revoke/list enforce naming, allowlist, quota, ownership markers, and the hijack guard; secrets appear only in create/rotate results inside redacted wrappers; ambiguous outcomes carry stage tokens and no credential.
-- [ ] Cross-tenant negative tests produce zero successful reads or mutations across user and service-principal surfaces.
-- [ ] Failure injection proves ambiguous tenant provisioning is never reported as clean, each user failure maps to an `IdpUserOperationFailure` outcome, each service-principal failure maps to the closed `ServicePrincipalFailure` set, and every variant carries its stable metric label.
+- [ ] Cross-tenant negative tests produce zero successful reads or mutations across the tenant and user surfaces.
+- [ ] Failure injection proves ambiguous tenant provisioning is never reported as clean, each user failure maps to an `IdpUserOperationFailure` outcome, and every variant carries its stable metric label.
 - [ ] Secret scanning finds no credential values in plugin logs, metrics, audit events, listings, or debug output; provider error bodies are redacted and truncated.
 - [ ] With the plugin enabled, initialization fails within the pre-warm budget when Keycloak is unreachable and the failure names the attempt count; with `enabled: false` the host starts without the plugin. After initialization, provider and Credential Store outages block only affected operations, and recovery — including operator secret rotation — needs no restart.
 - [ ] Every supported Keycloak 26.x release in the release matrix passes the provider contract suite.
@@ -896,6 +897,11 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 
 ### P2 Promotion Acceptance
 
+- [ ] `service-principal-sdk` is published and depended on, and the plugin registers `ServicePrincipalClientV1` in ClientHub against the contract as shipped rather than as anticipated here.
+- [ ] Service-principal create/rotate/revoke/list enforce naming, allowlist, quota, ownership markers, and the hijack guard; secrets appear only in create/rotate results inside redacted wrappers; ambiguous outcomes carry stage tokens and no credential.
+- [ ] Hard deprovisioning purges the tenant's service principals before boundary removal, and a purge failure aborts the saga with a retryable or terminal classification rather than a success-equivalent outcome.
+- [ ] Cross-tenant negative tests extend to the service-principal surface with zero successful reads or mutations.
+- [ ] Failure injection maps each service-principal failure to the closed `ServicePrincipalFailure` set, with every variant carrying its stable metric label.
 - [ ] `update_user` implements the SDK contract (partial update semantics, immutable identity/tenant binding, duplicate/password-policy/not-found classification) and passes the provider contract suite.
 - [ ] A read-only realm authentication-profile verifier gates tenant binding on shared/adopted realms before promotion of profile verification.
 - [ ] A runtime provider-version gate fails affected operations deterministically on unsupported majors without preventing host startup.
@@ -909,8 +915,8 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 | Keycloak 26.x | Provides realm, group, user, session, client, and credential administration over Admin REST and OAuth token endpoints, reached directly over HTTPS. | p1 |
 | Credential Store | Holds adopted/created realm-admin secrets and the optional TLS CA bundle; written by the plugin for created realms under its stable system actor. | p1 |
 | types-registry | Hosts the provider catalogue instance; publication is a hard initialization prerequisite. | p1 |
-| service-principal gear | Owns the machine-identity product (requirements, REST surface, authorization) and consumes this plugin as its registered `ServicePrincipalClientV1` adapter. | p1 |
-| service-principal-sdk | Platform-owned machine-identity contract implemented by this plugin. | p1 |
+| service-principal gear | Owns the machine-identity product (requirements, REST surface, authorization) and consumes this plugin as its registered `ServicePrincipalClientV1` adapter. Future dependency: not present in this workspace, in development in parallel. | p2 |
+| service-principal-sdk | Platform-owned machine-identity contract implemented by this plugin. Future dependency: not present in this workspace, so §5.4 and the `ServicePrincipalClientV1` interface contract are p2 and carry no v1 acceptance criteria. Every p1 dependency in this table already ships. | p2 |
 | OIDC AuthN Resolver Plugin | Validates Keycloak-issued tokens offline and consumes the claims projected by the realm mappers. It does not manage sessions or check per-identity revocation state. | p1 |
 | Operator realm bootstrap / IaC | Provisions shared/adopted realms, their authentication profile and protocol mappers, admin clients and secrets, and service-principal realm scopes. | p1 |
 | RBAC / Policy Engine | Makes authorization decisions outside this plugin, including the plugin system actor's Credential Store grants. | p1 |
@@ -936,17 +942,18 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 | Administrator credentials grant broader access than required. | Compromise can affect unrelated tenants or realms. | Two-tier admin model, exact least-privilege role grants on created realms, typed secret custody, rotation convergence, and secret non-disclosure tests. |
 | Provider metadata becomes unreadable after upgrade or rollback. | Existing tenants cannot be administered or retired safely. | Versioned fail-closed envelope, decode-failure metrics, and compatibility coverage for supported upgrade paths. |
 | The Credential Store write fails after created-realm Keycloak state exists. | Realm exists without retrievable admin credentials. | A dedicated ambiguity stage token for the post-provider secret-write window, the reconciliation runbook, and replay-safe provisioning that restores the stored secret. |
-| A service principal survives tenant retirement. | Machine access remains active after tenant deletion. | Purge barrier ordered before boundary teardown; purge failure aborts deprovisioning with retryable/terminal classification. |
+| A service principal survives tenant retirement. | Machine access remains active after tenant deletion. | Purge barrier ordered before boundary teardown; purge failure aborts deprovisioning with retryable/terminal classification. Not a v1 exposure — the plugin creates no service principals until the p2 surface lands — but the barrier must be verified as part of that promotion. |
 | Keycloak 26.x administration behavior changes across releases. | Lifecycle operations fail or produce different outcomes. | Qualify every supported 26.x release before publication; p2 runtime version gate. |
 | The plugin's init-time provider dependency breaks deployment ordering. | Host initialization fails when Keycloak is slow to become ready. | Bounded, tunable pre-warm budget with fast-bail on permanent errors; `enabled: false` escape hatch. |
 | Tenant-group membership grows past the scan cap. | Listings truncate (loudly) and hide the tail. | Hard-cap warning as the operational signal; realm-wide attribute-query evolution before larger populations are supported. |
 | An access JWT remains valid after user or tenant hard deprovisioning. | Access can continue until token expiry. | Limit v1 access-token lifetime to 15 minutes, revoke provider sessions, block refresh, and document the bounded exposure. |
 | Metric realm-label cardinality explodes in large fleets. | Metrics backend overload. | Configurable cardinality cap with label drop and a warning naming the tripping realm on every over-cap observation. |
 | The `version_observed` metadata-decode label carries a value taken from replayed metadata, so a malformed or hostile blob can mint unbounded time series. | Metrics backend overload from a caller-influenced label. | Emitted only on decode failure, so volume is low in normal operation; the label is not capped today. Bounding it to a closed classification is tracked as a follow-up against the implementation. |
+| §5.4 anticipates a `ServicePrincipalClientV1` shape that `service-principal-sdk` has not published yet, so the specification may diverge from the contract as shipped. | Rework of the machine-identity requirements at promotion time, and wasted effort if the trait differs materially. | Hold the surface at p2 with no v1 acceptance criteria (§4.2, §9), so v1 neither depends on nor is qualified against unavailable code; settle the trait shape with the owning gear before implementation starts; treat the published contract as authoritative over §5.4 and revise this document to match it. |
 
 ## 13. Open Questions
 
-No open question blocks v1. V1 uses the three realm bindings above, Keycloak 26.x qualification, the latency profile in §6.1, and offline JWT validation with a 15-minute maximum access-token lifetime.
+No open question blocks v1. V1 uses the three realm bindings above, Keycloak 26.x qualification, the latency profile in §6.1, and offline JWT validation with a 15-minute maximum access-token lifetime. The machine-identity surface is not a v1 blocker because it is not in v1: `service-principal-sdk` is absent from this workspace, so §5.4 is p2 with no v1 acceptance criteria (§4.2, §9, §10, §12).
 
 The following questions gate only p2 promotion:
 

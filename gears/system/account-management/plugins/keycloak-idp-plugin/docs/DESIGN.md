@@ -383,7 +383,7 @@ Domain components depend on plugin-owned ports rather than transport types: `req
 | Credential Store (OpenBao-backed) | Custody of adopted/created realm-admin secrets and the optional TLS CA bundle; written by the plugin only for created realms; unavailability blocks affected operations and init when the CA bundle or pre-warm needs it |
 | Operator IaC / realm bootstrap | Provides shared/adopted realms, their authentication profile and protocol mappers (including the `tenant_id`/`user_type` usermodel-attribute mappers), the bootstrap admin client and its secret, shared-realm admin client and secret, adopted-realm secrets under the template reference, and realm-default client scopes for service principals |
 | OIDC AuthN Resolver | Independently validates tokens; consumes the `user_type`/`tenant_id` claims the realm mappers project; the two components never call each other |
-| Trusted platform consumers | Resolve `ServicePrincipalClientV1` from ClientHub; their own RBAC/PDP authorizes calls before delegation |
+| Trusted platform consumers | Resolve `ServicePrincipalClientV1` from ClientHub; their own RBAC/PDP authorizes calls before delegation. Applies only once the p2 machine-identity surface lands — `service-principal-sdk` is absent from this workspace (§4.3), so this row describes the intended integration, not a v1 dependency |
 
 ### 3.6 Interactions & Sequences
 
@@ -595,6 +595,7 @@ The release-qualification query matrix for the PRD latency NFR covers unfiltered
 | Reconciliation | Operator runbook exists and consumes `ambig:{stage}` evidence without secret inspection |
 | Init dependency | Deployment ordering tolerates the pre-warm budget (Keycloak/Credential Store reachable within ≈37 s of plugin init) or explicitly disables the plugin |
 | User updates | `update_user` support requires implementing the SDK contract (JSON Merge Patch semantics, duplicate/password-policy classification) before any product surface promises profile editing through this provider |
+| Service-principal contract | The machine-identity surface is p2 and out of v1 scope (PRD §4.2, §5.4). `service-principal-sdk` is developed in parallel and absent from this workspace, so the design below is a target against an unpublished contract: it cannot compile or be qualified, and it carries no v1 acceptance criteria. Promotion requires the published trait, which is authoritative wherever it differs from this design. Tenant and user lifecycle carry no dependency on it and gate independently |
 
 ## 5. Traceability
 
