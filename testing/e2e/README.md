@@ -127,7 +127,7 @@ async def test_my_endpoint(base_url, auth_headers):
 | `make e2e-local`                     | Local  | Run tests against auto-started local server |
 | `make e2e-local E2E_TARGET=testing/e2e/gears/file_parser/` | Local | Run a targeted local E2E subset |
 | `make e2e-local-smoke`               | Local  | Run only smoke tests locally              |
-| `make e2e-usage-collector`           | Local  | Usage-collector suite: dedicated binary + TimescaleDB container (**requires Docker**) |
+| `make e2e-usage-collector`           | Local  | Usage-collector suite, run against both storage backends: a dedicated binary + container per backend, TimescaleDB then ClickHouse (**requires Docker**) |
 | `python3 scripts/ci.py e2e-local`    | Local  | Direct script execution (local)          |
 | `python3 scripts/ci.py e2e-local -- testing/e2e/gears/file_parser/` | Local | Direct targeted local script execution |
 | `python3 scripts/ci.py e2e-local --smoke` | Local | Direct script execution (smoke only) |
