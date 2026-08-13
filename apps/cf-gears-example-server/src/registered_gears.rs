@@ -27,6 +27,8 @@ use nodes_registry as _;
 use resource_group as _;
 #[cfg(all(feature = "simple-user-settings", not(feature = "oop-example")))]
 use simple_user_settings as _;
+#[cfg(feature = "settings-service")]
+use settings_service as _;
 use tenant_resolver as _;
 use types_registry as _;
 
