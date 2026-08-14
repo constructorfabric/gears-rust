@@ -172,6 +172,17 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
 
     async fn get_depth<C: DBRunner>(&self, db: &C, group_id: Uuid) -> Result<i32, DomainError>;
 
+    /// Deepest descendant of `group_id` relative to it, or `0` when it has
+    /// none. A single `MAX(depth)` aggregate over the closure table, for
+    /// callers -- the move path's depth-limit check -- that need only the
+    /// scalar; see [`Self::get_descendant_ids_with_depth`] for callers
+    /// (force delete) that need the row set itself.
+    async fn get_max_descendant_depth<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<i32, DomainError>;
+
     async fn count_children<C: DBRunner>(
         &self,
         db: &C,
@@ -292,16 +303,17 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
 
     /// Update `metadata_schema` and `updated_at` on one `gts_type` row.
     ///
-    /// Returns the `updated_at` it wrote rather than the row: every other
-    /// column is either the key it was addressed by or immutable, so the
-    /// caller can assemble the new row from what it already holds. Reading
-    /// it back cost a second `gts_type` SELECT per update (RG-08).
+    /// Returns the row as the database now holds it: assembled from
+    /// `current` plus the two columns this write just set, not re-read.
+    /// Every other column is either the key `current` was addressed by or
+    /// immutable, so a second `gts_type` SELECT per update could not have
+    /// told the caller anything `current` didn't already have (RG-08).
     async fn update_type<C: DBRunner>(
         &self,
         db: &C,
-        type_id: i16,
+        current: gts_type::Model,
         metadata_schema: Option<&serde_json::Value>,
-    ) -> Result<time::OffsetDateTime, DomainError>;
+    ) -> Result<gts_type::Model, DomainError>;
 
     async fn delete_by_id<C: DBRunner>(&self, db: &C, type_id: i16) -> Result<(), DomainError>;
 

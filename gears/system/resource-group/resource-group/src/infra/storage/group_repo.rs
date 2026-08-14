@@ -1056,6 +1056,49 @@ impl GroupRepositoryTrait for GroupRepository {
         Ok(rows.into_iter().map(|r| r.depth).max().unwrap_or(0))
     }
 
+    /// Deepest descendant of `group_id` relative to it, or `0` when it has
+    /// none.
+    ///
+    /// One `MAX(depth)` aggregate over the closure table -- see
+    /// `count_children` above for the same `SecureSelect` pattern applied to
+    /// `COUNT` -- instead of `get_descendant_ids_with_depth`'s whole row set
+    /// pulled into this process only to be folded down to this one number.
+    async fn get_max_descendant_depth<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<i32, DomainError> {
+        use sea_orm::{FromQueryResult, QuerySelect};
+
+        #[derive(FromQueryResult)]
+        struct MaxDepth {
+            max_depth: Option<i32>,
+        }
+
+        let scope = system_scope();
+        let rows: Vec<MaxDepth> = ClosureEntity::find()
+            .filter(closure_entity::Column::AncestorId.eq(group_id))
+            .filter(closure_entity::Column::Depth.ne(0))
+            .secure()
+            .scope_with(&scope)
+            .project_all(db, |q| {
+                q.select_only()
+                    .column_as(Expr::col(closure_entity::Column::Depth).max(), "max_depth")
+                    .into_model::<MaxDepth>()
+            })
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        // `MAX` over zero rows is one row holding NULL, not zero rows -- but
+        // falling back to `0` either way keeps this the same "no
+        // descendants" answer `get_descendant_ids_with_depth(...).max()` gave.
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.max_depth)
+            .unwrap_or(0))
+    }
+
     /// Count direct children of a group.
     async fn count_children<C: DBRunner>(
         &self,
@@ -1223,17 +1266,18 @@ impl GroupRepositoryTrait for GroupRepository {
             )))
             .from_subquery(subtree_query, anc_alias)
             .to_owned();
-        ClosureEntity::delete_many()
+        let deleted = ClosureEntity::delete_many()
             .filter(closure_entity::Column::DescendantId.in_subquery(subtree_for_descendants))
             .filter(closure_entity::Column::AncestorId.not_in_subquery(subtree_for_ancestors))
             .secure()
             .scope_with(&scope)
             .exec(db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+            .map_err(|e| DomainError::database(e.to_string()))?
+            .rows_affected;
         // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-2
 
-        let rows_written = if let Some(parent_id) = new_parent_id {
+        let inserted = if let Some(parent_id) = new_parent_id {
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-3
             // Compute new ancestor paths from new parent: the closure rows
             // whose descendant is the new parent, i.e. its ancestors and its
@@ -1312,7 +1356,27 @@ impl GroupRepositoryTrait for GroupRepository {
 
         // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-5
         // RETURN: closure rows updated within transaction — commit handled by caller
-        Ok(rows_written)
+        tracing::debug!(%group_id, deleted, inserted, "closure subtree rebuilt");
+        if new_parent_id.is_some() && inserted == 0 {
+            // Mirrors the `NOT IN` + `NULL` silent-corruption mode the delete
+            // step's doc comment above describes: that one needs a null
+            // `descendant_id` to misfire, but the effect is the same shape --
+            // a reparent that looks like it succeeded while the closure table
+            // quietly keeps stale (or here, no new) ancestor rows. A `NULL`
+            // can't happen here (see that comment), but a parent with no
+            // closure rows of its own -- which should be unreachable, every
+            // group gets a self-row on create -- would leave this INSERT
+            // with nothing to insert, and the DELETE above would have
+            // already dropped the subtree's real ancestors on the strength of
+            // the reparent this claims to perform.
+            tracing::warn!(
+                %group_id,
+                deleted,
+                "closure rebuild inserted no rows for a reparent -- the parent has no \
+                 closure rows, which the NOT IN delete would then silently preserve"
+            );
+        }
+        Ok(inserted)
         // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-5
     }
 

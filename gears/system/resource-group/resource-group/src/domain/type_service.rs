@@ -19,7 +19,6 @@ use crate::domain::error::DomainError;
 use crate::domain::repo::TypeRepositoryTrait;
 #[allow(unused_imports)]
 use crate::domain::validation;
-use crate::infra::storage::entity::gts_type;
 
 // @cpt-dod:cpt-cf-resource-group-dod-type-mgmt-service-crud:p1
 /// Service for GTS type lifecycle management.
@@ -349,21 +348,14 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-12
                 // DB: UPDATE gts_type SET metadata_schema = {new}, updated_at = now().
-                let updated_at = type_repo
-                    .update_type(tx, type_id, Some(&stored_schema))
+                //
+                // The repository assembles the updated row itself, from
+                // `type_model` plus the two columns it just wrote -- not read
+                // back (RG-08). Domain no longer needs to know which columns
+                // an UPDATE touches to answer that.
+                let updated_model = type_repo
+                    .update_type(tx, type_model, Some(&stored_schema))
                     .await?;
-
-                // Assembled, not read back (RG-08). `metadata_schema` and
-                // `updated_at` are what the write just set, `id` and
-                // `schema_id` are the keys it was addressed by, and
-                // `created_at` is immutable -- carried from the row this
-                // transaction read at the top. The re-read this replaces
-                // could only return these same five values.
-                let updated_model = gts_type::Model {
-                    metadata_schema: Some(stored_schema),
-                    updated_at: Some(updated_at),
-                    ..type_model
-                };
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-12
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-13
                 // RETURN updated ResourceGroupType (loaded with refreshed junctions).

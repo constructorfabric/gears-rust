@@ -109,6 +109,29 @@ enum UpdateGroupOutcome {
     NeedsSerializable,
 }
 
+/// Enough of a new-parent row for `move_group_internal_impl`'s checks: the
+/// GTS type id, which it resolves itself for the allowed-parent-type check,
+/// and the tenant, which it does nothing with except hand back so the
+/// caller can run its own cross-tenant check against the same read (see
+/// `MoveOutcome`).
+///
+/// Built by the caller from a single `find_model_by_id`, not by this
+/// function -- both call sites already need that row for their own purposes
+/// (a pre-call cross-tenant check on the update path, the snapshot itself on
+/// the move path), and a second read of the same id inside this function on
+/// top of that was the redundant one this type exists to remove.
+pub(crate) struct ParentSnapshot {
+    pub tenant_id: Uuid,
+    pub gts_type_id: i16,
+}
+
+/// What a subtree move hands back to its caller: enough to assemble the
+/// response and record the metric, and nothing of the persistence layer.
+pub(crate) struct MoveOutcome {
+    pub parent_tenant_id: Option<Uuid>,
+    pub closure_rows: u64,
+}
+
 impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// Create a new `GroupService` with the given database provider, query profile,
     /// and `PolicyEnforcer` for AuthZ-scoped queries.
@@ -1095,7 +1118,11 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // `tenant_id == group_id` by construction; reparenting one under a
         // different parent is also rejected here because the equality check
         // would fail.)
-        if let Some(new_parent_id) = req.parent_id
+        //
+        // Also the one read of the new parent this whole update makes: kept
+        // as a `ParentSnapshot` and handed to `move_group_internal_impl`
+        // below instead of letting it read the same row again.
+        let new_parent_snapshot = if let Some(new_parent_id) = req.parent_id
             && new_parent_id != existing.parent_id.unwrap_or_default()
         {
             let new_parent = group_repo
@@ -1112,7 +1139,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                      cross-tenant moves are not supported"
                 )));
             }
-        }
+            Some(ParentSnapshot {
+                tenant_id: new_parent.tenant_id,
+                gts_type_id: new_parent.gts_type_id,
+            })
+        } else {
+            None
+        };
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4b
         // DB: SELECT gts_type_id FROM resource_group WHERE parent_id = {group_id}
@@ -1141,12 +1174,16 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         if parent_changed {
             // Delegate to move logic (cycle detection + closure rebuild).
             // Type stays the same, so use the resolved `rg_type` for parent
-            // compatibility checks inside the move helper.
+            // compatibility checks inside the move helper. Its
+            // `MoveOutcome::parent_tenant_id` is not read here: the
+            // cross-tenant check already ran above, against the exact row
+            // `new_parent_snapshot` came from.
             Self::move_group_internal_impl(
                 group_repo,
                 tx,
                 group_id,
                 req.parent_id,
+                new_parent_snapshot,
                 &rg_type,
                 profile,
             )
@@ -1228,12 +1265,30 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-7
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-8
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-9
+        // The one read of the new parent this move makes -- see
+        // `move_group_internal_impl`'s doc for why it takes this as a
+        // snapshot instead of reading the row itself.
+        let new_parent_snapshot = match new_parent_id {
+            Some(new_pid) => {
+                let parent = group_repo
+                    .find_model_by_id(tx, new_pid)
+                    .await?
+                    .ok_or_else(|| DomainError::group_not_found(new_pid))?;
+                Some(ParentSnapshot {
+                    tenant_id: parent.tenant_id,
+                    gts_type_id: parent.gts_type_id,
+                })
+            }
+            None => None,
+        };
+
         // Cycle detect, type compat, profile enforce, closure rebuild
-        let (new_parent, closure_rows) = Self::move_group_internal_impl(
+        let outcome = Self::move_group_internal_impl(
             group_repo,
             tx,
             group_id,
             new_parent_id,
+            new_parent_snapshot,
             &rg_type,
             profile,
         )
@@ -1249,8 +1304,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // gear-wide invariant). Reject the move when the new parent lives
         // in a different tenant than the moved group; tenant-type roots have
         // `tenant_id == group_id`, so the equality check covers them too.
-        if let Some(new_parent) = new_parent
-            && new_parent.tenant_id != existing.tenant_id
+        if let Some(parent_tenant_id) = outcome.parent_tenant_id
+            && parent_tenant_id != existing.tenant_id
         {
             // Generic message: do not interpolate tenant ids — the caller
             // can't act on them legitimately, and disclosing the foreign
@@ -1284,7 +1339,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         }
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-10
 
-        metrics.closure_rows_written(Operation::Move, closure_rows);
+        metrics.closure_rows_written(Operation::Move, outcome.closure_rows);
 
         // Assembled rather than read back, as in `update_group_inner`: a move
         // writes exactly one column, and the rest of the row is `existing`
@@ -1401,28 +1456,26 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// enforcement, and closure table rebuild. Must be called within a
     /// SERIALIZABLE transaction.
     ///
-    /// Returns the new parent's row when there is a new parent. It has to be
-    /// read here for the type-compatibility check, and the caller needs the
-    /// same row for the cross-tenant check -- handing it back keeps the move
-    /// path to the one parent read the artifact declares in step 3, instead
-    /// of two reads of the same id inside the same transaction.
+    /// Takes the new parent as a `ParentSnapshot` the caller already read,
+    /// rather than reading the row again here. Both callers need this same
+    /// row for their own cross-tenant check -- `update_group_inner` before
+    /// calling in, `move_group_inner` after, via the returned
+    /// `MoveOutcome::parent_tenant_id` -- so a second read of the same id in
+    /// here on top of that was purely redundant. `parent` is `None` exactly
+    /// when `new_parent_id` is; a caller passing `Some(new_parent_id)` with
+    /// no snapshot behind it (which should not happen given the two callers
+    /// above) is treated the same as the read this replaces finding nothing.
     #[allow(clippy::cognitive_complexity)]
     async fn move_group_internal_impl(
         group_repo: &GR,
         conn: &impl DBRunner,
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
+        parent: Option<ParentSnapshot>,
         rg_type: &resource_group_sdk::ResourceGroupType,
         profile: &QueryProfile,
-    ) -> Result<
-        (
-            Option<crate::infra::storage::entity::resource_group::Model>,
-            u64,
-        ),
-        DomainError,
-    > {
-        let mut new_parent_model: Option<crate::infra::storage::entity::resource_group::Model> =
-            None;
+    ) -> Result<MoveOutcome, DomainError> {
+        let mut parent_tenant_id: Option<Uuid> = None;
         if let Some(new_pid) = new_parent_id {
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-1
             // Cycle detection: self-parent check (covered by is_descendant via self-row)
@@ -1439,11 +1492,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-3
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-2
 
-            // Validate parent type compatibility
-            let parent = group_repo
-                .find_model_by_id(conn, new_pid)
-                .await?
-                .ok_or_else(|| DomainError::group_not_found(new_pid))?;
+            // Validate parent type compatibility. `parent` came from the
+            // caller's own read -- see the function doc -- so `None` here
+            // means that read found nothing, same as this function's own
+            // `find_model_by_id` used to.
+            let parent = parent.ok_or_else(|| DomainError::group_not_found(new_pid))?;
+            parent_tenant_id = Some(parent.tenant_id);
 
             let parent_type_path =
                 Self::resolve_type_path_from_id(conn, parent.gts_type_id).await?;
@@ -1453,7 +1507,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     rg_type.code, parent_type_path
                 )));
             }
-            new_parent_model = Some(parent);
 
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-4
             // Cycle detection passed
@@ -1469,18 +1522,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             if let Some(max_depth) = profile.max_depth {
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 let parent_depth = group_repo.get_depth(conn, new_pid).await?;
-                // One query for the whole subtree. The rows already carry
-                // the depth relative to the moved group, and every id they
-                // contain is a descendant by construction -- so the previous
-                // `is_descendant` + `get_relative_depth` pair per row was
-                // re-asking the database what it had just returned.
-                let max_subtree_depth = group_repo
-                    .get_descendant_ids_with_depth(conn, group_id)
-                    .await?
-                    .into_iter()
-                    .map(|(_id, depth)| depth)
-                    .max()
-                    .unwrap_or(0);
+                // A single `MAX(depth)` aggregate, not the whole subtree
+                // pulled into this process to fold it down to one scalar:
+                // this check has never needed the descendant rows
+                // themselves, and it reruns on every move inside the
+                // SERIALIZABLE transaction the default profile
+                // (`max_depth: Some(10)`) puts every move through. See
+                // `get_descendant_ids_with_depth` for the callers -- force
+                // delete -- that do need the rows.
+                let max_subtree_depth = group_repo.get_max_descendant_depth(conn, group_id).await?;
                 let new_deepest = parent_depth + 1 + max_subtree_depth;
                 // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2b
@@ -1548,7 +1598,10 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .rebuild_subtree_closure(conn, group_id, new_parent_id)
             .await?;
 
-        Ok((new_parent_model, closure_rows))
+        Ok(MoveOutcome {
+            parent_tenant_id,
+            closure_rows,
+        })
     }
 
     /// Force-delete an entire subtree (group + descendants + memberships + closure).

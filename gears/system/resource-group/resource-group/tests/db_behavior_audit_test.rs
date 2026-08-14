@@ -738,8 +738,9 @@ async fn scale_move_closure_inserts_do_not_grow_with_subtree_size() {
 
 #[tokio::test]
 async fn scale_move_descendant_depth_selects_do_not_grow_with_subtree_size() {
-    // Move's depth validation calls get_descendant_ids_with_depth once and
-    // takes the max in memory (RG-05).
+    // Move's depth validation calls get_max_descendant_depth once -- a
+    // single MAX(depth) aggregate -- rather than pulling every descendant
+    // row into this process to fold down to that one number (RG-05).
     let small = count_in(
         &move_stats_for_subtree_size(3).await.0,
         QueryKind::Select,
@@ -1395,9 +1396,17 @@ fn static_rule_passes_type_service_uses_retry() {
          database error and is reported as 500, on a path account-management \
          drives at gear init"
     );
-    assert!(
-        retried >= 2,
-        "expected create_type and update_type to use transaction_with_retry, \
+    // Exact count, not a floor, for the same reason as the group_service
+    // rule above: a floor of >= 2 stays green if a fourth transaction is
+    // added without retry, or if a refactor quietly drops the wrapper from
+    // one of the three while adding it to a new one. All three of this
+    // file's transactions -- create_type, update_type, and delete_type --
+    // are retry-aware; only exact equality catches a regression in either
+    // direction.
+    assert_eq!(
+        retried, 3,
+        "expected exactly 3 transaction_with_retry call sites in \
+         type_service.rs -- create_type, update_type, delete_type -- \
          found {retried}"
     );
 }

@@ -479,18 +479,25 @@ impl TypeRepositoryTrait for TypeRepository {
     }
 
     /// Update the `gts_type` row (`metadata_schema`, `updated_at`).
+    ///
+    /// Returns the updated row, assembled from `current` plus the two
+    /// columns this write just set -- not read back. Every other column on
+    /// `current` is either the key it was addressed by (`id`, `schema_id`)
+    /// or immutable (`created_at`), so the caller no longer has to redo this
+    /// assembly itself, and there was nothing a second SELECT could have
+    /// told it beyond what `current` already holds (RG-08).
     async fn update_type<C: DBRunner>(
         &self,
         db: &C,
-        type_id: i16,
+        current: gts_type::Model,
         metadata_schema: Option<&serde_json::Value>,
-    ) -> Result<time::OffsetDateTime, DomainError> {
+    ) -> Result<gts_type::Model, DomainError> {
         let scope = system_scope();
         let updated_at = time::OffsetDateTime::now_utc();
 
         // Use SecureUpdateMany for scoped update
         GtsTypeEntity::update_many()
-            .filter(gts_type::Column::Id.eq(type_id))
+            .filter(gts_type::Column::Id.eq(current.id))
             .secure()
             .col_expr(
                 gts_type::Column::MetadataSchema,
@@ -502,9 +509,11 @@ impl TypeRepositoryTrait for TypeRepository {
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        // The timestamp is handed back rather than read back: it is the only
-        // thing this write decided that the caller did not already know.
-        Ok(updated_at)
+        Ok(gts_type::Model {
+            metadata_schema: metadata_schema.cloned(),
+            updated_at: Some(updated_at),
+            ..current
+        })
     }
 
     /// Delete a GTS type by its surrogate ID. CASCADE handles junction rows.
