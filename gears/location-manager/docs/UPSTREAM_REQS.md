@@ -29,6 +29,7 @@ This intake seeds the **Location Manager (Multi-Region)** gear tracked on the pl
 | Source | Why it needs this gear |
 |--------|-------------------------|
 | A production multi-region infrastructure control plane | Needs a hub-spoke control plane over a distributed cluster estate: geographic topology, agent-based cluster registration and lifecycle, disconnected-autonomous operation over unreliable WAN links, constraint-based placement, and WAN-resilient usage spooling. The generic core is wanted as a reusable gear so that platform-specific bindings stay in the adopting platform. |
+| An order/fulfillment product consuming placement asynchronously (added during review) | Accepts orders and commits subscriptions before fulfillment starts, so capacity, quota, topology, or cluster availability can change in the interval. Needs an immutable, expiring placement-decision reference — snapshot, selected cluster, constraints, quota lease, validity period, availability state, reason codes — to bind the commercial commitment to, with explicit expiry/revalidation rules instead of stale-capacity fulfillment or silent relocation. |
 
 ### 1.3 Relationship to Existing Gears
 
@@ -119,6 +120,14 @@ The future gear **MUST** resolve placement requests expressed as constraint sets
 
 - **Rationale**: Intent-based placement is the estate's core user-facing contract; determinism and decision traceability are what make it auditable and debuggable. Embedding platforms MAY wrap this resolver behind their own policy engines for additional deny-overrides policy layers.
 
+#### Placement Decision Reference (Asynchronous Consumers)
+
+- [ ] `p2` - **ID**: `cpt-cf-location-manager-upreq-placement-decision-reference`
+
+The future gear **MUST** materialize every successful placement resolution as an immutable, uniquely identified **placement decision record**, retrievable by ID, containing: the admission-time estate snapshot identity, the selected cluster, the resolved constraint set, the per-rung scoring data (the audit record of `cpt-cf-location-manager-upreq-constraint-placement`), the quota admission/lease reference (`cpt-cf-location-manager-upreq-scoped-quota`), the selected cluster's availability state at resolution, an explicit **validity period**, and reason codes. During the validity period the associated quota lease MUST be held reserved, so an asynchronous consumer — one that accepts an order or commits a subscription before fulfillment starts — can bind its commitment to the decision ID without racing capacity changes. The binding is exclusive by reference: the gear MUST NOT substitute a different cluster under an existing decision ID; a changed outcome is only ever produced by explicit **revalidation**, which is a fresh resolution against the current snapshot producing a new decision record (never a replay of the stored snapshot), with reason codes when the outcome differs from the original. On expiry without fulfillment the lease MUST be released and the decision marked expired; presenting an expired or invalidated decision MUST be denied with a reason code directing the consumer to revalidate. If the selected cluster's availability state changes during validity, the decision MUST be marked invalidated and a change signal emitted via the platform event mechanism, so the consumer learns before fulfillment rather than at it. Product, tenant, commercial, and lifecycle eligibility remain the consumer's responsibility; the decision record asserts topology, capacity, and quota admission only.
+
+- **Rationale**: Order-based consumers accept commercially before they fulfill technically; without an immutable, expiring decision reference they either commit against stale capacity or silently relocate the customer. Expiry-plus-revalidation keeps the placement contract's anti-stale discipline — a fresh resolution against current state, never a replay — while giving asynchronous consumers a bindable artifact. (Added during review at the request of an order/fulfillment consumer; see the PR discussion.)
+
 #### Constraint Vocabulary Registry
 
 - [ ] `p2` - **ID**: `cpt-cf-location-manager-upreq-constraint-vocabulary-registry`
@@ -131,7 +140,7 @@ The future gear **MUST** validate placement constraints against a governed vocab
 
 - [ ] `p2` - **ID**: `cpt-cf-location-manager-upreq-scoped-quota`
 
-The future gear **MUST** enforce per-scope quotas (per region, per AZ, optional geography aggregates) at placement admission by declaring geo-scope subject types to `gears/system/quota-enforcement` and consulting it before resolution completes; denials MUST identify the exhausted scope and current usage. The admission call MUST be race-free: it uses Quota Enforcement’s idempotent debit/lease primitives keyed by the placement request, committed when placement resolves and released when it fails, so concurrent resolutions cannot double-consume a scope’s remaining capacity. Location Manager MUST NOT implement its own consumption counters.
+The future gear **MUST** enforce per-scope quotas (per region, per AZ, optional geography aggregates) at placement admission by declaring geo-scope subject types to `gears/system/quota-enforcement` and consulting it before resolution completes; denials MUST identify the exhausted scope and current usage. The admission call MUST be race-free: it uses Quota Enforcement’s idempotent debit/lease primitives keyed by the placement request, committed when placement resolves and released when it fails; when the resolution produces a placement decision reference (`cpt-cf-location-manager-upreq-placement-decision-reference`), the lease is held reserved for the decision's validity period and released on expiry, invalidation, or explicit consumer release. Concurrent resolutions therefore cannot double-consume a scope’s remaining capacity. Location Manager MUST NOT implement its own consumption counters.
 
 - **Rationale**: Distributor→partner capacity delegation is per-scope; QE already owns deterministic quota decisions, so Location Manager's contribution is the scope subject model and the admission call, not a parallel engine.
 
@@ -180,7 +189,7 @@ The future gear's agent **MUST** operate within a small documented steady-state 
 | Priority | Requirements |
 |----------|-------------|
 | p1 (critical) | `cpt-cf-location-manager-upreq-geo-topology`, `cpt-cf-location-manager-upreq-agent-registration`, `cpt-cf-location-manager-upreq-declarative-sync`, `cpt-cf-location-manager-upreq-autonomous-mode`, `cpt-cf-location-manager-upreq-agent-config-inheritance`, `cpt-cf-location-manager-upreq-agent-lifecycle`, `cpt-cf-location-manager-upreq-constraint-placement`, `cpt-cf-location-manager-upreq-usage-spool` |
-| p2 (important) | `cpt-cf-location-manager-upreq-scoped-topology-admin`, `cpt-cf-location-manager-upreq-brownfield-attach`, `cpt-cf-location-manager-upreq-constraint-vocabulary-registry`, `cpt-cf-location-manager-upreq-scoped-quota`, `cpt-cf-location-manager-upreq-fleet-observability`, `cpt-cf-location-manager-upreq-agent-footprint` |
+| p2 (important) | `cpt-cf-location-manager-upreq-scoped-topology-admin`, `cpt-cf-location-manager-upreq-brownfield-attach`, `cpt-cf-location-manager-upreq-placement-decision-reference`, `cpt-cf-location-manager-upreq-constraint-vocabulary-registry`, `cpt-cf-location-manager-upreq-scoped-quota`, `cpt-cf-location-manager-upreq-fleet-observability`, `cpt-cf-location-manager-upreq-agent-footprint` |
 | p3 (nice-to-have) | `cpt-cf-location-manager-upreq-artifact-syndication`, `cpt-cf-location-manager-upreq-scoped-query` |
 
 ## 4. Traceability
