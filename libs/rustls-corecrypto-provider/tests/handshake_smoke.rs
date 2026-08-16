@@ -111,8 +111,19 @@ fn spawn_s_server(extra_args: &[&str]) -> (Child, u16, tempfile::TempDir) {
     // Reserve an ephemeral port from the OS, then release it immediately
     // so openssl can bind to the same number. There's a tiny TOCTOU race
     // window, but in practice the OS doesn't recycle ports that fast — and
-    // if a collision happens we retry up to 5 times.
-    for _ in 0..5 {
+    // if a collision happens we retry.
+    //
+    // We bind and connect on the explicit IPv4 loopback (127.0.0.1) rather
+    // than the hostname "localhost": the latter can resolve to ::1 (IPv6)
+    // first, which would never match an IPv4-only s_server. The retry count
+    // and per-attempt bind timeout are deliberately generous because this
+    // test runs inside the full workspace suite, where the machine can be
+    // CPU-saturated by concurrent compile-fail tests spawning rustc. Under
+    // that load openssl process startup / RSA keygen can take several
+    // seconds, so a tight 1s window produces spurious failures.
+    const MAX_ATTEMPTS: usize = 10;
+    const BIND_WAIT_POLLS: usize = 200; // 200 * 50ms = up to 10s per attempt.
+    for _ in 0..MAX_ATTEMPTS {
         let port = match TcpListener::bind("127.0.0.1:0") {
             Ok(l) => l.local_addr().expect("local_addr").port(),
             Err(_) => continue,
@@ -127,7 +138,7 @@ fn spawn_s_server(extra_args: &[&str]) -> (Child, u16, tempfile::TempDir) {
             "-key",
             key.to_str().unwrap(),
             "-accept",
-            &port.to_string(),
+            &format!("127.0.0.1:{port}"),
             "-www",
             "-quiet",
         ]);
@@ -138,16 +149,15 @@ fn spawn_s_server(extra_args: &[&str]) -> (Child, u16, tempfile::TempDir) {
             continue;
         };
 
-        // Wait briefly for the server to bind. Up to 1s.
-        for _ in 0..20 {
+        for _ in 0..BIND_WAIT_POLLS {
             std::thread::sleep(Duration::from_millis(50));
-            if TcpStream::connect(("localhost", port)).is_ok() {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
                 return (child, port, tmp);
             }
         }
         let _ = child.kill();
     }
-    panic!("could not bind openssl s_server on an ephemeral port after 5 attempts");
+    panic!("could not bind openssl s_server on an ephemeral port after {MAX_ATTEMPTS} attempts");
 }
 
 fn client_config() -> ClientConfig {
