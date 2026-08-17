@@ -5,11 +5,11 @@ use async_trait::async_trait;
 use toolkit::client_hub::ClientHub;
 
 use super::{deregister_cache_backend, register_cache_backend};
+use crate::ClusterCacheBackend;
 use crate::cache::types::{CacheConsistency, CacheEntry, CacheFeatures, PutRequest, Ttl};
 use crate::cache::watch::CacheWatch;
 use crate::error::ClusterError;
-use crate::profile::ClusterProfile;
-use crate::{ClusterCacheBackend, ClusterCacheV1};
+use crate::profile::{ClusterProfile, profile_scope};
 
 struct StubCache;
 
@@ -70,22 +70,36 @@ impl ClusterProfile for OrdersProfile {
     const NAME: &'static str = "orders";
 }
 
-#[test]
-fn register_then_resolve_round_trips() {
-    let hub = ClientHub::new();
-    let backend: Arc<dyn ClusterCacheBackend> = Arc::new(StubCache);
-
-    assert!(register_cache_backend(&hub, OrdersProfile::NAME, backend).is_ok());
-
-    // A consumer resolving the cache for the profile receives the backend.
-    let resolved = ClusterCacheV1::resolver(&hub)
-        .profile(OrdersProfile)
-        .resolve();
-    assert!(resolved.is_ok(), "registered backend must resolve");
+/// The hub entry these helpers write and remove.
+///
+/// Since `K4` a consumer's `resolve()` goes through the process's
+/// `dyn ClusterClient` rather than through this scope, so the round trip is
+/// asserted where it now lives — against the hub — rather than through a
+/// resolver, which would no longer be testing these functions at all.
+fn bound_backend(hub: &ClientHub) -> Option<Arc<dyn ClusterCacheBackend>> {
+    let Ok(scope) = profile_scope(OrdersProfile::NAME) else {
+        panic!("a valid profile name must produce a scope");
+    };
+    hub.try_get_scoped::<dyn ClusterCacheBackend>(&scope)
 }
 
 #[test]
-fn deregister_unbinds_so_later_resolve_reports_profile_not_bound() {
+fn register_then_look_up_round_trips() {
+    let hub = ClientHub::new();
+    let backend: Arc<dyn ClusterCacheBackend> = Arc::new(StubCache);
+
+    assert!(register_cache_backend(&hub, OrdersProfile::NAME, Arc::clone(&backend)).is_ok());
+
+    let Some(bound) = bound_backend(&hub) else {
+        panic!("a registered backend must be bound under the profile scope");
+    };
+    // The hub receives the instance itself: the gear's local client hands the
+    // same `Arc` back out, and its own test asserts the two are one (I14).
+    assert!(Arc::ptr_eq(&backend, &bound));
+}
+
+#[test]
+fn deregister_unbinds_the_profile_scope() {
     let hub = ClientHub::new();
     let backend: Arc<dyn ClusterCacheBackend> = Arc::new(StubCache);
     register_cache_backend(&hub, OrdersProfile::NAME, backend)
@@ -97,13 +111,10 @@ fn deregister_unbinds_so_later_resolve_reports_profile_not_bound() {
         "deregister must report the removed backend"
     );
 
-    let resolved = ClusterCacheV1::resolver(&hub)
-        .profile(OrdersProfile)
-        .resolve();
-    assert!(matches!(
-        resolved,
-        Err(ClusterError::ProfileNotBound { profile: "orders" })
-    ));
+    assert!(
+        bound_backend(&hub).is_none(),
+        "a deregistered profile must leave no binding behind"
+    );
 }
 
 #[test]

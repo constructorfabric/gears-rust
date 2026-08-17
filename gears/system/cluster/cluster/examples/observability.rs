@@ -38,6 +38,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
+use cluster::ProfileBackends;
 use cluster::defaults::{CasBasedDistributedLockBackend, CasBasedLeaderElectionBackend};
 use cluster_sdk::cache::{
     CacheConsistency, CacheEntry, CacheFeatures, CacheWatch, CacheWatchEvent, PutRequest, Ttl,
@@ -45,14 +46,11 @@ use cluster_sdk::cache::{
 use cluster_sdk::error::{ClusterError, ProviderErrorKind};
 use cluster_sdk::leader::{LeaderWatch, LeaderWatchEvent};
 use cluster_sdk::profile::ClusterProfile;
-use cluster_sdk::registration::{
-    register_cache_backend, register_leader_election_backend, register_lock_backend,
-};
 use cluster_sdk::{
     ClusterCacheBackend, ClusterCacheV1, ClusterMetrics, DistributedLockV1, InstrumentedCache,
     LeaderElectionV1, RetryPolicy,
 };
-use common::MemCacheBackend;
+use common::{MemCacheBackend, wire};
 use toolkit::client_hub::ClientHub;
 
 /// The bounded `provider` label for everything this app emits. A `&'static str`,
@@ -259,7 +257,7 @@ impl ClusterCacheBackend for FlakyWatchOnce {
 #[tokio::main]
 async fn main() -> Result<(), ClusterError> {
     let metrics = Arc::new(AppMetrics::default());
-    let hub = ClientHub::new();
+    let hub = Arc::new(ClientHub::new());
 
     // 1. Wrap the raw cache backend in the SDK's InstrumentedCache decorator,
     //    routing its signals to our sink under the `example` provider label.
@@ -268,23 +266,44 @@ async fn main() -> Result<(), ClusterError> {
         Arc::new(InstrumentedCache::new(raw, PROVIDER, metrics.clone()));
 
     // 2. Build the default lock + leader backends over the instrumented cache,
-    //    each given the same provider label and sink via with_observability. (The
-    //    lock default is wired the same way; omitted here to keep it short.)
+    //    each given the same provider label and sink via with_observability.
+    //    Binding them explicitly is what a plugin does when it has its own
+    //    backends; leaving them out would let the wiring auto-fill uninstrumented
+    //    defaults instead.
     let leader = CasBasedLeaderElectionBackend::new(Arc::clone(&cache_backend))?
         .with_observability(PROVIDER, metrics.clone());
     let lock = CasBasedDistributedLockBackend::new(Arc::clone(&cache_backend))?
         .with_observability(PROVIDER, metrics.clone());
 
-    register_cache_backend(&hub, AppProfile::NAME, Arc::clone(&cache_backend))?;
-    register_leader_election_backend(&hub, AppProfile::NAME, Arc::new(leader))?;
-    register_lock_backend(&hub, AppProfile::NAME, Arc::new(lock))?;
+    // The flaky cache used by the watch-restart demo below lives under its own
+    // profile, so the coordination above is unaffected. Both profiles are wired
+    // together: one cluster client serves every profile in the process.
+    let watch_cache: Arc<dyn ClusterCacheBackend> = Arc::new(InstrumentedCache::new(
+        Arc::new(FlakyWatchOnce::new(MemCacheBackend::linearizable())),
+        PROVIDER,
+        metrics.clone(),
+    ));
+
+    let wiring = wire(
+        &hub,
+        vec![
+            (
+                AppProfile::NAME,
+                ProfileBackends::new(Arc::clone(&cache_backend))
+                    .with_leader_election(Arc::new(leader))
+                    .with_lock(Arc::new(lock)),
+            ),
+            (WatchProfile::NAME, ProfileBackends::new(watch_cache)),
+        ],
+    )?;
 
     // ---- workload: consumers use the facades exactly as normal; emission is
     //      entirely transparent to them. ----
 
     let cache = ClusterCacheV1::resolver(&hub)
         .profile(AppProfile)
-        .resolve()?;
+        .resolve()
+        .await?;
     cache
         .put(PutRequest {
             key: "config/region",
@@ -315,7 +334,8 @@ async fn main() -> Result<(), ClusterError> {
 
     let lock = DistributedLockV1::resolver(&hub)
         .profile(AppProfile)
-        .resolve()?;
+        .resolve()
+        .await?;
     let guard = lock
         .try_lock("rebuild-index", Duration::from_secs(30))
         .await?;
@@ -328,7 +348,8 @@ async fn main() -> Result<(), ClusterError> {
 
     let leader = LeaderElectionV1::resolver(&hub)
         .profile(AppProfile)
-        .resolve()?;
+        .resolve()
+        .await?;
     let mut watch = leader.elect("scheduler").await?;
     // Drain the initial status (records the `acquired` transition), then resign
     // (records `resigned`).
@@ -338,17 +359,11 @@ async fn main() -> Result<(), ClusterError> {
 
     // Watch auto-restart: a transient (retryable) close is absorbed by the
     // combinator, which reconnects and emits `cluster_watch_resets_total` +
-    // `cluster.watch.reset`. The flaky cache lives under its own profile so the
-    // coordination above is unaffected.
-    let watch_cache: Arc<dyn ClusterCacheBackend> = Arc::new(InstrumentedCache::new(
-        Arc::new(FlakyWatchOnce::new(MemCacheBackend::linearizable())),
-        PROVIDER,
-        metrics.clone(),
-    ));
-    register_cache_backend(&hub, WatchProfile::NAME, watch_cache)?;
+    // `cluster.watch.reset`, against the flaky cache wired above.
     let cache = ClusterCacheV1::resolver(&hub)
         .profile(WatchProfile)
-        .resolve()?;
+        .resolve()
+        .await?;
     // A fast policy so the demo doesn't wait the default 1s reconnect backoff.
     let fast = RetryPolicy {
         initial_backoff: Duration::from_millis(1),
@@ -367,6 +382,8 @@ async fn main() -> Result<(), ClusterError> {
     // `compare_and_delete` appear from lock acquisition and the leader's
     // value-guarded release, not just the explicit consumer calls above.
     metrics.report();
+    wiring.stop().await;
+
     Ok(())
 }
 

@@ -25,4 +25,18 @@ skip = [
     # Tracking: https://github.com/constructorfabric/cargo-gears/issues/85
     "de0101_no_serde_in_contract",
     "de0102_no_toschema_in_contract", # same tracking issue as above
+    # Both lints key purely off the `*Dto` name suffix (case-insensitive) and
+    # assume DTO implies REST: DE0201 requires the type to live in
+    # `*/api/rest/*.rs`, DE0204 requires a `ToSchema` derive for OpenAPI.
+    # `cluster-sdk`'s `*Dto` types are neither — they are gRPC wire messages,
+    # projected into `proto/cluster/**/*.proto` (`message CacheEntryDto`) and
+    # pinned by `proto.lock.toml`. They never appear in an OpenAPI document, so
+    # `ToSchema` would be dead weight on them, and `api/rest/` would be the
+    # wrong home for a type whose only transport is gRPC. Note DE0204 fires
+    # here despite its own docs scoping it to `*/api/rest/*.rs`.
+    # The lints also flag the prost-generated twins under `target/`, which is
+    # build output rather than authored code.
+    # Tracking: https://github.com/constructorfabric/cargo-gears/issues/85
+    "de0201_dtos_only_in_api_rest",
+    "de0204_dtos_must_have_toschema_derive",
 ]

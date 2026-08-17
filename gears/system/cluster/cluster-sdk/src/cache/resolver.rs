@@ -1,15 +1,16 @@
 // Created: 2026-06-03 by Constructor Tech
 //! The fluent cache resolver and its startup capability-validation helper.
 
-use std::sync::Arc;
-
 use toolkit::client_hub::ClientHub;
 
+use crate::binding;
 use crate::cache::backend::ClusterCacheBackend;
 use crate::cache::facade::ClusterCacheV1;
 use crate::cache::types::{CacheCapability, CacheConsistency};
+use crate::dto::CacheDescriptor;
 use crate::error::ClusterError;
-use crate::profile::{ClusterProfile, profile_scope};
+use crate::intern::intern;
+use crate::profile::{ClusterProfile, validate_cluster_name};
 
 /// A fluent builder that resolves a [`ClusterCacheV1`] for a profile and
 /// validates declared capabilities at startup.
@@ -44,24 +45,103 @@ impl<'a> CacheResolverBuilder<'a> {
 
     /// Resolves the cache facade for the bound profile.
     ///
+    /// # Why this is `async`
+    ///
+    /// A remote binding cannot validate a declared capability without a
+    /// [`ProfileDescriptor`](crate::ProfileDescriptor), and fetching one is I/O
+    /// (DESIGN-DEPLOYABLE-GEAR §4.7.1, obstacle A). **This is the only SDK
+    /// signature the deployable model changes** (invariant I2) — the facades, the
+    /// typed-profile resolver, `scoped()`, the watch-event unions and
+    /// `auto_restart` all keep their shapes.
+    ///
+    /// It costs a consumer nothing beyond an `.await`: facades are resolved in a
+    /// gear's `start`, never its `init`, and both are already `async fn`.
+    ///
+    /// In Profile 1 the await is a formality — the local client's descriptor is
+    /// intrinsic, so its future is ready on the first poll and the bounded timeout
+    /// can never fire.
+    ///
+    /// # What it resolves through
+    ///
+    /// The process's single `dyn ClusterClient` (invariant I4), never a
+    /// per-profile hub registration: the client is what a remote consumer has, and
+    /// routing both profiles through it is what makes this one code path
+    /// (§4.9.3). See the `binding` module for the four steps and for
+    /// what happens when no client is registered — `Ok`, and a facade that reports
+    /// [`ClusterError::ProfileNotBound`] on first use (§4.9.1).
+    ///
     /// # Errors
     /// - [`ClusterError::ProfileNotSpecified`] if no profile was set.
     /// - [`ClusterError::InvalidName`] if the bound profile's
     ///   [`NAME`](ClusterProfile::NAME) violates [`CLUSTER_NAME_RULE`](crate::CLUSTER_NAME_RULE).
-    /// - [`ClusterError::ProfileNotBound`] if no cache backend is registered for
-    ///   the profile scope.
+    /// - [`ClusterError::ProfileNotBound`] if a cluster client is registered but
+    ///   binds no cache backend for the profile.
     /// - [`ClusterError::CapabilityNotMet`] if a declared capability is
-    ///   unsupported by the bound backend.
-    pub fn resolve(self) -> Result<ClusterCacheV1, ClusterError> {
+    ///   unsupported by the bound backend, and the profile's descriptor was
+    ///   obtainable within the SDK's bounded resolve timeout.
+    ///   When it was not, validation is deferred to the readiness contributor and
+    ///   this returns `Ok` (§4.7.1).
+    pub async fn resolve(self) -> Result<ClusterCacheV1, ClusterError> {
         let profile = self.profile_name.ok_or(ClusterError::ProfileNotSpecified)?;
-        let scope = profile_scope(profile)?;
-        let inner: Arc<dyn ClusterCacheBackend> = self.hub.get_scoped(&scope).map_err(|err| {
-            tracing::debug!(profile, error = %err, "cluster backend lookup failed for profile");
-            ClusterError::ProfileNotBound { profile }
-        })?;
-        validate_cache_capabilities(inner.as_ref(), &self.requirements)?;
-        Ok(ClusterCacheV1::from_backend(inner))
+        validate_cluster_name(profile)?;
+        let requirements = self.requirements;
+        let backend = binding::bind(
+            self.hub,
+            profile,
+            "cache",
+            |client| client.cache_backend(profile),
+            || binding::unbound_cache(profile),
+            move |descriptor| validate_cache_capabilities_from(&descriptor.cache, &requirements),
+        )
+        .await?;
+        Ok(ClusterCacheV1::from_backend(backend))
     }
+}
+
+/// Validates declared cache capabilities against the profile's **descriptor** —
+/// what the server-side binding declares (DESIGN-DEPLOYABLE-GEAR §5.5).
+///
+/// This is the form the resolve path uses in both deployment profiles, so the
+/// diagnostic is byte-identical across them. [`validate_cache_capabilities`] is
+/// the same rule applied to a backend in hand, kept for callers holding one.
+///
+/// # Errors
+/// Returns [`ClusterError::CapabilityNotMet`] — naming the primitive, the unmet
+/// capability, and the **operator-facing** provider name — for the first
+/// unsatisfied requirement.
+pub fn validate_cache_capabilities_from(
+    descriptor: &CacheDescriptor,
+    reqs: &[CacheCapability],
+) -> Result<(), ClusterError> {
+    // Matched exhaustively (no catch-all), for the reason
+    // `validate_cache_capabilities` gives.
+    for cap in reqs {
+        match cap {
+            CacheCapability::Linearizable => {
+                if CacheConsistency::from(descriptor.consistency) != CacheConsistency::Linearizable
+                {
+                    return Err(ClusterError::CapabilityNotMet {
+                        primitive: "ClusterCacheV1",
+                        capability: "Linearizable",
+                        // Interned rather than the error widened to `String`: the
+                        // frozen model keeps `&'static str` (invariant I3), and
+                        // provider names are a bounded, config-derived set.
+                        provider: intern(&descriptor.provider),
+                    });
+                }
+            }
+            CacheCapability::PrefixWatch => {
+                if !descriptor.features.prefix_watch {
+                    return Err(ClusterError::CapabilityNotMet {
+                        primitive: "ClusterCacheV1",
+                        capability: "PrefixWatch",
+                        provider: intern(&descriptor.provider),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validates declared cache capabilities against a backend's actual

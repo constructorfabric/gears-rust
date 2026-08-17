@@ -98,6 +98,14 @@ impl ClusterCacheBackend for FakeBackend {
         let (_sender, watch) = CacheWatch::channel(1);
         Ok(watch)
     }
+    async fn probe(&self) -> Result<(), ClusterError> {
+        // Fails so the decorator's forwarding is observable: an unforwarded
+        // `probe` would answer the trait's `Ok(())` default instead.
+        Err(ClusterError::Provider {
+            kind: ProviderErrorKind::ConnectionLost,
+            message: "probe boom".to_owned(),
+        })
+    }
 }
 
 fn instrumented() -> (InstrumentedCache, Arc<RecordingMetrics>) {
@@ -147,5 +155,37 @@ async fn provider_error_records_both_the_result_and_the_error_kind() {
     assert_eq!(
         metrics.provider_errors.lock().unwrap().as_slice(),
         &["other"]
+    );
+}
+
+/// The forwarding this decorator cannot get wrong quietly: both plugins wrap their
+/// cache in it, so the profile `Arc` the readiness healthcheck probes is an
+/// `InstrumentedCache`. Inheriting the trait's `Ok(())` default here would report
+/// every deployed backend healthy whatever its real state.
+#[tokio::test]
+async fn probe_is_forwarded_to_the_wrapped_backend() {
+    let (cache, _metrics) = instrumented();
+    assert!(
+        cache.probe().await.is_err(),
+        "probe must reach the wrapped backend, not the trait's Ok default"
+    );
+}
+
+/// And it is deliberately absent from the op metrics: readiness traffic arrives
+/// every couple of seconds forever, and folding it into `cluster_cache_ops_total`
+/// would move the counters consumers are measured by.
+#[tokio::test]
+async fn probe_is_not_recorded_as_a_cache_operation() {
+    let (cache, metrics) = instrumented();
+    let _outcome = cache.probe().await;
+
+    assert!(
+        metrics.cache_ops.lock().unwrap().is_empty(),
+        "a probe is not a consumer operation and must not reach the op counters"
+    );
+    assert!(metrics.cache_durations.lock().unwrap().is_empty());
+    assert!(
+        metrics.provider_errors.lock().unwrap().is_empty(),
+        "nor the provider-error counter: probe failures ride /health instead"
     );
 }

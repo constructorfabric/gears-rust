@@ -240,6 +240,7 @@ fn generate_projection_impl(model: &RestContractModel) -> TokenStream {
         &model.trait_ident,
         &client_struct_ident(&model.trait_ident),
         "rest-client",
+        None,
     )
 }
 

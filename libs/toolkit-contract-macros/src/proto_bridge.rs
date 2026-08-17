@@ -7,6 +7,15 @@
 //! - `#[proto_bridge(via_string)]` — convert via `to_string()` /
 //!   `FromStr::from_str(&s).unwrap_or_default()`. For `Uuid` and similar
 //!   string-encoded primitives. Handles `Option<T>` via `.map(...)`.
+//! - `#[proto_bridge(message)]` — for a **required nested message**. prost renders
+//!   every proto3 message-typed field as `Option<T>`, so a DTO field that is
+//!   semantically required (`LeaseRef { token: LeaseToken }`) does not line up with
+//!   its stub. This wraps on the way out and unwraps on the way in: absent decodes
+//!   as `Default::default()` in the infallible `From`, and as a
+//!   `MissingRequiredMessage` error in the fallible `TryFromProto`, so a peer that
+//!   omits it is a decode error rather than a panic or a silently zeroed field.
+//!   On a `Vec<T>` field it means `repeated T` and converts element-wise, which
+//!   plain `Into::into` cannot do for a message element.
 //! - `#[proto_bridge(skip)]` — exclude the field from both `to_proto` and
 //!   `from_proto` initializers. Reconstructed via `Default::default()` on
 //!   the `from_proto` side. Useful for `PhantomData<_>` markers and other
@@ -109,6 +118,8 @@ fn parse_stub_path(input: &DeriveInput) -> syn::Result<Path> {
 enum FieldConversion {
     Direct,
     ViaString,
+    /// Required nested message: `T` on the Rust side, `Option<T>` on the stub.
+    Message,
     /// Field is excluded from wire impls; reconstructed via `Default::default()`.
     Skip,
 }
@@ -128,6 +139,13 @@ fn parse_field_conversion(field: &Field) -> syn::Result<FieldConversion> {
                 conv = FieldConversion::ViaString;
                 seen = true;
                 Ok(())
+            } else if meta.path.is_ident("message") {
+                if seen {
+                    return Err(meta.error("duplicate field-level `proto_bridge` attribute"));
+                }
+                conv = FieldConversion::Message;
+                seen = true;
+                Ok(())
             } else if meta.path.is_ident("skip") {
                 if seen {
                     return Err(meta.error("duplicate field-level `proto_bridge` attribute"));
@@ -136,11 +154,179 @@ fn parse_field_conversion(field: &Field) -> syn::Result<FieldConversion> {
                 seen = true;
                 Ok(())
             } else {
-                Err(meta.error("unknown attribute; expected `via_string` or `skip`"))
+                Err(meta.error("unknown attribute; expected `via_string`, `message`, or `skip`"))
             }
         })?;
     }
     Ok(conv)
+}
+
+/// The three per-field conversion bodies — into the stub, out of it infallibly, and
+/// out of it fallibly — keyed by the field's declared mode and its shape
+/// (plain / `Option` / `Vec`).
+///
+/// Extracted from [`derive_struct`] because the three matches are one unit and
+/// belong together, and because `derive_struct` sits at the function-length limit.
+fn field_conversions(
+    field: &Field,
+    field_ident: &Ident,
+    conv: &FieldConversion,
+    support: &TokenStream,
+) -> syn::Result<(TokenStream, TokenStream, TokenStream)> {
+    let field_ty = &field.ty;
+    let is_optional = is_option_type(field_ty);
+    // `repeated T` of a *message* element: `Into::into` on the `Vec` itself does
+    // not exist, so the conversion has to run per element.
+    let is_repeated = matches!(field_ty, Type::Path(p)
+        if p.path.segments.last().is_some_and(|seg| seg.ident == "Vec"));
+    let inner_ty = if is_optional {
+        extract_option_inner(field_ty).ok_or_else(|| {
+            syn::Error::new(field_ty.span(), "could not extract Option<T> inner type")
+        })?
+    } else {
+        field_ty
+    };
+
+    let to_proto = match (&conv, is_optional) {
+        (FieldConversion::Direct, false) => {
+            quote! { ::std::convert::Into::into(v.#field_ident) }
+        }
+        // `message` adds nothing when the field is already `Option`: the stub is
+        // one `Option` deep either way.
+        (FieldConversion::Direct | FieldConversion::Message, true) => {
+            quote! { v.#field_ident.map(::std::convert::Into::into) }
+        }
+        (FieldConversion::ViaString, false) => {
+            quote! { v.#field_ident.to_string() }
+        }
+        (FieldConversion::ViaString, true) => {
+            quote! { v.#field_ident.map(|x| x.to_string()) }
+        }
+        (FieldConversion::Message, false) if is_repeated => {
+            quote! {
+                v.#field_ident
+                    .into_iter()
+                    .map(::std::convert::Into::into)
+                    .collect()
+            }
+        }
+        // Required on the Rust side, `Option` on the stub: always `Some`.
+        (FieldConversion::Message, false) => {
+            quote! { ::std::option::Option::Some(::std::convert::Into::into(v.#field_ident)) }
+        }
+        (FieldConversion::Skip, _) => unreachable!("skipped above"),
+    };
+
+    let from_proto = match (&conv, is_optional) {
+        (FieldConversion::Direct, false) => {
+            quote! { ::std::convert::Into::into(v.#field_ident) }
+        }
+        // `message` adds nothing when the field is already `Option`: the stub is
+        // one `Option` deep either way.
+        (FieldConversion::Direct | FieldConversion::Message, true) => {
+            quote! { v.#field_ident.map(::std::convert::Into::into) }
+        }
+        (FieldConversion::ViaString, false) => {
+            let msg = format!("proto bridge: invalid string for field `{field_ident}`");
+            quote! {
+                <#inner_ty as ::std::str::FromStr>::from_str(&v.#field_ident)
+                    .expect(#msg)
+            }
+        }
+        (FieldConversion::ViaString, true) => {
+            let msg = format!("proto bridge: invalid string for field `{field_ident}`");
+            quote! {
+                v.#field_ident.map(|s| {
+                    <#inner_ty as ::std::str::FromStr>::from_str(&s)
+                        .expect(#msg)
+                })
+            }
+        }
+        (FieldConversion::Message, false) if is_repeated => {
+            quote! {
+                v.#field_ident
+                    .into_iter()
+                    .map(::std::convert::Into::into)
+                    .collect()
+            }
+        }
+        // Absent where the DTO requires a value. The infallible impl cannot
+        // report that, so it defaults — `TryFromProto` is the surface that
+        // reports it, and is what the generated client uses.
+        (FieldConversion::Message, false) => {
+            quote! {
+                v.#field_ident
+                    .map(::std::convert::Into::into)
+                    .unwrap_or_default()
+            }
+        }
+        (FieldConversion::Skip, _) => unreachable!("skipped above"),
+    };
+
+    // Fallible counterpart to `from_proto`. Operates on `&Proto` so it
+    // can be called without consuming the proto value; non-string fields
+    // are cloned so the same surface works regardless of whether their
+    // type is Copy.
+    let field_name = field_ident.to_string();
+    let try_from_proto = match (&conv, is_optional) {
+        (FieldConversion::Direct, false) => {
+            quote! { ::std::convert::Into::into(::std::clone::Clone::clone(&v.#field_ident)) }
+        }
+        (FieldConversion::Direct | FieldConversion::Message, true) => {
+            quote! {
+                ::std::clone::Clone::clone(&v.#field_ident)
+                    .map(::std::convert::Into::into)
+            }
+        }
+        (FieldConversion::ViaString, false) => {
+            quote! {
+                <#inner_ty as ::std::str::FromStr>::from_str(&v.#field_ident)
+                    .map_err(|e| #support::grpc_repr::ViaStringParseError {
+                        field: #field_name,
+                        source: ::std::boxed::Box::new(e),
+                    })?
+            }
+        }
+        (FieldConversion::ViaString, true) => {
+            quote! {
+                v.#field_ident
+                    .as_ref()
+                    .map(|s| {
+                        <#inner_ty as ::std::str::FromStr>::from_str(s)
+                            .map_err(|e| #support::grpc_repr::ViaStringParseError {
+                                field: #field_name,
+                                source: ::std::boxed::Box::new(e),
+                            })
+                    })
+                    .transpose()?
+            }
+        }
+        (FieldConversion::Message, false) if is_repeated => {
+            quote! {
+                ::std::clone::Clone::clone(&v.#field_ident)
+                    .into_iter()
+                    .map(::std::convert::Into::into)
+                    .collect()
+            }
+        }
+        // A peer that omitted a required message is a wire-shape error, not a
+        // silently zeroed field.
+        (FieldConversion::Message, false) => {
+            quote! {
+                ::std::clone::Clone::clone(&v.#field_ident)
+                    .map(::std::convert::Into::into)
+                    .ok_or(#support::grpc_repr::ViaStringParseError {
+                        field: #field_name,
+                        source: ::std::boxed::Box::new(
+                            #support::grpc_repr::MissingRequiredMessage,
+                        ),
+                    })?
+            }
+        }
+        (FieldConversion::Skip, _) => unreachable!("skipped above"),
+    };
+
+    Ok((to_proto, from_proto, try_from_proto))
 }
 
 fn derive_struct(
@@ -175,99 +361,8 @@ fn derive_struct(
             skipped_from_inits.push(quote! { #field_ident: ::std::default::Default::default() });
             continue;
         }
-        let field_ty = &field.ty;
-        let is_optional = is_option_type(field_ty);
-        let inner_ty = if is_optional {
-            extract_option_inner(field_ty).ok_or_else(|| {
-                syn::Error::new(field_ty.span(), "could not extract Option<T> inner type")
-            })?
-        } else {
-            field_ty
-        };
-
-        let to_proto = match (&conv, is_optional) {
-            (FieldConversion::Direct, false) => {
-                quote! { ::std::convert::Into::into(v.#field_ident) }
-            }
-            (FieldConversion::Direct, true) => {
-                quote! { v.#field_ident.map(::std::convert::Into::into) }
-            }
-            (FieldConversion::ViaString, false) => {
-                quote! { v.#field_ident.to_string() }
-            }
-            (FieldConversion::ViaString, true) => {
-                quote! { v.#field_ident.map(|x| x.to_string()) }
-            }
-            (FieldConversion::Skip, _) => unreachable!("skipped above"),
-        };
-
-        let from_proto = match (&conv, is_optional) {
-            (FieldConversion::Direct, false) => {
-                quote! { ::std::convert::Into::into(v.#field_ident) }
-            }
-            (FieldConversion::Direct, true) => {
-                quote! { v.#field_ident.map(::std::convert::Into::into) }
-            }
-            (FieldConversion::ViaString, false) => {
-                let msg = format!("proto bridge: invalid string for field `{field_ident}`");
-                quote! {
-                    <#inner_ty as ::std::str::FromStr>::from_str(&v.#field_ident)
-                        .expect(#msg)
-                }
-            }
-            (FieldConversion::ViaString, true) => {
-                let msg = format!("proto bridge: invalid string for field `{field_ident}`");
-                quote! {
-                    v.#field_ident.map(|s| {
-                        <#inner_ty as ::std::str::FromStr>::from_str(&s)
-                            .expect(#msg)
-                    })
-                }
-            }
-            (FieldConversion::Skip, _) => unreachable!("skipped above"),
-        };
-
-        // Fallible counterpart to `from_proto`. Operates on `&Proto` so it
-        // can be called without consuming the proto value; non-string fields
-        // are cloned so the same surface works regardless of whether their
-        // type is Copy.
-        let field_name = field_ident.to_string();
-        let try_from_proto = match (&conv, is_optional) {
-            (FieldConversion::Direct, false) => {
-                quote! { ::std::convert::Into::into(::std::clone::Clone::clone(&v.#field_ident)) }
-            }
-            (FieldConversion::Direct, true) => {
-                quote! {
-                    ::std::clone::Clone::clone(&v.#field_ident)
-                        .map(::std::convert::Into::into)
-                }
-            }
-            (FieldConversion::ViaString, false) => {
-                quote! {
-                    <#inner_ty as ::std::str::FromStr>::from_str(&v.#field_ident)
-                        .map_err(|e| #support::grpc_repr::ViaStringParseError {
-                            field: #field_name,
-                            source: ::std::boxed::Box::new(e),
-                        })?
-                }
-            }
-            (FieldConversion::ViaString, true) => {
-                quote! {
-                    v.#field_ident
-                        .as_ref()
-                        .map(|s| {
-                            <#inner_ty as ::std::str::FromStr>::from_str(s)
-                                .map_err(|e| #support::grpc_repr::ViaStringParseError {
-                                    field: #field_name,
-                                    source: ::std::boxed::Box::new(e),
-                                })
-                        })
-                        .transpose()?
-                }
-            }
-            (FieldConversion::Skip, _) => unreachable!("skipped above"),
-        };
-
+        let (to_proto, from_proto, try_from_proto) =
+            field_conversions(field, field_ident, &conv, &support)?;
         to_proto_inits.push(quote! { #field_ident: #to_proto });
         from_proto_inits.push(quote! { #field_ident: #from_proto });
         try_from_proto_inits.push(quote! { #field_ident: #try_from_proto });

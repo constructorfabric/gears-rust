@@ -58,6 +58,33 @@ pub fn is_platform_security_context_type(ty: &Type) -> bool {
     type_path_ends_with(ty, "PlatformSecurityContext")
 }
 
+/// Parameter-level helper attributes a projection macro consumes and must not
+/// leak into the emitted trait. Mirrors `parse::SECCTX_ATTRS` on the base
+/// `#[contract]` macro.
+const SECCTX_PARAM_ATTRS: &[&str] = &["secctx", "security_context"];
+
+/// Strip `#[secctx]` / `#[security_context]` from every parameter of `method`.
+///
+/// A proc-macro attribute cannot declare helper attributes the way a derive can,
+/// so the only thing that keeps `#[secctx]` from reaching the compiler is the
+/// macro removing it — exactly as the base `#[contract]` macro does when it builds
+/// its cleaned signature. Without this, a projection trait carrying the explicit
+/// attribute fails to resolve it at all, which is
+/// how a platform-plane contract has to be written: the `ctx:`-name heuristic
+/// matches only a type path ending in the segment `SecurityContext`, and
+/// `PlatformSecurityContext` does not.
+pub fn strip_param_attrs(method: &mut TraitItemFn) {
+    for arg in &mut method.sig.inputs {
+        if let syn::FnArg::Typed(pat_type) = arg {
+            pat_type.attrs.retain(|attr| {
+                !SECCTX_PARAM_ATTRS
+                    .iter()
+                    .any(|name| attr.path().is_ident(name))
+            });
+        }
+    }
+}
+
 /// Strip method-level helper attributes by ident name (e.g. `get`, `post`,
 /// `rpc`, `streaming`, `retryable`). Mutates in place.
 pub fn strip_method_attrs(method: &mut TraitItemFn, attr_names: &[&str]) {
@@ -122,11 +149,27 @@ where
 /// Empty `impl <ProjectionTrait> for {Trait}Client {}` gated on a feature.
 /// PRD #1536 D3: with delegating defaults on the projection trait, the
 /// empty impl is enough to satisfy `Arc<dyn ProjectionTrait>`.
+///
+/// `transport_bounds` is `Some` when the generated client is generic over its
+/// transport, as the gRPC one is: the impl then has to carry the same parameter
+/// and the same bounds as the base-trait impl it inherits defaults from. REST's
+/// client is concrete and passes `None`.
 pub fn generate_projection_impl_for_client(
     projection_ident: &Ident,
     client_ident: &Ident,
     feature: &str,
+    transport_bounds: Option<&TokenStream>,
 ) -> TokenStream {
+    if let Some(bounds) = transport_bounds {
+        return quote! {
+            #[cfg(feature = #feature)]
+            #[::async_trait::async_trait]
+            impl<T> #projection_ident for #client_ident<T>
+            where
+                #bounds
+            {}
+        };
+    }
     quote! {
         #[cfg(feature = #feature)]
         #[::async_trait::async_trait]

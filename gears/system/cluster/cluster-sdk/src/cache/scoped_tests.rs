@@ -118,6 +118,13 @@ impl ClusterCacheBackend for RecordingCache {
             .cloned()
             .collect())
     }
+
+    async fn probe(&self) -> Result<(), ClusterError> {
+        // Records the call under a name no key could take, so the forwarding test
+        // can tell a forwarded probe from the trait's `Ok(())` default.
+        self.seen.lock().expect("lock").push("<probe>".to_owned());
+        Ok(())
+    }
 }
 
 fn scoped(inner: Arc<RecordingCache>, prefix: &str) -> ScopedCacheBackend {
@@ -218,5 +225,25 @@ async fn scoping_composes_when_nested() {
     assert_eq!(
         cache.seen.lock().expect("lock").as_slice(),
         ["event-broker/shard-0/k"]
+    );
+}
+
+/// A probe carries no key, so scoping has nothing to apply — but it must still be
+/// forwarded, including through nesting, or a scoped view answers the trait's
+/// `Ok(())` default over an unreachable backend.
+#[tokio::test]
+async fn probe_is_forwarded_through_every_scoping_layer() {
+    let cache = Arc::new(RecordingCache::new());
+    let inner = scoped(Arc::clone(&cache), "event-broker");
+    let outer = ScopedCacheBackend::new(
+        Arc::new(inner),
+        scope::validated_prefix("shard-0").expect("valid"),
+    );
+
+    assert!(outer.probe().await.is_ok());
+    assert_eq!(
+        cache.seen.lock().expect("lock").as_slice(),
+        ["<probe>"],
+        "the probe reached the real backend, unprefixed"
     );
 }

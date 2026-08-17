@@ -9,8 +9,25 @@
 //! - [`CasBasedLeaderElectionBackend`] — compare-and-swap leadership over
 //!   `put_if_absent` + `compare_and_swap` + `watch`, with TTL-bounded renewal.
 //! - [`CasBasedDistributedLockBackend`] — TTL-bounded mutual exclusion over
-//!   `put_if_absent` + conditional release, with TTL reaping of a crashed
-//!   holder.
+//!   `put_if_absent` + conditional release, with a crashed holder's lock lapsing
+//!   at its deadline.
+//!
+//! # Both are store-owned leases (DESIGN-DEPLOYABLE-GEAR §5.8.1, ADR-012)
+//!
+//! A held lock and a leader claim are the same thing: a
+//! [`LeaseRecord`](cluster_sdk::lease::LeaseRecord) — `{ owner, deadline, fence }` —
+//! under the primitive's cache key, held by conditional writes predicated on the
+//! [`LeaseToken`](cluster_sdk::lease::LeaseToken) the holder presents. Nothing
+//! about a lease lives in the process that issued it, so any replica of the cluster
+//! gear serves any lease operation and no process's death ends another's lease
+//! (invariant I7). The algebra lives in one place, [`lease`], and both defaults
+//! delegate to it.
+//!
+//! Expiry is therefore **logical**: the stored `deadline` decides, and the record
+//! outlives it by `fence_retention` so the fence that keeps a stale holder out
+//! survives the lapse. One consequence is worth knowing before reading either
+//! backend — a lapsing lease writes nothing, so no watch event announces it, and
+//! both defaults schedule their own wake-up at the incumbent's deadline instead.
 //!
 //! # Consistency safety (ADR-009)
 //!
@@ -50,13 +67,14 @@
 //! - lock — an in-flight blocking `lock()` waiter returns `Err(Shutdown)` (no
 //!   spawned task to await, since the waiter runs in the caller's future).
 //!
-//! No remote release is performed: held claims and locks lapse via TTL per
-//! `cpt-cf-clst-fr-shutdown-ttl-cleanup`.
+//! No remote release is performed: held claims and locks lapse at their stored
+//! deadline per `cpt-cf-clst-fr-shutdown-ttl-cleanup`.
 
 use async_trait::async_trait;
 
 mod guard;
 mod identity;
+mod lease;
 
 pub mod leader;
 pub mod lock;

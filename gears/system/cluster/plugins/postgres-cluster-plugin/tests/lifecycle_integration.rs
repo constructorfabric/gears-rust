@@ -123,20 +123,24 @@ async fn pg_life_002_build_and_start_is_idempotent() {
 /// `PG-LIFE-003`: after `stop`, the Postgres server shows zero connections
 /// from the plugin and any advisory locks it held are released.
 ///
-/// Covers the shutdown ordering of DESIGN.md §10 step 4 — drain held locks,
-/// close the liveness beacon, close the pool — with a lock deliberately still
-/// held at `stop()` time. Both halves are asserted: zero plugin connections
-/// afterwards (the pool, the two LISTEN connections, *and* the beacon all
-/// closed), and zero advisory locks (`stop()` closes the beacon explicitly, after
-/// the drain has read its key, rather than leaving its release to whenever the
-/// connection happens to be dropped).
+/// Covers DESIGN.md §10's shutdown, with a lock deliberately still held at
+/// `stop()` time. Both halves are asserted: zero plugin connections afterwards
+/// (the pool and the two LISTEN connections all closed), and zero advisory locks.
 ///
-/// Historically this scenario existed as a hang regression guard: a held lock
-/// used to pin a pool connection outside the pool's tracking, so `pool.close()`
-/// blocked forever until `stop()` learned to drain first. That hazard is gone
-/// with the connection model (a held lock pins nothing), but the shutdown
-/// sequence still has an order that matters — the drain needs both the beacon
-/// and the pool open — so the scenario keeps its value.
+/// The advisory-lock half is now trivially true rather than earned, and that is
+/// worth keeping as a regression guard: this plugin takes no advisory lock at all
+/// since the liveness beacon was removed (DESIGN-DEPLOYABLE-GEAR §5.8.2), so a
+/// non-zero count means one came back.
+///
+/// **Note what this deliberately does not assert**: that the held lock's row is
+/// gone. It is not — `stop()` revokes nothing, and `PG-LOCK-021` asserts that
+/// directly. This scenario is about connections and advisory locks only.
+///
+/// Historically it existed as a hang regression guard: a held lock used to pin a
+/// pool connection outside the pool's tracking, so `pool.close()` blocked forever
+/// until `stop()` learned to drain first. That hazard is gone with the connection
+/// model (a held lock pins nothing), which is what makes the connection assertion
+/// the whole of the remaining value here.
 #[tokio::test]
 async fn pg_life_003_stop_closes_pool_and_listen_connection() {
     let (_container, config) = common::start_postgres().await;
@@ -190,9 +194,9 @@ async fn pg_life_003_stop_closes_pool_and_listen_connection() {
     })
     .await;
     if !drained {
-        // Name the survivors: with four distinct connection kinds (pool, two
-        // LISTEN connections, and the liveness beacon — DESIGN.md §3.3), a bare
-        // count says nothing about which shutdown step failed to close its own.
+        // Name the survivors: with three distinct connection kinds (pool plus the
+        // two LISTEN connections), a bare count says nothing about which shutdown
+        // step failed to close its own.
         let survivors: Vec<(i32, String, String)> = sqlx::query_as(
             "SELECT pid, state, left(coalesce(query, ''), 60) FROM pg_stat_activity \
              WHERE datname = 'cluster_test' AND application_name <> $1",
@@ -206,10 +210,10 @@ async fn pg_life_003_stop_closes_pool_and_listen_connection() {
         );
     }
 
-    // The only advisory lock this plugin ever takes is the beacon, and the only
-    // thing that releases it is its connection closing (`lock::beacon`) — which
-    // `stop()` awaits. Unlike the connection count above this is not subject to
-    // backend-exit lag, so assert it directly.
+    // This plugin takes no advisory lock at all now (the liveness beacon was its
+    // only one), so this is a guard against one being reintroduced rather than a
+    // check that shutdown released anything. Unlike the connection count above it
+    // is not subject to backend-exit lag, so assert it directly.
     let advisory_locks: i64 =
         sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'")
             .fetch_one(&control_pool)

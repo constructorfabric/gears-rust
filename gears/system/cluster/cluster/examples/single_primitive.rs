@@ -8,13 +8,14 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use cluster_sdk::cache::{
     CacheCapability, CacheConsistency, CacheEvent, CacheWatchEvent, ClusterCacheV1, PutRequest, Ttl,
 };
 use cluster_sdk::error::ClusterError;
 use cluster_sdk::profile::ClusterProfile;
-use cluster_sdk::registration::register_cache_backend;
-use common::MemCacheBackend;
+use common::{MemCacheBackend, cache_profile, wire};
 use toolkit::client_hub::ClientHub;
 
 /// The typed profile this app binds its cluster backend under. The marker
@@ -26,12 +27,30 @@ impl ClusterProfile for AppProfile {
     const NAME: &'static str = "app";
 }
 
+// Declare the marker to the process. One line, at module scope, and it is the
+// *entire* difference between this file and the same file in a deployed consumer:
+// it tells cluster's consumer wiring and readiness contributor which profiles this
+// process expects, so a profile the cluster gear does not bind is named at startup
+// rather than at the first coordination call.
+//
+// It is not a prerequisite for resolving - every `resolve()` below would work
+// without it. Omitting it costs the diagnostic, not the function.
+cluster_sdk::register_cluster_profile!(AppProfile);
+
 #[tokio::main]
 async fn main() -> Result<(), ClusterError> {
-    // 1. Bind a backend under the profile. In production the wiring crate does
-    //    this from operator config; here we register the in-memory fixture.
-    let hub = ClientHub::new();
-    register_cache_backend(&hub, AppProfile::NAME, MemCacheBackend::linearizable())?;
+    // 1. Wire a backend under the profile. In production the gear does this from
+    //    operator config; here we wire the in-memory fixture. The wiring is also
+    //    what registers the process's cluster client, which is what a facade
+    //    resolves through.
+    let hub = Arc::new(ClientHub::new());
+    let handle = wire(
+        &hub,
+        vec![(
+            AppProfile::NAME,
+            cache_profile(MemCacheBackend::linearizable()),
+        )],
+    )?;
 
     // 2. Resolve the cache, declaring the capabilities the workload requires.
     //    Resolution fails fast (at startup) if the bound backend cannot meet them
@@ -40,7 +59,8 @@ async fn main() -> Result<(), ClusterError> {
         .profile(AppProfile)
         .require(CacheCapability::Linearizable)
         .require(CacheCapability::PrefixWatch)
-        .resolve()?;
+        .resolve()
+        .await?;
     let consistency = match cache.consistency() {
         CacheConsistency::Linearizable => "linearizable",
         CacheConsistency::EventuallyConsistent => "eventually-consistent",
@@ -105,6 +125,8 @@ async fn main() -> Result<(), ClusterError> {
         );
         println!("watch observed change to {key}; current value = {value}");
     }
+
+    handle.stop().await;
 
     Ok(())
 }

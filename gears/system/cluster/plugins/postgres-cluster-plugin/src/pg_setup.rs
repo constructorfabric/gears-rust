@@ -28,11 +28,9 @@ use crate::pg_error::map_sqlx_error;
 /// takes an advisory lock at all now — the `cluster_lock` row is the arbiter
 /// (DESIGN.md §5.1) — so the sweep would be a pure per-checkin round-trip on the
 /// cache hot path, doubling the pool's per-operation hook overhead to protect
-/// against a state this crate can no longer produce. The one advisory lock this
-/// plugin still takes is the liveness beacon, which lives on its own connection
-/// outside the pool and must **never** be released while the process runs
-/// (`lock::beacon`); an `unlock_all` on a pooled connection could not reach it,
-/// and one that could would be catastrophic.
+/// against a state this crate can no longer produce. Since the liveness beacon was
+/// removed (DESIGN-DEPLOYABLE-GEAR §5.8.2) this crate takes **no** advisory lock
+/// anywhere, pooled or otherwise.
 ///
 /// One caveat, stated precisely because it is easy to get wrong: `sqlx`'s own
 /// `Migrator::run` **does** take an advisory lock on a pooled connection, and it is
@@ -129,26 +127,31 @@ pub async fn ensure_schema(pool: &sqlx::PgPool, schema: &str) -> Result<(), Clus
 
 /// Rejects `pgbouncer_transaction_mode: true` at startup (DESIGN.md §5.4).
 ///
-/// Narrower than it once was, but not gone. Lock *operations* are now single
-/// statements against the pool and would tolerate transaction-mode pooling
-/// perfectly well. What cannot is the pair of connections this plugin opens
-/// outside the pool: the liveness beacon, whose session-scoped advisory lock
-/// transaction-mode pooling would release between transactions — asserting to
-/// the whole fleet that this instance is dead while it still holds live locks —
-/// and the `LISTEN` connections, whose subscriptions have the same session
-/// affinity.
+/// Narrower than it once was, and narrower again since the liveness beacon went
+/// (DESIGN-DEPLOYABLE-GEAR §5.8.2) — but not gone. Every lock and cache *operation*
+/// is a single statement against the pool and would tolerate transaction-mode
+/// pooling perfectly well. What cannot is the one kind of connection this plugin
+/// still opens outside the pool: the `LISTEN` connections, whose subscriptions are
+/// session-scoped and which transaction-mode pooling would silently detach from,
+/// leaving cache watches and blocked `lock()` waiters permanently unwoken.
 ///
-/// Both are opened directly rather than through the pool, so in practice this
-/// guards an operator who has put `PgBouncer` in front of the DSN itself. Silent,
-/// hard-to-diagnose misbehaviour rather than a clear startup failure is exactly
-/// what it is worth refusing to start over.
+/// The beacon was the other, and the more dangerous, case: transaction-mode pooling
+/// would have released its advisory lock between transactions, asserting to the
+/// whole fleet that this instance was dead while it still held live locks. That
+/// failure mode no longer exists.
+///
+/// The LISTEN connections are opened directly rather than through the pool, so in
+/// practice this guards an operator who has put `PgBouncer` in front of the DSN
+/// itself. Silent, hard-to-diagnose misbehaviour rather than a clear startup failure
+/// is exactly what it is worth refusing to start over.
 pub fn reject_pgbouncer_transaction_mode(enabled: bool) -> Result<(), ClusterError> {
     if enabled {
         return Err(ClusterError::InvalidConfig {
-            reason: "the liveness beacon's advisory lock and the LISTEN subscriptions require \
-                      session-mode pooling or a direct connection; transaction-mode PgBouncer \
-                      would release the beacon between transactions, telling the fleet this \
-                      instance is dead while it still holds locks"
+            reason: "the LISTEN subscriptions this plugin opens (cache watches, and the release \
+                     wake-up that unblocks a waiting lock()) are session-scoped and require \
+                     session-mode pooling or a direct connection; transaction-mode PgBouncer \
+                     would detach them between transactions, leaving watchers and blocked \
+                     lock() callers permanently unwoken"
                 .to_owned(),
         });
     }

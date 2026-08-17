@@ -52,7 +52,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cluster::{ClusterConfig, ClusterWiring, ProviderRegistry};
+use cluster::{
+    BoundProfile, ClusterConfig, ClusterHandle, ClusterWiring, ProfileRegistry, ProviderRegistry,
+};
 use cluster_sdk::cache::types::{PutRequest, Ttl};
 use cluster_sdk::{
     CacheCapability, ClusterCacheV1, ClusterError, ClusterProfile, DistributedLockV1,
@@ -64,6 +66,13 @@ use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use toolkit::client_hub::ClientHub;
+
+/// The step the gear's `start` takes after `from_config`: publish the bound set
+/// and register the local cluster client, which is what makes the profiles
+/// resolvable in this process (DESIGN-DEPLOYABLE-GEAR §4.9.3).
+fn publish(handle: &mut ClusterHandle, bound: Vec<Arc<BoundProfile>>) {
+    handle.publish(&Arc::new(ProfileRegistry::new()), bound);
+}
 
 /// The profile the YAML fixture names.
 #[derive(Clone, Copy)]
@@ -152,9 +161,10 @@ profiles:
         .with_cache_provider(Arc::new(PostgresCacheProvider))
         .with_lock_provider(Arc::new(PostgresLockProvider));
 
-    let handle = ClusterWiring::from_config(Arc::clone(&hub), &cfg, &registry)
+    let (mut handle, bound) = ClusterWiring::from_config(Arc::clone(&hub), &cfg, &registry)
         .await
         .expect("a mixed-backend profile must wire against live Postgres");
+    publish(&mut handle, bound);
 
     // --- All three primitives resolve under the single profile (UC-004's
     // "consumer gears see four working primitives" clause). Capability
@@ -165,15 +175,18 @@ profiles:
         .profile(EventBroker)
         .require(CacheCapability::Linearizable)
         .resolve()
+        .await
         .expect("the natively-bound Postgres cache resolves as linearizable");
     let lock = DistributedLockV1::resolver(&hub)
         .profile(EventBroker)
         .resolve()
+        .await
         .expect("the natively-bound Postgres lock resolves");
     assert!(
         LeaderElectionV1::resolver(&hub)
             .profile(EventBroker)
             .resolve()
+            .await
             .is_ok(),
         "leader election still rides the omit-default auto-wrap over the cache"
     );
@@ -273,23 +286,27 @@ profiles:
         .with_cache_provider(Arc::new(StandaloneCacheProvider))
         .with_lock_provider(Arc::new(PostgresLockProvider));
 
-    let handle = ClusterWiring::from_config(Arc::clone(&hub), &cfg, &registry)
+    let (mut handle, bound) = ClusterWiring::from_config(Arc::clone(&hub), &cfg, &registry)
         .await
         .expect("a heterogeneous profile must wire");
+    publish(&mut handle, bound);
 
     let cache = ClusterCacheV1::resolver(&hub)
         .profile(EventBroker)
         .require(CacheCapability::Linearizable)
         .resolve()
+        .await
         .expect("the standalone cache resolves as linearizable");
     let lock = DistributedLockV1::resolver(&hub)
         .profile(EventBroker)
         .resolve()
+        .await
         .expect("the Postgres lock resolves alongside a non-Postgres cache");
     assert!(
         LeaderElectionV1::resolver(&hub)
             .profile(EventBroker)
             .resolve()
+            .await
             .is_ok(),
         "leader election rides the omit-default auto-wrap over the standalone cache"
     );

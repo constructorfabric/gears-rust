@@ -204,6 +204,24 @@ impl ClusterCacheBackend for InstrumentedCache {
         self.record("scan_prefix", prefix, started, &out);
         out
     }
+
+    /// Forwarded, and deliberately *not* recorded.
+    ///
+    /// Forwarding is mandatory: both plugins wrap their cache in this decorator,
+    /// so the profile `Arc` the readiness healthcheck probes is an
+    /// `InstrumentedCache`. Inheriting the trait's `Ok(())` default here would
+    /// report every deployed backend healthy no matter its real state.
+    ///
+    /// It is not recorded because a probe is not a consumer operation.
+    /// [`record`](Self::record) emits `cluster_cache_ops_total` with a bounded
+    /// `method` label; adding a `probe` method would fold readiness traffic —
+    /// every couple of seconds, forever, from the pod itself — into the RED
+    /// metrics consumers are measured by. Probe outcomes belong on `/health` and
+    /// on the per-instance probe-failure metric that lands with the pool-saturation
+    /// gauge (DESIGN-DEPLOYABLE-GEAR §7.5), not in the cache op counters.
+    async fn probe(&self) -> Result<(), ClusterError> {
+        self.inner.probe().await
+    }
 }
 
 #[cfg(test)]

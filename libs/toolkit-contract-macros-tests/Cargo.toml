@@ -14,7 +14,13 @@ workspace = true
 
 [dev-dependencies]
 # The crates under test
-toolkit-contract = { workspace = true, features = ["rest-client"] }
+# `grpc-client` is needed for the *guards*, not for a client: the repr guard
+# `#[toolkit::grpc_contract]` emits is always-on, while the
+# `SecurityContextMarker` impls that satisfy it live behind this feature. So any
+# crate compiling a gRPC projection whose methods take a security context needs
+# it — which `valid_grpc_projection.rs` never revealed, because that contract
+# takes no context at all.
+toolkit-contract = { workspace = true, features = ["rest-client", "grpc-client"] }
 toolkit-contract-macros = { workspace = true }
 
 # Test framework

@@ -402,6 +402,25 @@ impl ClusterCacheBackend for PostgresCache {
         .map_err(map_sqlx_error)?;
         Ok(keys)
     }
+
+    /// `SELECT 1` against the pool — the cheapest statement that proves a
+    /// connection can be acquired and the server answers on it, which is exactly
+    /// what "is this profile serving" means for a Postgres binding
+    /// (DESIGN-DEPLOYABLE-GEAR §4.4).
+    ///
+    /// It touches no cluster table on purpose: a probe must not depend on the
+    /// migration state, the row count, or the reaper's progress, only on
+    /// reachability. Pool exhaustion surfaces here the same way it does on the
+    /// request path — as an acquire timeout mapped by
+    /// [`map_sqlx_error`](crate::pg_error::map_sqlx_error) — so a saturated pool
+    /// reports the profile degraded rather than silently passing.
+    async fn probe(&self) -> Result<(), ClusterError> {
+        sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

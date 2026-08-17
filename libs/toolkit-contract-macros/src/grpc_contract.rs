@@ -22,8 +22,8 @@ use syn::{TraitItem, Type};
 use crate::grpc_contract_parse::{GrpcContractModel, GrpcIdempotency, GrpcMethodModel, GrpcParam};
 use crate::projection::{
     build_delegation_body, client_struct_ident, generate_projection_impl_for_client,
-    render_method_inputs, render_method_return_ty, rewrite_streaming_signature, strip_method_attrs,
-    type_path_ends_with,
+    is_platform_security_context_type, is_security_context_type, render_method_inputs,
+    render_method_return_ty, rewrite_streaming_signature, strip_method_attrs, strip_param_attrs,
 };
 use crate::support::contract_support_path;
 
@@ -57,7 +57,7 @@ pub fn generate(model: &GrpcContractModel) -> TokenStream {
 }
 
 /// Auto-emit `impl From<#param_ty> for #stubs::#RequestType` for methods
-/// whose only wire parameter (after filtering out `self` and `SecurityContext`)
+/// whose only wire parameter (after filtering out `self` and the security context)
 /// is a proto-direct primitive type (`String`, `bool`, fixed-width int/float).
 /// Mirrors `toolkit-contract-protogen`'s synthesized-request convention so
 /// authors don't have to hand-write trivial wrapper bridges.
@@ -70,7 +70,7 @@ fn generate_synthesized_request_from_impls(model: &GrpcContractModel) -> TokenSt
             let wire_params: Vec<&GrpcParam> = method
                 .params
                 .iter()
-                .filter(|p| p.ident != "self" && !type_path_ends_with(&p.ty, "SecurityContext"))
+                .filter(|p| p.ident != "self" && !is_security_context_type(&p.ty))
                 .collect();
             // Exactly one wire param of a proto-direct primitive type.
             let [param] = wire_params.as_slice() else {
@@ -135,14 +135,16 @@ fn generate_repr_guards(model: &GrpcContractModel, support: &TokenStream) -> Tok
     let mut seen_secctx_keys: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     for method in &model.methods {
-        // Parameters: skip `self`. SecurityContext-typed arguments don't
-        // travel on the wire but still need a static assertion that the
-        // detected type really impls `SecurityContextMarker`.
+        // Parameters: skip `self`. Security-context arguments don't travel on
+        // the wire but still need a static assertion that the detected type
+        // really impls `SecurityContextMarker`. Both planes are recognised —
+        // the tenant `SecurityContext` and the platform
+        // `PlatformSecurityContext`.
         for param in &method.params {
             if param.ident == "self" {
                 continue;
             }
-            if type_path_ends_with(&param.ty, "SecurityContext") {
+            if is_security_context_type(&param.ty) {
                 let ty = &param.ty;
                 let key = quote!(#ty).to_string();
                 if seen_secctx_keys.insert(key) {
@@ -213,6 +215,7 @@ fn generate_cleaned_trait(model: &GrpcContractModel) -> TokenStream {
     for trait_item in &mut item.items {
         if let TraitItem::Fn(method) = trait_item {
             strip_method_attrs(method, GRPC_ATTRS);
+            strip_param_attrs(method);
             if let Some(model_method) = model_methods.get(&method.sig.ident.to_string()) {
                 if model_method.server_streaming {
                     let (ok, err) = &model_method.result_types;
@@ -300,6 +303,29 @@ fn idempotency_tokens(idem: GrpcIdempotency, support: &TokenStream) -> TokenStre
     quote! { #support::ir::grpc::GrpcIdempotency::#variant }
 }
 
+/// The bounds tonic's generated client requires of its transport, plus what
+/// `#[async_trait]` needs to make the generated futures `Send`.
+///
+/// Spelled through `tonic::codegen`'s re-exports (`StdError`, `Body`, `Bytes`)
+/// rather than through `bytes` / `http-body` directly, so a crate consuming this
+/// macro needs no dependency it did not already have for tonic.
+fn transport_bounds() -> TokenStream {
+    quote! {
+        T: ::tonic::client::GrpcService<::tonic::body::Body>
+            + ::std::clone::Clone
+            + ::std::marker::Send
+            + ::std::marker::Sync
+            + 'static,
+        T::Error: ::std::convert::Into<::tonic::codegen::StdError>,
+        T::ResponseBody: ::tonic::codegen::Body<Data = ::tonic::codegen::Bytes>
+            + ::std::marker::Send
+            + 'static,
+        <T::ResponseBody as ::tonic::codegen::Body>::Error:
+            ::std::convert::Into<::tonic::codegen::StdError> + ::std::marker::Send,
+        T::Future: ::std::marker::Send,
+    }
+}
+
 fn generate_client_struct(model: &GrpcContractModel, support: &TokenStream) -> TokenStream {
     let client_ident = client_struct_ident(&model.trait_ident);
     let stubs = &model.stubs_module;
@@ -314,16 +340,23 @@ fn generate_client_struct(model: &GrpcContractModel, support: &TokenStream) -> T
         client_type_ident,
     );
 
+    let bounds = transport_bounds();
+
     quote! {
         #[cfg(feature = "grpc-client")]
         #[doc = #doc]
-        pub struct #client_ident {
-            inner: #stubs::#client_module::#client_type_ident<::tonic::transport::Channel>,
+        ///
+        /// Generic over its transport so a platform-plane caller can supply a
+        /// channel wrapped with an interceptor. `T` defaults to
+        /// `tonic::transport::Channel`, so `#client_ident` on its own means
+        /// exactly what it meant before this parameter existed.
+        pub struct #client_ident<T = ::tonic::transport::Channel> {
+            inner: #stubs::#client_module::#client_type_ident<T>,
             config: #support::runtime::config::ClientConfig,
         }
 
         #[cfg(feature = "grpc-client")]
-        impl #client_ident {
+        impl #client_ident<::tonic::transport::Channel> {
             /// Build a new client wrapping the supplied tonic Channel.
             #[must_use]
             pub fn new(
@@ -348,12 +381,106 @@ fn generate_client_struct(model: &GrpcContractModel, support: &TokenStream) -> T
                 Self,
                 #support::runtime::transport_error::TransportError,
             > {
+                let channel = Self::channel(&config).await?;
+                Ok(Self::new(channel, config))
+            }
+
+            /// Build a client whose every outbound call passes through
+            /// `interceptor`.
+            ///
+            /// This is the **platform-plane** entry point. A
+            /// `PlatformSecurityContext` parameter carries no credential — it holds
+            /// a validated identity, which is the *result* of inbound
+            /// authentication — so the generated method bodies attach nothing from
+            /// it. The credential is process-level and belongs here, on the
+            /// channel: pass a
+            /// `toolkit_transport_grpc::InternalAuthInterceptor` built from a
+            /// rotating service-account token or a shared secret, and it attaches
+            /// `x-toolkit-internal-token` to every request.
+            ///
+            /// Mirrors tonic's own `with_interceptor`, and the shape the
+            /// hand-written `DirectoryGrpcClient` uses.
+            #[must_use]
+            pub fn with_interceptor<I>(
+                channel: ::tonic::transport::Channel,
+                interceptor: I,
+                config: #support::runtime::config::ClientConfig,
+            ) -> #client_ident<
+                ::tonic::service::interceptor::InterceptedService<
+                    ::tonic::transport::Channel,
+                    I,
+                >,
+            >
+            where
+                I: ::tonic::service::Interceptor,
+            {
+                #client_ident {
+                    inner: #stubs::#client_module::#client_type_ident::with_interceptor(
+                        channel,
+                        interceptor,
+                    ),
+                    config,
+                }
+            }
+
+            /// Connect to a base URL and build an intercepted client.
+            ///
+            /// The platform-plane counterpart of [`connect`](Self::connect); see
+            /// [`with_interceptor`](Self::with_interceptor).
+            ///
+            /// # Errors
+            ///
+            /// Returns a [`#support::runtime::transport_error::TransportError`]
+            /// when the channel cannot be established.
+            pub async fn connect_with_interceptor<I>(
+                config: #support::runtime::config::ClientConfig,
+                interceptor: I,
+            ) -> ::std::result::Result<
+                #client_ident<
+                    ::tonic::service::interceptor::InterceptedService<
+                        ::tonic::transport::Channel,
+                        I,
+                    >,
+                >,
+                #support::runtime::transport_error::TransportError,
+            >
+            where
+                I: ::tonic::service::Interceptor,
+            {
+                let channel = Self::channel(&config).await?;
+                Ok(Self::with_interceptor(channel, interceptor, config))
+            }
+
+            async fn channel(
+                config: &#support::runtime::config::ClientConfig,
+            ) -> ::std::result::Result<
+                ::tonic::transport::Channel,
+                #support::runtime::transport_error::TransportError,
+            > {
                 let endpoint = ::tonic::transport::Endpoint::from_shared(config.base_url.clone())
                     .map_err(|e| #support::runtime::transport_error::TransportError::network(e))?;
                 let endpoint = endpoint.timeout(config.timeout);
-                let channel = endpoint.connect().await
-                    .map_err(|e| #support::runtime::transport_error::TransportError::network(e))?;
-                Ok(Self::new(channel, config))
+                endpoint.connect().await
+                    .map_err(|e| #support::runtime::transport_error::TransportError::network(e))
+            }
+        }
+
+        #[cfg(feature = "grpc-client")]
+        impl<T> #client_ident<T>
+        where
+            #bounds
+        {
+            /// Build a client over an arbitrary tonic transport — an
+            /// `InterceptedService`, a test double, or a custom tower stack.
+            #[must_use]
+            pub fn with_transport(
+                transport: T,
+                config: #support::runtime::config::ClientConfig,
+            ) -> Self {
+                Self {
+                    inner: #stubs::#client_module::#client_type_ident::new(transport),
+                    config,
+                }
             }
         }
     }
@@ -368,13 +495,73 @@ fn generate_client_impl(model: &GrpcContractModel, support: &TokenStream) -> Tok
         .iter()
         .map(|m| generate_client_method(m, model, support));
 
+    let bounds = transport_bounds();
+
     quote! {
         #[cfg(feature = "grpc-client")]
         #[::async_trait::async_trait]
-        impl #trait_path for #client_ident {
+        impl<T> #trait_path for #client_ident<T>
+        where
+            #bounds
+        {
             #(#methods)*
         }
     }
+}
+
+/// The prost type of a method's request message, computed the way
+/// `toolkit-contract-protogen` computes it rather than guessed.
+///
+/// protogen has two cases, and only the second yields `<Method>Request`:
+///
+/// - **exactly one wire parameter of a named (non-primitive) type** — the message
+///   *is* that type, reused. `put_if_absent(req: PutRequest)` therefore has input
+///   `PutRequest`, and `renew(req: LeaseRef)` has input `LeaseRef`;
+/// - **anything else** — protogen synthesizes `<UpperCamelCase(method)>Request`
+///   from the wire fields, which is the case a single primitive parameter or a
+///   multi-parameter method falls into.
+///
+/// This used to assume the second case unconditionally, which happened to work only
+/// while every contract in the tree named its DTO after its method. The moment two
+/// methods shared a request DTO — the shape §12.1 of the cluster design specifies,
+/// where `put`/`put_if_absent` share `PutRequest` and `renew`/`release` share
+/// `LeaseRef` — the macro referred to a prost type protogen had never emitted.
+///
+/// The two must agree by construction, not by naming discipline: they are two
+/// halves of one pipeline, and a mismatch is a compile error in generated code
+/// pointing at the macro invocation rather than at the cause.
+fn proto_request_ident(method: &GrpcMethodModel) -> syn::Ident {
+    let wire_params: Vec<&GrpcParam> = method
+        .params
+        .iter()
+        .filter(|p| p.ident != "self" && !is_security_context_type(&p.ty))
+        .collect();
+
+    if let [param] = wire_params.as_slice()
+        && !is_proto_direct_primitive(&param.ty)
+        && let Some(named) = named_type_ident(&param.ty)
+    {
+        return named;
+    }
+
+    format_ident!("{}Request", method.ident.to_string().to_upper_camel_case())
+}
+
+/// The last path segment of a type, when it is a plain path that protogen would
+/// render as `TypeRef::Named` — so not a container, whose element type protogen
+/// projects as `repeated` / `optional` rather than as a message of its own.
+fn named_type_ident(ty: &Type) -> Option<syn::Ident> {
+    let Type::Path(path) = ty else {
+        return None;
+    };
+    let last = path.path.segments.last()?;
+    if matches!(
+        last.ident.to_string().as_str(),
+        "Option" | "Vec" | "HashMap" | "BTreeMap"
+    ) {
+        return None;
+    }
+    Some(last.ident.clone())
 }
 
 fn generate_client_method(
@@ -384,16 +571,28 @@ fn generate_client_method(
 ) -> TokenStream {
     let rpc_method_ident = format_ident!("{}", method.rpc_name.to_snake_case());
     let stubs = &model.stubs_module;
-    // Mirror `toolkit-contract-protogen`'s naming convention: the proto
-    // request type is `<UpperCamelCase(method.name)>Request`. Used to
-    // anchor type inference through the `Arc<T>` template in retryable
-    // bodies (where the chain `From → Arc::new → Arc::clone → deref →
-    // Request::new` would otherwise leave T ambiguous).
-    let request_ty_ident =
-        format_ident!("{}Request", method.ident.to_string().to_upper_camel_case());
+    let request_ty_ident = proto_request_ident(method);
     let proto_request_ty = quote! { #stubs::#request_ty_ident };
 
-    let sig_inputs = render_method_inputs(method.params.iter().map(|p| (&p.ident, &p.ty)));
+    // A platform-plane context is unused *in the client*: it carries no credential,
+    // so nothing is attached from it. Rename it to `_ctx` in the generated
+    // signature rather than leaving an `unused_variables` warning in every
+    // consumer's build — parameter names need not match the trait, and the
+    // underscore is the accurate statement about this client.
+    let renamed: Vec<(syn::Ident, syn::Type)> = method
+        .params
+        .iter()
+        .map(|p| {
+            let unused_here = is_platform_security_context_type(&p.ty);
+            let ident = if unused_here {
+                format_ident!("_{}", p.ident)
+            } else {
+                p.ident.clone()
+            };
+            (ident, p.ty.clone())
+        })
+        .collect();
+    let sig_inputs = render_method_inputs(renamed.iter().map(|(i, t)| (i, t)));
     let (ok_ty, err_ty) = &method.result_types;
     let return_ty = render_method_return_ty(ok_ty, err_ty, method.server_streaming);
     let err_convert = quote! {
@@ -412,7 +611,10 @@ fn generate_client_method(
         );
         return quote::quote_spanned! { span => compile_error!(#msg); };
     };
-    let ctx_ident = security_context_param(method);
+    // A platform-plane context carries no credential, so for *attachment*
+    // purposes it is absent — see `bearer_context_param`. The parameter is still
+    // in `sig_inputs`, which is built from `method.params`.
+    let ctx_ident = bearer_context_param(method);
 
     if method.server_streaming {
         return generate_streaming_client_method(
@@ -585,7 +787,7 @@ fn generate_retryable_unary_method(
     }
 }
 
-/// Identify the body parameter (the first non-`self`, non-SecurityContext
+/// Identify the body parameter (the first non-`self`, non-security-context
 /// param). Returns `None` when the method has no wire payload — in which
 /// case the macro emits a `compile_error!` pointing at the method ident,
 /// rather than producing generated code that fails downstream with an
@@ -594,15 +796,38 @@ fn body_param_ident(method: &GrpcMethodModel) -> Option<syn::Ident> {
     method
         .params
         .iter()
-        .find(|p| p.ident != "self" && !type_path_ends_with(&p.ty, "SecurityContext"))
+        .find(|p| p.ident != "self" && !is_security_context_type(&p.ty))
         .map(|p| p.ident.clone())
 }
 
-fn security_context_param(method: &GrpcMethodModel) -> Option<syn::Ident> {
+/// The security-context parameter **only when it carries a credential** — that
+/// is, only on the tenant plane.
+///
+/// The two planes source their outbound credential differently, and this is the
+/// distinction the generated client turns on:
+///
+/// - **tenant** — the credential is *inside* the context. `SecurityContext`
+///   carries the bearer token it was built from, so the client attaches
+///   `authorization: Bearer …` per request via `attach_bearer`.
+/// - **platform** — the context carries **no credential at all**.
+///   `PlatformSecurityContext` holds a validated `PlatformIdentity`, which is the
+///   *result* of inbound authentication. The outbound credential is process-level
+///   (a projected service-account token or a shared secret) and is attached at the
+///   channel by `InternalAuthInterceptor` as `x-toolkit-internal-token` — see
+///   [`with_interceptor`] on the generated client.
+///
+/// So a platform-plane context contributes nothing to the request, and the
+/// generated body attaches nothing from it. The parameter stays in the signature,
+/// where `cpt-cf-binding-constraint-security-context` requires it and where the
+/// server-side handler is what consumes the plane marker.
+///
+/// [`with_interceptor`]: generate_client_struct
+fn bearer_context_param(method: &GrpcMethodModel) -> Option<syn::Ident> {
     method
         .params
         .iter()
-        .find(|p| type_path_ends_with(&p.ty, "SecurityContext"))
+        .find(|p| is_security_context_type(&p.ty))
+        .filter(|p| !is_platform_security_context_type(&p.ty))
         .map(|p| p.ident.clone())
 }
 
@@ -684,5 +909,151 @@ fn generate_projection_impl(model: &GrpcContractModel) -> TokenStream {
         &model.trait_ident,
         &client_struct_ident(&model.trait_ident),
         "grpc-client",
+        Some(&transport_bounds()),
     )
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::generate;
+    use crate::grpc_contract_parse::{GrpcContractAttr, parse};
+
+    /// Expand a projection trait and return the emitted tokens as text.
+    ///
+    /// Asserting on the *emitted body* rather than on whether it compiles is
+    /// deliberate: "a platform-plane context contributes nothing to the request"
+    /// is invisible to the type system. A regression that reintroduced
+    /// `attach_bearer` for the platform plane would fail to compile only because
+    /// `PlatformSecurityContext` lacks `BearerContext` — and the moment someone
+    /// "helpfully" implemented that, the failure would become a runtime one with
+    /// requests carrying an empty credential.
+    fn expand(item: &str) -> String {
+        let attr: GrpcContractAttr = syn::parse_str(
+            r#"package = "demo.v1", service = "DemoApi", stubs_module = "crate::stubs""#,
+        )
+        .expect("attr parses");
+        let item: syn::ItemTrait = syn::parse_str(item).expect("trait parses");
+        let model = parse(attr, item).expect("model parses");
+        generate(&model).to_string()
+    }
+
+    const TENANT: &str = r#"
+        pub trait DemoApiGrpc: DemoApi {
+            #[rpc(name = "Ping")]
+            async fn ping(
+                &self,
+                ctx: SecurityContext,
+                body: String,
+            ) -> Result<u32, CanonicalError>;
+        }
+    "#;
+
+    const PLATFORM: &str = r#"
+        pub trait DemoApiGrpc: DemoApi {
+            #[rpc(name = "Ping")]
+            async fn ping(
+                &self,
+                ctx: PlatformSecurityContext,
+                body: String,
+            ) -> Result<u32, CanonicalError>;
+        }
+    "#;
+
+    #[test]
+    fn tenant_client_attaches_the_bearer_from_its_context() {
+        assert!(
+            expand(TENANT).contains("attach_bearer"),
+            "the tenant context carries the credential, so the client must attach it"
+        );
+    }
+
+    /// The platform plane's credential is process-level and is attached at the
+    /// channel by `InternalAuthInterceptor`. `PlatformSecurityContext` holds a
+    /// validated identity and no token, so there is nothing here to attach.
+    #[test]
+    fn platform_client_attaches_no_bearer() {
+        let expanded = expand(PLATFORM);
+        assert!(
+            !expanded.contains("attach_bearer"),
+            "a platform-plane context has no bearer to attach:\n{expanded}"
+        );
+    }
+
+    /// Both planes must classify the context out of the payload, so the *body*
+    /// parameter is the one after it. Misclassify the platform form and
+    /// `body_param_ident` picks `ctx`, silently making the context the wire body.
+    #[test]
+    fn both_planes_identify_the_second_parameter_as_the_wire_body() {
+        for src in [TENANT, PLATFORM] {
+            let expanded = expand(src);
+            assert!(
+                expanded.contains("From :: from (body)"),
+                "the wire body must be `body`, not the context:\n{expanded}"
+            );
+        }
+    }
+
+    /// The explicit attribute must not reach the compiler: a proc-macro attribute
+    /// cannot declare helper attributes, so the macro removing it is the only thing
+    /// that makes `#[secctx]` usable on a projection trait — and the attribute is
+    /// how a platform-plane contract has to be written, since the `ctx:`-name
+    /// heuristic does not recognise `PlatformSecurityContext`.
+    #[test]
+    fn the_secctx_attribute_is_stripped_from_the_emitted_trait() {
+        let expanded = expand(
+            r#"
+            pub trait DemoApiGrpc: DemoApi {
+                #[rpc(name = "Ping")]
+                async fn ping(
+                    &self,
+                    #[secctx] auth: PlatformSecurityContext,
+                    body: String,
+                ) -> Result<u32, CanonicalError>;
+            }
+        "#,
+        );
+        assert!(
+            !expanded.contains("secctx"),
+            "`#[secctx]` leaked into the emitted trait:\n{expanded}"
+        );
+    }
+
+    /// An explicitly-marked context is classified by the attribute even when its
+    /// type name gives no hint — which is the whole point of the attribute.
+    #[test]
+    fn an_attribute_marked_context_is_kept_off_the_wire() {
+        let expanded = expand(
+            r#"
+            pub trait DemoApiGrpc: DemoApi {
+                #[rpc(name = "Ping")]
+                async fn ping(
+                    &self,
+                    #[secctx] auth: PlatformSecurityContext,
+                    body: String,
+                ) -> Result<u32, CanonicalError>;
+                }
+            "#,
+        );
+        assert!(
+            expanded.contains("From :: from (body)"),
+            "the wire body must be `body`, not the marked context:\n{expanded}"
+        );
+    }
+
+    /// The generated client is generic over its transport with a `Channel`
+    /// default, which is what lets a platform-plane caller pass an
+    /// `InterceptedService` while every existing caller keeps writing `FooClient`.
+    #[test]
+    fn the_client_is_generic_over_its_transport_and_defaults_to_channel() {
+        let expanded = expand(TENANT);
+        assert!(
+            expanded.contains("struct DemoApiGrpcClient < T = :: tonic :: transport :: Channel >"),
+            "expected a defaulted transport parameter:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("with_interceptor"),
+            "expected a platform-plane constructor:\n{expanded}"
+        );
+    }
 }

@@ -45,6 +45,14 @@ pub fn default_lock_reaper_interval() -> u64 {
     5_000
 }
 
+/// Default fence-retention window: one hour, matching the cache-backed
+/// defaults' `FENCE_RETENTION_DEFAULT` (DESIGN-DEPLOYABLE-GEAR §5.8.1). Orders
+/// of magnitude above any plausible lease TTL, and one lapsed row per lock name
+/// is cheap.
+pub fn default_fence_retention() -> u64 {
+    3_600_000
+}
+
 /// Default lock-name-cardinality WARN threshold. DESIGN.md §7 / §8 / §11.
 pub fn default_lock_name_cardinality_warn_threshold() -> u32 {
     1_000
@@ -87,9 +95,8 @@ pub struct PostgresClusterConfig {
     /// writes, `pg_notify`, migrations, and the reapers' queries. It does not
     /// bound how many locks this instance can hold: a held lock occupies no
     /// connection between operations, and its acquire/renew/release statements
-    /// ride this pool like any other write, briefly (DESIGN.md §3.3). The
-    /// liveness beacon and the LISTEN connections are each additional to this
-    /// number.
+    /// ride this pool like any other write, briefly (DESIGN.md §3.3). The LISTEN
+    /// connections are additional to this number.
     #[serde(default = "default_pool_size")]
     pub pool_max_size: u32,
 
@@ -110,8 +117,7 @@ pub struct PostgresClusterConfig {
     /// The **upper** bound on how long the lock reaper sleeps, and the cadence of
     /// its `cluster_postgres_lock_active_names` gauge — an imminent `expires_at`
     /// shortens an individual sleep so an expired lock is reclaimed near its
-    /// actual deadline (`lock::reaper`'s "Wake schedule", DESIGN.md §5.2). Also
-    /// the cadence at which the reaper's orphan audit runs (§5.2).
+    /// actual deadline (`lock::reaper`'s "Wake schedule", DESIGN.md §5.2).
     #[serde(default = "default_lock_reaper_interval")]
     pub lock_reaper_interval_ms: u64,
 
@@ -127,6 +133,35 @@ pub struct PostgresClusterConfig {
     /// Default: 1000 (DESIGN.md §5.1/§8/§11).
     #[serde(default = "default_lock_name_cardinality_warn_threshold")]
     pub lock_name_cardinality_warn_threshold: u32,
+
+    /// How long a `cluster_lock` row outlives the lease it fenced, in
+    /// milliseconds. Default: 3600000 (one hour).
+    ///
+    /// The row's `fence` is what stops a stale holder's `renew`/`release` from
+    /// matching a lease someone else now owns, and it is per-`name`: delete the
+    /// row and the next acquisition starts again at 1. So the TTL reaper leaves a
+    /// lapsed row alone until `expires_at + fence_retention_ms` has passed, and
+    /// only the acquire path (which steals a lapsed row in place, at `fence + 1`)
+    /// touches it in between (DESIGN-DEPLOYABLE-GEAR §5.8.1).
+    ///
+    /// Set it above the longest lease TTL this deployment takes. Below that, a
+    /// holder wedged for longer than the window can return with a token that
+    /// matches again.
+    ///
+    /// **This is the native lock's own window, and it is deliberately not the
+    /// cluster gear's `fence_retention` key.** That key governs the *cache-backed
+    /// default* backends, whose fence lives in a cache value; this one governs a
+    /// fence that lives in a column here. Injecting the gear's key into every
+    /// provider's options would make it a silent addition to the plugin config
+    /// contract, which each provider's `deny_unknown_fields` would then reject.
+    /// The two cannot disagree in a way that matters: a lease name lives in
+    /// exactly one backend.
+    ///
+    /// Zero is rejected at startup. What it costs when raised is one lapsed row
+    /// per lock *name* for the length of the window — bounded by name
+    /// cardinality, not by acquisition rate.
+    #[serde(default = "default_fence_retention")]
+    pub fence_retention_ms: u64,
 
     /// Operator hint for replication topology. If omitted, detected at
     /// startup (DESIGN.md §3.6).
@@ -153,6 +188,7 @@ impl fmt::Debug for PostgresClusterConfig {
                 "lock_name_cardinality_warn_threshold",
                 &self.lock_name_cardinality_warn_threshold,
             )
+            .field("fence_retention_ms", &self.fence_retention_ms)
             .field("replication_mode", &self.replication_mode)
             .finish()
     }
@@ -197,7 +233,14 @@ impl PostgresClusterConfig {
         reject_zero_pool_size(self.pool_max_size)?;
         reject_zero_interval(self.cache_reaper_interval_ms, "cache_reaper_interval_ms")?;
         reject_zero_interval(self.lock_reaper_interval_ms, "lock_reaper_interval_ms")?;
+        cluster_sdk::lease::validate_fence_retention(self.fence_retention())?;
         Ok(())
+    }
+
+    /// The fence-retention window as a [`Duration`].
+    #[must_use]
+    pub fn fence_retention(&self) -> Duration {
+        Duration::from_millis(self.fence_retention_ms)
     }
 
     /// The pool acquire timeout as a [`Duration`].
@@ -255,6 +298,10 @@ pub struct PostgresLockConfig {
     #[serde(default = "default_lock_name_cardinality_warn_threshold")]
     pub lock_name_cardinality_warn_threshold: u32,
 
+    /// See [`PostgresClusterConfig::fence_retention_ms`].
+    #[serde(default = "default_fence_retention")]
+    pub fence_retention_ms: u64,
+
     /// See [`PostgresClusterConfig::replication_mode`].
     #[serde(default)]
     pub replication_mode: Option<ReplicationMode>,
@@ -278,6 +325,7 @@ impl fmt::Debug for PostgresLockConfig {
                 "lock_name_cardinality_warn_threshold",
                 &self.lock_name_cardinality_warn_threshold,
             )
+            .field("fence_retention_ms", &self.fence_retention_ms)
             .field("replication_mode", &self.replication_mode)
             .finish()
     }
@@ -295,6 +343,7 @@ impl PostgresLockConfig {
         crate::pg_setup::validate_schema(&self.schema)?;
         reject_zero_pool_size(self.pool_max_size)?;
         reject_zero_interval(self.lock_reaper_interval_ms, "lock_reaper_interval_ms")?;
+        cluster_sdk::lease::validate_fence_retention(self.fence_retention())?;
         Ok(())
     }
 
@@ -308,6 +357,12 @@ impl PostgresLockConfig {
     #[must_use]
     pub fn lock_reaper_interval(&self) -> Duration {
         Duration::from_millis(self.lock_reaper_interval_ms)
+    }
+
+    /// The fence-retention window as a [`Duration`].
+    #[must_use]
+    pub fn fence_retention(&self) -> Duration {
+        Duration::from_millis(self.fence_retention_ms)
     }
 }
 

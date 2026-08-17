@@ -27,7 +27,10 @@ pub(crate) use scoped::ScopedLeaderElectionBackend;
 
 pub use backend::LeaderElectionBackend;
 pub use facade::LeaderElectionV1;
-pub use resolver::{LeaderElectionResolverBuilder, validate_leader_election_capabilities};
+pub use resolver::{
+    LeaderElectionResolverBuilder, validate_leader_election_capabilities,
+    validate_leader_election_capabilities_from,
+};
 pub use types::{ElectionConfig, LeaderElectionCapability, LeaderElectionFeatures, LeaderStatus};
 pub use watch::{
     LeaderWatch, LeaderWatchEvent, LeaderWatchSender, ResignReceiver, ResignResponder,

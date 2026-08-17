@@ -9,14 +9,15 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::defaults::lease::{Acquisition, CacheLeaseStore};
 use crate::defaults::{ELECTION_KEY_PREFIX, ShutdownRevoke, guard, identity};
-use cluster_sdk::cache::types::{PutRequest, Ttl};
 use cluster_sdk::cache::{CacheWatch, CacheWatchEvent, ClusterCacheBackend};
 use cluster_sdk::error::ClusterError;
 use cluster_sdk::leader::{
     ElectionConfig, LeaderElectionBackend, LeaderElectionFeatures, LeaderStatus, LeaderWatch,
     LeaderWatchEvent, LeaderWatchSender, ResignReceiver, ResignResponder,
 };
+use cluster_sdk::lease::{LeaseRecord, LeaseToken};
 use cluster_sdk::observability::{self, ClusterMetrics, NoopMetrics, logs, spans, transition};
 
 /// The in-flight event buffer for each [`LeaderWatch`].
@@ -25,16 +26,28 @@ const EVENT_BUFFER: usize = 16;
 /// A leader-election backend that derives single-leader behavior from cache
 /// compare-and-swap operations (DESIGN §3.11, ADR-001).
 ///
-/// Candidacy is a `put_if_absent(election_key, node_id, ttl)`; the claim is
-/// renewed on [`ElectionConfig::renewal_interval`] via a version
-/// `compare_and_swap`, so a renewal that races a foreign takeover is detected
-/// as a [`ClusterError::CasConflict`] and surfaces as
-/// [`LeaderStatus::Lost`] followed by auto-reenrollment. A `watch` on the
-/// election key reconciles status reactively: it issues no renewal
-/// `compare_and_swap` (only the renewal timer does), though it may
-/// opportunistically re-`claim` a vacant key. A renewal's own change event
-/// therefore reconciles to a no-op status check, so it cannot re-trigger a
-/// renewal.
+/// # A leader claim is a store-owned lease (§5.8.1)
+///
+/// Candidacy takes the same [`LeaseRecord`] a lock does, under `election/{name}`:
+/// insert it if the name is free, steal it at `fence + 1` if the incumbent's
+/// `deadline` has passed. The claim is then held by renewing against the
+/// [`LeaseToken`] on [`ElectionConfig::renewal_interval`], and a renewal that
+/// matches no record surfaces as [`LeaderStatus::Lost`] followed by
+/// auto-reenrollment. Because the claim is a record rather than a process's
+/// promise, **a leader survives the replica it was elected through** — which is
+/// the point of the model (invariant I7).
+///
+/// Renewal stays client-driven, so it keeps doubling as the consumer-liveness
+/// proxy: a wedged holder stops renewing and loses the claim (invariant I8, §7.3).
+///
+/// A `watch` on the election key reconciles status reactively: it issues no
+/// renewal write (only the renewal timer does), though it may opportunistically
+/// re-`claim` a vacant key. A renewal's own change event therefore reconciles to a
+/// no-op status check, so it cannot re-trigger a renewal.
+///
+/// A lease *lapsing*, unlike a physical TTL expiry, writes nothing and so raises
+/// no watch event. A follower therefore times its next tick to the incumbent's
+/// `deadline` rather than relying on the watch to announce the vacancy.
 ///
 /// # Consistency safety (ADR-009)
 ///
@@ -45,7 +58,7 @@ const EVENT_BUFFER: usize = 16;
 /// [`features`](LeaderElectionBackend::features) derives `linearizable` from the
 /// underlying cache's consistency.
 pub struct CasBasedLeaderElectionBackend {
-    cache: Arc<dyn ClusterCacheBackend>,
+    leases: Arc<CacheLeaseStore>,
     /// Cancelled by [`ShutdownRevoke::revoke`] to signal every in-flight
     /// election task to surface a terminal shutdown (DESIGN §3.13).
     shutdown: CancellationToken,
@@ -87,12 +100,28 @@ impl CasBasedLeaderElectionBackend {
 
     fn with_cache(cache: Arc<dyn ClusterCacheBackend>) -> Self {
         Self {
-            cache,
+            leases: Arc::new(CacheLeaseStore::new(cache)),
             shutdown: CancellationToken::new(),
             tasks: Arc::new(Mutex::new(Vec::new())),
             provider: "unknown",
             metrics: Arc::new(NoopMetrics),
         }
+    }
+
+    /// Sets how long a lease record outlives the claim it fenced (§5.8.1).
+    ///
+    /// See
+    /// [`CasBasedDistributedLockBackend::with_fence_retention`](crate::defaults::CasBasedDistributedLockBackend::with_fence_retention)
+    /// for why this is a builder method rather than a third constructor. An
+    /// election claim and a lock are the same lease, so the same window governs
+    /// both and the wiring sets them from one key.
+    #[must_use]
+    pub fn with_fence_retention(mut self, retention: Duration) -> Self {
+        self.leases = Arc::new(CacheLeaseStore::with_retention(
+            Arc::clone(self.leases.cache()),
+            retention,
+        ));
+        self
     }
 
     /// Sets the `provider` label and metrics sink the backend emits through.
@@ -125,7 +154,13 @@ impl CasBasedLeaderElectionBackend {
         format!("{ELECTION_KEY_PREFIX}{name}")
     }
 
-    async fn join(&self, name: &str, config: ElectionConfig) -> Result<LeaderWatch, ClusterError> {
+    /// Enrols in `name` and returns the consumer's [`LeaderWatch`], spawning the
+    /// task that holds the claim.
+    ///
+    /// Named `enrol` rather than `join` so it does not shadow
+    /// [`LeaderElectionBackend::join`], which is the lease-token half of the same
+    /// operation and returns the token instead of a watch.
+    async fn enrol(&self, name: &str, config: ElectionConfig) -> Result<LeaderWatch, ClusterError> {
         let span =
             tracing::info_span!(spans::LEADER_ELECT, provider = %self.provider, election = %name);
         let out = async {
@@ -136,21 +171,17 @@ impl CasBasedLeaderElectionBackend {
                 return Err(ClusterError::Shutdown);
             }
             let key = Self::election_key(name);
-            let node_id = identity::fresh_id();
+            let owner = identity::fresh_id();
             // Subscribe before the first claim so a transition between the claim and
             // the watch establishment cannot be missed.
-            let cache_watch = self.cache.watch(&key).await?;
-            let initial = match self
-                .cache
-                .put_if_absent(PutRequest {
-                    key: &key,
-                    value: node_id.as_bytes(),
-                    ttl: Ttl::Of(config.ttl()),
-                })
+            let cache_watch = self.leases.cache().watch(&key).await?;
+            let (token, initial, incumbent_lapse) = match self
+                .leases
+                .try_acquire(&key, name, &owner, config.ttl())
                 .await?
             {
-                Some(_) => LeaderStatus::Leader,
-                None => LeaderStatus::Follower,
+                Acquisition::Acquired(token) => (Some(token), LeaderStatus::Leader, None),
+                Acquisition::Contended { lapse_in } => (None, LeaderStatus::Follower, lapse_in),
             };
             let (sender, resign_rx, mut watch) =
                 LeaderWatch::channel(EVENT_BUFFER, LeaderStatus::Follower);
@@ -158,10 +189,12 @@ impl CasBasedLeaderElectionBackend {
             // signals (`cluster_watch_resets_total` / `cluster.watch.reset`).
             watch.set_observability(self.provider, Arc::clone(&self.metrics));
             let task = ElectionTask {
-                cache: Arc::clone(&self.cache),
+                leases: Arc::clone(&self.leases),
                 name: name.to_owned(),
                 key,
-                node_id,
+                owner,
+                token,
+                incumbent_lapse,
                 config,
                 sender,
                 am_leader: matches!(initial, LeaderStatus::Leader),
@@ -198,8 +231,9 @@ impl ShutdownRevoke for CasBasedLeaderElectionBackend {
     /// (`cpt-cf-clst-fr-shutdown-revoke`): cancels the shared token — so every
     /// in-flight election task latches `Status(Lost)` then `Closed(Shutdown)` —
     /// and awaits those tasks, so a current leader has observed loss before this
-    /// returns. No remote release is performed; claims lapse via TTL
-    /// (`cpt-cf-clst-fr-shutdown-ttl-cleanup`).
+    /// returns. No resign is issued: the claim is a record that outlives this
+    /// process and lapses at its own deadline
+    /// (`cpt-cf-clst-fr-shutdown-ttl-cleanup`, §5.8.2).
     async fn revoke(&self) {
         self.shutdown.cancel();
         let handles = {
@@ -216,12 +250,12 @@ impl ShutdownRevoke for CasBasedLeaderElectionBackend {
 impl LeaderElectionBackend for CasBasedLeaderElectionBackend {
     fn features(&self) -> LeaderElectionFeatures {
         LeaderElectionFeatures::new(
-            self.cache.consistency() == cluster_sdk::cache::CacheConsistency::Linearizable,
+            self.leases.cache().consistency() == cluster_sdk::cache::CacheConsistency::Linearizable,
         )
     }
 
     async fn elect(&self, name: &str) -> Result<LeaderWatch, ClusterError> {
-        self.join(name, ElectionConfig::default()).await
+        self.enrol(name, ElectionConfig::default()).await
     }
 
     async fn elect_with_config(
@@ -229,19 +263,102 @@ impl LeaderElectionBackend for CasBasedLeaderElectionBackend {
         name: &str,
         config: ElectionConfig,
     ) -> Result<LeaderWatch, ClusterError> {
-        self.join(name, config).await
+        self.enrol(name, config).await
+    }
+
+    async fn join(
+        &self,
+        name: &str,
+        owner: &str,
+        config: ElectionConfig,
+    ) -> Result<Option<LeaseToken>, ClusterError> {
+        let span =
+            tracing::info_span!(spans::LEADER_ELECT, provider = %self.provider, election = %name);
+        let out = async {
+            let key = Self::election_key(name);
+            match self
+                .leases
+                .try_acquire(&key, name, owner, config.ttl())
+                .await?
+            {
+                Acquisition::Acquired(token) => Ok(Some(token)),
+                // Losing an election is an ordinary outcome, not an error.
+                Acquisition::Contended { .. } => Ok(None),
+            }
+        }
+        .instrument(span)
+        .await;
+        if let Err(err) = &out {
+            observability::emit_provider_error(
+                &*self.metrics,
+                self.provider,
+                "elect",
+                observability::ResourceId::Election(name),
+                err,
+            );
+        }
+        out
+    }
+
+    async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
+        let span = tracing::info_span!(
+            spans::LEADER_RENEW,
+            provider = %self.provider,
+            election = %token.name
+        );
+        let key = Self::election_key(&token.name);
+        let out = self.leases.renew(&key, token, ttl).instrument(span).await;
+        if let Err(err) = &out {
+            observability::emit_provider_error(
+                &*self.metrics,
+                self.provider,
+                "renew",
+                observability::ResourceId::Election(&token.name),
+                err,
+            );
+        }
+        out
+    }
+
+    async fn resign(&self, token: &LeaseToken) -> Result<(), ClusterError> {
+        let span = tracing::info_span!(
+            spans::LEADER_RESIGN,
+            provider = %self.provider,
+            election = %token.name
+        );
+        let key = Self::election_key(&token.name);
+        let out = self.leases.release(&key, token).instrument(span).await;
+        if let Err(err) = &out {
+            observability::emit_provider_error(
+                &*self.metrics,
+                self.provider,
+                "resign",
+                observability::ResourceId::Election(&token.name),
+                err,
+            );
+        }
+        out
     }
 }
 
 /// The background task that owns the renewal loop and self-terminates on
 /// channel closure (the consumer dropping its [`LeaderWatch`]).
 struct ElectionTask {
-    cache: Arc<dyn ClusterCacheBackend>,
+    leases: Arc<CacheLeaseStore>,
     /// The election name (the span/log `election` attribute), distinct from the
     /// prefixed cache [`key`](Self::key).
     name: String,
     key: String,
-    node_id: String,
+    /// This candidate's identity, matched against the record's `owner`.
+    owner: String,
+    /// The authority over this candidate's claim — `Some` only while it believes
+    /// it holds one. Replaced on every (re-)acquisition, since a steal carries a
+    /// new `fence`.
+    token: Option<LeaseToken>,
+    /// How long until the *incumbent's* claim lapses, when a lost claim attempt
+    /// observed it. Times a follower's next tick to the moment the claim becomes
+    /// takeable, which nothing else would announce (see the type docs).
+    incumbent_lapse: Option<Duration>,
     config: ElectionConfig,
     sender: LeaderWatchSender,
     am_leader: bool,
@@ -280,8 +397,11 @@ impl ElectionTask {
             tokio::pin!(tick);
             tokio::select! {
                 // Graceful cluster shutdown: revoke leadership confidence and end
-                // the watch terminally, without remote release (TTL reaps the
-                // claim). A current leader observes `Status(Lost)` first.
+                // the watch terminally, without resigning. Leaving the claim in the
+                // store is the point of the lease model - the record survives this
+                // process and lapses only at its own deadline (invariant I7), so a
+                // restart is not a leadership event. A current leader observes
+                // `Status(Lost)` first.
                 () = shutdown.cancelled() => {
                     self.sender.revoke_for_shutdown(self.am_leader);
                     return;
@@ -317,8 +437,8 @@ impl ElectionTask {
             }
         }
         // Teardown (consumer gone / cache watch closed / fatal): best-effort
-        // release so a successor is elected promptly; the claim otherwise lapses
-        // via TTL.
+        // resign so a successor is elected promptly; the claim otherwise lapses at
+        // its stored deadline.
         let _release = self.release_if_holder().await;
     }
 
@@ -368,47 +488,70 @@ impl ElectionTask {
     /// atomic regardless, so this only relieves contention.
     fn next_renewal_delay(&self, interval: Duration) -> Duration {
         if self.am_leader {
-            interval
-        } else {
-            interval + reclaim_jitter(interval / 2)
+            return interval;
+        }
+        // A follower also wakes when the incumbent's claim lapses. That is not an
+        // optimisation: a lease lapsing writes nothing to the store, so no watch
+        // event announces it, and without this the vacancy would go unnoticed until
+        // the next ordinary tick. Jitter stays proportional to whichever bound won,
+        // so a short remaining lease is not swamped by a full interval of jitter.
+        let base = self
+            .incumbent_lapse
+            .map_or(interval, |lapse| interval.min(lapse));
+        base + reclaim_jitter(base / 2)
+    }
+
+    /// Attempts to take the election's lease, recording the token when it lands and
+    /// the incumbent's remaining lifetime when it does not.
+    async fn take_lease(&mut self) -> Result<bool, ClusterError> {
+        match self
+            .leases
+            .try_acquire(&self.key, &self.name, &self.owner, self.config.ttl())
+            .await?
+        {
+            Acquisition::Acquired(token) => {
+                self.token = Some(token);
+                self.incumbent_lapse = None;
+                Ok(true)
+            }
+            Acquisition::Contended { lapse_in } => {
+                self.incumbent_lapse = lapse_in;
+                Ok(false)
+            }
         }
     }
 
-    /// Renews the lease on the timer tick. Only the timer renews — watch events
-    /// never write — so a renewal's own change event cannot re-trigger one.
-    /// Spanned as `cluster.leader.renew`.
+    /// `true` when `record` is this candidate's own live claim.
+    fn holds(&self, record: &LeaseRecord) -> bool {
+        self.token
+            .as_ref()
+            .is_some_and(|token| record.matches(token))
+            && self.leases.is_live(record)
+    }
+
+    /// Renews the claim on the timer tick — the operation that *holds* leadership
+    /// (§7.3). Only the timer renews — watch events never write — so a renewal's
+    /// own change event cannot re-trigger one. Spanned as `cluster.leader.renew`.
     async fn renew_tick(&mut self) -> bool {
         let span = tracing::info_span!(spans::LEADER_RENEW, provider = %self.provider, election = %self.name);
         async {
-            if !self.am_leader {
-                // Opportunistically (re)claim a vacant key in case a free event was
-                // missed (e.g. after `Lagged`).
+            let Some(token) = self.token.clone().filter(|_| self.am_leader) else {
+                // Not the leader: opportunistically (re)claim in case a vacancy
+                // event was missed (e.g. after `Lagged`).
                 return self.claim().await;
-            }
-            let entry = match self.cache.get(&self.key).await {
-                Ok(Some(entry)) => entry,
-                Ok(None) => return self.lose_then_reclaim().await,
-                Err(err) if err.is_retryable() => return self.on_transient().await,
-                Err(err) => return self.close(err).await,
             };
-            if entry.value.as_slice() != self.node_id.as_bytes() {
-                return self.transition_lost_then(LeaderStatus::Follower).await;
-            }
             match self
-                .cache
-                .compare_and_swap(
-                    &self.key,
-                    entry.version,
-                    self.node_id.as_bytes(),
-                    Ttl::Of(self.config.ttl()),
-                )
+                .leases
+                .renew(&self.key, &token, self.config.ttl())
                 .await
             {
-                Ok(_) => {
+                Ok(()) => {
                     self.missed = 0;
                     true
                 }
-                Err(ClusterError::CasConflict { .. }) => self.lose_then_reclaim().await,
+                // The predicate matched nothing: lapsed, or stolen by a successor
+                // that fenced this claim out. Both mean leadership is gone.
+                Err(ClusterError::LockExpired { .. }) => self.lose_then_reclaim().await,
                 Err(err) if err.is_retryable() => self.on_transient().await,
                 Err(err) => self.close(err).await,
             }
@@ -431,58 +574,45 @@ impl ElectionTask {
         true
     }
 
-    /// Reconciles cached state into a status transition (the reactive path for
-    /// watch events). Issues no renewal `compare_and_swap`, but may `claim` a
-    /// vacant key — a `put_if_absent` write — when it reconciles an observed
-    /// vacancy.
+    /// Reconciles stored state into a status transition (the reactive path for
+    /// watch events). Issues no renewal, but may take a vacant or lapsed claim.
     async fn reconcile(&mut self) -> bool {
-        let entry = match self.cache.get(&self.key).await {
-            Ok(entry) => entry,
+        let record = match self.leases.read(&self.key).await {
+            Ok(record) => record,
             // Transient read failures are retried by the renewal timer.
             Err(err) if err.is_retryable() => return true,
             Err(err) => return self.close(err).await,
         };
-        match entry {
-            Some(entry) if entry.value.as_slice() == self.node_id.as_bytes() => {
-                self.ensure_leader().await
-            }
-            Some(_) => {
+        match record {
+            Some(record) if self.holds(&record) => self.ensure_leader().await,
+            // Someone else's live claim.
+            Some(record) if self.leases.is_live(&record) => {
+                self.incumbent_lapse = self.leases.lapse_in(&record);
                 if self.am_leader {
                     self.transition_lost_then(LeaderStatus::Follower).await
                 } else {
                     true
                 }
             }
-            None => {
-                if self.am_leader {
-                    // Our own claim vanished (a TTL lapse observed via the watch)
-                    // while we still believed we were leader. Surface the loss
-                    // before reclaiming, mirroring the renewal timer's
-                    // `Ok(None) => lose_then_reclaim()` path — otherwise
-                    // `claim()`'s re-win would flow through `ensure_leader()`,
-                    // whose `am_leader` short-circuit would silently swallow the
-                    // lost-then-reacquired transition.
-                    self.lose_then_reclaim().await
-                } else {
-                    self.claim().await
-                }
+            // Vacant, lapsed, or unreadable — in every case there is no live claim
+            // this candidate is bound by, so try to take it.
+            _ if self.am_leader => {
+                // Our own claim is gone (lapsed, or stolen) while we still believed
+                // we held it. Surface the loss before reclaiming, mirroring the
+                // renewal timer: letting `claim()`'s re-win flow through
+                // `ensure_leader()` would hit its `am_leader` short-circuit and
+                // silently swallow the lost-then-reacquired transition.
+                self.lose_then_reclaim().await
             }
+            _ => self.claim().await,
         }
     }
 
-    /// Attempts to claim a vacant key, resolving to leader or follower.
+    /// Attempts to take a vacant or lapsed claim, resolving to leader or follower.
     async fn claim(&mut self) -> bool {
-        match self
-            .cache
-            .put_if_absent(PutRequest {
-                key: &self.key,
-                value: self.node_id.as_bytes(),
-                ttl: Ttl::Of(self.config.ttl()),
-            })
-            .await
-        {
-            Ok(Some(_)) => self.ensure_leader().await,
-            Ok(None) => {
+        match self.take_lease().await {
+            Ok(true) => self.ensure_leader().await,
+            Ok(false) => {
                 if self.am_leader {
                     self.transition_lost_then(LeaderStatus::Follower).await
                 } else {
@@ -520,25 +650,20 @@ impl ElectionTask {
     async fn lose_then_reclaim(&mut self) -> bool {
         self.am_leader = false;
         self.missed = 0;
+        // The claim this token was authority over is gone. Dropping it here keeps
+        // `holds()` from matching a record a successor may yet write.
+        self.token = None;
         self.record_transition(transition::LOST);
         if self.sender.send_status(LeaderStatus::Lost).await.is_err() {
             return false;
         }
-        match self
-            .cache
-            .put_if_absent(PutRequest {
-                key: &self.key,
-                value: self.node_id.as_bytes(),
-                ttl: Ttl::Of(self.config.ttl()),
-            })
-            .await
-        {
-            Ok(Some(_)) => {
+        match self.take_lease().await {
+            Ok(true) => {
                 self.am_leader = true;
                 self.record_transition(transition::ACQUIRED);
                 self.sender.send_status(LeaderStatus::Leader).await.is_ok()
             }
-            Ok(None) => self
+            Ok(false) => self
                 .sender
                 .send_status(LeaderStatus::Follower)
                 .await
@@ -610,22 +735,18 @@ impl ElectionTask {
         false
     }
 
-    /// Releases this participant's claim atomically: deletes the election key
-    /// only if it still carries *our* node id, so a foreign holder is never
-    /// released.
+    /// Gives up this candidate's claim, if it holds one.
     ///
-    /// The delete is **value-guarded** (`compare_and_delete` on `node_id`): if
-    /// this node's TTL lapses and a successor claims the key between teardown and
-    /// the delete, the key now holds the successor's id, so the delete is a
-    /// no-op — no spurious leadership flap. This mirrors the k8s elector's
-    /// `holderIdentity`-guarded release, and being a single atomic op it also
-    /// avoids the read-to-delete race a `get`-then-`delete` would carry. A
-    /// version guard would not suffice, since a re-created key resets its version.
+    /// A conditional delete predicated on the token, so a successor that took the
+    /// claim after this one lapsed is never resigned on its behalf — and, unlike
+    /// the value-guarded delete this replaces, the predicate is over `owner` *and*
+    /// `fence`, so it stays correct even when the successor is this same owner
+    /// re-acquiring (§5.8.1).
     async fn release_if_holder(&self) -> Result<(), ClusterError> {
-        self.cache
-            .compare_and_delete(&self.key, self.node_id.as_bytes())
-            .await
-            .map(|_| ())
+        match &self.token {
+            Some(token) => self.leases.release(&self.key, token).await,
+            None => Ok(()),
+        }
     }
 }
 

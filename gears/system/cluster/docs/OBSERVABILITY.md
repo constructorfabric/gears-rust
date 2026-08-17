@@ -40,7 +40,13 @@ and **log-event fields** (log volume is filter-controlled).
 
 Metric labels are restricted to the bounded, enum-like keys enumerated by
 `cluster_sdk::observability::METRIC_LABEL_ALLOWLIST`: `provider`, `op`, `result`,
-`transition`, `kind`, `primitive`.
+`transition`, `kind`, `primitive`, `profile`.
+
+`profile` joined that list with item `S2`. It was classified as high-cardinality
+here and in `fields::attr`, which contradicted DESIGN-DEPLOYABLE-GEAR §5.4
+("`profile` and `provider` are bounded and allowed as labels") and its invariant
+I15. The design is right: a profile name comes from the operator's configured
+profile set, fixed at `start` and changed only by an explicit reload (§5.6).
 
 ## 3. Field keys
 
@@ -54,6 +60,7 @@ Metric labels are restricted to the bounded, enum-like keys enumerated by
 | `transition` | Leadership transition kind | `acquired`, `lost`, `resigned` |
 | `kind` | Provider-error retryability class | `connection_lost`, `timeout`, `auth_failure` |
 | `primitive` | Primitive name | `cache`, `lock`, `leader` |
+| `profile` | Cluster profile | `default`, `orders` |
 
 ### Attribute keys (high-cardinality — spans and logs only, never metric labels)
 
@@ -63,7 +70,6 @@ Metric labels are restricted to the bounded, enum-like keys enumerated by
 | `name` | Coordination name |
 | `lock` | Lock name |
 | `election` | Election name |
-| `profile` | Cluster profile |
 
 ## 4. Spans
 
@@ -96,6 +102,8 @@ Metric labels are restricted to the bounded, enum-like keys enumerated by
 | `cluster_leader_transitions_total` | counter | — | `provider`, `transition` |
 | `cluster_watch_resets_total` | counter | — | `provider`, `primitive` |
 | `cluster_provider_errors_total` | counter | — | `provider`, `kind` |
+| `cluster_subscriptions_reaped_total` | counter | — | `profile`, `primitive` |
+| `cluster_subscriptions_active` | gauge | — | `profile`, `primitive` |
 
 The `op` label is a bounded set of facade operations: cache —
 `get`/`put`/`delete`/`contains`/`put_if_absent`/`compare_and_swap`/`watch`/`watch_prefix`
@@ -131,6 +139,19 @@ reconnect: the backend stamps a `(provider, metrics)` context onto the watch it
 hands out, which the combinator captures and reports against the watch's
 `primitive` label (`cache` / `leader`). The full contract is now
 emitted.
+
+`cluster_subscriptions_reaped_total` and `cluster_subscriptions_active` are the
+two exceptions to that port. They are emitted by the **cluster gear** — not by any
+backend — through a meter it owns directly
+(`cluster/src/api/grpc/sweep.rs`), on the same precedent as the Postgres plugin's
+reaper gauges: `ClusterMetrics` is the sink a *provider* reports through, it
+exposes neither a gauge nor a free-form counter, and a server-side session index
+is not a provider signal. Both come from the abandoned-subscription sweep
+(DESIGN-DEPLOYABLE-GEAR §5.4.1) on its 5 s cadence, and both carry exactly
+`(profile, primitive)` — an election name reaches the reap log and never the
+metric. `primitive` is `leader` today, since election subscriptions are the only
+kind this table holds; the label is emitted anyway so a second watch table slots
+in without the series changing shape.
 
 ## 6. Log events
 

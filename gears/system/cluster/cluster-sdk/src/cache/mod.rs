@@ -17,7 +17,9 @@ pub mod watch;
 pub use backend::ClusterCacheBackend;
 pub use facade::ClusterCacheV1;
 pub use polyfill::PollingPrefixWatch;
-pub use resolver::{CacheResolverBuilder, validate_cache_capabilities};
+pub use resolver::{
+    CacheResolverBuilder, validate_cache_capabilities, validate_cache_capabilities_from,
+};
 pub(crate) use scoped::ScopedCacheBackend;
 pub use types::{
     CacheCapability, CacheConsistency, CacheEntry, CacheEvent, CacheFeatures, PutRequest, Ttl,

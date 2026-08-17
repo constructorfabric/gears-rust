@@ -2,13 +2,25 @@
 //! `ClientHub` registration and deregistration helpers, keyed per profile per
 //! primitive (DESIGN §3.6).
 //!
-//! These are the write-side counterpart to the per-primitive resolvers: a
-//! resolver looks a backend up under `profile_scope(profile)`, and these
-//! helpers register and remove it under the same scope. The follow-up wiring
-//! crate composes them — it iterates the operator-declared profile×primitive
-//! matrix and calls one `register_*_backend` per cell at startup and the
-//! matching `deregister_*_backend` at shutdown, after which a resolve for that
-//! profile fails with [`ClusterError::ProfileNotBound`].
+//! The cluster gear's wiring composes them: it iterates the operator-declared
+//! profile×primitive matrix and calls one `register_*_backend` per cell at
+//! startup and the matching `deregister_*_backend` at shutdown.
+//!
+//! # What these no longer do, since `K4`
+//!
+//! **Registering a backend here does not by itself make a profile resolvable.**
+//! A consumer's `resolve()` goes through the process's single
+//! `dyn ClusterClient` (DESIGN-DEPLOYABLE-GEAR §3.1, §4.9.3), because that is the
+//! only object a *remote* consumer has and routing both deployment profiles
+//! through it is what keeps them one code path. The gear's `LocalClusterClient`
+//! answers from its `ProfileRegistry`, and these scoped entries are the same
+//! instances that registry holds — asserted by pointer equality, not assumed.
+//!
+//! So these helpers remain the process-local binding record: what the hub can
+//! enumerate for diagnostics, what `ClusterHandle::stop` unbinds, and the
+//! identity check that the local client interposes nothing. A programmatic caller
+//! that wants a *resolvable* profile wants `ClusterWiring`, which registers the
+//! client too.
 //!
 //! The profile is a runtime `&str` (not a typed [`ClusterProfile`] marker)
 //! because wiring reads profile names from operator configuration. The name is
@@ -49,8 +61,7 @@ pub fn register_cache_backend(
     Ok(())
 }
 
-/// Removes the cache backend registered for `profile`. Later resolves for that
-/// profile then fail with [`ClusterError::ProfileNotBound`].
+/// Removes the cache backend registered for `profile`, leaving its scope unbound.
 ///
 /// Returns `Ok(true)` if a backend was present and removed, `Ok(false)` if no
 /// cache backend was bound for the profile.

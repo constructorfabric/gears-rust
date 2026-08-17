@@ -154,6 +154,41 @@ pub trait ClusterCacheBackend: Send + Sync {
             feature: "scan_prefix",
         })
     }
+
+    /// A cheap, non-mutating liveness check on the backend's own resources — its
+    /// connection pool, its socket, the store's reachability.
+    ///
+    /// Read by the gear's composite readiness healthcheck (DESIGN-DEPLOYABLE-GEAR
+    /// §4.4), which is what turns a failing probe into
+    /// [`ProfileHealth::Degraded`](crate::dto::ProfileHealth::Degraded) on the
+    /// profile's descriptor — pulling *that* profile's consumers out of rotation
+    /// without touching consumers of healthy profiles.
+    ///
+    /// The default returns `Ok(())`, so the extension is additive and dyn-safe: a
+    /// plugin that does not implement it still compiles. That default is
+    /// deliberately `Ok(())` rather than [`ClusterError::Unsupported`], unlike
+    /// [`scan_prefix`](Self::scan_prefix): `scan_prefix` is a capability a caller
+    /// branches on, whereas this is advisory liveness, and "cannot be probed"
+    /// must not read as "is failing". A backend with no remote resource to check
+    /// — an in-process map — is genuinely always serving.
+    ///
+    /// Implementations must be cheap, non-mutating (`SELECT 1`, never a write)
+    /// and prompt: the composite healthcheck bounds every probe by its own
+    /// budget and reports the profile `Degraded` on timeout, and the framework in
+    /// turn bounds the whole check by `oop_http.healthcheck_timeout_ms` (500 ms
+    /// by default).
+    ///
+    /// A **delegating** backend must forward this method. The default's `Ok(())`
+    /// would otherwise mask the wrapped backend's real state, which is not a
+    /// theoretical concern: every plugin wraps its cache in
+    /// [`InstrumentedCache`](crate::observability::InstrumentedCache), so an
+    /// unforwarded `probe` would report `Ok` for every deployed profile.
+    ///
+    /// # Errors
+    /// Returns [`ClusterError`] if the backend cannot currently serve.
+    async fn probe(&self) -> Result<(), ClusterError> {
+        Ok(())
+    }
 }
 
 assert_dyn_compatible!(ClusterCacheBackend);

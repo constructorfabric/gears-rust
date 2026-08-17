@@ -50,6 +50,7 @@
   - [5.2 The `ProfileRegistry`](#52-the-profileregistry)
   - [5.3 Backend instance sharing — the N-connections problem](#53-backend-instance-sharing--the-n-connections-problem)
   - [5.4 Per-client profile binding and session tracking](#54-per-client-profile-binding-and-session-tracking)
+    - [5.4.1 The watch-subscription sweep (ask `A6`, decision 18)](#541-the-watch-subscription-sweep-ask-a6-decision-18)
   - [5.5 Profile discovery and capability validation over the wire](#55-profile-discovery-and-capability-validation-over-the-wire)
   - [5.6 Dynamic profile reload](#56-dynamic-profile-reload)
   - [5.7 Capacity, isolation and failure modes](#57-capacity-isolation-and-failure-modes)
@@ -98,7 +99,7 @@
   - [12.2 The error codec — `cluster-sdk/src/convert.rs`](#122-the-error-codec--cluster-sdksrcconvertrs)
   - [12.3 Gear: the profile registry — `cluster/src/registry.rs`](#123-gear-the-profile-registry--clustersrcregistryrs)
   - [12.4 Gear: `LocalClusterClient` — `cluster/src/local_client.rs`](#124-gear-localclusterclient--clustersrclocal_clientrs)
-  - [12.5 Gear: the session index — `cluster/src/session.rs`](#125-gear-the-session-index--clustersrcsessionrs)
+  - [12.5 Gear: the session index — `cluster/src/api/grpc/subscriptions.rs`](#125-gear-the-session-index--clustersrcapigrpcsubscriptionsrs)
   - [12.6 Gear: the service impls — `cluster/src/api/grpc/`](#126-gear-the-service-impls--clustersrcapigrpc)
   - [12.7 Gear: the gear — `cluster/src/gear.rs`](#127-gear-the-gear--clustersrcgearrs)
   - [12.8 Gear: the binary — `cluster/src/{main,registered_gears}.rs`](#128-gear-the-binary--clustersrcmainregistered_gearsrs)
@@ -359,7 +360,7 @@ Consumer-facing code is unchanged either way:
 ```rust
 // No consumer code at all: the framework's dependency-resolution loop invokes the
 // framework's proxy-wiring phase when the `cluster` dep resolves (§4.9).
-// The consumer writes only `deps = [cluster]` and its typed profile marker.
+// The consumer writes only its typed profile marker - no `deps = [cluster]` (4.9.2).
 
 // identical in Profile 1 and Profile 3 — `.await` is the one SDK-level change,
 // and both `init` and `start` are already async (Goal 2):
@@ -392,7 +393,7 @@ Using the platform's profile vocabulary rather than inventing terms:
 
 | Platform profile | Who owns backends | Consumer wiring |
 |---|---|---|
-| **Profile 1 — Embedded** | The consumer's own process (cluster gear or `ClusterWiring` linked in) | Cluster gear's `start` registers the real backends **and** a `LocalClusterClient` under `dyn ClusterClient` into the shared hub. Explicit `deps = [cluster]` gives the topo-sort ordering |
+| **Profile 1 — Embedded** | The consumer's own process (cluster gear or `ClusterWiring` linked in) | Cluster gear's `init` claims `dyn ClusterClient` with a `LocalClusterClient`; its `start` registers the real backends and publishes the profile set. Ordering comes from cluster's `system` tier, not from a `deps` edge (4.9.2) |
 | **Profile 2 — Host + Workers** (P2) | The Platform Host or a dedicated worker process | **Not designed — out of scope for the first deployable version (§8 phase 5, decision 12).** Single-host P2 is "Profile 3 over UDS/localhost" only for the *transport*; multi-host P2 has neither UDS nor k8s DNS, no mechanism exists to resolve the endpoint (§4.5), and the topology fork below is unanswered |
 | **Profile 3 — K8s Native** | The cluster pod | The framework's proxy-wiring phase replays cluster's `ConsumerRegistration`, which registers a `RemoteClusterClient` under the same `dyn ClusterClient` — unless a local impl is already there, in which case local wins. Per-profile backends are derived from it at `resolve()`, and the profile rides on each request (§3.1, §4.9.3). Endpoint via k8s DNS (§4.5). No consumer code (§4.9) |
 
@@ -418,7 +419,7 @@ Using the platform's profile vocabulary rather than inventing terms:
 So the consumer's entire cluster-facing surface is:
 
 ```rust
-#[toolkit::gear(name = "event-broker", deps = [cluster], capabilities = [..])]
+#[toolkit::gear(name = "event-broker", capabilities = [..])]        // no `deps = [cluster]` - see 4.9.2
 ```
 
 plus the typed `ClusterProfile` marker it already declares. **No mode flag, no endpoint, no profile list, no timeouts** — cluster defines no client-side configuration block at all, because every field such a block would carry is already owned by the framework or the platform transport layer (§2.2.2, §4.9.2).
@@ -501,7 +502,8 @@ gears/system/cluster/
                                  *_server traits — server codegen is out of scope (§6.1)
     src/api/rest/           NEW  admin/diagnostic routes (no primitives)
     src/local_client.rs     NEW  LocalClusterClient : ClusterClient over ProfileRegistry
-    src/session.rs          NEW  watch subscriptions + lease index (§5.4)
+    src/api/grpc/subscriptions.rs  NEW  watch subscriptions (§5.4); sweep.rs beside it (§5.4.1).
+                            No lease index - see §5.4
     src/registry.rs         NEW  ProfileRegistry + BackendInstanceCache
     src/health.rs           NEW  composite readiness healthcheck
     src/{gear,wiring,config,provider,defaults}.rs   amended
@@ -910,7 +912,7 @@ The consumer never *configures* what a profile means; it names one, and the clus
 
 **The facade binds lazily, and that is what makes wiring order a non-issue.** A resolved facade holds `Arc<ClientHub>`, its profile, its recorded requirements, and a `OnceLock` for the backend:
 
-- `resolve()` fills the slot eagerly when `dyn ClusterClient` is already in the hub. That is *always* true in Profile 1 (topo-sort on the explicit `deps = [cluster]`) and normally true in Profile 3.
+- `resolve()` fills the slot eagerly when `dyn ClusterClient` is already in the hub. That is *always* true in Profile 1 (the cluster gear claims it in `init`, before any consumer's `start`) and normally true in Profile 3 (the wiring phase precedes `start`).
 - If the client is not there yet, `resolve()` still returns `Ok` and the first call fills the slot.
 - Steady state is one atomic load per call, not a hub lookup — the per-call resolution PR #4084's example performs (`api-contracts-consumer/src/domain.rs`) is paid once here instead of on every operation.
 
@@ -920,7 +922,7 @@ This is what keeps late registration *correct*: a consumer resolving during its 
 
 - **A first call against a still-empty slot returns `ProfileNotBound { profile }`** — the same variant a reachable server returns for an unknown profile, distinguished by its message ("no cluster client registered in this process"). No new error variant, so the frozen `ClusterError` contract is untouched (§5.2).
 - **The requirement registry is also the readiness contributor, and it is unfeatured.** §4.7.1 already has `resolve()` record `(profile, primitive, requirements)` in a process-local registry; that registry registers itself as a readiness contributor on first use. It must live in the SDK's ungated core rather than in the `ConsumerRegistration` (§4.9.3 step 3), because **in Profile 1 the registration closure never runs at all** — the forwarding feature is off, so nothing is inventoried to replay. A contributor reachable only from the remote branch would leave the embedded profile with no backstop whatsoever. It reports `Unhealthy` when a facade recorded requirements and no `dyn ClusterClient` ever appeared within a grace window, which puts "nothing is wired" back on `/readyz` instead of in a request path.
-- **Resolve in `start`, never in `init`.** The framework's phases are global, not per-gear (`host_runtime.rs:847`): every gear's `init` runs before any gear's `start`, so the cluster gear's `start` — which registers `LocalClusterClient` (§11.2) — has not run during *any* consumer's `init`. An `init`-time resolve therefore never binds eagerly in either profile, and today it fails outright. Lazy binding makes it survive; that is a safety net, not a licence.
+- **Resolve in `start`, never in `init`.** The framework's phases are global, not per-gear (`host_runtime.rs:847`): every gear's `init` runs before any gear's `start`, so the cluster gear's `start` — which registers `LocalClusterClient` (§11.2) — has not run during *any* consumer's `init`. An `init`-time resolve therefore never binds eagerly in either profile. **What happens next is not symmetric, and the rule is enforced by this prose alone** (`CFG-2`): since the gear registers its `LocalClusterClient` in `init` rather than `start`, a Profile 1 `init`-time resolve now finds a client over a still-empty `ProfileRegistry` and returns `Err(ProfileNotBound)`, while Profile 3 — whose hub is still empty at `init`, because wiring runs after it — returns `Ok` with an unbound facade. Measured both ways. So a consumer that ignores this rule starts in Profile 3 and **fails to start** in Profile 1. Arguably the better failure of the two, but it is an I1 asymmetry, and making the rule structural rather than advisory is open.
 
 Together these keep the loud-failure guarantee of §4.7 while still letting a Profile 3 cold start proceed: absence is tolerated by `resolve()`, reported by readiness, and named by the first call if one arrives anyway.
 
@@ -962,7 +964,7 @@ There is likewise **no cluster-side client configuration block**. Each field one
 >
 > | Constraint | Consequence |
 > |---|---|
-> | `#[toolkit::consumes]` **does not inject a topo-sort dependency.** A separate attribute cannot mutate the `&'static` deps baked by `#[toolkit::gear]`, and auto-injecting `from` would make topo-sort fail for a *remote* provider — which would contradict non-blocking startup. The macro's own guidance is to declare co-located hard deps explicitly | Profile 1's ordering comes from the **explicit** `deps = [cluster]` in the gear attribute, which consumers write anyway for readiness gating (§11.1). Nothing is automatic, and nothing needs to be |
+> | `#[toolkit::consumes]` **does not inject a topo-sort dependency.** A separate attribute cannot mutate the `&'static` deps baked by `#[toolkit::gear]`, and auto-injecting `from` would make topo-sort fail for a *remote* provider — which would contradict non-blocking startup. The macro's own guidance is to declare co-located hard deps explicitly | Profile 1's ordering comes from cluster's `system` tier, which `run_start_phase` honours ahead of every application gear - **not** from a `deps` edge, which `K3` found is fatal in Profile 3 (§4.9.2). Nothing is automatic, and nothing needs to be |
 > | The generated client is a **REST** resolving client (`<Contract>RestResolvingClient`, feature `contract-directory-rest-client` — the feature name admits it). There is no gRPC variant, and **none is planned in #4084** | Cluster is platform-plane and therefore gRPC (§2.2.1), so **cluster cannot use the attribute at all** under option A. It submits its own `ConsumerRegistration` — a plain struct — with a gRPC-backed `RemoteClusterClient`. The mechanism is reused; only the macro sugar is not. **This is settled rather than pending**: its owner confirms `ConsumerRegistration` is transport-agnostic (owner gear, dep, wire closure), so cluster's hand-written registration rides the same inventory and replay path and **will not need rework** when a generated gRPC client eventually lands (decision 16) |
 >
 > So cluster adopts the framework's wiring *phase* and its local-wins *semantics*, and hand-writes the one registration
@@ -982,13 +984,31 @@ Two small additions make cluster fit it:
 
 2. **An SDK-submitted `ConsumerRegistration`** (§4.9.3), submitted by `cluster-sdk` rather than written per consumer. Because the registered object is a single `Arc<dyn ClusterClient>`, this is exactly the one-dep-one-object shape `#[toolkit::consumes]` generates — cluster writes the registration by hand only because that macro emits a REST client and cluster's transport is gRPC, and because cluster's registration also starts the descriptor prefetch.
 
-Consumer-visible surface then reduces to the marker it already needs plus the `deps` entry it already needs for readiness gating:
+Consumer-visible surface then reduces to the marker, and nothing else:
 
 ```rust
-#[toolkit::gear(name = "event-broker", deps = [cluster], capabilities = [..])]
+#[toolkit::gear(name = "event-broker", capabilities = [..])]        // no `deps = [cluster]`
 ```
 
-No wiring call, no cluster-specific config, and the transport choice moves out of consumer code entirely.
+No wiring call, no cluster-specific config, no dependency entry, and the transport choice moves out of consumer code entirely.
+
+> **Corrected by `K3`: a consumer must NOT declare `deps = [cluster]`.** This section previously said the surface was
+> the marker *plus* that `deps` entry. It is fatal in Profile 3. `deps` is a **hard** topo-sort edge — `RegistryBuilder`
+> fails the entire registry build with `RegistryError::UnknownDependency { gear, depends_on }` when a named gear is not
+> linked (`registry.rs:565-568`) — and a Profile 3 consumer links no cluster gear at all. So the line that was meant to
+> be the one thing a consumer writes is the one thing that would stop it starting, which would have broken invariant I1
+> outright: the same source file could not compile in both profiles.
+>
+> Omitting it costs nothing, because neither property the edge would buy depends on it:
+>
+> | What `deps = [cluster]` was for | What actually supplies it |
+> |---|---|
+> | **Start ordering** — cluster's `start` before the consumer's | The `system` tier. `run_start_phase` iterates `gears_by_system_priority()` (`host_runtime.rs:838`), which runs every `system`-capability gear ahead of every other one (`registry.rs:290-304`), and cluster declares `system` (§4.2). Measured, not assumed: a non-`system` gear in `cluster/tests/oop_probe_ordering.rs` finds cluster's profiles already published when its own `start` runs, with no `deps` edge in the process |
+> | **Readiness gating** on cluster | `ConsumerRegistration::dep_gear`, which the wiring phase registers with the `DependencyChecker` (`host_runtime.rs:520`). Cluster's own registration carries `dep_gear: "cluster"`, so a consumer gets the `/readyz` gate in **both** profiles without writing anything |
+>
+> **The one exception, named so it is not discovered:** a consumer that is *itself* `system`-tier shares cluster's
+> priority group, where ordering falls back to topo order within the group. Such a gear does need the edge — and may
+> write it only when cluster is co-located, which makes it a Profile 1 declaration and not part of the portable surface.
 
 > **Platform-doc tension to resolve — the one part of decision 16 still outstanding.** The platform DESIGN says both "the gear's `init` picks the transport ... then registers the chosen `Arc<dyn FooApi>` in ClientHub" (§"Responsibility boundaries") and that the bootstrap wires clients on dep resolution (§"OoP bootstrap"). Those are different owners for the same act. PR #4084's ADR-0004 settles it — the runtime's proxy-wiring phase replays an inventoried `ConsumerRegistration` — so the DESIGN's first reading should be narrowed to "the gear's SDK declares how to build each transport variant". Ownership is therefore a **documentation fix** (§10), and it is what remains of decision 16 now that ordering and the gRPC-codegen question are answered: the OoP path's post-`start` replay was incidental and is being aligned, and no gRPC counterpart to `#[toolkit::consumes]` is planned. Cluster needed neither answer — its SDK builds its own client at `resolve()` (§4.7.1) — so both are improvements to the surrounding platform rather than unblockings.
 
@@ -1192,7 +1212,7 @@ Because `auto` stays the default, this is purely additive — it can land with t
 | 3 | `RemoteClusterClient` + descriptor cache + the three `Remote*Backend` handles. Lock handles are unary (§6.5), so only the leader watch needs a channel pump | `cluster-sdk/src/{client/remote,descriptors,backend}.rs` | M |
 | 4 | `register_cluster_profile!` plus the `ConsumerRegistration` cluster submits by `inventory` — **ungated: `ConsumerRegistration` ships on `main`** (`libs/toolkit/src/discovery.rs`). Nothing waits on it: `resolve()` self-constructs the client (§4.7.1), so the phase is pre-population. **No config type, no endpoint resolver** — cluster derives its own endpoint (§4.5) | `cluster-sdk/src/{wiring,profile}.rs` | S–M |
 | 5 | Four hand-written gRPC service impls over the generated `*_server` traits — the sanctioned pattern, not interim glue (§6.1). Each adds `ProfileRegistry` dispatch between DTO conversion and backend call | `cluster/src/api/grpc/` | L |
-| 6 | Server-side session index: watch subscriptions keyed by subscription id, plus a lease index for diagnostics and quotas (§5.4). No lease lifetime here — that is the store's (§5.8.1) | `cluster/src/session.rs` | M |
+| 6 | Server-side session index: watch subscriptions keyed by subscription id, swept per §5.4.1. No lease lifetime here — that is the store's (§5.8.1), and no lease *index* either (§5.4) | `cluster/src/api/grpc/{subscriptions,sweep}.rs` | M |
 | 7 | `ProfileRegistry` — runtime-queryable, populated by `start` | `cluster/src/registry.rs` | M |
 | 7b | **`ClusterWiring::from_config` returns the bound-profile set alongside the `ClusterHandle`.** Today it returns `Result<ClusterHandle, ClusterError>` (`wiring.rs:127-131`) and discards exactly what the registry needs — per-profile provider identity, declared features and shared-instance refs. Without this there is nothing for `start` to `publish`, so item 7 has no data source. Hub registration under `cluster:{profile}` (`cluster-sdk/src/registration.rs:44-52`) and the all-or-nothing rollback (`wiring.rs:298,365-396`) are unchanged; this is a return-shape change, and the only signature in the current tree this design alters | `cluster/src/wiring.rs` | S |
 | 7c | **`LocalClusterClient`** — implements `ClusterClient` over the `ProfileRegistry`, registered under `dyn ClusterClient` by the gear's `start` alongside the existing per-profile hub registrations (§11.2). This is what makes Profile 1 resolve through the same trait as Profile 3 and gives the local-wins check something to find. Lives in the gear crate, not the SDK, because it depends on gear state (§3.4) | `cluster/src/local_client.rs`, `gear.rs` | S |
@@ -1313,9 +1333,52 @@ pub struct LeaseIndexEntry {
 - **Reaping on client death is TTL-driven**, exactly as the contract specifies (`cpt-cf-clst-fr-lock-release`, `cpt-cf-clst-fr-shutdown-ttl-cleanup`). A holder that stops renewing lapses at its stored `deadline`; no reaper has to notice the client is gone, and no replica has to be the one that issued the lease.
 - **Leader renewal liveness needs nothing extra**, because renewal is client-driven again (§7.3) — a wedged consumer stops renewing and loses its claim, which is the in-process behaviour.
 - **Shutdown fan-out is watches only.** §4.8 phase 3 closes subscriptions; leases are deliberately left alone, since revoking them is the failure mode §5.8.2 exists to remove.
-- **Observability.** Gauges per `(profile, primitive)`. Note ADR-004's cardinality rule: `profile` and `provider` are bounded and allowed as labels; lock/election **names** and cache **keys** are not, and stay in trace attributes and log fields.
+- **Observability.** Gauges per `(profile, primitive)`. Note ADR-004's cardinality rule: `profile` and `provider` are bounded and allowed as labels; lock/election **names** and cache **keys** are not, and stay in trace attributes and log fields. The SDK's field classification put `profile` under the high-cardinality `fields::attr` group, which contradicted this bullet and I15; corrected in `S2` — `profile` is a `fields::label` key and is on `METRIC_LABEL_ALLOWLIST`.
 - **Diagnostics.** An admin endpoint answering "who holds lock X" during an incident — something the in-process design could not answer at all. With multiple replicas this reads the *store*, not the local index, so the answer is fleet-wide rather than replica-local.
 - **Quotas.** Optional per-client caps (§5.7).
+
+**`LeaseIndexEntry` is not built, and the bullet above is why.** `S2` ships the watch-subscription half of this section and deliberately skips the lease half. Three facts in this section defeat it: nothing in the lease path may read it (I7), the diagnostics answer it exists to serve reads the **store** rather than the local index the moment there is more than one replica, and its only two consumers — `S4`'s `/admin/sessions` and §5.7's optional quotas — do not exist. What is left is a per-replica mirror of durable state, kept current by writes on the lease path, read by nobody. The scoping statement loses to its own diagnostics bullet: when `S4` lands it queries the store, and if quota accounting later needs a local counter it can carry a count rather than a mirror of every lease. Recorded rather than silently dropped.
+
+#### 5.4.1 The watch-subscription sweep (ask `A6`, decision 18)
+
+The specification decision 18 asks for, before phase 3. It is written here rather than as an ADR because the sweep is a mechanism internal to the serving gear — its only consumer-visible surface is one metric name — and §5.4 already owns the session index; ADRs 001–012 record decisions that reach consumers or plugin authors. Decision 18 is one of this document's own open questions, so it is answered where it was asked.
+
+**What is swept, and what needs no sweep.** Abandoned *watch subscriptions* — entries whose client will never come back for them. Leases need no equivalent: they expire in the store at their stored `deadline` (§5.8.1), which is the whole point of I7.
+
+**The key is "last poll", adapted to the streaming projection.** Decision 18 was written against a long-poll `await_change` and keyed the sweep off each subscription's last poll, aged by `poll_timeout × grace`. `C1`/`C2` made `await_change` `#[streaming]`, so there is no poll and no `poll_timeout` (the audit's verified-drift annex). The property the key was reaching for survives intact: it is *the last moment the client was demonstrably present for this subscription*. That is one timestamp, `last_seen`, written at three moments:
+
+1. **`open`** — the client just joined and is expected to attach.
+2. **`attach`** — the client opened (or re-opened) its stream.
+3. **every sweep pass that observes a live reader** — a client holding a stream open is present, continuously, and the pass that sees it says so.
+
+Point 3 is what makes one timestamp sufficient. Without it a long-held stream would look maximally stale the instant its reader vanished; with it, a subscription whose client dies gets a full grace window measured from the last pass rather than from a `join` an hour earlier.
+
+**The predicate.** A subscription is reaped when it has **no live reader** *and* has been that way for at least the grace window. Three states, and only the third is garbage:
+
+| State | Reader | Reaped? |
+|---|---|---|
+| Attached, client holding the stream | live | Never — `last_seen` is refreshed each pass |
+| Registered by `join`, no `await_change` yet | none | After the grace window. This is the follower-pump leak |
+| Attached, then the client vanished or cancelled | dropped | After the grace window, measured from the last pass that saw it live |
+
+The third state requires the server's stream task to *notice* a departed client: parked on `recv()` it would hold its receiver alive forever and never look dead. It therefore also selects on its outbound channel closing, so a cancelled or crashed client's receiver is dropped promptly and the entry becomes reader-less. Without that, the sweep would bound the follower-pump leak and miss the original crashed-client case decision 18 was written about.
+
+The grace window rather than immediate removal is what preserves §6.6's reconnect affordance: a client's `election_id` stays valid across a broken stream, so a re-`attach` inside the window needs no fresh `join`.
+
+**Cadence: 5 s**, matching the plugins' lock-reaper default (`default_lock_reaper_interval()`), which is what "sharing the plugins' existing reaper cadence" can mean here — a plugin's interval is per-provider operator config that the gear cannot read, and two bound providers may disagree, so the gear carries the same *value* rather than the same knob. It is a constant, not a config key: no operator has a reason to tune the lifetime of a server-side bookkeeping entry, and a key would need its own decision.
+
+**Grace multiplier: 3**, so the window is 15 s. It must exceed one cadence — an entry must never be reaped on the pass that first observes it reader-less — and it must be far above a `join`→`await_change` round trip. Three gives two full passes of slack and bounds the steady-state follower population at `grace / renewal_interval` ≈ 2 entries per participant on the default `ElectionConfig`, which is a constant rather than a leak.
+
+**Metrics** (ADR-004, both labelled `(profile, primitive)` and nothing else):
+
+- `cluster_subscriptions_reaped` — counter, incremented by each pass's reap count. Per §5.1 of the observability catalog the instrument carries no `_total`; the scraped series is `cluster_subscriptions_reaped_total`.
+- `cluster_subscriptions_active` — gauge, the live population after each pass. A profile that falls to zero is reported as zero rather than going quiet, so the series does not strand at its last non-zero value.
+
+An election **name** appears in neither, per I15; it is a log field on the reap event and a span attribute.
+
+**What the sweep may not do.** Nothing it touches is a lease. Reaping an entry revokes no leadership and fails no renewal (I7) — the subscription is a feed, the claim is a row in the store, and the only thing that sustains the claim is the client's own renewal (I8).
+
+**Why a sweep and not `join` reusing the caller's subscription.** The cheaper-looking fix is for `join` to hand back the caller's existing subscription for the same election instead of minting one, which would fix the *rate* at its source. It cannot be keyed safely on the identity available: with v1's `TrustedNetwork` mode every caller resolves to the single name `unauthenticated` (§4.6), so `(caller, election)` does not identify a participant — it identifies the whole fleet — and even under a real authenticator two replicas of one Deployment share a `ServiceAccount` name. Collapsing them is precisely the case the subscription id exists to tell apart. Reuse becomes available if a participant ever carries an identity of its own on `JoinRequest`; until then the sweep is both the necessary fix and the sufficient one, because it bounds abandonment (the crashed-client case reuse never addressed) and the follower-pump rate with the same mechanism.
 
 ### 5.5 Profile discovery and capability validation over the wire
 
@@ -1401,7 +1464,12 @@ The lease record therefore carries its own fence and outlives its lease:
 | **Acquisition preserves and increments** | Taking a lease whose `deadline` has passed reads the existing record and writes `fence + 1`. The record is CAS'd, not deleted-then-inserted, so the counter survives the change of owner |
 | **The record outlives the lease** | Its physical expiry is `deadline + fence_retention`, not `deadline`. The reaper may only remove a record once the retention window has also passed, which is what keeps the counter alive across a lapse. `fence_retention` defaults to an hour — orders of magnitude above any lease TTL, and cheap: one small row per lease *name*, not per acquisition |
 
-**The guarantee this buys, stated exactly**: a fence value is never reused for a given lease name **within `fence_retention` of its lease ending**. Beyond that window the counter may restart, and reuse then additionally requires the same `ClientId` to re-acquire and a token that has been stale for longer than the retention window — a holder whose renew cadence is a fraction of its TTL learns it lost the lease orders of magnitude sooner. Operators shortening `fence_retention` below the longest lease TTL in use is the one configuration that breaks this, so the backends reject it at startup.
+**The guarantee this buys, stated exactly**: a fence value is never reused for a given lease name **within `fence_retention` of its lease lapsing**. Beyond that window the counter may restart, and reuse then additionally requires the same `ClientId` to re-acquire and a token that has been stale for longer than the retention window — a holder whose renew cadence is a fraction of its TTL learns it lost the lease orders of magnitude sooner.
+
+Two corrections to what this paragraph originally claimed, both made when `L3` implemented it:
+
+- **"Its lease *ending*" is narrowed to "its lease *lapsing*".** `release` deletes the record, by the ruling in ADR-012, so a voluntary release drops the fence with it. Lapsing is the case a stale holder can be in.
+- **"The backends reject it at startup" cannot be checked against the longest lease TTL**, because there is no configured lease TTL to compare against: a TTL is a per-call argument to `lock(name, ttl)` and to an election claim. What the backends do reject at startup is a **zero** window — the absence of retention rather than a short one. The `ttl >= fence_retention` case is caught where a TTL exists, at acquisition, as a `warn!` naming both durations (once per backend). Denying coordination service for a config the caller did not set would be the worse failure.
 
 **This is why the fence stays internal.** Exposing it as `LockGuard::fence()` for external fencing — passing a monotonic token to a third-party resource so it can reject stale writers — would promise *global* monotonicity for the lifetime of the protected resource, which no backend here can honour across the retention window. The fence is scoped to making cluster's own lease predicates safe. External fencing, if a consumer needs it, is an additive `LockGuard` method backed by a source that can actually promise it (a Postgres sequence, say), and it needs its own ADR (§9).
 
@@ -2114,12 +2182,11 @@ Phases 1 and 2 are independent and can run in parallel. Phase 2 is worth landing
 | 12 | **Profile 2 (Host + Workers) — undesigned, and out of scope for phase 5 (§3.2, §8).** Three separate gaps, not one: (a) **transport** — UDS for single-host, bootstrap-token credential; (b) **endpoint resolution** — none exists (`remote_grpc_endpoints` is tier 3, #4084's resolver is directory + REST), so even single-host P2, the on-prem baseline, has no working path today; (c) **topology** — process count is no longer a correctness question (§5.8: any process serves any lease), but *backend scope* still is. One cluster process per host is safe **only if every host's process is pointed at the same backend configuration**; point them at per-host backends and locks silently stop being deployment-wide, which looks like a scaling choice and is not one. Say that explicitly in the P2 design and make the shared-backend requirement checkable at startup |
 | 13 | Backend credentials — still the platform OoP credential design's call, now narrowed to one deployment target |
 | 14 | `ClusterError::ProfileNotBound{profile: &'static str}` interning vs. widening the frozen enum (§5.2) |
-| 18 | **Who sweeps abandoned watch subscriptions?** (§5.4) A subscription is freed by an explicit unsubscribe or a closed stream, neither of which a dead client sends under the long-poll projection — so the index grows in exactly the failure mode it exists to survive. A periodic sweep keyed off each subscription's last poll (`poll_timeout × grace`), sharing the plugins' existing reaper cadence and emitting `cluster_subscriptions_reaped`, is the obvious shape. Leases need no equivalent: they expire in the store (§5.8.1). Specify before phase 3 |
-
 **Resolved:**
 
 | # | Question | Resolution |
 |---|---|---|
+| 18 | **Who sweeps abandoned watch subscriptions?** (§5.4) | **Closed — specified in [§5.4.1](#541-the-watch-subscription-sweep-ask-a6-decision-18) and implemented by `S2`.** The serving gear sweeps, on a 5 s cadence with a 3× grace window, keyed off a `last_seen` that the sweep itself refreshes for any subscription with a live reader — which is what "last poll" means once `await_change` is a stream rather than a long poll. It emits `cluster_subscriptions_reaped` and a `cluster_subscriptions_active` gauge, both per `(profile, primitive)`. Leases need no equivalent, as this question already said. Two things the question did not anticipate: the urgency is not the crashed client but `K2`'s follower pump, which leaves one unattached subscription **per renewal interval** — measured at 4 leaked across five 100 ms intervals (the audit's verified-drift annex); and the alternative fix, `join` reusing the caller's subscription, is unavailable because v1's `TrustedNetwork` mode gives every caller the same name |
 | 16 | **Who registers the client, and does the framework want the ordering changed?** (§4.9.2, §4.9.3) | **Closed — all three parts answered by #4084's owner.** (a) *Ownership*: settled by ADR-0004 — the runtime's proxy-wiring phase replays an inventoried `ConsumerRegistration`, and cluster's registration fits that closure signature as shipped. What remains is the platform DESIGN's two contradictory statements, which is a **documentation fix** (§10). (b) *Ordering*: **not deliberate.** The phase body needs only a populated `ClientHub` and a known gear registry, neither of which depends on `start`, so the OoP path will be aligned with the in-process order and will wire before `start`. Cluster keeps its self-construction branch as defence, but inline capability validation becomes the normal case rather than the lucky one (§4.7.1). (c) *gRPC codegen*: **none planned** — the feature is `contract-directory-rest-client` and generates a REST client only. But `ConsumerRegistration` is transport-agnostic, so cluster's hand-written gRPC registration rides the same inventory and replay path and **needs no rework** when a generated gRPC client lands. That answer was given while #4084 was open and cluster planned to hand-roll the client; the PR has since **merged**, so cluster builds on the macros directly and only the hand-written `ConsumerRegistration` remains — which the transport-agnostic type makes permanent-safe rather than interim (§6.1) |
 
 ## 10. Documentation Deltas
@@ -2189,7 +2256,7 @@ Facades are resolved in `start` and stored; nothing here names a transport:
 
 ```rust
 // reservations/src/gear.rs
-#[toolkit::gear(name = "reservations", deps = [cluster], capabilities = [rest, stateful])]
+#[toolkit::gear(name = "reservations", capabilities = [rest, stateful])]   // no `deps = [cluster]` (4.9.2)
 struct ReservationsGear { hub: OnceLock<Arc<ClientHub>>, service: OnceLock<Arc<Service>> }
 
 #[async_trait]
@@ -2771,7 +2838,9 @@ impl ClusterClient for LocalClusterClient {
 }
 ```
 
-### 12.5 Gear: the session index — `cluster/src/session.rs`
+### 12.5 Gear: the session index — `cluster/src/api/grpc/subscriptions.rs`
+
+> **As built (`S2`), and this sketch lost on three counts.** There is no `session.rs`: the table landed with the service that needs it, at `cluster/src/api/grpc/subscriptions.rs`, with the sweep task beside it in `sweep.rs`. There is no `leases` map — see §5.4's `LeaseIndexEntry` note for why the lease half is not built. And the container is a `Mutex<HashMap<..>>` rather than a `DashMap`: every access is a single point lookup or a whole-table walk, `attach`'s check-and-swap has to be one critical section against a concurrent sweep, and the crate has no other `dashmap` dependency to justify. What survives verbatim is the shape below minus its second field, and both bullets under it.
 
 Leases are **not** here — they are rows in the backing store (§5.8.1). What remains is a watch-subscription table plus a lease *index* for diagnostics, and the ownership check that used to live here is now a `WHERE` clause.
 
@@ -3405,7 +3474,19 @@ impl ClusterCacheV1 {
 
 ### 12.15 Client: the registration — `cluster-sdk/src/wiring.rs`
 
-**Gated off until #4084 lands** (§6.1): `ConsumerRegistration` is its type. Until then `resolve()`'s self-construction is the only path, and this file compiles to nothing.
+**Shipped** (item `K3`). The sketch below predates the merged type and diverges from it in three ways, all recorded in
+the audit's verified-drift annex; read the file, not this block:
+
+- the fields are **`owner_gear` / `dep_gear`**, not `owner_module` / `dep_module`;
+- `wire` receives an **`Arc<dyn EndpointResolver>`**, not a resolved `&str` — and `resolve_endpoint` is `async` while
+  `wire` is a sync `fn`, so the resolver cannot be consulted inside the closure at all. Cluster ignores it and derives
+  its own endpoint, which also avoids handing a **REST** base URI to a gRPC channel. The cost is that the ADR-0004
+  static override does not reach cluster;
+- the local-wins probe is **`try_get_local`**, not `get(..).is_ok()`, and the reason is sharper than telling a local
+  impl from a proxy: this registration is replayed in the `cluster-oop` process too (the gear links `cluster-sdk` with
+  `grpc-client` on), so without it a cluster-hosting process wires a remote client to its own socket. What makes the
+  probe answer correctly is that the gear claims `dyn ClusterClient` in **`init`** — one phase before the wiring
+  phase — rather than in `start`.
 
 ```rust
 inventory::submit! {
@@ -3503,3 +3584,33 @@ Four properties of types already in the tree that the design above has to respec
 | `LeaderWatch::changed()` takes `&mut self`, because the watch owns an `mpsc::Receiver` | An election subscription needs a `Mutex`, and **at most one in-flight `AwaitChange` per `election_id`** — a second concurrent poll is rejected with `FailedPrecondition` rather than serialised, which would hand one caller a stale event (§6.6) |
 | `ClientHub` has no unscoped `try_get`, and `register` is last-write-wins with no if-absent form (`client_hub.rs:142-248`) | The local-wins check uses `hub.get::<dyn ClusterClient>().is_ok()`, and both construction paths (§4.7.1, §4.9.3) check before registering. The race is benign — equivalent clients, one redundant lazy channel — but a `register_if_absent` on `ClientHub` would remove it, and is worth proposing alongside `try_get` |
 | `provider_name()` returns `&'static str`, while a descriptor's provider arrives as a runtime `String` | Both need the same interning §5.2 specifies for profile names — one shared `intern()` helper, not two leaks (§12.1) |
+
+---
+
+## Appendix — Invariants
+
+Properties no implementation may break. A change that appears to require breaking one of these is a
+change to *this document*, not an implementation choice.
+
+These were carried in the build plan while the work was in flight. That plan has been retired now
+the work has landed, so they live here, with the design they constrain. `AUDIT-DEPLOYABLE-GEAR.md`
+judges the implementation against this table and cites these by number.
+
+| # | Invariant | §ref |
+|---|---|---|
+| **I1** | **Profile transparency.** One consumer source file compiles and behaves identically in Profile 1 and Profile 3. No `cfg`, no mode flag, no profile-specific consumer code | Goal 2, §3.2, §11.5 |
+| **I2** | **`resolve()` becoming `async` is the only SDK signature change.** The four facades, the typed-profile resolver, `scoped()`, the watch-event unions and `auto_restart` keep their shapes | Goal 2, §3.1 |
+| **I3** | **`ClusterError` is frozen.** No new variants, no widened fields. `ProfileNotBound` carries an interned `&'static str` | §5.2, §6.10, decision 14 |
+| **I4** | **The boundary is the three backend traits**, and exactly one `Arc<dyn ClusterClient>` is registered per process, local winning over remote. No consumer names a `Remote*Backend` | §3.1, ADR-011 |
+| **I5** | **No consumer serves traffic against an unmet requirement.** Whether that arrives as `Err(CapabilityNotMet)` from `resolve()` or as an `Unhealthy` readiness verdict varies; the guarantee and the error text do not. **Enforced on both paths since `K5`** — the deferred verdict re-runs the *same* validator closure the inline path ran, so the error text is identical by construction rather than by convention. One residual: the contributor is wired by a consumer's `healthcheck()`, so a consumer that omits that line has no deferred enforcement; the registry `warn!`s when that happens (the audit's verified-drift annex) | §4.7, §4.7.1 |
+| **I6** | **Startup never blocks on cluster reachability.** `resolve()` awaits only the descriptor, bounded; the facade binds lazily; registration touches no network | §4.7.1, §4.9.1, ADR-0005 |
+| **I7** | **A lease is a fenced record in the backing store.** No process's death — holder's or broker's — ends another's lease. Any replica serves any lease operation | §5.8.1, §5.8.2, ADR-012 |
+| **I8** | **Renewal is client-driven**, so renewal remains the consumer-liveness proxy. A failed renew is `LockExpired` / `Status(Lost)`, never a terminal close | §6.6, §7.3 |
+| **I9** | **No cluster-side client configuration exists** — no mode flag, no endpoint key, no timeouts, no profile list. Every field such a block would carry is owned elsewhere | §3.2, §4.9.2 |
+| **I10** | **The profile name is typed in exactly two places** — the marker and the `.profile()` call. A config list would be a third | §4.9.2, `cpt-cf-clst-fr-validation-typed-profile` |
+| **I11** | **The plugin-facing `*Backend` traits stay stable.** Extensions are defaulted and dyn-safe (`probe()`, `migrate()`), never required methods | §4.4, §4.10.1, `cpt-cf-clst-nfr-plugin-stability` |
+| **I12** | **The wire is additive-only within `cluster.v1`.** `proto.lock.toml` — not the `cluster-sdk` crate version — is the wire-compatibility contract **for field _numbers_**; the committed `.proto` diff is the contract for field _types_ (`MACRO-4`). The lock records `field_name → number` plus tombstones and no type, so retyping `string key = 1` to `uint64 key = 1` leaves it byte-identical and all eight `protogen_shape` tests still pass — verified. Numbers themselves are correctly pinned: an inserted field takes the next free number rather than shifting its neighbours. A reviewer checking a wire change must read the `.proto`, not the lock | §6.12 |
+| **I13** | **No compound cache operations.** The frozen cache contract is not extended; the ~2× hot-path cost is accepted | §7.2.3, §7.2.7 |
+| **I14** | **Profile 1's hot path is unchanged.** `LocalClusterClient` returns the real backend `Arc` — no wrapper interposed on the request path | §3.1, §5.2 |
+| **I15** | **Metric labels stay bounded** to `profile`, `provider`, `primitive`, `method`, `code`. Lock names, election names and cache keys live in traces and logs only | §5.4, §7.5, ADR-004 |
+

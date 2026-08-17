@@ -171,6 +171,14 @@ The cluster gear is designed to work across the full range of Gears deployments:
 
 A consumer gear's code does not change between these shapes. The operator picks the backend per primitive in deployment YAML.
 
+**These five shapes vary the *backend*. Two further shapes vary *where cluster itself runs***, and they are the platform's deployment profiles rather than cluster's own vocabulary. The five above are all Profile 1; the deployable gear adds Profile 3 (see DESIGN-DEPLOYABLE-GEAR.md §3.2):
+
+- **Profile 1 — Embedded (all five shapes above).** The `cluster` gear and its plugins are linked into the consumer's own binary. A consumer's `resolve()` hands back the real backend, so a coordination call is a function call and the hot path costs nothing extra.
+- **Profile 2 — Host + Workers.** **Not designed, and this is a scope limit rather than a deferral.** No endpoint-resolution mechanism exists for it, and its topology fork is unanswered: one cluster process per *deployment* is a single point of failure with no scheduler, while one per *host* silently makes locks and elections per-host instead of deployment-wide. When P2 is designed the shape has to be chosen explicitly and enforced, because a per-host misconfiguration looks like a scaling choice and fails quietly.
+- **Profile 3 — K8s Native.** Cluster runs as its own pod (`cluster-oop`), serving the coordination primitives over gRPC on the platform plane and the framework's probes over HTTP. Consumers link no plugins and no backend drivers; the framework's proxy-wiring phase gives them a remote client and their source is byte-for-byte the Profile 1 source. Kubernetes only — Profile 2's gap is the reason.
+
+**A consumer gear's code does not change across the profiles either**, which is the stronger claim: not merely that the backend is configurable, but that whether coordination is a function call or an RPC is invisible at the call site. What varies is a Cargo feature and the operator's deployment, never the consumer's source.
+
 ### 3.2 Gear-Specific Environment Constraints
 
 - The in-process backend has no external dependencies and is the default for development.

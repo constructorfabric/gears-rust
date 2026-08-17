@@ -3,8 +3,8 @@
 //! `postgres_cluster_plugin` is the Postgres backend plugin for the cluster
 //! gear (DESIGN.md §1). It provides a native `ClusterCacheBackend` over a
 //! `sqlx::PgPool` and a native `DistributedLockBackend` over a `cluster_lock`
-//! lease row, with one per-instance advisory lock kept purely as a liveness
-//! beacon (DESIGN.md §5). Leader election is derived from the SDK default
+//! lease row whose `expires_at` is its only liveness authority (DESIGN.md §5,
+//! DESIGN-DEPLOYABLE-GEAR §5.8.1). Leader election is derived from the SDK default
 //! backend over the Postgres cache — no additional tables or connections are
 //! required for that primitive (DESIGN.md §6).
 //!
@@ -39,9 +39,8 @@
 //!
 //! ## Why `sqlx` directly, not `libs/toolkit-db`
 //!
-//! See DESIGN.md §3.1 — this plugin needs an owned, long-lived connection for
-//! the liveness beacon (and a `pg_locks` join inside the acquire predicate that
-//! reads it), `LISTEN`/`NOTIFY` streaming, and `PgPoolOptions` connect/acquire
+//! See DESIGN.md §3.1 — this plugin needs owned, long-lived connections for
+//! `LISTEN`/`NOTIFY` streaming, and `PgPoolOptions` connect/acquire
 //! hooks that have no Sea-ORM equivalent. This is a documented, deliberate architectural
 //! exception, not a convenience shortcut — hence the crate-level
 //! `#![allow(de0706_no_direct_sqlx)]` below. It used to be a lint-sanctioned

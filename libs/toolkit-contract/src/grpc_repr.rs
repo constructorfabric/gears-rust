@@ -117,6 +117,17 @@ pub const fn assert_grpc_repr<T: GrpcRepr + ?Sized>() {}
 /// lives in [`crate::grpc`] under the `grpc-client` feature.
 pub trait SecurityContextMarker {}
 
+/// References are transparent.
+///
+/// The projection macros classify `&SecurityContext` exactly as they classify
+/// `SecurityContext` — `projection::type_path_ends_with` recurses through
+/// `Type::Reference` on purpose, and DESIGN §2.2 permits either spelling. The
+/// guard they emit asserts on the parameter type *as written*, so without this
+/// impl the by-reference form fails the assertion for **both** planes while the
+/// by-value form passes. That asymmetry is invisible until someone writes the
+/// reference form, which is the shape the cluster contract uses.
+impl<T: SecurityContextMarker + ?Sized> SecurityContextMarker for &T {}
+
 /// Compile-time helper used by generated code. Calling
 /// `assert_security_context::<T>()` requires `T: SecurityContextMarker` —
 /// so any type the macro classifies as "security context" must explicitly
@@ -168,6 +179,23 @@ pub trait TryFromProto<P>: Sized {
     /// value its `FromStr` impl rejects.
     fn try_from_proto_wire(proto: P) -> Result<Self, ViaStringParseError>;
 }
+
+/// A required nested message was absent on the wire.
+///
+/// prost renders every proto3 message field as `Option<T>`, so "required" is a
+/// property of the Rust DTO rather than of the wire. A peer that omits such a field
+/// — an older build, a hand-written client, a corrupted frame — is a decode error
+/// here rather than a zeroed field that fails a predicate much later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingRequiredMessage;
+
+impl ::std::fmt::Display for MissingRequiredMessage {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.write_str("required nested message is absent")
+    }
+}
+
+impl ::std::error::Error for MissingRequiredMessage {}
 
 /// Logging hook called from generated `From<i32>` impls when the wire value
 /// does not correspond to any known Rust variant.

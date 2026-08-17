@@ -11,8 +11,14 @@ use crate::cache::types::{
     CacheCapability, CacheConsistency, CacheEntry, CacheFeatures, PutRequest, Ttl,
 };
 use crate::cache::watch::CacheWatch;
+use crate::dto::{
+    CacheConsistencyDto, CacheDescriptor, CacheFeaturesDto, LeaderElectionDescriptor,
+    LeaderElectionFeaturesDto, LockDescriptor, LockFeaturesDto, ProfileDescriptor, ProfileHealth,
+};
 use crate::error::ClusterError;
-use crate::profile::{ClusterProfile, profile_scope};
+use crate::profile::ClusterProfile;
+use crate::test_support::StubClusterClient;
+use crate::test_support::with_nothing_derivable;
 
 struct StubBackend {
     consistency: CacheConsistency,
@@ -137,60 +143,106 @@ fn validate_rejects_unmet_prefix_watch() {
     ));
 }
 
-#[test]
-fn resolve_without_profile_errors() {
+#[tokio::test]
+async fn resolve_without_profile_errors() {
     let hub = ClientHub::new();
-    let result = CacheResolverBuilder::new(&hub).resolve();
+    let result = CacheResolverBuilder::new(&hub).resolve().await;
     assert!(matches!(result, Err(ClusterError::ProfileNotSpecified)));
 }
 
-#[test]
-fn resolve_unbound_profile_errors() {
+/// Registers a cluster client binding `backend` to the orders profile — since
+/// `K4` the resolvers bind through `dyn ClusterClient`, not through a per-profile
+/// hub registration (DESIGN-DEPLOYABLE-GEAR §4.9.3).
+fn client_with(hub: &ClientHub, backend: StubBackend) {
+    StubClusterClient::for_profile(OrdersProfile::NAME)
+        .with_cache(Arc::new(backend))
+        .register(hub);
+}
+
+#[tokio::test]
+async fn resolve_unbound_profile_errors() {
     let hub = ClientHub::new();
+    // A client that binds a *different* profile: cluster is reachable and does
+    // not bind this one, which DESIGN §4.7 classifies as a permanent config error
+    // and returns from `resolve()` itself.
+    StubClusterClient::for_profile("other")
+        .with_cache(Arc::new(linearizable_backend()))
+        .register(&hub);
+
     let result = ClusterCacheV1::resolver(&hub)
         .profile(OrdersProfile)
-        .resolve();
+        .resolve()
+        .await;
     assert!(matches!(
         result,
         Err(ClusterError::ProfileNotBound { profile: "orders" })
     ));
 }
 
-#[test]
-fn resolve_happy_path_returns_facade() {
+/// The nothing-wired case, at the facade rather than the backend: `resolve()`
+/// succeeds and the first *call* reports it (§4.9.1). This is the misconfiguration
+/// lazy binding would otherwise hide, which is why it is asserted here and not
+/// only in the binding module's own tests.
+#[tokio::test]
+async fn resolve_with_nothing_wired_succeeds_and_the_first_call_reports_it() {
     let hub = ClientHub::new();
-    let Ok(scope) = profile_scope(OrdersProfile::NAME) else {
-        panic!("valid profile name must produce a scope");
+
+    // `with_nothing_derivable`, not a bare resolve: with `grpc-client` on, the resolve
+    // path would otherwise self-construct a client from a `POD_NAMESPACE` a concurrent
+    // test happens to have set, and this test would see a bound facade. See the
+    // helper's docs.
+    let Ok(cache) = with_nothing_derivable(
+        ClusterCacheV1::resolver(&hub)
+            .profile(OrdersProfile)
+            .resolve(),
+    )
+    .await
+    else {
+        panic!("an empty hub must not fail resolution");
     };
-    let backend: Arc<dyn ClusterCacheBackend> = Arc::new(linearizable_backend());
-    hub.register_scoped::<dyn ClusterCacheBackend>(scope, backend);
+
+    assert!(matches!(
+        cache.get("k").await,
+        Err(ClusterError::ProfileNotBound { profile: "orders" })
+    ));
+    // The weakest reading of every capability, so nothing a consumer branches on
+    // is falsely satisfied.
+    assert_eq!(cache.consistency(), CacheConsistency::EventuallyConsistent);
+    assert!(!cache.features().prefix_watch);
+}
+
+#[tokio::test]
+async fn resolve_happy_path_returns_facade() {
+    let hub = ClientHub::new();
+    client_with(&hub, linearizable_backend());
 
     let Ok(cache) = ClusterCacheV1::resolver(&hub)
         .profile(OrdersProfile)
         .require(CacheCapability::Linearizable)
         .resolve()
+        .await
     else {
         panic!("resolution against a matching backend must succeed");
     };
     assert_eq!(cache.consistency(), CacheConsistency::Linearizable);
 }
 
-#[test]
-fn resolve_rejects_capability_mismatch_at_startup() {
+#[tokio::test]
+async fn resolve_rejects_capability_mismatch_at_startup() {
     let hub = ClientHub::new();
-    let Ok(scope) = profile_scope(OrdersProfile::NAME) else {
-        panic!("valid profile name must produce a scope");
-    };
-    let backend: Arc<dyn ClusterCacheBackend> = Arc::new(StubBackend {
-        consistency: CacheConsistency::EventuallyConsistent,
-        prefix_watch: true,
-    });
-    hub.register_scoped::<dyn ClusterCacheBackend>(scope, backend);
+    client_with(
+        &hub,
+        StubBackend {
+            consistency: CacheConsistency::EventuallyConsistent,
+            prefix_watch: true,
+        },
+    );
 
     let result = ClusterCacheV1::resolver(&hub)
         .profile(OrdersProfile)
         .require(CacheCapability::Linearizable)
-        .resolve();
+        .resolve()
+        .await;
     assert!(matches!(
         result,
         Err(ClusterError::CapabilityNotMet {
@@ -198,4 +250,79 @@ fn resolve_rejects_capability_mismatch_at_startup() {
             ..
         })
     ));
+}
+
+/// What validation reads is the **descriptor**, not the bound backend — which is
+/// what lets a remote consumer validate at all, and what makes the diagnostic
+/// byte-identical across deployment profiles (DESIGN-DEPLOYABLE-GEAR §5.5).
+///
+/// The two are deliberately in conflict here: a backend that declares
+/// `Linearizable` behind a descriptor that does not. Only reading the descriptor
+/// can fail this, and only reading the descriptor can name the operator's
+/// provider rather than the Rust type.
+#[tokio::test]
+async fn validation_reads_the_descriptor_rather_than_the_backend() {
+    let hub = ClientHub::new();
+    let descriptor = ProfileDescriptor {
+        name: OrdersProfile::NAME.to_owned(),
+        cache: CacheDescriptor {
+            consistency: CacheConsistencyDto::EventuallyConsistent,
+            features: CacheFeaturesDto { prefix_watch: true },
+            provider: "postgres".to_owned(),
+        },
+        lock: LockDescriptor {
+            features: LockFeaturesDto { linearizable: true },
+            provider: "postgres".to_owned(),
+        },
+        leader_election: LeaderElectionDescriptor {
+            features: LeaderElectionFeaturesDto { linearizable: true },
+            provider: "postgres".to_owned(),
+        },
+        health: ProfileHealth::Serving,
+    };
+    StubClusterClient::for_profile(OrdersProfile::NAME)
+        // The backend says linearizable; the server-side descriptor says it is not.
+        .with_cache(Arc::new(linearizable_backend()))
+        .with_descriptor(descriptor)
+        .register(&hub);
+
+    let Err(ClusterError::CapabilityNotMet {
+        capability,
+        provider,
+        ..
+    }) = ClusterCacheV1::resolver(&hub)
+        .profile(OrdersProfile)
+        .require(CacheCapability::Linearizable)
+        .resolve()
+        .await
+    else {
+        panic!("the descriptor is what a declared capability is checked against");
+    };
+    assert_eq!(capability, "Linearizable");
+    // The operator-facing provider name, not `StubBackend`.
+    assert_eq!(provider, "postgres");
+}
+
+/// Validation is inline whenever the descriptor is in hand, and deferred when it
+/// is not — the two rows of §4.7.1's table, over the same unmet requirement.
+#[tokio::test]
+async fn an_unreachable_descriptor_defers_the_capability_check() {
+    let hub = ClientHub::new();
+    StubClusterClient::for_profile(OrdersProfile::NAME)
+        .with_cache(Arc::new(StubBackend {
+            consistency: CacheConsistency::EventuallyConsistent,
+            prefix_watch: true,
+        }))
+        .without_descriptor()
+        .register(&hub);
+
+    let result = ClusterCacheV1::resolver(&hub)
+        .profile(OrdersProfile)
+        .require(CacheCapability::Linearizable)
+        .resolve()
+        .await;
+    assert!(
+        result.is_ok(),
+        "with no descriptor there is nothing to validate against, so the check moves to readiness"
+    );
 }

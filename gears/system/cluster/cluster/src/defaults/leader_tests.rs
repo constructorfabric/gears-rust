@@ -7,7 +7,8 @@ use crate::defaults::test_cache::MemoryCache;
 use cluster_sdk::cache::ClusterCacheBackend;
 use cluster_sdk::cache::types::{PutRequest, Ttl};
 use cluster_sdk::error::ClusterError;
-use cluster_sdk::leader::{LeaderElectionBackend, LeaderStatus, LeaderWatchEvent};
+use cluster_sdk::leader::{ElectionConfig, LeaderElectionBackend, LeaderStatus, LeaderWatchEvent};
+use cluster_sdk::lease::LeaseToken;
 
 async fn settle() {
     for _ in 0..16 {
@@ -295,4 +296,143 @@ async fn renewal_extends_the_lease_beyond_the_initial_ttl() {
         panic!("get must succeed");
     };
     assert!(entry.is_some(), "the renewed claim must still be present");
+}
+
+// ---------------------------------------------------------------------------
+// The lease-token half of the trait (§5.8.1, item `L1`)
+// ---------------------------------------------------------------------------
+
+/// Two backends over one cache — the in-process stand-in for two cluster replicas
+/// over one backing store.
+fn two_handles(
+    cache: &Arc<MemoryCache>,
+) -> (CasBasedLeaderElectionBackend, CasBasedLeaderElectionBackend) {
+    let build = || {
+        CasBasedLeaderElectionBackend::new(Arc::clone(cache) as Arc<dyn ClusterCacheBackend>)
+            .expect("a linearizable cache must construct")
+    };
+    (build(), build())
+}
+
+#[tokio::test]
+async fn join_takes_the_claim_once_and_then_reports_a_follower() {
+    let cache = MemoryCache::linearizable();
+    let Ok(backend) = CasBasedLeaderElectionBackend::new(cache) else {
+        panic!("construct");
+    };
+    let config = ElectionConfig::default();
+    let Ok(Some(token)) = backend.join("primary", "cand-a", config).await else {
+        panic!("the first candidate must take the claim");
+    };
+    assert_eq!(token.name, "primary");
+    assert_eq!(token.owner, "cand-a");
+    assert_eq!(token.fence, 1);
+    assert!(
+        matches!(backend.join("primary", "cand-b", config).await, Ok(None)),
+        "losing an election is an ordinary outcome, not an error"
+    );
+}
+
+#[tokio::test]
+async fn a_claim_is_renewable_and_resignable_through_another_backend_handle() {
+    // The property that lets a leader survive the replica it was elected through
+    // (invariant I7).
+    let cache = MemoryCache::linearizable();
+    let (elector, other_replica) = two_handles(&cache);
+    let config = ElectionConfig::default();
+
+    let Ok(Some(token)) = elector.join("primary", "cand-a", config).await else {
+        panic!("join");
+    };
+    assert!(
+        other_replica.renew(&token, config.ttl()).await.is_ok(),
+        "a replica that never saw the join must serve the renew"
+    );
+    assert!(other_replica.resign(&token).await.is_ok());
+    // The election is open again.
+    assert!(matches!(
+        elector.join("primary", "cand-b", config).await,
+        Ok(Some(_))
+    ));
+}
+
+#[tokio::test]
+async fn renewing_a_claim_that_is_not_yours_is_expired() {
+    let cache = MemoryCache::linearizable();
+    let Ok(backend) = CasBasedLeaderElectionBackend::new(cache) else {
+        panic!("construct");
+    };
+    let config = ElectionConfig::default();
+    let Ok(Some(token)) = backend.join("primary", "cand-a", config).await else {
+        panic!("join");
+    };
+    let impostor = LeaseToken::new(&token.name, "cand-b", token.fence);
+    assert!(matches!(
+        backend.renew(&impostor, config.ttl()).await,
+        Err(ClusterError::LockExpired { name }) if name == "primary"
+    ));
+}
+
+#[tokio::test]
+async fn resigning_a_claim_nobody_holds_is_ok() {
+    let cache = MemoryCache::linearizable();
+    let Ok(backend) = CasBasedLeaderElectionBackend::new(cache) else {
+        panic!("construct");
+    };
+    assert!(
+        backend
+            .resign(&LeaseToken::new("primary", "cand-a", 1))
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn taking_a_lapsed_claim_strictly_increases_the_fence() {
+    let cache = MemoryCache::linearizable();
+    let Ok(backend) = CasBasedLeaderElectionBackend::new(cache) else {
+        panic!("construct");
+    };
+    let config = ElectionConfig::new(Duration::from_secs(5), 3).expect("a valid election config");
+    let Ok(Some(first)) = backend.join("primary", "cand-a", config).await else {
+        panic!("join");
+    };
+    tokio::time::advance(Duration::from_secs(6)).await;
+    let Ok(Some(second)) = backend.join("primary", "cand-b", config).await else {
+        panic!("a lapsed claim must be takeable");
+    };
+    assert!(
+        second.fence > first.fence,
+        "{} !> {}",
+        second.fence,
+        first.fence
+    );
+    // And the fenced-out predecessor cannot renew its way back in.
+    assert!(matches!(
+        backend.renew(&first, config.ttl()).await,
+        Err(ClusterError::LockExpired { .. })
+    ));
+}
+
+#[tokio::test]
+async fn an_elected_leader_and_a_token_claim_are_the_same_lease() {
+    // `elect` and `join` compete for one record, so a leader elected through the
+    // watch path blocks a token-path candidate.
+    let cache = MemoryCache::linearizable();
+    let Ok(backend) = CasBasedLeaderElectionBackend::new(cache) else {
+        panic!("construct");
+    };
+    let Ok(mut watch) = backend.elect("primary").await else {
+        panic!("elect");
+    };
+    assert!(matches!(
+        watch.changed().await,
+        LeaderWatchEvent::Status(LeaderStatus::Leader)
+    ));
+    assert!(matches!(
+        backend
+            .join("primary", "cand-b", ElectionConfig::default())
+            .await,
+        Ok(None)
+    ));
 }

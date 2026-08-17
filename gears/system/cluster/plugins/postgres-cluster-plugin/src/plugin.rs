@@ -130,22 +130,15 @@ impl PostgresClusterBuilder {
         let shutdown = CancellationToken::new();
 
         let cache = PostgresCache::new(pool.clone(), &config.schema);
-        // Establishes this instance's liveness beacon (DESIGN.md §3.3, §5.1)
-        // eagerly, so an unreachable database fails here rather than on the first
-        // `try_lock`. Its handle is shut down in `stop`, after the drain.
-        let crate::lock::LockRuntime {
-            lock,
-            beacon: lock_beacon,
-        } = PostgresLock::start(crate::lock::LockInit {
+        let lock = PostgresLock::new(crate::lock::LockInit {
             pool: pool.clone(),
-            connection_string: config.connection_string.clone(),
             schema: config.schema.clone(),
             reaper_interval: config.lock_reaper_interval(),
+            fence_retention: config.fence_retention(),
             metrics: Arc::clone(&metrics),
             provider: PROVIDER_NAME,
             guard_shutdown: shutdown.clone(),
-        })
-        .await?;
+        });
         let cache_dyn = instrumented_cache(&cache, Arc::clone(&metrics));
         // Both TTL reapers emit the plugin-local, non-contract signals of
         // DESIGN.md §8 (the reaper-sweep-duration histogram, plus the lock
@@ -197,11 +190,6 @@ impl PostgresClusterBuilder {
                 shutdown.cancel();
                 let _cache_reaper_exited = cache_reaper.await;
                 let _lock_reaper_exited = lock_reaper.await;
-                // The beacon does not observe `shutdown` (it has to outlive it,
-                // for the drain), so it is ended explicitly here too — otherwise
-                // this early return would leak its task and its connection until
-                // process exit (PGR-L5).
-                lock_beacon.shutdown().await;
                 // Bounded for the same reason as `stop()`'s close below: this
                 // path is reached because the database is already misbehaving.
                 close_pool(&pool).await;
@@ -216,7 +204,6 @@ impl PostgresClusterBuilder {
             cache,
             cache_dyn,
             lock,
-            lock_beacon: Some(lock_beacon),
             pool,
             cache_reaper: Some(cache_reaper),
             lock_reaper: Some(lock_reaper),
@@ -240,13 +227,6 @@ pub struct PostgresClusterHandle {
     /// crate (DESIGN.md §8).
     cache_dyn: Arc<dyn ClusterCacheBackend>,
     lock: Arc<PostgresLock>,
-    /// This instance's liveness beacon (`lock::beacon`, DESIGN.md §3.3), owned
-    /// here rather than by `PostgresLock` and shut down *after* the drain — the
-    /// drain deletes this instance's rows by beacon key, so the key must still be
-    /// readable when it runs, and releasing the beacon early would assert to the
-    /// fleet that this instance is dead. `Option` for the same `Drop`-impl reason
-    /// as the join handles below.
-    lock_beacon: Option<crate::lock::beacon::BeaconHandle>,
     pool: PgPool,
     // `Option`, not bare `JoinHandle`s: `PostgresClusterHandle` owns a `Drop`
     // impl below, and you cannot move a field out of a type that implements
@@ -310,9 +290,16 @@ impl PostgresClusterHandle {
     ///    in step 1 drops each `PgListener`, which closes its socket. No explicit
     ///    `UNLISTEN *` is issued, because ending the session is equivalent: a
     ///    closed backend cannot deliver further notifications (§10 step 3).
-    /// 4. Hands back every still-held lock in one beacon-scoped statement, then
-    ///    closes the beacon connection — which stops this instance vouching for
-    ///    anything the drain somehow missed — and finally the `sqlx::PgPool`.
+    /// 4. Closes the `sqlx::PgPool`.
+    ///
+    /// **No lock drain, deliberately.** A step 4 used to hand back every still-held
+    /// lock in one beacon-scoped `DELETE` before closing the beacon connection.
+    /// Deleting this instance's lease rows on the way out *is* the revocation
+    /// DESIGN-DEPLOYABLE-GEAR §5.8.2 exists to prevent, so held leases are now left
+    /// exactly where they are and lapse on their own deadlines (invariant I7). The
+    /// cost is that a name this instance held stays taken until its TTL instead of
+    /// being announced on `cluster_lock_released` the moment we let go — see
+    /// `PostgresLockHandle::stop`.
     pub async fn stop(mut self) {
         self.shutdown.cancel();
         // Close all active cache watches terminally *before* awaiting the
@@ -331,17 +318,6 @@ impl PostgresClusterHandle {
         .flatten()
         {
             let _exited = task.await;
-        }
-        // Hand back every still-held lock while the beacon key and the pool are
-        // both still live — the drain deletes and announces this instance's rows
-        // in one statement, so the rest of the fleet gets each name back
-        // immediately instead of waiting out its TTL (DESIGN.md §10 step 4,
-        // `PG-LIFE-003`).
-        self.lock.drain_beacon_rows().await;
-        // After the drain, never before: releasing the beacon while this process
-        // is still running asserts that the instance is dead (`lock::beacon`).
-        if let Some(beacon) = self.lock_beacon.take() {
-            beacon.shutdown().await;
         }
         // Bounded, not a bare `close()`: the guard tasks are detached and share
         // this pool with every cache operation, so an unresponsive backend could

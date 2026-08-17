@@ -15,6 +15,16 @@ metadata.docs.rs.all-features = true
 [lib]
 name = "cluster"
 
+# The Profile 3 deployable (DESIGN-DEPLOYABLE-GEAR §4.3 / §12.8). Deliberately
+# *not* behind `required-features`: the whole binary is a clap CLI feeding
+# `run_oop_with_options`, so gating it would only mean `cargo build --bin
+# cluster-oop` needed a feature flag to do the one thing it does. The cost is
+# that `toolkit/bootstrap`, `clap` and `grpc_hub` are unconditional dependencies
+# of the library too - see the notes on each below.
+[[bin]]
+name = "cluster-oop"
+path = "src/main.rs"
+
 # `testcontainers`/`testcontainers-modules` are declared as optional entries
 # under `[dependencies]` (Cargo does not allow optional `[dev-dependencies]`)
 # purely so the `integration` feature array can name them; every reference lives
@@ -35,8 +45,51 @@ workspace = true
 integration = ["dep:testcontainers", "dep:testcontainers-modules"]
 
 [dependencies]
-cluster-sdk = { workspace = true }
-toolkit = { workspace = true }
+# `grpc-client` is what carries the generated `*_server` traits and the encode
+# half of the error codec (`cluster_sdk::to_status`). The gear *serves* the
+# contract, so it needs the feature unconditionally — DESIGN §4.2's capability
+# set and Risk 8's `grpc-hub` linkage requirement follow from the same fact.
+cluster-sdk = { workspace = true, features = ["grpc-client"] }
+arc-swap = { workspace = true }
+# The four hand-written service impls (`src/api/grpc/`) and their streams.
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+# Platform-plane caller identity: `extract_internal_token_grpc` reads the
+# credential off the metadata, `toolkit-security` validates it into a
+# `PlatformSecurityContext` (§4.6).
+toolkit-transport-grpc = { workspace = true }
+toolkit-security = { workspace = true }
+secrecy = { workspace = true }
+# `bootstrap` is what carries `toolkit::bootstrap::oop::run_oop_with_options` -
+# the whole of `src/main.rs`. The feature is unconditional because the `[[bin]]`
+# is; it pulls the OoP bootstrap's own deps (serde-saphyr, the directory gRPC
+# client, tracing-appender/file-rotate, toolkit-http-middleware), of which this
+# gear already declared `toolkit-security` and `toolkit-transport-grpc` for `S1`.
+toolkit = { workspace = true, features = ["bootstrap"] }
+# `RestApiCapability::register_rest` takes and returns an `axum::Router`, so the
+# type must be nameable here; `S4`'s admin routes need it directly.
+axum = { workspace = true }
+# The `cluster-oop` CLI surface (`--config`, `-v`). `D3` adds the `migrate`
+# subcommand over the same parser.
+clap = { workspace = true }
+# `src/registered_gears.rs` links the hub gear into the binary. Risk 8 / `D-24`:
+# any process linking `cluster` must also link `grpc-hub`, because the `grpc`
+# capability without a hub is `RegistryError::GrpcRequiresHub` at startup. The
+# Cargo edge does not *satisfy* that requirement on its own - only the
+# `use grpc_hub as _;` in `registered_gears.rs` (and its counterpart in a
+# monolith's own file) forces the crate to be linked and its `inventory` entry
+# to exist - but it does make the requirement structural rather than documentary,
+# and it is what lets `tests/oop_bootstrap.rs` drive a hub-complete process.
+grpc_hub = { workspace = true }
+# `join_all` for the readiness healthcheck's probe fan-out (`src/health.rs`) —
+# the same primitive, from the same crate, the framework's own healthcheck
+# registry fans out with.
+futures-util = { workspace = true }
+# The subscription sweep's two instruments (`src/api/grpc/sweep.rs`, item `S2`).
+# A meter this gear owns directly rather than the `ClusterMetrics` port, on the
+# precedent the Postgres plugin's reaper set: that port is a backend's sink, it
+# carries no gauge, and a server-side session index is not a provider signal.
+opentelemetry = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -48,18 +101,49 @@ cf-gears-standalone-cluster-plugin = { path = "../plugins/standalone-cluster-plu
 cf-postgres-cluster-plugin = { path = "../plugins/postgres-cluster-plugin", version = "0.2.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `fence_retention: 1h` in operator YAML (DESIGN-DEPLOYABLE-GEAR §4.10). Taken
+# directly rather than through `toolkit` because the re-export list there carries
+# `var_expand` and not this module, and a `#[serde(with = "...")]` attribute needs
+# a real path. The `humantime-serde` feature is the platform's existing convention
+# for a duration in config (`toolkit-contract`'s wiring tuning fields use it), and
+# it adds no package to the lock file: `humantime` is already there through that
+# crate.
+toolkit-utils = { workspace = true, features = ["humantime-serde"] }
 # Optional, test-only — see the `[features]` and `cargo-shear` notes above.
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+# An in-memory metric reader, so the sweep's instruments are read back rather
+# than asserted about — including the label set, which invariant I15 makes a
+# testable property and not a convention.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# The wire error form, for the tests that assert a status reconstructs into the
+# typed `ClusterError` a consumer branches on (DESIGN-DEPLOYABLE-GEAR §6.9).
+toolkit-canonical-errors = { workspace = true }
 serde-saphyr = { workspace = true }
 uuid = { workspace = true }
 tracing-test = { workspace = true }
 parking_lot = { workspace = true }
+# Only to spell `OpenApiRegistry`'s signature in a test double: the trait names
+# `utoipa` schema types, so `register_rest` cannot be called from a test without
+# it. `S4`'s admin routes need the same double.
+utoipa = { workspace = true }
 # The shared backend-agnostic conformance suite, run against this gear's real
 # cache-derived default backends in `tests/conformance.rs`.
 # Path-only, no version on purpose: cargo drops a path-only dev-dependency from the published
 # manifest, so publishing this gear never needs the conformance crate on crates.io.
 cf-gears-cluster-conformance = { path = "../cluster-conformance" }
+# `tests/oop_bootstrap.rs` spawns the real `cluster-oop` binary, which connects to
+# DirectoryService eagerly and propagates the failure (`bootstrap/oop.rs:551-553`,
+# ask `A2`) - so the test has to serve one. `directory_grpc` carries the generated
+# `DirectoryServiceServer`, the same feature `toolkit/bootstrap` already turns on.
+cf-gears-system-sdks = { workspace = true, features = ["directory_grpc"] }
+# The spawned binary needs a config file and a `home_dir` that is not the
+# developer's; both are per-test temporary directories.
+tempfile = { workspace = true }
+# `tests/consumer_wiring.rs` sets `POD_NAMESPACE` for the duration of one host-runtime
+# run. `std::env::set_var` is `unsafe` in edition 2024 and the workspace forbids
+# `unsafe_code`, so the hermetic helper is the only available shape.
+temp-env = { workspace = true }

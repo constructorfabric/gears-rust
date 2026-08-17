@@ -7,6 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::error::ClusterError;
+use crate::lease::LeaseToken;
 use crate::lock::backend::DistributedLockBackend;
 use crate::lock::guard::LockGuard;
 use crate::lock::types::LockFeatures;
@@ -55,6 +56,49 @@ impl DistributedLockBackend for ScopedDistributedLockBackend {
             .lock(&scope::apply(&self.prefix, name), ttl, timeout)
             .await
     }
+
+    async fn acquire(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        self.inner
+            .acquire(&scope::apply(&self.prefix, name), owner, ttl)
+            .await
+    }
+
+    async fn acquire_waiting(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+        timeout: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        self.inner
+            .acquire_waiting(&scope::apply(&self.prefix, name), owner, ttl, timeout)
+            .await
+    }
+
+    /// Forwarded verbatim, prefix and all: the returned token names the *scoped*
+    /// lease, and it is presented back unchanged. Re-applying the prefix here would
+    /// double it, and stripping it on the way out would leave the inner backend
+    /// unable to find its own record — the same read-path rule the [`LockGuard`]
+    /// follows (DESIGN §3.8).
+    async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
+        self.inner.renew(token, ttl).await
+    }
+
+    /// Forwarded verbatim, for the reason [`renew`](Self::renew) gives.
+    async fn release(&self, token: &LeaseToken) -> Result<(), ClusterError> {
+        self.inner.release(token).await
+    }
+
+    /// Forwarded: a probe carries no name to scope, and a scoped view must not
+    /// answer the trait's `Ok(())` default over an unreachable backend.
+    async fn probe(&self) -> Result<(), ClusterError> {
+        self.inner.probe().await
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +139,13 @@ mod tests {
             _timeout: Duration,
         ) -> Result<LockGuard, ClusterError> {
             self.try_lock(name, _ttl).await
+        }
+
+        async fn probe(&self) -> Result<(), ClusterError> {
+            // Recorded under a name no lock could take, so a forwarded probe is
+            // distinguishable from the trait's `Ok(())` default.
+            self.seen.lock().expect("lock").push("<probe>".to_owned());
+            Ok(())
         }
     }
 
@@ -143,5 +194,23 @@ mod tests {
             backend.seen.lock().expect("lock").as_slice(),
             ["event-broker/shard-0/ledger"]
         );
+    }
+
+    /// A probe carries no name to scope, but it must still be forwarded — through
+    /// nesting too — or a scoped view answers the trait's `Ok(())` default over an
+    /// unreachable backend.
+    #[tokio::test]
+    async fn probe_is_forwarded_through_every_scoping_layer() {
+        let backend = Arc::new(RecordingBackend {
+            seen: Mutex::new(Vec::new()),
+        });
+        let inner = scoped(Arc::clone(&backend), "event-broker");
+        let outer = ScopedDistributedLockBackend::new(
+            Arc::new(inner),
+            scope::validated_prefix("shard-0").expect("valid prefix"),
+        );
+
+        assert!(outer.probe().await.is_ok());
+        assert_eq!(backend.seen.lock().expect("lock").as_slice(), ["<probe>"]);
     }
 }

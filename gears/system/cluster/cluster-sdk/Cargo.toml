@@ -23,9 +23,45 @@ workspace = true
 # (`observability::otel::OtelClusterMetrics`). Off by default so the SDK core
 # carries no OpenTelemetry dependency; plugins that emit metrics enable it.
 otel = ["dep:opentelemetry"]
+# The remote half of the deployable-gear seam (DESIGN-DEPLOYABLE-GEAR §3.4): the
+# `cluster.v1` contract traits, and from C2 the gRPC projection behind them. Off
+# by default because Profile 1 links neither.
+#
+# What is deliberately *not* behind it: `ClusterClient`, the DTOs and the error
+# codec. The gear needs the encode direction with no client linked, and Profile 1
+# needs the trait and the descriptor (§3.1, §12.1).
+grpc-client = [
+    # The `SecurityContextMarker` impls the projection's repr guard asserts on live
+    # behind this feature, while the guard itself is always emitted — so a crate
+    # projecting a contract whose methods take a security context must forward it.
+    "toolkit-contract/grpc-client",
+    "dep:toolkit-security",
+    "dep:futures-core",
+    # Direct deps the generated client and the compiled stubs need by name.
+    "dep:tonic",
+    "dep:toolkit-transport-grpc",
+    "dep:tonic-prost",
+    "dep:prost",
+    "dep:async-stream",
+    "dep:futures-util",
+    "dep:tonic-prost-build",
+]
 
 [dependencies]
 toolkit = { workspace = true }
+# The contract IR, descriptor and policy types the `#[toolkit::contract]` and
+# `#[derive(ContractError)]` codegen resolves against. Declared directly — and
+# unconditionally — because `contract_support_path()` prefers a direct
+# `toolkit-contract` edge over the `::toolkit::contract_support` fallback, so
+# having it here is what makes the generated paths match the reference
+# implementation in `examples/toolkit/api-contracts`. Its own transport features
+# are off by default.
+toolkit-contract = { workspace = true }
+# The wire error form. `ClusterError` stays the frozen Rust-facing contract;
+# `CanonicalError`/`Problem` is what crosses the boundary, and `src/convert.rs`
+# is the codec between them (§6.9). Unfeatured: the cluster gear needs the
+# encode direction with no gRPC client linked.
+toolkit-canonical-errors = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
@@ -51,10 +87,76 @@ schemars = { workspace = true }
 # so the SDK core stays OpenTelemetry-free; the metrics feature is enabled by
 # plugins that emit (see `observability::otel`).
 opentelemetry = { workspace = true, optional = true }
+# Optional: supplies `PlatformSecurityContext`, the mandatory first parameter of
+# every contract-trait method (§6.2). Only `src/contract.rs` needs it, so it
+# rides `grpc-client`.
+toolkit-security = { workspace = true, optional = true }
+# Optional: `#[toolkit::contract]` rewrites a `#[streaming]` method's return type
+# to `Pin<Box<dyn futures_core::Stream<..>>>` and names the crate unqualified, so
+# the dependency is required wherever a streaming contract is declared — which is
+# `src/contract.rs` alone.
+futures-core = { workspace = true, optional = true }
+# Optional: the gRPC projection of the contract (`src/grpc.rs`). The generated
+# stubs carry both halves — the client backs `Remote*Backend` (item `K2`), and the
+# `*_server` traits are what the cluster gear hand-writes its four service impls
+# against (item `S1`, §6.1).
+tonic = { workspace = true, features = ["transport"], optional = true }
+# Optional: supplies `attach_problem`, which puts the `Problem` envelope on the
+# `x-toolkit-problem-bin` trailer where `map_tonic_status` looks for it. The
+# encode half of the error codec (`convert::to_status`) lives in this crate so
+# its match over `ClusterWireError` stays exhaustive — see `convert`'s docs.
+toolkit-transport-grpc = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+# Named directly by the generated streaming client bodies.
+async-stream = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+
+[build-dependencies]
+# Optional so a default-feature build runs no protoc and needs none installed.
+tonic-prost-build = { workspace = true, optional = true }
+
+# The regenerator imports the `grpc-client`-gated `grpc` module, so without
+# `required-features` a default-feature `cargo test --workspace` would try to build
+# it and fail on the missing module.
+[[example]]
+name = "gen_grpc_proto"
+required-features = ["grpc-client"]
 
 [dev-dependencies]
+# Backs `tests/protogen_shape.rs`, which asserts that the `cluster.v1` contract IR
+# and DTO schemas actually project to a `.proto`. Three of protogen's constraints
+# are violated by writing ordinary Rust, and one of them — `Vec<u8>` rendering as
+# an integer array and projecting to `repeated int64` — fails *silently* on the
+# cache hot path. `C2` reuses this to regenerate the committed `.proto`.
+# Path-only, deliberately: no `version`, and not `workspace = true`. It is a
+# dev-dependency and *not* a normal dependency of this crate, so a versioned
+# requirement would force `cf-gears-toolkit-contract-protogen` to already be on
+# crates.io when `cluster-sdk` publishes — a publish-order constraint release-plz
+# cannot satisfy. Dev-dep paths are stripped from the published manifest, so this
+# costs downstream consumers nothing. Enforced by `make check-release-config`.
+toolkit-contract-protogen = { package = "cf-gears-toolkit-contract-protogen", path = "../../../../libs/toolkit-contract-protogen" }
+# Backs the staleness check in `tests/protogen_shape.rs`, which re-serialises the
+# lockfile to prove regeneration assigned no new field numbers.
+toml = { workspace = true }
+# Hermetic per-case environment mutation for `wiring_tests.rs`, which drives
+# `derive_endpoint()` over `POD_NAMESPACE`. Direct `std::env::set_var` is `unsafe`
+# in edition 2024 and the workspace forbids `unsafe_code`, so this is not a
+# convenience - it is the only way to write the test. Same choice, for the same
+# reasons, as `libs/rustls-corecrypto-provider`.
+temp-env = { workspace = true }
 # `test-util` (not part of the `full` feature set) enables `tokio::time::pause`
 # /`advance` and `#[tokio::test(start_paused = true)]` so renewal and TTL logic
 # is driven deterministically without real sleeps.
 tokio = { workspace = true, features = ["test-util"] }
+# The missing-`healthcheck()` WARN assertions in `requirements_tests.rs`. Not
+# `tracing-test` (already a workspace dep) for two reasons, both measured: that
+# crate keeps ONE process-global buffer which is never cleared and isolates tests
+# only by filtering on a span named after the test fn — and `tokio::spawn` does not
+# propagate spans, so the WARN raised by the contributor-silence one-shot is
+# attributed to whichever span happens to be entered on the polling thread. A
+# per-test `set_default` buffer is what makes `a_wired_consumer_is_never_warned`
+# (an *absence* assertion) sound. Same choice, same reason, as the postgres
+# plugin's `scoped_warn_capture`.
+tracing-subscriber = { workspace = true }
 

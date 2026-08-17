@@ -44,6 +44,7 @@ async fn omit_default_registers_all_three_then_stop_unbinds() {
             .profile(EventBroker)
             .require(CacheCapability::Linearizable)
             .resolve()
+            .await
             .is_ok(),
         "the bound linearizable cache resolves"
     );
@@ -51,6 +52,7 @@ async fn omit_default_registers_all_three_then_stop_unbinds() {
         LeaderElectionV1::resolver(&hub)
             .profile(EventBroker)
             .resolve()
+            .await
             .is_ok(),
         "omit-default leader election resolves"
     );
@@ -58,6 +60,7 @@ async fn omit_default_registers_all_three_then_stop_unbinds() {
         DistributedLockV1::resolver(&hub)
             .profile(EventBroker)
             .resolve()
+            .await
             .is_ok(),
         "omit-default lock resolves"
     );
@@ -68,13 +71,15 @@ async fn omit_default_registers_all_three_then_stop_unbinds() {
     assert!(matches!(
         ClusterCacheV1::resolver(&hub)
             .profile(EventBroker)
-            .resolve(),
+            .resolve()
+            .await,
         Err(ClusterError::ProfileNotBound { .. })
     ));
     assert!(matches!(
         LeaderElectionV1::resolver(&hub)
             .profile(EventBroker)
-            .resolve(),
+            .resolve()
+            .await,
         Err(ClusterError::ProfileNotBound { .. })
     ));
 }
@@ -97,6 +102,7 @@ async fn stop_revokes_an_active_leader_before_shutdown_completes() {
     let leader = LeaderElectionV1::resolver(&hub)
         .profile(EventBroker)
         .resolve()
+        .await
         .expect("leader election resolves");
     let mut watch = leader.elect("primary").await.expect("election joins");
     assert!(matches!(
@@ -138,6 +144,7 @@ async fn stop_revokes_active_lock_and_cache_watches_before_shutdown_completes() 
     let lock = DistributedLockV1::resolver(&hub)
         .profile(EventBroker)
         .resolve()
+        .await
         .expect("lock resolves");
     let _held = lock
         .try_lock("ledger", Duration::from_secs(100))
@@ -280,6 +287,7 @@ async fn explicit_backends_override_defaults() {
     LeaderElectionV1::resolver(&hub)
         .profile(EventBroker)
         .resolve()
+        .await
         .expect("leader election resolves")
         .elect("primary")
         .await
@@ -293,6 +301,7 @@ async fn explicit_backends_override_defaults() {
     DistributedLockV1::resolver(&hub)
         .profile(EventBroker)
         .resolve()
+        .await
         .expect("lock resolves")
         .try_lock("ledger", Duration::from_secs(30))
         .await
@@ -361,4 +370,117 @@ fn drop_during_panic_warns_instead_of_double_panicking() {
         logs_contain("dropped during panic unwind"),
         "the Drop guard must warn (not panic) during unwind"
     );
+}
+
+/// A second typed profile, so two profiles can be bound to one cache instance.
+#[derive(Clone, Copy)]
+struct Scheduler;
+impl ClusterProfile for Scheduler {
+    const NAME: &'static str = "scheduler";
+}
+
+/// DESIGN 5.3: the point of recording instance identity is that sharing is
+/// observable. Two profiles bound to the *same* cache `Arc` are served by one
+/// instance - one store, one sweeper, one stop hook - and must report one id,
+/// while each still gets its own SDK-default lock and election layered over it.
+///
+/// This is also the builder path's descriptor case: no operator config exists
+/// here, so provider identity falls back to the concrete backend type, which is
+/// the identity `CapabilityNotMet` already carries.
+#[tokio::test]
+async fn two_profiles_on_one_cache_report_one_cache_instance() {
+    let hub = Arc::new(ClientHub::new());
+    let plugin = StandaloneClusterPlugin::builder()
+        .build_and_start()
+        .expect("plugin starts");
+    let cache = plugin.cache();
+
+    let (handle, bound) = ClusterWiring::builder(Arc::clone(&hub))
+        .profile(EventBroker, ProfileBackends::new(Arc::clone(&cache)))
+        .profile(Scheduler, ProfileBackends::new(cache))
+        .on_stop(move || async move { plugin.stop().await })
+        .build_and_start_bound()
+        .expect("wiring starts");
+
+    assert_eq!(bound.len(), 2);
+    let broker = &bound[0];
+    let scheduler = &bound[1];
+    assert_eq!(broker.name, "event-broker");
+    assert_eq!(scheduler.name, "scheduler");
+
+    assert_eq!(
+        broker.instances.cache, scheduler.instances.cache,
+        "one cache Arc bound to two profiles is one instance"
+    );
+    assert_ne!(
+        broker.instances.lock, scheduler.instances.lock,
+        "each profile gets its own SDK-default lock over that shared cache"
+    );
+    assert_ne!(
+        broker.instances.leader_election, scheduler.instances.leader_election,
+        "and its own SDK-default election"
+    );
+
+    // The builder path has no configured provider name, so the descriptor
+    // reports the concrete backend type instead.
+    assert!(
+        broker
+            .descriptor()
+            .cache
+            .provider
+            .contains("StandaloneCache"),
+        "expected the concrete cache backend type, got: {}",
+        broker.descriptor().cache.provider
+    );
+    assert_eq!(
+        broker.descriptor().cache.provider,
+        scheduler.descriptor().cache.provider,
+        "both profiles describe the same cache"
+    );
+
+    handle.stop().await;
+}
+
+/// The hub stays all-or-nothing: a later profile failing registration rolls back
+/// every profile registered before it (DESIGN §3.7). Returning the bound-profile
+/// set does not change that — the set is built first, but nothing is published
+/// from it, so a failure discards the whole batch.
+#[tokio::test]
+async fn a_failed_registration_rolls_back_the_profiles_before_it() {
+    let hub = Arc::new(ClientHub::new());
+    let plugin = StandaloneClusterPlugin::builder()
+        .build_and_start()
+        .expect("plugin starts");
+    let cache = plugin.cache();
+
+    // The second profile's name violates the cluster name rule, which
+    // registration rejects — after the first profile has already registered.
+    let result = ClusterWiring::builder(Arc::clone(&hub))
+        .profile(EventBroker, ProfileBackends::new(Arc::clone(&cache)))
+        .profile_named("not a valid name", ProfileBackends::new(cache))
+        .build_and_start();
+
+    assert!(
+        matches!(result, Err(ClusterError::InvalidName { .. })),
+        "an invalid profile name must fail registration"
+    );
+    // A failed wiring publishes nothing and registers no cluster client, so the
+    // rollback shows up as the nothing-wired case: `resolve()` succeeds and the
+    // first call names the profile (DESIGN-DEPLOYABLE-GEAR §4.9.1).
+    let Ok(cache) = ClusterCacheV1::resolver(&hub)
+        .profile(EventBroker)
+        .resolve()
+        .await
+    else {
+        panic!("an empty hub must not fail resolution");
+    };
+    assert!(
+        matches!(
+            cache.get("k").await,
+            Err(ClusterError::ProfileNotBound { .. })
+        ),
+        "the profile registered before the failure must be rolled back"
+    );
+
+    plugin.stop().await;
 }

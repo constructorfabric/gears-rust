@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use cluster::{ClusterHandle, ClusterWiring, ProfileBackends};
 use cluster_sdk::cache::{
     CacheConsistency, CacheEntry, CacheEvent, CacheFeatures, CacheWatch, CacheWatchEvent,
     CacheWatchSender, ClusterCacheBackend, PutRequest, Ttl,
@@ -36,6 +37,7 @@ use cluster_sdk::cache::{
 use cluster_sdk::error::ClusterError;
 use cluster_sdk::profile::ClusterProfile;
 use tokio::time::Instant;
+use toolkit::client_hub::ClientHub;
 
 /// The typed profile every smoke test binds its backends under. A single shared
 /// profile keeps the register/resolve round-trip uniform across the suite.
@@ -418,4 +420,29 @@ impl ClusterCacheBackend for MemCacheBackend {
             .map(|(key, _)| key.clone())
             .collect())
     }
+}
+
+/// Wires `cache` as [`SmokeProfile`] through the **real** [`ClusterWiring`] and
+/// makes it resolvable in `hub`.
+///
+/// Since item `K4` a facade resolves through the process's single
+/// `dyn ClusterClient` rather than through the per-profile hub scopes
+/// (DESIGN-DEPLOYABLE-GEAR §4.9.3), so a smoke test cannot bind a primitive by
+/// calling `register_*_backend` alone. Going through the wiring is also what these
+/// tests want on their own terms: it is the same omit-default trio over the same
+/// cache that the fixture used to assemble by hand, built by the code that ships.
+///
+/// The returned handle must be stopped — a dropped one panics in debug builds by
+/// design (ADR-006).
+pub fn wire_smoke_profile(
+    hub: &Arc<ClientHub>,
+    cache: Arc<dyn ClusterCacheBackend>,
+) -> ClusterHandle {
+    let Ok(handle) = ClusterWiring::builder(Arc::clone(hub))
+        .profile(SmokeProfile, ProfileBackends::new(cache))
+        .build_and_start()
+    else {
+        panic!("wiring the smoke profile over a linearizable cache must succeed");
+    };
+    handle
 }

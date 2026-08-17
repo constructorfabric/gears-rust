@@ -252,66 +252,6 @@ async fn pg_lock_006_lock_expired_on_renew_past_ttl() {
     handle.stop().await;
 }
 
-/// `PG-LOCK-007`: forcibly closing the Postgres backend that holds this
-/// instance's **liveness beacon** (`pg_terminate_backend`) frees every lock the
-/// instance held, without waiting out any TTL.
-///
-/// The mechanism this asserts is the whole reason the beacon exists. Postgres
-/// releases the beacon's advisory lock the instant that connection dies, so the
-/// acquire predicate's `NOT EXISTS (SELECT 1 FROM pg_locks ...)` branch turns
-/// true for every row the dead incarnation wrote — and any acquirer, here or
-/// elsewhere, takes those names on its own next attempt. Nothing has to notice
-/// on the dead instance's behalf.
-///
-/// The TTL is 10 minutes precisely so a pass cannot be the TTL sweep doing its
-/// ordinary job: reacquisition inside a few seconds can only come from the
-/// liveness branch of the predicate.
-#[tokio::test]
-async fn pg_lock_007_beacon_loss_frees_every_lock_before_the_ttl() {
-    let (_container, config) = common::start_postgres_lock_only().await;
-    let connection_string = config.connection_string.clone();
-    let handle = PostgresLockPlugin::builder(config)
-        .build_and_start()
-        .await
-        .unwrap();
-    let lock = handle.lock();
-
-    let guard = lock
-        .try_lock("res", Duration::from_mins(10))
-        .await
-        .expect("acquire");
-
-    let control_pool = common::raw_pool(&connection_string).await;
-    let pid = handle.__test_lock().__test_beacon_backend_pid();
-    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
-        .bind(pid)
-        .fetch_one(&control_pool)
-        .await
-        .expect("pg_terminate_backend succeeds");
-    assert!(
-        terminated,
-        "PG-LOCK-007: pg_terminate_backend must report success"
-    );
-
-    let released = common::wait_until(
-        Duration::from_secs(15),
-        Duration::from_millis(50),
-        || async { lock.try_lock("res", Duration::from_secs(30)).await.is_ok() },
-    )
-    .await;
-    assert!(
-        released,
-        "PG-LOCK-007: a lock whose holder's beacon died must become acquirable at once, not at \
-         its 10-minute TTL"
-    );
-
-    // The original acquisition is gone; drop its guard without releasing (the
-    // `holder_id` fence makes a release a no-op against the successor's row).
-    std::mem::forget(guard);
-    control_pool.close().await;
-    handle.stop().await;
-}
-
 /// `PG-LOCK-008`: of 20 concurrent `try_lock` callers on the same name,
 /// exactly one succeeds and every other returns `LockContended`.
 #[tokio::test]
@@ -449,7 +389,7 @@ async fn pg_lock_010_standalone_plugin_creates_only_lock_table() {
 /// callable directly off this plugin's own builder.
 #[tokio::test]
 async fn pg_lock_011_end_to_end_yaml_routing_lock_postgres_cache_standalone() {
-    use cluster::{ClusterConfig, ClusterWiring, ProviderRegistry};
+    use cluster::{ClusterConfig, ClusterWiring, ProfileRegistry, ProviderRegistry};
     use cluster_sdk::lock::DistributedLockV1;
     use cluster_sdk::profile::ClusterProfile;
     use postgres_cluster_plugin::PostgresLockProvider;
@@ -490,15 +430,22 @@ async fn pg_lock_011_end_to_end_yaml_routing_lock_postgres_cache_standalone() {
         .with_cache_provider(Arc::new(StandaloneCacheProvider))
         .with_lock_provider(Arc::new(PostgresLockProvider));
     let hub = Arc::new(ClientHub::new());
-    let handle = ClusterWiring::from_config(Arc::clone(&hub), &cluster_config, &providers)
-        .await
-        .expect(
-            "PG-LOCK-011: wiring must resolve lock: postgres independently of cache: standalone",
-        );
+    let (mut handle, bound) = ClusterWiring::from_config(
+        Arc::clone(&hub),
+        &cluster_config,
+        &providers,
+    )
+    .await
+    .expect("PG-LOCK-011: wiring must resolve lock: postgres independently of cache: standalone");
+    // The step the gear's `start` takes next: publish the bound set and register
+    // the local cluster client a facade resolves through (DESIGN-DEPLOYABLE-GEAR
+    // section 4.9.3). Without it nothing in this process can reach the profile.
+    handle.publish(&Arc::new(ProfileRegistry::new()), bound);
 
     let lock = DistributedLockV1::resolver(&hub)
         .profile(RoutingProfile)
         .resolve()
+        .await
         .expect("lock facade resolves for the routing profile");
 
     let guard = lock
@@ -578,23 +525,26 @@ async fn pg_lock_012_held_locks_do_not_consume_pool_connections() {
         "PG-LOCK-012: all {HELD} locks must be genuinely held, not silently coalesced"
     );
 
-    // And the fleet-wide advisory-lock population is *one* — this instance's
-    // beacon — however many locks are held. That is the invariant the whole model
-    // rests on (nothing per-lock is ever locked, which is why
-    // `pg_advisory_unlock` is never called anywhere in the plugin), so assert it
-    // directly rather than inferring it from the pool not being exhausted.
-    let beacon_pid = handle.__test_lock().__test_beacon_backend_pid();
+    // And the fleet-wide advisory-lock population is *zero*, however many locks are
+    // held. That is the invariant the whole model rests on (nothing per-lock is ever
+    // locked, which is why `pg_advisory_unlock` is never called anywhere in the
+    // plugin), so assert it directly rather than inferring it from the pool not being
+    // exhausted.
+    //
+    // It used to be *one* — the instance's liveness beacon, the single advisory lock
+    // this plugin took. With the beacon removed (DESIGN-DEPLOYABLE-GEAR §5.8.2) the
+    // plugin takes none at all, so the assertion tightens to the empty set and needs
+    // no exemption for a pid of its own.
     let advisory_holders: Vec<i32> = sqlx::query_scalar(
         "SELECT DISTINCT pid FROM pg_locks WHERE locktype = 'advisory' AND granted = true",
     )
     .fetch_all(&control_pool)
     .await
     .expect("pg_locks query succeeds");
-    assert_eq!(
-        advisory_holders,
-        vec![beacon_pid],
-        "PG-LOCK-012: holding {HELD} locks must take no advisory lock beyond the instance's own \
-         beacon"
+    assert!(
+        advisory_holders.is_empty(),
+        "PG-LOCK-012: holding {HELD} locks must take no advisory lock at all, found holders on \
+         pids {advisory_holders:?}"
     );
 
     // The pool is still usable while all 12 locks are held — `renew` writes to
@@ -607,110 +557,6 @@ async fn pg_lock_012_held_locks_do_not_consume_pool_connections() {
     for guard in guards {
         guard.release().await.expect("release succeeds");
     }
-    handle.stop().await;
-}
-
-/// `PG-LOCK-013`: losing the beacon invalidates **every** lock this instance
-/// holds at once — including one whose consumer is sitting quietly in its
-/// critical section and never touches it again.
-///
-/// One beacon per instance means one blast radius, deliberately (DESIGN.md §5.1):
-/// a connection blip has one predictable outcome rather than a per-lock recovery
-/// path to reason about.
-///
-/// Three assertions, each covering a different way this could go wrong:
-///
-/// * **`renew` → `LockExpired`.** The rows are untouched by the beacon's death,
-///   so an implementation missing the `holder_beacon_*` fence would find the row,
-///   match the `holder_id`, and report a *successful* renewal for a lock every
-///   other instance can already steal — silently losing mutual exclusion rather
-///   than failing.
-/// * **`local_holders` empties without being asked.** The quiet holder generates
-///   no traffic at all, so nothing would purge it lazily. This is what the
-///   once-per-second ping is for.
-/// * **The negative**: a lock is not silently *retained* across the loss just
-///   because nobody else happens to want it. Without local detection the
-///   semantics would quietly weaken to "you remain the holder until someone
-///   takes it from you", which is precisely what the ping exists to prevent.
-#[tokio::test]
-async fn pg_lock_013_beacon_loss_invalidates_every_held_lock() {
-    let (_container, config) = common::start_postgres_lock_only().await;
-    let connection_string = config.connection_string.clone();
-    let handle = PostgresLockPlugin::builder(config)
-        .build_and_start()
-        .await
-        .unwrap();
-    let lock = handle.lock();
-    let concrete = handle.__test_lock();
-
-    let first = lock
-        .try_lock("res", Duration::from_mins(10))
-        .await
-        .expect("first acquire");
-    let second = lock
-        .try_lock("res2", Duration::from_mins(10))
-        .await
-        .expect("second acquire");
-    assert_eq!(
-        concrete.__test_local_holder_count(),
-        2,
-        "setup: both locks must be registered locally"
-    );
-    let epoch_before = concrete.__test_beacon_epoch();
-
-    let control_pool = common::raw_pool(&connection_string).await;
-    let beacon_pid = concrete.__test_beacon_backend_pid();
-    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
-        .bind(beacon_pid)
-        .fetch_one(&control_pool)
-        .await
-        .expect("pg_terminate_backend succeeds");
-    assert!(terminated, "setup: terminating the beacon must succeed");
-
-    // Nothing here touches either lock: the purge and the fresh beacon have to
-    // come from the ping noticing, not from a consumer asking.
-    let purged = common::wait_until(
-        Duration::from_secs(15),
-        Duration::from_millis(25),
-        || async {
-            concrete.__test_local_holder_count() == 0
-                && concrete.__test_beacon_epoch() > epoch_before
-        },
-    )
-    .await;
-    assert!(
-        purged,
-        "PG-LOCK-013: the ping must notice the loss and purge every local holder, including the \
-         one whose consumer never touched it again"
-    );
-
-    let renewed = first.renew(Duration::from_secs(30)).await;
-    assert!(
-        matches!(renewed, Err(ClusterError::LockExpired { .. })),
-        "PG-LOCK-013: renew after a beacon loss must report LockExpired, got {renewed:?}"
-    );
-
-    // Both names are genuinely free — not merely forgotten locally — well inside
-    // their 10-minute TTLs.
-    for name in ["res", "res2"] {
-        let reacquired = common::wait_until(
-            Duration::from_secs(15),
-            Duration::from_millis(50),
-            || async { lock.try_lock(name, Duration::from_secs(30)).await.is_ok() },
-        )
-        .await;
-        assert!(
-            reacquired,
-            "PG-LOCK-013: {name} must be acquirable again once the beacon that vouched for it is \
-             gone"
-        );
-    }
-
-    // Both guards belong to the dead incarnation; releasing either is a fenced
-    // no-op against the successor's row.
-    std::mem::forget(first);
-    std::mem::forget(second);
-    control_pool.close().await;
     handle.stop().await;
 }
 
@@ -783,209 +629,6 @@ async fn pg_lock_014_expired_lock_is_reclaimed_without_its_owner() {
     owner.stop().await;
 }
 
-/// `PG-LOCK-015`: the reaper's orphan sweep reclaims a row this instance wrote
-/// but holds no guard for, and leaves a legitimately-held row alone.
-///
-/// An orphan is what a `try_acquire` cancelled between its committed INSERT and
-/// its `local_holders` registration leaves behind — routine, since `lock()` wraps
-/// every attempt in a timeout. It is the one state nothing else can resolve: the
-/// row is unexpired *and* vouched for by a live beacon, so no instance will steal
-/// it, **including this one**, whose own next acquire reads its own orphan as a
-/// live holder. The name is wedged for everyone until the TTL.
-///
-/// Seam-driven on both sides: the orphan is planted directly rather than by
-/// racing a microsecond-wide cancellation window, and the sweep is run on demand
-/// rather than by waiting out reaper intervals. What is under test is the sweep's
-/// selectivity, not the timing of either.
-#[tokio::test]
-async fn pg_lock_015_orphan_sweep_reclaims_an_unregistered_row() {
-    let (_container, config) =
-        common::start_postgres_lock_only_with(json!({ "lock_reaper_interval_ms": 3_600_000 }))
-            .await;
-    let connection_string = config.connection_string.clone();
-    let handle = PostgresLockPlugin::builder(config)
-        .build_and_start()
-        .await
-        .unwrap();
-    let lock = handle.lock();
-    let concrete = handle.__test_lock();
-    let control_pool = common::raw_pool(&connection_string).await;
-
-    let kept = lock
-        .try_lock("keep", Duration::from_mins(10))
-        .await
-        .expect("the accounted lock acquires");
-    // Backdated well past the fence below, as a row abandoned an interval ago
-    // would be.
-    concrete
-        .__test_orphan_row("orphan", Duration::from_mins(1))
-        .await
-        .expect("the orphan seam runs");
-
-    // The orphan really does wedge the name — for this instance too. This is the
-    // damage being repaired, so assert it rather than assuming it.
-    let wedged = lock.try_lock("orphan", Duration::from_secs(30)).await;
-    assert!(
-        matches!(wedged, Err(ClusterError::LockContended { .. })),
-        "setup: an orphaned row must read as a live holder even to its own writer, got {wedged:?}"
-    );
-
-    let reclaimed = concrete
-        .__test_sweep_orphans_once(Duration::from_secs(5))
-        .await
-        .expect("the sweep runs");
-    assert_eq!(
-        reclaimed, 1,
-        "PG-LOCK-015: the sweep must reclaim exactly the one unregistered row"
-    );
-
-    let remaining: Vec<String> = sqlx::query_scalar("SELECT name FROM cluster_lock ORDER BY name")
-        .fetch_all(&control_pool)
-        .await
-        .expect("cluster_lock query succeeds");
-    assert_eq!(
-        remaining,
-        vec!["keep".to_owned()],
-        "PG-LOCK-015: the held row must survive and the orphan must be gone - a sweep that took \
-         neither, or both, would be equally wrong"
-    );
-
-    let reacquired = lock
-        .try_lock("orphan", Duration::from_secs(30))
-        .await
-        .expect("PG-LOCK-015: the freed name must be acquirable once the sweep reclaimed it");
-
-    kept.release().await.expect("release succeeds");
-    reacquired.release().await.expect("release succeeds");
-    control_pool.close().await;
-    handle.stop().await;
-}
-
-/// `PG-LOCK-017`: the orphan sweep never touches rows that are not its business —
-/// another instance's rows, and rows bearing a *previous* incarnation's beacon.
-///
-/// Its `WHERE` is keyed on this incarnation's beacon, which is what makes
-/// detection exact rather than heuristic. Getting that wrong in the permissive
-/// direction is the dangerous failure: deleting a foreign instance's row hands
-/// that instance's live lock to someone else.
-#[tokio::test]
-async fn pg_lock_017_orphan_sweep_only_touches_this_incarnations_rows() {
-    let (_container, config) =
-        common::start_postgres_lock_only_with(json!({ "lock_reaper_interval_ms": 3_600_000 }))
-            .await;
-    let connection_string = config.connection_string.clone();
-    let sweeper = PostgresLockPlugin::builder(config)
-        .build_and_start()
-        .await
-        .expect("the sweeping instance starts");
-    let foreign = PostgresLockPlugin::builder(common::lock_config_json(
-        &connection_string,
-        json!({ "lock_reaper_interval_ms": 3_600_000 }),
-    ))
-    .build_and_start()
-    .await
-    .expect("the foreign instance starts");
-    let control_pool = common::raw_pool(&connection_string).await;
-
-    // A foreign instance's live lock, and a row bearing a beacon key no live
-    // instance holds (what a previous incarnation of *this* process leaves).
-    let foreign_held = foreign
-        .lock()
-        .try_lock("foreign", Duration::from_mins(10))
-        .await
-        .expect("the foreign instance acquires");
-    sqlx::query(
-        "INSERT INTO cluster_lock \
-         (name, holder_id, acquired_at, expires_at, holder_beacon_hi, holder_beacon_lo) \
-         VALUES ('previous', md5('previous')::uuid, now() - interval '1 minute', \
-                 now() + interval '10 minutes', 7, 7)",
-    )
-    .execute(&control_pool)
-    .await
-    .expect("seed a previous incarnation's row");
-
-    let reclaimed = sweeper
-        .__test_lock()
-        .__test_sweep_orphans_once(Duration::from_secs(5))
-        .await
-        .expect("the sweep runs");
-    assert_eq!(
-        reclaimed, 0,
-        "PG-LOCK-017: neither a foreign instance's row nor a previous incarnation's is this \
-         sweep's business"
-    );
-
-    let remaining: Vec<String> = sqlx::query_scalar("SELECT name FROM cluster_lock ORDER BY name")
-        .fetch_all(&control_pool)
-        .await
-        .expect("cluster_lock query succeeds");
-    assert_eq!(
-        remaining,
-        vec!["foreign".to_owned(), "previous".to_owned()],
-        "PG-LOCK-017: both rows must survive a sweep keyed on a different beacon"
-    );
-
-    foreign_held.release().await.expect("release succeeds");
-    control_pool.close().await;
-    foreign.stop().await;
-    sweeper.stop().await;
-}
-
-/// `PG-LOCK-018`: the sweep's `acquired_at` fence exempts an acquisition
-/// registered between the sweep's snapshot of `local_holders` and its `DELETE`.
-///
-/// Without the fence this races every live acquisition: the known-`holder_id` set
-/// is read in Rust *before* the statement executes, so a row committing in
-/// between would be read as an orphan and deleted out from under its own guard.
-/// The fence is a database timestamp from the *previous* reaper wake, so a row is
-/// only ever deleted if it was already unregistered one full wake earlier.
-///
-/// Driven at the fence rather than at the clock: a freshly-acquired lock is swept
-/// with a fence in the *future* (which must reclaim nothing — the fence is what
-/// protects it) and then, as a positive control, the same row unregistered and
-/// swept with a fence past its `acquired_at`.
-#[tokio::test]
-async fn pg_lock_018_orphan_sweep_fence_exempts_a_fresh_acquisition() {
-    let (_container, config) =
-        common::start_postgres_lock_only_with(json!({ "lock_reaper_interval_ms": 3_600_000 }))
-            .await;
-    let handle = PostgresLockPlugin::builder(config)
-        .build_and_start()
-        .await
-        .unwrap();
-    let concrete = handle.__test_lock();
-
-    // An orphan too *young* for the fence: unregistered, but written after the
-    // previous wake. Exactly the shape of an acquisition still on its way to
-    // registering, and the sweep must leave it alone.
-    concrete
-        .__test_orphan_row("fresh", Duration::ZERO)
-        .await
-        .expect("the orphan seam runs");
-    let reclaimed = concrete
-        .__test_sweep_orphans_once(Duration::from_secs(5))
-        .await
-        .expect("the sweep runs");
-    assert_eq!(
-        reclaimed, 0,
-        "PG-LOCK-018: a row written since the previous wake must be exempt - it is \
-         indistinguishable from an acquisition that has committed but not yet registered"
-    );
-
-    // Positive control: the same row, one wake later, is reclaimed. Without this
-    // the assertion above would also pass for a sweep that never deletes anything.
-    let reclaimed = concrete
-        .__test_sweep_orphans_once(Duration::ZERO)
-        .await
-        .expect("the sweep runs");
-    assert_eq!(
-        reclaimed, 1,
-        "PG-LOCK-018: once the fence has moved past it, the same row is reclaimed"
-    );
-
-    handle.stop().await;
-}
-
 /// `PG-LOCK-016`: two separate plugin instances on the same database cannot hold
 /// the same lock at once — the cross-instance guarantee the whole primitive rests
 /// on, arbitrated by Postgres rather than by any in-process bookkeeping.
@@ -1028,22 +671,25 @@ async fn pg_lock_016_two_instances_cannot_hold_the_same_lock() {
          {contended:?}"
     );
 
-    // Exactly one lease row, and its beacon is A's — the ownership surface is the
-    // row, so that is where the assertion belongs (DESIGN.md §5.1).
+    // Exactly one lease row, at the first fence — the row *is* the ownership surface
+    // (DESIGN-DEPLOYABLE-GEAR §5.8.1), so that is where the assertion belongs. B's
+    // failed attempt must not have stolen, restamped or bumped anything.
+    //
+    // Asserted on `fence` rather than on the holder identity because A acquired
+    // through the guard path, which mints its owner internally per acquisition (and
+    // deliberately does not surface it — `LockGuard` cannot carry a token). The
+    // owner-side assertion lives in `pg_lock_024`, which acquires through the token
+    // half and therefore names its own owner.
     let control_pool = common::raw_pool(&connection_string).await;
-    let holders: Vec<(i32, i32)> =
-        sqlx::query_as("SELECT holder_beacon_hi, holder_beacon_lo FROM cluster_lock")
-            .fetch_all(&control_pool)
-            .await
-            .expect("cluster_lock query succeeds");
-    let beacon_a = instance_a
-        .__test_lock()
-        .__test_beacon_key()
-        .expect("instance A has a live beacon");
+    let fences: Vec<i64> = sqlx::query_scalar("SELECT fence FROM cluster_lock")
+        .fetch_all(&control_pool)
+        .await
+        .expect("cluster_lock query succeeds");
     assert_eq!(
-        holders,
-        vec![beacon_a],
-        "PG-LOCK-016: the lock must be held once, by instance A"
+        fences,
+        vec![1_i64],
+        "PG-LOCK-016: the lock must be held once, at the first fence - a contended attempt must \
+         not bump it"
     );
 
     // Handing over across instances works: B gets it as soon as A releases.
@@ -1168,163 +814,487 @@ async fn pg_lock_020_lock_after_stop_reports_shutdown_without_waiting() {
     );
 }
 
-/// `PG-LOCK-021`: a clean `stop()` leaves no `cluster_lock` row behind — for the
-/// locks it held **or** for one it had orphaned.
+/// `PG-LOCK-021`: a clean `stop()` leaves every held lease row **in place**, and the
+/// lease stays renewable through a handle that never saw the acquire.
 ///
-/// The drain is a single `DELETE ... WHERE holder_beacon_* = $ours`, which is
-/// what makes the orphan half true: the old map-iterating drain could not see a
-/// row with no local guard at all, so an acquisition cancelled after its INSERT
-/// committed left its row for the TTL even across a clean shutdown. Keying on the
-/// beacon rather than on local state covers both in one statement.
+/// **This assertion is the exact inverse of what it used to be**, and the inversion
+/// is the change `L2` exists to make. It previously asserted that `stop()` left *no*
+/// `cluster_lock` row behind: a shutdown drain deleted every row keyed on the
+/// outgoing incarnation's beacon, so a clean shutdown handed each name back to the
+/// fleet immediately. That is a clean handover while the process holding a lock is
+/// the process using it, and a fleet-wide revocation the moment locks are brokered —
+/// so the drain is gone and this test now asserts the property that replaced it
+/// (DESIGN-DEPLOYABLE-GEAR §5.8.2, invariant I7).
 ///
-/// A 10-minute TTL, so only the drain can be what removes any of them, and the
-/// orphan is planted through the seam rather than by racing a cancellation
-/// window.
+/// Two halves, and the second is the one that matters:
+///
+/// * The rows survive `stop()`. Necessary but weak on its own — an unswept row
+///   nothing can use would satisfy it too.
+/// * A **second handle**, built after the first has stopped, renews the lease using
+///   the token the first handle issued. No process vouches for a lease, so no
+///   process's death ends one, and any replica serves any lease operation. That is
+///   invariant I7 stated as a test, and it is the property the whole store-owned
+///   lease model was adopted for.
+///
+/// Acquired through the token half (`acquire`), because that is the half a brokered
+/// caller uses and the only one that can hand a token across a restart — a
+/// `LockGuard` cannot carry one (§6.5). A 10-minute TTL, so nothing here can pass by
+/// the lease merely lapsing.
 #[tokio::test]
-async fn pg_lock_021_stop_leaves_no_metadata_rows_behind() {
+async fn pg_lock_021_stop_leaves_held_leases_renewable_by_another_handle() {
     let (_container, config) = common::start_postgres_lock_only().await;
     let connection_string = config.connection_string.clone();
-    let handle = PostgresLockPlugin::builder(config)
+    let first = PostgresLockPlugin::builder(config)
         .build_and_start()
         .await
         .unwrap();
-    for name in ["drained-a", "drained-b", "drained-c"] {
-        let guard = handle
+
+    // Two guard-path leases that are never released, plus one token-path lease whose
+    // token outlives the handle that issued it.
+    for name in ["survives-a", "survives-b"] {
+        let guard = first
             .lock()
             .try_lock(name, Duration::from_mins(10))
             .await
             .expect("setup: acquire");
-        // Never released, and a TTL far past the end of this test, so only the
-        // drain can be what removes these rows.
         std::mem::forget(guard);
     }
-    handle
-        .__test_lock()
-        .__test_orphan_row("drained-orphan", Duration::ZERO)
+    let token = first
+        .lock()
+        .acquire(
+            "survives-c",
+            "owner-across-restart",
+            Duration::from_mins(10),
+        )
         .await
-        .expect("setup: plant an orphaned row");
+        .expect("setup: acquire a lease by token");
 
     let control_pool = common::raw_pool(&connection_string).await;
     let before: i64 = sqlx::query_scalar("SELECT count(*) FROM cluster_lock")
         .fetch_one(&control_pool)
         .await
         .expect("count rows before stop");
-    assert_eq!(
-        before, 4,
-        "setup: three held locks plus the orphan must all have rows"
-    );
+    assert_eq!(before, 3, "setup: all three leases must have rows");
 
-    handle.stop().await;
+    first.stop().await;
 
     let after: Vec<String> = sqlx::query_scalar("SELECT name FROM cluster_lock ORDER BY name")
         .fetch_all(&control_pool)
         .await
         .expect("count rows after stop");
-    assert!(
-        after.is_empty(),
-        "PG-LOCK-021: stop() must delete every row this instance's beacon vouched for, orphans \
-         included; left behind: {after:?}"
+    assert_eq!(
+        after,
+        vec![
+            "survives-a".to_owned(),
+            "survives-b".to_owned(),
+            "survives-c".to_owned()
+        ],
+        "PG-LOCK-021: stop() must revoke nothing - a restart is not a lease event"
     );
+
+    // The half that matters: a handle that never saw the acquire serves the renew.
+    let second =
+        PostgresLockPlugin::builder(common::lock_config_json(&connection_string, json!({})))
+            .build_and_start()
+            .await
+            .expect("a replacement instance starts");
+    second
+        .lock()
+        .renew(&token, Duration::from_mins(10))
+        .await
+        .expect(
+            "PG-LOCK-021: a lease must be renewable through a handle that never saw its acquire - \
+             no LockExpired, no re-acquire",
+        );
+    // And it is still exclusive afterwards, so the renew did not quietly release it.
+    let contended = second
+        .lock()
+        .try_lock("survives-c", Duration::from_secs(30))
+        .await;
+    assert!(
+        matches!(contended, Err(ClusterError::LockContended { .. })),
+        "PG-LOCK-021: the renewed lease must still exclude, got {contended:?}"
+    );
+
+    second
+        .lock()
+        .release(&token)
+        .await
+        .expect("the second handle releases the lease it renewed");
+
     control_pool.close().await;
+    second.stop().await;
 }
 
-/// `PG-LOCK-022`: the liveness beacon (DESIGN.md §5.1) is established at startup
-/// on its own connection, every acquisition stamps its key onto the row, and a
-/// beacon lost to a terminated backend is replaced by one under a *different*
-/// key.
+/// `PG-LOCK-023`: **uniform expiry** — a killed holder's lock is reclaimed at its TTL
+/// and *not before*.
 ///
-/// The three properties this asserts are the ones everything downstream rests on:
+/// This is `L2`'s headline exit criterion and the assertion that the beacon removal
+/// was complete (plan §6 "Uniform expiry", DESIGN-DEPLOYABLE-GEAR §7.6). It has a
+/// negative half and a positive half, and the negative half is the new one:
 ///
-/// * **One advisory lock, on a connection of its own.** Not a pool connection —
-///   the beacon exists to be released by exactly one
-///   socket closing, so sharing a connection with anything else would couple its
-///   lifetime to unrelated traffic.
-/// * **The row records it.** `holder_beacon_hi`/`lo` must match the live key, or
-///   nothing in the fleet can judge whether the row's owner is still alive.
-/// * **A reconnect draws a fresh key.** Per-incarnation is what makes "this row
-///   was written by this process, on this connection" provable, and it is why a
-///   pre-disconnect row can never be re-vouched by the successor beacon.
+/// * **Not before.** The holder is killed outright — its handle stopped, its guard
+///   task gone, its pool closed — and the lock must still be *unacquirable* for the
+///   remainder of its TTL. Under the beacon this was false by design: Postgres
+///   dropped the beacon's advisory lock the instant the connection died, so the lock
+///   became stealable in milliseconds. That sub-TTL reclaim is the capability `L2`
+///   deliberately removes, and this half is what would fail if any second liveness
+///   mechanism were reintroduced.
+/// * **At its TTL.** The lock must then become acquirable, so the removal did not
+///   simply wedge the name.
+///
+/// The TTL is short (2s) because the test has to *wait out* the whole of it to prove
+/// the negative, and the "not before" window is sampled repeatedly rather than once
+/// so a single lucky read cannot pass it.
+///
+/// Both profiles now share this timing, which is the point: keeping the beacon for
+/// in-process acquisitions and dropping it for brokered ones would have meant one
+/// deployment reclaiming a dead holder's lock in milliseconds and another waiting out
+/// the TTL — the same code, the same config, two timings (§5.8.2, Goal 2).
 #[tokio::test]
-async fn pg_lock_022_beacon_is_established_stamped_and_replaced_on_loss() {
+async fn pg_lock_023_a_killed_holders_lock_is_reclaimed_at_its_ttl_and_not_before() {
+    const TTL: Duration = Duration::from_secs(2);
+
     let (_container, config) = common::start_postgres_lock_only().await;
     let connection_string = config.connection_string.clone();
+
+    // A long reaper interval, so nothing here can be the reaper being prompt: the
+    // survivor takes the name on its own acquire predicate or not at all.
+    let victim = PostgresLockPlugin::builder(common::lock_config_json(
+        &connection_string,
+        json!({ "lock_reaper_interval_ms": 600_000 }),
+    ))
+    .build_and_start()
+    .await
+    .expect("the victim instance starts");
+    let survivor = PostgresLockPlugin::builder(common::lock_config_json(
+        &connection_string,
+        json!({ "lock_reaper_interval_ms": 600_000 }),
+    ))
+    .build_and_start()
+    .await
+    .expect("the surviving instance starts");
+
+    let guard = victim
+        .lock()
+        .try_lock("uniform", TTL)
+        .await
+        .expect("the victim acquires");
+    // Never released: the guard is leaked so no `Drop` can turn this into a voluntary
+    // release, which would test nothing.
+    std::mem::forget(guard);
+
+    let killed_at = tokio::time::Instant::now();
+    // Kill the holder as completely as a process death would: tasks cancelled, pool
+    // closed, nothing left running that could renew.
+    victim.stop().await;
+
+    // The negative half. Sample across most of the remaining TTL rather than once.
+    let mut samples = 0_u32;
+    while killed_at.elapsed() < TTL.mul_f64(0.75) {
+        let attempted = survivor
+            .lock()
+            .try_lock("uniform", Duration::from_secs(30))
+            .await;
+        assert!(
+            matches!(attempted, Err(ClusterError::LockContended { .. })),
+            "PG-LOCK-023: a killed holder's lock must stay held for its whole TTL - it became \
+             acquirable after {elapsed:?} of a {TTL:?} lease, which means some liveness mechanism \
+             other than the deadline reclaimed it; got {attempted:?}",
+            elapsed = killed_at.elapsed()
+        );
+        samples += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        samples >= 5,
+        "PG-LOCK-023: the not-before window must actually be sampled, got {samples} samples"
+    );
+
+    // The positive half: it does lapse, on the deadline and nothing else.
+    let reclaimed = common::wait_until(TTL * 4, Duration::from_millis(50), || {
+        let lock = survivor.lock();
+        async move {
+            lock.try_lock("uniform", Duration::from_secs(30))
+                .await
+                .is_ok()
+        }
+    })
+    .await;
+    assert!(
+        reclaimed,
+        "PG-LOCK-023: the lease must lapse at its deadline - removing the beacon must not wedge \
+         the name instead"
+    );
+
+    survivor.stop().await;
+}
+
+/// `PG-LOCK-024`: the lease token is the whole of the authority, and a **steal fences
+/// its predecessor**.
+///
+/// Four properties of §5.8.1, asserted against the row rather than against anything a
+/// process remembers:
+///
+/// * The row records the owner the caller named. The token half passes a `ClientId`
+///   straight through (§5.4), unlike the guard half which mints one internally.
+/// * A steal-on-expiry strictly *increases* the fence, so the counter is not merely
+///   different but ordered — which is what makes "steal on expiry" safe rather than
+///   just detectable.
+/// * The superseded holder's `renew` fails. It is `LockExpired` whichever fence
+///   missed: lapsed, stolen and never-yours are indistinguishable and all three mean
+///   the caller must stop acting as the holder (§6.9).
+/// * The superseded holder's `release` is a **no-op `Ok`** that leaves the successor's
+///   lease untouched. This is the one that would be a mutual-exclusion break if the
+///   predicate were `name` alone: a stale token would delete a live holder's lease.
+#[tokio::test]
+async fn pg_lock_024_a_stolen_lease_fences_its_predecessor() {
+    let (_container, config) = common::start_postgres_lock_only().await;
+    let connection_string = config.connection_string.clone();
+    let handle = PostgresLockPlugin::builder(common::lock_config_json(
+        &connection_string,
+        json!({ "lock_reaper_interval_ms": 600_000 }),
+    ))
+    .build_and_start()
+    .await
+    .unwrap();
+    let lock = handle.lock();
+    let concrete = handle.__test_lock();
+
+    let first = lock
+        .acquire("fenced", "owner-first", Duration::from_mins(10))
+        .await
+        .expect("the first owner acquires");
+    assert_eq!(
+        concrete.__test_lease_row("fenced").await.unwrap(),
+        Some(("owner-first".to_owned(), 1)),
+        "PG-LOCK-024: the row must record the owner the caller named, at the first fence"
+    );
+
+    // Lapse the lease **by moving its deadline into the past**, rather than by
+    // sleeping out a short TTL.
+    //
+    // Not merely for speed: the fence only survives a lapse while the *row* does, and
+    // a short TTL guarantees it will not. `try_acquire` signals the reaper's
+    // `deadline_hint` whenever the TTL it writes is shorter than the reaper's interval
+    // (`lock::should_hint`), so a sub-interval TTL wakes the reaper within its 100ms
+    // floor and the lapsed row is swept — after which a re-acquire is a fresh INSERT
+    // at `FIRST_FENCE` and the counter has reset. That reset is the known gap item
+    // `L3` closes with `fence_retention` (DESIGN-DEPLOYABLE-GEAR §5.8.1); see
+    // ADR-012 for why it is not a mutual-exclusion break in the meantime, and note
+    // that `L3` must reach this table's reaper and not only the cache's.
+    //
+    // So: a 10-minute TTL at acquire (no hint, and the reaper is on a 600s interval
+    // besides), then an out-of-band expiry that notifies nothing. The row is still
+    // there when the steal runs, which is what lets this test assert the acquire
+    // statement's own fence arithmetic rather than the reaper's timing.
+    let control_pool = common::raw_pool(&connection_string).await;
+    sqlx::query("UPDATE cluster_lock SET expires_at = now() - interval '1 second' WHERE name = $1")
+        .bind("fenced")
+        .execute(&control_pool)
+        .await
+        .expect("setup: lapse the lease out of band");
+
+    let second = lock
+        .acquire("fenced", "owner-second", Duration::from_mins(10))
+        .await
+        .expect("a lapsed lease must be stealable");
+    assert!(
+        second.fence > first.fence,
+        "PG-LOCK-024: a steal must strictly increase the fence, went {} -> {}",
+        first.fence,
+        second.fence
+    );
+    assert_eq!(
+        concrete.__test_lease_row("fenced").await.unwrap(),
+        Some(("owner-second".to_owned(), 2)),
+        "PG-LOCK-024: the row must carry the successor's owner and the bumped fence"
+    );
+
+    // The predecessor is fenced out of both operations.
+    let renewed = lock.renew(&first, Duration::from_mins(10)).await;
+    assert!(
+        matches!(renewed, Err(ClusterError::LockExpired { .. })),
+        "PG-LOCK-024: a fenced-out token must not renew, got {renewed:?}"
+    );
+    lock.release(&first)
+        .await
+        .expect("PG-LOCK-024: releasing a fenced-out token is Ok by absence, never an error");
+    assert_eq!(
+        concrete.__test_lease_row("fenced").await.unwrap(),
+        Some(("owner-second".to_owned(), 2)),
+        "PG-LOCK-024: the predecessor's release must not touch the successor's lease"
+    );
+
+    // And the successor really still holds it.
+    lock.renew(&second, Duration::from_mins(10))
+        .await
+        .expect("the live holder renews");
+    lock.release(&second)
+        .await
+        .expect("the live holder releases");
+
+    control_pool.close().await;
+    handle.stop().await;
+}
+
+/// `PG-LOCK-025`: `release` is idempotent by absence, and `renew` after it is
+/// `LockExpired`.
+///
+/// The trait's contract, and worth its own test because the old implementation
+/// reached this answer through a *local* registry — a release whose `local_holders`
+/// entry was gone returned `Ok` without issuing a statement. Nothing local is
+/// consulted now: the SQL predicate is the whole check, so absence has to produce
+/// `Ok` from the statement matching zero rows (§6.10).
+#[tokio::test]
+async fn pg_lock_025_release_is_idempotent_by_absence() {
+    let (_container, config) = common::start_postgres_lock_only().await;
+    let handle = PostgresLockPlugin::builder(config)
+        .build_and_start()
+        .await
+        .unwrap();
+    let lock = handle.lock();
+
+    let token = lock
+        .acquire("idem", "owner-a", Duration::from_mins(10))
+        .await
+        .expect("acquire");
+    lock.release(&token).await.expect("the first release");
+    lock.release(&token)
+        .await
+        .expect("PG-LOCK-025: a retried release must be Ok, never a not-found");
+    // A third time, against a name that never existed at all.
+    let never = cluster_sdk::LeaseToken::new("never-held", "owner-a", 1);
+    lock.release(&never)
+        .await
+        .expect("PG-LOCK-025: releasing a lease that never existed must be Ok");
+
+    let renewed = lock.renew(&token, Duration::from_mins(10)).await;
+    assert!(
+        matches!(renewed, Err(ClusterError::LockExpired { .. })),
+        "PG-LOCK-025: renewing a released lease must be LockExpired, got {renewed:?}"
+    );
+
+    handle.stop().await;
+}
+
+/// `PG-LOCK-026`: the fence-retention window (item `L3`,
+/// DESIGN-DEPLOYABLE-GEAR §5.8.1). A lease that **lapses**, sits there long
+/// enough for many reaper sweeps, and is then re-acquired **by the same owner**
+/// gets a strictly greater fence.
+///
+/// Same owner is the whole point. A different owner is fenced by the `owner`
+/// column on its own; it is the same one that a restarted counter would hand a
+/// matching predicate, because its stale token carries the identity that
+/// survives. Before `L3` the reaper deleted the row at its deadline and the
+/// re-acquire was a fresh INSERT at fence 1 — see `PG-LOCK-024`'s note.
+///
+/// The reaper runs at 100 ms against a real 300 ms TTL, so this asserts against a
+/// sweep loop that certainly ran, rather than one that had no time to.
+#[tokio::test]
+async fn pg_lock_026_the_fence_survives_a_lapse_and_its_sweeps() {
+    let (_container, config) =
+        common::start_postgres_lock_only_with(json!({ "lock_reaper_interval_ms": 100 })).await;
     let handle = PostgresLockPlugin::builder(config)
         .build_and_start()
         .await
         .unwrap();
     let lock = handle.lock();
     let concrete = handle.__test_lock();
-    let control_pool = common::raw_pool(&connection_string).await;
 
-    let key = concrete
-        .__test_beacon_key()
-        .expect("PG-LOCK-022: build_and_start must establish the beacon eagerly");
-    assert_eq!(
-        concrete.__test_beacon_epoch(),
-        1,
-        "setup: exactly one beacon established so far"
-    );
-
-    // Its own connection, holding exactly its own key — asserted by key, not by
-    // count, so no other advisory lock on the server can be mistaken for it.
-    let beacon_pid = concrete.__test_beacon_backend_pid();
-    let beacon_locks: Vec<i32> = sqlx::query_scalar(
-        "SELECT pid FROM pg_locks \
-         WHERE locktype = 'advisory' AND granted AND objsubid = 2 \
-           AND classid = $1::oid AND objid = $2::oid",
-    )
-    .bind(key.0)
-    .bind(key.1)
-    .fetch_all(&control_pool)
-    .await
-    .expect("pg_locks query succeeds");
-    assert_eq!(
-        beacon_locks,
-        vec![beacon_pid],
-        "PG-LOCK-022: the beacon key must be granted exactly once, on the beacon's own connection"
-    );
-
-    let guard = lock
-        .try_lock("beacon-stamped", Duration::from_secs(30))
+    let stale = lock
+        .acquire("retained", "owner-a", Duration::from_millis(300))
         .await
-        .expect("acquire");
-    let stamped: (i32, i32) = sqlx::query_as(
-        "SELECT holder_beacon_hi, holder_beacon_lo FROM cluster_lock WHERE name = 'beacon-stamped'",
-    )
-    .fetch_one(&control_pool)
-    .await
-    .expect("the acquired lock wrote a row");
+        .expect("the first acquisition");
+    assert_eq!(stale.fence, 1);
+
+    // Past the lease and past a dozen sweeps, but nowhere near the default
+    // hour-long retention window.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
     assert_eq!(
-        stamped, key,
-        "PG-LOCK-022: an acquisition must stamp the live beacon key onto its row"
+        concrete.__test_lease_row("retained").await.unwrap(),
+        Some(("owner-a".to_owned(), 1)),
+        "PG-LOCK-026: the lapsed row must still be there - the sweep predicate is \
+         expires_at <= now() - retention, not expires_at <= now()"
     );
 
-    // Kill the beacon's backend. The once-per-second ping is what notices — the
-    // server released the beacon at the disconnect regardless, but nothing else
-    // in this process would ever touch that connection to find out.
-    let _terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
-        .bind(beacon_pid)
-        .fetch_one(&control_pool)
+    let fresh = lock
+        .acquire("retained", "owner-a", Duration::from_mins(10))
         .await
-        .expect("terminate succeeds");
+        .expect("a lapsed lease must be stealable by anyone, including its last owner");
+    assert!(
+        fresh.fence > stale.fence,
+        "PG-LOCK-026: the same owner re-acquiring must be fenced against its own stale \
+         token, went {} -> {}",
+        stale.fence,
+        fresh.fence
+    );
 
-    let replaced = common::wait_until(Duration::from_secs(15), Duration::from_millis(100), || {
-        let concrete = std::sync::Arc::clone(&concrete);
-        async move { concrete.__test_beacon_epoch() >= 2 }
-    })
+    // The consequence that matters: the stale token is inert.
+    let renewed = lock.renew(&stale, Duration::from_mins(10)).await;
+    assert!(
+        matches!(renewed, Err(ClusterError::LockExpired { .. })),
+        "PG-LOCK-026: the stale token must not renew the lease that replaced it, got {renewed:?}"
+    );
+
+    lock.release(&fresh)
+        .await
+        .expect("the live holder releases");
+    handle.stop().await;
+}
+
+/// `PG-LOCK-027`: the other half of the window, and the negative control for
+/// `PG-LOCK-026` — shorten `fence_retention_ms` below the lapse and the row
+/// really is swept, the counter really does restart, and the stale token really
+/// does match again.
+///
+/// Without this, `PG-LOCK-026` would also pass against a reaper that simply never
+/// managed to run. With it, the only difference between the two tests is the
+/// window, so the window is what the pair measures.
+#[tokio::test]
+async fn pg_lock_027_a_row_is_swept_once_its_window_passes() {
+    let (_container, config) = common::start_postgres_lock_only_with(json!({
+        "lock_reaper_interval_ms": 100,
+        "fence_retention_ms": 200,
+    }))
+    .await;
+    let handle = PostgresLockPlugin::builder(config)
+        .build_and_start()
+        .await
+        .unwrap();
+    let lock = handle.lock();
+    let concrete = handle.__test_lock();
+
+    let stale = lock
+        .acquire("swept", "owner-a", Duration::from_millis(300))
+        .await
+        .expect("the first acquisition");
+    assert_eq!(stale.fence, 1);
+
+    // Past the lease (300 ms), past the window (200 ms more), and past several
+    // sweeps at 100 ms.
+    let gone = common::wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        || async { concrete.__test_lease_row("swept").await.unwrap().is_none() },
+    )
     .await;
     assert!(
-        replaced,
-        "PG-LOCK-022: the ping must notice the terminated backend and establish a fresh beacon"
-    );
-    assert_ne!(
-        concrete.__test_beacon_key(),
-        Some(key),
-        "PG-LOCK-022: the replacement beacon must carry a different key, or a pre-disconnect row \
-         would still look vouched for"
+        gone,
+        "PG-LOCK-027: a row past both its deadline and its window must be swept"
     );
 
-    drop(guard);
-    control_pool.close().await;
+    let fresh = lock
+        .acquire("swept", "owner-a", Duration::from_mins(10))
+        .await
+        .expect("acquire a free name");
+    assert_eq!(
+        fresh.fence, 1,
+        "PG-LOCK-027: with no row left there is no counter to carry"
+    );
+
+    lock.release(&fresh)
+        .await
+        .expect("the live holder releases");
     handle.stop().await;
 }

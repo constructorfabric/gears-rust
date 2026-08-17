@@ -24,6 +24,17 @@ pub use toolkit_transport_grpc::BearerContext;
 // `grpc-client` since that's where the dep enters the build graph.
 impl crate::grpc_repr::SecurityContextMarker for toolkit_security::SecurityContext {}
 
+// The platform plane. Unlike the tenant context this one carries no credential —
+// it holds a validated `PlatformIdentity`, which is the *result* of inbound
+// authentication — so it deliberately does **not** implement `BearerContext`.
+// The outbound credential is process-level and is attached at the channel by
+// `InternalAuthInterceptor`; the generated client attaches nothing from this
+// context. The marker exists so `#[toolkit::grpc_contract]` can assert that a
+// parameter it classified as a security context really is one, which is what
+// stops a wire DTO named `…SecurityContext` from being silently excluded from the
+// payload.
+impl crate::grpc_repr::SecurityContextMarker for toolkit_security::PlatformSecurityContext {}
+
 /// Map a [`tonic::Status`] into a [`TransportError`].
 ///
 /// - If the server attached a [`Problem`] payload via the

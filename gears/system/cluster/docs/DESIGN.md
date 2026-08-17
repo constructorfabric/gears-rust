@@ -79,6 +79,8 @@ Explicit pub/sub messaging is excluded. The event broker gear provides reliable 
 | `cpt-cf-clst-adr-capability-typing-and-profile-resolution` (ADR-007) | Per-primitive capability typing — `*Capability` enums replace bundled `CapabilityClass`; consequences: `ClusterProfile` typed marker, fluent resolver, capability-mismatch fails startup |
 | `cpt-cf-clst-adr-leader-election-backend-safety` (ADR-009) | Per-backend correctness analysis for SDK-default leader election (and lock) under failure; constructor pair `new` (rejects `EventuallyConsistent`) + `new_allow_weak_consistency` (opt-in with warning); promotes the r2 deep-dive to decision-of-record |
 | `cpt-cf-clst-adr-cache-scan-prefix-for-polyfill` (ADR-010) | Cache `scan_prefix` enumeration added to the frozen cache contract so the SDK `PollingPrefixWatch` polyfill can enumerate keys under a prefix without a native prefix-watch backend |
+| `cpt-cf-clst-adr-remote-backend-seam` (ADR-011) | The process boundary is the three backend traits, with exactly one `dyn ClusterClient` per process as their factory (local winning over remote); the profile is a request parameter resolved server-side; facades bind lazily and capability validation reads the profile descriptor |
+| `cpt-cf-clst-adr-store-owned-leases` (ADR-012) | Leases are fenced records in the backing store rather than session state, so no process's death ends another's lease and any replica serves any lease operation; the Postgres liveness beacon is removed and sub-TTL reclaim is traded for one lease mechanism across every profile |
 
 #### NFR Allocation
 
@@ -169,6 +171,32 @@ Each non-functional requirement from the PRD maps to its design response and ver
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+**The `grpc-client` feature layer, which the diagram above does not show.** The stack above is Profile 1: every
+layer is linked into one process and the arrows are function calls. Profile 3 cuts it between the SDK and the
+wiring, and the cut is a **Cargo feature on `cf-gears-cluster-sdk`**, not a new layer:
+
+```
+  Consumers                        (unchanged source, both profiles)
+      |
+  cf-gears-cluster-sdk             facades + backend traits + resolvers
+      |                            ClusterClient: unfeatured, three sync factory
+      |                            methods + async descriptor()
+      +-- (feature off) ---------> LocalClusterClient  -> the real backend Arc
+      |                            registered by the cluster gear's start
+      |
+      +-- (feature "grpc-client") -> RemoteClusterClient -> tonic stubs -> cluster pod
+                                     Remote{Cache,Lock,Leader}Backend
+```
+
+Three properties of that seam matter more than the picture. The **boundary is the three backend traits**, so a
+consumer names a facade and never a `Remote*Backend` (invariant I4) — the remote types are `pub` inside a private
+module and reachable only as `Arc<dyn _Backend>`. **Exactly one `Arc<dyn ClusterClient>` is registered per
+process**, local winning over remote at *registration* time, so the decision is made once by what the binary
+linked rather than per call. And **Profile 1 links no cluster transport**: with the feature off, the SDK has no
+direct `tonic` edge at all, which is why `ClusterClient` itself is unfeatured — a feature-gated trait would have
+made the seam visible to consumers. The gear crate is the exception and enables `grpc-client` unconditionally,
+because it *serves* the contract; see §3.15.1 for what that costs an embedding process.
+
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
 | SDK | Public-API facade structs (`*V1`), backend traits (`*Backend`), per-primitive resolver builders, `ClusterProfile` marker trait, `*Capability` requirement enums, `*Features` characteristic structs, shared types, per-primitive `scoped()` helpers, `PollingPrefixWatch` polyfill, `register_*_backend` / `deregister_*_backend` helpers | Rust crate (`cf-cluster-sdk`) |
@@ -258,7 +286,7 @@ All three backend traits MUST be dyn-compatible. The SDK includes compile-time a
 | `LockFeatures` | `#[non_exhaustive] struct { linearizable: bool, ... }`. |
 | `*ResolverBuilder<'a>` | Per-primitive fluent builder: `.profile<P: ClusterProfile>(_: P)`, `.require(cap: *Capability)`, `.resolve() -> Result<*V1, ClusterError>`. |
 | `CacheConsistency` | `enum { Linearizable, EventuallyConsistent }`. Cache-only — leader election and lock backends use `*Features { linearizable: bool }` instead. |
-| `CacheEntry` | Versioned key-value pair: `{ value: Vec<u8>, version: u64 }`. Version is opaque, monotonically increasing per key, starting at 1. Version 0 is reserved as sentinel. |
+| `CacheEntry` | Versioned key-value pair: `{ value: Vec<u8>, version: u64 }`. Version is opaque, monotonically increasing per key, starting at 1. Version 0 is reserved as sentinel. **The monotonicity holds only while the key exists**: a `delete`, or a TTL reap, removes the counter with the key, and the next write of that key starts again at 1 (measured: `standalone-cluster-plugin/src/cache.rs`). It is therefore safe as a CAS predicate — which compares versions of a key it just read — and **unsafe as a durable fence**, because "version 1" does not identify one incarnation of a key. Anything needing a value that outlives its key must carry its own counter in the value: that is exactly what the store-owned lease record does with `fence`, and why `fence_retention` keeps the record alive past the lease (DESIGN-DEPLOYABLE-GEAR §5.8.1). |
 | `CacheEvent` | Lightweight notification: `Changed { key }`, `Deleted { key }`, `Expired { key }`. No payload — consumer calls `get(key)` for current value. |
 | `CacheWatchEvent` | Watch union: `Event(CacheEvent)`, `Lagged { dropped: u64 }`, `Reset`, `Closed(ClusterError)`. Per ADR-003. |
 | `CacheWatch` | Async receiver yielding `CacheWatchEvent` items. Dropping unsubscribes. Per-key ordering guaranteed; no cross-key ordering. |
@@ -322,6 +350,15 @@ All three backend traits MUST be dyn-compatible. The SDK includes compile-time a
 └────────────────────────────────────────────────────────────────────┘
 ```
 
+**Two components the diagram predates.** `cf-gears-cluster` is no longer only a wiring library owned by a parent
+host gear: it is the cluster **gear** (`name = "cluster"`, capabilities `stateful, system, grpc, rest`), it serves
+the four coordination services over gRPC from `src/api/grpc/`, and it ships a `cluster-oop` binary. The
+builder/handle library described below still exists and is still embeddable — that half is unchanged — but the
+same crate now also owns the profile registry, the composite readiness check, the local client and the deployable
+entry point. And beside the SDK sits its `grpc-client` half (§1.3): `RemoteClusterClient` plus the three
+`Remote*Backend` handles, compiled only when the feature is on, which is what lets a Profile 3 consumer link the
+SDK and no plugins at all.
+
 #### cf-cluster-sdk (this change)
 
 - [x] `p1` - **ID**: `cpt-cf-clst-component-sdk`
@@ -378,6 +415,18 @@ Each plugin (Postgres, K8s, Redis, NATS, etcd, standalone) exposes a builder/han
 **Staleness bound**: `is_leader() == true` at time T does NOT guarantee this node holds leadership at time T on the backend. The background task's state lags by up to one renewal interval plus a provider round-trip in steady state, and up to a full TTL under partition.
 
 **Worst-case window with default config** (`ttl=30s`, `max_missed_renewals=2`, derived `renewal_interval=10s`): under network partition, renewal attempts fail at T+10s, T+20s, and T+30s; the third consecutive failure triggers `LeaderWatchEvent::Status(Lost)` emission. The backend revokes the lease at T+30s, after which a successor's `put_if_absent` may succeed. The consumer-perceived dual-leadership window is `TTL + observation_lag`, where `observation_lag` is the time between renewal-failure emission and the consumer's code reaching a watch-polling await point. A consumer with a 1s iteration cycle observes the transition ~30s after partition begins; one with a 60s synchronous compute block ~90s. Operators tune `ttl` and `max_missed_renewals` against this trade-off: shorter TTL shortens the window at the cost of more renewal traffic and lower tolerance for transient network jitter. Pattern C below (lock + CAS) eliminates the dual-write effect at the resource level regardless of window size.
+
+**Profile 3 widens the bound by one transport hop, and does not change its shape.** With cluster deployed as its
+own pod, `status()` is still a synchronous read of a cached snapshot — the remote handle keeps a local cache fed
+by the event stream, exactly as the in-process watch keeps one fed by its channel — so the *cost* of the call is
+unchanged. What changes is how the snapshot got there: leadership transitions are derived client-side from
+`renew` results and a re-`join` on the renewal cadence (the server announces no leadership; see
+DESIGN-DEPLOYABLE-GEAR.md §6.6), and each of those is now an RPC. So `observation_lag` gains one round trip in
+steady state, and under partition the client's renew fails against an unreachable *cluster pod* rather than an
+unreachable *backend* — which produces the same `Status(Lost)` after the same `max_missed_renewals`, because
+renewal remains client-driven precisely so that it stays the liveness proxy (invariant I8). The worst-case window
+is therefore `TTL + observation_lag + one_rpc`, and the three consumer patterns below apply unchanged: a
+consumer that needs mutual exclusion still gets it from `try_lock` or a CAS failing, not from a timing argument.
 
 Three consumer patterns are available, ordered by tolerance for transient dual-leadership:
 
@@ -655,6 +704,29 @@ Same shape for `validate_leader_election_capabilities` and `validate_lock_capabi
 
 **Why per-primitive (not bundled `CapabilityClass`)**: the prior bundled `CapabilityClass { Standalone, Durable, InMemory, Coordination }` collapsed three orthogonal axes (topology, persistence, consistency) into one fuzzy ordering. Per-primitive `*Capability` enums are type-safe (a cache resolver cannot accept `MetadataFiltering`) and grounded in concrete backend characteristic checks rather than coarse tier claims.
 
+#### 3.10.1 `resolve()` is `async`, and where validation lands
+
+`resolve()` on all three resolvers is `async fn`. **It is the only SDK signature the remote-backend model changes** — the facades, the typed-profile resolver, `scoped()`, the watch-event unions and `auto_restart` all keep their shapes.
+
+The reason is validation, not the resolution itself: checking a declared capability needs the bound backend's `consistency()`/`features()`, and for a *remote* binding those come from a `ProfileDescriptor` that has to be fetched. A synchronous signature cannot await one. In-process there is nothing to await — the bound object **is** the real backend, so its characteristics are known immediately and validation is inline, exactly as the tables above describe.
+
+Two rules for consumers follow, and both are cheap:
+
+- **Resolve facades in `start`, never in `init`.** Both are already `async fn` on the gear traits, so the `.await` costs a consumer nothing structurally. `init` is the wrong phase regardless: backends are registered by the cluster gear's own `start`.
+- **A consumer that branches on `CapabilityNotMet` is relying on the inline path.** That is always the in-process path. Against a remote cluster the same check can instead land on readiness — see the specification of the bounded descriptor await and the inline-vs-deferred split in [DESIGN-DEPLOYABLE-GEAR.md](./DESIGN-DEPLOYABLE-GEAR.md) §4.7.1. The *guarantee* is identical either way (no consumer serves traffic against an unmet requirement) and so is the error text; only the delivery point moves.
+
+**What `resolve()` actually does**, now that the seam is in place (ADR-011):
+
+1. Takes the process's one `Arc<dyn ClusterClient>` from the `ClientHub`.
+2. Asks it for this profile's backend. Synchronous and pure in both deployment profiles — the real backend locally, a remote handle remotely. A client that does not bind the profile is `Err(ProfileNotBound)` here, immediately.
+3. **Awaits the profile's `ProfileDescriptor`, bounded** by an SDK constant (2 s). This is the only `await` on the path, and it waits on the descriptor — never on cluster becoming reachable.
+4. Validates the declared requirements against that descriptor, or defers to readiness when it did not arrive in time.
+
+Two consequences worth stating rather than leaving to be found:
+
+- **Validation reads the descriptor, not the backend.** The tables above describe the check; its *input* is now what the profile's binding declares, which is what a remote consumer can obtain at all. In-process the descriptor is computed from the real backends, so the answer is identical — and the error text is byte-identical across deployment profiles, which is the property the equivalence gate asserts. One thing does change under operator config: `CapabilityNotMet { provider }` names the provider **the operator wrote** (`postgres`) rather than the Rust type behind it.
+- **A process with no cluster client wired at all is not a resolve failure.** `resolve()` returns `Ok` and the facade reports `ProfileNotBound` on its first *call*, naming the profile; the distinguishing phrase (*no cluster client registered in this process*) is logged at `warn`, because `ClusterError` is frozen and cannot carry a second message. That tolerance is what lets a Profile 3 cold start proceed, and the readiness contributor is what stops it hiding a Profile 1 build mistake.
+
 ### 3.11 SDK Default Backends
 
 > **Implementation location:** The three default backend implementations live in the **cluster gear** (`cf-gears-cluster`), not in the SDK. Consumer gears never import them directly; only the cluster gear's wiring layer instantiates them. The SDK retains only the backend *traits* and facades that consumers depend on.
@@ -808,11 +880,48 @@ Per-backend storage layout (e.g., the Postgres plugin's `cluster_cache` and `clu
 
 ### 3.15 Deployment Topology
 
-Cluster is an in-process Rust library SDK; it has no deployment topology of its own. The SDK is consumed by other gears in the same process; the `ClusterHandle` lifecycle is owned by a parent host gear's `RunnableCapability::start`/`stop` (see §3.7).
+**Cluster has a deployment topology of its own, and it is mapped to the platform's deployment profiles.** This
+section previously said the opposite — "an in-process Rust library SDK; it has no deployment topology of its
+own" — which was true while the only shape was a library linked into a consumer's process. It is no longer:
+`cf-gears-cluster` ships a `[[bin]] cluster-oop` and can be deployed as its own pod, with consumers reaching it
+over gRPC. The consumer API is unchanged in both shapes (DESIGN-DEPLOYABLE-GEAR.md Goal 2), so what varies is
+the topology, not the code.
 
-The deployment shape that matters operationally is the **profile × backend** matrix mapped onto the parent host gear's deployment. §4.2 Recommended Deployment Combinations enumerates the supported shapes (single-instance dev/test, multi-instance non-K8s, K8s-low-throughput, K8s + Redis production, Redis-only). Each shape is realized by the parent host gear's deployment (Kubernetes pod, systemd unit, Docker container) plus the backend bindings declared in operator YAML and instantiated by the lifecycle wiring in the `cf-gears-cluster` gear crate. The wiring instantiates each primitive's bound provider independently and auto-fills only the primitives the operator omits with the SDK defaults over that profile's cache, so the mixed-backend shapes in the matrix below are expressible in YAML today (`cpt-cf-clst-fr-routing-per-primitive`) for whichever native providers the linked plugins ship.
+| Platform profile | Topology | What owns the backends | How a consumer gets a primitive |
+|---|---|---|---|
+| **Profile 1 — Embedded** | One process. `cluster` and its plugins are linked into the consumer's binary; the gear's `start` owns the `ClusterHandle`, or a consumer owns `ClusterWiring` directly (§3.7) | The consumer's own process | `resolve()` returns the real backend `Arc` through a `LocalClusterClient` — no wrapper on the request path, no network |
+| **Profile 2 — Host + Workers** | **Not designed.** Out of scope for the first deployable version, and stated as a scope limit rather than a deferral: no endpoint-resolution mechanism exists for it, and its topology fork (one cluster process per *deployment* vs. per *host*) is unanswered — the second silently makes locks per-host rather than deployment-wide | — | — |
+| **Profile 3 — K8s Native** | The `cluster-oop` binary in its own pod, serving the four coordination services on the gRPC port and the framework probes on the HTTP port. One replica by default, pending the cross-replica failover suite; store-owned leases (ADR-012) already make any replica able to serve any lease operation | The cluster pod | The framework's proxy-wiring phase registers a `RemoteClusterClient`; `resolve()` derives per-primitive remote handles from it and the profile rides on each request |
+
+Within a profile, the shape that still matters operationally is the **profile × backend** matrix. §4.2
+Recommended Deployment Combinations enumerates the supported shapes (single-instance dev/test, multi-instance
+non-K8s, K8s-low-throughput, K8s + Redis production, Redis-only); each is realized by the deployment of whatever
+process owns the wiring — a `cluster-oop` pod in Profile 3, the consumer's own pod, systemd unit or container in
+Profile 1 — plus the backend bindings declared in operator YAML. The wiring instantiates each primitive's bound
+provider independently and auto-fills only the primitives the operator omits with the SDK defaults over that
+profile's cache, so the mixed-backend shapes in the matrix below are expressible in YAML today
+(`cpt-cf-clst-fr-routing-per-primitive`) for whichever native providers the linked plugins ship.
+
+**What `cluster-oop` does not contain** is worth stating, because the absence is the design: no directory
+registration, no heartbeat, no backoff, no dependency retry and no drain logic. `/healthz`, `/readyz`, `/health`
+and `/openapi.json` are bound and served **before** the gear's `start` runs, self-registration and the presence
+loop run in the background, and the drain sequence and deregistration run on SIGTERM — all of it supplied by
+`toolkit::bootstrap::oop::run_oop_with_options`, which the binary's `main` calls and otherwise does nothing
+(ADR-0005). The binary is a `clap` CLI over that one call plus a `registered_gears.rs` naming the two gears the
+process must link.
 
 Cross-cluster / geo-distributed coordination is out of scope (§4.2 Out of Scope in PRD).
+
+#### 3.15.1 Linking `cluster` requires linking `grpc-hub`
+
+**Any process that links the `cluster` gear must also link `grpc-hub` and give it a `listen_addr`, or it fails at startup.** This is not confined to the deployable (out-of-process) shape — it applies to every in-process monolith too, and it is a hard failure rather than a degradation: the framework refuses to build a registry that has gRPC services and no hub, with `RegistryError::GrpcRequiresHub` (`libs/toolkit/src/runtime/host_runtime.rs:777-779`).
+
+The cause is that the gear declares the `grpc` capability and exports the four coordination services (`cluster.{cache,lock,leader,profile}.v1`), which it does so that one profile-dispatch mechanism serves both an embedded and a remote consumer. Two consequences an operator has to plan for:
+
+- **Once the hub is linked, cluster's four services are served on that process's hub port.** That is a network surface an embedded cluster never had, so an embedding process needs the same `NetworkPolicy` treatment as a dedicated cluster pod: the coordination port is platform-plane and must not be reachable from outside the platform namespaces.
+- **The hub must bind a port the operator is willing to expose.** There is no "link the hub but serve nothing" mode today.
+
+Gating the capability behind a `serve-grpc` feature *is* expressible — but only as two mutually exclusive `#[cfg_attr(..., toolkit::gear(...))]` attributes, since `#[toolkit::gear]` accepts a `#[cfg]` **inside** its `capabilities = [..]` list and then silently ignores it (measured against `toolkit-macros`; the capability is registered either way). It is not adopted, because the gear links `tonic` unconditionally regardless, so the feature would remove the hub requirement without removing the dependency — see DESIGN-DEPLOYABLE-GEAR.md Risk 8.
 
 ## 4. Additional Context
 
@@ -823,7 +932,7 @@ Cross-cluster / geo-distributed coordination is out of scope (§4.2 Out of Scope
 | Backend | Cache | Leader Election | Distributed Lock |
 |---------|-------|----------------|-----------------|
 | **Standalone** (in-process, shipped) | Native (HashMap + AtomicU64) | Native (watch channel) | Native (Mutex + Notify) |
-| **Postgres** (shipped) | Native (table + LISTEN/NOTIFY) | SDK default (on PG cache) | Native (`pg_advisory_lock`) |
+| **Postgres** (shipped) | Native (table + LISTEN/NOTIFY) | SDK default (on PG cache) | Native (`cluster_lock` row, owner + fence) |
 | **K8s** (follow-up) | Native (CRD + `resourceVersion`) | Native (Lease API) | Native (Lease API) |
 | **Redis** (follow-up) | Native (GET/SET/Lua) | SDK default (on Redis cache) | Native (SET NX EX + Lua) |
 | **NATS KV** (follow-up) | Native (KV bucket + revision) | SDK default (on NATS cache) | SDK default (on NATS cache) |

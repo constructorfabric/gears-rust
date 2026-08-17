@@ -189,6 +189,13 @@ impl ClusterCacheBackend for ScopedCacheBackend {
             .map(|key| scope::strip(&self.prefix, &key).to_owned())
             .collect())
     }
+
+    /// Forwarded unchanged: a probe carries no key, so there is nothing to scope.
+    /// Forwarding at all is what keeps a scoped view from reporting the trait's
+    /// `Ok(())` default over an unreachable backend.
+    async fn probe(&self) -> Result<(), ClusterError> {
+        self.inner.probe().await
+    }
 }
 
 #[cfg(test)]

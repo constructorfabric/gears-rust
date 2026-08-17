@@ -27,8 +27,10 @@ pub mod types;
 
 pub(crate) use scoped::ScopedDistributedLockBackend;
 
-pub use backend::DistributedLockBackend;
+pub use backend::{DistributedLockBackend, STORE_OWNED_LEASES};
 pub use facade::DistributedLockV1;
 pub use guard::{LockCommandReceiver, LockGuard, LockRequest, LockResponder};
-pub use resolver::{LockResolverBuilder, validate_lock_capabilities};
+pub use resolver::{
+    LockResolverBuilder, validate_lock_capabilities, validate_lock_capabilities_from,
+};
 pub use types::{LockCapability, LockFeatures};

@@ -34,7 +34,6 @@ const ALL_HIGH_CARDINALITY_FIELDS: &[&str] = &[
     fields::attr::NAME,
     fields::attr::LOCK,
     fields::attr::ELECTION,
-    fields::attr::PROFILE,
 ];
 
 #[test]

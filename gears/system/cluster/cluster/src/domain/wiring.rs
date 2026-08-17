@@ -3,12 +3,14 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cluster_sdk::{
-    ClusterCacheBackend, ClusterError, ClusterProfile, DistributedLockBackend,
-    LeaderElectionBackend, StopHook, deregister_cache_backend, deregister_leader_election_backend,
-    deregister_lock_backend, register_cache_backend, register_leader_election_backend,
-    register_lock_backend,
+    CacheDescriptor, ClusterCacheBackend, ClusterClient, ClusterError, ClusterProfile,
+    DistributedLockBackend, LeaderElectionBackend, LeaderElectionDescriptor, LockDescriptor,
+    ProfileDescriptor, ProfileHealth, StopHook, deregister_cache_backend,
+    deregister_leader_election_backend, deregister_lock_backend, register_cache_backend,
+    register_leader_election_backend, register_lock_backend,
 };
 
 use crate::defaults::{
@@ -16,8 +18,25 @@ use crate::defaults::{
 };
 use toolkit::client_hub::ClientHub;
 
-use crate::config::{ClusterConfig, ProfileConfig};
-use crate::provider::ProviderRegistry;
+use crate::config::{BackendBinding, ClusterConfig, ProfileConfig};
+use crate::domain::local_client::LocalClusterClient;
+use crate::domain::provider::ProviderRegistry;
+use crate::domain::registry::{BoundProfile, InstanceId, ProfileInstanceRefs, ProfileRegistry};
+
+/// The health a freshly wired profile declares until the composite readiness
+/// healthcheck probes it (DESIGN §4.4).
+///
+/// Wiring is the only evidence available at this point, and it is positive: every
+/// backend the profile binds was constructed successfully, so `Serving` is the
+/// honest reading and a failing `probe()` is what can later contradict it. It is
+/// deliberately *not* the enum's `Default` (`Degraded`), which is the wire
+/// fail-safe for a health value that arrived unspecified — a different question
+/// from a profile whose backends have just been built.
+const WIRED_HEALTH: ProfileHealth = ProfileHealth::Serving;
+
+/// What wiring the cluster produces: the lifecycle [`ClusterHandle`] and the
+/// bound-profile set the profile registry publishes (DESIGN §5.1, §5.2).
+pub type WiredCluster = (ClusterHandle, Vec<Arc<BoundProfile>>);
 
 /// The per-primitive backend bindings for one profile.
 ///
@@ -29,6 +48,47 @@ pub struct ProfileBackends {
     cache: Arc<dyn ClusterCacheBackend>,
     leader_election: Option<Arc<dyn LeaderElectionBackend>>,
     lock: Option<Arc<dyn DistributedLockBackend>>,
+    /// The operator-facing provider names behind these backends, which only the
+    /// config-driven path knows ([`ClusterWiring::from_config`]). `None` on the
+    /// programmatic builder path, where the resolved backends' own
+    /// `provider_name()` is the only identity there is.
+    providers: Option<ProviderIdentities>,
+}
+
+/// The provider name behind each primitive of one profile, as the operator wrote
+/// it — `"postgres"`, not `postgres_cluster_plugin::cache::PostgresCache`.
+///
+/// This is the identity that reaches a consumer, on the descriptor and so in
+/// `CapabilityNotMet { provider }`: an operator reading a capability failure must
+/// see which real backend failed the requirement (DESIGN §5.5).
+struct ProviderIdentities {
+    cache: String,
+    /// The provider of the native leader-election binding, or — when the
+    /// primitive was omitted and rides the SDK default — the provider of the
+    /// cache that default is layered over, since that cache is what stores the
+    /// election's lease records.
+    leader_election: String,
+    /// The lock's provider, on the same rule as
+    /// [`leader_election`](Self::leader_election).
+    lock: String,
+}
+
+impl ProviderIdentities {
+    /// The identities to report when no configured provider name exists — the
+    /// programmatic builder path. `provider_name()` resolves through the vtable
+    /// to the concrete backend type, which is the same identity
+    /// `CapabilityNotMet` already carries today.
+    fn from_backends(
+        cache: &Arc<dyn ClusterCacheBackend>,
+        leader_election: &Arc<dyn LeaderElectionBackend>,
+        lock: &Arc<dyn DistributedLockBackend>,
+    ) -> Self {
+        Self {
+            cache: cache.provider_name().to_owned(),
+            leader_election: leader_election.provider_name().to_owned(),
+            lock: lock.provider_name().to_owned(),
+        }
+    }
 }
 
 impl ProfileBackends {
@@ -40,6 +100,7 @@ impl ProfileBackends {
             cache,
             leader_election: None,
             lock: None,
+            providers: None,
         }
     }
 
@@ -58,14 +119,6 @@ impl ProfileBackends {
     }
 }
 
-/// The three resolved backends for one profile, ready to register.
-struct ResolvedProfile {
-    name: String,
-    cache: Arc<dyn ClusterCacheBackend>,
-    leader_election: Arc<dyn LeaderElectionBackend>,
-    lock: Arc<dyn DistributedLockBackend>,
-}
-
 /// Entry point for wiring the cluster gear.
 pub struct ClusterWiring;
 
@@ -80,6 +133,7 @@ impl ClusterWiring {
             hub,
             profiles: Vec::new(),
             stop_hooks: Vec::new(),
+            fence_retention: cluster_sdk::lease::FENCE_RETENTION_DEFAULT,
         }
     }
 
@@ -90,6 +144,19 @@ impl ClusterWiring {
     /// Each provider's shutdown hook is owned by the returned [`ClusterHandle`]
     /// and awaited on [`stop`](ClusterHandle::stop).
     ///
+    /// # The bound-profile set
+    ///
+    /// Returns the [`BoundProfile`] set alongside the handle (DESIGN §5.1, §5.2).
+    /// Hub registration under `cluster:{profile}` and the all-or-nothing rollback
+    /// are unchanged — this is the profile knowledge the hub cannot enumerate,
+    /// returned so the profile registry has a data source: per-profile provider
+    /// identity, the declared consistency and features each backend reports, and
+    /// which instances the profile is built from.
+    ///
+    /// The set holds strong `Arc`s to those instances, so keeping it alive keeps
+    /// the profiles' backends alive independently of the hub registrations
+    /// (§5.3).
+    ///
     /// # Errors
     /// - [`ClusterError::InvalidConfig`] if a profile names an unregistered
     ///   provider for any primitive, or if a provider rejects its options.
@@ -99,8 +166,10 @@ impl ClusterWiring {
         hub: Arc<ClientHub>,
         config: &ClusterConfig,
         providers: &ProviderRegistry,
-    ) -> Result<ClusterHandle, ClusterError> {
-        let mut builder = Self::builder(hub);
+    ) -> Result<WiredCluster, ClusterError> {
+        // Read before any backend is built: a zero window is an operator error
+        // that must fail before a pool is opened, not after (§5.8.1).
+        let mut builder = Self::builder(hub).with_fence_retention(config.fence_retention()?)?;
         for (name, profile) in &config.profiles {
             tracing::debug!(profile = %name, "wiring cluster profile from config");
             let (cache, cache_stop) = build_cache_for_profile(name, profile, providers).await?;
@@ -112,6 +181,17 @@ impl ClusterWiring {
             builder = builder.on_stop(move || async move { cache_stop().await });
 
             let mut backends = ProfileBackends::new(Arc::clone(&cache));
+            // Recorded before the bindings are resolved, because it is the
+            // *config* that says which provider serves each primitive, and an
+            // omitted primitive inherits the cache's provider (§5.5).
+            backends.providers = Some(ProviderIdentities {
+                cache: profile.cache.provider.clone(),
+                leader_election: binding_provider(
+                    profile.leader_election.as_ref(),
+                    &profile.cache.provider,
+                ),
+                lock: binding_provider(profile.lock.as_ref(), &profile.cache.provider),
+            });
 
             if let Some(binding) = &profile.leader_election {
                 let provider = providers
@@ -143,8 +223,17 @@ impl ClusterWiring {
 
             builder = builder.profile_named(name.clone(), backends);
         }
-        builder.build_and_start()
+        builder.build_and_start_bound()
     }
+}
+
+/// The provider serving a primitive: its own binding's when it has one, else the
+/// `cache_provider` the omit-default SDK backend is layered over (§5.5).
+fn binding_provider(binding: Option<&BackendBinding>, cache_provider: &str) -> String {
+    binding.map_or_else(
+        || cache_provider.to_owned(),
+        |binding| binding.provider.clone(),
+    )
 }
 
 async fn build_cache_for_profile(
@@ -170,6 +259,9 @@ pub struct ClusterWiringBuilder {
     hub: Arc<ClientHub>,
     profiles: Vec<(String, ProfileBackends)>,
     stop_hooks: Vec<StopHook>,
+    /// Applied to every SDK default backend this builder auto-fills (§5.8.1).
+    /// Native backends are passed through untouched and keep their own.
+    fence_retention: Duration,
 }
 
 impl ClusterWiringBuilder {
@@ -191,6 +283,24 @@ impl ClusterWiringBuilder {
         self
     }
 
+    /// Sets how long a lease record outlives the lease it fenced, for every SDK
+    /// default backend this builder auto-fills (DESIGN-DEPLOYABLE-GEAR §5.8.1).
+    ///
+    /// [`ClusterWiring::from_config`] calls this with the operator's
+    /// `fence_retention`; an embedding library caller that does not gets
+    /// [`FENCE_RETENTION_DEFAULT`](cluster_sdk::lease::FENCE_RETENTION_DEFAULT).
+    /// A primitive bound to a native backend is unaffected — its fence, if it has
+    /// one, is that backend's own business and takes that backend's own option.
+    ///
+    /// # Errors
+    /// [`ClusterError::InvalidConfig`] when `retention` is zero
+    /// (`cluster_sdk::lease::validate_fence_retention`).
+    pub fn with_fence_retention(mut self, retention: Duration) -> Result<Self, ClusterError> {
+        cluster_sdk::lease::validate_fence_retention(retention)?;
+        self.fence_retention = retention;
+        Ok(self)
+    }
+
     /// Registers a shutdown action — typically a wired plugin handle's `stop()`
     /// future — run once during [`ClusterHandle::stop`] after backends are
     /// deregistered.
@@ -204,11 +314,23 @@ impl ClusterWiringBuilder {
     }
 
     /// Resolves every profile's four backends (auto-filling unbound primitives
-    /// with the SDK defaults) and registers them in the hub under
-    /// `cluster:{profile}`.
+    /// with the SDK defaults), registers them in the hub under
+    /// `cluster:{profile}`, **and makes this process able to resolve them**: the
+    /// bound set is published into a fresh [`ProfileRegistry`] and a
+    /// [`LocalClusterClient`] over it is registered under `dyn ClusterClient`
+    /// (DESIGN-DEPLOYABLE-GEAR §3.1, §4.9.3).
     ///
     /// Resolution happens before any hub mutation, so a failure to build a
     /// default backend cannot leave a partially-registered hub.
+    ///
+    /// That last half is new with item `K4`, and it is what keeps this method's
+    /// promise intact: since `K4` a facade resolves through the process's cluster
+    /// client rather than through the per-profile hub scopes, so wiring that
+    /// registered only the scopes would bind backends nothing could reach. The
+    /// registry is created here because this path *drops* the bound set — the
+    /// config-driven [`ClusterWiring::from_config`] hands it to its caller instead,
+    /// and the caller (the gear) owns publishing it into the registry the gRPC
+    /// services and the readiness check were built over in `init`.
     ///
     /// # Errors
     /// - [`ClusterError::InvalidConfig`] if a default leader-election or lock
@@ -217,35 +339,60 @@ impl ClusterWiringBuilder {
     /// - [`ClusterError::InvalidName`] if a profile name violates the cluster
     ///   name rule.
     pub fn build_and_start(self) -> Result<ClusterHandle, ClusterError> {
+        let (mut handle, bound) = self.build_and_start_bound()?;
+        let profiles = Arc::new(ProfileRegistry::new());
+        handle.publish(&profiles, bound);
+        // This handle created the registry, so it is the one that clears it -
+        // which is what keeps `stop()` unbinding the profiles on this path.
+        handle.profiles = Some(profiles);
+        Ok(handle)
+    }
+
+    /// [`build_and_start`](Self::build_and_start), also returning the
+    /// bound-profile set (DESIGN §5.2).
+    ///
+    /// The config-driven [`ClusterWiring::from_config`] surfaces this set to its
+    /// caller; the programmatic builder path does not need it yet, so
+    /// `build_and_start` keeps its shape and drops it.
+    fn build_and_start_bound(self) -> Result<WiredCluster, ClusterError> {
         // Phase 1 — resolve all backends (fallible) before touching the hub.
         // Default leader-election and lock backends the wiring itself creates
         // expose a shutdown-revoke seam; collect them so
         // `ClusterHandle::stop` can revoke in-flight coordination before shutdown
         // completes (DESIGN §3.13). Native (explicitly-bound) backends are not
         // revoked here — they manage shutdown through their own plugin stop hook.
-        let mut resolved = Vec::with_capacity(self.profiles.len());
+        let mut bound = Vec::with_capacity(self.profiles.len());
         let mut revokers: Vec<Arc<dyn ShutdownRevoke>> = Vec::new();
         for (name, backends) in self.profiles {
-            resolved.push(resolve_profile_backends(name, backends, &mut revokers)?);
+            bound.push(resolve_profile_backends(
+                name,
+                backends,
+                self.fence_retention,
+                &mut revokers,
+            )?);
         }
 
         // Phase 2 — register every primitive under the profile scope. A failure
         // partway (e.g. a later profile with an invalid name) must not leave
         // earlier profiles half-registered, so roll back everything registered
         // so far before propagating the error — the hub stays all-or-nothing.
-        let mut registered: Vec<String> = Vec::with_capacity(resolved.len());
-        for profile in resolved {
-            let name = register_profile_or_rollback(&self.hub, profile, &registered)?;
-            registered.push(name);
+        let mut registered: Vec<String> = Vec::with_capacity(bound.len());
+        for profile in &bound {
+            register_profile_or_rollback(&self.hub, profile, &registered)?;
+            registered.push(profile.name.clone());
         }
 
-        Ok(ClusterHandle {
-            hub: self.hub,
-            registered,
-            stop_hooks: self.stop_hooks,
-            revokers,
-            stopped: false,
-        })
+        Ok((
+            ClusterHandle {
+                hub: self.hub,
+                registered,
+                stop_hooks: self.stop_hooks,
+                revokers,
+                profiles: None,
+                stopped: false,
+            },
+            bound,
+        ))
     }
 }
 
@@ -253,53 +400,112 @@ impl ClusterWiringBuilder {
 /// `backends.cache`, collecting each default's shutdown-revoke seam into
 /// `revokers` (DESIGN §3.13). Explicitly-bound (native) primitives are passed
 /// through untouched.
+///
+/// The resolved backends are then described: consistency and features are read
+/// off the real backends, provider identity comes from config where there is
+/// config, and each primitive's instance is identified (DESIGN §5.2).
 fn resolve_profile_backends(
     name: String,
     backends: ProfileBackends,
+    fence_retention: Duration,
     revokers: &mut Vec<Arc<dyn ShutdownRevoke>>,
-) -> Result<ResolvedProfile, ClusterError> {
+) -> Result<Arc<BoundProfile>, ClusterError> {
     let cache = backends.cache;
     let leader_election: Arc<dyn LeaderElectionBackend> =
         if let Some(backend) = backends.leader_election {
             backend
         } else {
-            let default = Arc::new(CasBasedLeaderElectionBackend::new(Arc::clone(&cache))?);
+            let default = Arc::new(
+                CasBasedLeaderElectionBackend::new(Arc::clone(&cache))?
+                    .with_fence_retention(fence_retention),
+            );
             revokers.push(Arc::clone(&default) as Arc<dyn ShutdownRevoke + Send + Sync>);
             default as Arc<dyn LeaderElectionBackend>
         };
     let lock: Arc<dyn DistributedLockBackend> = if let Some(backend) = backends.lock {
         backend
     } else {
-        let default = Arc::new(CasBasedDistributedLockBackend::new(Arc::clone(&cache))?);
+        let default = Arc::new(
+            CasBasedDistributedLockBackend::new(Arc::clone(&cache))?
+                .with_fence_retention(fence_retention),
+        );
         revokers.push(Arc::clone(&default) as Arc<dyn ShutdownRevoke>);
         default as Arc<dyn DistributedLockBackend>
     };
-    Ok(ResolvedProfile {
+    let providers = backends
+        .providers
+        .unwrap_or_else(|| ProviderIdentities::from_backends(&cache, &leader_election, &lock));
+    let descriptor = describe_profile(&name, &cache, &leader_election, &lock, &providers);
+    let instances = ProfileInstanceRefs {
+        cache: InstanceId::of(&cache),
+        leader_election: InstanceId::of(&leader_election),
+        lock: InstanceId::of(&lock),
+    };
+    Ok(Arc::new(BoundProfile::new(
         name,
         cache,
         leader_election,
         lock,
-    })
+        descriptor,
+        instances,
+    )))
+}
+
+/// The profile's [`ProfileDescriptor`]: what each bound backend *declares*,
+/// which is the one piece of profile knowledge a sync accessor on a remote
+/// backend cannot fetch for itself (DESIGN §5.5).
+///
+/// Consistency and features are read from the real backends rather than from
+/// config, so a descriptor cannot claim a capability the backend does not
+/// declare.
+fn describe_profile(
+    name: &str,
+    cache: &Arc<dyn ClusterCacheBackend>,
+    leader_election: &Arc<dyn LeaderElectionBackend>,
+    lock: &Arc<dyn DistributedLockBackend>,
+    providers: &ProviderIdentities,
+) -> ProfileDescriptor {
+    ProfileDescriptor {
+        name: name.to_owned(),
+        cache: CacheDescriptor {
+            consistency: cache.consistency().into(),
+            features: cache.features().into(),
+            provider: providers.cache.clone(),
+        },
+        lock: LockDescriptor {
+            features: lock.features().into(),
+            provider: providers.lock.clone(),
+        },
+        leader_election: LeaderElectionDescriptor {
+            features: leader_election.features().into(),
+            provider: providers.leader_election.clone(),
+        },
+        health: WIRED_HEALTH,
+    }
 }
 
 /// Registers `profile`'s three primitives in `hub`. On failure, deregisters
 /// `profile` itself and every name in `registered` so the hub stays
 /// all-or-nothing, logs a warning naming the failed profile and rollback
-/// count, and returns the error. On success, logs registration and returns the
-/// profile's name for the caller to add to `registered`.
+/// count, and returns the error. On success, logs registration; the caller adds
+/// the profile's name to `registered`.
+///
+/// The backend `Arc`s are cloned into the hub rather than moved, because the
+/// bound-profile set keeps its own strong references (DESIGN §5.3). The hub
+/// receives the same instances it always did.
 fn register_profile_or_rollback(
     hub: &Arc<ClientHub>,
-    profile: ResolvedProfile,
+    profile: &BoundProfile,
     registered: &[String],
-) -> Result<String, ClusterError> {
+) -> Result<(), ClusterError> {
     let result = (|| {
-        register_cache_backend(hub, &profile.name, profile.cache)?;
-        register_leader_election_backend(hub, &profile.name, profile.leader_election)?;
-        register_lock_backend(hub, &profile.name, profile.lock)
+        register_cache_backend(hub, &profile.name, Arc::clone(&profile.cache))?;
+        register_leader_election_backend(hub, &profile.name, Arc::clone(&profile.leader_election))?;
+        register_lock_backend(hub, &profile.name, Arc::clone(&profile.lock))
     })();
     let Err(err) = result else {
         tracing::info!(profile = %profile.name, "cluster profile registered");
-        return Ok(profile.name);
+        return Ok(());
     };
     tracing::warn!(
         profile = %profile.name,
@@ -327,6 +533,13 @@ pub struct ClusterHandle {
     /// Shutdown-revoke seams for the wiring-created default leader-election and
     /// lock backends, revoked first on [`stop`](ClusterHandle::stop).
     revokers: Vec<Arc<dyn ShutdownRevoke>>,
+    /// The registry this handle **created** and therefore clears on
+    /// [`stop`](ClusterHandle::stop) — the programmatic
+    /// [`build_and_start`](ClusterWiringBuilder::build_and_start) path only.
+    /// `None` on the gear's path, where the gear owns its registry and clears it
+    /// itself (§4.8 phase 4), and `None` for any other caller of
+    /// [`publish`](ClusterHandle::publish).
+    profiles: Option<Arc<ProfileRegistry>>,
     /// Set by [`stop`](ClusterHandle::stop) so the [`Drop`] guard can tell a
     /// graceful shutdown apart from a forgotten one (ADR-006 §Confirmation).
     stopped: bool,
@@ -337,6 +550,37 @@ impl ClusterHandle {
     #[must_use]
     pub fn hub(&self) -> &Arc<ClientHub> {
         &self.hub
+    }
+
+    /// Publishes `bound` into `profiles` and registers a [`LocalClusterClient`]
+    /// over it under `dyn ClusterClient` — the two steps that make a wired process
+    /// able to resolve (DESIGN-DEPLOYABLE-GEAR §3.1, §5.2, §11.2).
+    ///
+    /// Publishing comes first, so a consumer that finds the client finds a
+    /// populated registry behind it. The reverse order is not broken — a request
+    /// landing between the two is answered `ProfileNotBound`, which is what the
+    /// whole pre-`start` window already answers — but it would be a needless
+    /// window.
+    ///
+    /// Registration is last-write-wins and this deliberately does not remove it at
+    /// [`stop`](ClusterHandle::stop): clearing the registry already makes every
+    /// method answer `ProfileNotBound`, and it does so *naming the profile*, where
+    /// an absent client would leave a resolver reporting only the coarser "nothing
+    /// is wired in this process" (§4.9.1).
+    ///
+    /// **Clearing the registry at shutdown stays with whoever owns it**: the gear
+    /// clears its own in `stop`, because that registry outlives any single wiring
+    /// and must be cleared even when `start` failed before a handle existed. Only
+    /// [`build_and_start`](ClusterWiringBuilder::build_and_start), which creates a
+    /// registry precisely because nothing else will, hands that job to the handle.
+    pub fn publish(&mut self, profiles: &Arc<ProfileRegistry>, bound: Vec<Arc<BoundProfile>>) {
+        profiles.publish(bound);
+        tracing::debug!(
+            generation = profiles.generation(),
+            "cluster profile registry published"
+        );
+        self.hub
+            .register::<dyn ClusterClient>(Arc::new(LocalClusterClient::new(Arc::clone(profiles))));
     }
 
     /// The single shutdown entry point (DESIGN §3.7, §3.13).
@@ -365,6 +609,14 @@ impl ClusterHandle {
         );
         for revoker in &self.revokers {
             revoker.revoke().await;
+        }
+        // Clear the published set before the hub scopes, mirroring the gear's own
+        // stop order: a request arriving during the drain resolves to
+        // `ProfileNotBound` rather than reaching a backend about to be torn down
+        // (DESIGN-DEPLOYABLE-GEAR §4.8, §5.6 phase C). The `dyn ClusterClient`
+        // registration itself stays - see `publish`.
+        if let Some(profiles) = &self.profiles {
+            profiles.clear();
         }
         deregister_all(&self.hub, &self.registered);
         // `mem::take` rather than `into_iter` because `ClusterHandle` now owns a

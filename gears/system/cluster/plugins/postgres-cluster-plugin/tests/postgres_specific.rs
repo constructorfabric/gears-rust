@@ -120,89 +120,6 @@ async fn pg_spec_002_key_length_over_2048_bytes_rejected() {
     handle.stop().await;
 }
 
-/// `PG-SPEC-004`: the Postgres-level guarantee the whole liveness model rests on
-/// — an advisory lock vanishes from `pg_locks` the instant its session's backend
-/// dies, with nothing in application code doing the removing.
-///
-/// Deliberately asserted at the catalog rather than through the plugin's
-/// behaviour, which is `PG-LOCK-007`'s job. What is under test here is the
-/// *server's* contract: this is the one property the design cannot rebuild in
-/// application code without reintroducing a heartbeat, a TTL on that heartbeat,
-/// and a reaper for it (`lock::beacon`). If Postgres ever stopped honouring it,
-/// every downstream assertion would still pass for the wrong reason — the TTL
-/// would quietly become the only thing bounding a crashed holder's lock.
-///
-/// Also asserts the flip side: the *successor* beacon is a different key. A
-/// server that recycled keys would let a reconnected instance vouch for its own
-/// pre-disconnect rows, which is exactly what per-incarnation keys rule out.
-#[tokio::test]
-async fn pg_spec_004_advisory_lock_released_on_session_disconnect() {
-    let (_container, config) = common::start_postgres_lock_only().await;
-    let connection_string = config.connection_string.clone();
-    let handle = PostgresLockPlugin::builder(config)
-        .build_and_start()
-        .await
-        .unwrap();
-    let concrete = handle.__test_lock();
-    let control_pool = common::raw_pool(&connection_string).await;
-
-    let key = concrete
-        .__test_beacon_key()
-        .expect("the beacon is established at startup");
-    let beacon_pid = concrete.__test_beacon_backend_pid();
-    let granted = |hi: i32, lo: i32| {
-        let control_pool = control_pool.clone();
-        async move {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM pg_locks \
-                 WHERE locktype = 'advisory' AND granted AND objsubid = 2 \
-                   AND classid = $1::oid AND objid = $2::oid",
-            )
-            .bind(hi)
-            .bind(lo)
-            .fetch_one(&control_pool)
-            .await
-            .expect("pg_locks query succeeds")
-        }
-    };
-    assert_eq!(
-        granted(key.0, key.1).await,
-        1,
-        "setup: the beacon key must be granted before the backend is killed"
-    );
-
-    let _terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
-        .bind(beacon_pid)
-        .fetch_one(&control_pool)
-        .await
-        .expect("terminate succeeds");
-
-    let released = common::wait_until(Duration::from_secs(5), Duration::from_millis(50), || {
-        let granted = granted(key.0, key.1);
-        async move { granted.await == 0 }
-    })
-    .await;
-    assert!(
-        released,
-        "PG-SPEC-004: Postgres must drop an advisory lock when its session's backend dies - no \
-         application code releases the beacon, ever"
-    );
-
-    let replaced = common::wait_until(Duration::from_secs(15), Duration::from_millis(100), || {
-        let concrete = std::sync::Arc::clone(&concrete);
-        async move { concrete.__test_beacon_key().is_some_and(|live| live != key) }
-    })
-    .await;
-    assert!(
-        replaced,
-        "PG-SPEC-004: the replacement beacon must carry a fresh key, or a reconnected instance \
-         would vouch for its own pre-disconnect rows"
-    );
-
-    control_pool.close().await;
-    handle.stop().await;
-}
-
 /// `PG-SPEC-005`: a mid-session `synchronous_commit` mutation is corrected on the
 /// next pool checkout (DESIGN.md §3.4).
 ///
@@ -218,8 +135,9 @@ async fn pg_spec_004_advisory_lock_released_on_session_disconnect() {
 ///
 /// This scenario used to have a second half, asserting the same correction on the
 /// dedicated lock session's own re-assertion timer. That connection is gone: the
-/// only long-lived connection the lock opens now is the beacon, which writes
-/// nothing at all and so has no durability setting to maintain (`lock::beacon`).
+/// lock opens no long-lived connection of its own at all now that the liveness
+/// beacon is gone, so there is no off-pool session with a durability setting to
+/// maintain.
 #[tokio::test]
 async fn pg_spec_005_mid_checkout_synchronous_commit_mutation_corrected() {
     let (_container, config) =
@@ -658,6 +576,14 @@ async fn pg_spec_008_explicit_replication_mode_skips_detection() {
 /// which reaper-interval timing cannot distinguish from "several intervals
 /// elapsed". `lock_reaper_interval_ms` is set long so the reaper's own sweeps
 /// never race these assertions.
+///
+/// `fence_retention_ms` is set to a second, and that is not tuning: since item
+/// `L3` a lapsed row is *not* sweepable until `expires_at + fence_retention` has
+/// passed (§5.8.1), so under the shipped hour-long default the backlog seeded
+/// below is a minute expired and correctly untouchable. A short explicit window
+/// keeps this a test about batching. It also moves the next-expiry probe, which
+/// now reports when the earliest row becomes **reapable** rather than when its
+/// lease lapses - asserted with the window added below.
 #[tokio::test]
 async fn pg_spec_009_expired_backlog_swept_in_bounded_batches() {
     use postgres_cluster_plugin::PostgresLock;
@@ -667,8 +593,15 @@ async fn pg_spec_009_expired_backlog_swept_in_bounded_batches() {
     // one deliberately partial.
     const BACKLOG: i64 = 1500;
 
-    let (_container, config) =
-        common::start_postgres_lock_only_with(json!({ "lock_reaper_interval_ms": 600_000 })).await;
+    // One second of retention: long enough that nothing races, short enough that
+    // the minute-expired backlog below is genuinely past its window.
+    const RETENTION_SECS: f64 = 1.0;
+
+    let (_container, config) = common::start_postgres_lock_only_with(json!({
+        "lock_reaper_interval_ms": 600_000,
+        "fence_retention_ms": 1_000,
+    }))
+    .await;
     let connection_string = config.connection_string.clone();
     let schema = config.schema.clone();
     let handle = PostgresLockPlugin::builder(config)
@@ -689,16 +622,15 @@ async fn pg_spec_009_expired_backlog_swept_in_bounded_batches() {
         "PG-SPEC-009: with no locks there is no deadline to wake for"
     );
 
-    // Seed already-expired rows as a *foreign* holder would leave them behind —
-    // no beacon and no `local_holders` entries here, so the sweep's job is purely
-    // to drain the metadata table. The beacon columns carry an arbitrary key no
-    // live instance holds, which is exactly what a dead foreign incarnation's
-    // rows look like (DESIGN.md §5.1).
+    // Seed already-expired rows as a *foreign* holder would leave them behind — the
+    // owner is an identity no live instance here uses, which is exactly what a dead
+    // holder's lapsed leases look like. Nothing local accounts for them, and nothing
+    // needs to: the sweep's job is purely to drain the metadata table.
     sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO {schema}.cluster_lock \
-         (name, holder_id, acquired_at, expires_at, holder_beacon_hi, holder_beacon_lo) \
-         SELECT 'spec9-' || g, md5('spec9-' || g)::uuid, now() - interval '2 minutes', \
-                now() - interval '1 minute', 1, 1 \
+         (name, owner, fence, acquired_at, expires_at) \
+         SELECT 'spec9-' || g, 'spec9-foreign-owner', 1, now() - interval '2 minutes', \
+                now() - interval '1 minute' \
          FROM generate_series(1, {BACKLOG}) AS g"
     )))
     .execute(&control_pool)
@@ -733,16 +665,17 @@ async fn pg_spec_009_expired_backlog_swept_in_bounded_batches() {
     );
 
     // The live lock's 5-minute TTL is now the earliest (only) deadline, and the probe
-    // must report it as a delay measured on the database clock.
+    // must report when that row becomes *reapable* - its deadline plus the window -
+    // as a delay measured on the database clock.
     let next = lock
         .__test_seconds_until_next_expiry()
         .await
         .expect("next-expiry probe")
         .expect("a live lock must have a deadline");
     assert!(
-        (240.0..=300.0).contains(&next),
-        "PG-SPEC-009: the probe must report the live lock's own deadline as seconds \
-         from the database clock's now(); got {next}"
+        (240.0 + RETENTION_SECS..=300.0 + RETENTION_SECS).contains(&next),
+        "PG-SPEC-009: the probe must report the live lock's deadline plus the fence \
+         retention window, in seconds from the database clock's now(); got {next}"
     );
 
     handle.stop().await;
@@ -763,10 +696,20 @@ async fn pg_spec_009_expired_backlog_swept_in_bounded_batches() {
 /// so its advisory lock is only releasable by this process's own reaper, and until
 /// that runs every `try_lock` on the name fails. The guard is deliberately never
 /// released: the reaper reclaiming it out from under a live guard is the scenario.
+///
+/// The 100 ms `fence_retention_ms` is what keeps this a test about the hint. Since
+/// item `L3` the gate weighs `ttl + retention` against the interval, because a row
+/// is not the reaper's work until its window has also passed — so under the shipped
+/// hour-long default no TTL can open it, and this test would be asserting only that
+/// acquire steals a lapsed row (which it does, with or without a reaper). A short
+/// window puts the mechanism back in play.
 #[tokio::test]
 async fn pg_spec_010_local_acquire_wakes_the_reaper_before_its_interval() {
-    let (_container, config) =
-        common::start_postgres_lock_only_with(json!({ "lock_reaper_interval_ms": 600_000 })).await;
+    let (_container, config) = common::start_postgres_lock_only_with(json!({
+        "lock_reaper_interval_ms": 600_000,
+        "fence_retention_ms": 100,
+    }))
+    .await;
     let handle = PostgresLockPlugin::builder(config)
         .build_and_start()
         .await
@@ -816,10 +759,15 @@ async fn pg_spec_010_local_acquire_wakes_the_reaper_before_its_interval() {
 /// *earlier* than the sleep in flight was computed with — the acquire-time signal
 /// alone would not cover this. Here the lock is acquired with a 5-minute TTL (the
 /// reaper commits to sleeping until roughly that), then renewed down to 1s.
+///
+/// `fence_retention_ms` is short for the same reason as in `PG-SPEC-010`.
 #[tokio::test]
 async fn pg_spec_010b_renew_wakes_the_reaper_when_it_shortens_a_ttl() {
-    let (_container, config) =
-        common::start_postgres_lock_only_with(json!({ "lock_reaper_interval_ms": 600_000 })).await;
+    let (_container, config) = common::start_postgres_lock_only_with(json!({
+        "lock_reaper_interval_ms": 600_000,
+        "fence_retention_ms": 100,
+    }))
+    .await;
     let handle = PostgresLockPlugin::builder(config)
         .build_and_start()
         .await
@@ -923,33 +871,29 @@ async fn pg_spec_011_stricter_isolation_default_rejected_at_startup() {
     }
 }
 
-/// `PG-SPEC-012`: the acquire predicate's `pg_locks` subplan does **not** execute
-/// on the uncontended path.
+/// `PG-SPEC-012`: the acquire path scans `pg_locks` on **no** path — one of `L2`'s
+/// exit criteria, asserted against a real query plan rather than against source
+/// text (DESIGN-DEPLOYABLE-GEAR §5.8.2).
 ///
-/// `pg_locks` is a function scan over `pg_lock_status()` with no index, so paying
-/// it on every acquire would make the common case `O(locks in the cluster)`. The
-/// predicate is written as `CASE`, not `OR`, precisely because SQL does not
-/// guarantee left-to-right evaluation of `OR` operands - only `CASE` guarantees
-/// its branches are evaluated as needed.
+/// This assertion inverted when the liveness beacon was removed, and the inversion
+/// is the point. It used to check that the predicate's `pg_locks` subplan was
+/// *skipped* on the uncontended path — the predicate was written as `CASE`, not
+/// `OR`, precisely because SQL does not guarantee left-to-right evaluation of `OR`
+/// operands, and the old third case here was a **control** proving the subplan
+/// really existed to be skipped. There is no subplan now: the predicate is
+/// `expires_at <= now()` alone, so every path must come back clean, and the former
+/// control is now the strongest of the three assertions.
 ///
-/// Verified with `EXPLAIN ANALYZE` rather than taken on trust, and against the
-/// statement acquisition actually runs (`__test_explain_acquire` plans the same
-/// string). The contended case at the end is the control that proves the subplan
-/// is really there to be skipped, rather than the assertion passing because it
-/// was never planned at all.
+/// `pg_locks` is a function scan over `pg_lock_status()` with no index, so what this
+/// buys is that a contended acquire is no longer `O(advisory locks in the cluster)`
+/// (§7.2.4). The scaling risk that cost carried had its own baseline test; it is
+/// retired along with the scan.
 ///
-/// Reading the plan needs one piece of care. Postgres plans a correlated
-/// `NOT EXISTS` as a *pair* of alternatives (`SubPlan 1 or hashed SubPlan 2`),
-/// and executes whichever it picks, so `never executed` appears against the
-/// unchosen alternative even on the contended path. The question is therefore
-/// whether *any* `pg_lock_status` scan reports actual timings, which is what
-/// [`pg_locks_was_scanned`] tests.
-///
-/// Worth noting what the contended plan shows when it does run: the hashed
-/// alternative scans every advisory lock in the cluster and hashes it, which is
-/// the `O(locks in the cluster)` cost `PG-SPEC-014` measures the scaling of.
+/// Verified with `EXPLAIN ANALYZE` against the statement acquisition actually runs
+/// (`__test_explain_acquire` plans the same string), so a regression that
+/// reintroduced a liveness join would fail here rather than merely reading oddly.
 #[tokio::test]
-async fn pg_spec_012_pg_locks_subplan_is_skipped_off_the_contended_path() {
+async fn pg_spec_012_the_acquire_path_never_scans_pg_locks() {
     let (_container, config) = common::start_postgres_lock_only().await;
     let handle = PostgresLockPlugin::builder(config)
         .build_and_start()
@@ -967,8 +911,8 @@ async fn pg_spec_012_pg_locks_subplan_is_skipped_off_the_contended_path() {
         "PG-SPEC-012: an uncontended acquire must not scan pg_locks; plan was:\n{plan}"
     );
 
-    // Second acquire: the row above has lapsed (1ms TTL), so `ON CONFLICT` fires
-    // and the CASE's *first* branch answers - still no pg_locks scan.
+    // Second acquire: the row above has lapsed (1ms TTL), so `ON CONFLICT` fires and
+    // the steal branch runs.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let plan = concrete
         .__test_explain_acquire("spec12", Duration::from_mins(10))
@@ -976,21 +920,20 @@ async fn pg_spec_012_pg_locks_subplan_is_skipped_off_the_contended_path() {
         .expect("EXPLAIN succeeds");
     assert!(
         !pg_locks_was_scanned(&plan),
-        "PG-SPEC-012: an expired row must be judged by expires_at alone, with the pg_locks \
-         subplan never executed; plan was:\n{plan}"
+        "PG-SPEC-012: a lapsed row must be judged by expires_at alone; plan was:\n{plan}"
     );
 
-    // Control: contending for a *live* row must reach the liveness branch, or the
-    // two assertions above would pass for a predicate that never consults
-    // pg_locks at all.
+    // Third: contending for a *live* row. This is the case that used to reach the
+    // beacon liveness branch, so it is the one where a reintroduced join would show
+    // up first.
     let plan = concrete
         .__test_explain_acquire("spec12", Duration::from_mins(10))
         .await
         .expect("EXPLAIN succeeds");
     assert!(
-        pg_locks_was_scanned(&plan),
-        "PG-SPEC-012: control - contending for a live row must actually evaluate the pg_locks \
-         liveness check; plan was:\n{plan}"
+        !pg_locks_was_scanned(&plan),
+        "PG-SPEC-012: contending for a live row must not consult pg_locks either - the deadline \
+         is the only liveness authority; plan was:\n{plan}"
     );
 
     handle.stop().await;
@@ -1001,24 +944,28 @@ async fn pg_spec_012_pg_locks_subplan_is_skipped_off_the_contended_path() {
 ///
 /// Postgres emits both alternatives of a correlated `NOT EXISTS` subplan, so
 /// presence of the scan in the plan text says nothing on its own; only the
-/// per-node timing does. A node that ran carries "actual time=".
+/// per-node timing does. A node that ran carries "actual time=". Kept in that exact
+/// form even though no such subplan is planned any more: it is what makes the
+/// assertion above robust against a regression that reintroduces one.
 fn pg_locks_was_scanned(plan: &str) -> bool {
     plan.lines()
         .filter(|line| line.contains("pg_lock_status"))
         .any(|line| line.contains("actual time="))
 }
 
-/// `PG-SPEC-013`: `cluster_lock_beacon_nonneg_check` rejects a negative beacon
-/// half.
+/// `PG-SPEC-013`: `cluster_lock_fence_positive_check` rejects a non-positive fence.
 ///
-/// The non-negative invariant is not cosmetic: the acquire predicate compares
-/// these columns against `pg_locks`'s `classid`/`objid`, which are `oid` and
-/// therefore unsigned. A negative half would compare as a large positive oid and
-/// silently never match, so every row carrying one would read as unvouched and be
-/// stealable on sight. The generator masks the sign bit off; this CHECK is the
-/// backstop that keeps any other writer honest.
+/// The Rust side only ever writes `1` (a fresh acquisition) or `fence + 1` (a
+/// steal), so this CHECK exists to keep *any other writer* honest — an operator with
+/// `psql`, or a future migration. It matters because a zero or negative fence is not
+/// merely odd: `FIRST_FENCE` is 1 precisely so that 0 stays available to mean "no
+/// lease held", and a stored fence outside the token's `u64` is reported as a
+/// provider error rather than silently coerced (`fence_to_u64`).
+///
+/// It replaces the beacon non-negative CHECK this ID used to cover, whose columns are
+/// gone (DESIGN-DEPLOYABLE-GEAR §5.8.2).
 #[tokio::test]
-async fn pg_spec_013_negative_beacon_half_is_rejected_by_the_check() {
+async fn pg_spec_013_non_positive_fence_is_rejected_by_the_check() {
     let (_container, config) = common::start_postgres_lock_only().await;
     let connection_string = config.connection_string.clone();
     let handle = PostgresLockPlugin::builder(config)
@@ -1027,23 +974,21 @@ async fn pg_spec_013_negative_beacon_half_is_rejected_by_the_check() {
         .unwrap();
     let control_pool = common::raw_pool(&connection_string).await;
 
-    for (hi, lo) in [(-1_i32, 1_i32), (1, -1)] {
+    for fence in [0_i64, -1] {
         let rejected = sqlx::query(
-            "INSERT INTO cluster_lock \
-             (name, holder_id, expires_at, holder_beacon_hi, holder_beacon_lo) \
-             VALUES ($1, md5($1)::uuid, now() + interval '1 minute', $2, $3)",
+            "INSERT INTO cluster_lock (name, owner, fence, expires_at) \
+             VALUES ($1, 'spec13-owner', $2, now() + interval '1 minute')",
         )
-        .bind(format!("spec13-{hi}-{lo}"))
-        .bind(hi)
-        .bind(lo)
+        .bind(format!("spec13-{fence}"))
+        .bind(fence)
         .execute(&control_pool)
         .await;
-        let err = rejected.expect_err("PG-SPEC-013: a negative beacon half must be rejected");
+        let err = rejected.expect_err("PG-SPEC-013: a non-positive fence must be rejected");
         assert_eq!(
             err.as_database_error()
                 .and_then(sqlx::error::DatabaseError::code),
             Some(std::borrow::Cow::Borrowed("23514")),
-            "PG-SPEC-013: expected a CHECK violation for ({hi}, {lo}), got {err:?}"
+            "PG-SPEC-013: expected a CHECK violation for fence {fence}, got {err:?}"
         );
     }
 
@@ -1051,92 +996,58 @@ async fn pg_spec_013_negative_beacon_half_is_rejected_by_the_check() {
     handle.stop().await;
 }
 
-/// `PG-SPEC-014`: contended-acquire latency against a seeded `pg_locks`
-/// population - the §6 cost baseline.
+/// `PG-SPEC-014`: `probe()` answers from the real pool on both primitives — `Ok`
+/// while the database is reachable, `Err` once it is not.
 ///
-/// Recorded as an artefact rather than asserted against a threshold: a CI
-/// container's absolute timings are not a production predictor, and the risk this
-/// exists for is a *scaling* one. The contended path is the only path that
-/// evaluates the `pg_locks` subplan (`PG-SPEC-012`), and that scan is
-/// `O(locks in the cluster)` with no index, so what matters is how latency moves
-/// as the cluster-wide advisory-lock count grows.
-///
-/// Read the numbers with `cargo test ... -- --nocapture pg_spec_014`. The
-/// pre-designed exit if they ever look bad is DESIGN.md's `acquired_at` staleness
-/// fallback, which pays the scan only for rows that look neglected.
-///
-/// The seeded locks are held by one unrelated session, which is enough: the
-/// predicate scans every advisory lock in the cluster regardless of who holds it.
-/// 5000 stays under the stock `max_locks_per_transaction * max_connections` bound
-/// (~6400), which is the point past which the server itself starts failing.
+/// Run against a container because the failure direction is the point, and the
+/// only honest way to produce it is to take the pool away. The two halves are
+/// separate handles on purpose: a `lock: { provider: postgres }` binding opens its
+/// own pool and never shares a co-located cache one (DESIGN.md §3.5), so a single
+/// probe cannot speak for both, and this is the scenario that proves it.
 #[tokio::test]
-async fn pg_spec_014_contended_acquire_cost_against_pg_locks_population() {
-    use std::fmt::Write as _;
-
-    const ATTEMPTS: u32 = 50;
-
-    let (_container, config) = common::start_postgres_lock_only().await;
-    let connection_string = config.connection_string.clone();
-    let handle = PostgresLockPlugin::builder(config)
+async fn pg_spec_014_probe_reports_pool_reachability_on_both_primitives() {
+    // Cache half, through the combined plugin.
+    let (_container, config) = common::start_postgres().await;
+    let handle = PostgresClusterPlugin::builder(config)
         .build_and_start()
         .await
         .unwrap();
-    let lock = handle.lock();
-
-    // A live, unexpired, well-vouched row: every attempt below therefore reaches
-    // the liveness branch rather than short-circuiting on expiry.
-    let held = lock
-        .try_lock("spec14", Duration::from_mins(10))
+    let cache = handle.cache();
+    cache
+        .probe()
         .await
-        .expect("the contended lock is acquired");
+        .expect("PG-SPEC-014: probe must succeed against a reachable database");
 
-    // One dedicated connection holding all the seeded keys, so they persist for
-    // the whole measurement.
-    let seeder = common::raw_pool(&connection_string).await;
-    let mut holder_conn = seeder.acquire().await.expect("seed connection");
-
-    let mut report = String::from(
-        "\nPG-SPEC-014 contended-acquire latency vs cluster-wide pg_locks population\n",
-    );
-    let mut population_target = 0_i64;
-    for target in [0_i64, 100, 1_000, 5_000] {
-        if target > population_target {
-            sqlx::query(
-                "SELECT pg_advisory_lock(1000000 + g, 0) FROM generate_series($1::int, $2::int) g",
-            )
-            .bind(i32::try_from(population_target + 1).expect("seed count fits i32"))
-            .bind(i32::try_from(target).expect("seed count fits i32"))
-            .execute(&mut *holder_conn)
-            .await
-            .expect("seeding advisory locks succeeds");
-            population_target = target;
-        }
-        let population: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'")
-                .fetch_one(&seeder)
-                .await
-                .expect("pg_locks count succeeds");
-
-        let started = std::time::Instant::now();
-        for _ in 0..ATTEMPTS {
-            let contended = lock.try_lock("spec14", Duration::from_secs(30)).await;
-            assert!(
-                matches!(contended, Err(ClusterError::LockContended { .. })),
-                "PG-SPEC-014: every attempt must contend, or the measurement is of the wrong \
-                 path; got {contended:?}"
-            );
-        }
-        let mean_us = started.elapsed().as_secs_f64() * 1e6 / f64::from(ATTEMPTS);
-        writeln!(
-            report,
-            "  pg_locks rows: {population:>5}   mean contended try_lock: {mean_us:>8.1} us"
-        )
-        .expect("writing to a String cannot fail");
-    }
-    println!("{report}");
-
-    held.release().await.expect("release succeeds");
-    drop(holder_conn);
-    seeder.close().await;
+    // `stop()` closes the pool, so the same backend `Arc` now has nothing to
+    // acquire a connection from — the readiness healthcheck's degraded path.
     handle.stop().await;
+    let err = cache
+        .probe()
+        .await
+        .expect_err("PG-SPEC-014: probe must fail once the pool is closed");
+    assert!(
+        matches!(err, ClusterError::Provider { .. }),
+        "PG-SPEC-014: a closed pool is a provider error, got {err:?}"
+    );
+
+    // Lock half, through the standalone lock-only plugin and its own pool.
+    let (_lock_container, lock_config) = common::start_postgres_lock_only().await;
+    let lock_handle = PostgresLockPlugin::builder(lock_config)
+        .build_and_start()
+        .await
+        .unwrap();
+    let lock = lock_handle.lock();
+    lock.probe()
+        .await
+        .expect("PG-SPEC-014: the standalone lock's own pool must probe Ok");
+
+    lock_handle.stop().await;
+    let lock_err = lock
+        .probe()
+        .await
+        .expect_err("PG-SPEC-014: probe must fail once the lock pool is closed");
+    assert!(
+        matches!(lock_err, ClusterError::Provider { .. }),
+        "PG-SPEC-014: a closed lock pool is a provider error, got {lock_err:?}"
+    );
 }

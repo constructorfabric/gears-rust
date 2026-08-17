@@ -23,8 +23,8 @@
   - [4.4 scan_prefix](#44-scan_prefix)
   - [4.5 Consistency Declaration](#45-consistency-declaration)
 - [5. Distributed Lock Implementation](#5-distributed-lock-implementation)
-  - [5.1 The Lease Row and the Liveness Beacon](#51-the-lease-row-and-the-liveness-beacon)
-  - [5.2 TTL Enforcement](#52-ttl-enforcement)
+  - [5.1 The Lease Row](#51-the-lease-row)
+  - [5.2 TTL Enforcement and Garbage Collection](#52-ttl-enforcement-and-garbage-collection)
   - [5.3 Blocking lock()](#53-blocking-lock)
   - [5.4 PgBouncer Constraint](#54-pgbouncer-constraint)
 - [6. Leader Election](#6-leader-election)
@@ -39,7 +39,7 @@
 
 ## 1. Overview
 
-`cf-postgres-cluster-plugin` is the Postgres backend plugin for the cluster gear. It provides a native `ClusterCacheBackend` over a `sqlx::PgPool` and a native `DistributedLockBackend` over a `cluster_lock` lease row, with a single per-instance advisory lock retained purely as a liveness beacon (§5.1). Leader election is derived from the SDK default backend over the Postgres cache — no additional tables or connections are required for that primitive.
+`cf-postgres-cluster-plugin` is the Postgres backend plugin for the cluster gear. It provides a native `ClusterCacheBackend` over a `sqlx::PgPool` and a native `DistributedLockBackend` over a `cluster_lock` lease row whose `expires_at` is its only liveness authority (§5.1). Leader election is derived from the SDK default backend over the Postgres cache — no additional tables or connections are required for that primitive.
 
 The plugin is the recommended deployment for **multi-instance, no-K8s** environments (DESIGN §4.2): Postgres is already deployed in every Gears environment, zero new infrastructure is required, and a conditional upsert under `synchronous_commit = on` gives ACID-correct mutual exclusion without a distributed lock service.
 
@@ -58,7 +58,7 @@ The plugin satisfies `cpt-cf-clst-component-plugins` for the Postgres backend. I
 |---|---|---|---|
 | `ClusterCacheBackend` | Native — `cluster_cache` table + LISTEN/NOTIFY | `Linearizable` | `prefix_watch: false` (LISTEN channel is key-exact; `watch_prefix` returns `Unsupported`) |
 | `LeaderElectionBackend` | SDK default `CasBasedLeaderElectionBackend` over Postgres cache | Inherits cache — `linearizable: true` | — |
-| `DistributedLockBackend` | Native — the `cluster_lock` lease row as sole arbiter, plus one per-instance advisory lock as a liveness beacon (§5.1). Independently routable via `lock: { provider: postgres }` (§3.5), with its own pool/config — not required to be paired with the postgres cache provider | `linearizable: true` | — |
+| `DistributedLockBackend` | Native — the `cluster_lock` lease row as sole arbiter, with `expires_at` as the only liveness authority (§5.1). Independently routable via `lock: { provider: postgres }` (§3.5), with its own pool/config — not required to be paired with the postgres cache provider | `linearizable: true` | — |
 
 `prefix_watch: false` means that consumers requiring `CacheCapability::PrefixWatch` cannot bind this backend without the polyfill. A consumer that needs prefix-watch semantics over this cache wraps it in `PollingPrefixWatch` (ADR-010), which synthesizes them over `scan_prefix`.
 
@@ -99,28 +99,29 @@ The plugin therefore caps an indexed key at **2048 bytes** (`limits::MAX_INDEXED
 
 ```sql
 CREATE TABLE cluster_lock (
-    name             TEXT        NOT NULL,
-    holder_id        UUID        NOT NULL,
-    acquired_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at       TIMESTAMPTZ NOT NULL,
-    holder_beacon_hi INT4        NOT NULL,
-    holder_beacon_lo INT4        NOT NULL,
+    name        TEXT        NOT NULL,
+    owner       TEXT        NOT NULL,
+    fence       BIGINT      NOT NULL,
+    acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (name),
     CONSTRAINT cluster_lock_name_len_check CHECK (octet_length(name) <= 2048),
-    CONSTRAINT cluster_lock_beacon_nonneg_check
-        CHECK (holder_beacon_hi >= 0 AND holder_beacon_lo >= 0)
+    CONSTRAINT cluster_lock_fence_positive_check CHECK (fence > 0)
 );
 
 CREATE INDEX cluster_lock_expires_idx ON cluster_lock (expires_at);
 ```
 
-This row **is** the lock (§5.1) — not metadata beside one. `expires_at` is the lock's absolute deadline, computed as `now() + ttl` on the **database** clock at insert and at every renew (PGR-C2, exactly as for `cluster_cache.expires_at`) — not a raw `acquired_at`/`ttl_ms` pair the TTL reaper re-derives for every row on every tick. A derived deadline could not be indexed at all: `timestamptz + interval` is `STABLE`, not `IMMUTABLE` (its result depends on the session `TimeZone`), so Postgres rejects an expression index on `acquired_at + ttl_ms * interval '1ms'`, and `now()` may not appear in a partial-index predicate either — leaving every sweep a guaranteed sequential scan with a per-row interval multiply. Storing the deadline makes the sweep an indexed `WHERE expires_at <= now()` and lets the reaper read `min(expires_at)` index-only, to wake when the next lock is actually due rather than polling blindly (§5.2). The index is unconditional rather than partial like the cache's: a lock TTL is mandatory (`DistributedLockBackend` takes a `Duration`, not a `Ttl`), so there is no `NULL` subset to exclude. `acquired_at` is restamped on every renew and is otherwise diagnostic; the only query that filters on it is the orphan sweep's fence (§5.2), which needs it to tell a row abandoned an interval ago from one written since. (§6's pre-designed `pg_locks` cost fallback would give it a second, load-bearing role; it is not built.) `holder_id` is a random UUID generated at acquire time; `renew()`, `release()`, and the reaper all guard on it to prevent a foreign or stale holder from renewing, releasing, or reclaiming another's lock. It is a native `UUID` column (and a `uuid::Uuid`, not a `String`, in Rust): the only writer is `try_acquire`'s `Uuid::new_v4()`, so the native type costs 16 bytes instead of 36, compares as bytes rather than as a collated string in every fenced query, and makes the invariant the column's own rather than a convention.
+This row **is** the lock (§5.1) — not metadata beside one. `expires_at` is the lock's absolute deadline, computed as `now() + ttl` on the **database** clock at insert and at every renew (PGR-C2, exactly as for `cluster_cache.expires_at`) — not a raw `acquired_at`/`ttl_ms` pair the TTL reaper re-derives for every row on every tick. A derived deadline could not be indexed at all: `timestamptz + interval` is `STABLE`, not `IMMUTABLE` (its result depends on the session `TimeZone`), so Postgres rejects an expression index on `acquired_at + ttl_ms * interval '1ms'`, and `now()` may not appear in a partial-index predicate either — leaving every sweep a guaranteed sequential scan with a per-row interval multiply. Storing the deadline makes the sweep an indexed `WHERE expires_at <= now()` and lets the reaper read `min(expires_at)` index-only, to wake when the next lock is actually due rather than polling blindly (§5.2). The index is unconditional rather than partial like the cache's: a lock TTL is mandatory (`DistributedLockBackend` takes a `Duration`, not a `Ttl`), so there is no `NULL` subset to exclude. `acquired_at` is restamped on every renew and is purely diagnostic — no query filters on it. (It used to carry one load-bearing role, the orphan sweep's fence; that sweep went with the beacon, §5.2.)
 
-`holder_beacon_hi`/`holder_beacon_lo` are the two `int4` halves of the liveness beacon vouching for the row: the single per-incarnation advisory lock the holding instance took at startup on a dedicated connection (§5.1). They are what makes ownership *checkable by anyone* rather than only by the row's writer — the acquire predicate joins them against `pg_locks`, so a row whose beacon is no longer granted is stealable the instant Postgres notices the holder's connection is gone, without waiting out `expires_at`. Nothing renews or maintains them; the beacon is released only by its connection closing, which is precisely the event they exist to detect.
+`owner` and `fence` are the **lease token**, and together they are the whole of the authority over the row (cluster DESIGN-DEPLOYABLE-GEAR §5.8.1, ADR-012). `renew` and `release` are conditional writes predicated on `(name, owner, fence)` and on nothing any process remembers, which is what lets a lease acquired through one replica be renewed through another that never saw the acquire (invariant I7).
 
-Two `int4` halves rather than one `bigint`, `NOT NULL`, and non-negative, all for the predicate's sake: `pg_locks` exposes the two-argument advisory key as `classid`/`objid`, which are `oid` (unsigned), so keeping both halves non-negative makes the comparison a plain cast with no sign reinterpretation, and `NOT NULL` keeps the predicate free of a `NULL` branch. The columns were declared in `0002_cluster_lock.sql` itself rather than added by a follow-on migration exactly so that no schema version ever exists in which a row can lack a beacon.
+- `owner` is the holder's identity: a caller-supplied `ClientId` for a brokered acquisition, or a freshly minted UUID per in-process `try_lock`/`lock`, so two guards held concurrently in one process are distinct owners and neither can renew or release the other's lease. `TEXT`, not the `UUID` the superseded `holder_id` column used — a `ClientId` is an opaque caller string, so the column cannot be narrower than that. The comparison is equality-only against a row already located by primary key, so the collation-aware compare costs nothing measurable next to the 16-byte one it replaces.
+- `fence` is per-`name` and strictly increases on every acquisition, including a steal-on-expiry: the acquire statement writes `fence = cluster_lock.fence + 1`, read off the row's own current value rather than bound by the acquirer, so the increment is atomic with the steal that performs it. That is what makes "steal on expiry" safe rather than merely detectable — a stale holder's operations fail their predicate instead of silently succeeding against a lease someone else now owns. `BIGINT` starting at 1, so 0 stays available to name the absence of a claim; `cluster_lock_fence_positive_check` is the backstop for the Rust-side `FIRST_FENCE`.
 
-There is deliberately **no index** on `(holder_beacon_hi, holder_beacon_lo)`, though three statements filter on that pair (the orphan sweep, the shutdown drain, and the post-reconnect cleanup — §5.2, §10). The table holds only *active* locks, so at the cardinality `cluster_postgres_lock_active_names` reports a sequential scan is trivial while the index would be pure write amplification on the acquire path. Revisit against that gauge, not up front.
+**The fence is not retained past the lease, and that is a known gap.** `release` deletes the row and the TTL reaper deletes a lapsed one, so a subsequent acquisition of that name starts again at 1 — the same counter reset `cluster_cache.version` has (§2.2). Closing it is item `L3`, which introduces `fence_retention` and must teach the reaper below to skip a row inside that window. Until then the guarantee this table offers is the narrower **"a fence value is never reused while the lease is live"**. The exposure is one owner re-acquiring a name it previously held while still holding a token from before the lapse; both tokens then name that owner's own live lease, so it is not a mutual-exclusion break. ADR-012 records why.
+
+There is deliberately **no index** on `(owner, fence)`. Nothing filters on either without also filtering on `name`, which is the primary key, so every lease predicate is already a single-row lookup and an index on the token halves would be pure write amplification on the acquire path.
 
 `name` is `PRIMARY KEY` and so carries the same btree index-tuple exposure as `cluster_cache.key` — identical bound, identical two-layer enforcement (`lock::validate_lock_name` in Rust, `cluster_lock_name_len_check` as the SQL backstop). Names are rejected at acquisition, before any lock state is mutated, so `release()` never reaches a lock whose metadata row could not be written.
 
@@ -162,10 +163,9 @@ cf-postgres-cluster-plugin/
       watch.rs      — LISTEN connection + per-watcher fan-out
       reaper.rs     — TTL sweeper background task
     lock/
-      beacon.rs     — Beacon: the one dedicated liveness-beacon connection
       mod.rs        — PostgresLock (DistributedLockBackend impl); PostgresLockPlugin, builder,
                        handle (standalone lock-only construction, §3.5)
-      reaper.rs     — cluster_lock TTL sweep + beacon-scoped orphan sweep
+      reaper.rs     — cluster_lock TTL sweep
     migrations/     — two independent embedded `sqlx::migrate!()` Migrators, not
                        one shared Migrator over one folder — see below
       cache/
@@ -182,7 +182,7 @@ cf-postgres-cluster-plugin/
 This split is required, not cosmetic: `Migrator::run` unconditionally applies every migration it was embedded with, so a single `Migrator` over one shared folder containing both files cannot support "lock-only migrates only its own table" — running it from the standalone lock plugin would apply `0001_cluster_cache.sql` too. Both Migrators write into the same database's single `_sqlx_migrations` tracking table (there is one table per database, not per `Migrator`), so each is constructed with `.set_ignore_missing(true)`: without it, a `Migrator` that only knows about its own file fails `Migrator::run`'s built-in `validate_applied_migrations` check the moment the *other* plugin's version is already recorded there. `CREATE TABLE IF NOT EXISTS` is deliberately **not** used in either migration file — `sqlx::migrate!()`'s version tracking plus its per-run advisory lock (`Migrator::run`'s `conn.lock()`) already guarantee each file's SQL executes at most once per database, which is what backs `PG-LIFE-002`/`PG-CACHE-007`'s idempotency requirement; adding `IF NOT EXISTS` on top would silently mask a real schema-drift bug (e.g. a manually created table with a stale schema) instead of surfacing `MigrateError::VersionMismatch`.
 
 **Why `sqlx` directly, not `libs/toolkit-db`.** This plugin uses `sqlx::PgPool`/`PgPoolOptions`/`sqlx::migrate!()` directly rather than going through `libs/toolkit-db`'s Sea-ORM/`SecureConn` abstraction — already designated at the SDK level (`cluster/docs/DESIGN.md` §3.5: "External backend libraries… belong to the follow-up plugin crates… and are NOT SDK dependencies"). This isn't a convenience shortcut around the platform's normal "route DB access through `SecureConn`" rule (`docs/toolkit_unified_system/11_database_patterns.md`); it's because three things this plugin needs have no `sea_orm::DatabaseConnection` equivalent to route through in the first place:
-- **A long-lived, owned connection for the liveness beacon** (§3.3, §5.1): the beacon's whole meaning is that one specific socket's death releases it, so the plugin must own that connection outright for its lifetime (`lock/beacon.rs`) rather than borrowing one per statement. `DatabaseConnection`'s only own-a-connection primitive is a transaction, and abusing a long-lived transaction for this collides with the PgBouncer-transaction-mode incompatibility this plugin already rejects at startup (§5.4). The acquire predicate also joins `pg_locks` inside its own `WHERE`, which has no ORM equivalent either.
+- **Long-lived, owned connections for `LISTEN`** (§3.3, §4.3, §5.3): a subscription is session-scoped, so the plugin must own those connections outright for their lifetime rather than borrowing one per statement. `DatabaseConnection`'s only own-a-connection primitive is a transaction, and abusing a long-lived transaction for this collides with the PgBouncer-transaction-mode incompatibility this plugin already rejects at startup (§5.4).
 - **`LISTEN`/`NOTIFY` streaming** (§4.3): there is no Sea-ORM concept of a subscribed, long-lived notification stream; this is a raw `sqlx::postgres::PgListener`/`PgConnection` API with nothing to wrap.
 - **`PgPoolOptions::after_connect`/`before_acquire` hooks** (§3.4, enforcing `synchronous_commit = on` per ADR-009): pool-lifecycle hooks are configured at `sqlx` pool-construction time — even Sea-ORM's own Postgres connector (`SqlxPostgresConnector::from_sqlx_postgres_pool`) takes an already-built `sqlx::PgPool` as input, so there's no lower layer to intercept this from Sea-ORM's side.
 
@@ -261,17 +261,17 @@ impl Drop for PostgresClusterHandle {
 1. Opens `sqlx::PgPool` with the configured pool size (`PgPoolOptions::connect`,
    `.await`ed).
 2. Runs the embedded migrations (`.await`ed, idempotent).
-3. Establishes the liveness beacon outside the pool (`.await`ed, §3.3) and opens the
+3. Opens the
    dedicated LISTEN connections (`.await`ed).
-4. Spawns the cache TTL reaper, the lock TTL reaper, the beacon task, and
-   the LISTEN fan-out tasks.
+4. Spawns the cache TTL reaper, the lock TTL reaper, and the LISTEN fan-out tasks.
 5. Returns the handle. By the time `build_and_start` resolves, the schema
-   exists and both the beacon and the LISTEN connection are live — there is
+   exists and the LISTEN connections are live — there is
    no readiness gate or background-init race for callers to reason about, unlike
    a design built around a synchronous builder. A failure at any of these steps
-   tears down whatever the earlier ones already started (including the beacon,
-   which does not observe the shared shutdown token and so is ended by its own
-   `BeaconHandle::shutdown`) rather than detaching it.
+   tears down whatever the earlier ones already started rather than detaching it.
+   (The lock backend itself is now built synchronously and infallibly: it
+   establishes nothing up front, since every lease operation is one statement on
+   a pool the caller already opened.)
 
 `stop`:
 1. Cancels all `CancellationToken`s; awaits background tasks.
@@ -279,32 +279,26 @@ impl Drop for PostgresClusterHandle {
 3. Drops each dedicated `PgListener` — awaiting the cancelled LISTEN tasks in
    step 1 is what drops them, so the LISTEN connections are already closed by the
    time step 4 runs (§10 step 3).
-4. Hands back held locks, then closes the beacon, then the pool — in that order
-   (§10 step 4). The beacon closes *after* the drain, never before: the drain
-   reads the beacon key and needs the pool, so both must still be live when it
-   runs.
+4. Closes the pool (§10 step 4). **Held lease rows are left in place** — a
+   restart is not a lease event — so there is no drain, and no ordering
+   constraint here beyond closing the pool last.
 5. Sets `self.stopped = true` as the last step — graceful shutdown completed, so the `Drop` guard above must not fire.
 
 ### 3.3 Connection Pool Split
 
 | Connection type | Purpose | Pool |
 |---|---|---|
-| Write pool (`PgPool`, default 5 connections) | All cache reads/writes, **every** `cluster_lock` statement (acquire, renew, release, both sweeps, the drain), all `pg_notify`, migrations | `sqlx::PgPool` |
+| Write pool (`PgPool`, default 5 connections) | All cache reads/writes, **every** `cluster_lock` statement (acquire, renew, release, the TTL sweep), all `pg_notify`, migrations | `sqlx::PgPool` |
 | Cache-watch LISTEN connection (1 dedicated, combined plugin only) | Receives all `NOTIFY cluster_cache_changes` events; never used for queries | A dedicated `sqlx::PgListener`, outside the pool |
 | Lock release-wake LISTEN connection (1 dedicated) | Receives all `NOTIFY cluster_lock_released` events, feeding the in-process `ReleaseWaiters` registry that wakes blocked `lock()` callers (§5.3) | A dedicated `sqlx::PgListener`, outside the pool |
-| **Liveness beacon (1 dedicated)** | Holds this instance's single per-incarnation advisory lock, and pings itself once a second. Carries no lock traffic whatsoever: no lock name, no `holder_id`, no row, no write of any kind | A dedicated `sqlx::PgConnection` (`lock/beacon.rs`), outside the pool |
 
-The beacon is **not** a lock (§5.1). It is a crash-triggered tombstone: one statement establishes it, no statement ever maintains it, and the server deletes it the instant that connection dies. Every other instance can read it in SQL (`pg_locks`), which is what lets the acquire predicate decide "is this row's holder still alive?" atomically with the acquire itself rather than in a second round-trip that would have to be raced.
+**The lock primitive opens no connection of its own.** It used to: one dedicated socket held the liveness beacon, whose death was the fleet's signal that this process was gone (§5.1). With the beacon removed the only off-pool connections left belong to `LISTEN`, and both are the cache's and the release-wake's rather than the lease's.
 
 A held lock therefore consumes **no connection at all** — not a pooled one, and not a share of anything per-lock. The number of simultaneously held locks is bounded by `cluster_lock` cardinality (§8's `lock_name_cardinality_warn_threshold`), not by `pool_max_size` and not by Postgres's shared lock-manager table. This is why there is no "size the pool for your concurrent locks" advisory.
 
-Three properties of the beacon are load-bearing and enforced elsewhere in this document:
+**No `pg_advisory_lock`, blocking or otherwise, anywhere in this plugin** (§5.1, §5.3). The blocking form in particular would park a task inside Postgres waiting for a key nobody can hand over. This was previously a property enforced *on* the beacon; it is now simply total.
 
-- **It is never released explicitly** (§5.1) — not on release, not on expiry, not at shutdown. Releasing it while the process runs asserts that this instance is dead, and every lock it holds becomes stealable on sight. Only closing the connection ends it, and at shutdown that happens anyway.
-- **Never the blocking `pg_advisory_lock`** (§5.3), on the beacon or anywhere else. A blocking form would park a task inside Postgres waiting for a key nobody can hand over.
-- **Its ping and its reconnect are bounded client-side** (`beacon::STATEMENT_TIMEOUT`, 5s; `CONNECT_TIMEOUT`, 10s), and both are raced against the shutdown token. `sqlx` applies no read or connect timeout of its own, and a server-side `statement_timeout` is useless for the case that matters, since the peer that would enforce it is the one that stopped answering. Overrunning is read as a lost beacon and handled exactly like one: the connection is discarded rather than reused, because a timed-out statement leaves the wire protocol in an indeterminate state. `PG-LOCK-019` is the regression test.
-
-**Total connection count.** Neither the LISTEN connections nor the beacon live in the `PgPool` (`sqlx::PgListener` owns its own connection and cannot adopt a `PoolConnection`; the beacon must outlive any checkout, and its whole meaning is tied to one socket's lifetime), so an instance's real steady-state connection count is `pool_max_size + 3` for the combined `PostgresClusterPlugin` (cache-watch + lock release-wake + beacon) and `pool_max_size + 2` for the standalone `PostgresLockPlugin` (release-wake + beacon — no cache half, so no cache-watch connection). That total does not move with how many locks are held.
+**Total connection count.** The LISTEN connections do not live in the `PgPool` (`sqlx::PgListener` owns its own connection and cannot adopt a `PoolConnection`), so an instance's real steady-state connection count is `pool_max_size + 2` for the combined `PostgresClusterPlugin` (cache-watch + lock release-wake) and `pool_max_size + 1` for the standalone `PostgresLockPlugin` (release-wake only — no cache half, so no cache-watch connection). Each is one lower than it was, the beacon having been the difference. That total does not move with how many locks are held.
 
 ### 3.4 synchronous_commit Enforcement
 
@@ -315,7 +309,7 @@ Enforcement happens at two points in the connection lifecycle, using `sqlx::PgPo
 1. **`after_connect`** — runs `SET synchronous_commit = on` once when a new physical connection is established. Covers the common case (role/database default is `off`, or a session-level `ALTER ROLE ... SET synchronous_commit = off` applies at login).
 2. **`before_acquire`** — re-runs `SET synchronous_commit = on` every time a connection is checked out of the pool for use, whether for a cache operation or a lock acquire. This closes the window ADR-009 flags: `synchronous_commit` is `USERSET` scope, so it can be mutated mid-session by anything sharing the connection (a misbehaving statement, a pooler-level session variable reset, `ALTER ROLE` applied after the connection was opened). Re-asserting on every checkout means a mutation can only affect the *current* checkout, never a later one.
 
-**No residual gap.** The pool hooks cover every connection the pool owns, and that is now *every statement this plugin issues against its own tables* — the `cluster_lock` INSERT/UPDATE/DELETEs ride the pool exactly like cache writes do, so they get `before_acquire` re-assertion on every checkout. The only long-lived connection outside the pool that the lock opens is the liveness beacon, which **writes nothing at all**: no row, no `pg_notify`, one `pg_try_advisory_lock` at establishment and a ping thereafter. It therefore has no durability setting to maintain, and needs neither the assertion nor the interval re-assertion the previous lock session carried. The residual risk DESIGN §11 used to record for that session is retired rather than accepted.
+**No residual gap.** The pool hooks cover every connection the pool owns, and that is now *every statement this plugin issues against its own tables* — the `cluster_lock` INSERT/UPDATE/DELETEs ride the pool exactly like cache writes do, so they get `before_acquire` re-assertion on every checkout. The lock opens **no long-lived connection outside the pool at all** — the liveness beacon was the last one, and it is gone (§5.1) — so there is no off-pool session with a durability setting to maintain, and neither the assertion nor the interval re-assertion the old lock session carried is needed. The residual risk DESIGN §11 used to record for that session is retired rather than accepted.
 
 `PG-LOCK-009` asserts the override against a database whose own default is `off`; `PG-SPEC-005` asserts the correction on the checkout *after* an external mid-session flip, with `pool_max_size: 1` so the connection handed back is provably the same one.
 
@@ -335,8 +329,7 @@ The cluster wiring crate (`cf-gears-cluster`) already implements config-driven p
 |---|---|---|
 | Migrations run | `0001_cluster_cache.sql` + `0002_cluster_lock.sql` | `0002_cluster_lock.sql` only |
 | Dedicated LISTEN connections | 2: cache watch (`cluster_cache_changes`) + lock release-wake (`cluster_lock_released`) | 1: lock release-wake (`cluster_lock_released`) only — no cache half, so no cache-watch connection |
-| Liveness beacon (§3.3) | 1 | 1 — the lock primitive is the whole plugin here, so it is not optional |
-| Background tasks | Cache TTL reaper, lock TTL reaper, beacon task, cache-watch LISTEN task, lock release-wake LISTEN task | Lock TTL reaper, beacon task, lock release-wake LISTEN task |
+| Background tasks | Cache TTL reaper, lock TTL reaper, cache-watch LISTEN task, lock release-wake LISTEN task | Lock TTL reaper, lock release-wake LISTEN task |
 | `synchronous_commit` enforcement (§3.4) | Yes, on the shared pool | Yes, on its own pool |
 
 Operator YAML example — Postgres lock routed independently of a non-Postgres cache:
@@ -453,9 +446,11 @@ The Postgres cache is read-through: every `get` hits the database directly. Ther
 
 ## 5. Distributed Lock Implementation
 
-### 5.1 The Lease Row and the Liveness Beacon
+### 5.1 The Lease Row
 
-A lock is held **iff** a `cluster_lock` row exists whose `expires_at` is in the future *and* whose recorded beacon is still granted in `pg_locks`. The row is the sole arbiter of ownership. Every acquire, renew, and release is a single statement against the write pool, with no session affinity and no in-process state that is load-bearing for exclusion.
+A lock is held **iff** a `cluster_lock` row exists whose `expires_at` is in the future. That is the whole predicate: `expires_at` is the only liveness authority, so no process vouches for a lease and no process's death ends one (invariant I7, cluster DESIGN-DEPLOYABLE-GEAR §5.8.1). The row is the sole arbiter of ownership, and it *is* the lease record of §5.8.1 held in columns rather than in an encoded cache value — `owner` and `fence` are the token the holder presents, `expires_at` is its deadline (§2.1).
+
+Both halves of `DistributedLockBackend` are served from that one lease. `acquire`/`acquire_waiting` hand the token back for a caller that must renew from somewhere other than the acquiring task — a remote one, or a different cluster replica; `try_lock`/`lock` take the same lease and wrap the token in a guard task, because `LockGuard`'s fields are private and cannot carry one. Every acquire, renew, and release is a single statement against the write pool, with no session affinity and no in-process state that is load-bearing for exclusion.
 
 #### How mutual exclusion works
 
@@ -471,49 +466,35 @@ Step 3 is what makes it correct: two acquirers cannot both observe the lock as f
 
 Three variants look equivalent and are not: a `SELECT` to check followed by an `INSERT` is a check-then-act race; letting the primary key's unique violation *be* the contention signal cannot express "steal if expired", making a lapsed lock permanently unacquirable; and `SELECT … FOR UPDATE` then `UPDATE` needs an explicit transaction and locks nothing when no row exists yet, so two first-time acquirers both proceed and one takes a unique violation.
 
-#### The liveness beacon
+#### What the liveness beacon was, and why it is gone
 
-At startup, on one dedicated connection outside the pool (§3.3), the instance picks a random per-incarnation key and takes it:
+An earlier revision carried one per-incarnation advisory lock on a dedicated connection outside the pool — a **liveness beacon**, stamped onto every row this instance wrote, whose disappearance from `pg_locks` published "the process that took this lock is gone". The acquire predicate joined against it, so a crashed holder's lock became stealable *before* its TTL, and an advisory lock was the only Postgres primitive that was simultaneously established in one statement, readable from any other session in SQL, and deleted by the server the instant the session ended.
 
-```sql
-SELECT pg_try_advisory_lock($1, $2);   -- (beacon_hi, beacon_lo), both non-negative int4
-```
+It was sound precisely when the process holding the beacon was the process using the lock. Brokered, that stops being true: the cluster gear's beacon would vouch for locks held by other, live consumers, so its restart would revoke the fleet's locks. The predicate therefore had to change for remote clients — and **it changed for everyone**, because keeping it for in-process acquisitions and dropping it for brokered ones would mean the same code and the same config reclaim a dead holder's lock in milliseconds in one deployment and at the TTL in another: two timings, and a class of bug that reproduces in only one profile (cluster DESIGN-DEPLOYABLE-GEAR §5.8.2, Goal 2).
 
-`pg_try_advisory_lock`, never the blocking form. Nobody else holds a freshly random 62-bit key, so `false` means a collision: draw another and retry.
+**The price is explicit, not buried:** a crashed holder's lock now lingers until its TTL, in every profile. That is the same bound every non-Postgres backend already had, and it is a reason to keep lock TTLs tight rather than to keep two mechanisms. ADR-012 records the decision and both rejected alternatives; `PG-LOCK-023` asserts the resulting timing in both directions — reclaimed at the TTL, and *not before*.
 
-The beacon is not a lock. It is a **crash-triggered tombstone**, and an advisory lock is the only Postgres primitive that is all four of: established by one statement (no schema, no row, no WAL, no write ever again); readable from any other session in SQL, and therefore joinable inside the acquire statement's own predicate; **deleted by the server the instant the session ends**, with nothing having to maintain it; and unfiltered by privilege, unlike `pg_stat_activity`, which nulls most columns for other roles' sessions. The third property is the whole point — it is what returns a crashed holder's locks to the fleet without waiting out their TTL, and the one property that cannot be rebuilt in application code without reintroducing a heartbeat, a TTL on that heartbeat, and a reaper for it.
-
-The key being ours to choose is what makes per-incarnation keying free, and that is load-bearing: every row carrying this key was provably written by this process, on this connection. The orphan sweep, the shutdown drain, and the post-reconnect cleanup all rest on it and need no other fence.
-
-**The beacon is never released explicitly — an invariant, not an omission.** Not when a lock is released, not when one expires, not at shutdown. Releasing it while the process is still running asserts that this instance is dead, and every lock it holds becomes stealable immediately. Closing the connection is the only correct way for it to end.
-
-**Acquire fails outright when there is no live beacon**, with `ClusterError::Provider { ConnectionLost }`, and never a row write. Stamping a row with a dead incarnation's key — or with none — would hand the caller a guard for a lock every other instance can steal on sight, and the consumer would not find out until its next `renew`. `lock()` classifies that error as transient and retries it inside the caller's budget, so a blip still resolves into a successful acquisition rather than a spurious failure.
+Three things went with it, each with its own cost stated where it lands: the sub-TTL reclaim above, the shutdown drain (§10), and the incarnation-keyed orphan sweep (§5.2).
 
 #### SQL contract per operation
 
 **Acquire** — one statement, any pool connection:
 
 ```sql
-INSERT INTO cluster_lock (name, holder_id, acquired_at, expires_at,
-                          holder_beacon_hi, holder_beacon_lo)
-VALUES ($1, $2, now(), now() + ($3::bigint * interval '1 millisecond'), $4, $5)
+INSERT INTO cluster_lock (name, owner, fence, acquired_at, expires_at)
+VALUES ($1, $2, 1, now(), now() + ($3::bigint * interval '1 millisecond'))
 ON CONFLICT (name) DO UPDATE
-   SET holder_id        = EXCLUDED.holder_id,
-       acquired_at      = EXCLUDED.acquired_at,
-       expires_at       = EXCLUDED.expires_at,
-       holder_beacon_hi = EXCLUDED.holder_beacon_hi,
-       holder_beacon_lo = EXCLUDED.holder_beacon_lo
- WHERE CASE WHEN cluster_lock.expires_at <= now() THEN true
-            ELSE NOT EXISTS (
-                   SELECT 1 FROM pg_locks
-                    WHERE locktype = 'advisory' AND objsubid = 2 AND granted
-                      AND classid = cluster_lock.holder_beacon_hi::oid
-                      AND objid   = cluster_lock.holder_beacon_lo::oid)
-       END
-RETURNING 1;
+   SET owner       = EXCLUDED.owner,
+       fence       = cluster_lock.fence + 1,
+       acquired_at = EXCLUDED.acquired_at,
+       expires_at  = EXCLUDED.expires_at
+ WHERE cluster_lock.expires_at <= now()
+RETURNING fence;
 ```
 
-**`CASE`, not `OR`.** SQL does not guarantee left-to-right evaluation of `OR` operands, and this needs the cheap indexed comparison to short-circuit the `pg_locks` scan off the uncontended path — `pg_locks` is a function scan over `pg_lock_status()` with no index. `PG-SPEC-012` holds that to `EXPLAIN ANALYZE` rather than taking it on trust, and notes one subtlety worth knowing when reading such a plan: Postgres emits the correlated `NOT EXISTS` as a *pair* of alternatives (`SubPlan 1 or hashed SubPlan 2`) and runs whichever it picks, so "never executed" appears against the unchosen one even on the contended path.
+**One branch, one indexed comparison.** The predicate used to be a `CASE` — not an `OR`, whose operand evaluation order SQL does not guarantee — purely so the cheap comparison could short-circuit a `pg_locks` scan off the uncontended path. With the beacon gone there is no scan to short-circuit, and the acquire path loses its only unindexed access: `pg_locks` is a function scan over `pg_lock_status()` with no index, so a contended acquire was `O(advisory locks on the server)`. `PG-SPEC-012` now holds the *plan* to issuing no such scan on any path — uncontended, steal, or contended — which is `L2`'s exit criterion and a stronger property than the short-circuit it replaces.
+
+**`fence` is read off the row, not bound by the acquirer.** Postgres evaluates `cluster_lock.fence + 1` against the latest committed version of the conflicting tuple (step 3 above), so two racing stealers cannot land on the same fence: the loser blocks on the winner's row lock, re-evaluates `WHERE cluster_lock.expires_at <= now()` against the winner's committed row, and matches nothing. `RETURNING fence` is what makes the token mintable from the same statement — the INSERT path returns 1, the steal path the incremented value, zero rows means contended. This is what the cache-backed default needs an explicit CAS on `CacheEntry.version` to achieve; here the guarded upsert *is* the CAS.
 
 **Renew** — authoritative against a single truth, no probe:
 
@@ -521,82 +502,53 @@ RETURNING 1;
 UPDATE cluster_lock
    SET acquired_at = now(),
        expires_at  = now() + ($1::bigint * interval '1 millisecond')
- WHERE name = $2 AND holder_id = $3
+ WHERE name = $2 AND owner = $3 AND fence = $4
    AND expires_at > now()
-   AND holder_beacon_hi = $4 AND holder_beacon_lo = $5
 RETURNING 1;
 ```
 
-Zero rows is `ClusterError::LockExpired`, whichever fence failed. The `holder_id` fence (PGR-L1) guards against a **successor**; `expires_at > now()` refuses to resurrect a lease the fleet is already entitled to treat as free; and the beacon fence guards against **ourselves** — if this instance's beacon has been replaced since the acquisition, the row carries a dead key that anyone can steal, and reporting a healthy renewal for it is the one way this design could silently lose mutual exclusion.
+Zero rows is `ClusterError::LockExpired`, whichever fence failed — lapsed, stolen and never-yours are indistinguishable and all three mean the caller must stop acting as the holder. `owner` keeps one holder from renewing another's lease; `fence` guards against a **successor**, which stole at `fence + 1`; `expires_at > now()` refuses to resurrect a lease the fleet is already entitled to treat as free.
 
-**Release** — one statement: a `DELETE … WHERE name = $1 AND holder_id = $2` and the `pg_notify` in a single data-modifying CTE, so releasing costs one pool checkout and the wake is atomic with the row's disappearance. The `holder_id` fence is sufficient on its own: a lock stolen after a beacon loss carries the successor's `holder_id` and will not match.
+The predicate is entirely over stored state, so **every replica gives the same answer** — that is invariant I7, and `PG-LOCK-021` asserts it by renewing through a handle built after the acquiring one had stopped. The third fence that used to be here, "has *this instance's* beacon been replaced since the acquisition?", is gone with the beacon: a renew now fails only because the lease moved on, never because the process that took it had a bad moment.
 
-**`pg_advisory_unlock` is not called anywhere in this plugin** — the single sharpest way to state the design, and a useful invariant to check any change against.
+**Release** — one statement: a `DELETE … WHERE name = $1 AND owner = $2 AND fence = $3` and the `pg_notify` in a single data-modifying CTE, so releasing costs one pool checkout and the wake is atomic with the row's disappearance. Liveness is deliberately *not* in the predicate: a lapsed row still bearing this token is still this holder's, and removing it frees the name immediately instead of making the next acquirer steal it. **Absence is `Ok`** — a retried release, one bearing a fenced-out token, and one whose lease the sweep already reclaimed all delete nothing and all succeed (`PG-LOCK-025`). Selecting the notify `FROM` the delete's CTE is what keeps that quiet: a no-op release sends nothing.
 
-Be exact about what that does and does not mean, since "lock" names two different things here. Releasing a lock still means **deleting its row**, and five paths do that: `release`, the TTL sweep, the orphan sweep (§5.2), the shutdown drain (§10), and the beacon's post-reconnect hand-over (§5.2). What is gone is the *advisory-lock* release — nothing per-lock is `pg_advisory_lock`ed, so there is no session-scoped unlock to pair with it. The one advisory lock this plugin takes is the per-instance beacon, released only by its connection closing.
+**This plugin takes no advisory lock at all, anywhere** — the single sharpest way to state the design, and a useful invariant to check any change against. `PG-LOCK-012` and `PG-LIFE-003` both assert the empty set directly, so a reintroduced one shows up as a test failure rather than as design drift.
+
+Be exact about what that does and does not mean, since "lock" names two different things here. Releasing a lock still means **deleting its row**, and two paths do that: `release` (fenced on the token) and the TTL sweep. What is gone is the *advisory-lock* release — nothing per-lock was ever `pg_advisory_lock`ed, so there is no session-scoped unlock to pair with it, and since the beacon was removed there is no advisory lock outside the pool either.
 
 The consequence is the point: a row delete is something **any** instance can perform, whereas an advisory unlock could only ever be issued by the session that took it. An expired or unvouched row is therefore stealable by the acquire predicate itself, evaluated by whoever asks — no reclaim step, and no reason reclamation has to route back to the instance that held the lock. That is what lets a crashed *or merely wedged* holder's lock be taken by anyone rather than only by a healthy reaper on the owning instance (`PG-LOCK-014`).
 
-#### The one surviving in-process registry
+#### No in-process registry survives
 
-`local_holders` (`DashMap<String, Uuid>`, name to `holder_id`) records the locks this process currently has a live guard for. It is **not** authoritative for exclusion and is named so no future reader mistakes it for it: `renew` and `release` fence in SQL, the reaper does not need to know which locks are ours, and `cluster_postgres_lock_active_names` is table-derived rather than `len()` of this map.
+There used to be one — `local_holders`, name to `holder_id` — kept for exactly one consumer, §5.2's orphan sweep, which had to distinguish a row with a live local guard from a row whose acquirer went away. Both went together: the sweep was keyed on the beacon, and with no incarnation key to filter on there is nothing for the registry to exempt.
 
-It survives for exactly one consumer — §5.2's orphan sweep, which must distinguish a row with a live local guard from a row whose acquirer went away. That is the one question the database cannot answer about itself, and the only reason any local registry remains.
+Nothing here now remembers which locks this process holds, because nothing needs to: every predicate is over stored state. That is also what makes any replica able to serve any lease operation.
 
-### 5.2 TTL Enforcement, Beacon Loss, and Garbage Collection
+### 5.2 TTL Enforcement and Garbage Collection
 
 `expires_at` is the lease deadline, computed in SQL against the **database** clock at insert and at every renew (§2.1). Reclamation happens on two independent paths, and only the first is load-bearing for exclusion:
 
-1. **Any acquirer's own predicate.** An expired row, or one whose beacon has vanished, is taken in the acquiring statement itself (§5.1). No sweep has to have run, and no instance has to cooperate. This is the whole guarantee.
+1. **Any acquirer's own predicate.** A lapsed row is taken in the acquiring statement itself (§5.1). No sweep has to have run, and no instance has to cooperate. This is the whole guarantee.
 2. **The background reaper**, which is garbage collection plus a promptness optimisation: it deletes expired rows so the table does not grow, and NOTIFYs their names so blocked waiters wake instead of sitting out a heartbeat. A sweep that never runs costs table growth and slower wake-ups, never a double-hold.
 
     Each sweep deletes in bounded batches (`DELETE ... WHERE name IN (SELECT name ... ORDER BY expires_at LIMIT n FOR UPDATE SKIP LOCKED)`), looping until a batch comes back short. `SKIP LOCKED` keeps the per-instance reapers from serializing behind each other, and `cancel` is re-checked between batches so shutdown is not held up mid-backlog.
 
-    **Wake schedule.** After each sweep the reaper sleeps until the earlier of the next metrics tick (`lock_reaper_interval_ms`) and the next row's deadline, read as `SELECT extract(epoch FROM (min(expires_at) - now())), now()` — an index-only read, with the subtraction done in Postgres so the delay never depends on this instance's wall clock, and the `now()` doubling as the orphan sweep's fence below. The interval is the *cap*: it keeps `cluster_postgres_lock_active_names` and the cardinality WARN on their configured cadence, and only these interval-boundary wakes do the gauge work. `min(expires_at)` only *shortens* an individual sleep.
+    **Wake schedule.** After each sweep the reaper sleeps until the earlier of the next metrics tick (`lock_reaper_interval_ms`) and the next row's deadline, read as `SELECT extract(epoch FROM (min(expires_at) - now()))` — an index-only read, with the subtraction done in Postgres so the delay never depends on this instance's wall clock. (It used to carry `now()` back on the same select list, as the orphan sweep's fence; that sweep is gone, and with it the only reader of the database clock here.) The interval is the *cap*: it keeps `cluster_postgres_lock_active_names` and the cardinality WARN on their configured cadence, and only these interval-boundary wakes do the gauge work. `min(expires_at)` only *shortens* an individual sleep.
 
 A sleep is computed from the table as it looked at wake time, so on its own that shortening would miss a lock whose entire lifetime fits inside one sleep (TTL ≲ `lock_reaper_interval_ms`). `try_acquire` and `renew` therefore signal the reaper (an in-process `tokio::sync::Notify`) once their write is committed — but **only when the TTL they wrote is shorter than `lock_reaper_interval_ms`**, which is exactly that condition. The signal is in-process only, and that is sufficient rather than partial: the sweep is promptness only, so a hint no other instance hears costs at most a waiter's heartbeat. Both the expiry-driven and the signalled wake are floored at 100 ms (or at `lock_reaper_interval_ms` when that is shorter), so many staggered deadlines — or a burst of acquisitions — coalesce into one wake instead of one each. A **lost** signal costs at most one late sweep; a **spurious** one is not symmetric, which is why the gating is not merely an optimisation. `Notify` holds a single permit, so signalling on every write keeps the `notified()` branch permanently ready and collapses every subsequent sleep to the floor — an instance renewing a couple of hundred leases a second would run a full iteration every 100 ms instead of every interval, roughly fifty times the intended database load, permanently, on every instance in the fleet. Expiry is deliberately **not** bucketed into coarse slices: for a lock the TTL is the crash safety net, so rounding deadlines up to a shared boundary would let a stale lock block waiters for up to a full bucket past its TTL.
 
-#### Beacon loss means losing every lock
+#### What garbage collection no longer does
 
-One beacon per instance means one blast radius, deliberately: a connection blip has one predictable outcome rather than a per-lock recovery path to reason about. When the beacon connection drops:
+Two liveness responsibilities used to live on this wake loop. Both went with the beacon (§5.1), and stating what they cost is the point of this subsection rather than a footnote to it.
 
-- Other instances see the beacon absent from `pg_locks` and may reclaim this instance's rows immediately. Correct — the instance can no longer prove it is alive.
-- The instance purges `local_holders`, so nothing local advertises a lock it cannot defend.
-- After reconnect the key differs, so `renew`'s beacon fence can never match a pre-disconnect row. Those locks are gone permanently rather than resurfacing.
-- Consumers learn at their next `renew`, which returns `LockExpired`. That is the only channel `LockGuard` offers — the SDK has no asynchronous lost-lock signal, by design.
-- Once reconnected, the instance runs §10's drain statement **against its previous key**, deleting those rows and batch-NOTIFYing their names. Identical SQL, different parameter, and safely fenced for free: the dead key only ever matched rows this instance wrote, and any already stolen now carry the successor's beacon. A courtesy rather than a requirement — the rows are unvouched and stealable either way — but it hands names over on a NOTIFY instead of making waiters discover them by retry.
+**The orphan sweep.** Acquire is a single statement, so there is no compensating unlock to issue if the caller goes away. A `try_acquire` future dropped after its INSERT committed — `lock()`'s per-attempt timeout elapsing mid-acquire, a cancelled consumer task, a runtime shutting down — leaves a lease this process owns and no longer has a token for. Under the beacon this was *worse* than a lapsed lease and needed its own mechanism: the row was unexpired **and** vouched for by a live beacon, so nothing in the fleet would steal it — including this instance, whose own next acquire of that name read its own orphan as a live holder. The name was wedged for both sides until the TTL, and an incarnation-keyed `DELETE` (every row bearing this beacon whose `holder_id` was not in `local_holders`, fenced on an `acquired_at` from the previous reaper wake) reclaimed it early.
 
-**Detecting the loss requires a ping, and this is the one place the design does not get a fence for free.** An idle `PgConnection` is not polled, so a beacon whose backend died goes unnoticed *locally* until something uses that connection — and nothing ever does. Without local detection the semantics would quietly weaken to "you remain the holder until someone with a live beacon takes it from you": our own `renew` would keep matching its row and succeeding, because the row still carries our `holder_id` and our now-dead key. No mutual exclusion is violated — the moment another instance steals, the `holder_id` fence makes the next `renew` fail — but the instance would go on believing it holds a lock it can no longer defend, for as long as nobody else wants it. So the beacon task pings its own connection once a second and treats a failed ping as loss: purge, reconnect, new key. A fixed cadence rather than `lock_reaper_interval_ms` (default 5s, and an operator may set it far higher), because this bounds how long an instance can be wrong about what it holds. `PG-LOCK-013` asserts all three halves, including the negative — that a lock is *not* silently retained across the loss when nobody else contends for it.
+With no beacon there is no incarnation key to filter on and no local registry to exempt, and — more to the point — **an abandoned row is now just a lapsed lease at its deadline**, reclaimed by the TTL sweep above like any other. The cost is that its name is taken until its TTL rather than until the next interval wake. That is the same trade as the sub-TTL reclaim of a crashed holder (§5.1), applied to a local mishap rather than a remote crash, and it is bounded by the same thing: the TTL the caller chose.
 
-The remaining race is safe in the direction that matters: a beacon can be read as *alive* moments before it dies (conservative — we decline to steal, and the TTL still bounds it), but a genuinely granted beacon is always visible in `pg_locks`, so a live holder is never robbed.
+**Detecting a dead holder locally.** The beacon task pinged its own connection once a second, so an instance learned within about a second that it could no longer defend what it held, and purged `local_holders`. Nothing replaces that, and nothing needs to: there is no local state to purge, and a holder learns its lease is gone the way the SDK has always specified — at its next `renew`, which returns `LockExpired` (`LockGuard` offers no asynchronous lost-lock signal, by design). The instance can no longer be *wrong* about what it holds in a way that matters, because holding is no longer a local fact.
 
-#### The real bound on "immediate"
-
-Sub-TTL recovery is bounded by how quickly Postgres notices the client is gone, not by anything in this design. A clean process exit or socket close releases the beacon at once. A hard kill or a partition that leaves the TCP connection half-open leaves the backend blocked in `recv`, still holding the beacon, until keepalives fire. The honest statement of the guarantee is therefore **"immediate on clean disconnect, keepalive-bounded otherwise, TTL-bounded in the worst case."**
-
-Tightening that bound is a **server-side** lever, not a client-side one. The beacon sets `tcp_keepalives_idle = 5`, `tcp_keepalives_interval = 2`, `tcp_keepalives_count = 3` on its own session at establishment (the GUCs are `USERSET`): ≈11s worst case, typically 5–7s, for one packet every 5s on one connection per instance. Client-side `keepalives_*` would be the wrong instrument — those detect a dead *server*, which the ping already does faster; what matters here is Postgres noticing that **we** are gone. Best-effort and never fatal: the GUCs are unsupported on some platforms, and a failed `SET` costs recovery promptness with the TTL still bounding it, so it logs at DEBUG and continues. That is deliberately the opposite of how `synchronous_commit` is treated (§3.4). Fixed constants rather than config knobs, because recovery promptness is *already* under caller control through the lock TTL, which is a per-acquisition parameter on the trait — an operator wanting faster reclamation should shorten the TTL rather than tune socket timers. `tcp_user_timeout` is rejected on platform support: it is a tighter bound, but setting a non-zero value where it is unsupported is an error rather than a no-op.
-
-#### Reclaiming orphaned rows
-
-Acquire is a single statement, so there is no compensating unlock to issue if the caller goes away. A `try_acquire` future dropped after its INSERT committed — `lock()`'s per-attempt timeout elapsing mid-acquire, a cancelled consumer task, a runtime shutting down — leaves a row this instance owns with **no local guard**. This is routine rather than exotic, and it is the one case the previous design handled better.
-
-Its severity is worth stating plainly: because the row is unexpired *and* vouched for by a live beacon, nothing in the fleet will steal it — including this instance, whose own next acquire of that name reads its own orphan as a live holder. The name is wedged for both sides until the TTL.
-
-**Detection is exact.** The beacon key is fresh per incarnation, so every row bearing it was written by this process, in this incarnation. Any such row whose `holder_id` is not in `local_holders` is an orphan — no heuristics, no `pg_locks` read, no key-by-key reconciliation:
-
-```sql
-DELETE FROM cluster_lock
- WHERE holder_beacon_hi = $1 AND holder_beacon_lo = $2
-   AND holder_id <> ALL($3::uuid[])
-   AND acquired_at < $4
-RETURNING name;
-```
-
-`$3` is `local_holders`' value set — `O(locks held by this instance)`. An empty array is correct and needs no special case (`<> ALL('{}')` is true). The reclaimed names are then NOTIFYed in one batch, so waiters wake instead of sitting out the TTL.
-
-**`$4` is the fence that keeps a live acquisition safe.** Without it the sweep races every acquisition in flight: the known-`holder_id` set is snapshotted in Rust *before* the DELETE executes, so a row committing in between would be read as an orphan and deleted out from under its own guard. Rather than reintroduce a per-acquisition guard, the fence is a database `now()` captured at the **previous interval-boundary reaper wake**, so a row is only ever deleted if it was already unregistered one full interval earlier. The fence deliberately does *not* advance on expiry-driven wakes: a younger fence makes more rows eligible, which is the wrong direction, while a staler one only delays cleanup. The first wake after startup needs no special case — every row bearing a fresh beacon was written within the current interval, so the fence exempts them all.
-
-**Residual.** An acquisition that straddles two interval wakes — a committed INSERT more than one `lock_reaper_interval_ms` before its `local_holders` registration *on the same task* — could still be swept. That requires pathological runtime starvation between one statement returning and one `DashMap` insert, and the consequence is a spurious `LockExpired` for that acquisition, not a double-hold: the row is gone, so exclusion is never violated. If that residual ever proves real, the exact alternative is a set of in-flight `holder_id`s taken before the INSERT and dropped after registration — recommended against unless it does, since it puts a cost on every acquisition to guard against garbage collection rather than against a correctness failure. `PG-LOCK-015`/`017`/`018` cover the sweep's reclamation, its selectivity, and the fence respectively.
+**And the "immediate on clean disconnect" bound is gone with them.** The honest statement of crash recovery used to be "immediate on clean disconnect, keepalive-bounded otherwise, TTL-bounded in the worst case", which is why the beacon set `tcp_keepalives_*` on its own session. It is now simply **TTL-bounded, always**, in every profile — no socket timers, no server-side levers, nothing to tune. Recovery promptness is under caller control through the lock TTL, which is a per-acquisition parameter on the trait: an operator wanting faster reclamation shortens the TTL. `PG-LOCK-023` asserts both directions of that bound.
 
 ### 5.3 Blocking lock()
 
@@ -616,23 +568,26 @@ No server-side wait is ever issued: no blocking `pg_advisory_lock`, and no `SELE
 **What `lock()` reports when it cannot acquire.** Three outcomes, deliberately distinguished, because a caller's response to each differs:
 
 - `ClusterError::Shutdown` — checked before any lock work, so an acquisition arriving after `stop()` has cancelled the shared token answers immediately instead of retrying a backend that is being torn down. `try_lock` takes the same check, so the two agree rather than one reporting `Shutdown` and the other `Provider { ConnectionLost }` depending on how far shutdown had progressed (`PG-LOCK-020`).
-- `Provider { ConnectionLost }` — the budget ran out while this instance still had no live beacon (§5.1) or could not reach the pool. A transient gap is retried inside the caller's budget (the beacon reconnects with a 200ms..5s capped backoff), which is what carries a `lock()` through a Postgres failover; but if it never clears, the caller is told *that* rather than being handed the `LockTimeout` ordinary contention produces. Retrying is deliberately not given a shorter give-up budget: failover commonly takes 10–30s, and cutting the retry short to improve an error code would trade a real availability property for a cosmetic one.
+- `Provider { ConnectionLost }` — the budget ran out while this instance could not reach the pool. Retried inside the caller's budget, which is what carries a `lock()` through a Postgres failover; this is now the *only* transient case, since an acquisition can no longer fail for a reason local to this process (it used to also cover "no live beacon to stamp a row with", which was the common case rather than the rare one); but if it never clears, the caller is told *that* rather than being handed the `LockTimeout` ordinary contention produces. Retrying is deliberately not given a shorter give-up budget: failover commonly takes 10–30s, and cutting the retry short to improve an error code would trade a real availability property for a cosmetic one.
 - `LockTimeout` — the budget ran out while Postgres was answering normally and saying the lock was held. This is genuine contention, and only this case reports it.
 
 The wait does **not** LISTEN on the acquiring connection. `sqlx`'s `PgListener` owns its own single connection and has no public way to adopt an already-checked-out `PoolConnection`, so instead a single **dedicated** `cluster_lock_released` LISTEN connection (opened at `build_and_start`, present in both the combined and standalone plugins — §3.3) runs a fan-out task that `notify()`s the in-process `ReleaseWaiters` registry; each blocked `lock()` caller registers a waiter there and is woken when a `NOTIFY cluster_lock_released` for its name arrives. The 250 ms heartbeat sleep is a safety net against a missed notification (registration racing an already-fired `NOTIFY`, or the listen task momentarily reconnecting): a lost wake only costs latency up to the heartbeat interval, never correctness — the loop always re-attempts the acquire statement itself as the source of truth. A waiter that gives up (timeout or heartbeat-driven re-acquire) deregisters itself from the registry on drop, so no stale waiter accumulates.
 
-This avoids busy-polling: waiters wake promptly when a holder explicitly releases. The TTL sweep, the orphan sweep, the shutdown drain, and the beacon's post-reconnect cleanup all NOTIFY the names they reclaim as well, each in one batched statement.
+This avoids busy-polling: waiters wake promptly when a holder explicitly releases. The TTL sweep also NOTIFYs the names it reclaims, in one batched statement. (It is the only other NOTIFY source left — the orphan sweep, the shutdown drain and the beacon's post-reconnect cleanup were the others, and all three are gone with the beacon.)
+
+**A lapsing lease announces nothing**, which is worth stating because it is the one gap the heartbeat covers: expiry is logical rather than physical, so nothing is written at the deadline and no `NOTIFY` fires until the reaper happens to sweep the row. A waiter listening only to the release channel would sleep past a lease it could have taken, so the retry loop's 250 ms heartbeat is load-bearing rather than merely a safety net against a dropped wake.
 
 ### 5.4 PgBouncer Constraint
 
 **Narrower than it once was, but not gone.** Every lock *operation* is now a single statement on the pool (§5.1), which transaction-mode pooling would serve perfectly well; the constraint no longer touches acquire, renew, release, or either sweep. What still needs session affinity is the pair of things this plugin opens outside the pool:
 
-- **The liveness beacon.** Its advisory lock lives on a *server* session, and transaction pooling does not pin a client to one across transactions. Returning the connection releases nothing — it strands the beacon on a pooled server session, or hands it to whichever client is next given that session. The consequence is worse than under the old design: a beacon released while the process still runs asserts to the entire fleet that this instance is dead, so every lock it holds becomes stealable on sight.
-- **The two `LISTEN` connections**, whose subscriptions have exactly the same session affinity.
+- **The two `LISTEN` connections** (cache watch, and the release wake-up that unblocks a waiting `lock()`), whose subscriptions are session-scoped. Transaction-mode pooling would silently detach them between transactions, leaving watchers and blocked `lock()` callers permanently unwoken.
 
-Both are opened directly rather than through the pool, so in practice this guards an operator who has put PgBouncer in front of the DSN itself:
+Narrower again since the liveness beacon was removed (§5.1). The beacon was the other case, and the more dangerous one: transaction pooling would have released its advisory lock between transactions, asserting to the entire fleet that this instance was dead while it still held live locks. That failure mode no longer exists.
 
-- If `pgbouncer_transaction_mode: true` is set in config, `build_and_start` returns `Err(ClusterError::InvalidConfig { … })` naming the beacon and the LISTEN subscriptions.
+The LISTEN connections are opened directly rather than through the pool, so in practice this guards an operator who has put PgBouncer in front of the DSN itself:
+
+- If `pgbouncer_transaction_mode: true` is set in config, `build_and_start` returns `Err(ClusterError::InvalidConfig { … })` naming the LISTEN subscriptions.
 - Operators using PgBouncer must either use session pooling mode for the cluster plugin's connection string, or use a different lock backend.
 
 ### 5.5 Inspecting Locks (operators)
@@ -640,26 +595,16 @@ Both are opened directly rather than through the pool, so in practice this guard
 `cluster_lock` is the supported inspection surface. `pg_locks` is not, and was a strictly worse one anyway: it only ever exposed the two halves of a name hash, which is irreversible, so identifying the lock behind a row meant enumerating candidate names and hashing each.
 
 ```sql
-SELECT name, holder_id, holder_beacon_hi, holder_beacon_lo,
+SELECT name, owner, fence,
        acquired_at, expires_at, expires_at - now() AS remaining
   FROM cluster_lock
  WHERE expires_at > now()
  ORDER BY name;
 ```
 
-One limit to be clear about: `holder_beacon_*` identifies the holding **incarnation**, not a human-meaningful instance. A random per-incarnation key is not resolvable to a pod, host, or process on its own. It is greppable, though — the beacon logs its key at INFO when established (`cluster.lock.beacon_established`, §8), so a key read out of the table leads back to that instance's logs. Deliberately cheaper than a `holder_instance` column duplicating identity already present in log context.
+**This query is now the whole answer**, which it was not before: a row whose `expires_at` was in the future used to be only *possibly* held, because its beacon might have vanished, so establishing whether anyone actually held a lock meant a second join against `pg_locks`. `expires_at` is the only liveness authority now (§5.1), so `expires_at > now()` is held and everything else is not.
 
-A row whose `expires_at` is still in the future is not necessarily *held*: its beacon may be gone, in which case the next acquirer takes it. To check that directly:
-
-```sql
-SELECT l.name,
-       EXISTS (SELECT 1 FROM pg_locks p
-                WHERE p.locktype = 'advisory' AND p.objsubid = 2 AND p.granted
-                  AND p.classid = l.holder_beacon_hi::oid
-                  AND p.objid   = l.holder_beacon_lo::oid) AS holder_alive
-  FROM cluster_lock l
- WHERE l.expires_at > now();
-```
+One limit to be clear about: what `owner` means depends on how the lease was taken. A brokered acquisition carries the caller's `ClientId`, which is meaningful. An in-process `try_lock`/`lock` mints a fresh UUID per acquisition (§2.1), which identifies the *acquisition* and is not resolvable to a pod, host, or process on its own — deliberately cheaper than a `holder_instance` column duplicating identity already present in log context. `fence` is useful directly: a name whose fence is well above 1 has been stolen after lapsing that many times, which is a lock whose TTL is too short for its critical section.
 
 ## 6. Leader Election
 
@@ -716,7 +661,7 @@ pub struct PostgresClusterConfig {
     /// logs `cluster.lock.name_cardinality_high` (WARN) and the
     /// `cluster_postgres_lock_active_names` gauge should be alerted on.
     /// Default: 1000 (see DESIGN §8/§11 — a cardinality signal, and the
-    /// input to the deferred beacon-index decision, §2.1).
+    /// §2.1).
     #[serde(default = "default_lock_name_cardinality_warn_threshold")]
     pub lock_name_cardinality_warn_threshold: u32,
 
@@ -830,7 +775,7 @@ This is the operational counterpart to the `pg_locks` scan-cost risk
 documented in §11: that scan is `O(advisory locks in the cluster)` and is paid
 only on contended acquires, so this gauge is the load proxy a Grafana
 panel/alert reads `cluster_lock_op_duration_seconds{op="try_lock"}` p99
-against. It is also the input to the deferred beacon-index decision (§2.1). It is a plain count, not a per-name breakdown — lock names
+against. It is a plain count, not a per-name breakdown — lock names
 are never used as label values (the cardinality rule below). When the count
 exceeds `lock_name_cardinality_warn_threshold` (config, §7; default 1 000), the
 plugin logs `cluster.lock.name_cardinality_high` (WARN, rate-limited to once
@@ -862,21 +807,20 @@ Log events follow the `cluster.{primitive}.{event}` naming scheme
 `cluster.provider.replication_async` (WARN, once at startup, §3.6),
 `cluster.provider.notify_queue_high` (WARN, §11),
 `cluster.provider.notify_queue_readable` (INFO, §11), plus the
-beacon and garbage-collection events below. It has no leadership transitions of
+garbage-collection events below. It has no leadership transitions of
 its own to report (leader election is the SDK default over this plugin's cache,
 and emits `cluster.leader.transition` itself).
 
-**Beacon and garbage-collection events** (all plugin-local, all carrying the
-beacon key / affected `lock` as log *fields*, never as metric labels):
+**Garbage-collection events** (all plugin-local, all carrying the affected
+`lock` as a log *field*, never as a metric label). The four
+`cluster.lock.beacon_*` lines this table used to carry are gone with the beacon
+they reported on (§5.1), and so is `cluster.lock.drain_incomplete` with the
+shutdown drain (§10) — an operator alerting on any of them should drop those
+alerts rather than expect silence to mean health:
 
 | Event | Level | Meaning |
 |---|---|---|
-| `cluster.lock.beacon_established` | INFO, once per incarnation | The instance took its liveness beacon, at the stated `beacon_hi`/`beacon_lo`, `backend_pid`, and `epoch`. **This is the line that makes a row's `holder_beacon_*` traceable back to an instance** (§5.5); an operator reading the table greps for it |
-| `cluster.lock.beacon_lost` | WARN | The once-per-second ping failed, so this instance can no longer prove it is alive: every lock it held is now stealable by the fleet, `lost_locks` reports how many local guards were purged, and acquisition fails until a fresh beacon is established (§5.2). Paired with a `cluster_provider_errors_total{op="lock_beacon_lost"}` increment. The signal to alert on |
-| `cluster.lock.beacon_rows_handed_over` | INFO | After reconnecting, the instance deleted and announced the rows written by its *previous* incarnation, so waiters take those names now rather than on their own retry (§5.2). `handed_over` is the count |
-| `cluster.lock.beacon_keepalive_unsupported` | DEBUG | A `tcp_keepalives_*` `SET` was refused by the platform (§5.2). Crash detection falls back to the platform default, still TTL-bounded — deliberately not a warning |
 | `cluster.lock.orphan_rows_reclaimed` | WARN | The reaper's orphan sweep deleted rows this instance wrote but holds no guard for — acquisitions cancelled after their row committed (§5.2). Each was wedging its name for the whole fleet until its TTL. A steady stream means `lock()` timeouts are landing mid-acquire often enough to be worth widening |
-| `cluster.lock.drain_incomplete` | WARN | `stop()` could not delete or announce this instance's rows on the way out (§10). They stop being vouched for the moment the beacon closes a step later, so the fleet reacquires those names by retry rather than by the release NOTIFY — a promptness cost, not a correctness one |
 
 ## 9. ProviderErrorKind Mapping
 
@@ -902,13 +846,15 @@ Connection loss during a LISTEN reconnect loop is surfaced as `Provider { kind: 
 1. Cancel the `CancellationToken` shared by all background tasks (cache reaper, lock reaper, cache-watch LISTEN task, lock release-wake LISTEN task). Await each task's `JoinHandle`. Cancellation also unparks each held lock's guard task promptly, rather than leaving it waiting on a consumer that may never act.
 2. Send `CacheWatchEvent::Closed(ClusterError::Shutdown)` to all active watcher channels (dispatched directly against the watch registry before the LISTEN task is awaited, so every watcher observes it prior to `stop()` returning).
 3. Drop each dedicated `PgListener` (cancelling its task drops the listener, which closes its socket). No explicit `UNLISTEN *` is issued — dropping the connection ends the session, which is functionally equivalent (a closed backend cannot deliver further notifications).
-4. Hand back every lock still held, in **one statement** — `DELETE FROM cluster_lock WHERE holder_beacon_hi = $1 AND holder_beacon_lo = $2 RETURNING name`, followed by a batched `NOTIFY cluster_lock_released` of those names — then close the beacon connection, then close the `sqlx::PgPool` under a bounded `POOL_CLOSE_TIMEOUT` (10s — see §11's note on unbounded pool statements).
+4. Close the `sqlx::PgPool` under a bounded `POOL_CLOSE_TIMEOUT` (10s — see §11's note on unbounded pool statements).
 
-    **The beacon columns fence the drain for free**, which is what collapses what used to be a multi-pass, fixpoint-looping, ordering-sensitive procedure into a single `DELETE`. The key is per-incarnation, so the statement can only ever match rows *this instance* wrote; a row whose lock lapsed and was re-acquired elsewhere now carries the successor's beacon and is skipped — exactly what matching `holder_id` name-by-name had to do by hand. There is no delete-before-unlock ordering invariant any more, because there is no unlock; there is no fixpoint loop, because a straggler acquisition that commits its row *after* the DELETE costs nothing (the beacon closes moments later, leaving that row unvouched, so the next acquirer takes the name on its own heartbeat retry rather than waiting out the TTL).
+    **Held lease rows are deliberately left in place, and that is the whole of cluster DESIGN-DEPLOYABLE-GEAR §5.8.2: a cluster restart is not a lease event.** This step used to hand back every lock still held, in one `DELETE FROM cluster_lock WHERE <this incarnation's beacon>` followed by a batched `NOTIFY cluster_lock_released` of those names, then close the beacon connection. That was a clean handover while the process holding a lock was the process using it — and it is a fleet-wide revocation the moment locks are brokered, because the rows being deleted belong to other, live consumers.
 
-    It is also strictly more correct than what it replaced, in one further way: it reclaims **orphaned** rows — rows with no live local guard, left by an acquisition cancelled after its INSERT committed — which a drain that iterates a local map cannot see at all. `PG-LOCK-021` asserts both halves: three held locks and one orphan, all gone after a clean `stop()`.
+    So every remaining lease now lapses on its own deadline, renewed in the meantime by whichever holder still owns it, through whichever replica answers next (invariant I7). `PG-LOCK-021` asserts exactly this, and asserts the half that matters: a lease acquired through the stopping handle is still renewable through a handle built *afterwards*. It is the inverse of what that scenario used to assert.
 
-    The order is deliberate and the beacon is shut down **separately from the shared token** to enforce it: the drain reads the beacon key and needs the pool, so both must still be live when it runs. Releasing the beacon before the drain would be worse than premature — it would assert to the whole fleet that this instance is dead while it still held locks. The NOTIFY goes out on a connection the drain **detaches from the pool and closes explicitly**, because a `PoolConnection` is returned asynchronously: one released microseconds before `pool.close()` can still be in flight when that close returns, leaving a live backend behind that nothing subsequently closes (`PG-LIFE-003` catches exactly this). A failed drain is logged as `cluster.lock.drain_incomplete` and costs only promptness — those rows stop being vouched for when the beacon connection closes a step later.
+    **The cost, stated:** a name this instance held is taken until its TTL rather than released the moment we let go, so a waiter elsewhere waits out the deadline instead of being woken by a `NOTIFY`. That is the same bound a crashed holder now has (§5.1) and the same one every non-Postgres backend always had.
+
+    Two things fall out of the removal that are worth stating so they are not rediscovered as gaps. There is no longer any **ordering** constraint in this sequence beyond "close the pool last" — the drain needed both the beacon key and the pool live, and that was the reason the beacon was shut down separately from the shared cancellation token. And the orphaned rows the drain also reclaimed (rows with no live guard, left by an acquisition cancelled after its INSERT committed) are now left to the TTL sweep like any other lapsed lease (§5.2).
 
 No remote cleanup is performed on a best-effort basis: held claims and locks lapse via their TTL once the connections drop (`cpt-cf-clst-fr-shutdown-ttl-cleanup`).
 
@@ -936,33 +882,35 @@ The variable to manage is therefore the *aggregate* notifying-transaction rate t
 
 **[Retired: hash collision in lock names]** Lock names are no longer hashed at all — the name is the `cluster_lock` primary key, compared as text (§5.1), so two distinct names cannot exclude one another under any circumstances. The `cluster_postgres_lock_active_names` gauge and the `cluster.lock.name_cardinality_high` WARN remain, now purely as a cardinality signal (and as the input to the deferred index decision, §2.1).
 
-**[Risk: beacon key collision]** Two live instances drawing the same 62-bit beacon key would mean one instance's beacon vouches for the other's dead rows, degrading those rows to TTL-bounded reclamation. It does *not* break mutual exclusion: the `holder_id` fence is unaffected, and a vouched-for row is only ever *harder* to steal. `pg_try_advisory_lock` returning `false` detects a collision at establishment and redraws, up to 8 times. Documented as a degradation mode, not guarded further.
-
 **[Risk: `pg_locks` scan cost on the contended path — shipping on measurement]** The acquire predicate's liveness check is a function scan over `pg_lock_status()` with no index, so it is `O(advisory locks in the cluster)`. Three things bound the exposure: the `CASE` short-circuits it off the uncontended path entirely (`PG-SPEC-012`), the subplan is correlated against a single row located by primary key, and contended retries are already rate-limited to roughly four per second per waiter by the NOTIFY-plus-heartbeat design (§5.3). `PG-SPEC-014` records the baseline as an artefact rather than a threshold — on a CI container it measures roughly 0.6 ms at a handful of advisory locks rising to ~2.7 ms at 5000, i.e. the linear scaling the shape predicts, at absolute values far below any plausible lock TTL. **The signal to watch** is `cluster_lock_op_duration_seconds{op="try_lock"}` p99 read against `cluster_postgres_lock_active_names`; note the histogram carries no `result` dimension (deliberately, to mirror the CAS-based default backend's signal set), so contended and uncontended acquires share one distribution and a rise is diluted. **The pre-designed exit**, should it ever look bad: skip the liveness check for rows renewed recently (`WHEN cluster_lock.acquired_at > now() - $staleness THEN false`), paying the scan only for the suspicious set. Correctness is unaffected because skipping is strictly conservative — it declines to steal, never steals wrongly — at the cost of making crash detection `min($staleness, TTL)` rather than immediate.
 
-**[Risk: PgBouncer transaction mode mis-configuration]** Silent mis-behaviour if an operator uses transaction-mode PgBouncer without the `pgbouncer_transaction_mode: true` config flag. Lock operations themselves are fine now, but the beacon is not: transaction pooling would release its advisory lock between transactions, which asserts to the fleet that this instance is dead while it still holds live locks (see §5.4). Mitigation: the startup validation flag; documentation.
+**[Risk: PgBouncer transaction mode mis-configuration]** Silent mis-behaviour if an operator uses transaction-mode PgBouncer without the `pgbouncer_transaction_mode: true` config flag. Lock and cache operations themselves are fine — every one is a single statement on the pool — but the `LISTEN` connections are not: transaction pooling would detach their session-scoped subscriptions, leaving cache watchers and blocked `lock()` callers permanently unwoken (see §5.4). Narrower than it was, since the beacon's advisory lock was the sharper edge here. Mitigation: the startup validation flag; documentation.
 
 **[Trade-off: prefix_watch is polling-based]** `watch_prefix` is serviced by `PollingPrefixWatch`, not a native LISTEN/NOTIFY subscription. This means prefix watch events have a latency of up to the poll interval (default 5s) and the poll cost is N `get` calls per interval. Use cases that require sub-second prefix-change propagation should use a backend with native prefix watch (etcd, NATS).
 
 **[Retired: all lock operations serialize on one session]** They no longer do. Every lock statement runs on the write pool, so lock throughput is bounded by pool width like everything else, and the previous escape hatch (a set of sessions with lock-name-hash affinity) is moot. The property that motivated the single session — a held lock costing no pool connection — is unchanged and now stronger: a held lock costs no connection at all.
 
-**[Trade-off: losing the beacon invalidates every lock on the instance]** One beacon means one blast radius. Where the pinned-connection model lost one lock per dropped connection, losing the beacon makes every `cluster_lock` row that instance holds stealable by the fleet at once (§5.1) — the rows survive, but nothing vouches for them any more. The failure is *detected*, not silent, and within a bounded time: the beacon task's 1s ping (`beacon::PING_INTERVAL`) plus its `beacon::STATEMENT_TIMEOUT` puts a ceiling on how long the instance can be wrong about what it holds, and the `holder_beacon_hi`/`holder_beacon_lo` fence — compared by key, so a reconnected beacon under a fresh key does not resurrect the old rows — turns every subsequent `renew` into `LockExpired` and leaves a `release` with no row of its own to delete. On detection the beacon task purges `local_holders`, logs `cluster.lock.beacon_lost` with the casualty count, and emits `cluster_provider_errors_total{op="lock_beacon_lost"}`; acquisition fails with a retryable `Provider { ConnectionLost }` until the beacon is re-established. But a consumer mid-critical-section still learns only at its next `renew`, since `LockGuard` has no asynchronous lost-lock signal. That is the same exposure ADR-002's no-remote-I/O-in-the-critical-section rule already governs, now with a wider fan-out per incident. Monitor `cluster.lock.beacon_lost` and `cluster_provider_errors_total{op="lock_beacon_lost"}`.
+**[Trade-off: a crashed holder's lock lingers until its TTL]** This is the cost of removing the liveness beacon (§5.1, §5.2), and it replaces a trade-off this section used to record in the opposite direction ("losing the beacon invalidates every lock on the instance"). Where the beacon returned a dead holder's locks to the fleet in milliseconds — bounded by how fast Postgres noticed the connection was gone — reclamation is now bounded only by the lease TTL the holder chose, in **every** profile.
 
-Note that a ping overrunning `beacon::STATEMENT_TIMEOUT` (§3.3) is read as a lost connection and carries the same blast radius, which makes runtime starvation a (remote) way to lose every lock on the instance without the database having done anything wrong. The bound is set at ~1000x the expected latency of a single-round-trip built-in on a dedicated connection precisely to keep that improbable, and the failure is detected and fenced rather than silent. There is no separate signal for it: a timed-out ping surfaces as `cluster.lock.beacon_lost` like any other loss, so `beacon_lost` firing without a matching backend outage is the signal that the bound is too tight for the deployment.
+What is bought for it is uniformity, and it is worth the cost: a consumer behaves identically wherever it runs (Goal 2), a cluster replica can be restarted, upgraded or rescheduled without revoking the fleet's locks, and any replica serves any lease operation (invariant I7). Keeping the beacon for in-process acquisitions and dropping it for brokered ones would have meant two timings for the same code and the same config — a class of bug that reproduces in only one deployment shape.
 
-**[Risk: pool statements are not bounded client-side]** §3.3 bounds the beacon's ping and its reconnect, because an unresponsive round-trip there would wedge `stop()`. The **write pool** has no equivalent bound: `pool_acquire_timeout` covers checkout, but statement execution afterwards does not time out, and `sqlx` supplies no read timeout. Against a server that freezes *after* a successful checkout, any pool statement — a reaper sweep, a `renew`, a cache operation — can block indefinitely, and where that statement is inside a background task, `stop()` blocks on its join.
+The failure mode this removes is also worth naming, because it was real: one beacon per instance meant one blast radius, so a single connection blip made *every* lock that instance held stealable at once, and a ping overrunning its statement timeout was read as a loss — which made runtime starvation a way to lose every lock on the instance without the database having done anything wrong. Nothing can now invalidate a lease for a reason local to the holding process.
+
+**Operationally: keep lock TTLs tight.** The TTL is a per-acquisition parameter on the trait, so recovery promptness is under caller control rather than operator control — there is no knob here to tune, deliberately. A consumer whose critical section is short should not ask for a long lease. ADR-012 records the decision, both rejected alternatives, and this cost; `PG-LOCK-023` holds the resulting timing in both directions.
+
+**[Risk: pool statements are not bounded client-side]** The **write pool** has no client-side statement bound: `pool_acquire_timeout` covers checkout, but statement execution afterwards does not time out, and `sqlx` supplies no read timeout. Against a server that freezes *after* a successful checkout, any pool statement — a reaper sweep, a `renew`, a cache operation — can block indefinitely, and where that statement is inside a background task, `stop()` blocks on its join.
 
 This is pre-existing and not specific to the lock half (it applies equally to every cache operation), which is why it is recorded here rather than fixed as part of the session refactor. The practical bound today comes from `pool_acquire_timeout` arithmetic: a frozen server normally fails the *next* checkout at the `before_acquire` hook, which is the path `PG-LOCK-019` exercises. That is an accident of timing, not a guarantee — do not read `PG-LOCK-019` as proof that `stop()` is bounded in general.
 
-Two of its sharper edges are closed. `PgPool::close()` waits for **every** checked-out connection to come back, and the per-lock guard tasks are spawned detached — a guard parked in a `renew`'s pool I/O is neither preemptible by the shutdown token nor joined anywhere, so an unbounded `close()` relocated the stall out of the joins this section tells operators to budget for and into a step with no budget at all. It is now bounded by `POOL_CLOSE_TIMEOUT` (10s), which is safe because `close()` marks the pool closed *before* it starts waiting: giving up leaves the pool closed and any straggler connection closed when its holder returns it, and logs `cluster.lock.pool_close_timeout`. Separately, `BeaconHandle` has a `Drop` that cancels its token and aborts its task, so a supervisor's `timeout(D, handle.stop())` giving up mid-shutdown no longer leaks the beacon task and its off-pool backend for the life of the process — which is precisely the failure mode this section's own supervisor-level advice would otherwise have caused. (Leaking it would also keep this instance's beacon *granted*, so the fleet would go on treating its abandoned rows as live until the process exited.) Both handle `Drop`s also cancel the shared token before their diagnostic panic/warn, so a dropped `stop()` future still unwinds the background tasks.
+Two of its sharper edges are closed. `PgPool::close()` waits for **every** checked-out connection to come back, and the per-lock guard tasks are spawned detached — a guard parked in a `renew`'s pool I/O is neither preemptible by the shutdown token nor joined anywhere, so an unbounded `close()` relocated the stall out of the joins this section tells operators to budget for and into a step with no budget at all. It is now bounded by `POOL_CLOSE_TIMEOUT` (10s), which is safe because `close()` marks the pool closed *before* it starts waiting: giving up leaves the pool closed and any straggler connection closed when its holder returns it, and logs `cluster.lock.pool_close_timeout`. Separately, the second edge this used to record — a supervisor's `timeout(D, handle.stop())` giving up mid-shutdown leaking the beacon task and its off-pool backend for the life of the process, keeping that beacon *granted* so the fleet went on treating abandoned rows as live — is retired with the beacon itself: there is no off-pool connection left to leak. Both handle `Drop`s still cancel the shared token before their diagnostic panic/warn, so a dropped `stop()` future still unwinds the background tasks.
 
 What remains open is the general case: a client-side bound on pool *statements*. Until then, a deployment that needs a hard shutdown ceiling should still enforce it at the supervisor level.
 
 **[Retired: same-instance exclusion enforced in-process]** Two acquisitions from the same instance now race exactly as two instances do — on the row lock of the conflicting tuple (§5.1) — so Postgres is the authority for both, and no in-process registry participates in exclusion at all. `PG-LOCK-008` (20 concurrent local callers) and `PG-LOCK-016` (two instances) are deliberately kept as separate scenarios even though they exercise the same mechanism now: that they *do* is the claim worth holding both halves to.
 
-**[Trade-off: a holder is no longer told when its lock is reclaimed]** Reclamation used to route through the owning instance, so the owner necessarily noticed and logged it. A successor now steals the row directly and the previous holder learns only at its next `renew` — no behavioural difference for the consumer (`LockExpired` either way), but an operator loses a signal that fired without anyone having to ask for it. Deliberately not replaced: reinstating it means an indexed `SELECT` over `local_holders`' names on every reaper wake, which is the class of query this design removed, for a signal with no current consumer.
+**[Trade-off: a holder is no longer told when its lock is reclaimed]** Reclamation used to route through the owning instance, so the owner necessarily noticed and logged it. A successor now steals the row directly and the previous holder learns only at its next `renew` — no behavioural difference for the consumer (`LockExpired` either way), but an operator loses a signal that fired without anyone having to ask for it. Deliberately not replaced: reinstating it would mean reintroducing a per-process registry of held names (removed with the beacon, §5.1) plus an indexed `SELECT` over it on every reaper wake — the class of query this design removed, for a signal with no current consumer.
 
-**[Trade-off: `synchronous_commit = on` enforced, no `off` mode]** The plugin enforces `synchronous_commit = on` on every connection (§3.4) and offers no `EventuallyConsistent`/weak-consistency mode. Operators who need `off`'s write-latency benefit and can tolerate its durability trade-off (risk of losing the last few commits on crash) cannot get it from this plugin — that use case belongs on a backend designed for it. Enforcement is via `after_connect` + `before_acquire` hooks (re-asserted on every checkout), which now covers every durability-relevant write including the `cluster_lock` rows. There is no longer any connection outside that: the one long-lived connection the lock opens is the beacon, which writes nothing at all and so has no durability setting to maintain (§3.4). The residual window this risk used to record is retired rather than accepted.
+**[Trade-off: `synchronous_commit = on` enforced, no `off` mode]** The plugin enforces `synchronous_commit = on` on every connection (§3.4) and offers no `EventuallyConsistent`/weak-consistency mode. Operators who need `off`'s write-latency benefit and can tolerate its durability trade-off (risk of losing the last few commits on crash) cannot get it from this plugin — that use case belongs on a backend designed for it. Enforcement is via `after_connect` + `before_acquire` hooks (re-asserted on every checkout), which now covers every durability-relevant write including the `cluster_lock` rows. There is no longer any connection outside that at all: with the beacon removed the lock opens no off-pool connection whatsoever (§3.4). The residual window this risk used to record is retired rather than accepted.
 
 **[Risk: async replication is warn-only, not enforced]** ADR-009 requires synchronous streaming replication for Postgres leader/lock safety under failover, but §3.6's `replication_mode` check only warns (`cluster.provider.replication_async`) when it detects or is told the topology is async — it never fails startup. An operator who ignores or doesn't monitor that log line can run indefinitely on an async-replicated, failover-unsafe topology. This is a deliberate choice (topology isn't always confidently detectable, and some deployments legitimately don't need HA), not an oversight — but it means this is an operational monitoring dependency, not a guarantee enforced by the plugin itself; pair the WARN log with an alert, not just a dashboard.
 
