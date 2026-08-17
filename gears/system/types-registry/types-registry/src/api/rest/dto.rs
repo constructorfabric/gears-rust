@@ -30,7 +30,13 @@ impl From<&GtsIdSegment> for GtsIdSegmentDto {
             package: segment.package().to_owned(),
             namespace: segment.namespace().to_owned(),
             type_name: segment.type_name().to_owned(),
-            ver_major: segment.ver_major(),
+            // 0.12.0 replaced `ver_major() -> u32` with `ver_major_opt() -> Option<u32>`
+            // so an unspecified version is no longer indistinguishable from `v0`.
+            // `unwrap_or(0)` reproduces 0.11.0 exactly — it returned
+            // `parts().map_or(0, ..)`, i.e. 0 for a UUID-tail segment — so this
+            // response shape does not change. Surfacing the distinction belongs to
+            // the major-0 quarantine slice (ADR-0015), not to the upgrade.
+            ver_major: segment.ver_major_opt().unwrap_or(0),
         }
     }
 }

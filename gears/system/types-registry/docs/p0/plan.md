@@ -26,10 +26,11 @@ commit. Two tasks exceed the ~5 file guideline, flagged with the reason where th
 
 ## Decisions taken during planning
 
-Ten decisions were made here rather than in the spec, because all of them are consequences
+Eleven decisions were made here rather than in the spec, because all of them are consequences
 of task ordering or of facts about the runtime that only surface once the work is sliced.
 P1–P5 were taken before implementation started; P6–P10 came out of reviewing Phase 1 on its way
-in, and the spec has been updated to match all five.
+in, and the spec has been updated to match all five. P11 is a later housekeeping close-out
+(O1 resolved), not a scope decision.
 
 ### P1. The spec's §15 build order is replaced by vertical slices
 
@@ -382,6 +383,27 @@ trip per page, absorbed by the client cache on repeat, complete with respect to 
 rather than to an instant. That is the same trade DESIGN accepts for expansion, but it means
 T25/T26 migrate call sites onto a two-step read rather than a renamed one-step read.
 
+### P11. O1 closed — `gts-rust` 0.12.0 published, the local-checkout patch removed
+
+Housekeeping, not a decision about scope: no task is added or renumbered.
+
+T1 consumed 0.12.0 from `~/dev/gts-rust` via `[patch.crates-io]` because the crate wasn't
+published yet, and every plan doc tracked that as O1 — a merge blocker. On 2026-08-18 the
+crates went live on crates.io (`gts`, `gts-id`, `gts-macros`, all `0.12.0`, confirmed
+against the crates.io API), so O1's precondition is met and it closes.
+
+Closing it out: the `[patch.crates-io]` block and its `DO NOT MERGE` comment are deleted
+from `Cargo.toml`; the three `"0.12.0"` requirements are untouched, since they already
+named the target version rather than the local checkout's declared one (SPEC §7 explains
+why that mattered). `Cargo.lock` was re-resolved (`cargo update -p gts -p gts-id -p
+gts-macros`) and now carries a registry `source` and checksum for all three instead of a
+path override — it is committable for the first time on this branch.
+
+Re-verified against the published crate rather than assumed unchanged: `cargo check
+--workspace` clean, `cargo test -p cf-gears-types-registry` 209 passed / 0 failed (T1's
+208 + the 6 `gts_012_semantics_tests.rs` tests), `make gts-docs` 798 files / 0 errors.
+Full detail in [`t1-gts-0.12.0-upgrade-report.md`](./t1-gts-0.12.0-upgrade-report.md) §6.
+
 ## Dependency graph
 
 ```
@@ -540,7 +562,7 @@ reconciliation helper work against a mock consumer. Nothing has been cut over ye
 the platform boots; the old trait is gone and no consumer references it. The SDK client cache
 is in place on the new models, with its window, byte bound and `fresh` bypass (P7) — P0 does
 not finish with an uncached read path. All 15 success criteria of SPEC §16; `make ci`,
-`make test-db`, `make e2e-local`, `make dylint` green; O1 resolved before merge.
+`make test-db`, `make e2e-local`, `make dylint` green; O1 resolved (P11).
 
 ## Risks and mitigations
 
@@ -549,12 +571,13 @@ not finish with an uncached read path. All 15 success criteria of SPEC §16; `ma
 | 0.12.0 semantics reject a currently-admitted schema in another gear | **High** — breaks unrelated gears | T1 is first and is its own commit; full re-validation sweep before any registry code |
 | Pull→push cutover regresses platform boot | **High** — every gear now gates on its own registration | T24 lands after the helper is proven against a mock (Checkpoint 6); migration split across T25/T26 by gear group; each verified by booting the example server |
 | Removing the old trait breaks ~50 call sites in 20+ gears | **High** | Split by gear group; new trait exists and is tested (T23) before the first consumer moves; `cargo test --workspace` gates each migration task |
-| `[patch.crates-io]` on an absolute local path | **High** — CI cannot build, `Cargo.lock` poisoned | Never committed with the patch in place; O1 blocks merge |
+| `[patch.crates-io]` on an absolute local path | **High** — CI cannot build, `Cargo.lock` poisoned | **Resolved 2026-08-18 (P11):** never committed with the patch in place; O1 closed by publishing `gts` 0.12.0 to crates.io and deleting the patch |
 | A gear's registration fails at startup and it gates readiness on it | Medium | This is DESIGN-intended (*"Each gear gates only its own readiness"*), but it is a real behavioural change; the SDK helper retries, and failures name the gear and identifier |
 | Dual path (in-memory + DB) live through phases 1–5 | Medium | The DB path has no consumer until T24; no dual-write, no reconciliation between them. P6 keeps them from converging by accident: the new path holds no persistent store, so there is no second copy of entity state that could drift from the old repository |
 | Read latency regresses at T24, when reads move from memory to the database | Medium | Correctness first, then the cache: D3 already materializes what a read returns, so a read is one keyed `SELECT`, and T30 restores caching with DESIGN's contract (P7). The exposure is the T24–T28 window, which is why Checkpoint 7 gates on T30 |
 | A cached entry can be stale inside its freshness window | Low | DESIGN §3.3's sanctioned trade, and now bounded further: T29's validators let T30 revalidate rather than guess, `fresh` gives an authoritative read, `0s` disables the window, and invalidation is immediate on an observed terminal outcome |
 | The validator field reaches the SDK models after consumers have migrated | **High** — a second migration across 20+ gears | T23 carries the field from the start, before T25/T26 move any consumer; T29 only fills it in (P9) |
+| A materialized `effective_*` value differs from the deleted client-side computation | Medium — reads as a regression, invites a "fix" back to the old wrong answer | 12 call sites in `account-management`, `resource-group`, `credstore` consume those methods today. The old ones resolved only the parent `$ref` and approximated trait defaults (`TODO(#1723)`), so `gts-rust` is authoritative; T25/T26 carry an explicit criterion to accept the new value, and SPEC §13 pins the outside-the-chain `$ref` case as a test |
 | Content-free discovery turns one-step list reads into list + `batchGet` at ~87 call sites | Medium | The SDK helpers hydrate internally, so call shapes survive (P10); the client cache absorbs the second trip; T23 fixes the helper shape before T25/T26 touch a consumer |
 | `GET /entities` shape change reaches e2e alongside the `POST` break | Medium | Both are the same migration in T28, behind the one shared helper it already owns; the route's declared stability is `unstable` |
 | Concurrency protocol wrong under the least-tested backend (MySQL) | Medium | `make test-db` on all three at every checkpoint |

@@ -92,7 +92,7 @@ correctness core, not scope.
 | D5 | **Reverse impact by iterative worklist over direct edges**, not a recursive CTE | Plain indexed `WHERE to_entity_id = ?` + visited set + fingerprint-stability early stop. Portable across three backends with no `sea-query` CTE work |
 | D6 | **The old `TypesRegistryClient` is removed in P0**; every consumer migrates inside this effort | ~50 call sites across 20+ gears move. Forced by two facts: async admission makes the old synchronous `register()` a lie in its own signature, and the old models' `Arc`-linked object graphs cannot cross a wire, so keeping them keeps an out-of-process blocker. Migration is split by gear group — see `plan.md` P5 |
 | D7 | `operation.plane = 1` (platform), `tenant_id = NULL`, `principal_id` a hardcoded constant with a `TODO` | Idempotency scope becomes global — see §9 ceiling C2 |
-| D8 | **Consume `gts-rust` from the local checkout for now**, via `[patch.crates-io]` | Unblocks slice 0 without waiting for a release. Temporary by construction — see §7 |
+| D8 | **Consumed `gts-rust` from the local checkout via `[patch.crates-io]` until it was published** | Unblocked slice 0 without waiting for a release. **Resolved 2026-08-18**: 0.12.0 published to crates.io, patch removed — see §7 |
 | D9 | **Use `toolkit-db/preview-outbox`** | Closes DESIGN §4's outbox sign-off for this gear |
 | D10 | **`POST /entities` breaks**: `200` + results becomes `202` + operation | No compatibility path on that route. The gear's REST stability is `unstable`; the break is called out in the changelog |
 | D11 | **Registration moves from registry-side pull to per-gear push** | A gear's code must not depend on whether it runs in-process; pull silently loses the types of an out-of-process gear. types-registry seeds only what it owns; every other gear reconciles its own through one SDK helper that owns batching, idempotency and retry. Requires `owning_gear` on the inventory records. See `plan.md` P4 |
@@ -246,38 +246,50 @@ works in our favour: it makes the ADR-0015 major-0 quarantine (§8.1 step 7) exa
 `gts`, `gts-id` and `gts-macros` move together — the workspace pins all three, and
 `gts-dylint` / `gts-macros-cli` must not lag.
 
-### Sourcing it (D8) — temporary, with an exit condition
+### Sourcing it (D8) — resolved, O1 closed
 
-0.12.0 is not published: crates.io reports max `0.11.0`, the local checkout's
-`Cargo.toml` says `0.11.0`, and tags stop at `v0.9.4`. Per D8 the code is consumed
-directly from `~/dev/gts-rust` through a workspace-root override:
+**Status: closed 2026-08-18.** `gts`, `gts-id` and `gts-macros` 0.12.0 are published on
+crates.io (verified live against the crates.io API), and the `[patch.crates-io]` override
+described below has been deleted. The workspace requirements were already `0.12.0`, so
+they resolve unchanged, this time from the registry:
 
 ```toml
-# Cargo.toml — DO NOT MERGE TO main. Replace with published 0.12.0 (O1).
-# Local gts-rust is still versioned 0.11.0, so every `gts = "0.11.0"` requirement
-# in the workspace resolves against it unchanged — no version specs need editing.
-[patch.crates-io]
-gts        = { path = "/Users/vasily/dev/gts-rust/gts" }
-gts-id     = { path = "/Users/vasily/dev/gts-rust/gts-id" }
-gts-macros = { path = "/Users/vasily/dev/gts-rust/gts-macros" }
+# Cargo.toml
+gts-id     = "0.12.0"
+gts        = "0.12.0"
+gts-macros = "0.12.0"
 ```
 
-`[patch.crates-io]` rather than editing the three dependency lines: it is one removable
-block, and because the local crates still declare `0.11.0` the existing version
-requirements are satisfied as-is. Reverting is deleting four lines.
+This section is kept, past tense, because the lesson it recorded is not obsolete just
+because the crate shipped — the next time a workspace patches a crate ahead of its
+release, the same trap is waiting.
 
-Two consequences that must not be discovered later:
+**What the section used to say, and why it mattered while the patch existed.** Before
+publication, the three crates were consumed directly from `~/dev/gts-rust` through
+`[patch.crates-io]`, with the requirements deliberately pinned at `0.12.0` rather than
+`0.11.0`. An earlier revision of this section had them at `0.11.0`, on the argument that
+the local crates declared `0.11.0` too, so nothing needed editing. That held only until
+the local checkout bumped its own version: at that point the patch stopped satisfying a
+`0.11.0` requirement, and cargo's response to a patch it cannot use is not an error — it
+recorded three `[[patch.unused]]` entries and silently resolved `gts` from the *published*
+0.11.0 instead. The build was back on the old semantics with nothing failing except a
+compile error in the one place that used a 0.12.0-only API. Pinning the requirements to
+the *target* version rather than to whatever the local checkout happened to declare made
+the patch load-bearing: no published version could satisfy it, so deleting it prematurely
+would have failed resolution loudly instead of downgrading quietly.
 
-- **CI and every other developer break.** The path is absolute and outside the
-  repository; nothing but this machine can resolve it. A relative path does not help —
-  this work happens in a `git worktree`, so the depth to `~/dev/gts-rust` differs between
-  the main checkout (`../gts-rust`) and a worktree (`../../gts-rust`).
-- **`Cargo.lock` records the patch.** It must not be committed with the override in place.
+**Verification run on the switch to the published crate** (workspace unaffected by the
+patch removal beyond the dependency source):
 
-**Exit condition, blocking merge:** 0.12.0 (with `gts-id` and `gts-macros`) is published
-and the `[patch.crates-io]` block is replaced by ordinary version requirements. Until
-then this branch is local-only and `make ci` results are advisory rather than
-reproducible. Tracked as O1.
+| Check | Result |
+|---|---|
+| `cargo check --workspace` | clean, no errors |
+| `cargo test -p cf-gears-types-registry` | 209 passed, 0 failed (T1's baseline was 208 + the 6 `gts_012_semantics_tests.rs` tests; consistent) |
+| `cargo test --workspace` | **10260 passed, 0 failed, 611 ignored** (most ignores need Docker/testcontainers). Population differs from T1's 10213 passed / 368 skipped — this run includes doc-tests — but the number that matters, failures, is 0 either way |
+| `make gts-docs` | 798 files, 0 errors |
+| `Cargo.lock` | `gts`, `gts-id`, `gts-macros` now carry `source = "registry+…"` and a checksum; `num-cmp` (the transitive dependency 0.12.0 introduced, noted in the T1 report) is still present, now sourced from the published `gts`'s own manifest |
+
+Full addendum: [`t1-gts-0.12.0-upgrade-report.md`](./t1-gts-0.12.0-upgrade-report.md) §6.
 
 Toolchain is not a problem: `gts-rust` requires 1.95.0 and this workspace is already on
 1.97.0 with `rust-version = "1.95.0"`. (CLAUDE.md's "minimum toolchain 1.92.0" is stale.)
@@ -786,8 +798,35 @@ already use: `get_type_schema`, `get_instance`, `get_type_schemas`, `get_instanc
 trip, since the kind is the trailing `~` of the identifier. `EntitySnapshot` likewise carries
 small accessors for the materialized groups — `effective_traits`, `effective_schema`,
 `authored_value`, `segments` — so a consumer that previously called the old models' computed
-methods reads a field instead. Nothing is recomputed client-side: D3 means the server already
-materialized it, which is why the old `Arc`-linked parent chain is not reproduced.
+methods reads a field instead.
+
+**The old models' client-side `effective_*` methods are deleted, and duplication is the
+weakest of three reasons.**
+
+1. **They are wrong for a schema that references outside its derivation chain.**
+   `GtsTypeSchema::effective_schema` inlines only the parent's `$ref` and, in its own words,
+   leaves *"non-parent `allOf[].$ref` items (mixin references) … as-is"*;
+   `effective_properties` / `effective_required` walk `parent` alone. A parent chain is not a
+   reference closure, so any `$ref` or `x-gts-ref` to a type outside the chain stays
+   unresolved. The server resolves through `gts-rust`'s `resolve_schema_refs`, which closes
+   over every reference.
+2. **They are a local approximation of GTS semantics**, which
+   `constraint-gts-implementation` forbids outright. The code admits it: `effective_traits`
+   carries `TODO(#1723): replace with gts-rust's resolve_schema(...).effective_traits once
+   that helper is exposed publicly`.
+3. **They cannot cross a wire**, because they need the `Arc<GtsTypeSchema>` parent graph —
+   the OoP blocker recorded in §8.4.
+
+D3 removes the need entirely: the server materializes `resolved_schema`, `effective_traits`
+and `effective_traits_schema` at admission, through `gts-rust`, and a read returns them.
+
+**Consequence for the migration, stated because it will look like a regression.** A
+materialized value is not always byte-equal to what the old method returned — it differs
+exactly where the approximation was wrong, which is the unresolved-reference and
+trait-default cases above. Where they differ, `gts-rust` is right by definition. Twelve call
+sites across `account-management`, `resource-group` and `credstore` consume these methods
+today; an assertion there that fails after the switch is reporting the old bug, and must be
+updated to the materialized value rather than restored.
 
 No security-context argument: P0 has no planes, and adding one now would encode a
 signature we know is wrong. When planes land, `ctx` becomes the first parameter of every
@@ -1187,6 +1226,8 @@ termination on a cycle, baseline selection.
 | `batchGet` with a mix of current and stale validators | `200`, `unchanged` for current keys, snapshots for the rest |
 | Instance validator | omits `resolution_fingerprint` and still changes on revision |
 | Validator with an unknown version field | rejected, never treated as a match |
+| Type Schema whose `$ref` targets a type **outside** its derivation chain | `resolved_schema` closes over that reference too — the case the deleted client-side `effective_schema` left unresolved (§10.1) |
+| `effective_traits` of a chain with a trait default at two levels | matches `gts-rust`, not the deleted client-side merge order |
 | Request carrying `$select` | refused with an RFC-9457 problem naming the parameter, never answered with the default representation |
 | Registration policy, four DESIGN §3.2 entries | each admits and refuses exactly what §10.3's table says, including the exact-key-versus-`~*` split |
 | Per-parameter resolution | longest literal prefix wins; an exact key beats any pattern; an entry omitting `allowed_vendors` is skipped so a less-specific entry supplies it; no entry means closed |
@@ -1266,7 +1307,6 @@ references.
 - Commit a partial effective-artifact refresh.
 - Remove or weaken a failing test to make a slice pass.
 - Reorder the acceptance checks in §8.1 — the ordering is a disclosure boundary.
-- Merge the `[patch.crates-io]` override, or commit a `Cargo.lock` produced under it (§7).
 - Collapse `CompatibilityVerdict::Unknown` into `Incompatible` — they are separate
   outcomes with separate reasons.
 - Write raw SQL in a handler, service or repository.
@@ -1292,6 +1332,8 @@ Each slice ends green and independently reviewable.
    generated schema documents of `#[gts_type_schema]` types and account for every change.
    Ships as its own commit — its failure mode is other gears, not this one. `Cargo.lock`
    is **not** committed while the patch is in place.
+   *(This step is historical. O1 closed 2026-08-18 — 0.12.0 published, the patch removed;
+   see §7.)*
 1. **Schema + migration** — 9 tables, three backends, `routing_config` absent.
    *Verify:* `make test-db`; migration up on all three; constraints reject the shapes
    their CHECKs name.
@@ -1366,17 +1408,19 @@ Consumer migration is part of P0 (D6) and is split by gear group; see `plan.md` 
 
 ## 17. Open questions
 
-All questions that blocked the start are answered (D8, D9, D10). One remains as a
-**merge** blocker rather than a start blocker.
+All questions that blocked the start are answered (D8, D9, D10). None remain as a merge
+blocker.
 
 | # | Question | Blocks | Recommendation |
 |---|---|---|---|
-| O1 | **Publishing `gts` 0.12.0** (with `gts-id` / `gts-macros`). D8 unblocks development via `[patch.crates-io]`, but that override cannot be merged: CI cannot resolve an absolute local path, and `Cargo.lock` would record it | **merge**, not start | Publish before the P0 branch merges; until then treat `make ci` results as local-only |
 | O2 | `principal_id` constant: which value? Proposal — a named `P0_PRINCIPAL_ID` deterministic UUIDv5 from `"types-registry.p0.principal"` rather than `Uuid::nil()`, so it is greppable and not mistaken for a nil-write bug | slice 6 | Deterministic v5 |
 | O4 | ADR-0015 quarantine preflight — DESIGN requires the join of `dependency` to `entity.gts_id` finding stable subjects referencing major-0 targets to be empty or remediated before the rule is enabled. First release is expected to need only the check | slice 5 | Run as a migration-time assertion |
 
 Closed in review: `preview-outbox` sign-off (D9 — `ledger`, `file-storage` and
-`chat-engine` already depend on it) and the `POST /entities` wire break (D10).
+`chat-engine` already depend on it) and the `POST /entities` wire break (D10). **Closed
+2026-08-18: O1**, publishing `gts` / `gts-id` / `gts-macros` 0.12.0 — the crates are on
+crates.io, the `[patch.crates-io]` override is deleted, and `make ci` results stop being
+local-only for reasons connected to this dependency (§7).
 
 ---
 
@@ -1392,12 +1436,14 @@ Closed in review: `preview-outbox` sign-off (D9 — `ledger`, `file-storage` and
   (test shape). `guidelines/DNA/languages/RUST.md` is **outdated and not used**
 - **ADRs honoured in P0**: 0001, 0003, 0004, 0005, 0006, 0008, 0012, 0014, 0015
 - **ADRs out of P0 scope**: 0002, 0007, 0009, 0010, 0011, 0013
-- **`gts-rust`**: `/Users/vasily/dev/gts-rust` at `f65bf62`; target release 0.12.0,
-  declaring `GTS_SPECIFICATION_VERSION = "0.13"`
+- **`gts-rust`**: published on crates.io as 0.12.0 (source: `/Users/vasily/dev/gts-rust`
+  at `f65bf62`, version-bumped at `df7c14b`), declaring
+  `GTS_SPECIFICATION_VERSION = "0.13"`
 - **Prerequisites closed here**: activation write set (§4), `sea-query` recursive CTE
-  (D5), and GTS capabilities 1–7 of DESIGN §4 via the 0.12.0 upgrade (§7)
-- **Prerequisites still open**: 0.12.0 publication (O1, blocks merge), ADR-0015 quarantine
-  preflight (O4), worker liveness bounds (§10.3 `worker.*` proposes values), benchmark
-  profile. GTS capability 8 (pattern containment) is deferred with federation
+  (D5), GTS capabilities 1–7 of DESIGN §4 via the 0.12.0 upgrade (§7), and 0.12.0
+  publication (O1, closed 2026-08-18)
+- **Prerequisites still open**: ADR-0015 quarantine preflight (O4), worker liveness bounds
+  (§10.3 `worker.*` proposes values), benchmark profile. GTS capability 8 (pattern
+  containment) is deferred with federation
 - **`preview-outbox` reliance**: approved (D9), matching `ledger`, `file-storage`,
   `chat-engine`

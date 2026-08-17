@@ -6,19 +6,39 @@ This report discharges T1's third acceptance criterion — *"every difference in
 `#[gts_type_schema]`-generated schema documents versus 0.11.0 is enumerated and accounted
 for — none silent"* — and records what the re-validation sweep actually covered.
 
-Source: `/Users/vasily/dev/gts-rust` at `f65bf62`, the commit SPEC §7 verified against.
+Source: `/Users/vasily/dev/gts-rust` at `df7c14b`. SPEC §7 verified against `f65bf62`, and
+`df7c14b` is the version bump on top of it — nine `Cargo.toml`/`Cargo.lock` files, no source
+change — so every behavioural finding below, including the schema-document diff, was captured
+at `f65bf62` and still holds.
 
 ## 1. What changed in the workspace
 
 **`Cargo.toml`** — one `[patch.crates-io]` block redirecting `gts`, `gts-id` and
-`gts-macros` to the local checkout. No version requirement is edited: the local crates
-still declare `0.11.0`, so the three existing `gts* = "0.11.0"` requirements resolve
-against them unchanged. The block carries a DO-NOT-MERGE marker and names O1 as its exit
-condition.
+`gts-macros` to the local checkout, plus the three workspace requirements moved to
+**`0.12.0`**. The block carries a DO-NOT-MERGE marker and names O1 as its exit condition.
 
 `Cargo.lock` **is not committed.** The patch removes the registry `source` and `checksum`
 of all three crates and adds `num-cmp` (a new transitive dependency of the local `gts`), so
 a committed lockfile would encode this machine's absolute path.
+
+**Why the requirements moved, and it was not a preference.** The task's original criterion
+was *"no version requirement anywhere is edited (local crates still declare `0.11.0`)"* —
+sound while it held. Mid-task the local checkout bumped itself
+(`df7c14b chore: bump version 0.11.0 -> 0.12.0`), and a `0.11.0` requirement cannot be
+satisfied by a `0.12.0` path crate. Cargo's response is **not** an error: it wrote three
+`[[patch.unused]]` entries into `Cargo.lock` and resolved all three crates from the
+**published 0.11.0** instead. The workspace was silently back on the old semantics.
+
+Two things follow, and both are worth keeping:
+
+- **Requirements at `0.12.0` make the patch load-bearing.** No published version satisfies
+  them, so the patch cannot fall out unnoticed, and deleting it at O1 time fails resolution
+  loudly rather than downgrading quietly.
+- **The capability test is what caught it.** `gts_012_semantics_tests.rs` cannot compile
+  against 0.11.0, so a silent downgrade becomes a build failure. Nothing else in the
+  repository used a 0.12.0-only symbol, so without that test the workspace would have kept
+  compiling and "T1 done" would have meant "still on 0.11.0". That is the concrete payoff of
+  writing the failing test instead of asserting the upgrade in prose.
 
 **One source break.** `GtsIdSegment::ver_major() -> u32` is gone in 0.12.0, replaced by
 `ver_major_opt() -> Option<u32>` — this is the *"distinguish v0 from wildcard versions"*
@@ -36,7 +56,7 @@ Surfacing the v0/unspecified distinction is deliberately *not* done here. It bel
 major-0 quarantine slice (ADR-0015, T18), which is where the exactness this fix enables is
 actually wanted.
 
-**One test added.** `TR/tests/gts_012_semantics_tests.rs`, 5 tests pinning the capabilities
+**One test added.** `TR/tests/gts_012_semantics_tests.rs`, 6 tests pinning the capabilities
 DESIGN §4 requires and 0.11.0 lacks — the tri-state verdict, per-level content-model
 classification, the document-level comparison entry point, and the checker versions used as
 admission provenance. Under 0.11.0 the file does not compile: none of
@@ -167,7 +187,7 @@ every linked declaration admits.
 Run and green:
 
 - `cargo nextest run -p cf-gears-types-registry` — 208 passed.
-- `cargo nextest run --workspace` — *see the summary appended below.*
+- `cargo nextest run --workspace` — **10213 passed, 368 skipped, 0 failures**, against a pre-upgrade baseline of 10206 passed + 368 skipped. The difference is exactly the 6 tests this task adds.
 - `make gts-docs` — 797 files, 0 errors. Plus the same sweep with the 0.12.0 validator.
 - Server boots and admits the full inventory under the patch (behaviour verified at
   runtime, not only at compile time).
@@ -197,7 +217,7 @@ repository — the lints come from the external `cargo-gears` tool. There is con
 second workspace whose `gts` dependency needs the same patch. Fixing the comment is
 out of T1's scope; it is noted here so the next reader does not go looking for that file.
 
-## 5. Blocking exit condition (O1)
+## 5. Blocking exit condition (O1) — closed
 
 The `[patch.crates-io]` block must not merge. Until `gts` / `gts-id` / `gts-macros` 0.12.0
 are published:
@@ -209,3 +229,57 @@ are published:
 Publish, then delete the block — the version requirements above it already say `0.11.0`
 and will need bumping to `0.12.0` at that point, which is the one place a version edit
 belongs.
+
+*(The requirements were later moved to `0.12.0` themselves, ahead of publication — see §1
+above and SPEC §7. What follows records the actual close.)*
+
+## 6. Closing O1 — publication confirmed, patch removed (2026-08-18)
+
+`gts`, `gts-id` and `gts-macros` 0.12.0 are live on crates.io. Confirmed against the
+crates.io API directly (not assumed from the workspace resolving cleanly), with a
+compliant User-Agent header — the anonymous default gets a `403` from crates.io's data
+policy, which reads as "not found" if the error body isn't inspected:
+
+```
+gts:        max_version 0.12.0, max_stable_version 0.12.0
+gts-id:     max_version 0.12.0, max_stable_version 0.12.0
+gts-macros: max_version 0.12.0, max_stable_version 0.12.0
+```
+
+**Change.** `Cargo.toml`'s `# DO NOT MERGE TO main` comment and the `[patch.crates-io]`
+table are deleted. The three `gts* = "0.12.0"` requirements are untouched — per §1 above,
+they already named the target version rather than whatever the local checkout declared,
+so there was nothing to bump.
+
+**Re-resolution.** `cargo update -p gts`, `-p gts-id`, `-p gts-macros` (run one at a time —
+passing all three to one invocation returned "package ID specification `gts` did not match
+any packages" on this cargo version, `1.97.0`; individually each succeeded). `Cargo.lock`
+now carries, for all three:
+
+```
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "…"
+```
+
+in place of the path override. `num-cmp` — the transitive dependency §1 noted as new in
+0.12.0 — is still present, now sourced from the published `gts`'s own manifest rather than
+the local checkout's.
+
+**Re-verification against the published crate**, not assumed identical to the patched
+build:
+
+| Check | Before (patched, §4) | After (published) |
+|---|---|---|
+| `cargo check --workspace` | (implied by the full test run) | clean, 0 errors |
+| `cargo test -p cf-gears-types-registry` | 208 passed (+ 6 new = §1's count) | **209 passed, 0 failed** |
+| `cargo test --workspace` | 10213 passed, 368 skipped, 0 failed | **10260 passed, 611 ignored, 0 failed.** The population differs (this run includes doc-tests, hence the larger ignored count — most need Docker/testcontainers) but the figure that matters is unchanged: 0 failures |
+| `make gts-docs` | 797 files, 0 errors | **798 files, 0 errors** (one additional file now under the scanned paths, unrelated to this change) |
+| `gts_012_semantics_tests.rs` | compiles and passes under the patch | **6/6 pass against the registry crate** |
+
+No regression, no behavioural difference observed. This is expected — the published crate
+is the same source the patch pointed at (`f65bf62`, version-bumped at `df7c14b`) — but it
+was checked rather than presumed, per this report's own standard in §2–§4.
+
+**`Cargo.lock` is committable for the first time on this branch.** §5's rule — never
+commit a lockfile produced under the patch — no longer applies: there is no patch. O1 is
+closed; see `plan.md` P11 and `todo.md` Checkpoint 7.

@@ -16,35 +16,54 @@ breaks in SPEC §10.2 — `POST /entities` (D10) and the paged content-free `GET
 
 ## Phase 0 — Upgrade
 
-### - [ ] T1: Upgrade to `gts-rust` 0.12.0 via `[patch.crates-io]`
+### - [x] T1: Upgrade to `gts-rust` 0.12.0 via `[patch.crates-io]`
 
 **Description:** Point the workspace at the local `gts-rust` checkout so the tri-state
 compatibility verdict, `ContentModel` classification and `compare_documents` become
 available, then prove the corrected semantics break nothing already declared. This task's
 failure mode is other gears, which is why it runs first and alone.
 
+Outcome and full evidence: [`t1-gts-0.12.0-upgrade-report.md`](./t1-gts-0.12.0-upgrade-report.md).
+
 **Acceptance criteria:**
-- [ ] `[patch.crates-io]` overrides `gts`, `gts-id`, `gts-macros` with paths into `~/dev/gts-rust`; no version requirement anywhere is edited (local crates still declare `0.11.0`)
-- [ ] All 202 declared GTS identifiers in the repository still admit; any that do not are fixed or explicitly waived in writing
-- [ ] Every difference in `#[gts_type_schema]`-generated schema documents versus 0.11.0 is enumerated and accounted for — none silent
-- [ ] `Cargo.lock` is **not** committed while the patch is present
+- [x] `[patch.crates-io]` overrides `gts`, `gts-id`, `gts-macros` with paths into `~/dev/gts-rust`, and the three workspace requirements name **`0.12.0`**. The original criterion said not to edit any version requirement, on the premise that the local crates still declared `0.11.0`; that premise expired when the checkout bumped itself, and a `0.11.0` requirement then made the patch **unused** — a cargo warning, not an error — silently building against the published 0.11.0. Requirements at `0.12.0` make the patch load-bearing (SPEC §7)
+- [x] All 202 declared GTS identifiers in the repository still admit; any that do not are fixed or explicitly waived in writing — 118/118 admitted at runtime under the e2e feature set, 797 doc/JSON files validate under the 0.12.0 validator, and every macro literal compiles. **The figure 202 itself is not reproducible** and is replaced by three measured populations in the report §3
+- [x] Every difference in `#[gts_type_schema]`-generated schema documents versus 0.11.0 is enumerated and accounted for — none silent. 9 of 118 documents differ, all by one change (a doc-commented GTS-identifier field's subschema preserved under `allOf` instead of having its `description` overwritten); shown semantically inert, including `x-gts-ref`, which `XGtsRefValidator` still enforces by recursing through `allOf` (report §2)
+- [x] `Cargo.lock` is **not** committed while the patch is present
 
 **Verification:**
-- [ ] `make ci`
-- [ ] `make gts-docs`
-- [ ] `cargo test --workspace` — no new failures versus the pre-upgrade baseline
-- [ ] Manual: capture generated schema documents before and after, diff them
+- [ ] `make ci` — **partial**: `fmt` clean, `clippy --workspace --all-targets --all-features -D warnings -D clippy::perf` clean, workspace tests and `gts-docs` green; `test-db`, `test-users-info-pg` and `test-usage-collector-pg` not run (Docker daemon down) and `dylint` not run (`cargo-gears` not installed). None of the four links `gts` in a way this upgrade touches; recorded in report §4
+- [x] `make gts-docs` — 797 files, 0 errors, both with the installed validator and with one built from the local checkout
+- [x] `cargo test --workspace` — 10213 passed, 368 skipped, 0 failures; baseline was 10206 passed + 368 skipped, and the difference is exactly the 6 new capability tests
+- [x] Manual: generated schema documents captured before and after by booting the example server and dumping `GET /cf/types-registry/v1/entities`, then diffed field by field
+
+**One source break, fixed:** `GtsIdSegment::ver_major() -> u32` became
+`ver_major_opt() -> Option<u32>` (the v0-versus-wildcard fix). One call site,
+`TR/src/api/rest/dto.rs`, now reads `ver_major_opt().unwrap_or(0)` — byte-identical to
+0.11.0, which returned `parts().map_or(0, ..)` — so the REST response shape is unchanged.
+Surfacing the distinction belongs to the major-0 quarantine slice (T18).
+
+**Added:** `TR/tests/gts_012_semantics_tests.rs`, 6 tests pinning the tri-state verdict,
+`ContentModel` including `Partial`, `GtsStore::compare_documents` and the provenance
+versions. Under 0.11.0 the file does not compile — none of those symbols exists in the
+published crate — so it is a genuine RED→GREEN.
 
 **Dependencies:** None
 **Files likely touched:** `Cargo.toml`, plus test fixtures the corrected semantics reject
 **Scope:** M (mechanical change, large verification surface)
 
+**Update, 2026-08-18 — O1 closed.** `gts` / `gts-id` / `gts-macros` 0.12.0 published to
+crates.io; the `[patch.crates-io]` block is deleted from `Cargo.toml` and `Cargo.lock`
+re-resolved against the registry. Re-verified, not assumed: `cargo check --workspace`
+clean, `cargo test -p cf-gears-types-registry` 209/0 (this task's 208 + the 6
+`gts_012_semantics_tests.rs` tests), `make gts-docs` 798/0. See report §6.
+
 ---
 
 ### Checkpoint 0
-- [ ] `make ci` green
-- [ ] Every declared GTS identifier admits under 0.12.0
-- [ ] Generated-schema diff reviewed and accounted for
+- [ ] `make ci` green — **partial, see T1**: everything that does not need Docker or `cargo-gears` is green
+- [x] Every declared GTS identifier admits under 0.12.0
+- [x] Generated-schema diff reviewed and accounted for — report §2, one class of change in 9 of 118 documents
 - [ ] **Human review before any registry code is written**
 
 ---
@@ -696,7 +715,8 @@ T26 once every consumer has moved.
 - [ ] Models stay **gRPC-expressible** for future out-of-process use (plan decision P5): flat structures, no `Arc`-linked object graphs, no trait objects. The old trait's `Arc<GtsTypeSchema>` parent chain is exactly what must not be reproduced
 - [ ] No security-context parameter; a doc comment records that planes will add one as a deliberate breaking change, and that out-of-process use requires it
 - [ ] **Convenience read helpers as provided methods** over the two required primitives, so consumers keep familiar call shapes and the trait stays object-safe (DESIGN: *"single reads and the kind-narrowed `get_type_schema` / `get_instance` are provided methods over it"*): `get_type_schema`, `get_instance`, `get_type_schemas`, `get_instances`, the `_by_uuid` variants, `list_type_schemas`, `list_instances`. Kind narrowing costs no round trip — the kind is the trailing `~` of the identifier, so a kind-mismatched argument fails locally
-- [ ] `EntitySnapshot` carries small accessors for the materialized groups (`effective_traits`, `effective_schema`, `authored_value`, `segments`) so the ~40 call sites using the old models' computed methods become field reads rather than rewrites. Nothing is recomputed client-side — D3 means the server already materialized it
+- [ ] `EntitySnapshot` carries small accessors for the materialized groups (`effective_traits`, `effective_schema`, `authored_value`, `segments`) so the ~40 call sites using the old models' computed methods become field reads rather than rewrites
+- [ ] **No `effective_*` recomputation exists in the SDK** — the old `GtsTypeSchema::effective_schema` / `effective_properties` / `effective_required` / `effective_traits` / `effective_traits_schema` are not reproduced. They resolved only the parent `$ref` and left non-parent references unresolved, and `effective_traits` was an admitted approximation (`TODO(#1723)`), so reproducing them would reintroduce both a wrong answer and a `constraint-gts-implementation` violation (SPEC §10.1)
 - [ ] `EntityQuery` carries `limit` and `cursor`, and `EntityPage` carries the next cursor — the trait already declared `EntityPage` in SPEC §10.1, and without these it is a page in name only (D12)
 - [ ] `list_instances` / `list_type_schemas` **hydrate a content-free page through `batchGet`**, so the ~87 existing call sites keep reading payloads from the result. The doc comment states the trade: complete with respect to the traversal, not to an instant, and one extra round trip per page which the client cache absorbs
 - [ ] **The validator field is in the models from this task**, and `BatchGet` accepts a validator per requested key, even though T29 computes them and T30 consumes them. Adding either later would break the SDK contract after ~50 call sites have moved onto it (SPEC §8.5, `plan.md` P9). A result variant for `unchanged` is part of the same shape
@@ -795,6 +815,7 @@ single-tenant and rg plugins), `resource-group`, `usage-collector` (+ plugins), 
 - [ ] `RegisterResult::ensure_all_ok` sites are replaced by the helper's terminal result — no site treats `pending` as success
 - [ ] Registration failure fails that gear's startup naming the gear and identifier, and does not affect other gears
 
+- [ ] Where a materialized `effective_*` field differs from what the deleted client-side method returned, the **materialized value is accepted** — the difference is the old approximation being wrong (unresolved non-parent `$ref`, trait-default order), and `gts-rust` is authoritative. A failing assertion is updated to the new value, never "fixed" back
 **Verification:**
 - [ ] `cargo test --workspace`
 - [ ] `make quickstart` and `make example` — server boots, `/health` green, every migrated gear's types present
@@ -821,6 +842,7 @@ single-tenant and rg plugins), `resource-group`, `usage-collector` (+ plugins), 
 - [ ] `types-registry-sdk` exports only the new surface
 - [ ] No consumer recomputes effective artifacts locally — every site reads the materialized group (D3)
 
+- [ ] Where a materialized `effective_*` field differs from what the deleted client-side method returned, the **materialized value is accepted** — the difference is the old approximation being wrong (unresolved non-parent `$ref`, trait-default order), and `gts-rust` is authoritative. A failing assertion is updated to the new value, never "fixed" back
 **Verification:**
 - [ ] `cargo test --workspace`
 - [ ] `grep -r TypesRegistryClient` finds nothing outside history
@@ -998,7 +1020,7 @@ only the projection / visibility / Context-Tenant key dimensions.
 - [ ] All 15 success criteria of SPEC §16 met
 - [ ] `make ci`, `make test-db` (three backends), `make e2e-local`, `make e2e-docker`, `make dylint`, `make lychee` green
 - [ ] Every ceiling in SPEC §9 has a comment at the point it binds
-- [ ] O1 resolved: `gts` 0.12.0 published and `[patch.crates-io]` removed — **blocks merge**
+- [x] O1 resolved: `gts` 0.12.0 published and `[patch.crates-io]` removed — **blocks merge** (closed 2026-08-18, see T1 report §6)
 - [ ] `TypesRegistryClient` is deleted and no crate references it (D6, T26)
 - [ ] Conditional reads work end to end: an exact read carries a validator and honours `If-None-Match` with `304`, `batchGet` reports `unchanged` per key (T29)
 - [ ] Discovery is bounded: no response is unbounded in items or bytes, and a cursor traverses the whole set exactly once (T27, D12)
