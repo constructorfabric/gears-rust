@@ -6,16 +6,28 @@ use axum::{Extension, Router};
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::canonical_prelude::StatusCode;
 use toolkit::api::operation_builder::{
-    CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature, OperationBuilder,
+    CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature, OperationBuilder, ParamLocation, ParamSpec,
 };
 
 use super::dto::{
-    GtsEntityDto, ListEntitiesResponse, RegisterEntitiesRequest, RegisterEntitiesResponse,
+    EntityDto, GtsEntityDto, ListEntitiesResponse, OperationAcceptedDto, OperationDto,
+    RegisterEntitiesRequest, RegisterEntitiesResponse, SubmitEntitiesRequest,
 };
 use super::handlers;
+use crate::domain::registry_service::RegistryService;
 use crate::domain::service::TypesRegistryService;
 
 const API_TAG: &str = "Types Registry";
+
+/// Base path of the pre-database contract. `main`'s routes, unchanged, served
+/// from the in-memory service until T24 deletes them with their repository.
+pub const V1: &str = "/types-registry/v1";
+
+/// Base path of the database-backed async surface. Interim by design: T24a
+/// promotes these operations onto [`V1`] once the in-memory path is gone, so P0
+/// ends on one version (P12). Route paths are built from these two constants and
+/// nowhere else — the promotion is then a constant change, not a sweep.
+pub const V2: &str = "/types-registry/v2";
 
 struct License;
 
@@ -33,9 +45,34 @@ pub fn register_routes(
     mut router: Router,
     openapi: &dyn OpenApiRegistry,
     service: Arc<TypesRegistryService>,
+    registry: Option<Arc<RegistryService>>,
 ) -> Router {
+    // ponytail: ceiling C8 — every P0 operation is platform-plane (`plane = 1`),
+    // but the plane is expressed by the contract and the data, **not enforced by
+    // the transport**. An in-process gear has no inbound platform-identity
+    // validator, api-gateway has no platform listener, and `OperationBuilder`
+    // cannot mark a route platform-only. So these routes keep the authentication
+    // they have and stay `.exposed()`; `.anonymous()` is deliberately **not**
+    // used, because without a platform identity to replace the current gate it
+    // would be a regression rather than a step toward one. The upgrade path is a
+    // platform listener with `X-ToolKit-Internal-Token` / `PlatformIdentity` plus
+    // a declarative route marker — both toolkit/api-gateway work outside this
+    // gear (SPEC §9 C8, §8.4).
+
+    // -----------------------------------------------------------------------
+    // v1 — the pre-database contract, unchanged from `main`
+    // -----------------------------------------------------------------------
+    //
+    // Every v1 route is served by `TypesRegistryService` from the in-memory
+    // repository, and no v1 route touches `RegistryService`. That separation is
+    // the point of T9a rather than an implementation detail: T9 repointed these
+    // two routes at the database, which changed `POST /v1/entities`'s request
+    // body under its existing callers and left `oagw` and `account-management`
+    // writing to the database while resolving from process memory. The database
+    // path has no consumer until T24 (SPEC §10.2, `plan.md` P12).
+
     // POST /types-registry/v1/entities - Register GTS entities
-    router = OperationBuilder::post("/types-registry/v1/entities")
+    router = OperationBuilder::post(format!("{V1}/entities"))
         .operation_id("types_registry.register")
         .summary("Register GTS entities")
         .description(
@@ -55,7 +92,7 @@ pub fn register_routes(
         .register(router, openapi);
 
     // GET /types-registry/v1/entities - List GTS entities
-    router = OperationBuilder::get("/types-registry/v1/entities")
+    router = OperationBuilder::get(format!("{V1}/entities"))
         .operation_id("types_registry.list")
         .summary("List GTS entities")
         .description(
@@ -80,7 +117,7 @@ pub fn register_routes(
         .register(router, openapi);
 
     // GET /types-registry/v1/entities/{gts_id} - Get GTS entity by ID
-    router = OperationBuilder::get("/types-registry/v1/entities/{gts_id}")
+    router = OperationBuilder::get(format!("{V1}/entities/{{gts_id}}"))
         .operation_id("types_registry.get")
         .summary("Get GTS entity by ID")
         .description("Retrieve a single GTS entity by its identifier.")
@@ -97,5 +134,115 @@ pub fn register_routes(
         .standard_errors(openapi)
         .register(router, openapi);
 
-    router.layer(Extension(service))
+    // -----------------------------------------------------------------------
+    // v2 — the database-backed async surface (T9)
+    // -----------------------------------------------------------------------
+    //
+    // Interim: T24a promotes these onto v1 once the in-memory path is deleted.
+
+    // POST /types-registry/v2/entities — submit a registration (D10)
+    //
+    // The async shape DESIGN specifies: the response is a receipt for an
+    // operation and the outcome is polled. `200` is returned only for a replay of
+    // an operation that is already terminal.
+    router = OperationBuilder::post(format!("{V2}/entities"))
+        .operation_id("types_registry.submit_entities")
+        .summary("Submit GTS entities for registration")
+        .description(
+            "Submit one or more GTS entities for admission. Returns 202 with the operation's \
+             Location; poll GET /types-registry/v2/operations/{operation_id} for the \
+             per-candidate outcome. A replay of a terminal operation returns 200. An \
+             Idempotency-Key header is required: a replay with the same body returns the same \
+             operation, and a different body under the same key is a conflict.",
+        )
+        // Declared, not merely enforced. `OperationBuilder` has no `header_param`
+        // beside `path_param` / `query_param` (upstream #4614), but
+        // `ParamLocation::Header` exists and the registry maps it, so `param` does
+        // the job — a required header absent from the document is what a generated
+        // client omits.
+        .param(ParamSpec {
+            name: "Idempotency-Key".to_owned(),
+            location: ParamLocation::Header,
+            required: true,
+            description: Some(
+                "Caller-supplied key scoping the retry of this submission. A replay with the \
+                 same body returns the same operation; a different body under the same key is \
+                 a conflict."
+                    .to_owned(),
+            ),
+            param_type: "string".to_owned(),
+            array: false,
+        })
+        .tag(API_TAG)
+        .authenticated()
+        .exposed()
+        .require_license_features::<License>([])
+        .json_request::<SubmitEntitiesRequest>(openapi, "Entities to admit")
+        .handler(handlers::submit_entities)
+        .json_response_with_schema::<OperationAcceptedDto>(
+            openapi,
+            StatusCode::ACCEPTED,
+            "Accepted; poll the operation at the returned Location",
+        )
+        .json_response_with_schema::<OperationAcceptedDto>(
+            openapi,
+            StatusCode::OK,
+            "Replay of an operation that is already terminal",
+        )
+        .problem_response(
+            openapi,
+            StatusCode::CONFLICT,
+            "The Idempotency-Key is bound to a different request",
+        )
+        .standard_errors(openapi)
+        .register(router, openapi);
+
+    // GET /types-registry/v2/operations/{operation_id} — poll an operation
+    router = OperationBuilder::get(format!("{V2}/operations/{{operation_id}}"))
+        .operation_id("types_registry.get_operation")
+        .summary("Get an admission operation")
+        .description(
+            "Return one operation and the durable per-candidate outcomes. `status` is progress \
+             only: `completed` means every item is terminal, and the outcomes are on the items.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .exposed()
+        .require_license_features::<License>([])
+        .path_param(
+            "operation_id",
+            "The operation UUID returned by a submission",
+        )
+        .handler(handlers::get_operation)
+        .json_response_with_schema::<OperationDto>(openapi, StatusCode::OK, "The operation")
+        .problem_response(openapi, StatusCode::NOT_FOUND, "No such operation")
+        .standard_errors(openapi)
+        .register(router, openapi);
+
+    // GET /types-registry/v2/entities/{entity_key} — exact read from the database
+    router = OperationBuilder::get(format!("{V2}/entities/{{entity_key}}"))
+        .operation_id("types_registry.get_entity")
+        .summary("Get a GTS entity by identifier or Registry Reference")
+        .description(
+            "Return one entity with its authored document and the effective artifacts \
+             materialized at admission. The key is either a canonical GTS identifier or the \
+             Registry Reference UUID derived from it. A deleted entity is still readable and \
+             reports its lifecycle status.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .exposed()
+        .require_license_features::<License>([])
+        .path_param(
+            "entity_key",
+            "A GTS identifier (e.g. gts.acme.core.events.user_created.v1~) or a Registry \
+             Reference UUID",
+        )
+        .handler(handlers::get_entity_by_key)
+        .json_response_with_schema::<EntityDto>(openapi, StatusCode::OK, "The requested entity")
+        .problem_response(openapi, StatusCode::NOT_FOUND, "Entity not found")
+        .standard_errors(openapi)
+        .register(router, openapi);
+
+    router.layer(Extension(service)).layer(Extension(registry))
 }

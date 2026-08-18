@@ -1,0 +1,129 @@
+//! The `version_family` repository: the row that names a version family and, by
+//! its unique key, serializes concurrent first admission into it.
+
+use sea_orm::{ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter};
+use time::OffsetDateTime;
+use toolkit_db::secure::{AccessScope, DBRunner, ScopeError, SecureEntityExt, SecureInsertExt};
+use uuid::Uuid;
+
+use super::conflict_do_nothing;
+use crate::domain::enums::OwnershipScope;
+use crate::domain::family::FamilyKey;
+use crate::domain::ports::VersionFamilyRow;
+use crate::infra::storage::entity::version_family;
+
+/// One stored row as the domain names it. See `entity_repo::row` for why the
+/// mapper sits beside the repository rather than on the entity.
+fn row(m: version_family::Model) -> VersionFamilyRow {
+    VersionFamilyRow {
+        id: m.id,
+        family_key: FamilyKey::from_stored(m.family_key),
+        ownership_scope: m.ownership_scope.into(),
+        owner_tenant_id: m.owner_tenant_id,
+        created_at: m.created_at,
+    }
+}
+
+pub struct VersionFamilyRepo;
+
+impl VersionFamilyRepo {
+    /// Exact read by family key.
+    pub async fn find_by_key(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        family_key: &str,
+    ) -> Result<Option<VersionFamilyRow>, ScopeError> {
+        Ok(version_family::Entity::find()
+            .filter(version_family::Column::FamilyKey.eq(family_key))
+            .secure()
+            .scope_with(scope)
+            .one(runner)
+            .await?
+            .map(row))
+    }
+
+    /// Insert the family if absent, otherwise read the existing row. Returns
+    /// `(row, created)`.
+    ///
+    /// The winner is decided by `uq_tr_version_family_key`, not by the read that
+    /// precedes the insert: two callers can both see no row, and the constraint
+    /// then keeps the loser's row out. That is why the conflict is handled rather
+    /// than propagated — it is the serialization point, not a fault.
+    ///
+    /// The conflict must not be *raised*, though, only absorbed: this method runs
+    /// inside the admission commit transaction, and a raised unique violation aborts
+    /// that transaction on `PostgreSQL`, taking the recovering re-read with it. See
+    /// [`conflict_do_nothing`].
+    ///
+    /// **This is not a row lock.** `database.sql` describes the family row as the
+    /// lock that serializes concurrent first admission, and `SELECT … FOR UPDATE`
+    /// is how that reads on Postgres and `MySQL` — but `DBRunner` deliberately
+    /// hides the raw executor and the secure builder exposes no lock clause, so a
+    /// repository cannot take one. Serializing the *validation* window (the
+    /// version-family shape and contiguity rules) needs the toolkit advisory lock,
+    /// which lives on the `Db` handle and therefore belongs to the service layer;
+    /// [`Self::lock_order`] is the ordering half of it.
+    pub async fn create_or_get(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        family_key: &str,
+        ownership_scope: OwnershipScope,
+        owner_tenant_id: Option<Uuid>,
+        now: OffsetDateTime,
+    ) -> Result<(VersionFamilyRow, bool), ScopeError> {
+        if let Some(existing) = Self::find_by_key(runner, scope, family_key).await? {
+            return Ok((existing, false));
+        }
+
+        let candidate = version_family::ActiveModel {
+            family_key: Set(family_key.to_owned()),
+            ownership_scope: Set(ownership_scope.into()),
+            owner_tenant_id: Set(owner_tenant_id),
+            created_at: Set(now),
+            ..Default::default()
+        };
+        // `exec` rather than `exec_with_returning`: it is the one execution shape
+        // that reports a swallowed conflict as `RecordNotInserted` on all three
+        // backends. `exec_with_returning` reports the same fact as `RecordNotFound`
+        // wherever `RETURNING` is available, which would leave this matching on a
+        // library's message text.
+        let created = match version_family::Entity::insert(candidate.clone())
+            .secure()
+            .scope_with_model(scope, &candidate)?
+            .on_conflict_raw(conflict_do_nothing(version_family::Column::Id))
+            .exec(runner)
+            .await
+        {
+            Ok(_) => true,
+            Err(ScopeError::Db(DbErr::RecordNotInserted)) => false,
+            Err(e) => return Err(e),
+        };
+
+        // One read for both outcomes: either this call's row or the winner's, and
+        // the conflict left the transaction usable either way — which is the whole
+        // point of absorbing it instead of raising it.
+        let family = Self::find_by_key(runner, scope, family_key)
+            .await?
+            // The row exists by now, inserted here or by the winner. If the read
+            // misses it, something outside this protocol deleted it, and failing
+            // closed is the only safe answer.
+            .ok_or(ScopeError::Invalid(
+                "version family vanished between insert and re-read",
+            ))?;
+        Ok((family, created))
+    }
+
+    /// Canonical order for acquiring family locks: sorted and deduplicated.
+    ///
+    /// A batch admission touches several families, and two batches touching the
+    /// same two families in opposite orders would deadlock. Sorting is enough to
+    /// make that impossible, and byte order is the same total order the family key
+    /// column already uses.
+    #[must_use]
+    pub fn lock_order(family_keys: &[String]) -> Vec<String> {
+        let mut ordered: Vec<String> = family_keys.to_vec();
+        ordered.sort();
+        ordered.dedup();
+        ordered
+    }
+}

@@ -177,14 +177,6 @@ fn candidate_object_levels_classify_every_level_including_partial() {
     );
 }
 
-/// Prerequisite 5: the checker's spec and implementation versions are
-/// readable, so admission can persist them as provenance on every revision.
-#[test]
-fn checker_versions_are_available_as_provenance() {
-    assert_eq!(GTS_SPECIFICATION_VERSION, "0.13");
-    assert!(!GTS_IMPLEMENTATION_VERSION.is_empty());
-}
-
 /// Guards the one failure mode `[patch.crates-io]` has: an override that stops
 /// matching the version requirement is recorded as `[[patch.unused]]` — a cargo
 /// *warning* — and the workspace silently resolves the published 0.11.0 instead.
@@ -192,6 +184,7 @@ fn checker_versions_are_available_as_provenance() {
 /// imports above stop compiling. This says it out loud, with a diagnosis.
 #[test]
 fn workspace_did_not_silently_fall_back_to_gts_0_11() {
+    assert_eq!(GTS_SPECIFICATION_VERSION, "0.13");
     assert!(
         !GTS_IMPLEMENTATION_VERSION.starts_with("0.11."),
         "resolved gts {GTS_IMPLEMENTATION_VERSION}: the [patch.crates-io] override is not in \

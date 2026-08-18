@@ -272,8 +272,13 @@ impl MetadataSchemaRegistry for GtsMetadataSchemaRegistry {
                     cause: None,
                 }
             })?;
+        // An instance of the metadata type is `{"payload": {…}}`, not the bare
+        // object (§4.4.1, `TenantMetadataEnvelopeV1`). AM stores the payload content,
+        // so the envelope is composed here rather than demanded of callers — the only
+        // seam that validates a metadata value as a whole document.
+        let enveloped = serde_json::json!({ "payload": value });
         let errors: Vec<String> = validator
-            .iter_errors(value)
+            .iter_errors(&enveloped)
             .map(|e| e.to_string())
             .collect();
         if !errors.is_empty() {

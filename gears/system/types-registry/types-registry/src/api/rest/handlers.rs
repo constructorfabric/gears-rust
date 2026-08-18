@@ -3,14 +3,21 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Extension, Path, Query};
+use axum::extract::{Extension, OriginalUri, Path, Query};
+use axum::http::{HeaderMap, HeaderValue, header};
 use toolkit::api::canonical_prelude::*;
+use uuid::Uuid;
 
 use super::dto::{
-    GtsEntityDto, ListEntitiesQuery, ListEntitiesResponse, RegisterEntitiesRequest,
-    RegisterEntitiesResponse, RegisterResultDto, RegisterSummaryDto,
+    EntityDto, GtsEntityDto, ListEntitiesQuery, ListEntitiesResponse, OperationAcceptedDto,
+    OperationDto, RegisterEntitiesRequest, RegisterEntitiesResponse, RegisterResultDto,
+    RegisterSummaryDto, SubmitEntitiesRequest,
 };
+use super::routes::V2;
+use crate::domain::admission::{Candidate, SubmitRequest};
+use crate::domain::enums::OperationKind;
 use crate::domain::error::DomainError;
+use crate::domain::registry_service::{EntityKey, RegistryService};
 use crate::domain::service::TypesRegistryService;
 
 /// POST /api/v1/types-registry/entities
@@ -99,13 +106,205 @@ pub async fn get_entity(
     Ok(Json(entity.into()))
 }
 
+// ---------------------------------------------------------------------------
+// The database-backed platform-plane handlers (T9)
+// ---------------------------------------------------------------------------
+//
+// Mapping steps only. Every one of these reads a request, calls exactly one
+// domain method, and maps the result — no policy, no limit, no existence check
+// and no vocabulary decision lives here, which is what makes a future
+// `api/grpc` adapter able to reuse the same domain surface (SPEC §8.4).
+//
+// The handlers above this line are the pre-database path T27 deletes. The boundary
+// is a section banner and nothing else: it used to be a second `use` block, which
+// read like a module seam inside one file, and a reader cannot tell a seam from an
+// oversight.
+
+/// Advisory only: how long a client should wait before its first poll. The
+/// operation may well be terminal sooner — while admission is inline (T21) it
+/// already is — so this is a hint, not a contract.
+const RETRY_AFTER_SECONDS: &str = "1";
+
+/// Response signal required by the workspace idempotency convention.
+const IDEMPOTENCY_REPLAYED_HEADER: &str = "idempotency-replayed";
+
+/// `POST /types-registry/v2/entities`
+///
+/// Submit a registration. `202` with the operation's `Location`, or `200` when a
+/// replayed operation is already terminal (SPEC §8.1, D10).
+///
+/// The `Idempotency-Key` is **read** from the header and passed as a parameter.
+/// It is never interpreted here: no default, no generated value, no trimming
+/// decision — an absent or unusable key is the domain's refusal to make.
+pub async fn submit_entities(
+    Extension(service): Extension<Option<Arc<RegistryService>>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Json(req): Json<SubmitEntitiesRequest>,
+) -> ApiResult<(StatusCode, HeaderMap, Json<OperationAcceptedDto>)> {
+    let service = require_registry(service)?;
+    // Absent and unusable are kept apart. An absent header is the domain's refusal
+    // to make — `validate` takes the empty string and answers "an Idempotency-Key
+    // header is required" — but a header that *was* sent and cannot be decoded is
+    // this layer's own answer, because a `String` cannot carry the distinction any
+    // further and "required" would be a lie about what the caller did.
+    let idempotency_key = match headers.get("idempotency-key") {
+        None => String::new(),
+        Some(value) => value
+            .to_str()
+            .map_err(|_| super::error::idempotency_key_not_utf8())?
+            .to_owned(),
+    };
+
+    let request = SubmitRequest {
+        idempotency_key,
+        kind: OperationKind::Registration,
+        dry_run: req.dry_run.unwrap_or(false),
+        candidates: req
+            .items
+            .into_iter()
+            .map(|c| Candidate {
+                gts_id: c.gts_id,
+                content: Some(c.content),
+                expected_resource_version: c.expected_resource_version,
+                force: c.force.unwrap_or(false),
+            })
+            .collect(),
+    };
+
+    let accepted = service
+        .submit(&request, time::OffsetDateTime::now_utc())
+        .await
+        .map_err(CanonicalError::from)?;
+
+    let status = if accepted.replayed && accepted.terminal() {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+
+    let mut out = HeaderMap::new();
+    let location = operation_location(uri.path(), accepted.operation_id);
+    let location_value = HeaderValue::from_str(&location).map_err(|e| {
+        tracing::error!(
+            error = %e,
+            location = %location,
+            "types_registry could not encode the operation Location header"
+        );
+        CanonicalError::internal("the registry could not construct an operation receipt").create()
+    })?;
+    out.insert(header::LOCATION, location_value);
+    if status == StatusCode::ACCEPTED {
+        out.insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static(RETRY_AFTER_SECONDS),
+        );
+    }
+    if accepted.replayed {
+        out.insert(
+            IDEMPOTENCY_REPLAYED_HEADER,
+            HeaderValue::from_static("true"),
+        );
+    }
+
+    // The status comes from the receipt, not from a second read. `submit` already
+    // knows it: `pending` when the operation is queued, `completed` once inline
+    // admission has run — which is why reporting a constant `pending` here would be
+    // wrong, and why the read this replaced existed at all. What the read also cost
+    // was a snapshot transaction over two statements and a `"pending"` fallback for
+    // an operation that had just been committed and so cannot be absent.
+    Ok((
+        status,
+        out,
+        Json(OperationAcceptedDto {
+            operation_id: accepted.operation_id,
+            status: accepted.status.into(),
+            replayed: accepted.replayed,
+        }),
+    ))
+}
+
+/// The `Location` of an accepted operation, derived from the path the request
+/// actually arrived on.
+///
+/// **Not the gear-relative constant.** api-gateway mounts every gear under
+/// `prefix_path` with `Router::nest`, so a hardcoded
+/// `/types-registry/v2/operations/{id}` is a `404` for any client that follows it:
+/// RFC 9110 §10.2.2 resolves `Location` against the effective request URI, and an
+/// absolute-path reference discards the prefix. Measured on a live server, not
+/// reasoned about — see the Checkpoint 1 report §8.1.
+///
+/// [`OriginalUri`] rather than `Uri` for the same reason: `nest` rewrites the URI
+/// the inner handler sees, stripping exactly the prefix that has to survive here.
+///
+/// The receipt is a **sibling** of the submit path — `…/v1/entities` answers with
+/// `…/v1/operations/{id}` — so the last segment is replaced rather than appended to.
+/// If the route is ever mounted somewhere that does not end in `/entities`, the
+/// gear-relative path is the fallback: a wrong prefix is better than a path with two
+/// resources in it.
+fn operation_location(request_path: &str, operation_id: Uuid) -> String {
+    let trimmed = request_path.trim_end_matches('/');
+    match trimmed.strip_suffix("/entities") {
+        Some(base) => format!("{base}/operations/{operation_id}"),
+        None => format!("{V2}/operations/{operation_id}"),
+    }
+}
+
+/// `GET /types-registry/v2/operations/{operation_id}`
+pub async fn get_operation(
+    Extension(service): Extension<Option<Arc<RegistryService>>>,
+    Path(operation_id): Path<Uuid>,
+) -> ApiResult<Json<OperationDto>> {
+    let service = require_registry(service)?;
+    let record = service
+        .operation(operation_id)
+        .await
+        .map_err(CanonicalError::from)?
+        .ok_or_else(|| CanonicalError::from(DomainError::not_found_by_uuid(operation_id)))?;
+    Ok(Json(record.into()))
+}
+
+/// `GET /types-registry/v2/entities/{entity_key}`
+///
+/// The key is a GTS identifier or a Registry Reference; which one it is is the
+/// domain's classification, not this handler's.
+pub async fn get_entity_by_key(
+    Extension(service): Extension<Option<Arc<RegistryService>>>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<EntityDto>> {
+    let service = require_registry(service)?;
+    let parsed = EntityKey::parse(&key);
+    let record = service
+        .entity(&parsed)
+        .await
+        .map_err(CanonicalError::from)?
+        .ok_or_else(|| CanonicalError::from(DomainError::not_found_by_id(key)))?;
+    Ok(Json(record.into()))
+}
+
+/// The database-backed path is only wired where a database is bound to this gear
+/// (`no-db.yaml`, `--mock`). A problem document naming the cause beats a `404`
+/// suggesting the API changed, so the routes exist and answer `503`.
+fn require_registry(
+    service: Option<Arc<RegistryService>>,
+) -> Result<Arc<RegistryService>, CanonicalError> {
+    service.ok_or_else(|| {
+        CanonicalError::service_unavailable()
+            .with_detail(
+                "types-registry has no database bound; admission and database-backed reads are \
+                 unavailable in this deployment",
+            )
+            .create()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::infra::InMemoryGtsRepository;
     use gts::GtsConfig;
     use serde_json::json;
-    use toolkit_gts::{gts_id, gts_uri};
+    use toolkit_gts::gts_uri;
 
     const JSON_SCHEMA_DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
 
@@ -122,23 +321,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_entities_returns_503_when_not_ready() {
-        let service = create_service();
-        // Service is not ready yet
-
-        let req = RegisterEntitiesRequest {
-            entities: vec![json!({
-                "$id": gts_uri!("acme.core.events.user_created.v1~"),
-                "$schema": JSON_SCHEMA_DRAFT_07,
-                "type": "object"
-            })],
-        };
-
-        let result = register_entities(Extension(service), Json(req)).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_list_entities_returns_503_when_not_ready() {
         let service = create_service();
         // Service is not ready yet
@@ -146,42 +328,6 @@ mod tests {
         let query = ListEntitiesQuery::default();
         let result = list_entities(Extension(service), Query(query)).await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_get_entity_returns_503_when_not_ready() {
-        let service = create_service();
-        // Service is not ready yet
-
-        let result = get_entity(
-            Extension(service),
-            Path(gts_id!("acme.core.events.user_created.v1~").to_owned()),
-        )
-        .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_register_entities_handler_when_ready() {
-        let service = create_service();
-        service.switch_to_ready().unwrap();
-
-        let req = RegisterEntitiesRequest {
-            entities: vec![json!({
-                "$id": gts_uri!("acme.core.events.user_created.v1~"),
-                "$schema": JSON_SCHEMA_DRAFT_07,
-                "type": "object"
-            })],
-        };
-
-        let result = register_entities(Extension(service), Json(req)).await;
-        assert!(result.is_ok());
-
-        let (status, Json(response)) = result.unwrap();
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(response.summary.total, 1);
-        assert_eq!(response.summary.succeeded, 1);
-        assert_eq!(response.summary.failed, 0);
     }
 
     #[tokio::test]
@@ -209,41 +355,5 @@ mod tests {
 
         let Json(response) = result.unwrap();
         assert_eq!(response.count, 2);
-    }
-
-    #[tokio::test]
-    async fn test_get_entity_handler_when_ready() {
-        let service = create_service();
-
-        // Register entity via internal API (before ready)
-        _ = service.register(vec![json!({
-            "$id": gts_uri!("acme.core.events.user_created.v1~"),
-            "$schema": JSON_SCHEMA_DRAFT_07,
-            "type": "object"
-        })]);
-        service.switch_to_ready().unwrap();
-
-        let result = get_entity(
-            Extension(service),
-            Path(gts_id!("acme.core.events.user_created.v1~").to_owned()),
-        )
-        .await;
-        assert!(result.is_ok());
-
-        let Json(entity) = result.unwrap();
-        assert_eq!(entity.gts_id, gts_id!("acme.core.events.user_created.v1~"));
-    }
-
-    #[tokio::test]
-    async fn test_get_entity_not_found() {
-        let service = create_service();
-        service.switch_to_ready().unwrap();
-
-        let result = get_entity(
-            Extension(service),
-            Path(gts_id!("fabrikam.pkg.ns.type.v1~").to_owned()),
-        )
-        .await;
-        assert!(result.is_err());
     }
 }

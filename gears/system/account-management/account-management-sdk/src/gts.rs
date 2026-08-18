@@ -380,16 +380,19 @@ pub struct TenantTypeTraits {
     pub idp_provisioning: bool,
 }
 
-/// Base tenant-type envelope (abstract). Carries no instance data — the
-/// `id` field exists only to satisfy the `gts-macros` base-struct
-/// contract (a base must declare an `id: GtsInstanceId` or `gts_type:
-/// GtsTypeId`) and is inert (see gear docs).
+/// Base tenant-type envelope (abstract): closed root, open `payload` container
+/// (GTS spec §4.4.1). Derived types describe their content in `payload`; a root
+/// with no container made them either non-composing or unable to carry data.
+///
+/// `required` is stated explicitly because schemars would derive it from field
+/// optionality and list `id` too — and `id` is inert, present only to satisfy the
+/// macro's base-struct contract, which rejects `Option<GtsInstanceId>`.
 #[gts_type_schema(
     dir_path = "schemas",
     base = true,
     type_id = gts_id!("cf.core.am.tenant_type.v1~"),
     description = "Base tenant type schema for Account Management. Derived tenant type schemas resolve behavioral traits via x-gts-traits. Traits configure system behavior for processing tenants of each type - they are not part of the tenant instance data model.",
-    properties = "id",
+    properties = "id,payload",
     traits_schema = inline(TenantTypeTraits),
     // Inline-only `x-gts-traits` defaults (not in docs/schemas). gts's
     // OP#13 `validate_entity_traits` rejects an `x-gts-traits-schema` with
@@ -400,10 +403,16 @@ pub struct TenantTypeTraits {
     traits = serde_json::json!({ "allowed_parent_types": [], "idp_provisioning": false }),
     gts_abstract = true
 )]
-pub struct TenantTypeEnvelopeV1 {
-    /// Required by the `gts-macros` base-struct contract; envelopes carry
-    /// no instance data.
+#[schemars(extend("required" = ["payload"]))]
+pub struct TenantTypeEnvelopeV1<P> {
+    /// Inert; see the type docs.
     pub id: gts::GtsInstanceId,
+    /// The open container (§4.4.1). Generic like `BaseEventV1<P>` in
+    /// `gts-macros-cli`: a derived Rust struct declared `base = TenantTypeEnvelopeV1`
+    /// is substituted here and the chain type-checks end to end. The emitted schema
+    /// is `{"type": "object"}` whatever `P` is, so JSON-authored derived types
+    /// compose against it too.
+    pub payload: P,
 }
 
 // ---------------------------------------------------------------------------
@@ -439,14 +448,17 @@ pub struct TenantMetadataTraits {
     pub inheritance_policy: MetadataInheritancePolicy,
 }
 
-/// Base tenant-metadata envelope (abstract). See [`TenantTypeEnvelopeV1`]
-/// for the inert-`id` rationale.
+/// Base tenant-metadata envelope (abstract): same shape as
+/// [`TenantTypeEnvelopeV1`], and unlike it this one has validated instances — a
+/// stored metadata value is checked against its derived schema.
+/// `MetadataSchemaRegistry::validate_value` composes the envelope around AM's
+/// stored payload, so the REST contract is unchanged.
 #[gts_type_schema(
     dir_path = "schemas",
     base = true,
     type_id = gts_id!("cf.core.am.tenant_metadata.v1~"),
     description = "Base tenant metadata schema for Account Management. Derived metadata schemas resolve behavioral traits via x-gts-traits. Traits configure how MetadataService treats entries of each schema - they are not part of the metadata payload.",
-    properties = "id",
+    properties = "id,payload",
     traits_schema = inline(TenantMetadataTraits),
     // Inline-only `x-gts-traits` default — see `TenantTypeEnvelopeV1` for
     // the OP#13 rationale. Guarded by
@@ -454,10 +466,13 @@ pub struct TenantMetadataTraits {
     traits = serde_json::json!({ "inheritance_policy": "override_only" }),
     gts_abstract = true
 )]
-pub struct TenantMetadataEnvelopeV1 {
-    /// Required by the `gts-macros` base-struct contract; envelopes carry
-    /// no instance data.
+#[schemars(extend("required" = ["payload"]))]
+pub struct TenantMetadataEnvelopeV1<P> {
+    /// Required by the `gts-macros` base-struct contract; inert, and not
+    /// `required` — see [`TenantTypeEnvelopeV1`].
     pub id: gts::GtsInstanceId,
+    /// The open container (§4.4.1): a metadata value's own fields live here.
+    pub payload: P,
 }
 
 #[cfg(test)]
@@ -730,11 +745,13 @@ mod sync_tests {
 
     #[test]
     fn tenant_type_envelope_trait_contract_matches_docs() {
-        let generated = TenantTypeEnvelopeV1::gts_schema_with_refs();
+        // `()` is the empty container: this asserts the *envelope's* contract, which
+        // is the same whatever a derived type puts in the slot.
+        let generated = TenantTypeEnvelopeV1::<()>::gts_schema_with_refs();
         assert_trait_contract(
             &generated,
             &read_disk_schema("tenant_type.v1.schema.json"),
-            TenantTypeEnvelopeV1::TYPE_ID,
+            TenantTypeEnvelopeV1::<()>::TYPE_ID,
             &serde_json::json!({ "allowed_parent_types": [], "idp_provisioning": false }),
         );
         // `type_id` and the `allowed_parent_types` `x-gts-ref` are separate
@@ -745,7 +762,7 @@ mod sync_tests {
             .pointer("/x-gts-traits-schema/properties/allowed_parent_types/items/x-gts-ref");
         assert_eq!(
             xref.and_then(Value::as_str),
-            Some(TenantTypeEnvelopeV1::TYPE_ID),
+            Some(TenantTypeEnvelopeV1::<()>::TYPE_ID),
             "allowed_parent_types x-gts-ref literal must match the envelope's type_id literal",
         );
     }
@@ -753,9 +770,9 @@ mod sync_tests {
     #[test]
     fn tenant_metadata_envelope_trait_contract_matches_docs() {
         assert_trait_contract(
-            &TenantMetadataEnvelopeV1::gts_schema_with_refs(),
+            &TenantMetadataEnvelopeV1::<()>::gts_schema_with_refs(),
             &read_disk_schema("tenant_metadata.v1.schema.json"),
-            TenantMetadataEnvelopeV1::TYPE_ID,
+            TenantMetadataEnvelopeV1::<()>::TYPE_ID,
             &serde_json::json!({ "inheritance_policy": "override_only" }),
         );
     }

@@ -19,18 +19,21 @@ per-gear push, and a new SDK trait replaces the old one outright.
 Global entities only — no tenant ownership, no `PlatformSecurityContext`, no PDP, no
 federation.
 
-30 tasks in 8 phases with 8 review checkpoints. Twenty-seven are S or M; three are **L** and say
+32 tasks in 8 phases with 8 review checkpoints — 30 planned up front, plus T9a and T24a added
+out of the Checkpoint 1 review (P12/P13). Twenty-nine are S or M; three are **L** and say
 why in their own entry — T25 and T26 (consumer migration across twenty-plus gears) and T28
 (e2e migration across seven files), each split by gear or by file rather than landing as one
 commit. Two tasks exceed the ~5 file guideline, flagged with the reason where they occur.
 
 ## Decisions taken during planning
 
-Eleven decisions were made here rather than in the spec, because all of them are consequences
+Twelve decisions were made here rather than in the spec, because all of them are consequences
 of task ordering or of facts about the runtime that only surface once the work is sliced.
 P1–P5 were taken before implementation started; P6–P10 came out of reviewing Phase 1 on its way
-in, and the spec has been updated to match all five. P11 is a later housekeeping close-out
-(O1 resolved), not a scope decision.
+in, and the spec has been updated to match all five. P12 is a correction: it reverses a change T9
+made to the existing v1 REST contract, and adds T9a and T24a. P13 is a reordering — Instances
+into Phase 1, and `make dylint` per phase instead of per task. (P11 was a housekeeping close-out
+and is retired; the number is not reused.)
 
 ### P1. The spec's §15 build order is replaced by vertical slices
 
@@ -182,7 +185,7 @@ container and filters with `GtsIdPattern`, which is a pure function in `gts-id` 
 identifier string — it never asks the store a semantic question. Exact reads are keyed
 lookups. And D3 already materializes `resolved_schema` / `effective_traits` /
 `effective_traits_schema` on the current-state row. So a read is a `SELECT` plus, for a
-pattern query, `GtsIdPattern::matches` in Rust. Nothing about GTS semantics is
+pattern query, `GtsId::matches_pattern` in Rust. Nothing about GTS semantics is
 reimplemented, so `constraint-gts-implementation` is untouched.
 
 **And the snapshot was not merely unnecessary for reads, it was wrong for them.** SPEC §13
@@ -383,26 +386,99 @@ trip per page, absorbed by the client cache on repeat, complete with respect to 
 rather than to an instant. That is the same trade DESIGN accepts for expansion, but it means
 T25/T26 migrate call sites onto a two-step read rather than a renamed one-step read.
 
-### P11. O1 closed — `gts-rust` 0.12.0 published, the local-checkout patch removed
+### P12. v1 stays intact; the async surface ships as v2 and is promoted at T24a
 
-Housekeeping, not a decision about scope: no task is added or renumbered.
+T9 repointed the two existing v1 routes — `POST /entities` and `GET /entities/{gts_id}` — at the
+database path instead of adding new ones. That contradicts the invariant in the risk table below
+(*"The DB path has no consumer until T24; no dual-write"*), and it costs more than a red e2e
+suite:
 
-T1 consumed 0.12.0 from `~/dev/gts-rust` via `[patch.crates-io]` because the crate wasn't
-published yet, and every plan doc tracked that as O1 — a merge blocker. On 2026-08-18 the
-crates went live on crates.io (`gts`, `gts-id`, `gts-macros`, all `0.12.0`, confirmed
-against the crates.io API), so O1's precondition is met and it closes.
+* the `POST` body shape changed and gained a required `Idempotency-Key`, so existing callers
+  get `400`/`422` — not the status-code break T28 was scoped for;
+* `testing/e2e/gears/oagw/helpers.py` and `testing/e2e/gears/account_management/conftest.py`
+  register over REST and then resolve through `TypesRegistryClient`, so both gears write to the
+  database and read from process memory. That is a functional cross-gear regression, and no e2e
+  edit repairs it — only T24 does;
+* `GET /entities` (list, memory) and `GET /entities/{entity_key}` (database) gave one resource two
+  sources of truth.
 
-Closing it out: the `[patch.crates-io]` block and its `DO NOT MERGE` comment are deleted
-from `Cargo.toml`; the three `"0.12.0"` requirements are untouched, since they already
-named the target version rather than the local checkout's declared one (SPEC §7 explains
-why that mattered). `Cargo.lock` was re-resolved (`cargo update -p gts -p gts-id -p
-gts-macros`) and now carries a registry `source` and checksum for all three instead of a
-path override — it is committable for the first time on this branch.
+So the surface becomes **additive**: v1 is restored verbatim from `main` and keeps serving the
+in-memory store, while T9's async surface moves to `/types-registry/v2/` (T9a). The two stores
+stay unreconciled — no dual-write, no fallback read — which is P6 enforced rather than merely
+intended: with a fallback, an admission that never happened would read as success.
 
-Re-verified against the published crate rather than assumed unchanged: `cargo check
---workspace` clean, `cargo test -p cf-gears-types-registry` 209 passed / 0 failed (T1's
-208 + the 6 `gts_012_semantics_tests.rs` tests), `make gts-docs` 798 files / 0 errors.
-Full detail in [`t1-gts-0.12.0-upgrade-report.md`](./t1-gts-0.12.0-upgrade-report.md) §6.
+**v2 is interim, and its retirement is planned rather than assumed.** T24 deletes the in-memory
+repository, so the v1 routes reading it are deleted in that same task, and **T24a** promotes v2
+onto the v1 paths. Recommended Phase 7 order is **T24 → T27 → T24a → T28**: T27 authors the
+remaining routes once, on v2, and the rename happens after them; T25/T26 float, since they depend
+on T24 alone.
+
+**What this buys, concretely.** `make e2e-local` stays green from here to T24 with no e2e file
+edited, and the red window shrinks from ~19 tasks to the T24–T28 stretch, where the wire break is
+real and unavoidable. What it does *not* buy is an earlier cutover: the SDK and every consumer
+stay on the in-memory store until T24, which is P6's design and not a gap. The earliest honest
+cutover needs Instances (T10), revisions (T11), reference and derivation edges (T13) and
+dependency-aware batching (T19) — without them the first `register` from `oagw` or
+`account-management` fails, since both push batches of derived schemas and instances.
+
+### P13. Instances move into Phase 1; `make dylint` runs per phase, not per task
+
+Two ordering changes, taken after Checkpoint 1's report.
+
+**T10 moves from Phase 2 into Phase 1.** Instances are not a widening of the path — they are
+what the platform pushes today. P4 counts *"roughly eleven plugin gears"* already registering
+their well-known Instances from their own `init()`, so Instance support is on the critical path
+to T24 and is the longest pole in it. T9's surface also accepts an Instance and then fails it in
+the **worker** (`StoreBuildError::UnsupportedKind` → `WorkerError::StoreBuild` → opaque `500`, a
+retryable class for a final decision); building the feature closes that hole rather than adding a
+refusal for it, so no separate task is needed.
+
+The move drags in three companions, listed in T10's own entry. The one worth naming here is the
+**identifier-derived closure**, because it corrects a claim Phase 1 committed to code:
+`DependencyRepo::closure` walks the `dependency` table only, so nothing until T13 could reach a
+candidate's base — and `admission_worker_test.rs` asserts a derived Type Schema *fails*, blaming
+T13's missing edges. That is half right. `GtsId::chain_ids()` and `get_type_id()` are pure
+functions of the identifier, so a derivation base — and an Instance's conforming type — need no
+edge table at all. Seeding the closure worklist with the chain as well as the edges is what makes
+T10 cheap, and it admits derived Type Schemas in Phase 1 as a side effect. T13 keeps what is
+genuinely edge-derived: `$ref` and `x-gts-ref` targets, and T14's reverse walk.
+
+Phase 1 therefore delivers one global entity **of each kind**, and Phase 2 becomes revisions and
+concurrency. T12's *kind* rule moves with T10 — a Type Schema `…ns.thing.v1~` and an Instance
+`…ns.thing.v1` derive the same `family_key` — while shape and contiguity stay in T12.
+
+**`make dylint` moves from per-task verification to the phase checkpoint.** It builds the whole
+workspace, so per task it is the most expensive check on the list and the one that gets skipped;
+per phase it is cheap enough to actually run. The exposure is bounded — phases 2 through 7 are two
+to four tasks each.
+
+**The per-task standing bar had to move with it.** `todo.md` required *"`make ci` green"* of every
+task, and `make ci` ends in `dylint` (`Makefile:907`) — so the old bar cancelled this decision on
+the line above it, which is why T1–T9 each recorded `make ci` as *partial*. The bar is now
+`make fmt`, `make clippy` and gear tests per task; the full `make ci` — `dylint`, `deny`,
+`lychee`, `gts-docs` and four container targets — is a checkpoint gate. Bare `make ci` lines are
+gone from individual tasks, and where one carried something specific (`lychee` on the two
+documentation tasks) that check stayed and only `ci` went.
+
+**And `make test-db` was never the right command for this gear.** It runs `cf-gears-toolkit-db`'s
+own suite and never builds `cf-gears-types-registry` — a task could satisfy that line without
+executing one line of the gear, which T2, T4, T5, T7 and T8 each noticed separately. The two
+container suites now have a target of their own, `make test-types-registry-db` (`Makefile:516`),
+in `make ci` beside `test-users-info-pg` and `test-usage-collector-pg`. `todo.md`'s Commands
+section is the single definition; the tasks say *gear tests* and point at it.
+
+The counter-evidence is real, and is why this is a decision rather than a convenience: the first
+run happened at Checkpoint 1 with 26 violations standing across T1–T9, in three families
+(DE0708, DE1302, DE0301). A phase is a far shorter accumulation window than nine tasks, and
+layering violations are cheap to fix in bulk because they are mechanical.
+
+**The per-task records go with the requirement.** T1–T9 each carried a `make dylint` line
+recording that it had not run; with no per-task requirement there is nothing for those lines to
+record, so they are removed rather than left standing as unmet criteria. Nothing observed is lost:
+the workspace-wide run at Checkpoint 1 covers every one of those tasks, and it is where the
+findings are recorded. Checkpoint 0's gate is ticked from that same run — Phase 0 is one task and
+the run included its changes. Phase 1's run covers T1–T9 only, so Checkpoint 1 carries an explicit
+**re-run** item for T9a and T10.
 
 ## Dependency graph
 
@@ -415,13 +491,17 @@ T6 config ───────────────────────�
                                                                    │
                                                         T9 REST: POST, GET op, GET entity
                                                                    │
-                     ┌─────────────────────────────────────────────┤
-                     ▼                                             ▼
-        T10 instances                                  T11 revisions + CAS
-                     │                                             │
-                     └──────────────► T12 family rules ◄───────────┘
+                              T9a v1 restored; async surface on /v2/ (P12)
+                                                                   │
+                              T10 instances + chain-derived closure; family kind (P13)
+                                                                   │
+                              ─── Checkpoint 1 ───
+                                                                   │
+                                                        T11 revisions + CAS
+                                                                   │
+                                          T12 family shape + contiguity
                                              │
-                              T13 dependency edges
+                              T13 dependency edges ($ref / x-gts-ref only)
                                              │
                      ┌───────────────────────┼───────────────────────┐
                      ▼                       ▼                       ▼
@@ -451,6 +531,8 @@ T6 config ───────────────────────�
                    ▼
         T27 REST completion + OpenAPI + QUICKSTART
                    │
+        T24a retire v1; promote v2 → v1 (P12)
+                   │
         T28 e2e suites move to submit-then-poll
 
         T29 validators + conditional reads (needs T23 + T27)
@@ -464,11 +546,11 @@ exists. From T7 onward the graph is vertical.
 ## Task index
 
 ### Phase 0 — Upgrade (fail fast)
-- T1: Upgrade to `gts-rust` 0.12.0 via `[patch.crates-io]`, re-validate all declared identifiers
+- T1: Upgrade to `gts-rust` 0.12.0, re-validate all declared identifiers
 
 **Checkpoint 0**
 
-### Phase 1 — One global Type Schema, persisted, async, end to end (fixtures only)
+### Phase 1 — One global entity of each kind, persisted, async, end to end (fixtures only)
 - T2: Migration for the 9 tables
 - T3: SeaORM entities for the core six
 - T4: Repositories on `DBRunner`
@@ -476,12 +558,13 @@ exists. From T7 onward the graph is vertical.
 - T6: Typed configuration
 - T7: Acceptance path and operation records
 - T8: Admission worker — one dependency-free candidate
-- T9: REST — `POST /entities`, `GET /operations/{id}`, `GET /entities/{key}`
+- T9: REST — `POST /entities`, `GET /operations/{id}`, `GET /entities/{entity_key}`
+- T9a: Restore the v1 contract; the async surface moves to `/types-registry/v2/` (P12)
+- T10: Registered Instances — **moved here from Phase 2** (P13)
 
 **Checkpoint 1** ← proves the architecture
 
-### Phase 2 — Instances, revisions, concurrency
-- T10: Registered Instances
+### Phase 2 — Revisions and concurrency
 - T11: Content revisions and compare-and-swap
 - T12: Version-family kind, shape and contiguity rules
 
@@ -516,6 +599,7 @@ exists. From T7 onward the graph is vertical.
 
 ### Phase 7 — Cutover and migration
 - T24: **Cutover** — registry seeds only what it owns; ready mode and in-memory repository out
+- T24a: Retire v1; promote v2 → v1 (P12) — lands after T27, before T28
 - T25: Migrate system gears and plugins onto the new trait
 - T26: Migrate domain gears; delete the old trait
 - T27: REST completion, OpenAPI, QUICKSTART
@@ -527,7 +611,9 @@ exists. From T7 onward the graph is vertical.
 
 ## Checkpoints
 
-Each checkpoint is a human review gate. Do not proceed past a failing one.
+Each checkpoint is a human review gate. Do not proceed past a failing one. **Every checkpoint
+runs `make dylint` over the full workspace** — per phase rather than per task (P13); Checkpoint 0
+is left as recorded, with T1's documented exception.
 
 **Checkpoint 0** — `make ci` green; every declared GTS identifier still admits under
 0.12.0; every difference in generated schema documents accounted for. This gate protects
@@ -535,11 +621,15 @@ other gears, so it is reviewed before any registry code is written.
 
 **Checkpoint 1** — a fixture Type Schema registers over REST, the operation reaches
 `completed`, the entity and its resolved artifacts are readable, and both survive a process
-restart. Consumers are untouched: the old trait is still served from its existing in-memory
+restart. **The new surface is additive (T9a, P12): v1 is intact, `make e2e-local` is green and no
+e2e file was edited.** An Instance registers against a Type Schema committed by an earlier
+operation, and a derived Type Schema admits against a committed base with the `dependency` table
+empty (T10, P13). Consumers are untouched: the old trait is still served from its existing in-memory
 repository, while the new path reads from the database and holds no store between admissions
-(P6). `make test-db` green on three backends. This checkpoint proves the architecture.
+(P6). `make test-db` green on three backends, and `make dylint` re-run after T9a and T10 — the
+recorded run covers T1–T9 only (P13). This checkpoint proves the architecture.
 
-**Checkpoint 2** — Instances register; equal content reports `unchanged` without a revision;
+**Checkpoint 2** — equal content reports `unchanged` without a revision;
 a stale `expected_resource_version` fails `precondition_failed`; family shape and contiguity
 refusals hold under concurrency.
 
@@ -561,8 +651,9 @@ reconciliation helper work against a mock consumer. Nothing has been cut over ye
 **Checkpoint 7** — every gear reconciles its own declarations and gates its own readiness;
 the platform boots; the old trait is gone and no consumer references it. The SDK client cache
 is in place on the new models, with its window, byte bound and `fresh` bypass (P7) — P0 does
-not finish with an uncached read path. All 15 success criteria of SPEC §16; `make ci`,
-`make test-db`, `make e2e-local`, `make dylint` green; O1 resolved (P11).
+not finish with an uncached read path. **One REST version: no `/v2/` path survives, and the
+in-memory repository and its routes are gone (T24a, P12).** All 15 success criteria of SPEC §16;
+`make ci`, `make test-db`, `make e2e-local`, `make dylint` green.
 
 ## Risks and mitigations
 
@@ -571,17 +662,16 @@ not finish with an uncached read path. All 15 success criteria of SPEC §16; `ma
 | 0.12.0 semantics reject a currently-admitted schema in another gear | **High** — breaks unrelated gears | T1 is first and is its own commit; full re-validation sweep before any registry code |
 | Pull→push cutover regresses platform boot | **High** — every gear now gates on its own registration | T24 lands after the helper is proven against a mock (Checkpoint 6); migration split across T25/T26 by gear group; each verified by booting the example server |
 | Removing the old trait breaks ~50 call sites in 20+ gears | **High** | Split by gear group; new trait exists and is tested (T23) before the first consumer moves; `cargo test --workspace` gates each migration task |
-| `[patch.crates-io]` on an absolute local path | **High** — CI cannot build, `Cargo.lock` poisoned | **Resolved 2026-08-18 (P11):** never committed with the patch in place; O1 closed by publishing `gts` 0.12.0 to crates.io and deleting the patch |
 | A gear's registration fails at startup and it gates readiness on it | Medium | This is DESIGN-intended (*"Each gear gates only its own readiness"*), but it is a real behavioural change; the SDK helper retries, and failures name the gear and identifier |
-| Dual path (in-memory + DB) live through phases 1–5 | Medium | The DB path has no consumer until T24; no dual-write, no reconciliation between them. P6 keeps them from converging by accident: the new path holds no persistent store, so there is no second copy of entity state that could drift from the old repository |
+| Dual path (in-memory + DB) live through phases 1–5 | Medium | The DB path has no consumer until T24; no dual-write, no reconciliation between them. P6 keeps them from converging by accident: the new path holds no persistent store, so there is no second copy of entity state that could drift from the old repository. **This was breached by T9 and repaired by T9a (P12):** repointing the v1 routes made the DB path consumer-visible ~19 tasks early, and `oagw` / `account-management` were then registering into the database while resolving from memory. The mitigation is now structural — v1 and v2 are separate routes over separate stores, and the criterion "no route straddles the two stores" is grep-checkable |
 | Read latency regresses at T24, when reads move from memory to the database | Medium | Correctness first, then the cache: D3 already materializes what a read returns, so a read is one keyed `SELECT`, and T30 restores caching with DESIGN's contract (P7). The exposure is the T24–T28 window, which is why Checkpoint 7 gates on T30 |
 | A cached entry can be stale inside its freshness window | Low | DESIGN §3.3's sanctioned trade, and now bounded further: T29's validators let T30 revalidate rather than guess, `fresh` gives an authoritative read, `0s` disables the window, and invalidation is immediate on an observed terminal outcome |
 | The validator field reaches the SDK models after consumers have migrated | **High** — a second migration across 20+ gears | T23 carries the field from the start, before T25/T26 move any consumer; T29 only fills it in (P9) |
 | A materialized `effective_*` value differs from the deleted client-side computation | Medium — reads as a regression, invites a "fix" back to the old wrong answer | 12 call sites in `account-management`, `resource-group`, `credstore` consume those methods today. The old ones resolved only the parent `$ref` and approximated trait defaults (`TODO(#1723)`), so `gts-rust` is authoritative; T25/T26 carry an explicit criterion to accept the new value, and SPEC §13 pins the outside-the-chain `$ref` case as a test |
 | Content-free discovery turns one-step list reads into list + `batchGet` at ~87 call sites | Medium | The SDK helpers hydrate internally, so call shapes survive (P10); the client cache absorbs the second trip; T23 fixes the helper shape before T25/T26 touch a consumer |
-| `GET /entities` shape change reaches e2e alongside the `POST` break | Medium | Both are the same migration in T28, behind the one shared helper it already owns; the route's declared stability is `unstable` |
+| `GET /entities` shape change reaches e2e alongside the `POST` break | Medium | Both are the same migration in T28, behind the one shared helper it already owns; the route's declared stability is `unstable`. Under P12 both arrive at the same moment by construction: T24 deletes old v1, T24a promotes the whole async surface at once |
 | Concurrency protocol wrong under the least-tested backend (MySQL) | Medium | `make test-db` on all three at every checkpoint |
-| The `POST /entities` 202 break reaches other gears' e2e suites | Medium | Confirmed surface: 6 types-registry e2e files (~95 references to `/entities`) plus `account_management/conftest.py`, whose registration helper is another suite's setup. T28 owns the migration behind one shared polling helper, not open-coded loops |
+| The `POST /entities` 202 break reaches other gears' e2e suites | Medium | Confirmed surface: 6 types-registry e2e files (~95 references to `/entities`) plus `account_management/conftest.py` and — **missed until P12** — `oagw/helpers.py`, which registers a batch of schemas *and* instances and reads them back through the list route. T28 owns the migration behind one shared polling helper, not open-coded loops. The break itself no longer arrives at T9: T9a keeps v1 intact, so the suite goes red at T24 and green at T28 rather than being red for ~19 tasks |
 | Activation write set exceeds the measured 27 in a future deployment | Low | Configured bound 512, refuses rather than partially commits (T14) |
 
 ## Parallelization
@@ -589,28 +679,7 @@ not finish with an uncached read path. All 15 success criteria of SPEC §16; `ma
 - **Parallel:** T16 with T14/T15. T22 with T21. T25 and T26 are independent gear groups once
   T24 lands. T30 with T27/T28 — it needs the new models (T26) and the database read path
   (T24), and nothing in the REST or e2e tasks touches the client cache.
-- **Sequential:** T2→T5 (foundation), T7→T8, T13→T14→T15, T22→T23→T24.
+- **Sequential:** T2→T5 (foundation), T7→T8, T13→T14→T15, T22→T23→T24, and in Phase 7
+  T24→T27→T24a→T28 (P12) — the promotion sits between the last new route and the e2e migration.
 - **Contract first, then parallel:** T23's trait shape is fixed by SPEC §10.1, so it can
   start as soon as Checkpoint 4 passes.
-
-## Open questions
-
-- **O1** — publish `gts` 0.12.0. Blocks merge, not development (T1 uses the patch).
-- **O2** — `principal_id` constant value. Needed by T7; spec recommends a deterministic
-  UUIDv5 from `"types-registry.p0.principal"`.
-- **O4** — ADR-0015 quarantine preflight as a migration-time assertion. Needed by T18.
-
-**Pre-existing finding, not P0 scope.** `testing/e2e/gears/resource_group/conftest.py::create_type` posts to `/types-registry/v1/types` expecting `201`, but types-registry registers no `/types` route — only `/entities`. The fixture is referenced 36 times in that suite, so either those tests are skipped or already failing. Worth reporting to the resource-group owners; this plan does not take it on, and T28 does not touch it.
-
-Closed in review: no new ADRs for P0 (the no-PDP deviation is SPEC §9 C6, the wire break is
-§10.2); registration moves to push in P0 (P4), which retires O3 and ceiling C3; the old SDK
-trait is removed in P0 rather than deprecated (P5), which supersedes SPEC D6; the persistent
-`ArcSwap` snapshot is replaced by a transient per-unit store with reads from the database
-(P6), which rewrites SPEC D2 and §8.2 and retires ceilings C1 and C4; the SDK client cache
-DESIGN requires is kept rather than deleted (P7), which adds SPEC §8.3, ceiling C7 and T30; the
-P0 REST surface and SDK **are** the platform-plane API for global entities, with the plane
-contract-deep rather than transport-deep (P8), which rewrites SPEC §8.4 and adds ceiling C8;
-freshness validators and conditional reads are **in** P0 (P9), because the inputs a platform
-read needs all exist — which adds SPEC §8.5 and T29, and shrinks C7; discovery becomes a
-bounded content-free page with a cursor (P10), which adds SPEC D12 and rewrites §10.2, while
-arbitrary `$select` and `expand_type_filter` stay out with corrected reasons.

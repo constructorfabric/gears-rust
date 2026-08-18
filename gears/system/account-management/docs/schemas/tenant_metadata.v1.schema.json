@@ -3,6 +3,22 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "description": "Base tenant metadata schema for Account Management. Derived metadata schemas resolve behavioral traits via x-gts-traits. Traits configure how MetadataService treats entries of each schema - they are not part of the metadata payload.",
   "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "description": "Inert: present only to satisfy the gts-macros base-struct contract. Not required.",
+      "type": "string",
+      "format": "gts-instance-id"
+    },
+    "payload": {
+      "description": "A metadata value's own fields live here (GTS spec 4.4.1 designated open container).",
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "payload"
+  ],
   "x-gts-abstract": true,
   "x-gts-traits-schema": {
     "type": "object",
@@ -11,7 +27,10 @@
       "inheritance_policy": {
         "description": "How MetadataService resolves values across the tenant hierarchy for this schema, per MetadataInheritancePolicy. 'override_only' (MetadataInheritancePolicy::OverrideOnly) returns the tenant's own entry or empty; 'inherit' (MetadataInheritancePolicy::Inherit) walks ancestors via parent_id, includes the nearest self-managed ancestor, then stops.",
         "type": "string",
-        "enum": ["override_only", "inherit"],
+        "enum": [
+          "override_only",
+          "inherit"
+        ],
         "default": "override_only"
       }
     }

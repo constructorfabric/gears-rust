@@ -336,6 +336,11 @@ gears:
           parent_id: "00000000-0000-0000-0000-000000000005"
           status: active
 
+  types-registry:
+    database:
+      server: "sqlite_users"
+      file: "types_registry.db"
+
   credstore:
     database:
       server: "sqlite_users"

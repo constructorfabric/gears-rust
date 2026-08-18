@@ -3,6 +3,22 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "description": "Base tenant type schema for Account Management. Derived tenant type schemas resolve behavioral traits via x-gts-traits. Traits configure system behavior for processing tenants of each type - they are not part of the tenant instance data model.",
   "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "description": "Inert: present only to satisfy the gts-macros base-struct contract. Not required.",
+      "type": "string",
+      "format": "gts-instance-id"
+    },
+    "payload": {
+      "description": "Derived tenant types describe their content here (GTS spec 4.4.1 designated open container).",
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "payload"
+  ],
   "x-gts-abstract": true,
   "x-gts-traits-schema": {
     "type": "object",
@@ -11,7 +27,10 @@
       "allowed_parent_types": {
         "description": "GTS instance identifiers of tenant types allowed as parent. Empty array means the type is root-only or leaf-only. The root tenant type has allowed_parent_types: [] by convention.",
         "type": "array",
-        "items": { "type": "string", "x-gts-ref": "gts.cf.core.am.tenant_type.v1~" },
+        "items": {
+          "type": "string",
+          "x-gts-ref": "gts.cf.core.am.tenant_type.v1~"
+        },
         "default": []
       },
       "idp_provisioning": {

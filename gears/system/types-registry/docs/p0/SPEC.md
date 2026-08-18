@@ -92,7 +92,7 @@ correctness core, not scope.
 | D5 | **Reverse impact by iterative worklist over direct edges**, not a recursive CTE | Plain indexed `WHERE to_entity_id = ?` + visited set + fingerprint-stability early stop. Portable across three backends with no `sea-query` CTE work |
 | D6 | **The old `TypesRegistryClient` is removed in P0**; every consumer migrates inside this effort | ~50 call sites across 20+ gears move. Forced by two facts: async admission makes the old synchronous `register()` a lie in its own signature, and the old models' `Arc`-linked object graphs cannot cross a wire, so keeping them keeps an out-of-process blocker. Migration is split by gear group — see `plan.md` P5 |
 | D7 | `operation.plane = 1` (platform), `tenant_id = NULL`, `principal_id` a hardcoded constant with a `TODO` | Idempotency scope becomes global — see §9 ceiling C2 |
-| D8 | **Consumed `gts-rust` from the local checkout via `[patch.crates-io]` until it was published** | Unblocked slice 0 without waiting for a release. **Resolved 2026-08-18**: 0.12.0 published to crates.io, patch removed — see §7 |
+| D8 | **`gts`, `gts-id` and `gts-macros` are pinned at 0.12.0 and move together** | A split pin puts the identifier crate and the semantics crate on different specifications. `gts-dylint` / `gts-macros-cli` must not lag either — see §7 |
 | D9 | **Use `toolkit-db/preview-outbox`** | Closes DESIGN §4's outbox sign-off for this gear |
 | D10 | **`POST /entities` breaks**: `200` + results becomes `202` + operation | No compatibility path on that route. The gear's REST stability is `unstable`; the break is called out in the changelog |
 | D11 | **Registration moves from registry-side pull to per-gear push** | A gear's code must not depend on whether it runs in-process; pull silently loses the types of an out-of-process gear. types-registry seeds only what it owns; every other gear reconciles its own through one SDK helper that owns batching, idempotency and retry. Requires `owning_gear` on the inventory records. See `plan.md` P4 |
@@ -109,10 +109,12 @@ record how.
 transaction-size/timeout profile for that atomic write or a generation/staging protocol
 … 'short transaction' alone is not a bound."*
 
-Measured over the current repository — 202 distinct declared chained GTS identifiers —
-the largest reverse-impact set of any base type is **27** (`gts.cf.core.events.event_type.v1~`;
-next: `topic.v1~` 21, `event.v1~` 18, `errors.err.v1~` 14). A revision of the hottest
-base type in the platform therefore refreshes ≤ 28 `type_schema` rows in one transaction.
+Measured over every chained GTS identifier declared in the repository, the largest
+reverse-impact set of any base type is **27** (`gts.cf.core.events.event_type.v1~`; next:
+`topic.v1~` 21, `event.v1~` 18, `errors.err.v1~` 14). A revision of the hottest base type in
+the platform therefore refreshes ≤ 28 `type_schema` rows in one transaction. The bound below
+is set against **27**, not against the size of the declared population — a re-count of the
+latter does not move it.
 
 **P0 profile: single transaction, no staging.** Configured bound
 `limits.activation_write_set` = **512** rows; exceeding it fails the candidate with a
@@ -126,8 +128,8 @@ the worklist carries no depth. `database.sql` already sanctions the early stop:
 *"The traversal reaches the subject anyway, recomputes it, finds an identical digest,
 and stops there."*
 
-Still open and inherited: the `toolkit-db/preview-outbox` sign-off, worker liveness
-bounds, and the ADR-0015 quarantine preflight (§11).
+Still open and inherited: the `toolkit-db/preview-outbox` sign-off and worker liveness
+bounds. The ADR-0015 quarantine preflight is **satisfied by construction** — see §17, O4.
 
 ---
 
@@ -184,7 +186,7 @@ request against `gts-rust`, not a local approximation."* **0.12.0 supplies all t
 so the upgrade is a scope item of this task rather than a follow-up, and no deviation
 has to be recorded.
 
-Verified against `/Users/vasily/dev/gts-rust` at `f65bf62`:
+Verified against `gts-rust` 0.12.0:
 
 | DESIGN §4 prerequisite | 0.11.0 | 0.12.0 |
 |---|---|---|
@@ -238,20 +240,17 @@ const values"*, *"fix(macros): Preserve explicit additional properties models"*,
 
 Two of these reach beyond Types Registry. The macro fix changes generated schema
 documents, so `#[gts_type_schema]` output may differ; the traits fix changes what
-`x-gts-traits` materializes. **All 202 declared GTS identifiers in the repository must be
-re-validated under 0.12.0 before the upgrade lands** — this is slice 0, and it is the
-one slice whose failure mode is other gears rather than this one. The `gts-id` v0 fix
+`x-gts-traits` materializes. **Every declared GTS identifier in the repository must be
+re-validated under 0.12.0 before the upgrade lands** — this is T1, and it is the one task
+whose failure mode is other gears rather than this one. The `gts-id` v0 fix
 works in our favour: it makes the ADR-0015 major-0 quarantine (§8.1 step 7) exact.
 
 `gts`, `gts-id` and `gts-macros` move together — the workspace pins all three, and
 `gts-dylint` / `gts-macros-cli` must not lag.
 
-### Sourcing it (D8) — resolved, O1 closed
+### Sourcing it (D8)
 
-**Status: closed 2026-08-18.** `gts`, `gts-id` and `gts-macros` 0.12.0 are published on
-crates.io (verified live against the crates.io API), and the `[patch.crates-io]` override
-described below has been deleted. The workspace requirements were already `0.12.0`, so
-they resolve unchanged, this time from the registry:
+The workspace pins all three crates from crates.io:
 
 ```toml
 # Cargo.toml
@@ -260,36 +259,15 @@ gts        = "0.12.0"
 gts-macros = "0.12.0"
 ```
 
-This section is kept, past tense, because the lesson it recorded is not obsolete just
-because the crate shipped — the next time a workspace patches a crate ahead of its
-release, the same trap is waiting.
-
-**What the section used to say, and why it mattered while the patch existed.** Before
-publication, the three crates were consumed directly from `~/dev/gts-rust` through
-`[patch.crates-io]`, with the requirements deliberately pinned at `0.12.0` rather than
-`0.11.0`. An earlier revision of this section had them at `0.11.0`, on the argument that
-the local crates declared `0.11.0` too, so nothing needed editing. That held only until
-the local checkout bumped its own version: at that point the patch stopped satisfying a
-`0.11.0` requirement, and cargo's response to a patch it cannot use is not an error — it
-recorded three `[[patch.unused]]` entries and silently resolved `gts` from the *published*
-0.11.0 instead. The build was back on the old semantics with nothing failing except a
-compile error in the one place that used a 0.12.0-only API. Pinning the requirements to
-the *target* version rather than to whatever the local checkout happened to declare made
-the patch load-bearing: no published version could satisfy it, so deleting it prematurely
-would have failed resolution loudly instead of downgrading quietly.
-
-**Verification run on the switch to the published crate** (workspace unaffected by the
-patch removal beyond the dependency source):
+**Verification of the upgrade:**
 
 | Check | Result |
 |---|---|
 | `cargo check --workspace` | clean, no errors |
-| `cargo test -p cf-gears-types-registry` | 209 passed, 0 failed (T1's baseline was 208 + the 6 `gts_012_semantics_tests.rs` tests; consistent) |
-| `cargo test --workspace` | **10260 passed, 0 failed, 611 ignored** (most ignores need Docker/testcontainers). Population differs from T1's 10213 passed / 368 skipped — this run includes doc-tests — but the number that matters, failures, is 0 either way |
+| `cargo test -p cf-gears-types-registry` | 209 passed, 0 failed |
+| `cargo test --workspace` | **10260 passed, 0 failed, 611 ignored** (most ignores need Docker/testcontainers) |
 | `make gts-docs` | 798 files, 0 errors |
-| `Cargo.lock` | `gts`, `gts-id`, `gts-macros` now carry `source = "registry+…"` and a checksum; `num-cmp` (the transitive dependency 0.12.0 introduced, noted in the T1 report) is still present, now sourced from the published `gts`'s own manifest |
-
-Full addendum: [`t1-gts-0.12.0-upgrade-report.md`](./t1-gts-0.12.0-upgrade-report.md) §6.
+| `Cargo.lock` | `num-cmp` is the one transitive dependency 0.12.0 introduces |
 
 Toolchain is not a problem: `gts-rust` requires 1.95.0 and this workspace is already on
 1.97.0 with `rust-version = "1.95.0"`. (CLAUDE.md's "minimum toolchain 1.92.0" is stale.)
@@ -400,9 +378,8 @@ the predicted outcome in a separate short transaction.
 
 **Reads are served from the database.** Nothing persistent lives in process memory.
 
-This is not the obvious choice, so here is what it rests on. Two questions were conflated
-in an earlier draft of this section: *what needs a `GtsStore`* and *what needs entity
-rows*. They have different answers.
+This is not the obvious choice, and it rests on separating two questions that look like
+one: *what needs a `GtsStore`* and *what needs entity rows*. They have different answers.
 
 A `GtsStore` is needed only where GTS semantics are computed over a set of related
 documents — `resolve_schema_refs`, `compare_documents`, derivation-chain validation,
@@ -415,7 +392,7 @@ string — the current `InMemoryGtsRepository::list` iterates the store purely a
 container and filters with `GtsIdPattern`, never asking the store a semantic question. And
 by D3 the effective artifacts a reader wants (`resolved_schema`, `effective_traits`,
 `effective_traits_schema`) are already materialized on the current-state row. So a read is
-a `SELECT` plus, for a pattern query, `GtsIdPattern::matches` over the candidate rows in
+a `SELECT` plus, for a pattern query, `GtsId::matches_pattern` over the candidate rows in
 Rust. No GTS semantics are reimplemented, so `constraint-gts-implementation` is not
 touched.
 
@@ -465,27 +442,19 @@ barrier conflicts with `constraint-boot-path`.
 
 ### 8.3 The SDK client cache stays
 
-An earlier revision of this spec removed the `local_client` caches
-(`local_client.cache.type_schemas` / `.instances`) and kept their config keys as
-accepted-and-ignored. **That is reversed.** DESIGN requires a client cache —
-`cpt-cf-types-registry-fr-client-cache`, *"bounded per-client representation cache with
-batched conditional revalidation and fail-closed expiry handling"* — and the removal rested
-on two claims that do not survive contact with DESIGN §3.3.
+DESIGN requires a client cache — `cpt-cf-types-registry-fr-client-cache`, *"bounded
+per-client representation cache with batched conditional revalidation and fail-closed
+expiry handling"* — and under D2 it earns its keep: a read is now a database round trip,
+not a memory read, so the cache buys what it costs elsewhere.
 
-The first was ours to begin with and expired with D2: *"an LRU in front of an in-memory
-snapshot is pure overhead plus a staleness window."* True while reads came from a
-process-local snapshot; meaningless once reads are a database round trip, where a cache
-buys exactly what it costs elsewhere.
-
-The second was simply wrong. It read a bounded window as a correctness violation, but
+Its bounded staleness window is sanctioned, not a correctness violation.
 `cpt-cf-types-registry-nfr-cache-correctness` is *"no invalidated result accepted as
 current after the client observes the mutation"*, and DESIGN §3.3 draws the line
 explicitly: *"a remote mutation not yet observed may produce a stale snapshot within the
-bounded window but is not described as an invalidated entry accepted as current."* Bounded
-staleness is the sanctioned trade, not the bug. It is also a different NFR from
-`nfr-multi-pod-correctness`, which constrains the **registry's** own reads — *"no
-process-local authority"* — and is satisfied by D2. Conflating a client's freshness window
-with registry-side authority is what produced the wrong conclusion.
+bounded window but is not described as an invalidated entry accepted as current."* That is
+also a different NFR from `nfr-multi-pod-correctness`, which constrains the **registry's**
+own reads — *"no process-local authority"* — and is satisfied by D2. A client's freshness
+window and registry-side authority are not the same property.
 
 What P0 builds is DESIGN's cache minus what needs inputs P0 does not have:
 
@@ -626,10 +595,9 @@ the SDK (D6) also removes an OoP blocker.
 
 ### 8.5 Freshness validators and conditional reads
 
-An earlier revision put *"freshness validators, `ETag` / `If-None-Match`, conditional reads"*
-out of scope because they *"need the validator inputs tenancy supplies."* **They are in P0**,
-and that reason was a misreading of DESIGN §3.3's own input table
-(`cpt-cf-types-registry-tech-freshness-validator`):
+**Validators, `ETag` / `If-None-Match` and conditional reads are in P0.** They look like they
+need the inputs tenancy supplies; DESIGN §3.3's own input table
+(`cpt-cf-types-registry-tech-freshness-validator`) says otherwise:
 
 | Validator input | Managed | Applies to a P0 read |
 |---|---|---|
@@ -713,22 +681,19 @@ Migration notes:
 
 ### Declared ceilings
 
-The two compatibility ceilings of the previous revision of this spec are **gone**:
-`gts-rust` 0.12.0 supplies the tri-state verdict and the content-model classification,
-so P0 honours `principle-fail-closed` for compatibility rather than deviating from it
-(§7).
+There is no compatibility ceiling: `gts-rust` 0.12.0 supplies the tri-state verdict and
+the content-model classification, so P0 honours `principle-fail-closed` for compatibility
+rather than deviating from it (§7).
 
-Two memory ceilings are also gone, and for a better reason than deferral: D2 holds no
-store between admission units and serves reads from the database, so neither bound exists
-to be raised later. The rows are struck rather than deleted, because both were quoted in
-review and their absence is the point.
+C1, C3 and C4 are **struck** — resolved in P0 rather than deferred. The rows are kept
+because other documents cite the numbers.
 
 | # | Ceiling | Upgrade path |
 |---|---|---|
-| C1 | *(struck by D2 — kept for the record.)* Whole entity set is held in process memory; entity count becomes a memory bound. DESIGN bounds document size but not entity count | Resolved in P0: the store is transient per admission unit and bounded by the unit's dependency closure, not by the entity count (§8.2) |
-| C2 | `idempotency_scope_hash` digests three constants, so the key namespace is **global**: two unrelated callers reusing one key collide with `409` | Real scope arrives with planes and principals (O2) |
-| C3 | *(struck by D11 — kept for the record.)* **The inventory pull model was in-process-only** (§8.4), and `owning_gear` was to be written as the constant `"types-registry"` because `InventoryTypeSchema` / `InventoryInstance` carry no gear name. DESIGN sanctions the default: *"`toolkit-gts` base types default to `types-registry` ownership… `owning_gear` is mutable across revisions"*. Out-of-process gears are **blocked** by this, not merely degraded | Resolved in P0 by D11: `owning_gear` lands on the inventory records (T22) and every gear pushes its own (T23–T25) |
-| C4 | *(struck by D2 — kept for the record.)* Startup reads the whole table on the platform boot path; startup time is linear in entity count | Resolved in P0: there is no warm-up read. `init()` seeds what types-registry owns and starts the worker; startup cost is the seed set, not the table (§8.2) |
+| C1 | **Struck by D2.** Was: the whole entity set held in process memory, so entity count becomes a memory bound | Resolved in P0 — the store is transient per admission unit and bounded by the unit's dependency closure (§8.2) |
+| C2 | `idempotency_scope_hash` digests three constants, so the key namespace is **global**: two unrelated callers reusing one key collide with `409` | Real scope arrives with planes and principals at P1 |
+| C3 | **Struck by D11.** Was: the inventory pull model is in-process-only (§8.4) and `owning_gear` a hardcoded constant, which **blocks** out-of-process gears rather than degrading them | Resolved in P0 — `owning_gear` lands on the inventory records (T22) and every gear pushes its own (T23–T25) |
+| C4 | **Struck by D2.** Was: startup reads the whole table on the platform boot path, so startup time is linear in entity count | Resolved in P0 — no warm-up read; startup cost is the seed set, not the table (§8.2) |
 | C5 | No operation-retention sweep: terminal operations accumulate | The §3.2 sweep, once volume justifies it |
 | C6 | **No PDP.** Reads and writes are authenticated but not authorized, deviating from `06`'s *"every sensitive DB access MUST be covered by a PDP decision"*. Entities are `#[secure(unrestricted)]`, so a tenant-scoped query fails closed rather than leaking | The deferred identity-to-permission binding; then `tenant_col` + `PolicyEnforcer` (§12) |
 | C7 | **The validator has no tenant or projection dimensions.** P0's validator digests `resource_version`, `resolution_fingerprint` and a fixed default-projection marker (§8.5); the SDK cache key likewise carries visibility context and projection as constants. Correct while every read is platform-plane and no `$select` exists, and wrong the moment either arrives | The wire form is a **versioned** JSON object, so P1 adds the chain versions and the real projection digest under a new version and refuses to honour a P0 token |
@@ -774,6 +739,15 @@ pub trait TypesRegistryEntities: Send + Sync {
         request: DeleteEntities,
     ) -> Result<RegistrationOperation, CanonicalError>;
 
+    /// Provided: a one-item `delete_entities`, mirroring
+    /// `DELETE /entities/{entity_key}`. One deletion model, two spellings.
+    async fn delete_entity(
+        &self,
+        key: IdempotencyKey,
+        entity: DeleteItem,
+        dry_run: bool,
+    ) -> Result<RegistrationOperation, CanonicalError> { /* … */ }
+
     async fn get_operation(
         &self,
         operation_id: Uuid,
@@ -795,10 +769,12 @@ pub trait TypesRegistryEntities: Send + Sync {
 `list_entities`, keeping the trait object-safe while preserving the call shapes consumers
 already use: `get_type_schema`, `get_instance`, `get_type_schemas`, `get_instances`, their
 `_by_uuid` variants, `list_type_schemas`, `list_instances`. Kind narrowing costs no round
-trip, since the kind is the trailing `~` of the identifier. `EntitySnapshot` likewise carries
-small accessors for the materialized groups — `effective_traits`, `effective_schema`,
-`authored_value`, `segments` — so a consumer that previously called the old models' computed
-methods reads a field instead.
+trip, since the kind is the trailing `~` of the identifier. `EntitySnapshot` likewise exposes the
+materialized documents as **plain fields** — `content`, `resolved_schema`,
+`effective_traits`, `effective_traits_schema` — plus a small `segments` accessor, so a
+consumer that previously called the old models' computed methods reads a field instead.
+No accessor is needed to reach inside a group, because outside `provenance` there is no
+group to reach inside of.
 
 **The old models' client-side `effective_*` methods are deleted, and duplication is the
 weakest of three reasons.**
@@ -833,10 +809,11 @@ signature we know is wrong. When planes land, `ctx` becomes the first parameter 
 method, as DESIGN specifies — a breaking change taken deliberately at that point rather
 than faked now.
 
-Models: `EntityKey`, `EntityLookup` (`Found` / `NotFound`; no `Unchanged`, no `Failed`
+Models: `EntityKey`, `EntityLookup` (`Found` / `Unchanged` / `NotFound`; no `Failed`
 without federation), `EntitySnapshot`, `EntityKind`, `LifecycleStatus`,
-`AuthoredContent`, `EffectiveArtifacts`, `Provenance`, `RegisterEntities`,
-`RegisterItem`, `DeleteEntities`, `RegistrationOperation`, `RegistrationItemResult`,
+`Provenance`, `BatchGet`, `BatchGetItem`,
+`RegisterEntities`, `RegisterItem`, `DeleteEntities`, `DeleteItem`,
+`RegistrationOperation`, `RegistrationItemResult`,
 `OperationStatus`, `CandidateStatus`. Field-for-field the DESIGN §3.3 shapes with the
 out-of-scope fields absent — never renamed, so P1 adds rather than rewrites.
 
@@ -850,13 +827,14 @@ Business listener, `.authenticated()`, path `/types-registry/v1/...` per DE0801.
 | Method | Path | Success |
 |---|---|---|
 | `POST` | `/types-registry/v1/entities` | `202` + operation; `200` on terminal replay |
-| `POST` | `/types-registry/v1/entities:delete` | `202` + operation; `200` on terminal replay |
+| `POST` | `/types-registry/v1/entities:batchDelete` | `202` + operation; `200` on terminal replay |
+| `DELETE` | `/types-registry/v1/entities/{entity_key}` | `202` + operation; `200` on terminal replay |
 | `POST` | `/types-registry/v1/entities:batchGet` | `200`, one result per requested key |
 | `GET` | `/types-registry/v1/entities/{entity_key}` | `200`; `404` when absent |
 | `GET` | `/types-registry/v1/entities` | `200` + one content-free page and a cursor |
 | `GET` | `/types-registry/v1/operations/{operation_id}` | `200` |
 
-`Idempotency-Key` is required on both mutations. Every `202` carries operation
+`Idempotency-Key` is required on every mutation, both deletion spellings included. Every `202` carries operation
 `Location` and advisory `Retry-After`. Errors are RFC-9457 via
 `modkit::api::problem` with `.standard_errors(openapi)`.
 
@@ -864,6 +842,32 @@ Business listener, `.authenticated()`, path `/types-registry/v1/...` per DE0801.
 to `202` + operation, on the same path, with no transitional alias. The route's declared
 stability is `unstable`, the change is called out in the changelog, and any REST caller
 must move to submit-then-poll. `GET /entities/{gts_id}` keeps its current response shape.
+
+**The break is withdrawn for the T9a–T24 window** (`plan.md` P12). T9 took it early by
+repointing the existing v1 routes at the database, which changed `POST /v1/entities`'s
+*request* body and so refused its existing callers with `400` rather than handing them a
+`202` they could adapt to. Worse, it left
+`oagw` and `account-management` writing to the database while still resolving through the
+in-memory `TypesRegistryClient`.
+
+**The two versions name their array differently, on purpose.** v1 takes `entities`, v2 takes
+`items`, so the T24a promotion refuses a v1 body outright — `400`, missing field `items` —
+rather than accepting the field and failing later on elements that changed shape too. `items`
+is also what the operation result, the discovery page and `Page<T>` call their array.
+
+So **T9a restores both v1 routes verbatim from `main`** and registers the async surface under
+`/types-registry/v2/` instead. Until T24 the two are separate paths over separate stores: no
+v1 handler takes `RegistryService`, no v2 handler takes `TypesRegistryService`, and neither
+falls back to the other on a miss — a v1-registered identifier is `404` on v2 and the reverse,
+asserted rather than tolerated, because a fallback would report an entity as registered when
+the admission meant to persist it never ran.
+
+`/v2/` is interim by construction. T24 deletes v1 with the in-memory repository it reads, and
+**T24a promotes the async surface onto the v1 paths**, so P0 still ends on one version and the
+break above is reinstated there. Route paths come from one constant per version
+(`routes::V1` / `routes::V2`, used by the tests too), so the promotion is a constant change
+rather than a sweep. The table above describes the **post-T24a** surface, which is the P0
+end state.
 
 **`GET /entities` breaks too, and this is the second wire break (D12).** Today it returns
 every match in one array, each item carrying its full `content`. DESIGN specifies this route
@@ -945,9 +949,11 @@ silently keeps a setting that no longer applies.
 `ctx.config_or_default()` makes absent config and `config: {}` equivalent to these
 defaults. Existing keys (`entity_id_fields`, `schema_id_fields`, `entities`) are retained.
 
-Test fixtures registering under `acme` / `x` / `vendor` / `test` vendors need
-`registration_policy` entries — 196 of 202 declared identifiers in the repository are
-`gts.cf.*`, so no production gear is affected.
+Test fixtures need `registration_policy` entries: `acme`, `test`, `vendor` and `x` are the
+common fixture vendors, with `fabrikam`, `contoso`, `globex`, `myvendor`, `acme_corp` and
+`nonexistent` in narrower ones. **No production gear is affected** — every declaration outside
+`gts.cf.*` is in a test file, an inline `#[cfg(test)]` block or a doc comment, and no
+`#[gts_type_schema]` in shipped code names another vendor.
 
 #### Registration policy in P0: one of its two parameters
 
@@ -1009,18 +1015,21 @@ gears/system/types-registry/
     │   ├── dependency.rs                  NEW  extraction + reverse worklist
     │   ├── gts_store.rs                   NEW  build a transient GtsStore from rows (D2)
     │   ├── validator.rs                   NEW  freshness validator digest + wire form (§8.5)
+    │   ├── ports.rs                       NEW  persistence ports + the row / input types
     │   ├── service.rs                    rewritten
     │   └── repo.rs                       rewritten: async, DB-backed traits
     ├── infra/
     │   ├── storage/
     │   │   ├── entity/                    NEW  one file per entity, 9 tables (`02`)
     │   │   ├── migrations/                NEW  initial migration + Migrator
-    │   │   ├── repo.rs                    NEW  repositories, `runner: &impl DBRunner`
-    │   │   ├── mapper.rs                  NEW  entity ↔ SDK model `From` impls
+    │   │   ├── repo/                      NEW  one file per repository, `runner: &impl DBRunner`,
+    │   │   │                                   taking and returning `domain::ports` types
+    │   │   ├── store.rs                    NEW  `Repos`: the five ports over the repositories
+    │   │   ├── mapper.rs                  NEW  domain row ↔ SDK model `From` impls
     │   │   └── in_memory_repo.rs         DELETED
     │   ├── outbox.rs                      NEW  LeasedMessageHandler + wiring
     │   └── cache/                        retyped onto EntitySnapshot, byte-bounded (§8.3)
-    ├── api/rest/                         extend: operations, batchGet, delete
+    ├── api/rest/                         extend: operations, batchGet, batchDelete, delete-one
     └── ../QUICKSTART.md                   NEW  per `02` (gear has REST endpoints)
 
 gears/system/types-registry/types-registry/tests/
@@ -1066,9 +1075,9 @@ Workspace clippy is pedantic; `unwrap_used` and `expect_used` are denied.
 | Repository methods take `runner: &impl DBRunner`, **not** `&SecureConn` — the same method then works inside and outside a transaction | `11` |
 | Multi-step mutations go through `in_transaction_mapped`, which consumes the `SecureConn` and hands the closure a `&SecureTx` | `11` |
 | `#[domain_model]` on **every** non-module-private `struct`/`enum` under `domain/` — enforced by lint DE0309. Strictly module-private types are exempt | `02` |
-| SeaORM entities: one file per entity under `infra/storage/entity/`; repository in `infra/storage/repo.rs` | `02` |
+| SeaORM entities: one file per entity under `infra/storage/entity/`; repositories under `infra/storage/repo/`, one file per repository. `02` writes this as a single `infra/storage/repo.rs`; five repositories in one file read past 1200 lines, so the gear follows `mini-chat`'s `infra/db/repo/` shape and keeps `storage::repo::EntityRepo` as the import path through `repo/mod.rs` re-exports | `02` |
 | `#[derive(Scopable)]` with an explicit `#[secure(...)]` on every entity — all four dimensions declared, or `unrestricted` | `06` |
-| REST DTOs only in `api/rest/dto.rs`, with serde + utoipa; `From` conversions there or in `mapper.rs` | `02` |
+| REST DTOs only in `api/rest/dto.rs`, with serde + utoipa; `From` conversions there or in `mapper.rs`. **Its input is a `domain::ports` row, not a `SeaORM` entity** — entities do not leave `infra/storage/repo/`, which maps them at the edge, so an entity ↔ SDK mapper has nothing to take | `02` |
 | Local client adapter in `domain/local_client.rs`, implementing the SDK trait and delegating to the domain service | `02` |
 | Gear name kebab-case (`types-registry`), endpoints `/{gear}/v{N}/{resource}` | `02`, `04` |
 | A gear with REST endpoints SHOULD ship `QUICKSTART.md` | `02` |
@@ -1090,7 +1099,7 @@ merely the cheaper one.
 Repository-owned traversal, domain-free, no raw SQL:
 
 ```rust
-// infra/storage/repo.rs
+// infra/storage/repo/dependency_repo.rs
 //
 // ponytail: iterative worklist over direct reverse edges, not a recursive CTE.
 // Bounded by limits.activation_write_set (512); measured max fan-out in-repo is 27.
@@ -1174,11 +1183,11 @@ follow-up.
 identifier profile refusals, SCC condensation and topological order, reverse worklist
 termination on a cycle, baseline selection.
 
-**Compatibility semantics (slice 0 + 5)** — the tests that pin the 0.12.0 behaviour:
+**Compatibility semantics** — the tests that pin the 0.12.0 behaviour, from T1 onward:
 
 | Test | Asserts |
 |---|---|
-| Re-validation sweep over all declared identifiers | every one of the 202 identifiers still admits under 0.12.0; a failure names the identifier and the finding |
+| Re-validation sweep over all declared identifiers | every declared identifier still admits under 0.12.0; a failure names the identifier and the finding |
 | Generated-schema diff for `#[gts_type_schema]` types | every difference from 0.11.0 output is accounted for, none silent |
 | `CompatibilityVerdict::Unknown` from `compare_documents` | candidate fails with a reason **distinct** from `Incompatible`, and nothing is committed |
 | Optional property added at a `Closed` level | compatible |
@@ -1318,52 +1327,10 @@ references.
 
 ## 15. Build order
 
-> **Superseded by [`plan.md`](./plan.md).** The ordering below is horizontal and builds a
-> synchronous admission path that a later slice would rewrite; `plan.md` P1 replaces it with
-> vertical slices, and `todo.md` is the executable task list. Kept here only as the record of
-> what was first proposed.
-
-Each slice ends green and independently reviewable.
-
-0. **`gts-rust` upgrade** — add the `[patch.crates-io]` block of §7 (D8). No version
-   specs change, since the local crates still declare `0.11.0`.
-   *Verify:* `make ci` and `make gts-docs` green; **all 202 declared GTS identifiers
-   re-validate** under the corrected compatibility, traits and macro semantics; diff the
-   generated schema documents of `#[gts_type_schema]` types and account for every change.
-   Ships as its own commit — its failure mode is other gears, not this one. `Cargo.lock`
-   is **not** committed while the patch is in place.
-   *(This step is historical. O1 closed 2026-08-18 — 0.12.0 published, the patch removed;
-   see §7.)*
-1. **Schema + migration** — 9 tables, three backends, `routing_config` absent.
-   *Verify:* `make test-db`; migration up on all three; constraints reject the shapes
-   their CHECKs name.
-2. **Repositories + transient-store builder** — SeaORM entities, per-aggregate repos, and
-   the function that builds a `GtsStore` from a `gts_id`-sorted row set (D2). Ready-mode
-   and `temporary`/`persistent` removed. The old `TypesRegistryClient` keeps its existing
-   in-memory repository until the cutover, so nothing is served from a new store here.
-   *Verify:* every existing test in the gear still passes; restart preserves entities.
-3. **Synchronous admission core** — acceptance checks §8.1, family locks, revision
-   insert, current-state projection, dependency edges, CAS. Not yet wired to REST.
-   *Verify:* the concurrency and family tests in §13.
-4. **Reverse impact + materialization** — worklist, artifact refresh, fingerprint,
-   activation bound.
-   *Verify:* refresh, idempotent-refresh and over-bound tests.
-5. **Compatibility + derivation + quarantine** — baseline selection, `compare_documents`,
-   `Unknown` rejected with its own reason, `candidate_object_levels` surfaced in Dry Run,
-   chain validation, Draft-07 gate, ADR-0015. Includes the quarantine preflight (O4).
-   *Verify:* compat matrix including an `Unknown` case; `GTS_SPECIFICATION_VERSION` and
-   the crate version persisted on every revision.
-6. **Operations + outbox + worker** — `operation` / `operation_item`, idempotency,
-   fingerprint, leased outbox, SCC ordering, partial admission, Dry Run.
-   *Verify:* replay, `409`, duplicate delivery, lease expiry, partial-admission tests.
-7. **New SDK trait** — `TypesRegistryEntities`, models, `register_and_await`, both
-   traits published in `ClientHub`.
-   *Verify:* SDK unit tests; a mock consumer round-trips submit → poll → read.
-8. **REST + docs** — six routes, `Idempotency-Key`, RFC-9457, OpenAPI, and `QUICKSTART.md`
-   per `02`.
-   *Verify:* `make e2e-local`; `make dylint`; `/cf/docs` renders every operation.
-
-Consumer migration is part of P0 (D6) and is split by gear group; see `plan.md` Phase 7.
+**Superseded by [`plan.md`](./plan.md).** This section originally ordered the work
+horizontally — schema, then repositories, then a synchronous admission path a later slice
+would have rewritten. `plan.md` P1 replaces it with vertical slices and [`todo.md`](./todo.md)
+is the executable task list. The number is kept because other documents cite it.
 
 ---
 
@@ -1390,7 +1357,7 @@ Consumer migration is part of P0 (D6) and is split by gear group; see `plan.md` 
    entity is still exact-readable as deleted and absent from lists.
 10. No tenant-scoped row and no federation table exists in any P0 deployment.
 11. Every ceiling in §9 is a comment in the code at the point it binds.
-12. The workspace is on `gts-rust` 0.12.0, all 202 declared identifiers re-validate, and
+12. The workspace is on `gts-rust` 0.12.0, every declared identifier re-validates, and
     an undecidable compatibility comparison (`CompatibilityVerdict::Unknown`) is rejected
     with its own reason rather than collapsed into `Incompatible`.
 13. The SDK client cache is in place on the new models with a byte-bounded store, a
@@ -1408,19 +1375,20 @@ Consumer migration is part of P0 (D6) and is split by gear group; see `plan.md` 
 
 ## 17. Open questions
 
-All questions that blocked the start are answered (D8, D9, D10). None remain as a merge
-blocker.
+**None remain.** Two answers are load-bearing enough to state rather than merely close:
 
-| # | Question | Blocks | Recommendation |
-|---|---|---|---|
-| O2 | `principal_id` constant: which value? Proposal — a named `P0_PRINCIPAL_ID` deterministic UUIDv5 from `"types-registry.p0.principal"` rather than `Uuid::nil()`, so it is greppable and not mistaken for a nil-write bug | slice 6 | Deterministic v5 |
-| O4 | ADR-0015 quarantine preflight — DESIGN requires the join of `dependency` to `entity.gts_id` finding stable subjects referencing major-0 targets to be empty or remediated before the rule is enabled. First release is expected to need only the check | slice 5 | Run as a migration-time assertion |
+**O4 — there is no ADR-0015 quarantine preflight scan, and none is needed.** A scan would
+establish the rule's base case over a registry that predated it, and no such registry exists:
+the release that introduces the check is the release that first persists an entity. What
+remains is the negative obligation the ADR states — do not enable the rule against a database
+populated by a build that had the storage but not the check.
 
-Closed in review: `preview-outbox` sign-off (D9 — `ledger`, `file-storage` and
-`chat-engine` already depend on it) and the `POST /entities` wire break (D10). **Closed
-2026-08-18: O1**, publishing `gts` / `gts-id` / `gts-macros` 0.12.0 — the crates are on
-crates.io, the `[patch.crates-io]` override is deleted, and `make ci` results stop being
-local-only for reasons connected to this dependency (§7).
+**O2 — `principal_id` is `Uuid::nil()`**, behind the named constant `P0_PRINCIPAL_ID`. A
+deterministic UUIDv5 would *look like* a principal a reader could resolve to a subject, and P0
+has no platform identity at all (ceiling C8); nil is the honest spelling of "no subject". The
+constant carries the greppability, and its docstring carries the nil-write warning. Nothing
+downstream depends on the value: C2 makes the `Idempotency-Key` namespace global whichever
+constant is digested.
 
 ---
 
@@ -1436,13 +1404,10 @@ local-only for reasons connected to this dependency (§7).
   (test shape). `guidelines/DNA/languages/RUST.md` is **outdated and not used**
 - **ADRs honoured in P0**: 0001, 0003, 0004, 0005, 0006, 0008, 0012, 0014, 0015
 - **ADRs out of P0 scope**: 0002, 0007, 0009, 0010, 0011, 0013
-- **`gts-rust`**: published on crates.io as 0.12.0 (source: `/Users/vasily/dev/gts-rust`
-  at `f65bf62`, version-bumped at `df7c14b`), declaring
-  `GTS_SPECIFICATION_VERSION = "0.13"`
+- **`gts-rust`**: 0.12.0 from crates.io, declaring `GTS_SPECIFICATION_VERSION = "0.13"`
 - **Prerequisites closed here**: activation write set (§4), `sea-query` recursive CTE
-  (D5), GTS capabilities 1–7 of DESIGN §4 via the 0.12.0 upgrade (§7), and 0.12.0
-  publication (O1, closed 2026-08-18)
-- **Prerequisites still open**: ADR-0015 quarantine preflight (O4), worker liveness bounds
+  (D5), GTS capabilities 1–7 of DESIGN §4 via the 0.12.0 upgrade (§7)
+- **Prerequisites still open**: worker liveness bounds
   (§10.3 `worker.*` proposes values), benchmark profile. GTS capability 8 (pattern
   containment) is deferred with federation
 - **`preview-outbox` reliance**: approved (D9), matching `ledger`, `file-storage`,

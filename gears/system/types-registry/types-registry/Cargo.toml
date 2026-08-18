@@ -33,19 +33,51 @@ tracing = { workspace = true }
 inventory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["time"] }
 axum = { workspace = true, features = ["macros"] }
 uuid = { workspace = true, features = ["v5"] }
 thiserror = { workspace = true }
+# SHA-256 for the request fingerprint and the idempotency scope hash (T7). The
+# FIPS-validated implementation the platform installs at bootstrap, rather than
+# the `sha2` crate DE0708 bans -- see `domain/admission/fingerprint.rs`.
+aws-lc-rs = { workspace = true }
 parking_lot = { workspace = true }
 lru = "0.18.2"
 
+# Persistence (SPEC §5) - driver features come from toolkit-db
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+# `Scopable` / `#[secure(...)]` on the storage entities.
+toolkit-db-macros = { workspace = true }
+# `timestamptz` columns; `macros` is dev-only, for `datetime!` literals in tests.
+time = { workspace = true }
+
 # Local dependencies
+# `toolkit_db::outbox` needs no feature: it stopped being a preview in
+# toolkit-db 0.12.0 and is now unconditional.
 toolkit = { workspace = true }
+toolkit-db = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-utils = { workspace = true }
 
+[features]
+# Gates the container-backed PostgreSQL / MySQL migration tests
+# (`tests/migration_backends_test.rs`). Off by default because they need a
+# Docker daemon; enable with `--features integration`. The SQLite half of the
+# suite always runs.
+integration = ["toolkit-db/pg", "toolkit-db/mysql"]
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+# In-memory SQLite for the schema-level migration tests.
+toolkit-db = { workspace = true, features = ["sqlite"] }
+# PostgreSQL / MySQL bring-up for the `integration` suite. Not optional --
+# `[dev-dependencies]` cannot be -- but every reference is behind
+# `#![cfg(feature = "integration")]`, so a default `cargo test` needs no Docker.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+# `Router::oneshot` for the REST contract tests (T9).
+tower = { workspace = true }
+time = { workspace = true, features = ["macros"] }
