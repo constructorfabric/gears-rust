@@ -181,8 +181,8 @@ of scope for this PRD); Quota Manager translates their workflows into QE API cal
 
 - **Role**: Any platform service that performs operations subject to budget enforcement (e.g., LLM Gateway invoking a
   model, compute service starting a job, storage service allocating bytes). Calls Quota Enforcement's debit, rollback,
-  and lease primitives via SDK or REST. It populates the metric owner's projection and supplies typed caller
-  attribution; it does not create a caller-specific projection. Credit is reserved for Quota Manager.
+  and lease primitives directly using the metric owner's projection. It supplies typed caller attribution and does not
+  create a caller-specific projection. Credit is reserved for Quota Manager.
 
 #### Metric Owner
 
@@ -190,7 +190,8 @@ of scope for this PRD); Quota Manager translates their workflows into QE API cal
 
 - **Role**: The single Gear that owns a metric. Publishes and registers the owner-scoped subject/resource projections
   and the separate Quota-attribute contract, including admitted metrics and supported scopes. Its schemas must be
-  general enough for every service that debits the shared metric.
+  general enough for every service that debits the shared metric. It publishes the contract but does not proxy calls to
+  QE; any PDP-authorized Quota Consumer may debit directly.
 
 #### Quota Reader
 
@@ -206,8 +207,9 @@ of scope for this PRD); Quota Manager translates their workflows into QE API cal
 - **Role**: Platform component that owns license-pack catalog, plan templates, provisioning, redistribution,
   increase-request workflow, and the human-facing surfaces for tenant administrators and end users. Calls Quota
   Enforcement's CRUD and read APIs on their behalf, propagating the original caller's SecurityContext for PDP scoping.
-  It resolves the owning Gear for each metric so Quotas are created against that owner's projection. Out of scope for
-  this PRD — described here only because QE's actor model and permission table refer to it.
+  It resolves the owning Gear for each metric so Quotas are created against that owner's projection, and it orchestrates
+  replacement of Quotas when an owner publishes a breaking projection version. Out of scope for this PRD — described
+  here only because QE's actor model and permission table refer to it.
 - **Needs**: Stable Quota CRUD APIs (create, update, deactivate, read), bulk Quota Snapshot reads with PDP scoping,
   Quota Snapshot reads scoped to a single user/tenant, credit primitive for redistribution and compensatory adjustments.
 
@@ -245,8 +247,9 @@ of scope for this PRD); Quota Manager translates their workflows into QE API cal
 
 - **Role**: The platform `types-registry` gear. Provides metric (usage type) registration, kind classification (
   counter/gauge), and enforcement-mode classification (`QuotaGated` / `Direct`); Quota Enforcement references registered
-  metric names in Quotas. It also hosts the QE abstract bases, owner projections, their admitted-metric traits, and the
-  separate Quota-attribute contracts. QE does not duplicate these schemas in a table or registration API.
+  metric names in Quotas. It also hosts the QE abstract bases, scope discriminators, owner projections, their
+  admitted-metric traits, and the separate Quota-attribute contracts. QE does not duplicate these schemas in a table or
+  registration API.
 
 #### AuthZ Resolver
 
@@ -622,18 +625,29 @@ completeness:
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-fr-projection-contracts`
 
 QE **MUST** register abstract subject and resource bases at `gts.cf.core.qe.subj.v1~` and
-`gts.cf.core.qe.res.v1~`. The Gear that owns a metric **MUST** publish concrete derived projections for every supported
-subject scope; callers **MUST** debit against those owner projections and **MUST NOT** create per-caller projections for
-the same metric. The concrete subject projection is the type half of Quota identity, so applicable-Quota lookup uses
+`gts.cf.core.qe.res.v1~`. It **MUST** also register the scope-discriminator type
+`gts.cf.core.qe.subject_scope.v1~` and its P1 `user` and `tenant` well-known instances. The Gear that owns a metric
+**MUST** publish concrete derived projections for every supported subject scope; callers **MUST** debit against those
+owner projections and **MUST NOT** create per-caller projections for the same metric. The concrete subject projection
+is the type half of Quota identity, so applicable-Quota lookup uses
 `(projection_type, server_resolved_subject_id, metric)` and may return several Quotas for that key.
 
-Each projection **MUST** refine its required `metadata` object and **MUST** declare its admitted metrics through a typed
-`x-gts-traits` value whose entries are `x-gts-ref` shape-validated metric type ids; their existence is verified at
-bootstrap per `cpt-cf-quota-enforcement-fr-contract-validation`. The request may also carry a resource
-projection for typed resource properties; resource does not enter the P1 counter key. Metric identity remains owned by
-`types-registry` and is not changed by this requirement.
+Each subject projection **MUST** declare a required `scope` trait in the base's `x-gts-traits-schema`. Its value
+**MUST** be a `GtsInstanceId` narrowed to `gts.cf.core.qe.subject_scope.v1~*`; the P1 values are
+`gts.cf.core.qe.subject_scope.v1~cf.core.qe.user.v1` and
+`gts.cf.core.qe.subject_scope.v1~cf.core.qe.tenant.v1`. QE **MUST** read the registry-validated effective trait and
+compare the instance ids directly. Scope **MUST NOT** be inferred from the type-id name segment.
 
-Within a deployment, a metric **MUST** be admitted by at most one concrete subject projection **per subject scope**.
+Each projection **MUST** refine its required `metadata` object and **MUST** declare its admitted metrics through a typed
+`x-gts-traits` value whose entries are metric type ids narrowed by `x-gts-ref`. `x-gts-ref` is pattern-level only: it
+validates that a value is a well-formed GTS id under the declared prefix. The system **MUST** therefore itself verify,
+at bootstrap per `cpt-cf-quota-enforcement-fr-contract-validation`, that each referenced metric is registered and is
+genuinely derived from the metric base — a narrowed `x-gts-ref` is a prefix match, not a derivation check. The request
+may also carry a resource projection for typed resource properties; resource does not enter the P1 counter key. Metric
+identity remains owned by `types-registry` and is not changed by this requirement.
+
+Within a deployment, a metric **MUST** be admitted by at most one concrete subject projection **per `(metric, scope)`
+pair**. One owner may own several metrics and one projection may admit several, so the constraint binds the pair.
 Two projections admitting the same metric at the same scope split the applicable-Quota key and fragment one budget into
 two counters — the precise failure owner-declared projections exist to prevent. QE **MUST** reject that configuration at
 bootstrap rather than resolving it by precedence: a silent winner would make which counter is debited depend on
@@ -683,7 +697,9 @@ The subject registry is the set of concrete owner projections in `types-registry
 instances are replaced by owner-scoped projection types such as
 `gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.tenant.v1~` and
 `gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~`. QE **MUST** reject Quota creation against an unregistered,
-abstract, non-subject, or non-resolvable projection.
+abstract, non-subject, or unknown-scope projection, or one that does not admit the Quota's metric. Creation **MUST**
+validate the registry contract rather than require membership in the replica's active `ProjectionContractCatalog`, so
+a registered concrete replacement projection may receive pre-staged Quotas before cutover.
 
 Bootstrap **MUST** enforce a 1:1 relationship between configured concrete projections and resolvers, validate every
 admitted metric reference, and fail the Gear on mismatch. Resolution logic that inspects `SecurityContext.subject_type`
@@ -755,8 +771,9 @@ assignment-binding concept. Each Quota **MUST** carry:
   Engine via EvaluationContext for attribute-based selection (region, tier, environment, …),
 - a `source` value identifying who imposed the Quota; see **Source value semantics** below.
 
-The system **MUST** reject creation of a Quota whose projection is not registered/concrete/resolvable or whose
-subject_id violates that scope's expectations.
+The system **MUST** reject creation of a Quota whose projection is not registered, concrete, derived from the QE subject
+base, or does not admit the metric, and **MUST** reject a `subject_id` that violates the declared scope. The projection
+need not be active in the receiving replica's evaluation catalogue; such a Quota remains unevaluated until cutover.
 
 **Source value semantics.** `source` instances live under base `gts.cf.qe.source.type.v1~`. P1 seeds two:
 `gts.cf.qe.source.type.v1~cf.qe.source.licensing.v1` (default; caps materialized from the licensing layer) and
@@ -800,6 +817,15 @@ the catalog kinds in `cpt-cf-quota-enforcement-fr-notification-plugin`) **MUST**
 the lease ID, owning subject context, held amount, and the deactivated `quota_id`. Updates **MUST** preserve the quota
 ID and the subject reference; breaking changes (changing metric, type, period, or subject) **MUST** be performed by
 deactivating the original Quota and creating a new one.
+
+A projection version change follows the same rule. QE **MUST NOT** provide aliasing or migration. Quota Manager
+**MUST** first create equivalent Quotas for the registered concrete replacement projection; each replacement has a new
+ID and counter, carries no consumed value, and remains unevaluated until its catalogue generation becomes active. For
+consumption Quotas, the deployment **MUST** bootstrap the replacement generation and atomically switch all evaluation
+traffic at a period boundary. It **MUST NOT** use a mixed v1/v2 rolling cutover, because the two generations debit
+independent counters. After the traffic switch, Quota Manager **MUST** deactivate the old Quotas. Allocation
+deactivation already resolves active leases. P1 uses blue/green or an equivalent single-generation switch; replacement
+at scale depends on `cpt-cf-quota-enforcement-fr-bulk-quota-crud` (P2).
 
 **Cap reductions guard.** A Quota update that would reduce `cap` strictly below the Quota's current consumed amount (
 consumption-type Quotas, within the active period) or current in-flight count (allocation-type Quotas) **MUST** be
@@ -2656,23 +2682,24 @@ on behalf of a tenant administrator)
 - Caller is authenticated with the appropriate scope (operator-level for cross-tenant operations; Quota Manager
   forwarding a tenant administrator's SecurityContext for own-tenant operations)
 - Target metric is registered in `types-registry`
-- Target owner projection is registered, concrete, resolvable, and admits the metric
+- Target owner projection is registered, concrete, derived from the QE subject base, and admits the metric
 
 **Main Flow**:
 
 1. Caller submits a Quota payload (subject reference, metric, type, period if applicable, `enforcement_mode`, cap,
    `source` (defaults to `licensing` when omitted; `operator` for manual caps), optional notification thresholds,
    optional validity window, optional failure-mode hint, optional metadata)
-1. System validates the payload (metric exists; type/period combinatorics are valid; owner projection is concrete and
-   resolvable; Quota metadata conforms to its separate owner contract)
+1. System validates the payload (metric exists; type/period combinatorics are valid; owner projection is registered,
+   concrete, derived from the QE subject base, and admits the metric; Quota metadata conforms to its separate owner
+   contract). This registry validation does not require the projection to be in the active evaluation catalogue.
 1. System persists the Quota with a server-assigned quota ID and emits a `quota-changed` notification event
 
 **Postconditions**:
 
-- The Quota is immediately effective for evaluation; subsequent operations under the bound subject and metric are
-  constrained accordingly. If other active Quotas already exist for the same `(subject, metric)` pair, the new Quota
-  joins the applicable-Quotas set; arbitration is resolved by the active Quota Resolution Policy (default
-  `most-restrictive-wins`)
+- If its projection is in the active evaluation catalogue, the Quota is immediately effective. Otherwise it is
+  pre-staged and remains unevaluated until that catalogue generation becomes active. Once effective, it joins any other
+  applicable Quotas and arbitration is resolved by the active Quota Resolution Policy (default
+  `most-restrictive-wins`).
 
 **Alternative Flows**:
 
@@ -3225,7 +3252,7 @@ on behalf of a tenant administrator)
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
 | `toolkit-db`                             | Database infrastructure used by the P1 storage plugin                                                                                                                                                                                                                                                               | p1          |
 | `authz-resolver`                        | Platform PDP for read and write authorization                                                                                                                                                                                                                                                                       | p1          |
-| `types-registry`                        | Metric catalog plus QE abstract bases, owner projections, admitted-metric traits, and Quota-attribute contracts. Required for bootstrap and Quota/Policy writes; deliberately absent from the evaluation hot path.                                                                                                  | p1          |
+| `types-registry`                        | Metric catalog plus QE abstract bases, scope discriminators, owner projections, admitted-metric traits, and Quota-attribute contracts. Required for bootstrap and Quota/Policy writes; deliberately absent from the evaluation hot path.                                                                              | p1          |
 | Quota Manager metric-owner mapping      | Maps each metric to its owning Gear/projection so Quota Manager creates Quotas against the stable owner identity rather than a caller-specific type.                                                                                                                                                                | p1          |
 | Engine evaluator                        | Library backing the active Quota Resolution Engine. P1: a sandboxed CEL evaluator (mandatory for the built-in `cel` Engine). P2-or-later candidates: Starlark, Lua, Wasm runtimes. The `most-restrictive-wins` Engine has no external library dependency.                                                           | p1          |
 | `quota-enforcement-coordination-plugin` | TTL-bounded distributed locks for sweeper / dispatcher singletons via `cpt-cf-quota-enforcement-contract-coordination-plugin`. Default impl piggybacks on the storage backend's locking primitives; operators may swap to an independent backend (etcd, Consul, Redis Redlock, k8s Lease) without touching QE-core. | p1          |

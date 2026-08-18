@@ -74,10 +74,12 @@ Chosen option: **(b), registered and enforced projection contracts**.
 
 ### The contract model
 
-QE owns two abstract (`x-gts-abstract`) base types — `gts.cf.core.qe.subj.v1~` and
-`gts.cf.core.qe.res.v1~`. Only concrete derived projections are instantiable. A representative
-subject projection is `gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~`; an owner may
-publish both user- and tenant-scope projections.
+QE owns three abstract (`x-gts-abstract`) base types — `gts.cf.core.qe.subj.v1~`,
+`gts.cf.core.qe.res.v1~`, and `gts.cf.core.qe.quota_attrs.v1~` — plus the concrete
+scope-discriminator type `gts.cf.core.qe.subject_scope.v1~`. Only concrete derived contracts
+are instantiable. A representative subject projection is
+`gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~`; an owner may publish both user- and
+tenant-scope projections.
 
 This replaces the illustrative `gts.cf.qe.subject.type.v1~cf.qe.subject.user.v1`, which has
 three defects:
@@ -88,11 +90,9 @@ three defects:
 
 The decisions that follow:
 
-* **The metric owner declares the projection — never each caller.** Other services debit that
-  metric through the owner's projection, populated from their own domain data. Caller-declared
-  projections would change the applicable-Quotas key per caller, fragment one shared budget
-  into N counters, and force the operator either to create N Quotas or to deny callers that
-  have none.
+* **The metric owner declares the projection — never each caller.** Any PDP-authorized service
+  may debit directly through QE using that projection; the owner publishes the contract but does
+  not proxy calls. Caller-specific projections would fragment one shared budget into N counters.
 * **The subject projection is the identity a Quota binds to.** Applicable-Quota lookup is
   keyed by `(projection_type, subject_id, metric)`; several Quotas may share that key.
 * **Scope cascade requires every applicable owner projection to resolve** — the owner's
@@ -126,19 +126,34 @@ The abstract bases carry the common properties `type`, `id`, and `metadata`:
 
 * **`metadata` is required on the wire.** Omitting it is non-conforming and MUST NOT be
   defaulted to `{}`; callers send an empty object when the projection declares no properties.
+* **Each subject projection declares its subject scope** as a required `scope` trait in the
+  base's `x-gts-traits-schema`. Its value is a `GtsInstanceId` narrowed to
+  `gts.cf.core.qe.subject_scope.v1~*`; P1 defines the well-known instances
+  `gts.cf.core.qe.subject_scope.v1~cf.core.qe.user.v1` and
+  `gts.cf.core.qe.subject_scope.v1~cf.core.qe.tenant.v1`. QE reads the registry-validated
+  effective trait and compares the instance ids directly. Encoding scope in the type-id name
+  segment would force string parsing, which `guidelines/GTS.md` conventions 14 and 15 rule out.
 * **Each subject projection declares its admitted metrics** through an inherited
   `x-gts-traits` value whose entries are `GtsTypeId`s narrowed via `x-gts-ref` to the platform
-  metric base. `x-gts-ref` constrains the **shape** of the id, not the existence of the
-  metric: existence is checked at bootstrap when the catalog is built, and admission at
-  Gateway ingress against that catalog. A request naming an unadmitted metric fails closed.
-  The registry thereby becomes an inventory of which metrics are metered against which owner
-  and scope. Narrowing the set is a breaking contract change.
-* **A metric is admitted by at most one projection per subject scope, per deployment.** Two
-  projections admitting the same metric at the same scope would split the applicable-Quota key
-  and fragment one budget into two counters. QE rejects that at bootstrap rather than
-  resolving it by precedence, because a silent winner would make the debited counter depend on
-  configuration order. Distinct scopes of one owner admitting the same metric is the intended
-  arrangement — it is what makes scope cascade expressible.
+  metric base. `x-gts-ref` is **pattern-level only** — it validates that the value is a
+  well-formed GTS id under the declared prefix, and nothing more. Three checks it does *not*
+  perform, all of which QE therefore owns:
+  * that the referenced metric is registered — checked at bootstrap when the catalog is built;
+  * that the referenced type is genuinely *derived* from the metric base, since a narrowed
+    `x-gts-ref` is a prefix match, not a derivation check;
+  * that debiting the metric is permitted — checked at Gateway ingress against the catalog.
+
+  A request naming an unadmitted metric fails closed. The registry thereby becomes an
+  inventory of which metrics are metered against which owner and scope. Narrowing the set is a
+  breaking contract change.
+* **A metric is admitted by at most one projection per `(metric, scope)` pair, per
+  deployment.** One owner may own several metrics and one projection may admit several, so the
+  constraint binds the pair, not the projection or the owner. Two projections admitting the
+  same metric at the same scope would make the applicable-Quota set ambiguous and fragment one
+  budget into two counters. QE rejects that at bootstrap rather than resolving it by
+  precedence, because a silent winner would make the debited counter depend on configuration
+  order. Distinct scopes of one owner admitting the same metric is the intended arrangement —
+  it is what makes scope cascade expressible.
 * **The resource projection carries identity plus schematized properties only.** It completes
   the request contract for resource-aware selection but does not enter the counter key. A
   Quota on a named resource is expressible today through properties; whether resource becomes
@@ -173,11 +188,14 @@ The abstract bases carry the common properties `type`, `id`, and `metadata`:
 Contracts are resolved and snapshotted **outside** the evaluation transaction:
 
 * **Bootstrap** builds an immutable in-process `ProjectionContractCatalog` for the
-  deployment's configured projections; Gateway validates requests against that local snapshot.
-  A new contract version becomes admissible only after a successful bootstrap — P1 has no
-  runtime refresh path, so publishing a new version requires a gear restart.
+  deployment's configured projections; Gateway validates evaluation requests against that local
+  snapshot. `types-registry` remains authoritative; QE's catalogue is only a validated local
+  snapshot. A new contract version becomes evaluable only in a deployment generation whose
+  bootstrap catalogue includes it. P1 has no runtime refresh path.
 * **`QuotaManagementService`** owns the `TypesRegistryClient` and a bounded LRU cache for
-  metric and Quota-attribute contract lookups.
+  metric, projection, and Quota-attribute contract lookups. Quota creation validates the
+  registry contract, not the active evaluation catalogue, so replacement Quotas can be staged
+  before cutover.
 * **`PolicyService`** resolves the contracts a Policy references and snapshots their schema
   and version with the immutable Policy version.
 * **Registration happens in `types-registry`.** QE gains no registration endpoint.
@@ -221,17 +239,22 @@ validation cannot prove:
 * operator/cardinality mismatch — comparing `quota.regions: string[]` with
   `request.region: string` using `==` rather than membership.
 
-**At bootstrap**, QE registers its abstract bases and validates a closed consistency set:
+**At bootstrap**, QE registers its abstract bases, the scope-discriminator type and its P1
+well-known instances, then validates a closed consistency set:
 
 * every compiled `SubjectProjectionResolver` names a registered, concrete owner projection
   derived from the QE subject base;
 * every projection configured for resolution has exactly one resolver;
-* all admitted metric references resolve;
-* no two configured projections admit the same metric at the same subject scope;
+* every admitted metric reference resolves to a registered type that is genuinely derived from
+  the metric base — neither check is covered by `x-gts-ref`, which is pattern-level only;
+* no two configured projections admit the same metric at the same declared scope;
 * no resolver accepts an anonymous/nil identity.
 
+QE reads each projection's registry-validated effective `scope` trait and compares its
+`GtsInstanceId` directly.
+
 Any mismatch fails gear bootstrap. Owner projections not configured in that deployment stay
-discoverable in the registry without becoming silently resolvable.
+discoverable and may receive pre-staged Quotas, but are not evaluated by that generation.
 
 ### Consequences
 
@@ -239,6 +262,16 @@ discoverable in the registry without becoming silently resolvable.
 narrow — including narrowing the admitted-metric set — requires a new contract version. Adding
 a *required* property likewise requires a new version, because every existing caller populates
 the owner's contract.
+
+**Breaking-version replacement.** QE provides no alias or migration verb. Quota Manager first
+creates equivalent Quotas for the registered concrete replacement projection. They have new ids
+and counters and remain unevaluated until cutover; consumed value is not carried forward. For
+consumption Quotas, a new deployment generation bootstraps the replacement catalogue and traffic
+switches atomically at a period boundary. Mixed-generation evaluation traffic is forbidden because
+v1 and v2 replicas would debit independent counters. After the switch, Quota Manager deactivates
+the old Quotas; allocation deactivation resolves active leases. P1 therefore uses blue/green or an
+equivalent single-generation traffic switch, while replacement at scale depends on P2 Bulk Quota
+CRUD.
 
 * Attribute mistakes become save-time or ingress errors instead of silent Quota-selection
   misses.
