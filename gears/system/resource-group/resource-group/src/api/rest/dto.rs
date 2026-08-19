@@ -181,6 +181,9 @@ pub struct CreateGroupDto {
     pub name: String,
     /// Parent group ID (null for root groups).
     pub parent_id: Option<Uuid>,
+    /// Optional target tenant for the created group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
     /// Type-specific metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -251,6 +254,7 @@ impl From<CreateGroupDto> for CreateGroupRequest {
             code: dto.type_path,
             name: dto.name,
             parent_id: dto.parent_id,
+            tenant_id: dto.tenant_id,
             metadata: dto.metadata,
         }
     }

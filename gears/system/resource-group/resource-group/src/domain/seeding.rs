@@ -157,6 +157,7 @@ pub async fn seed_groups<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait>(
                     code: seed.code.clone(),
                     name: seed.name.clone(),
                     parent_id: seed.parent_id,
+            tenant_id: None,
                     metadata: seed.metadata.clone(),
                 };
                 group_service

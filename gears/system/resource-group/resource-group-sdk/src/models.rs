@@ -239,6 +239,19 @@ pub struct CreateGroupRequest {
     /// Parent group ID (null for root groups).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Uuid>,
+    /// Optional target tenant for the created group.
+    ///
+    /// If omitted, the tenant scope is derived from the caller's own
+    /// `SecurityContext` -- today's unchanged default behavior. If present
+    /// and different from the caller's own tenant, the create succeeds only
+    /// when the caller's `create`-action `AccessScope` actually covers the
+    /// target tenant (platform-admin / onboarding use case); otherwise the
+    /// request is rejected.
+    ///
+    /// Rejected for tenant-typed groups (`code` starting with
+    /// `TENANT_RG_TYPE_PATH`): their effective tenant is always `group.id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
     /// Type-specific metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
