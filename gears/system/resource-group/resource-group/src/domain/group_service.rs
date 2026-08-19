@@ -233,8 +233,28 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // whose path starts with `TENANT_RG_TYPE_PATH` opens a new tenant scope.
         let is_tenant = req.code.starts_with(TENANT_RG_TYPE_PATH);
 
+        // Reject a caller-supplied `tenant_id` on tenant-typed groups: the
+        // effective tenant is always the group's own (generated) id.
+        Self::reject_tenant_id_on_tenant_type(is_tenant, req.tenant_id)?;
+
+        // Resolve the target tenant: omitted `tenant_id` defaults to the
+        // caller's own tenant. A present `tenant_id` lets an authorized
+        // caller (platform admin / onboarding) target a different tenant.
+        let target_tenant_id = req.tenant_id.unwrap_or(tenant_id);
+
+        // Guardrail: explicit id + cross-tenant target is rejected while
+        // identifier ownership policy is undecided.
+        if req.id.is_some() && target_tenant_id != tenant_id {
+            return Err(DomainError::validation(
+                "id and tenant_id cannot both be set on group creation: an explicit id \
+                 combined with a cross-tenant target is not accepted while identifier \
+                 ownership policy is undecided"
+                    .to_owned(),
+            ));
+        }
+
         // AuthZ gate with provisioning context
-        let _scope =
+        let scope =
             self.enforcer
                 .access_scope_with(
                     ctx,
@@ -250,11 +270,34 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                                     serde_json::Value::String(id.to_string())
                                 }),
                             ),
+                            (
+                                pep_properties::OWNER_TENANT_ID.to_owned(),
+                                serde_json::Value::String(target_tenant_id.to_string()),
+                            ),
                         ])),
                 )
                 .await
                 .map_err(DomainError::from)?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-1
+
+        // When the target tenant differs from the caller's own, re-verify
+        // it against the compiled `AccessScope` rather than trusting the
+        // PDP's `decision: true` alone: a policy that grants "create"
+        // unconditionally must not become an unbounded cross-tenant create.
+        // Skipped when the target is the caller's own tenant, so the common
+        // path is unchanged.
+        if target_tenant_id != tenant_id {
+            let permitted = scope.is_unconstrained()
+                || scope.contains_uuid(pep_properties::OWNER_TENANT_ID, target_tenant_id);
+            if !permitted {
+                debug!(
+                    caller_tenant_id = %tenant_id,
+                    target_tenant_id = %target_tenant_id,
+                    "create_group rejected: target tenant outside caller's AccessScope"
+                );
+                return Err(DomainError::tenant_not_found(target_tenant_id));
+            }
+        }
 
         let profile = self.profile.clone();
         let db = self.db.db();
@@ -277,7 +320,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                         &*type_repo,
                         tx,
                         &req,
-                        tenant_id,
+                        target_tenant_id,
                         &profile,
                     )
                     .await
@@ -1698,6 +1741,23 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         if name.is_empty() || name.chars().count() > 255 {
             return Err(DomainError::validation(
                 "Group name must be between 1 and 255 characters",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reject a caller-supplied `tenant_id` on tenant-typed groups: tenant
+    /// groups derive their `tenant_id` from the group's own id, not from a
+    /// request field.
+    fn reject_tenant_id_on_tenant_type(
+        is_tenant: bool,
+        tenant_id: Option<Uuid>,
+    ) -> Result<(), DomainError> {
+        if is_tenant && tenant_id.is_some() {
+            return Err(DomainError::validation(
+                "Tenant-typed groups cannot have an explicit tenant_id: \
+                 their effective tenant is always the group's own id"
+                    .to_owned(),
             ));
         }
         Ok(())
