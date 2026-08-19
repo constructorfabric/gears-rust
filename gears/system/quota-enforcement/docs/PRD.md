@@ -123,7 +123,6 @@ idempotent operations, and a uniform evaluation contract.
 | Subject Projection        | A registered, versioned GTS type derived from `gts.cf.core.qe.subj.v1~`. It is the published request contract and the subject-type half of Quota identity; it refines `metadata`, declares admitted metrics, and encodes a scope such as an owner's `user` or `tenant` scope.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | Resource Projection       | A registered, versioned GTS type derived from `gts.cf.core.qe.res.v1~` that describes the optional resource identity and request properties available to Policies. It does not enter the P1 counter key.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | Projection                | A deliberate DTO-style copy of quota-relevant fields from a caller's domain object into a metric-owner-declared subject or resource contract. The owner declares it; every caller populates it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| Deployment Generation     | QE replicas bootstrapped with the same immutable `ProjectionContractCatalog`. During a breaking projection cutover, only one generation may receive evaluation traffic.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | Subject Resolution        | The process of resolving every applicable owner projection scope for an operation and deriving each concrete subject id from `SecurityContext`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | Metric                    | The named resource being counted. Metric names are registered as usage types in the platform `types-registry`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Quota                     | A declarative limit assigned to a single subject for a single metric. Carries the subject reference, metric reference, quota type, period (consumption types only), enforcement mode, cap, optional notification thresholds, optional validity window, and optional failure-mode hint. Identified by a stable quota ID. Quotas are first-class stored entities — there is no separate "template" or "binding" concept; an operator who wants the same shape on many subjects creates one Quota per subject (typically driven by the subject manager at subject-creation time).                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -210,8 +209,8 @@ of scope for this PRD); Quota Manager translates their workflows into QE API cal
   increase-request workflow, and the human-facing surfaces for tenant administrators and end users. Calls Quota
   Enforcement's CRUD and read APIs on their behalf, propagating the original caller's SecurityContext for PDP scoping.
   It resolves the owning Gear for each metric so Quotas are created against that owner's projection, and it orchestrates
-  replacement of Quotas when an owner publishes a breaking projection version. Out of scope for this PRD — described
-  here only because QE's actor model and permission table refer to it.
+  replacement of Quotas when a future release supports breaking projection activation. That workflow is out of P1 and
+  is described here only because QE's actor model and permission table refer to it.
 - **Needs**: Stable Quota CRUD APIs (create, update, deactivate, read), bulk Quota Snapshot reads with PDP scoping,
   Quota Snapshot reads scoped to a single user/tenant, credit primitive for redistribution and compensatory adjustments.
 
@@ -699,14 +698,13 @@ The subject registry is the set of concrete owner projections in `types-registry
 instances are replaced by owner-scoped projection types such as
 `gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.tenant.v1~` and
 `gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~`. QE **MUST** reject Quota creation against an unregistered,
-abstract, non-subject, or unknown-scope projection, or one that does not admit the Quota's metric. Creation **MUST**
-validate the registry contract rather than require membership in the replica's active `ProjectionContractCatalog`, so
-a registered concrete replacement projection may receive pre-staged Quotas before cutover.
+abstract, non-subject, unknown-scope, or non-configured projection, or one that does not admit the Quota's metric.
 
 Bootstrap **MUST** enforce a 1:1 relationship between configured concrete projections and resolvers, validate every
-admitted metric reference, and fail the Gear on mismatch. Resolution logic that inspects `SecurityContext.subject_type`
-**MUST** match the platform's actual short values rather than a GTS identifier. Anonymous contexts and nil UUID subject
-or tenant ids **MUST** be rejected; they are not valid Quota subjects.
+admitted metric reference, and fail the Gear on mismatch. It **MUST** also fail when the configured catalogue is
+incompatible with any active Quota or Policy. Resolution logic that inspects `SecurityContext.subject_type` **MUST**
+match the platform's actual short values rather than a GTS identifier. Anonymous contexts and nil UUID subject or tenant
+ids **MUST** be rejected; they are not valid Quota subjects.
 
 - **Rationale**: Registry-resident owner projections provide discoverable identity and shape while explicit resolver
   consistency keeps subject derivation server-side and auditable.
@@ -716,8 +714,10 @@ or tenant ids **MUST** be rejected; they are not valid Quota subjects.
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-fr-subject-resolution`
 
-The system **MUST** apply every applicable owner projection resolver to `SecurityContext`. For an operation whose
-context yields tenant `T` and user `U`, an owner supporting both scopes **MUST** produce
+The system **MUST** derive the complete projection set for the request metric from the server-side
+`ProjectionContractCatalog` and apply every applicable resolver in that set to `SecurityContext`. The caller-declared
+projection **MUST** be a member of the set but **MUST NOT** select or narrow it. For an operation whose context yields
+tenant `T` and user `U`, an owner supporting both scopes **MUST** produce
 `{(owner-tenant-projection, T), (owner-user-projection, U)}`. The system **MUST** then fetch every active Quota whose
 `(projection_type, subject_id)` pair is in that set and forward those Quotas to
 multi-quota evaluation (`cpt-cf-quota-enforcement-fr-multi-quota-evaluation`).
@@ -774,8 +774,8 @@ assignment-binding concept. Each Quota **MUST** carry:
 - a `source` value identifying who imposed the Quota; see **Source value semantics** below.
 
 The system **MUST** reject creation of a Quota whose projection is not registered, concrete, derived from the QE subject
-base, or does not admit the metric, and **MUST** reject a `subject_id` that violates the declared scope. The projection
-need not be active in the receiving replica's evaluation catalogue; such a Quota remains unevaluated until cutover.
+base, is absent from the configured evaluation catalogue, or does not admit the metric, and **MUST** reject a
+`subject_id` that violates the declared scope.
 
 **Source value semantics.** `source` instances live under base `gts.cf.qe.source.type.v1~`. P1 seeds two:
 `gts.cf.qe.source.type.v1~cf.qe.source.licensing.v1` (default; caps materialized from the licensing layer) and
@@ -820,13 +820,10 @@ the lease ID, owning subject context, held amount, and the deactivated `quota_id
 ID and the subject reference; breaking changes (changing metric, type, period, or subject) **MUST** be performed by
 deactivating the original Quota and creating a new one.
 
-A projection version change **MUST** follow ADR-0007's ordered breaking-version procedure. QE provides no projection
-alias or Quota/counter migration operation: replacement Quotas have new IDs and counters, with no transferred
-consumption. Catalogue, Quota, and Policy-draft verification **MUST** finish while the old generation serves. At a
-consumption-period boundary, QE drains evaluations, atomically activates the complete affected Policy set, verifies one
-compatible catalogue/Quota/Policy set, and switches traffic. The barrier **MUST NOT** exceed 30 seconds and counts
-against `cpt-cf-quota-enforcement-nfr-availability`. Mixed-generation traffic is forbidden. Replacement at scale
-depends on `cpt-cf-quota-enforcement-fr-bulk-quota-crud` (P2).
+Activating a breaking projection-version change is **out of scope for P1**. The current version remains active. A
+replacement contract may be registered, but Quota and Policy writes referencing it and deployments whose configured
+catalogue is incompatible with any active Quota or Policy **MUST** be rejected; writes return
+`PROJECTION_NOT_RESOLVABLE`. P1 provides no projection alias or Quota/counter migration operation.
 
 **Cap reductions guard.** A Quota update that would reduce `cap` strictly below the Quota's current consumed amount (
 consumption-type Quotas, within the active period) or current in-flight count (allocation-type Quotas) **MUST** be
@@ -1785,11 +1782,6 @@ update; `active → rolled_back` on rollback; `active → deleted` plus latest-p
 atomically. No reader observes intermediate states; any concurrent evaluation either sees the prior version, the new
 version, or (post-delete) falls through to the next-most-specific scope, never an inconsistent mix.
 
-**Contract-set activation.** Projection cutover names the outgoing and replacement contracts and supplies a draft and
-expected version for every affected active Policy. QE derives that set server-side and rejects missing, extra, invalid,
-or conflicting replacements. Storage activates the complete set in one transaction or changes nothing; the same
-operation restores an old-generation-compatible set during rollback.
-
 **EvaluationContext + Decision diagnostics.** The `EvaluationContext.active_policy` field exposes both `policy_id` and
 `policy_version` to Engines. Decision `diagnostics` **MUST** include `engine_id`, `policy_id`, and `policy_version` of
 the Policy that produced the Decision so operators inspecting a Decision (via
@@ -2350,8 +2342,6 @@ gauges that surface QE-internal policy decisions and guard-rail rejections invis
   §3.2 inertness rule (surfaces operator misconfigurations where a Quota was declared on a non-gated metric).
 - **`contract_validation_failures_total`** — rejected contract instances by closed validation surface/reason.
 - **`admitted_metric_violations_total`** — projection/metric incompatibilities by closed validation surface.
-- **`projection_cutover_barrier_seconds`** — time from old-generation admission stop to new-generation admission; every
-  observation **MUST NOT** exceed 30 seconds and counts as evaluation unavailability.
 
 Labels **MUST NOT** include high/unbounded-cardinality identifiers (`tenant_id`, `subject_id`, `quota_id`, `policy_id`,
 `idempotency_key`, `lease_token`, metric, projection type, caller attribution). Permitted dimensions are deployment-
@@ -2423,9 +2413,6 @@ billion total active Quotas.
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-nfr-availability`
 
 The system **MUST** maintain 99.95% monthly availability for evaluation endpoints.
-
-The breaking-projection cutover barrier is limited to 30 seconds and counts against this availability budget. A cutover
-**MUST NOT** start when its maximum duration would exceed the remaining monthly budget.
 
 - **Threshold**: 99.95% uptime per calendar month
 - **Rationale**: Quota evaluation is on the critical path for every guarded operation; downtime translates directly to
@@ -2576,9 +2563,9 @@ The following commonly applicable NFR categories are not applicable to this gear
 - **Stability**: unstable (v0)
 
 - **Description**: Public SDK interfaces cover consumer evaluation, Quota Manager operations, and operator-only Policy
-  management. Atomic contract-set activation is operator-only per §2.3. Evaluation inputs include typed projections and
-  diagnostic `caller_type` metadata but never a caller-supplied subject id. Projection registration remains a
-  `types-registry` operation. Exact interfaces are defined in DESIGN.md.
+  management. Evaluation inputs include typed projections and diagnostic `caller_type` metadata but never a
+  caller-supplied subject id. Projection registration remains a `types-registry` operation. Exact interfaces are defined
+  in DESIGN.md.
 
 - **Breaking Change Policy**: Unstable during initial development; will stabilize in a future version (target: v1).
 
@@ -2591,8 +2578,7 @@ The following commonly applicable NFR categories are not applicable to this gear
 - **Stability**: unstable (v0)
 
 - **Description**: REST endpoints covering the same operations as the SDK interfaces, intended for cross-language
-  integration and for external consumers that cannot link the Rust SDK directly. This includes
-  `POST /v1/quota-enforcement/policies/contract-set-activation` for the atomic Policy step of projection cutover.
+  integration and for external consumers that cannot link the Rust SDK directly.
 
 - **Breaking Change Policy**: Unstable during initial development; will follow `/v1/quota-enforcement/...` versioning at
   stabilization.
@@ -2620,8 +2606,7 @@ ingress.
 
 - **Direction**: required from plugin implementor
 
-- **Protocol/Format**: Rust trait implemented by each storage backend plugin. Its contract-set activation derives the
-  affected Policy set and atomically activates all valid replacements or none.
+- **Protocol/Format**: Rust trait implemented by each storage backend plugin.
 
 - **Compatibility**: Plugin contract versioned with the gear's major version; plugins must match the gear's major
   version.
@@ -2700,7 +2685,8 @@ on behalf of a tenant administrator)
 - Caller is authenticated with the appropriate scope (operator-level for cross-tenant operations; Quota Manager
   forwarding a tenant administrator's SecurityContext for own-tenant operations)
 - Target metric is registered in `types-registry`
-- Target owner projection is registered, concrete, derived from the QE subject base, and admits the metric
+- Target owner projection is registered, concrete, configured for evaluation, derived from the QE subject base, and
+  admits the metric
 
 **Main Flow**:
 
@@ -2708,20 +2694,19 @@ on behalf of a tenant administrator)
    `source` (defaults to `licensing` when omitted; `operator` for manual caps), optional notification thresholds,
    optional validity window, optional failure-mode hint, optional metadata)
 1. System validates the payload (metric exists; type/period combinatorics are valid; owner projection is registered,
-   concrete, derived from the QE subject base, and admits the metric; Quota metadata conforms to its separate owner
-   contract). This registry validation does not require the projection to be in the active evaluation catalogue.
+   concrete, present in the configured evaluation catalogue, derived from the QE subject base, and admits the metric;
+   Quota metadata conforms to its separate owner contract).
 1. System persists the Quota with a server-assigned quota ID and emits a `quota-changed` notification event
 
 **Postconditions**:
 
-- If its projection is in the active evaluation catalogue, the Quota is immediately effective. Otherwise it is
-  pre-staged and remains unevaluated until that catalogue generation becomes active. Once effective, it joins any other
-  applicable Quotas and arbitration is resolved by the active Quota Resolution Policy (default
-  `most-restrictive-wins`).
+- The Quota is immediately effective and joins any other applicable Quotas; arbitration is resolved by the active Quota
+  Resolution Policy (default `most-restrictive-wins`).
 
 **Alternative Flows**:
 
 - **Unknown metric**: System rejects with actionable error
+- **Projection outside the configured catalogue**: System rejects with `PROJECTION_NOT_RESOLVABLE`
 - **`types-registry` unreachable**: System rejects with actionable error
 - **`type=rate`**: System rejects with `NOT_YET_IMPLEMENTED` error in P1
 - **Invalid projection or Quota-attribute contract**: System rejects with the corresponding canonical field/precondition error
@@ -3062,10 +3047,8 @@ on behalf of a tenant administrator)
   `change_kind = "deleted"`; `delete_policy` against the seeded global Policy is rejected with
   `CANNOT_DELETE_SEEDED_GLOBAL_POLICY`; the seeded built-in global Policy materializes at bootstrap as
   `policy_version = 1`
-- [ ] Projection cutover derives every affected active Policy server-side and activates the complete replacement set in
-  one transaction; missing, extra, invalid, or conflicting replacements change nothing. Prechecks run while the old
-  generation serves; mixed-generation traffic is forbidden; the cutover barrier is at most 30 seconds and is charged to
-  the availability budget; failure restores an old-generation-compatible Policy set and routing
+- [ ] P1 rejects breaking projection-version activation: Quota and Policy writes referencing a projection outside the
+  configured catalogue fail, and bootstrap fails when the catalogue is incompatible with an active Quota or Policy
 - [ ] Self-declared `caller_type` is absent from `EvaluationContext`; Policy validation rejects any reference to it, and
   changing it cannot change authorization, applicable Quotas, a Decision/Debit Plan, or any counter/allocation key
 - [ ] Decision diagnostics on every evaluation include `engine_id`, `policy_id`, and `policy_version` of the Policy that

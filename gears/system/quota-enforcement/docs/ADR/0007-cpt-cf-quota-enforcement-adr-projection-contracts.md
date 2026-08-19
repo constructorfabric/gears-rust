@@ -97,7 +97,9 @@ The decisions that follow:
   keyed by `(projection_type, subject_id, metric)`; several Quotas may share that key.
 * **Scope cascade requires every applicable owner projection to resolve** — the owner's
   `user.v1~` and `tenant.v1~`, for example — so user- and tenant-scoped Quotas reach the
-  Engine together.
+  Engine together. At bootstrap, QE derives the authoritative metric-to-projection set from
+  the configured projections' admitted-metric declarations. A caller-declared projection is
+  validated against that set but cannot select or narrow it.
 * **Only the projection type travels on the wire.** The subject `id` is always resolved
   server-side from `SecurityContext`, and consumption DTOs MUST NOT accept one. QE has no
   type-level subject operation, so the resolved id is required and non-nil; an anonymous
@@ -184,12 +186,11 @@ Contracts are resolved and snapshotted **outside** the evaluation transaction:
 * **Bootstrap** builds an immutable in-process `ProjectionContractCatalog` for the
   deployment's configured projections; Gateway validates evaluation requests against that local
   snapshot. `types-registry` remains authoritative; QE's catalogue is only a validated local
-  snapshot. A new contract version becomes evaluable only in a deployment generation whose
-  bootstrap catalogue includes it. P1 has no runtime refresh path.
+  snapshot. A new contract version becomes evaluable only when the configured catalogue includes
+  it. P1 has no runtime refresh or breaking-version activation path.
 * **`QuotaManagementService`** owns the `TypesRegistryClient` and a bounded LRU cache for
   metric, projection, and Quota-attribute contract lookups. Quota creation validates the
-  registry contract, not the active evaluation catalogue, so replacement Quotas can be staged
-  before cutover.
+  registry contract and requires the projection to be in the configured evaluation catalogue.
 * **`PolicyService`** resolves the contracts a Policy references and snapshots their schema
   and version with the immutable Policy version.
 * **Registration happens in `types-registry`.** QE gains no registration endpoint.
@@ -247,8 +248,8 @@ well-known instances, then validates a closed consistency set:
 QE reads each projection's registry-validated effective `scope` trait and compares its
 `GtsInstanceId` directly.
 
-Any mismatch fails gear bootstrap. Owner projections not configured in that deployment stay
-discoverable and may receive pre-staged Quotas, but are not evaluated by that generation.
+Any mismatch fails gear bootstrap. Owner projections outside the configured catalogue remain
+discoverable, but P1 rejects Quota and Policy writes that reference them.
 
 ### Consequences
 
@@ -257,22 +258,12 @@ narrow — including narrowing the admitted-metric set — requires a new contra
 a *required* property likewise requires a new version, because every existing caller populates
 the owner's contract.
 
-**Breaking-version replacement.** QE provides no projection alias or Quota/counter migration verb.
-Replacement Quotas get new ids and counters, with no carried-forward consumption. P1 uses this
-ordered procedure:
-
-1. Register the replacement contracts, Quotas, and Policy drafts, then verify them while the old
-   generation serves.
-2. At a consumption-period boundary, stop old-generation admission and drain in-flight evaluations.
-   This cutover barrier MUST NOT exceed 30 seconds and counts against the availability budget.
-3. Atomically activate the complete set of affected Policy versions under expected-version checks.
-   Missing, extra, invalid, or conflicting replacements abort the transaction.
-4. Route traffic only after the new generation's catalogue, Quotas, and active Policies form one
-   compatible set. On failure or timeout, restore the old Policy set and routing before admission.
-5. Deactivate the old Quotas; allocation deactivation resolves active leases.
-
-Mixed-generation evaluation traffic is forbidden because the generations use independent counters.
-Replacement at scale depends on P2 Bulk Quota CRUD.
+**Breaking-version replacement is not supported in P1.** The current projection remains active. A
+replacement contract may be registered, but P1 rejects Quota and Policy writes that reference it and
+rejects bootstrap if the configured catalogue would leave any active Quota or Policy on an
+incompatible version. Safe activation requires a future transition mechanism that prevents
+cross-version admission and preserves idempotency across projection versions; QE provides no
+projection alias or Quota/counter migration verb in P1.
 
 * Attribute mistakes become save-time or ingress errors instead of silent Quota-selection
   misses.
