@@ -535,6 +535,8 @@ humantime = "2.3.0"
 # URL parsing
 url = "2.5"
 urlencoding = "2.1"
+# Percent-decode URL userinfo before applying credentials (e.g. ClickHouse DSN).
+percent-encoding = "2"
 
 # Regex for env expansion
 regex = "1.10"
