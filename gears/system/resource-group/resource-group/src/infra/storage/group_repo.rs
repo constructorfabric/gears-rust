@@ -1068,6 +1068,10 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         group_id: Uuid,
     ) -> Result<i32, DomainError> {
+        // `Expr::max` (the SQL aggregate) lives on `ExprTrait` as of
+        // sea-query 1.0. Imported here rather than file-wide: its `max`
+        // would shadow `Ord::max` for the paginating methods above.
+        use sea_orm::ExprTrait;
         use sea_orm::{FromQueryResult, QuerySelect};
 
         #[derive(FromQueryResult)]
