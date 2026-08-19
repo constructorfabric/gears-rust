@@ -6,13 +6,16 @@ use toolkit::api::{OpenApiRegistry, OperationBuilder};
 
 use crate::api::rest::{dto, handlers};
 use crate::domain::service::Service;
+use crate::infra::storage::sea_orm_repo::SeaOrmGithubRepoRepository;
+
+pub type ConcreteService = Service<SeaOrmGithubRepoRepository>;
 
 const API_TAG: &str = "GitHub Mirror";
 
 pub fn register_routes(
     mut router: Router,
     openapi: &dyn OpenApiRegistry,
-    service: Arc<Service>,
+    service: Arc<ConcreteService>,
 ) -> Router {
     router = OperationBuilder::get("/github-mirror/v1/health")
         .operation_id("github_mirror.health")

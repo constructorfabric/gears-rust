@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::sync::Arc;
 
 use axum::Router;
@@ -7,40 +9,19 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use github_mirror::GithubMirrorGear;
 use toolkit::api::OpenApiRegistryImpl;
-use toolkit::{ClientHub, ConfigProvider, Gear, GearCtx, RestApiCapability};
+use toolkit::{ClientHub, Gear, RestApiCapability};
 use tower::ServiceExt;
-use uuid::Uuid;
-
-struct StaticConfig {
-    section: Option<serde_json::Value>,
-}
-
-impl ConfigProvider for StaticConfig {
-    fn get_gear_config(&self, gear_name: &str) -> Option<&serde_json::Value> {
-        if gear_name == "github-mirror" {
-            self.section.as_ref()
-        } else {
-            None
-        }
-    }
-}
-
-fn ctx_with(section: Option<serde_json::Value>) -> GearCtx {
-    GearCtx::new(
-        "github-mirror",
-        Uuid::new_v4(),
-        Arc::new(StaticConfig { section }),
-        Arc::new(ClientHub::new()),
-        tokio_util::sync::CancellationToken::new(),
-    )
-}
 
 #[tokio::test]
 async fn init_then_register_rest_serves_health_with_configured_url() {
     let gear = GithubMirrorGear::default();
-    let ctx = ctx_with(Some(serde_json::json!({
-        "config": { "api_base_url": "https://ghe.corp/api/v3" }
-    })));
+    let ctx = common::gear_ctx(
+        Arc::new(ClientHub::new()),
+        Some(serde_json::json!({
+            "config": { "api_base_url": "https://ghe.corp/api/v3" }
+        })),
+    )
+    .await;
 
     gear.init(&ctx).await.expect("init must succeed");
 
@@ -64,7 +45,7 @@ async fn init_then_register_rest_serves_health_with_configured_url() {
 #[tokio::test]
 async fn init_without_config_section_uses_defaults() {
     let gear = GithubMirrorGear::default();
-    let ctx = ctx_with(None);
+    let ctx = common::gear_ctx(Arc::new(ClientHub::new()), None).await;
 
     let result = gear.init(&ctx).await;
 
@@ -74,7 +55,7 @@ async fn init_without_config_section_uses_defaults() {
 #[tokio::test]
 async fn second_init_fails_with_already_initialized() {
     let gear = GithubMirrorGear::default();
-    let ctx = ctx_with(None);
+    let ctx = common::gear_ctx(Arc::new(ClientHub::new()), None).await;
 
     gear.init(&ctx).await.expect("first init must succeed");
     let second = gear.init(&ctx).await;
@@ -86,7 +67,7 @@ async fn second_init_fails_with_already_initialized() {
 #[tokio::test]
 async fn register_rest_before_init_fails() {
     let gear = GithubMirrorGear::default();
-    let ctx = ctx_with(None);
+    let ctx = common::gear_ctx(Arc::new(ClientHub::new()), None).await;
 
     let openapi = OpenApiRegistryImpl::new();
     let result = gear.register_rest(&ctx, Router::new(), &openapi);

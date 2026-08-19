@@ -1,19 +1,16 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::Arc;
+mod common;
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use github_mirror::api::rest::routes::register_routes;
-use github_mirror::domain::service::{Service, ServiceConfig};
 use toolkit::api::OpenApiRegistryImpl;
 use tower::ServiceExt;
 
-fn test_router(api_base_url: &str) -> Router {
-    let service = Arc::new(Service::new(ServiceConfig {
-        api_base_url: api_base_url.to_owned(),
-    }));
+async fn test_router(api_base_url: &str) -> Router {
+    let service = common::service(api_base_url).await;
     let openapi = OpenApiRegistryImpl::new();
     register_routes(Router::new(), &openapi, service)
 }
@@ -25,7 +22,7 @@ async fn body_json(response: axum::http::Response<Body>) -> serde_json::Value {
 
 #[tokio::test]
 async fn health_returns_200_with_gear_identity() {
-    let router = test_router("https://api.github.com");
+    let router = test_router("https://api.github.com").await;
 
     let request = Request::builder()
         .uri("/github-mirror/v1/health")
@@ -42,7 +39,7 @@ async fn health_returns_200_with_gear_identity() {
 
 #[tokio::test]
 async fn health_reflects_configured_base_url() {
-    let router = test_router("https://github.example.corp/api/v3");
+    let router = test_router("https://github.example.corp/api/v3").await;
 
     let request = Request::builder()
         .uri("/github-mirror/v1/health")
@@ -57,7 +54,7 @@ async fn health_reflects_configured_base_url() {
 
 #[tokio::test]
 async fn unknown_route_returns_404() {
-    let router = test_router("https://api.github.com");
+    let router = test_router("https://api.github.com").await;
 
     let request = Request::builder()
         .uri("/github-mirror/v1/nope")

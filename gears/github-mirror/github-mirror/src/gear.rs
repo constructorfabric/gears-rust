@@ -6,19 +6,24 @@ use toolkit::api::OpenApiRegistry;
 use toolkit::{Gear, GearCtx, RestApiCapability};
 use tracing::info;
 
+use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
 use github_mirror_sdk::GithubMirrorClientV1;
 
 use crate::api::rest::routes;
 use crate::config::GithubMirrorConfig;
 use crate::domain::local_client::LocalClient;
 use crate::domain::service::{Service, ServiceConfig};
+use crate::infra::storage::sea_orm_repo::SeaOrmGithubRepoRepository;
+
+type ConcreteService = Service<SeaOrmGithubRepoRepository>;
 
 #[toolkit::gear(
     name = "github-mirror",
-    capabilities = [rest]
+    deps = [authz_resolver],
+    capabilities = [rest, db]
 )]
 pub struct GithubMirrorGear {
-    service: OnceLock<Arc<Service>>,
+    service: OnceLock<Arc<ConcreteService>>,
 }
 
 impl Default for GithubMirrorGear {
@@ -29,15 +34,36 @@ impl Default for GithubMirrorGear {
     }
 }
 
+impl toolkit::contracts::DatabaseCapability for GithubMirrorGear {
+    fn migrations(&self) -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
+        use sea_orm_migration::MigratorTrait;
+        crate::infra::storage::migrations::Migrator::migrations()
+    }
+}
+
 #[async_trait]
 impl Gear for GithubMirrorGear {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         let cfg: GithubMirrorConfig = ctx.config_or_default()?;
         info!(api_base_url = %cfg.api_base_url, "Initializing github-mirror gear");
 
-        let service = Arc::new(Service::new(ServiceConfig {
-            api_base_url: cfg.api_base_url,
-        }));
+        let db = Arc::new(ctx.db_required()?);
+        let repo = Arc::new(SeaOrmGithubRepoRepository::new());
+
+        let authz = ctx
+            .client_hub()
+            .get::<dyn AuthZResolverClient>()
+            .map_err(|e| anyhow::anyhow!("failed to get AuthZ resolver: {e}"))?;
+        let policy_enforcer = PolicyEnforcer::new(authz);
+
+        let service = Arc::new(Service::new(
+            db,
+            repo,
+            policy_enforcer,
+            ServiceConfig {
+                api_base_url: cfg.api_base_url,
+            },
+        ));
 
         self.service
             .set(service.clone())
@@ -78,5 +104,12 @@ mod tests {
     fn default_gear_has_no_service_until_init() {
         let gear = GithubMirrorGear::default();
         assert!(gear.service.get().is_none());
+    }
+
+    #[test]
+    fn gear_provides_initial_migration() {
+        use toolkit::contracts::DatabaseCapability;
+        let gear = GithubMirrorGear::default();
+        assert_eq!(gear.migrations().len(), 1);
     }
 }

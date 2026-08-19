@@ -1,50 +1,44 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod common;
+
 use std::sync::Arc;
 
 use github_mirror::GithubMirrorGear;
+use github_mirror::domain::repo::RepositoryRecord;
 use github_mirror_sdk::GithubMirrorClientV1;
-use toolkit::{ClientHub, ConfigProvider, Gear, GearCtx};
+use toolkit::{ClientHub, Gear};
 use toolkit_odata::ODataQuery;
-use toolkit_security::SecurityContext;
-use uuid::Uuid;
 
-struct NoConfig;
-
-impl ConfigProvider for NoConfig {
-    fn get_gear_config(&self, _gear_name: &str) -> Option<&serde_json::Value> {
-        None
+fn record(id: i64, owner: &str, name: &str) -> RepositoryRecord {
+    RepositoryRecord {
+        id,
+        owner: owner.to_owned(),
+        name: name.to_owned(),
+        full_name: format!("{owner}/{name}"),
+        default_branch: "main".to_owned(),
+        private: false,
+        pushed_at: None,
+        stars: 0,
+        forks: 0,
+        description: Some("mirrored".to_owned()),
     }
-}
-
-fn test_ctx(hub: Arc<ClientHub>) -> GearCtx {
-    GearCtx::new(
-        "github-mirror",
-        Uuid::new_v4(),
-        Arc::new(NoConfig),
-        hub,
-        tokio_util::sync::CancellationToken::new(),
-    )
-}
-
-fn caller() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::new_v4())
-        .subject_tenant_id(Uuid::new_v4())
-        .build()
-        .unwrap_or_else(|e| panic!("test caller context must build: {e}"))
 }
 
 #[tokio::test]
 async fn consumer_resolves_client_from_hub_and_queries_status() {
     let hub = Arc::new(ClientHub::new());
     let gear = GithubMirrorGear::default();
-    gear.init(&test_ctx(hub.clone())).await.unwrap_or_default();
+    gear.init(&common::gear_ctx(hub.clone(), None).await)
+        .await
+        .expect("init must succeed");
 
     let client = hub
         .get::<dyn GithubMirrorClientV1>()
         .unwrap_or_else(|e| panic!("consumer must resolve the client from ClientHub: {e}"));
 
     let status = client
-        .status(&caller())
+        .status(&common::caller())
         .await
         .unwrap_or_else(|e| panic!("status query must succeed: {e}"));
 
@@ -54,22 +48,39 @@ async fn consumer_resolves_client_from_hub_and_queries_status() {
 }
 
 #[tokio::test]
-async fn list_repositories_is_honestly_unimplemented_until_storage_port() {
+async fn list_repositories_via_hub_returns_seeded_rows() {
+    let db = common::inmem_db().await;
+    let service = common::service_over(db.clone(), "https://api.github.com");
+
+    let tenant = uuid::Uuid::new_v4();
+    let ctx = common::caller_in(tenant);
+    service
+        .upsert_repository(&ctx, record(101, "constructorfabric", "gears-rust"))
+        .await
+        .unwrap_or_else(|e| panic!("seed upsert must succeed: {e}"));
+    service
+        .upsert_repository(&ctx, record(102, "constructorfabric", "github-repotap"))
+        .await
+        .unwrap_or_else(|e| panic!("seed upsert must succeed: {e}"));
+
     let hub = Arc::new(ClientHub::new());
     let gear = GithubMirrorGear::default();
-    gear.init(&test_ctx(hub.clone())).await.unwrap_or_default();
+    let gear_ctx = common::gear_ctx(hub.clone(), None)
+        .await
+        .with_db(toolkit_db::DBProvider::new(db));
+    gear.init(&gear_ctx).await.expect("init must succeed");
 
     let client = hub
         .get::<dyn GithubMirrorClientV1>()
         .unwrap_or_else(|e| panic!("consumer must resolve the client from ClientHub: {e}"));
 
-    let result = client
-        .list_repositories(&caller(), ODataQuery::default())
-        .await;
+    let page = client
+        .list_repositories(&ctx, ODataQuery::default())
+        .await
+        .unwrap_or_else(|e| panic!("list must succeed: {e}"));
 
-    let err = result.err().map(|e| e.to_string()).unwrap_or_default();
-    assert!(
-        err.to_lowercase().contains("unimplemented") || err.contains("4551"),
-        "expected the Unimplemented canonical category, got: {err}"
-    );
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].full_name, "constructorfabric/gears-rust");
+    assert_eq!(page.items[1].full_name, "constructorfabric/github-repotap");
+    assert_eq!(page.items[0].id, 101);
 }

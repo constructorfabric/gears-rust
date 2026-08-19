@@ -1,6 +1,30 @@
+use std::sync::Arc;
+
+use authz_resolver_sdk::PolicyEnforcer;
+use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
+use github_mirror_sdk::Repository;
 use toolkit_macros::domain_model;
+use toolkit_odata::{ODataQuery, Page, PageInfo};
+use toolkit_security::{SecurityContext, pep_properties};
+
+use super::error::DomainError;
+use super::repo::{GithubRepoRepository, RepositoryRecord};
 
 pub const GEAR_NAME: &str = "github-mirror";
+
+const DEFAULT_LIST_LIMIT: u64 = 50;
+
+pub(crate) type DbProvider = toolkit_db::DBProvider<toolkit_db::DbError>;
+
+pub(crate) const REPOSITORY_RESOURCE: ResourceType = ResourceType::from_static(
+    "github_mirror.repository",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
+
+pub(crate) mod actions {
+    pub const LIST: &str = "list";
+    pub const UPSERT: &str = "upsert";
+}
 
 #[domain_model]
 #[derive(Debug, Clone)]
@@ -17,14 +41,26 @@ pub struct MirrorStatus {
 }
 
 #[domain_model]
-pub struct Service {
+pub struct Service<R: GithubRepoRepository> {
+    db: Arc<DbProvider>,
+    repo: Arc<R>,
+    policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
 }
 
-impl Service {
-    #[must_use]
-    pub fn new(config: ServiceConfig) -> Self {
-        Self { config }
+impl<R: GithubRepoRepository> Service<R> {
+    pub fn new(
+        db: Arc<DbProvider>,
+        repo: Arc<R>,
+        policy_enforcer: PolicyEnforcer,
+        config: ServiceConfig,
+    ) -> Self {
+        Self {
+            db,
+            repo,
+            policy_enforcer,
+            config,
+        }
     }
 
     #[must_use]
@@ -35,22 +71,67 @@ impl Service {
             api_base_url: self.config.api_base_url.clone(),
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    /// List mirrored repositories visible to the caller's tenant.
+    ///
+    /// # Errors
+    /// Returns `DomainError::Forbidden` when the PDP denies access and
+    /// `DomainError::Database`/`Internal` on storage failures.
+    pub async fn list_repositories(
+        &self,
+        ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<Repository>, DomainError> {
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &REPOSITORY_RESOURCE,
+                actions::LIST,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
+            )
+            .await?;
 
-    #[test]
-    fn status_reports_gear_name_and_configured_base_url() {
-        let service = Service::new(ServiceConfig {
-            api_base_url: "https://api.github.com".to_owned(),
-        });
+        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+        let conn = self.db.conn()?;
+        let items = self.repo.list(&conn, &scope, limit).await?;
 
-        let status = service.status();
+        Ok(Page::new(
+            items,
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit,
+            },
+        ))
+    }
 
-        assert_eq!(status.gear, GEAR_NAME);
-        assert_eq!(status.api_base_url, "https://api.github.com");
-        assert!(!status.version.is_empty());
+    /// Insert or update a mirrored repository row for the caller's tenant.
+    ///
+    /// # Errors
+    /// Returns `DomainError::Forbidden` when the PDP denies access and
+    /// `DomainError::Database`/`Internal` on storage failures.
+    pub async fn upsert_repository(
+        &self,
+        ctx: &SecurityContext,
+        record: RepositoryRecord,
+    ) -> Result<Repository, DomainError> {
+        let tenant_id = ctx.subject_tenant_id();
+
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &REPOSITORY_RESOURCE,
+                actions::UPSERT,
+                None,
+                &AccessRequest::new().resource_property(pep_properties::OWNER_TENANT_ID, tenant_id),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        self.repo.upsert(&conn, &scope, tenant_id, record).await
     }
 }

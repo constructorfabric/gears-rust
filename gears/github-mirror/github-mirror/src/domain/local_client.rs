@@ -7,25 +7,58 @@ use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 
+use crate::domain::error::DomainError;
+use crate::domain::repo::GithubRepoRepository;
 use crate::domain::service::Service;
 
 #[resource_error(gts_id!("cf.core.github_mirror.repository.v1~"))]
 pub struct RepositoryError;
 
-#[domain_model]
-pub struct LocalClient {
-    service: Arc<Service>,
+impl From<DomainError> for CanonicalError {
+    // Flat match on the domain enum is the whole point of this conversion;
+    // the structured `tracing::*!` macros count toward cognitive complexity
+    // but splitting the arms into helpers would just hide the mapping.
+    #[allow(clippy::cognitive_complexity)]
+    fn from(e: DomainError) -> Self {
+        match e {
+            DomainError::NotFound => RepositoryError::not_found("Repository not found")
+                .with_resource("repository")
+                .create(),
+            DomainError::Validation { field, message } => RepositoryError::invalid_argument()
+                .with_field_violation(field, message, "VALIDATION_ERROR")
+                .create(),
+            DomainError::Forbidden(msg) => {
+                tracing::warn!(msg = %msg, "github-mirror access forbidden");
+                RepositoryError::not_found("Repository not found or not accessible")
+                    .with_resource("repository")
+                    .create()
+            }
+            DomainError::Internal(msg) => {
+                tracing::error!(msg = %msg, "github-mirror internal error");
+                CanonicalError::internal(msg).create()
+            }
+            DomainError::Database(db_err) => {
+                tracing::error!(error = ?db_err, "github-mirror database error");
+                CanonicalError::internal(db_err.to_string()).create()
+            }
+        }
+    }
 }
 
-impl LocalClient {
+#[domain_model]
+pub struct LocalClient<R: GithubRepoRepository + 'static> {
+    service: Arc<Service<R>>,
+}
+
+impl<R: GithubRepoRepository + 'static> LocalClient<R> {
     #[must_use]
-    pub fn new(service: Arc<Service>) -> Self {
+    pub fn new(service: Arc<Service<R>>) -> Self {
         Self { service }
     }
 }
 
 #[async_trait]
-impl GithubMirrorClientV1 for LocalClient {
+impl<R: GithubRepoRepository + 'static> GithubMirrorClientV1 for LocalClient<R> {
     async fn status(&self, _ctx: &SecurityContext) -> Result<MirrorStatus, CanonicalError> {
         let status = self.service.status();
         Ok(MirrorStatus {
@@ -37,12 +70,12 @@ impl GithubMirrorClientV1 for LocalClient {
 
     async fn list_repositories(
         &self,
-        _ctx: &SecurityContext,
-        _query: ODataQuery,
+        ctx: &SecurityContext,
+        query: ODataQuery,
     ) -> Result<Page<Repository>, CanonicalError> {
-        Err(RepositoryError::unimplemented(
-            "repository store not ported yet (gears-rust#4551); the contract is stable, the backing store is not",
-        )
-        .create())
+        self.service
+            .list_repositories(ctx, &query)
+            .await
+            .map_err(CanonicalError::from)
     }
 }
