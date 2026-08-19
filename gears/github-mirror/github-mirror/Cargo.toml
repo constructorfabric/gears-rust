@@ -42,7 +42,7 @@ toolkit-canonical-errors = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite"] }
 toolkit-db-macros = { workspace = true }
 toolkit-macros = { workspace = true }
-toolkit-odata = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-security = { workspace = true }
 
 [dev-dependencies]
@@ -51,6 +51,6 @@ tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 serde_json = { workspace = true }
 uuid = { workspace = true }
-toolkit-odata = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-security = { workspace = true }
 async-trait = { workspace = true }
