@@ -90,9 +90,9 @@ three defects:
 
 The decisions that follow:
 
-* **The metric owner declares the projection — never each caller.** Any PDP-authorized service
-  may debit directly through QE using that projection; the owner publishes the contract but does
-  not proxy calls. Caller-specific projections would fragment one shared budget into N counters.
+* **The metric owner declares the projection — never each caller.** Any authorized caller may debit
+  directly through QE using that projection; the owner publishes the contract but does not proxy
+  calls. Caller-specific projections would fragment one shared budget into N counters.
 * **The subject projection is the identity a Quota binds to.** Applicable-Quota lookup is
   keyed by `(projection_type, subject_id, metric)`; several Quotas may share that key.
 * **Scope cascade requires every applicable owner projection to resolve** — the owner's
@@ -171,17 +171,11 @@ The abstract bases carry the common properties `type`, `id`, and `metadata`:
 
 ### Caller attribution and authorization
 
-* **Every evaluation request carries a typed `caller_type: GtsTypeId`** naming the calling
-  Gear, exposed to Policies as attribution. Typed rather than a free-form metadata key, so
-  attribution aggregates consistently.
-* **Attribution is explicitly not a security boundary.** `SecurityContext` carries no
-  authenticated service identity, and intermediary Gears forward the end caller's context, so
-  QE cannot verify the claim. Making it enforceable would require a platform-level service
-  identity in `toolkit-security` and the AuthN Resolver — a separate story.
-* **Permission to debit stays with PDP and `token_scopes`.**
-* **Apportionment remains expressible as Policy** over that attribute — a Policy may allow
-  `chat-engine` at most 5,000 units of the shared 10,000-unit owner budget. That is a rule
-  over caller attribution, not a second per-caller identity taxonomy.
+* **`caller_type: GtsTypeId` is self-declared diagnostic metadata.** QE excludes it from
+  Policy/Engine input and MUST NOT use it for authorization, Policy branching, quota
+  apportionment, Quota selection, Debit Plans, or counter/allocation keys.
+* **Permission to debit stays with PDP and `token_scopes`.** Caller-dependent enforcement requires
+  a future server-derived, authenticated service identity; `caller_type` cannot provide one.
 
 ### Resolution, validation, and failure surface
 
@@ -219,7 +213,7 @@ attributes are captured with the locked Quota row.
 | Surface | Validation point | Rule |
 |---------|------------------|------|
 | `quota.metadata` | Quota create/update | Resolve the metric owner's snapshotted Quota-attribute contract and validate once before persistence. Stored metadata is not revalidated during evaluation. |
-| Request subject/resource projections and caller attribution | Gateway ingress of every write and preview operation, including each batch item | Require registered concrete types, required `metadata`, schema conformance, non-nil server-derived subject id, and admitted metric before Engine dispatch. |
+| Request subject/resource projections and `caller_type` | Gateway ingress of every write and preview operation, including each batch item | Require registered concrete types, required `metadata`, schema conformance, non-nil server-derived subject id, and admitted metric. Structurally validate `caller_type`, then exclude it from Policy/Engine input. |
 
 A request with an unregistered projection, schema mismatch, missing metadata, or inadmissible
 metric maps to `InvalidArgument` / HTTP 400 with a stable field-level reason. It returns a
@@ -263,15 +257,22 @@ narrow — including narrowing the admitted-metric set — requires a new contra
 a *required* property likewise requires a new version, because every existing caller populates
 the owner's contract.
 
-**Breaking-version replacement.** QE provides no alias or migration verb. Quota Manager first
-creates equivalent Quotas for the registered concrete replacement projection. They have new ids
-and counters and remain unevaluated until cutover; consumed value is not carried forward. For
-consumption Quotas, a new deployment generation bootstraps the replacement catalogue and traffic
-switches atomically at a period boundary. Mixed-generation evaluation traffic is forbidden because
-v1 and v2 replicas would debit independent counters. After the switch, Quota Manager deactivates
-the old Quotas; allocation deactivation resolves active leases. P1 therefore uses blue/green or an
-equivalent single-generation traffic switch, while replacement at scale depends on P2 Bulk Quota
-CRUD.
+**Breaking-version replacement.** QE provides no projection alias or Quota/counter migration verb.
+Replacement Quotas get new ids and counters, with no carried-forward consumption. P1 uses this
+ordered procedure:
+
+1. Register the replacement contracts, Quotas, and Policy drafts, then verify them while the old
+   generation serves.
+2. At a consumption-period boundary, stop old-generation admission and drain in-flight evaluations.
+   This cutover barrier MUST NOT exceed 30 seconds and counts against the availability budget.
+3. Atomically activate the complete set of affected Policy versions under expected-version checks.
+   Missing, extra, invalid, or conflicting replacements abort the transaction.
+4. Route traffic only after the new generation's catalogue, Quotas, and active Policies form one
+   compatible set. On failure or timeout, restore the old Policy set and routing before admission.
+5. Deactivate the old Quotas; allocation deactivation resolves active leases.
+
+Mixed-generation evaluation traffic is forbidden because the generations use independent counters.
+Replacement at scale depends on P2 Bulk Quota CRUD.
 
 * Attribute mistakes become save-time or ingress errors instead of silent Quota-selection
   misses.
