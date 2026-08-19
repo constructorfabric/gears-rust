@@ -292,9 +292,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
                 .await
                 .map_err(|e| DomainError::database(e.to_string()))?
                 .ok_or_else(|| {
-                    DomainError::database(
-                        "Guard row disappeared after UNIQUE violation".to_owned(),
-                    )
+                    DomainError::database("Guard row disappeared after UNIQUE violation".to_owned())
                 })?;
             Ok(winner.tenant_id)
         } else {

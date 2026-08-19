@@ -69,7 +69,9 @@ pub async fn seed_types<TR: TypeRepositoryTrait>(
                         allowed_membership_types: seed_allowed_membership_types,
                         metadata_schema: seed.metadata_schema.clone(),
                     };
-                    type_service.update_type_unscoped(&seed.code, update_req).await?;
+                    type_service
+                        .update_type_unscoped(&seed.code, update_req)
+                        .await?;
                     result.updated += 1;
                     // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-seed-types:p1:inst-seed-2c
                 } else {
@@ -157,7 +159,7 @@ pub async fn seed_groups<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait>(
                     code: seed.code.clone(),
                     name: seed.name.clone(),
                     parent_id: seed.parent_id,
-            tenant_id: None,
+                    tenant_id: None,
                     metadata: seed.metadata.clone(),
                 };
                 group_service

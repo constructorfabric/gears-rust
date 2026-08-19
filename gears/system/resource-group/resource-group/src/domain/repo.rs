@@ -356,6 +356,13 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
         type_id: i16,
     ) -> Result<Vec<(Uuid, String)>, DomainError>;
 
+    async fn find_groups_violating_removed_membership_types<C: DBRunner>(
+        &self,
+        db: &C,
+        child_type_id: i16,
+        membership_codes: &[String],
+    ) -> Result<Vec<(String, Uuid, String)>, DomainError>;
+
     async fn list_types<C: DBRunner>(
         &self,
         db: &C,

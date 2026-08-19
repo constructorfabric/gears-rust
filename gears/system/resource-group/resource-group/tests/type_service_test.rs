@@ -535,7 +535,10 @@ async fn type_delete_not_found() {
     let type_svc = common::make_type_service(db.clone());
 
     let code = type_code("delnf");
-    let err = type_svc.delete_type_unscoped(&code).await.expect_err("should fail");
+    let err = type_svc
+        .delete_type_unscoped(&code)
+        .await
+        .expect_err("should fail");
 
     assert!(
         matches!(err, DomainError::TypeNotFound { .. }),
@@ -1151,7 +1154,10 @@ async fn meta_can_be_root_fallback_no_stored_key() {
         .expect("insert junction");
 
     // Load via service -- has allowed_parent_types so fallback = false
-    let loaded_child = type_svc.get_type_unscoped(&child_code).await.expect("get type");
+    let loaded_child = type_svc
+        .get_type_unscoped(&child_code)
+        .await
+        .expect("get type");
     assert!(
         !loaded_child.can_be_root,
         "Fallback: no __can_be_root + has parents -> can_be_root=false"
@@ -1369,7 +1375,10 @@ async fn gts_load_allowed_parent_types_returns_paths() {
     );
 
     // Also verify via direct get_type (which goes through load_full_type)
-    let loaded = type_svc.get_type_unscoped(&child.code).await.expect("get type");
+    let loaded = type_svc
+        .get_type_unscoped(&child.code)
+        .await
+        .expect("get type");
     assert_eq!(loaded.allowed_parent_types, vec![parent.code]);
 }
 

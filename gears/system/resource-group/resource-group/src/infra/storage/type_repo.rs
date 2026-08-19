@@ -735,6 +735,93 @@ impl TypeRepositoryTrait for TypeRepository {
         Ok(groups.into_iter().map(|g| (g.id, g.name)).collect())
     }
 
+    async fn find_groups_violating_removed_membership_types<C: DBRunner>(
+        &self,
+        db: &C,
+        child_type_id: i16,
+        membership_codes: &[String],
+    ) -> Result<Vec<(String, uuid::Uuid, String)>, DomainError> {
+        if membership_codes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope = system_scope();
+
+        // Resolve membership type codes to IDs.
+        let mut membership_types: Vec<gts_type::Model> = Vec::new();
+        for chunk in membership_codes.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            let found = GtsTypeEntity::find()
+                .filter(gts_type::Column::SchemaId.is_in(chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            membership_types.extend(found);
+        }
+
+        if membership_types.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let id_to_code: std::collections::HashMap<i16, String> = membership_types
+            .iter()
+            .map(|t| (t.id, t.schema_id.clone()))
+            .collect();
+        let type_ids: Vec<i16> = membership_types.iter().map(|t| t.id).collect();
+
+        // Find groups of `child_type_id` that have memberships in any of
+        // the removed membership types. Unscoped — an integrity sweep must
+        // always see the real data regardless of the caller's scope.
+        use crate::infra::storage::entity::resource_group_membership::{
+            self as membership_entity, Entity as MembershipEntity,
+        };
+
+        // Subquery: group ids of the child type that have a membership
+        // of a removed type.
+        let groups_with_membership: Vec<rg_entity::Model> = ResourceGroupEntity::find()
+            .filter(rg_entity::Column::GtsTypeId.eq(child_type_id))
+            .secure()
+            .scope_with(&scope)
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        if groups_with_membership.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let group_ids: Vec<uuid::Uuid> = groups_with_membership.iter().map(|g| g.id).collect();
+        let name_by_id: std::collections::HashMap<uuid::Uuid, String> = groups_with_membership
+            .iter()
+            .map(|g| (g.id, g.name.clone()))
+            .collect();
+
+        let mut violations: Vec<(String, uuid::Uuid, String)> = Vec::new();
+        for chunk in type_ids.chunks(
+            toolkit_db::secure::max_bind_params_for(db)
+                .saturating_sub(1)
+                .max(1),
+        ) {
+            let members: Vec<membership_entity::Model> = MembershipEntity::find()
+                .filter(membership_entity::Column::GtsTypeId.is_in(chunk.to_vec()))
+                .filter(membership_entity::Column::GroupId.is_in(group_ids.clone()))
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+
+            for m in &members {
+                if let Some(code) = id_to_code.get(&m.gts_type_id) {
+                    let name = name_by_id.get(&m.group_id).cloned().unwrap_or_default();
+                    violations.push((code.clone(), m.group_id, name));
+                }
+            }
+        }
+
+        Ok(violations)
+    }
+
     /// List GTS types with `OData` filtering and cursor-based pagination.
     async fn list_types<C: DBRunner>(
         &self,

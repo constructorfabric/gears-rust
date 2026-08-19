@@ -673,7 +673,7 @@ async fn rest_post_membership_returns_201() {
                 code: gt_code,
                 name: "G1".to_owned(),
                 parent_id: None,
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -808,7 +808,7 @@ async fn rest_delete_membership_returns_204() {
                 code: gt,
                 name: "GDel".to_owned(),
                 parent_id: None,
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -889,7 +889,7 @@ async fn rest_post_group_with_parent_returns_201() {
                 code: root_type.clone(),
                 name: "Parent".to_owned(),
                 parent_id: None,
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -932,7 +932,7 @@ async fn rest_delete_group_force_returns_204() {
                 code: rt.clone(),
                 name: "FParent".to_owned(),
                 parent_id: None,
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -949,7 +949,7 @@ async fn rest_delete_group_force_returns_204() {
                 code: rt,
                 name: "FChild".to_owned(),
                 parent_id: Some(parent.id),
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -984,7 +984,7 @@ async fn rest_get_group_hierarchy_returns_200() {
                 code: rt.clone(),
                 name: "HRoot".to_owned(),
                 parent_id: None,
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1000,7 +1000,7 @@ async fn rest_get_group_hierarchy_returns_200() {
                 code: rt,
                 name: "HChild".to_owned(),
                 parent_id: Some(root.id),
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1317,7 +1317,7 @@ async fn input_membership_non_gts_resource_type() {
                 code: rt,
                 name: "NGGroup".to_owned(),
                 parent_id: None,
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1667,7 +1667,7 @@ async fn gts_membership_post_tilde_encoded() {
                 code: gt,
                 name: "TildeGroup".to_owned(),
                 parent_id: None,
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1728,7 +1728,7 @@ async fn gts_membership_delete_tilde_encoded() {
                 code: gt,
                 name: "TildeDelGrp".to_owned(),
                 parent_id: None,
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1897,7 +1897,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
                 code: gt,
                 name: "MSIDGrp".to_owned(),
                 parent_id: None,
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1941,7 +1941,7 @@ async fn smallint_hierarchy_response_has_no_surrogate_ids() {
                 code: rt.clone(),
                 name: "HSIDRoot".to_owned(),
                 parent_id: None,
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1957,7 +1957,7 @@ async fn smallint_hierarchy_response_has_no_surrogate_ids() {
                 code: rt,
                 name: "HSIDChild".to_owned(),
                 parent_id: Some(root.id),
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -2267,7 +2267,7 @@ async fn rest_move_group_under_descendant_returns_400_cycle() {
                 code: rt.clone(),
                 name: "CycRoot".to_owned(),
                 parent_id: None,
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -2283,7 +2283,7 @@ async fn rest_move_group_under_descendant_returns_400_cycle() {
                 code: rt,
                 name: "CycChild".to_owned(),
                 parent_id: Some(root.id),
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -2305,7 +2305,11 @@ async fn rest_move_group_under_descendant_returns_400_cycle() {
     let resp = router.oneshot(req).await.unwrap();
     let status = resp.status();
     let body = response_body(resp).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400, got {status}: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expected 400, got {status}: {body}"
+    );
 
     let violations = body["context"]["violations"]
         .as_array()
@@ -2342,7 +2346,7 @@ async fn rest_move_group_self_parent_returns_400_cycle() {
                 code: rt,
                 name: "SelfRoot".to_owned(),
                 parent_id: None,
-            tenant_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -2364,7 +2368,11 @@ async fn rest_move_group_self_parent_returns_400_cycle() {
     let resp = router.oneshot(req).await.unwrap();
     let status = resp.status();
     let body = response_body(resp).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400, got {status}: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expected 400, got {status}: {body}"
+    );
 
     let violations = body["context"]["violations"]
         .as_array()

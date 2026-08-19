@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer, ResourceType};
-use resource_group_sdk::models::{CreateTypeRequest, ResourceGroupType, UpdateTypeRequest};
 use resource_group_sdk::TYPE_RESOURCE_TYPE;
+use resource_group_sdk::models::{CreateTypeRequest, ResourceGroupType, UpdateTypeRequest};
 use toolkit_db::secure::{DBRunner, TxConfig};
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::{SecurityContext, pep_properties};
@@ -474,11 +474,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
     /// Delete a GTS type definition (`AuthZ`-gated: `delete` on
     /// [`RG_TYPE_RESOURCE`]).
-    pub async fn delete_type(
-        &self,
-        ctx: &SecurityContext,
-        code: &str,
-    ) -> Result<(), DomainError> {
+    pub async fn delete_type(&self, ctx: &SecurityContext, code: &str) -> Result<(), DomainError> {
         self.gate(ctx, "delete").await?;
         self.delete_type_unscoped(code).await
     }
@@ -660,6 +656,43 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-4
         // IF violations collected -> RETURN AllowedParentTypesViolation (handled inline above)
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-4
+
+        // Compute removed membership types and verify none are in use.
+        let removed_membership_types: Vec<String> = existing
+            .allowed_membership_types
+            .iter()
+            .filter(|m| !req.allowed_membership_types.contains(m))
+            .cloned()
+            .collect();
+
+        if !removed_membership_types.is_empty() {
+            let violations = type_repo
+                .find_groups_violating_removed_membership_types(
+                    conn,
+                    type_id,
+                    &removed_membership_types,
+                )
+                .await?;
+
+            if let Some((removed_mt, names)) = removed_membership_types.iter().find_map(|mt| {
+                let group_names: Vec<String> = violations
+                    .iter()
+                    .filter(|(code, _, _)| code == mt)
+                    .map(|(_, _, name)| name.clone())
+                    .collect();
+                if group_names.is_empty() {
+                    None
+                } else {
+                    Some((mt, group_names))
+                }
+            }) {
+                return Err(DomainError::allowed_parent_types_violation(format!(
+                    "Cannot remove allowed membership type '{removed_mt}': \
+                     groups of this type have active memberships: {}",
+                    names.join(", ")
+                )));
+            }
+        }
 
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-5
         Ok(())

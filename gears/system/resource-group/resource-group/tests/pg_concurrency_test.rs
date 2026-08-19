@@ -43,7 +43,9 @@ use resource_group_sdk::models::{CreateGroupRequest, CreateTypeRequest};
 use sea_orm_migration::MigratorTrait;
 use testcontainers::{ContainerRequest, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres;
-use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db, migration_runner::run_migrations_for_testing};
+use toolkit_db::{
+    ConnectOpts, DBProvider, DbError, connect_db, migration_runner::run_migrations_for_testing,
+};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -158,38 +160,50 @@ async fn concurrent_move_a_to_b_and_b_to_a() {
         .expect("create type");
 
     let root = group_svc
-        .create_group(&ctx, CreateGroupRequest {
-            id: None,
-            code: rt.code.clone(),
-            name: "Root".to_owned(),
-            parent_id: None,
-            tenant_id: None,
-            metadata: None,
-        }, tenant_id)
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: rt.code.clone(),
+                name: "Root".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
         .await
         .expect("create root");
 
     let a = group_svc
-        .create_group(&ctx, CreateGroupRequest {
-            id: None,
-            code: rt.code.clone(),
-            name: "A".to_owned(),
-            parent_id: Some(root.id),
-            tenant_id: None,
-            metadata: None,
-        }, tenant_id)
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: rt.code.clone(),
+                name: "A".to_owned(),
+                parent_id: Some(root.id),
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
         .await
         .expect("create A");
 
     let b = group_svc
-        .create_group(&ctx, CreateGroupRequest {
-            id: None,
-            code: rt.code,
-            name: "B".to_owned(),
-            parent_id: Some(root.id),
-            tenant_id: None,
-            metadata: None,
-        }, tenant_id)
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: rt.code,
+                name: "B".to_owned(),
+                parent_id: Some(root.id),
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
         .await
         .expect("create B");
 
@@ -243,50 +257,66 @@ async fn concurrent_create_child_and_move_parent() {
         .expect("create type");
 
     let root = group_svc
-        .create_group(&ctx, CreateGroupRequest {
-            id: None,
-            code: rt.code.clone(),
-            name: "Root".to_owned(),
-            parent_id: None,
-            tenant_id: None,
-            metadata: None,
-        }, tenant_id)
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: rt.code.clone(),
+                name: "Root".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
         .await
         .expect("create root");
 
     let other = group_svc
-        .create_group(&ctx, CreateGroupRequest {
-            id: None,
-            code: rt.code.clone(),
-            name: "Other".to_owned(),
-            parent_id: None,
-            tenant_id: None,
-            metadata: None,
-        }, tenant_id)
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: rt.code.clone(),
+                name: "Other".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
         .await
         .expect("create other root");
 
     let parent = group_svc
-        .create_group(&ctx, CreateGroupRequest {
-            id: None,
-            code: rt.code.clone(),
-            name: "Parent".to_owned(),
-            parent_id: Some(root.id),
-            tenant_id: None,
-            metadata: None,
-        }, tenant_id)
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: rt.code.clone(),
+                name: "Parent".to_owned(),
+                parent_id: Some(root.id),
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
         .await
         .expect("create parent");
 
     let (child, _moved) = tokio::join!(
-        group_svc.create_group(&ctx, CreateGroupRequest {
-            id: None,
-            code: rt.code.clone(),
-            name: "Child".to_owned(),
-            parent_id: Some(parent.id),
-            tenant_id: None,
-            metadata: None,
-        }, tenant_id),
+        group_svc.create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: rt.code.clone(),
+                name: "Child".to_owned(),
+                parent_id: Some(parent.id),
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id
+        ),
         group_svc.move_group(parent.id, Some(other.id)),
     );
 
@@ -362,27 +392,35 @@ async fn concurrent_non_force_delete_and_create_child() {
         .expect("create type");
 
     let root = group_svc
-        .create_group(&ctx, CreateGroupRequest {
-            id: None,
-            code: rt.code.clone(),
-            name: "Root".to_owned(),
-            parent_id: None,
-            tenant_id: None,
-            metadata: None,
-        }, tenant_id)
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: rt.code.clone(),
+                name: "Root".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
         .await
         .expect("create root");
 
     let (del_res, create_res) = tokio::join!(
         group_svc.delete_group(&ctx, root.id, false),
-        group_svc.create_group(&ctx, CreateGroupRequest {
-            id: None,
-            code: rt.code,
-            name: "Orphan".to_owned(),
-            parent_id: Some(root.id),
-            tenant_id: None,
-            metadata: None,
-        }, tenant_id),
+        group_svc.create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: rt.code,
+                name: "Orphan".to_owned(),
+                parent_id: Some(root.id),
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id
+        ),
     );
 
     match (&del_res, &create_res) {
@@ -432,14 +470,18 @@ async fn concurrent_delete_type_and_create_group() {
 
     let (del_res, create_res) = tokio::join!(
         type_svc.delete_type(&ctx, &rt.code),
-        group_svc.create_group(&ctx, CreateGroupRequest {
-            id: None,
-            code: rt.code.clone(),
-            name: "Race".to_owned(),
-            parent_id: None,
-            tenant_id: None,
-            metadata: None,
-        }, tenant_id),
+        group_svc.create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: rt.code.clone(),
+                name: "Race".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id
+        ),
     );
 
     match (&del_res, &create_res) {
