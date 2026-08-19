@@ -32,6 +32,21 @@ Updated:  2026-08-11 by Constructor Tech
 > the published trait returns nothing there and exposes replay as its own operation so a caller
 > receives the new invocation id. Each Runtime Plugin (Temporal, Starlark, cloud FaaS, …) provides
 > one `RuntimeAdapter` impl bound to a single GTS adapter type.
+>
+> **Which crate declares which type.** A type is declared by the crate whose surface uses it. Most
+> belong to exactly one: the registry, schedule, trigger and tenant-policy types are host-internal;
+> `InvocationRecord`, `InvocationTimelineEvent` and `InvocationIndexError` are plugin-facing;
+> `InvocationSummary`, `InvocationOutcome` and `InvocationErrorCategory` are consumer-facing.
+>
+> Two appear on both published surfaces — `InvocationId` and `InvocationStatus` — and neither SDK
+> may depend on the other. Each therefore declares its own, and **the GTS type is the contract
+> between them**: `InvocationStatus` mirrors `gts.cf.core.sless.status.v1~`, and both crates'
+> mirrors MUST be verified against that schema, not against each other. Conformance is required on
+> **both** sides; checking only the plugin's would let the consumer's drift unnoticed, and a
+> consumer branching on a state the gear no longer emits fails silently.
+>
+> The set is deliberately small. If the plugin → host event port later carries the fields needed to
+> create an index row, `InvocationTimestamps` joins the shared set and the same rule applies.
 
 ##### Core Types (Rust)
 
@@ -353,7 +368,10 @@ pub struct InvocationRecord {
 #[derive(Clone, Debug)]
 pub struct InvocationSummary {
     pub invocation_id: InvocationId,
-    pub function_id: FunctionId,
+    /// Named `callable_id` rather than `function_id` because it accepts workflows
+    /// too (ADR `cpt-cf-serverless-runtime-adr-callable-type-hierarchy`); the
+    /// underlying index column keeps the registry's `function_id` name.
+    pub callable_id: FunctionId,
     /// GTS adapter type of the plugin that ran the invocation.
     pub adapter: GtsId,
     pub tenant_id: TenantId,
@@ -372,13 +390,22 @@ pub struct InvocationErrorSummary {
     pub category: InvocationErrorCategory,
 }
 
-/// Consumer-facing retry classification.
+/// What kind of failure a consumer is looking at, for deciding whether a fresh run
+/// is worth starting. Named for the failure rather than for an action: by the time a
+/// run reaches `Failed` the plugin has already retried to its `RetryPolicy` and given
+/// up, so the plugin's `Retryable` no longer describes anything outstanding. The host
+/// maps `RuntimeErrorCategory` onto this one-to-one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InvocationErrorCategory {
-    Retryable,
-    NonRetryable,
+    /// Situational — a replay may succeed.
+    Transient,
+    /// Replaying the same inputs fails the same way.
+    Permanent,
+    /// A limit was hit; a replay may succeed once capacity frees up.
     ResourceLimit,
+    /// Ran out of time; a replay may succeed.
     Timeout,
+    /// Stopped deliberately, not a failure of the callable.
     Canceled,
 }
 

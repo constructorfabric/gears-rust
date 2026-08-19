@@ -183,11 +183,12 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
 - **Depends On**: `cpt-cf-serverless-runtime-feature-gear-scaffold`, `cpt-cf-serverless-runtime-feature-function-registry`. Cross-crate dependency on the plugin trait surface (defined in `gears/serverless-runtime/serverless-plugin-sdk/`).
 
-- **Scope**: Dispatcher (resolve plugin by GTS adapter type), invocation-index persistence, event-port handler for plugin emissions, aggregate query helpers, delegation hooks for deep fetches. Concrete dispatcher implementation, index entity schema, event-handler wiring, and SDK-trait integration shape live in F-04 FEATURE.md.
+- **Scope**: Dispatcher (resolve plugin by GTS adapter type), invocation-index persistence, event-port handler for plugin emissions, aggregate query helpers, delegation hooks for deep fetches. **Implements `ServerlessRuntimeClientV1` and registers it in `ClientHub`** — every operation on that trait is dispatch (invoke, control, replay) or an index read (get, query), so it cannot be implemented before this feature and has no earlier owner. Includes the integration test that starts a callable through the published contract alone, which SDK PRD §1.3 uses to verify its first goal. Concrete dispatcher implementation, index entity schema, event-handler wiring, and SDK-trait integration shape live in F-04 FEATURE.md.
 
 - **Out of scope**:
   - Plugin crate implementation (future plugin DECOMPOSITION)
-  - SDK trait definitions (SDK crate)
+  - Declaring the SDK traits themselves — the contract crates own their declarations; this feature
+    supplies the host-side implementation of the consumer one
 
 - **Requirements Covered**:
 

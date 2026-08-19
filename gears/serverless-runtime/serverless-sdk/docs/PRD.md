@@ -165,7 +165,7 @@ contract itself is not stable until 1.0 (§3.1)._
 | Term | Definition |
 |------|------------|
 | **Callable** | A registered function or workflow, addressed by its type identifier. Functions and workflows are siblings — neither is a kind of the other — and this SDK treats both through one surface. |
-| **Invocation** | One run of a callable, identified by an invocation identifier the `serverless-runtime` gear assigns. |
+| **Invocation** | One run of a callable, identified by an invocation identifier the executing backend assigns and the `serverless-runtime` gear records. |
 | **Recorded run** | What the `serverless-runtime` gear itself retains about an invocation: which callable, which backend, tenant, owner, current state, timings, and a summary of the failure if there was one. Built from what the executing backend reports. Everything beyond it — the inputs and outputs, and the step-by-step history — stays with the backend that ran the callable. |
 | **Control action** | An intervention applied to an existing run that is still in progress — cancelling, suspending or resuming it, or asking for a failed one to be tried again. |
 | **Replay** | Running a finished invocation again as a **new** invocation with the same inputs, producing a new invocation identifier. Distinct from a control action for that reason. |
@@ -330,11 +330,17 @@ The system **MUST** allow a caller to submit a request for validation only. Noth
 execute, no run **SHALL** be recorded, and the caller **MUST** be able to tell from the response
 that this was a validation and not a real run.
 
-- **Rationale**: Callers that assemble automation from configuration need to know a request will
-  be accepted before committing to side effects. Because a validated request leaves no record,
-  the response must say so — otherwise a caller could try to look the run up afterwards and be
-  told it does not exist.
+- **Rationale**: Callers that assemble automation from configuration need to catch a malformed or
+  unusable request before committing to side effects. Because a validated request leaves no
+  record, the response must say so — otherwise a caller could try to look the run up afterwards
+  and be told it does not exist.
 - **Actors**: `cpt-cf-serverless-runtime-sdk-actor-consumer-dev`
+- **Limits — a passing dry run is not an acceptance guarantee**: it rules out `NotFound`,
+  `NotActive`, `InvalidInput` and `QuotaExceeded`, and nothing more. The same request can still be
+  refused with `UnsupportedMode`, `NoPluginAvailable`, `ServiceUnavailable` or a rate limit, and a
+  dry run says nothing about authorisation. Stated because "validate the request" naturally reads
+  as pre-flight approval, and a caller who takes it that way will omit handling for refusals that
+  stay reachable.
 
 #### Suppress duplicate runs
 
@@ -350,6 +356,10 @@ this happened.
   or duplicate charges. Distinguishing a reused result from a fresh one matters because the two
   have different timing and side-effect implications for the caller.
 - **Actors**: `cpt-cf-serverless-runtime-sdk-actor-consumer-dev`
+- **The runtime defines the key's scope**: this SDK carries the key opaquely and does not
+  determine what makes two requests "the same". Whether a key is distinct per tenant, per subject
+  or per callable is the runtime's to specify, and it has not — so a caller cannot currently tell
+  whether reusing one key across two different callables collides. Tracked as gap G-05 (§13).
 - **Blocked, partially**: the runtime operates two distinct mechanisms — preventing a duplicate
   start, and returning a cached successful result — and specifies a response shape only for the
   second. Until the first is specified, a request that was deduplicated rather than cached
@@ -444,9 +454,10 @@ the caller.
 
 When the runtime refuses a request, the system **MUST** report the reason in a form the caller
 can act on directly, without inspecting message text. The reasons **MUST** separately cover: the
-callable is unknown; the callable is not currently accepting work; the inputs are invalid; the
-caller is not permitted; the tenant's quota is exhausted; the requested intervention is not
-valid for the run's state; and the runtime or its backend is unavailable.
+callable is unknown; the callable is not currently accepting work; the callable does not support
+the requested invocation mode; the inputs are invalid; the caller is not permitted; the tenant's
+quota is exhausted; the requested intervention does not apply to this invocation; and the runtime
+or its backend is unavailable.
 
 - **Rationale**: These reasons demand different responses — correct the input, wait and retry,
   escalate a permission problem, or fail the caller's own operation. Message text is not a
@@ -458,13 +469,19 @@ valid for the run's state; and the runtime or its backend is unavailable.
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-fr-failure-vs-refusal`
 
 A callable that ran and then failed **MUST** be reported as a completed request whose run
-finished in a failure state — not as a refusal. Refusal **SHALL** mean only that the runtime
-declined to accept the request.
+finished in a failure state — not as a refusal. A refusal **SHALL** mean that no result was
+delivered: either the runtime declined the request, or it started the run and could not complete
+it synchronously.
 
 - **Rationale**: "The runtime would not start this" and "your automation ran and threw" call for
   entirely different handling, and a caller waiting on a result must be able to tell them apart.
   Collapsing them loses that distinction exactly where it matters most.
 - **Actors**: `cpt-cf-serverless-runtime-sdk-actor-consumer-dev`
+- **The one case that is neither**: a synchronous call whose run reaches a suspension point. The
+  runtime accepted it and it is still going, but no result can be returned on that call, so it is
+  reported as a refusal and **MUST** carry the invocation's identity. The run remains suspended —
+  resumable, cancellable, and subject to the runtime's suspension timeout — so the caller can
+  continue with it asynchronously rather than losing the work it just started.
 
 #### Agree with the runtime's HTTP surface
 
@@ -749,11 +766,13 @@ repository's 80% threshold rather than a stricter figure, for the reason given i
 
 **Main Flow**:
 1. The consuming gear asks the runtime to cancel the run.
-2. The runtime accepts the request.
-3. The consuming gear retrieves the run and confirms it reached a cancelled state.
+2. The runtime accepts the request. Acceptance means the request was taken, not that the run has
+   stopped.
+3. The consuming gear re-reads the run until it reports a cancelled state. Backends generally
+   cancel cooperatively, so a run winds down rather than stopping at once.
 
 **Postconditions**:
-- The run is no longer progressing.
+- The run reaches a cancelled state and is no longer progressing.
 
 **Alternative Flows**:
 - **The run already finished**: the intervention is refused as not valid for the run's state, and
@@ -839,9 +858,12 @@ repository's 80% threshold rather than a stricter figure, for the reason given i
   does not transfer directly.
 - Should the crate directory be renamed to match the crate name? The docs tree is `serverless-sdk`
   while every document names the crate `serverless-runtime-sdk`. Tracked as gap G-03.
-- What does the runtime return when a request is deduplicated rather than served from cache? The
-  two are separate mechanisms and only the caching one has a specified response, so a caller
-  cannot currently tell a deduplicated request from a freshly started one. Tracked as gap G-05.
+- What does the runtime return when a request is deduplicated rather than served from cache, and
+  what is the deduplication key's scope? The two are separate mechanisms and only the caching one
+  has a specified response, so a caller cannot currently tell a deduplicated request from a
+  freshly started one. Nor is it defined what makes two requests "the same" — per tenant, per
+  subject, per callable — so a caller cannot tell whether one key reused across two callables
+  collides. Tracked as gap G-05.
 - Has a failed or cancelled run finished? The runtime's state machine transitions out of both when
   compensation is configured, while its prose calls both terminal. Tracked as gap G-06.
 - How is a caller meant to give a callable access to a credential? Today there is no answer: the
@@ -856,7 +878,18 @@ repository's 80% threshold rather than a stricter figure, for the reason given i
   others incorrectly and recover, whereas a credential written into execution history cannot be
   un-written.
 
-Until G-01, G-02, G-05 and G-06 are closed, the published contract is a draft: each one either
+- Who assigns the invocation identifier, and does duplicate suppression actually work? The runtime
+  suppresses duplicates before the identifier exists, so two concurrent requests carrying the same
+  key can each start a run — the outcome the key exists to prevent. Tracked as gap G-07, which
+  proposes the runtime assign the identifier itself.
+- Can a run be read immediately after being started in the background? Nothing requires the
+  runtime's record to exist before the call returns. Tracked as gap G-08.
+- Is what a read returns current? Status notifications from the backend carry no ordering or
+  identity and are retried on timeout, so a run can appear to move backwards, and a lost
+  notification leaves the record wrong with no way to repair it. Every read in this SDK is served
+  from that record. Tracked as gap G-09.
+
+Until G-01, G-02 and G-05 to G-09 are closed, the published contract is a draft: each one either
 leaves a stated requirement partially unmet or leaves an operation's semantics undecided. The
 contract **SHALL NOT** be declared final while any remains open.
 
@@ -867,9 +900,9 @@ contract **SHALL NOT** be declared final while any remains open.
 - **Features**: not yet written
 - **Runtime gear**: [`../../docs/PRD.md`](../../docs/PRD.md),
   [`../../docs/DESIGN.md`](../../docs/DESIGN.md)
-- **Open host-side gaps** (G-01 – G-06):
+- **Open host-side gaps** (G-01 – G-09):
   [`../../docs/NEXT_ADR_SCOPE.md`](../../docs/NEXT_ADR_SCOPE.md) §3. Of these, **G-01, G-02,
-  G-05 and G-06 block declaring this contract final** (§13); G-03 and G-04 are naming and
+  G-05 to G-09 block declaring this contract final** (§13); G-03 and G-04 are naming and
   filename inconsistencies that do not.
 
 ---

@@ -658,7 +658,7 @@ A function that does not declare `workflow_traits` has none of these capabilitie
 1. **Execute without durable overhead** — if the workflow can complete within the sync timeout without requiring suspension or event waiting, the runtime executes it as a plain function call. Checkpointing is skipped (not silently — the invocation record explicitly notes `mode: sync`), and the result is returned directly. This is appropriate for short-lived workflows where durability adds cost without value.
 2. **Reject the request** — if the workflow requires capabilities that are incompatible with synchronous execution (suspension, event waiting, long-running steps that exceed the sync timeout), the runtime MUST return an explicit error directing the client to use asynchronous invocation. The runtime MUST NOT silently degrade behavior.
 
-A workflow's `workflow_traits` SHOULD declare whether it is async-only. Workflows that require suspension or event waiting MUST be marked async-only and will be rejected on sync invocation. Workflows that do not require these capabilities may be invoked in either mode. If a workflow does not declare async-only but reaches a suspension point during synchronous execution, the runtime MUST fail the request with error type `gts.cf.core.sless.err.v1~cf.core.sless.err.sync_suspension.v1~` (409) rather than blocking indefinitely or silently dropping the suspension.
+A workflow's `workflow_traits` SHOULD declare whether it is async-only. Workflows that require suspension or event waiting MUST be marked async-only and will be rejected on sync invocation. Workflows that do not require these capabilities may be invoked in either mode. If a workflow does not declare async-only but reaches a suspension point during synchronous execution, the runtime MUST fail the request with error type `gts.cf.core.sless.err.v1~cf.core.sless.err.sync_suspension.v1~` (409) rather than blocking indefinitely or silently dropping the suspension. What fails is the **request**, not the invocation: the run transitions to `suspended` as it would under any other suspension point, and from there follows the ordinary rules for that state — it can be resumed or cancelled, and is failed by the runtime once `max_suspension_days` elapses. The error therefore carries the invocation id, so the caller that started the run can still reach it.
 
 **Short-timeout guidance:** synchronous operations should have short timeouts. Clients requiring long-running or durable execution should use asynchronous invocation (jobs), which returns an invocation ID that can be used to poll status, receive callbacks, or reconnect to a resumed execution.
 
@@ -878,7 +878,7 @@ The Function Registry exposes CRUD over `Function` and `Workflow` entities at `/
 
 ##### Invocation Control Actions (Generic)
 
-The `:control` endpoint handles **platform-level lifecycle actions** that work across all plugins. The host executes these directly — they never reach the plugin.
+The `:control` endpoint handles **platform-level lifecycle actions** that work across all plugins. The host validates the action against the invocation's current state and the callable's kind, then routes it to the plugin that owns the run — invocation lifecycle belongs to the plugin per ADR `cpt-cf-serverless-runtime-adr-thin-host`. "Platform-level" describes the verbs being uniform across backends, not the host applying them itself.
 
 ```json
 {

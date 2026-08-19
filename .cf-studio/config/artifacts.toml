@@ -86,7 +86,7 @@ patterns = ["gears/types-registry/*"]
 
 [[ignore]]
 reason = "Ignore gears/serverless-runtime/serverless-plugin-sdk/BACKUP-pre-split-sdk-docs — a backup of the SDK documents as they stood before the SDK was split by audience, kept only so the prior work (notably four ADRs) is not lost. It is not current design, is not maintained, and must not be validated: it has 6 dangling feature links (its DECOMPOSITION lists features 0001-0007, only 0001 exists) and a README matching no artifact pattern. When the plugin-facing SDK is designed, write fresh documents in that crate's own docs/ directory and register that instead — do not lift this ignore to cover them."
-patterns = ["gears/serverless-runtime/serverless-plugin-sdk/*"]
+patterns = ["gears/serverless-runtime/serverless-plugin-sdk/BACKUP-pre-split-sdk-docs/*"]
 
 [[ignore]]
 reason = "Ignore serverless-runtime companion docs — supplementary to DESIGN.md, not standalone SDLC artifacts."

@@ -49,8 +49,8 @@ STANDARDS ALIGNMENT:
 > **Status: draft.** Sections that do not apply to a library with no I/O, no persistence and no
 > deployment footprint of its own say so explicitly rather than being omitted.
 >
-> The contract described here **is not final**. Four unresolved questions in the
-> `serverless-runtime` gear's own documentation reach into it — G-01, G-02, G-05 and G-06 in
+> The contract described here **is not final**. Seven unresolved questions in the
+> `serverless-runtime` gear's own documentation reach into it — G-01, G-02 and G-05 to G-09 in
 > [`NEXT_ADR_SCOPE.md`](../../docs/NEXT_ADR_SCOPE.md) §3. Each either leaves a stated requirement
 > partially unmet or leaves an operation's semantics undecided, so the surface below can still
 > change in ways that break callers. See §4 for what each one blocks.
@@ -128,10 +128,17 @@ is not yet designed.
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-principle-refusal-vs-failure`
 
-`Err` means the Serverless Runtime declined to do the work. A callable that ran and then failed
-returns `Ok`, carrying a summary whose status is `Failed`. A synchronous caller must be able to
-distinguish "the runtime would not start this" from "your automation threw", and collapsing both
-into `Err` destroys that distinction precisely where it matters most.
+`Err` means no result was delivered: the Serverless Runtime either declined the work, or started
+it and could not finish it synchronously. A callable that ran and then failed returns `Ok`,
+carrying a summary whose status is `Failed`. A synchronous caller must be able to distinguish "the
+runtime would not start this" from "your automation threw", and collapsing both into `Err`
+destroys that distinction precisely where it matters most.
+
+The second `Err` case is `SyncSuspension`, and it is why the principle is about delivering a
+result rather than about refusal alone: the run was accepted and started, then reached a
+suspension point that a synchronous call cannot wait through. It carries the invocation id
+because the run survives — suspended, resumable, cancellable — so the caller can continue with it
+asynchronously. The gear's HTTP surface reports the same condition as a 409, so both paths agree.
 
 #### The crate never interprets platform identifiers
 
@@ -189,23 +196,29 @@ need for their own boundaries.
 | `InvokeRequest` | What to run and how: `callable_id`, `mode`, `params`, `dry_run`, `idempotency_key`. |
 | `InvocationMode` | `Sync` or `Async`. Adopted from the gear's model unchanged. |
 | `InvocationSummary` | One row of the gear's invocation index — see below. |
-| `InvocationErrorSummary` | Stable failure type and retry category stored in the gear's index. |
-| `InvocationErrorCategory` | Bounded classification a caller uses when deciding whether to replay. |
+| `InvocationErrorSummary` | Stable failure type and failure category stored in the gear's index. |
+| `InvocationErrorCategory` | What kind of failure it was — `Transient`, `Permanent`, `ResourceLimit`, `Timeout`, `Canceled`. Named for the failure, not for an action: the plugin has already retried to its policy by the time a run reaches `Failed`. |
 | `InvocationOutcome` | What starting or replaying a run returns — see below. |
 | `InvocationStatus` | The nine run states, adopted verbatim from the gear's `gts.cf.core.sless.status.v1~` schema: `Queued`, `Running`, `Suspended`, `Succeeded`, `Failed`, `Canceled`, `Compensating`, `Compensated`, `DeadLettered`. |
 | `ControlAction` | `Cancel`, `Suspend`, `Resume`, `Retry` — the in-place interventions. |
 | `InvocationId` | Identity assigned by the gear. |
 
-**`InvocationSummary`** is exactly the gear's index row (host
+**`InvocationSummary`** carries the gear's index row with the SDK's field naming (host
 `cpt-cf-serverless-runtime-adr-thin-host`), not a trimmed `InvocationRecord`: invocation id,
 callable id, the backend that ran it, tenant, owner, status, timestamps (created, started,
-suspended, finished), and an error summary populated only in failure states. The full record —
+suspended, finished), and an error summary populated only in failure states. Every value the
+index holds is present; only the callable's field is renamed, from the registry's `function_id`
+to `callable_id`, because it accepts workflows too. The full record —
 inputs, results, observability, step history — exists only with the executing backend and is
 not reachable through this crate.
 
 The plugin port carries the same safe fields in its own crate-local type; the host maps them into
-`InvocationErrorSummary`, so neither SDK depends on the other. Backend messages and arbitrary
-details remain plugin-local and are available through observability APIs.
+`InvocationErrorSummary`, so neither SDK depends on the other. That mapping is also where the
+vocabulary changes: the plugin classifies a failure for its own retry policy (`Retryable` and so
+on), while the consumer sees what kind of failure it was (`Transient`, `Permanent`, …). A run
+reaches `Failed` only once the plugin has retried to policy and given up, so a word naming a
+retry would describe something already spent. Backend messages and arbitrary details remain
+plugin-local and are available through observability APIs.
 
 **`InvocationOutcome`** wraps the summary and adds what a caller cannot otherwise learn:
 
@@ -288,6 +301,12 @@ Every method takes `&SecurityContext` as its first argument, per platform conven
 new invocation id, which a caller has no other way to obtain; the four control actions all act
 on the invocation they are given, so returning nothing is sufficient.
 
+`Ok(())` from `control_invocation` means **accepted, not applied**. The gear routes the action to
+the plugin that owns the run, and two things sit between acceptance and an observable change:
+backends generally treat cancellation as cooperative, so a run winds down rather than stopping at
+once, and reads here are served from the gear's index, which the plugin updates by notification.
+A caller that needs to know the action took effect re-reads the run.
+
 `list_invocations` takes `&ODataQuery` and returns `Page<T>` from `toolkit-odata`, the platform's
 standard filtering, sorting and cursor-paging model
 ([OData, Pagination, Select, Filter](../../../../docs/toolkit_unified_system/07_odata_pagination_select_filter.md)).
@@ -309,16 +328,22 @@ types below are relative to `gts.cf.core.sless.err.v1~cf.core.sless.err.…`.
 | `NotActive` | `not_active.v1~` | 409 | callable is draft, disabled or archived |
 | `InvalidInput` | `validation.v1~` | 422 | inputs fail the callable's schema |
 | `QuotaExceeded` | `quota_exceeded.v1~` | 429 | tenant concurrency exhausted |
-| `SyncSuspension` | `sync_suspension.v1~` | 409 | a synchronous run reached a suspension point |
+| `SyncSuspension { invocation_id }` | `sync_suspension.v1~` | 409 | a synchronous run reached a suspension point; the run stays suspended and the id reaches it |
 | `AccessDenied` | — † | 403 | caller not permitted |
-| `UnsupportedControl` | — † | 409 | action invalid for the run's current state |
+| `UnsupportedMode` | — † | 409 | the callable does not offer the requested invocation mode |
+| `UnsupportedControl` | — † | 409 | action does not apply — the run's state, or the callable's kind |
 | `NoPluginAvailable` | — † | 503 | no backend registered for the callable |
 | `ServiceUnavailable { retry_after }` | — † | 503 | backend registered but not accepting work |
 | `Internal` | — | 500 | unclassified |
 
 † Not enumerated by the gear's design. Tracked as gap G-01 in
 [`NEXT_ADR_SCOPE.md`](../../docs/NEXT_ADR_SCOPE.md) §3. Until it is closed, agreement between
-the in-process and HTTP paths is asserted for the first five variants only.
+the in-process and HTTP paths is asserted for the five mapped variants only.
+
+`UnsupportedMode` refuses a request before anything runs, because the callable does not offer the
+mode asked for. It is not `SyncSuspension`, which concerns a run that already started and then
+reached a suspension point. The restriction is symmetric — `supported_invocations` can exclude
+either mode — so this is not specifically about synchronous calls.
 
 Per `cpt-cf-serverless-runtime-sdk-principle-refusal-vs-failure`, a callable that ran and failed
 is not represented here: it returns `Ok` with `status: Failed`.
@@ -341,6 +366,13 @@ contract cannot express something without it — not for convenience.
 None of these ties the crate to an execution technology, so
 `cpt-cf-serverless-runtime-sdk-nfr-engine-neutrality` holds. There is no dependency on the
 `serverless-runtime` gear, on any runtime plugin, or on the plugin-facing SDK.
+
+That last exclusion has a consequence worth stating. Two types appear on both this surface and the
+plugin-facing one — `InvocationId` and `InvocationStatus` — and since neither SDK may depend on the
+other, this crate declares its own. They are not copies kept in step by convention: `InvocationStatus`
+mirrors the GTS type `gts.cf.core.sless.status.v1~`, and that schema is the contract. This crate's
+mirror is verified against the schema, as the plugin SDK's must be — each answers to the schema
+rather than to the other.
 
 ### 3.5 External Dependencies
 
@@ -403,10 +435,13 @@ does not invent answers, so each leaves something here provisional:
 
 | Gap | What it blocks here |
 |---|---|
-| G-01 | Four error variants — `AccessDenied`, `UnsupportedControl`, `NoPluginAvailable`, `ServiceUnavailable` — have no gear error type to map onto, so refusal parity (§3.3) is proven for the other five only. |
+| G-01 | Five error variants — `AccessDenied`, `UnsupportedMode`, `UnsupportedControl`, `NoPluginAvailable`, `ServiceUnavailable` — have no gear error type to map onto, so refusal parity (§3.3) is proven for the other five only. |
 | G-02 | Whether `Retry` mints a new invocation id. If it does, it is not an in-place intervention: it leaves `ControlAction` and joins `replay_invocation`, changing the trait's shape. |
-| G-05 | A deduplicated request cannot be distinguished from a freshly started one. `InvocationOutcome.cached` covers the response-cache path only; the gear specifies no response shape for deduplication. Adding that distinction later means adding a field or replacing `cached` with an origin discriminator. |
+| G-05 | A deduplicated request cannot be distinguished from a freshly started one. `InvocationOutcome.cached` covers the response-cache path only; the gear specifies no response shape for deduplication. Adding that distinction later means adding a field or replacing `cached` with an origin discriminator. The deduplication key's scope is also unspecified — the gear defines a key tuple for response caching but only a time window for deduplication — so what makes two requests "the same" is not something this crate can document. |
 | G-06 | Whether `Failed` and `Canceled` mean the run has finished. Seven of the nine states can be classified; these two are contradicted between the gear's state machine and its prose, so no terminal/success classification is published here yet. |
+| G-07 | Who assigns the invocation id, and whether duplicate suppression actually works. Dedup runs before the id exists, so two concurrent requests carrying the same key can both start a run — the case `fr-idempotency` exists to prevent. |
+| G-08 | Whether a run can be read immediately after starting it. Nothing orders the first status notification before `invoke` returns, so `usecase-start-async`'s postcondition is not guaranteed by the protocol. |
+| G-09 | Whether what a read returns is current. Status notifications carry no ordering or identity and are retried on timeout, so a run can appear to move backwards; a lost one leaves the record wrong permanently, with no resync path. Every read in this crate is served from that record. |
 
 Until all four close, the surface in §3.3 is a draft and can still change in ways that break
 callers. `InvocationOutcome` and `ControlAction` are the two types most likely to move.

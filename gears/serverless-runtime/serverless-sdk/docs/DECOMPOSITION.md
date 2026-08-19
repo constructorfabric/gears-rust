@@ -31,6 +31,12 @@ This split gives explicit coverage to every PRD FR/NFR and every identified DESI
 constraint, entity, component, interface, and sequence. No feature owns persistence, transport,
 runtime-plugin behavior, or executable business logic.
 
+That exclusion is a boundary, not a gap: the crate declares `ServerlessRuntimeClientV1`, and the
+host implements it and registers it in `ClientHub` under F-04 Plugin Dispatcher + Invocation Index
+(see the host [`DECOMPOSITION.md`](../../serverless-runtime/docs/DECOMPOSITION.md) §2.4), which
+also owns the integration test PRD §1.3 uses to verify its first goal. Nothing here can be
+exercised end to end before that feature lands.
+
 The PRD's consumer-developer and runtime-gear actors are intentionally not allocated to features:
 they identify participants in the contract, not deliverables to implement.
 
