@@ -172,42 +172,34 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         }
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
 
-        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-9
-        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-10
         // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-1
-        // Tenant compatibility: check existing memberships for this resource
-        let existing_tenants = self
+        // Tenant compatibility via the guard table `resource_membership_tenant`.
+        // `ensure_membership_guard` uses `INSERT ... ON CONFLICT` on PK
+        // `(gts_type_id, resource_id)` to atomically claim or read the
+        // resource's owning tenant, closing the first-membership race (RG-01).
+        //
+        // If the returned tenant differs from the group's tenant, the caller
+        // (another tenant) already owns this resource → reject.
+        let guard_tenant = self
             .membership_repo
-            .get_existing_membership_tenant_ids(&conn, gts_type_id, resource_id)
+            .ensure_membership_guard(&conn, gts_type_id, resource_id, group_model.tenant_id)
             .await?;
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-1
 
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-2
-        // IF no existing memberships → pass (first membership, any tenant allowed)
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-2
-
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-3
-        // Collect distinct tenant_ids from existing memberships (existing_tenants)
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-3
-
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-4
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-5
-        if !existing_tenants.is_empty() && !existing_tenants.contains(&group_model.tenant_id) {
+        if guard_tenant != group_model.tenant_id {
             debug!(
                 group_id = %group_id,
                 resource_type = %resource_type,
                 resource_id = %resource_id,
-                "Tenant incompatibility on membership add"
+                guard_tenant = %guard_tenant,
+                "Tenant incompatibility on membership add (guard table)"
             );
             return Err(DomainError::tenant_incompatibility(format!(
-                "Resource ({resource_type}, {resource_id}) is already linked in tenant {:?}, cannot add to tenant {}",
-                existing_tenants, group_model.tenant_id
+                "Resource ({resource_type}, {resource_id}) belongs to tenant \
+                 {guard_tenant}, cannot link to tenant {}",
+                group_model.tenant_id
             )));
         }
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-5
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-4
-        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-10
-        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-9
+        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-1
 
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-11
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12

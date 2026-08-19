@@ -407,4 +407,20 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
         gts_type_id: i16,
         resource_id: &str,
     ) -> Result<Vec<Uuid>, DomainError>;
+
+    /// Try to insert the guard row for a resource membership.
+    ///
+    /// `INSERT ... ON CONFLICT DO NOTHING` on PK `(gts_type_id, resource_id)`
+    /// serializes the first membership of a resource. Returns the `tenant_id`
+    /// that was either just inserted or already present.
+    ///
+    /// The caller must then compare the returned tenant against the group's
+    /// own tenant and reject the `add_membership` if they differ.
+    async fn ensure_membership_guard<C: DBRunner>(
+        &self,
+        db: &C,
+        gts_type_id: i16,
+        resource_id: &str,
+        tenant_id: Uuid,
+    ) -> Result<Uuid, DomainError>;
 }

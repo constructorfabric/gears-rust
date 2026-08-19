@@ -6,3 +6,4 @@ pub mod gts_type_allowed_parent;
 pub mod resource_group;
 pub mod resource_group_closure;
 pub mod resource_group_membership;
+pub mod resource_membership_tenant;

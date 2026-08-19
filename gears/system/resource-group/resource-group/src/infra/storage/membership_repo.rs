@@ -240,4 +240,65 @@ impl MembershipRepositoryTrait for MembershipRepository {
         tenant_ids.dedup();
         Ok(tenant_ids)
     }
+
+    async fn ensure_membership_guard<C: DBRunner>(
+        &self,
+        db: &C,
+        gts_type_id: i16,
+        resource_id: &str,
+        tenant_id: Uuid,
+    ) -> Result<Uuid, DomainError> {
+        use crate::infra::storage::entity::resource_membership_tenant::{
+            self as guard_entity, Entity as GuardEntity,
+        };
+
+        let sc = system_scope();
+
+        // Optimistic: try to read first; if none exists, insert.
+        let existing = GuardEntity::find()
+            .filter(guard_entity::Column::GtsTypeId.eq(gts_type_id))
+            .filter(guard_entity::Column::ResourceId.eq(resource_id))
+            .secure()
+            .scope_with(&sc)
+            .one(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        if let Some(guard) = existing {
+            return Ok(guard.tenant_id);
+        }
+
+        // No guard row yet — try to claim this resource.
+        let model = guard_entity::ActiveModel {
+            gts_type_id: Set(gts_type_id),
+            resource_id: Set(resource_id.to_owned()),
+            tenant_id: Set(tenant_id),
+            created_at: Set(time::OffsetDateTime::now_utc()),
+        };
+
+        let result = toolkit_db::secure::secure_insert::<GuardEntity>(model, &sc, db).await;
+        if result.is_ok() {
+            return Ok(tenant_id);
+        }
+        let err = result.unwrap_err();
+        if err.is_unique_violation() {
+            // Lost the race. Read the established tenant.
+            let winner = GuardEntity::find()
+                .filter(guard_entity::Column::GtsTypeId.eq(gts_type_id))
+                .filter(guard_entity::Column::ResourceId.eq(resource_id))
+                .secure()
+                .scope_with(&sc)
+                .one(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?
+                .ok_or_else(|| {
+                    DomainError::database(
+                        "Guard row disappeared after UNIQUE violation".to_owned(),
+                    )
+                })?;
+            Ok(winner.tenant_id)
+        } else {
+            Err(DomainError::database(err.to_string()))
+        }
+    }
 }
