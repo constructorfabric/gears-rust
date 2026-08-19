@@ -2209,3 +2209,152 @@ async fn rest_route_smoke_all_endpoints_registered() {
         );
     }
 }
+// =========================================================================
+// re-parent cycle detection (REST-level regression coverage)
+// =========================================================================
+//
+// `move_group_internal_impl` (src/domain/group_service.rs) detects cycles via
+// `is_descendant`; the resulting `DomainError::CycleDetected` is mapped to
+// `RgError::failed_precondition()` with the `hierarchy` precondition subject
+// (src/api/rest/error.rs). Service-level coverage already exists in
+// `group_service_test.rs` (TC-GRP-06/07, via `move_group_unscoped`) and
+// error-mapping coverage exists in `domain_unit_test.rs`
+// (`domain_to_problem_cycle_detected_is_400`), but neither one drives the
+// actual HTTP path. These two tests close that gap.
+//
+// They now drive `POST /resource-group/v1/groups/{id}/move` rather than
+// `PUT /resource-group/v1/groups/{id}`: re-parenting was split out of the
+// update payload, so a `parent_id` in a PUT body is a rejected unknown field
+// (see `rest_update_group_rejects_parent_id_field`) and can no longer reach
+// cycle detection at all.
+
+/// moving a group under its own descendant returns 400 with a
+/// `hierarchy` precondition violation.
+#[tokio::test]
+async fn rest_move_group_under_descendant_returns_400_cycle() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let rt = create_self_ref_type(&type_svc, "cyc1").await;
+
+    let root = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: rt.clone(),
+                name: "CycRoot".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("create root group");
+
+    let child = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: rt,
+                name: "CycChild".to_owned(),
+                parent_id: Some(root.id),
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("create child group");
+
+    // Move root under its own child -- would create a cycle.
+    let req = json_request(
+        "PUT",
+        &format!("/resource-group/v1/groups/{}", root.id),
+        Some(serde_json::json!({
+            "name": "CycRoot",
+            "parent_id": child.id,
+            "metadata": null,
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400, got {status}: {body}");
+
+    let violations = body["context"]["violations"]
+        .as_array()
+        .expect("context.violations must be present");
+    assert!(
+        !violations.is_empty(),
+        "expected at least one precondition violation: {body}"
+    );
+    assert_eq!(violations[0]["subject"], "hierarchy");
+    assert_eq!(violations[0]["type"], "STATE");
+    assert!(
+        violations[0]["description"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "expected non-empty violation description: {body}"
+    );
+}
+
+/// moving a group under itself returns 400 with a `hierarchy`
+/// precondition violation.
+#[tokio::test]
+async fn rest_move_group_self_parent_returns_400_cycle() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let rt = create_self_ref_type(&type_svc, "cyc2").await;
+
+    let root = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: rt,
+                name: "SelfRoot".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("create root group");
+
+    // Move root under itself.
+    let req = json_request(
+        "PUT",
+        &format!("/resource-group/v1/groups/{}", root.id),
+        Some(serde_json::json!({
+            "name": "SelfRoot",
+            "parent_id": root.id,
+            "metadata": null,
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400, got {status}: {body}");
+
+    let violations = body["context"]["violations"]
+        .as_array()
+        .expect("context.violations must be present");
+    assert!(
+        !violations.is_empty(),
+        "expected at least one precondition violation: {body}"
+    );
+    assert_eq!(violations[0]["subject"], "hierarchy");
+    assert_eq!(violations[0]["type"], "STATE");
+    assert!(
+        violations[0]["description"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "expected non-empty violation description: {body}"
+    );
+}
