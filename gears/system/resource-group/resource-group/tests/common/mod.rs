@@ -300,7 +300,7 @@ pub async fn create_root_type(
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
-    svc.create_type(CreateTypeRequest {
+    svc.create_type_unscoped(CreateTypeRequest {
         code,
         can_be_root: true,
         allowed_parent_types: vec![],
@@ -328,7 +328,7 @@ pub async fn create_child_type(
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
-    svc.create_type(CreateTypeRequest {
+    svc.create_type_unscoped(CreateTypeRequest {
         code,
         can_be_root: false,
         allowed_parent_types: parents.iter().map(|s| (*s).to_owned()).collect(),
@@ -555,7 +555,7 @@ pub fn assert_no_surrogate_ids(json: &serde_json::Value) {
 
 /// Build a `TypeService` from a DB provider.
 pub fn make_type_service(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
-    TypeService::new(db, Arc::new(TypeRepository))
+    TypeService::new(db, make_enforcer(), Arc::new(TypeRepository))
 }
 
 /// In-memory SQLite with migrations applied and a [`QueryRecorder`] attached,

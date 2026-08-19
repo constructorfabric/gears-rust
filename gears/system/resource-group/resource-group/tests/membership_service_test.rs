@@ -38,7 +38,7 @@ async fn create_type_with_memberships(
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code,
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -53,7 +53,7 @@ async fn create_type_with_memberships(
 #[tokio::test]
 async fn membership_add_happy_path() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -96,7 +96,7 @@ async fn membership_add_happy_path() {
 #[tokio::test]
 async fn membership_add_nonexistent_group() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
     let tenant = Uuid::now_v7();
@@ -119,7 +119,7 @@ async fn membership_add_nonexistent_group() {
 #[tokio::test]
 async fn membership_add_duplicate() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -155,7 +155,7 @@ async fn membership_add_duplicate() {
 #[tokio::test]
 async fn membership_add_unregistered_resource_type() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -192,7 +192,7 @@ async fn membership_add_unregistered_resource_type() {
 #[tokio::test]
 async fn membership_add_not_in_allowed_membership_types() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -226,7 +226,7 @@ async fn membership_add_not_in_allowed_membership_types() {
 #[tokio::test]
 async fn membership_add_tenant_incompatibility() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -265,7 +265,7 @@ async fn membership_add_tenant_incompatibility() {
 #[tokio::test]
 async fn membership_remove_existing() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -307,7 +307,7 @@ async fn membership_remove_existing() {
 #[tokio::test]
 async fn membership_remove_nonexistent() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -333,7 +333,7 @@ async fn membership_remove_nonexistent() {
 #[tokio::test]
 async fn membership_multiple_resource_types_same_group() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -369,7 +369,7 @@ async fn membership_multiple_resource_types_same_group() {
 #[tokio::test]
 async fn membership_first_always_allowed_tenant() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -391,7 +391,7 @@ async fn membership_first_always_allowed_tenant() {
 #[tokio::test]
 async fn membership_empty_resource_id() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -417,7 +417,7 @@ async fn membership_empty_resource_id() {
 #[tokio::test]
 async fn membership_remove_unregistered_resource_type() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -452,7 +452,7 @@ async fn membership_remove_unregistered_resource_type() {
 #[tokio::test]
 async fn membership_empty_allowed_membership_types_rejects_all() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -483,7 +483,7 @@ async fn membership_empty_allowed_membership_types_rejects_all() {
 #[tokio::test]
 async fn membership_same_resource_multiple_groups_same_tenant() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -551,7 +551,7 @@ async fn membership_list_empty() {
 #[tokio::test]
 async fn list_memberships_unscoped_returns_rows_without_ctx() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 

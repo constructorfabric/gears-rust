@@ -72,7 +72,11 @@ impl Gear for ResourceGroup {
         let membership_repo = Arc::new(MembershipRepository);
 
         // Create TypeService
-        let type_service = Arc::new(TypeService::new(db.clone(), type_repo.clone()));
+        let type_service = Arc::new(TypeService::new(
+            db.clone(),
+            enforcer.clone(),
+            type_repo.clone(),
+        ));
 
         self.type_service
             .set(type_service)

@@ -87,7 +87,7 @@ async fn create_self_referencing_type(
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -97,7 +97,7 @@ async fn create_self_referencing_type(
         .await
         .expect("create self-referencing type (initial)");
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -124,7 +124,7 @@ async fn create_type_with_memberships(
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code,
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -417,7 +417,7 @@ async fn trace_update_type() {
 
     rec.clear();
     let updated = type_svc
-        .update_type(
+        .update_type_unscoped(
             &t.code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -769,7 +769,7 @@ async fn junction_inserts_for_parent_count(n: usize) -> usize {
 
     rec.clear();
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: format!(
                 "{}x.test.child.i{}.v1~",
                 gts_id!("cf.core.rg.type.v1~"),
@@ -815,7 +815,7 @@ async fn list_types_total_statements_for_page_size(n: usize) -> usize {
         ..Default::default()
     };
     let page = type_svc
-        .list_types(&query)
+        .list_types_unscoped(&query)
         .await
         .expect("list_types should succeed");
     assert_eq!(page.items.len(), n, "page must contain all N created types");
@@ -845,7 +845,7 @@ async fn create_type_conflict_check_does_not_overfetch_junctions() {
 
     rec.clear();
     let result = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: t.code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1145,7 +1145,7 @@ async fn total_statements_for_update_type_removing_n_parents(n: usize) -> usize 
 
     rec.clear();
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &child_type.code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -1198,7 +1198,7 @@ async fn negative_control_tenant_root_create_runs_in_tx() {
     let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: unique_tenant_type_code(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1270,7 +1270,7 @@ async fn negative_control_read_paths_produce_no_write_statements() {
         .await
         .expect("list_groups should succeed");
     type_svc
-        .list_types(&toolkit_odata::ODataQuery::default())
+        .list_types_unscoped(&toolkit_odata::ODataQuery::default())
         .await
         .expect("list_types should succeed");
 
@@ -1306,7 +1306,7 @@ async fn trace_delete_type() {
 
     rec.clear();
     type_svc
-        .delete_type(&t.code)
+        .delete_type_unscoped(&t.code)
         .await
         .expect("delete_type should succeed for an unreferenced type");
 

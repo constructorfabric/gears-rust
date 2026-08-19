@@ -26,7 +26,7 @@ async fn recorder_observes_statements_and_tags_tx_membership() {
         Uuid::now_v7().as_simple()
     );
     // NotFound is fine -- we only care that a SELECT ran.
-    type_svc.get_type(&code).await.ok();
+    type_svc.get_type_unscoped(&code).await.ok();
 
     let after_read = rec.total();
     assert!(
@@ -42,7 +42,7 @@ async fn recorder_observes_statements_and_tags_tx_membership() {
     // A write wrapped in `db.transaction_with_retry(...)`: create_type's
     // INSERT statements must be tagged in_tx = true.
     let created = type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -94,7 +94,7 @@ async fn recorder_observes_statements_and_tags_tx_membership() {
     // And it restarts with the trace: `clear()` needs no separate counter to
     // reset, because there is no separate counter.
     rec.clear();
-    type_svc.get_type(&code).await.ok();
+    type_svc.get_type_unscoped(&code).await.ok();
     let after_clear = rec.events();
     assert!(
         !after_clear.is_empty(),
