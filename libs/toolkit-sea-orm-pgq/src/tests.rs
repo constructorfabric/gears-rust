@@ -330,6 +330,25 @@ fn graph_ddl() -> PropertyGraph {
     }
 }
 
+/// An edge's clauses must come in grammar order: `KEY`, then `SOURCE`, then
+/// `DESTINATION`, then `LABEL`. Asserted as an ordering rather than by
+/// containment, because a statement with every clause present in the wrong order
+/// still contains all of them — the first version of this test passed while the
+/// generated DDL was a syntax error `PostgreSQL` rejected at `LABEL`.
+#[test]
+fn an_edge_declares_its_clauses_in_grammar_order() {
+    let sql = graph_ddl().create_statement().expect("renders");
+    let edges = sql.split("EDGE TABLES").nth(1).expect("has edge tables");
+    let key = edges.find(" KEY (").expect("KEY");
+    let source = edges.find("SOURCE KEY").expect("SOURCE");
+    let destination = edges.find("DESTINATION KEY").expect("DESTINATION");
+    let label = edges.find("LABEL").expect("LABEL");
+    assert!(
+        key < source && source < destination && destination < label,
+        "clauses out of grammar order in: {edges}"
+    );
+}
+
 /// The endpoint keys carry the tenant column, which is what makes an edge
 /// structurally unable to join a vertex of another tenant — before any scope
 /// predicate is applied.

@@ -125,11 +125,12 @@ impl PropertyGraph {
                 if index > 0 {
                     sql.push_str(",\n");
                 }
-                write_element(&mut sql, &edge.element)?;
+                write_element_head(&mut sql, &edge.element)?;
                 sql.push_str("\n      SOURCE KEY (");
                 write_endpoint(&mut sql, &edge.source)?;
                 sql.push_str("\n      DESTINATION KEY (");
                 write_endpoint(&mut sql, &edge.destination)?;
+                write_element_label(&mut sql, &edge.element);
             }
             sql.push_str("\n  )");
         }
@@ -149,7 +150,8 @@ impl PropertyGraph {
     }
 }
 
-fn write_element(sql: &mut String, element: &VertexTable) -> Result<(), PgqError> {
+/// `table KEY (columns)` — the part that opens any element.
+fn write_element_head(sql: &mut String, element: &VertexTable) -> Result<(), PgqError> {
     require_named(&element.table, "an element table name")?;
     require_named(&element.label, "an element label")?;
     if element.key.0.is_empty() {
@@ -167,11 +169,28 @@ fn write_element(sql: &mut String, element: &VertexTable) -> Result<(), PgqError
     write_ident(sql, &element.table);
     sql.push_str(" KEY (");
     write_ident_list(sql, &element.key.0);
-    sql.push_str(")\n      LABEL ");
+    sql.push(')');
+    Ok(())
+}
+
+/// `LABEL label PROPERTIES (columns)` — the part that closes any element.
+///
+/// Written separately because an edge's endpoint clauses sit **between** the two
+/// halves: the grammar is `table KEY (…) SOURCE … DESTINATION … LABEL …`, and
+/// emitting `LABEL` before `SOURCE` is a syntax error rather than a reordering
+/// the parser tolerates.
+fn write_element_label(sql: &mut String, element: &VertexTable) {
+    sql.push_str("\n      LABEL ");
     write_ident(sql, &element.label);
     sql.push_str(" PROPERTIES (");
     write_ident_list(sql, &element.properties);
     sql.push(')');
+}
+
+/// A vertex element, whose two halves are adjacent.
+fn write_element(sql: &mut String, element: &VertexTable) -> Result<(), PgqError> {
+    write_element_head(sql, element)?;
+    write_element_label(sql, element);
     Ok(())
 }
 

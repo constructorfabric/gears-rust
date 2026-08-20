@@ -150,7 +150,7 @@ testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 # Database image pins: see libs/test-containers.
 cf-gears-test-containers = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 anyhow = { workspace = true }
 temp-env = { workspace = true }
 trybuild = { workspace = true }
