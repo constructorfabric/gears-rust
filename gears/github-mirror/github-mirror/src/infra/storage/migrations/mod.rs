@@ -1,5 +1,6 @@
 use sea_orm_migration::prelude::*;
 
+pub mod commits_004;
 pub mod initial_001;
 pub mod issues_002;
 pub mod pull_requests_003;
@@ -13,6 +14,7 @@ impl MigratorTrait for Migrator {
             Box::new(initial_001::Migration),
             Box::new(issues_002::Migration),
             Box::new(pull_requests_003::Migration),
+            Box::new(commits_004::Migration),
         ]
     }
 }

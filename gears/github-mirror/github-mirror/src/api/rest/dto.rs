@@ -1,4 +1,4 @@
-use github_mirror_sdk::{Issue, PullRequest, Repository};
+use github_mirror_sdk::{Commit, Issue, PullRequest, Repository};
 
 use crate::domain::service::MirrorStatus;
 
@@ -121,6 +121,37 @@ impl From<PullRequest> for PullRequestDto {
             updated_at: pr.updated_at,
             closed_at: pr.closed_at,
             merged_at: pr.merged_at,
+        }
+    }
+}
+
+/// A mirrored GitHub commit as served by the read API.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct CommitDto {
+    pub repo_id: i64,
+    pub sha: String,
+    pub message: String,
+    pub author_login: Option<String>,
+    pub committer_login: Option<String>,
+    pub authored_at: Option<String>,
+    pub committed_at: Option<String>,
+    pub additions: i64,
+    pub deletions: i64,
+}
+
+impl From<Commit> for CommitDto {
+    fn from(c: Commit) -> Self {
+        Self {
+            repo_id: c.repo_id,
+            sha: c.sha,
+            message: c.message,
+            author_login: c.author_login,
+            committer_login: c.committer_login,
+            authored_at: c.authored_at,
+            committed_at: c.committed_at,
+            additions: c.additions,
+            deletions: c.deletions,
         }
     }
 }

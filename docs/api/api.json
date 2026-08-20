@@ -467,6 +467,61 @@
         ],
         "type": "object"
       },
+      "CommitDto": {
+        "description": "A mirrored GitHub commit as served by the read API.",
+        "properties": {
+          "additions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "author_login": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "authored_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "committed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "committer_login": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deletions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "repo_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "sha": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_id",
+          "sha",
+          "message",
+          "additions",
+          "deletions"
+        ],
+        "type": "object"
+      },
       "ConversionPatchDto": {
         "additionalProperties": false,
         "description": "Request body for\n`PATCH /tenants/{tenant_id}/conversions/{request_id}` and\n`PATCH /tenants/{tenant_id}/child-conversions/{request_id}`.\n\n`status` is required and narrowed to the three admissible terminal\ntransitions ([`ConversionPatchStatusDto`]). `comment` is optional\nand follows the same length contract as the POST body.\n\nThe handler routes each admissible status to the matching service\nmethod (`approve` / `cancel` / `reject`) — the wire DTO does NOT\nknow about the service handle. See\n[`crate::api::rest::handlers::conversions`] for the dispatch.",
@@ -2858,6 +2913,24 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/CityDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_CommitDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CommitDto"
             },
             "type": "array"
           },
@@ -13103,6 +13176,112 @@
           }
         ],
         "summary": "List mirrored repositories",
+        "tags": [
+          "GitHub Mirror"
+        ]
+      }
+    },
+    "/github-mirror/v1/repos/{owner}/{name}/commits": {
+      "get": {
+        "description": "Returns commits held in the local mirror for the caller's tenant, newest first",
+        "operationId": "github_mirror.list_commits",
+        "parameters": [
+          {
+            "description": "Repository owner login",
+            "in": "path",
+            "name": "owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository name",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum number of commits to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_CommitDto"
+                }
+              }
+            },
+            "description": "Paginated list of mirrored commits"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List mirrored commits of a repository",
         "tags": [
           "GitHub Mirror"
         ]

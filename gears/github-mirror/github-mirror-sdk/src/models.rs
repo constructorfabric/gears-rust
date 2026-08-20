@@ -77,3 +77,21 @@ pub struct PullRequest {
     pub closed_at: Option<String>,
     pub merged_at: Option<String>,
 }
+
+/// A mirrored GitHub commit (read-slice shape).
+///
+/// Keyed by `(repo_id, sha)` — commits have no numeric GitHub id.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    /// Owning repository's GitHub id.
+    pub repo_id: i64,
+    pub sha: String,
+    pub message: String,
+    pub author_login: Option<String>,
+    pub committer_login: Option<String>,
+    pub authored_at: Option<String>,
+    pub committed_at: Option<String>,
+    pub additions: i64,
+    pub deletions: i64,
+}

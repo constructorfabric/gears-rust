@@ -116,3 +116,38 @@ pub mod pull_requests {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod commits {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    /// Mirrored GitHub commit, tenant-scoped like every mirror table.
+    ///
+    /// Commits have no numeric GitHub id, so the key is
+    /// `(tenant_id, repo_id, sha)` — the reference keys by `(repo_id, sha)`.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_commits")]
+    #[secure(tenant_col = "tenant_id", resource_col = "sha", no_owner, no_type)]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        /// Owning repository's GitHub id.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub repo_id: i64,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub sha: String,
+        pub message: String,
+        pub author_login: Option<String>,
+        pub committer_login: Option<String>,
+        /// RFC3339 timestamps kept as text (engine-agnostic), as in the reference.
+        pub authored_at: Option<String>,
+        pub committed_at: Option<String>,
+        pub additions: i64,
+        pub deletions: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

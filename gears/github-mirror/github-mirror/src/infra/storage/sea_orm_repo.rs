@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use github_mirror_sdk::{Issue, PullRequest, Repository};
+use github_mirror_sdk::{Commit, Issue, PullRequest, Repository};
 use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, Order};
 use toolkit_db::secure::{
     DBRunner, ScopeError, SecureEntityExt, SecureInsertExt, SecureOnConflict,
@@ -9,10 +9,11 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
-    IssueRecord, IssueRepository, PullRequestRecord, PullRequestRepository, RepoRepository,
-    RepositoryRecord,
+    CommitRecord, CommitRepository, IssueRecord, IssueRepository, PullRequestRecord,
+    PullRequestRepository, RepoRepository, RepositoryRecord,
 };
 
+use super::entity::commits::{self, Entity as CommitEntity};
 use super::entity::issues::{self, Entity as IssueEntity};
 use super::entity::pull_requests::{self, Entity as PullRequestEntity};
 use super::entity::repositories::{self, Entity as RepoEntity};
@@ -354,6 +355,104 @@ impl PullRequestRepository for SeaOrmPullRequestRepository {
             .scope_with(scope)
             .filter(sea_orm::Condition::all().add(pull_requests::Column::RepoId.eq(repo_id)))
             .order_by(pull_requests::Column::Number, Order::Asc)
+            .limit(limit)
+            .all(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+
+pub struct SeaOrmCommitRepository;
+
+impl SeaOrmCommitRepository {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SeaOrmCommitRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn commit_active_model(tenant_id: Uuid, r: &CommitRecord) -> commits::ActiveModel {
+    commits::ActiveModel {
+        tenant_id: ActiveValue::Set(tenant_id),
+        repo_id: ActiveValue::Set(r.repo_id),
+        sha: ActiveValue::Set(r.sha.clone()),
+        message: ActiveValue::Set(r.message.clone()),
+        author_login: ActiveValue::Set(r.author_login.clone()),
+        committer_login: ActiveValue::Set(r.committer_login.clone()),
+        authored_at: ActiveValue::Set(r.authored_at.clone()),
+        committed_at: ActiveValue::Set(r.committed_at.clone()),
+        additions: ActiveValue::Set(r.additions),
+        deletions: ActiveValue::Set(r.deletions),
+    }
+}
+
+#[async_trait]
+impl CommitRepository for SeaOrmCommitRepository {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: CommitRecord,
+    ) -> Result<Commit, DomainError> {
+        let on_conflict = SecureOnConflict::<CommitEntity>::columns([
+            commits::Column::TenantId,
+            commits::Column::RepoId,
+            commits::Column::Sha,
+        ])
+        .update_columns([
+            commits::Column::Message,
+            commits::Column::AuthorLogin,
+            commits::Column::CommitterLogin,
+            commits::Column::AuthoredAt,
+            commits::Column::CommittedAt,
+            commits::Column::Additions,
+            commits::Column::Deletions,
+        ])
+        .map_err(map_scope_error)?;
+
+        CommitEntity::insert(commit_active_model(tenant_id, &record))
+            .secure()
+            .scope_with_model(scope, &commit_active_model(tenant_id, &record))
+            .map_err(map_scope_error)?
+            .on_conflict(on_conflict)
+            .exec(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(Commit {
+            repo_id: record.repo_id,
+            sha: record.sha,
+            message: record.message,
+            author_login: record.author_login,
+            committer_login: record.committer_login,
+            authored_at: record.authored_at,
+            committed_at: record.committed_at,
+            additions: record.additions,
+            deletions: record.deletions,
+        })
+    }
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Commit>, DomainError> {
+        let rows = CommitEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(sea_orm::Condition::all().add(commits::Column::RepoId.eq(repo_id)))
+            .order_by(commits::Column::CommittedAt, Order::Desc)
             .limit(limit)
             .all(conn)
             .await

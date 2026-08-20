@@ -1,6 +1,6 @@
-use github_mirror_sdk::{Issue, PullRequest, Repository};
+use github_mirror_sdk::{Commit, Issue, PullRequest, Repository};
 
-use super::entity::{issues, pull_requests, repositories};
+use super::entity::{commits, issues, pull_requests, repositories};
 
 impl From<repositories::Model> for Repository {
     fn from(m: repositories::Model) -> Self {
@@ -52,6 +52,22 @@ impl From<pull_requests::Model> for PullRequest {
             updated_at: m.updated_at,
             closed_at: m.closed_at,
             merged_at: m.merged_at,
+        }
+    }
+}
+
+impl From<commits::Model> for Commit {
+    fn from(m: commits::Model) -> Self {
+        Self {
+            repo_id: m.repo_id,
+            sha: m.sha,
+            message: m.message,
+            author_login: m.author_login,
+            committer_login: m.committer_login,
+            authored_at: m.authored_at,
+            committed_at: m.committed_at,
+            additions: m.additions,
+            deletions: m.deletions,
         }
     }
 }

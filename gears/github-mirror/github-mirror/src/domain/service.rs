@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
-use github_mirror_sdk::{Issue, PullRequest, Repository};
+use github_mirror_sdk::{Commit, Issue, PullRequest, Repository};
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page, PageInfo};
 use toolkit_security::{SecurityContext, pep_properties};
 
 use super::error::DomainError;
 use super::repo::{
-    IssueRecord, IssueRepository, PullRequestRecord, PullRequestRepository, RepoRepository,
-    RepositoryRecord,
+    CommitRecord, CommitRepository, IssueRecord, IssueRepository, PullRequestRecord,
+    PullRequestRepository, RepoRepository, RepositoryRecord,
 };
 
 pub const GEAR_NAME: &str = "github-mirror";
@@ -34,6 +34,11 @@ pub(crate) const PULL_REQUEST_RESOURCE: ResourceType = ResourceType::from_static
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+pub(crate) const COMMIT_RESOURCE: ResourceType = ResourceType::from_static(
+    "github_mirror.commit",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
+
 pub(crate) mod actions {
     pub const LIST: &str = "list";
     pub const UPSERT: &str = "upsert";
@@ -54,21 +59,30 @@ pub struct MirrorStatus {
 }
 
 #[domain_model]
-pub struct Service<R: RepoRepository, I: IssueRepository, P: PullRequestRepository> {
+pub struct Service<
+    R: RepoRepository,
+    I: IssueRepository,
+    P: PullRequestRepository,
+    C: CommitRepository,
+> {
     db: Arc<DbProvider>,
     repo: Arc<R>,
     issues: Arc<I>,
     pull_requests: Arc<P>,
+    commits: Arc<C>,
     policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
 }
 
-impl<R: RepoRepository, I: IssueRepository, P: PullRequestRepository> Service<R, I, P> {
+impl<R: RepoRepository, I: IssueRepository, P: PullRequestRepository, C: CommitRepository>
+    Service<R, I, P, C>
+{
     pub fn new(
         db: Arc<DbProvider>,
         repo: Arc<R>,
         issues: Arc<I>,
         pull_requests: Arc<P>,
+        commits: Arc<C>,
         policy_enforcer: PolicyEnforcer,
         config: ServiceConfig,
     ) -> Self {
@@ -77,6 +91,7 @@ impl<R: RepoRepository, I: IssueRepository, P: PullRequestRepository> Service<R,
             repo,
             issues,
             pull_requests,
+            commits,
             policy_enforcer,
             config,
         }
@@ -334,5 +349,96 @@ impl<R: RepoRepository, I: IssueRepository, P: PullRequestRepository> Service<R,
         self.pull_requests
             .upsert(&conn, &scope, tenant_id, record)
             .await
+    }
+
+    /// List mirrored commits of one repository (`owner/name`), tenant-scoped,
+    /// newest first.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored for this
+    /// tenant; `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn list_commits(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        query: &ODataQuery,
+    ) -> Result<Page<Commit>, DomainError> {
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &COMMIT_RESOURCE,
+                actions::LIST,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+        let items = self
+            .commits
+            .list_by_repo(&conn, &scope, repository.id, limit)
+            .await?;
+
+        Ok(Page::new(
+            items,
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit,
+            },
+        ))
+    }
+
+    /// Insert or update a mirrored commit row for the caller's tenant.
+    ///
+    /// The owning repository must already be mirrored (`DomainError::NotFound`
+    /// otherwise).
+    ///
+    /// # Errors
+    /// `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn upsert_commit(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        record: CommitRecord,
+    ) -> Result<Commit, DomainError> {
+        let tenant_id = ctx.subject_tenant_id();
+
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &COMMIT_RESOURCE,
+                actions::UPSERT,
+                None,
+                &AccessRequest::new().resource_property(pep_properties::OWNER_TENANT_ID, tenant_id),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let record = CommitRecord {
+            repo_id: repository.id,
+            ..record
+        };
+        self.commits.upsert(&conn, &scope, tenant_id, record).await
     }
 }

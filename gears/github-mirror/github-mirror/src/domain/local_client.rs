@@ -8,7 +8,9 @@ use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 
 use crate::domain::error::DomainError;
-use crate::domain::repo::{IssueRepository, PullRequestRepository, RepoRepository};
+use crate::domain::repo::{
+    CommitRepository, IssueRepository, PullRequestRepository, RepoRepository,
+};
 use crate::domain::service::Service;
 
 #[resource_error(gts_id!("cf.core.github_mirror.repository.v1~"))]
@@ -50,22 +52,31 @@ pub struct LocalClient<
     R: RepoRepository + 'static,
     I: IssueRepository + 'static,
     P: PullRequestRepository + 'static,
+    C: CommitRepository + 'static,
 > {
-    service: Arc<Service<R, I, P>>,
+    service: Arc<Service<R, I, P, C>>,
 }
 
-impl<R: RepoRepository + 'static, I: IssueRepository + 'static, P: PullRequestRepository + 'static>
-    LocalClient<R, I, P>
+impl<
+    R: RepoRepository + 'static,
+    I: IssueRepository + 'static,
+    P: PullRequestRepository + 'static,
+    C: CommitRepository + 'static,
+> LocalClient<R, I, P, C>
 {
     #[must_use]
-    pub fn new(service: Arc<Service<R, I, P>>) -> Self {
+    pub fn new(service: Arc<Service<R, I, P, C>>) -> Self {
         Self { service }
     }
 }
 
 #[async_trait]
-impl<R: RepoRepository + 'static, I: IssueRepository + 'static, P: PullRequestRepository + 'static>
-    GithubMirrorClientV1 for LocalClient<R, I, P>
+impl<
+    R: RepoRepository + 'static,
+    I: IssueRepository + 'static,
+    P: PullRequestRepository + 'static,
+    C: CommitRepository + 'static,
+> GithubMirrorClientV1 for LocalClient<R, I, P, C>
 {
     async fn status(&self, _ctx: &SecurityContext) -> Result<MirrorStatus, CanonicalError> {
         let status = self.service.status();

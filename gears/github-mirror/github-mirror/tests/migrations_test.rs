@@ -13,7 +13,12 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
     Migrator::up(&conn, None).await.expect("up must succeed");
 
     let manager = SchemaManager::new(&conn);
-    for table in ["gm_repositories", "gm_issues", "gm_pull_requests"] {
+    for table in [
+        "gm_repositories",
+        "gm_issues",
+        "gm_pull_requests",
+        "gm_commits",
+    ] {
         assert!(
             manager.has_table(table).await.unwrap(),
             "{table} must exist after up()"
@@ -24,7 +29,12 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         migration.down(&manager).await.expect("down must succeed");
     }
 
-    for table in ["gm_repositories", "gm_issues", "gm_pull_requests"] {
+    for table in [
+        "gm_repositories",
+        "gm_issues",
+        "gm_pull_requests",
+        "gm_commits",
+    ] {
         assert!(
             !manager.has_table(table).await.unwrap(),
             "{table} must be gone after down()"
