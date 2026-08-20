@@ -51,9 +51,9 @@ pub fn is_security_context_type(ty: &Type) -> bool {
 
 /// Returns `true` when `ty` is the *platform*-plane context
 /// [`PlatformSecurityContext`], in value or reference form. The tenant
-/// [`SecurityContext`] is **not** matched. Used to reject platform-plane
-/// methods from the REST projection while internal-token injection is deferred
-/// (see `rest_contract_parse::parse_method`).
+/// [`SecurityContext`] is **not** matched. Used to select the platform-plane
+/// carrier (`X-ToolKit-Internal-Token`) and its route auth axis in the REST/gRPC
+/// codegen.
 pub fn is_platform_security_context_type(ty: &Type) -> bool {
     type_path_ends_with(ty, "PlatformSecurityContext")
 }

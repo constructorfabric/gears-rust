@@ -490,7 +490,7 @@ Tests S1, S2, S8, S9 verify integration seams that unit tests (TC-DTO-*, TC-SDK-
 ### File Layout
 
 ```
-testing/e2e/gears/resource_group/
+testing/e2e/suites/resource_group/
 ├── conftest.py                          ← helpers, timeout config
 ├── test_authz_tenant_scoping.py         ← existing (9 tests) — keep as-is
 ├── test_mtls_auth.py                    ← (p2 — deferred, not implemented yet) 4 MTLS tests; do not run in current iteration

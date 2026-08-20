@@ -99,6 +99,7 @@ bootstrap = [
     "dep:toolkit-http-middleware",
     # OoP outbound platform-plane credential (InternalAuthInterceptor + SA reader)
     "dep:toolkit-transport-grpc",
+    "dep:secrecy",
 ]
 
 [dependencies]
@@ -119,6 +120,8 @@ toolkit-security = { workspace = true, optional = true }
 toolkit-http-middleware = { workspace = true, optional = true }
 # OoP outbound platform-plane credential attachment (bootstrap feature).
 toolkit-transport-grpc = { workspace = true, optional = true }
+# Wrapping the shared-secret / SA token as a redacting SecretString (bootstrap).
+secrecy = { workspace = true, optional = true }
 # Concrete K8s TokenReview InternalAuthenticator (k8s-auth feature).
 toolkit-k8s-auth = { workspace = true, optional = true }
 

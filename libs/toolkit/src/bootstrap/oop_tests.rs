@@ -879,3 +879,91 @@ mod advertise_uri {
         validate_advertise_uri(&default, true).unwrap();
     }
 }
+
+/// Tests for `build_platform_credentials` — the four outcomes that decide
+/// whether an `OoP` gear attaches any outbound platform-plane credential. Every
+/// wrong answer would otherwise be a silent "no credential", so these are
+/// exercised directly.
+mod platform_credentials {
+    use super::*;
+    use secrecy::ExposeSecret as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio_util::sync::CancellationToken;
+    use toolkit_contract::runtime::config::CredentialState;
+    use toolkit_security::InternalAuthConfig;
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("oop-cred-{tag}-{}-{n}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn shared_secret_yields_provider_with_the_secret() {
+        let cfg = InternalAuthConfig::SharedSecret {
+            secret: "shared-tok".to_owned(),
+            peer_name: "toolkit-internal".to_owned(),
+        };
+        let (_interceptor, provider) = build_platform_credentials(&cfg, &CancellationToken::new())
+            .await
+            .expect("shared secret builds");
+        let provider = provider.expect("shared secret yields a provider");
+        match provider.current() {
+            CredentialState::Available(token) => assert_eq!(token.expose_secret(), "shared-tok"),
+            other => panic!("expected Available, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn kube_with_token_path_yields_provider_reading_the_file() {
+        let dir = unique_dir("kube-ok");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("token");
+        tokio::fs::write(&path, "kube.sa.jwt").await.unwrap();
+
+        let cfg = InternalAuthConfig::Kube {
+            audiences: vec!["toolkit-internal".to_owned()],
+            token_path: Some(path),
+        };
+        let (_interceptor, provider) = build_platform_credentials(&cfg, &CancellationToken::new())
+            .await
+            .expect("kube with token path builds");
+        let provider = provider.expect("kube-with-path yields a provider");
+        match provider.current() {
+            CredentialState::Available(token) => assert_eq!(token.expose_secret(), "kube.sa.jwt"),
+            other => panic!("expected Available, got {other:?}"),
+        }
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn kube_without_token_path_yields_no_provider() {
+        let cfg = InternalAuthConfig::Kube {
+            audiences: vec!["toolkit-internal".to_owned()],
+            token_path: None,
+        };
+        let (_interceptor, provider) = build_platform_credentials(&cfg, &CancellationToken::new())
+            .await
+            .expect("kube without token path builds (inbound-only)");
+        assert!(
+            provider.is_none(),
+            "inbound-only kube participant must attach no outbound credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn kube_with_missing_token_file_is_an_error() {
+        let path = unique_dir("kube-missing").join("token");
+        let cfg = InternalAuthConfig::Kube {
+            audiences: vec!["toolkit-internal".to_owned()],
+            token_path: Some(path),
+        };
+        assert!(
+            build_platform_credentials(&cfg, &CancellationToken::new())
+                .await
+                .is_err(),
+            "a missing token file must surface a contextualized error, not Ok(None)"
+        );
+    }
+}

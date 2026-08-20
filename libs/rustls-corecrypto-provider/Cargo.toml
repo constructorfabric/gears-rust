@@ -69,9 +69,9 @@ tempfile = { workspace = true }
 # Hermetic env-var manipulation for the `oe::tests::override_*` tests --
 # safer than direct `std::env::set_var` calls under parallel cargo-test.
 temp-env = { workspace = true }
+serial_test = { workspace = true, features = ["file_locks"] }
 # Test-cert + test-key generation for server-side handshake_smoke.
 rcgen = { workspace = true }
-serial_test = { workspace = true }
 # Cross-implementation RSA-PSS verifier (pure-Rust RustCrypto) — used to
 # assert that Apple's PSS signatures use the RFC-mandated salt_len =
 # hash_len. See TODO-4 in README. `pkcs1` (DER parsing of Apple's public

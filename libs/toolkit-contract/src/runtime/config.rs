@@ -1,6 +1,113 @@
-//! Client and retry configuration consumed by generated REST clients.
+//! Client, retry, and credential configuration consumed by generated clients.
+//!
+//! [`ClientConfig`] is shared by both the generated REST client and the
+//! generated gRPC client; [`InternalTokenProvider`] is the runtime source of the
+//! platform-plane credential those clients attach on `PlatformSecurityContext`
+//! methods.
 
+use std::borrow::Cow;
+use std::sync::Arc;
 use std::time::Duration;
+
+use secrecy::SecretString;
+
+/// Outcome of resolving the process's platform-plane credential on one outbound
+/// call.
+///
+/// Three-state (rather than `Option<SecretString>`) so an attach site can tell
+/// an intentionally unauthenticated deployment (Profile 1) apart from a broken
+/// credential source — e.g. the projected token file is transiently empty.
+/// Attach helpers stay silent on [`Self::NotConfigured`] and `warn!` on
+/// [`Self::Unavailable`], never emitting the token.
+#[derive(Debug)]
+pub enum CredentialState {
+    /// No credential configured (Profile 1 / `InternalCredential::None`). Attach
+    /// nothing, silently — a legitimate deployment.
+    NotConfigured,
+    /// A credential is configured and currently available; attach it.
+    Available(SecretString),
+    /// Configured but currently unavailable (empty token file, or the background
+    /// refresh has not run yet). Attach nothing but **warn** — a broken source,
+    /// not an intentional opt-out. Carries the reason (never the token).
+    Unavailable(Cow<'static, str>),
+}
+
+/// Source of the process's **platform-plane** internal credential.
+///
+/// Generated clients attach it — as the `X-ToolKit-Internal-Token` header /
+/// metadata, **never** `Authorization` — on methods whose plane marker is
+/// `PlatformSecurityContext` (`cpt-cf-adr-two-plane-auth`). The credential comes
+/// from the runtime (the bootstrap-selected `InternalCredential`), never the
+/// contract argument.
+///
+/// Invoked on every call so a rotating credential (e.g. a projected Kubernetes
+/// `ServiceAccount` token) is always attached in its current form; it returns a
+/// [`CredentialState`] to distinguish not-configured (silent) from unavailable
+/// (warn). Because it runs per-request on an async path, the closure **must not
+/// block, do I/O, or take a contended lock** (see [`InternalTokenProvider::new`]).
+#[derive(Clone)]
+pub struct InternalTokenProvider(Arc<dyn Fn() -> CredentialState + Send + Sync>);
+
+impl InternalTokenProvider {
+    /// Build a provider whose credential is resolved by `provider` on each call
+    /// (supports rotation).
+    ///
+    /// The closure **must not block, do I/O, or take a contended lock** — it is
+    /// called on every outbound platform-plane request from an async path. See
+    /// [`InternalTokenProvider`] and use `ServiceAccountTokenReader::token_provider`
+    /// as the reference pattern for a rotating credential.
+    #[must_use]
+    pub fn new(provider: impl Fn() -> CredentialState + Send + Sync + 'static) -> Self {
+        Self(Arc::new(provider))
+    }
+
+    /// Build a provider that always yields the given static `token`.
+    ///
+    /// Suitable for a non-rotating credential (e.g. a shared secret); prefer
+    /// [`InternalTokenProvider::new`] for rotating tokens.
+    #[must_use]
+    pub fn from_token(token: SecretString) -> Self {
+        Self::new(move || CredentialState::Available(token.clone()))
+    }
+
+    /// Resolve the current credential state.
+    #[must_use]
+    pub fn current(&self) -> CredentialState {
+        (self.0)()
+    }
+
+    /// Resolve the token to attach on an outbound platform-plane call, applying
+    /// the shared attach policy so the REST and gRPC helpers behave identically:
+    /// `None`/[`NotConfigured`](CredentialState::NotConfigured) → `None` (silent),
+    /// [`Available`](CredentialState::Available) → `Some`, and
+    /// [`Unavailable`](CredentialState::Unavailable) → `None` plus a `warn!`
+    /// naming the plane and `rpc` (never the token).
+    #[must_use]
+    pub fn resolve_for_attach(provider: Option<&Self>, rpc: &str) -> Option<SecretString> {
+        match provider.map(Self::current) {
+            None | Some(CredentialState::NotConfigured) => None,
+            Some(CredentialState::Available(token)) => Some(token),
+            Some(CredentialState::Unavailable(reason)) => {
+                tracing::warn!(
+                    plane = "platform",
+                    rpc,
+                    reason = %reason,
+                    "platform-plane credential configured but currently unavailable; \
+                     sending request without the internal token",
+                );
+                None
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for InternalTokenProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render the credential (or even hint at its presence beyond the
+        // opaque marker) so it cannot leak through a `{:?}` sink.
+        f.write_str("InternalTokenProvider(<fn>)")
+    }
+}
 
 /// Base configuration for a generated REST client.
 #[derive(Debug, Clone)]
@@ -37,6 +144,15 @@ pub struct ClientConfig {
     /// [`build_default_http_client`](crate::runtime::client::build_default_http_client)).
     /// Set this when a resolved endpoint may cross an untrusted network.
     pub require_tls: bool,
+    /// Source of the platform-plane internal credential attached to methods
+    /// whose plane marker is `PlatformSecurityContext` (carried as
+    /// `X-ToolKit-Internal-Token`). `None` (the default) attaches nothing —
+    /// legitimate for Profile 1 / in-process (`InternalCredential::None`);
+    /// the requirement is enforced server-side. The bootstrap layer populates
+    /// this from the process's selected `InternalCredential`. Tenant-plane
+    /// methods (`SecurityContext`) never consult it; they forward the caller's
+    /// bearer token from the argument.
+    pub internal_token_provider: Option<InternalTokenProvider>,
 }
 
 impl ClientConfig {
@@ -50,6 +166,7 @@ impl ClientConfig {
             retry: RetryConfig::default(),
             sse_reconnect: ReconnectConfig::default(),
             require_tls: false,
+            internal_token_provider: None,
         }
     }
 
@@ -88,6 +205,20 @@ impl ClientConfig {
     #[must_use]
     pub fn with_require_tls(mut self, require_tls: bool) -> Self {
         self.require_tls = require_tls;
+        self
+    }
+
+    /// Set (or clear) the platform-plane internal-credential provider. See
+    /// [`Self::internal_token_provider`]. Accepts either an
+    /// [`InternalTokenProvider`] or an `Option<InternalTokenProvider>`, so the
+    /// bootstrap layer can pass through whatever the process selected without a
+    /// branch.
+    #[must_use]
+    pub fn with_internal_token_provider(
+        mut self,
+        provider: impl Into<Option<InternalTokenProvider>>,
+    ) -> Self {
+        self.internal_token_provider = provider.into();
         self
     }
 }

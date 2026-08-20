@@ -116,13 +116,11 @@ async fn health_probe_passes_on_a_non_success_status() {
 
 #[tokio::test]
 async fn health_probe_fails_only_when_nothing_gets_through() {
-    // The other side of the bound above: with no listener the request dies at the
-    // transport level, the one genuinely unreachable case.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-
-    let p = provider(format!("http://{addr}/eurofxref-daily.xml"));
+    // The other side of the bound above: a `.invalid` host (RFC 6761) can
+    // never resolve, so the request dies at the transport level — the one
+    // genuinely unreachable case — deterministically, with no ephemeral port
+    // for another test's listener to race for.
+    let p = provider("http://unreachable.invalid/eurofxref-daily.xml".to_owned());
     let ctx = SecurityContext::anonymous();
     let err = p.health(&ctx, "req").await.unwrap_err();
     assert!(
@@ -147,14 +145,11 @@ async fn a_future_dated_document_is_rejected_rather_than_served() {
 }
 
 #[tokio::test]
-async fn connection_refused_maps_to_unreachable() {
-    // Bind then immediately drop the listener: the port is free but nothing is
-    // listening, so the request fails at the transport level.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-
-    let p = provider(format!("http://{addr}/eurofxref-daily.xml"));
+async fn unresolvable_host_maps_to_unreachable() {
+    // A `.invalid` host (RFC 6761) can never resolve, so the request fails at
+    // the transport level deterministically — no ephemeral port involved, so
+    // no other test can ever race for it.
+    let p = provider("http://unreachable.invalid/eurofxref-daily.xml".to_owned());
     let ctx = SecurityContext::anonymous();
     let err = p.fetch_latest(&ctx, &[], "req").await.unwrap_err();
     assert!(matches!(err, RateProviderError::Unreachable(_)));

@@ -152,7 +152,11 @@ The platform needs a tenant model with unlimited hierarchy depth (configurable a
 | Conversion Request Status | Lifecycle state of a mode conversion request: `pending` (awaiting counterparty decision), `approved` (counterparty consented, conversion applied), `cancelled` (**initiator withdrew** the request from their own scope), `rejected` (**counterparty declined** the request from their own scope), or `expired` (configured approval window elapsed without resolution). `cancelled` and `rejected` are distinct terminal states — the distinction is carried in the status itself, not only in audit. |
 | Tenant Type | Classification of a tenant node. Types are extensible at runtime via the GTS types registry. Deployments define their own type topology. |
 | User | A human subject managed by AM via the IdP contract (provisioning, tenant binding, group membership). Corresponds to the platform-level [Subject](../../../../docs/arch/authorization/DESIGN.md#core-terms) term narrowed to human identities; API clients and service accounts are not AM-managed users. |
-| IdP Contract | Abstract pluggable interface for Identity Provider operations (tenant provisioning, tenant deprovisioning, user provisioning, update, deprovisioning, and tenant-scoped user query). |
+| IdP Contract | Abstract pluggable interface for Identity Provider operations (tenant provisioning, tenant deprovisioning, user provisioning, update, deprovisioning, tenant-scoped user query, and the service-account lifecycle). |
+| Service Account | A tenant-owned, non-human identity used by a workload that must authenticate without human credentials: a confidential OAuth 2.0 `client_credentials` client whose issued tokens carry the owning tenant and a service-subject type. Managed as a resource type distinct from `User`, so a grant over users never confers machine-credential minting. |
+| Client Credentials | OAuth 2.0 grant in which a confidential client authenticates with its client identifier and secret. The only grant a service account supports. |
+| One-Time Disclosure | Exposure of a plaintext client secret through the service-account provision and rotate-secret responses only. No read-back path exists; recovery from a lost secret is a rotation. |
+| Ambiguous Outcome | An IdP contract failure category in which the provider may have retained state, so the operation cannot be reported as either a success or a safely retryable failure. The caller reconciles by matching the name it submitted in the tenant's listing. |
 | User Group | A [Resource Group](../../resource-group/docs/PRD.md) entity with a Resource Group type configured for user membership (`allowed_memberships` includes the user resource type). AM delegates group hierarchy, membership management, and cycle detection to the Resource Group gear. |
 | Tenant Metadata Schema | A GTS-registered schema that defines a category of extensible tenant data (e.g., branding, contacts), its validation rules, and its `inheritance_policy` trait; identified by its chained `schema_id`. |
 | Inheritance Policy | The `inheritance_policy` trait on a tenant metadata schema, controlling parent-to-child propagation: `override_only` (default; each tenant sets its own value, no inheritance) or `inherit` (child inherits parent value unless overridden). |
@@ -194,6 +198,12 @@ The platform needs a tenant model with unlimited hierarchy depth (configurable a
 **ID**: `cpt-cf-account-management-actor-idp`
 
 - **Role**: Pluggable identity provider that manages user authentication, token issuance, and user-tenant binding. Provides tenant identity via user attributes in tokens. Conforms to the AM IdP contract for user lifecycle operations.
+
+#### Machine Workload
+
+**ID**: `cpt-cf-account-management-actor-machine-workload`
+
+- **Role**: A service, job, agent, or automation process that authenticates without a human user. Never calls AM: it uses the credentials AM's service-account operations obtained for it to request access tokens through the OAuth 2.0 `client_credentials` grant, and loses the ability to authenticate once that credential is superseded by a rotation or removed by a revocation.
 
 #### Billing System
 
@@ -284,6 +294,7 @@ AM coordinates user lifecycle operations but **does not own user identity data**
 - Self-managed tenant model: strict isolation via barrier; metadata inheritance stops at self-managed boundaries (p1).
 - Tenant CRUD operations: create, read, update, soft-delete with configurable retention (p1).
 - IdP user operations contract: pluggable contract for user provisioning, update, deprovisioning, and query (p1).
+- Service accounts: tenant-scoped machine identities over the same pluggable IdP contract — provision, list, rotate-secret, revoke — with one-time secret disclosure and four independently grantable permissions on a resource type distinct from `User` (p1).
 - User groups management (via Resource Group): create groups, manage membership, nested groups with cycle detection delegated to Resource Group (p1).
 - Observability metrics: domain-specific metrics exported via platform observability conventions (OpenTelemetry) (p1).
 - Extensible tenant metadata: GTS-registered schemas for tenant-specific data kinds (e.g., branding, contacts) with per-schema inheritance policy and validation (p2).
@@ -298,6 +309,10 @@ AM coordinates user lifecycle operations but **does not own user identity data**
 - AuthZ Resolver (PDP) implementation: covered by Gears DESIGN; this gear covers the tenant model consumed by PDP.
 - Resource provisioning and lifecycle for non-identity platform resources: outside AM scope. AM provides tenant context and ownership boundaries but does not manage downstream resource CRUD or provisioning workflows.
 - Tenant lifecycle events (CloudEvents): deferred until EVT (Events and Audit Bus) is introduced.
+- Service-account credential storage, secret distribution, and workload injection: AM discloses a secret once and keeps nothing; long-term custody belongs to the caller and the platform secret-management plane.
+- Retrieval of an existing service-account secret, account update, enable/disable, and paginated or filtered account listing: not exposed in v1 (see §5.5).
+- Automatic reconciliation of an ambiguous IdP outcome (idempotency keys, operation keys, retry workers): AM surfaces the ambiguity and the caller reconciles by matching its submitted name; holding reconciliation state would contradict the no-local-storage constraint.
+- Service-account name syntax, scope-allowlist membership, and per-tenant quota: enforced by the registered IdP adapter, which owns client-id derivation and its own limits. AM applies only boundary caps on payload size.
 
 ### 4.3 Deferred Detailed Coverage
 
@@ -676,6 +691,56 @@ The system **MUST** support tenant-scoped user listing and point-existence check
 
 - **Rationale**: Tenant-scoped user queries are required for administration and support. User-ID filtering enables callers to verify user existence before adding them to a Resource Group.
 
+#### Service Account Provisioning
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-fr-service-account-provision`
+
+**Actors**: `cpt-cf-account-management-actor-tenant-admin`, `cpt-cf-account-management-actor-machine-workload`, `cpt-cf-account-management-actor-idp`
+
+The system **MUST** provision, through the IdP integration contract, a confidential `client_credentials` service account owned by an explicit target tenant, and **MUST** disclose exactly once everything the workload needs to authenticate: the client identifier, the plaintext client secret, the token endpoint, and the subject identifier. The credential-bearing response **MUST NOT** be cached or stored by intermediaries. The system **MUST** reject a request whose name is already live in the target tenant and **MUST NOT** resume, reveal, or modify the existing account, so a tenant and a name together identify at most one live account.
+
+- **Rationale**: Workloads need dedicated non-human credentials rather than borrowed human accounts, and a name that could match more than one live account would leave a caller recovering from an uncertain outcome unable to tell which identity its request produced.
+
+#### Service Account Discovery
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-fr-service-account-list`
+
+**Actors**: `cpt-cf-account-management-actor-tenant-admin`, `cpt-cf-account-management-actor-idp`
+
+The system **MUST** list a target tenant's service accounts through the IdP integration contract, identifying each by its client identifier and by the name its creator supplied, reported unchanged. The listing **MUST NOT** carry a client secret in any field.
+
+- **Rationale**: Administrators need inventory for audit, rotation, and revocation, and the verbatim name is the only provider-independent way to recognise an account when the identity provider assigns client identifiers the caller cannot predict. Inventory access must not become credential access.
+
+#### Service Account Secret Rotation
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-fr-service-account-rotate`
+
+**Actors**: `cpt-cf-account-management-actor-tenant-admin`, `cpt-cf-account-management-actor-machine-workload`, `cpt-cf-account-management-actor-idp`
+
+The system **MUST** rotate a tenant-owned account's secret without changing its identity, disclosing the new secret exactly once in a response that **MUST NOT** be cached or stored by intermediaries. An address that does not resolve within the target tenant **MUST** surface as `not_found` rather than succeeding, and **MUST NOT** disclose whether that identifier exists under a different tenant.
+
+- **Rationale**: Workloads need regular and incident-driven credential replacement without replacing their identity, and rotation must never mint a credential for a foreign or nonexistent one. Rotation is also the recovery path both for a lost secret and for an account left behind by an uncertain provisioning outcome.
+
+#### Service Account Revocation
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-fr-service-account-revoke`
+
+**Actors**: `cpt-cf-account-management-actor-tenant-admin`, `cpt-cf-account-management-actor-machine-workload`, `cpt-cf-account-management-actor-idp`
+
+The system **MUST** revoke a tenant-owned service account through the IdP integration contract and **MUST** treat revocation of an already-absent account as indistinguishable from revocation of a present one, so the operation is idempotent and retry-safe. That indistinguishability **MUST** also cover an address owned by a different tenant, so revocation never becomes a probe for accounts owned elsewhere. A clean provider failure or an ambiguous outcome **MUST NOT** be reported as a successful revocation.
+
+- **Rationale**: Administrators need an immediate, retry-safe way to terminate workload access, and reporting absence identically in every case denies a caller any signal about other tenants' accounts.
+
+#### Service Account Secret Confidentiality
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-fr-service-account-secret-confidentiality`
+
+**Actors**: `cpt-cf-account-management-actor-tenant-admin`, `cpt-cf-account-management-actor-idp`
+
+The system **MUST NOT** expose any path that reads back an existing plaintext client secret, and **MUST NOT** persist one. Because a provider adapter may place a credential in the text it returns with a failure, the system **MUST NOT** surface that text — to a caller or to its own logs — in any form, whether whole, filtered, shortened, or digested; each failure category **MUST** be answered with a fixed message the system owns, and the record kept of the discarded text **MUST** be confined to its category, its length, and whether a field was attributed.
+
+- **Rationale**: A leaked client secret grants workload identity until rotation or revocation. A credential embedded in provider text is indistinguishable from ordinary prose — `secret=abc123` is plain ASCII — so no filter or length cap can make relaying that text safe; only discarding it can. This is deliberately stricter than the tenant and user halves of the same contract, which forward a non-reversible digest for operator correlation, because a credential-minting call is where a vendor error is most likely to quote the secret it just issued.
+
 ### 5.6 User Groups Management
 
 User groups are implemented as [Resource Group](../../resource-group/docs/PRD.md) entities. AM ensures the required Resource Group type exists and coordinates cleanup at tenant retirement, but consumers use Resource Group directly for group hierarchy and membership operations.
@@ -912,8 +977,11 @@ AM persists tenant hierarchy data, tenant metadata, conversion-request state, an
   - Tenant hierarchy and tenant-mode data: Internal / Confidential.
   - Opaque identity references in audit records: PII-adjacent and platform-protected.
   - Extensible metadata: classification defined per registered GTS schema.
+  - Service-account client secrets: restricted authentication credentials. Never persisted, wrapped in a redacting, zeroize-on-drop, non-serializable type in process, and disclosed only through the two responses that mint them.
+  - Service-account client identifiers, subject identifiers, tenant ownership, and scopes: security-sensitive control-plane metadata, distinct from and never mixed with human profile attributes.
+  - Text an IdP adapter supplies with a service-account failure: untrusted data of unknown classification — AM cannot inspect it to establish one — and therefore handled as the most sensitive class: discarded, with only its category, length, and whether a field was attributed retained.
 - **Inherited legal/privacy ownership**: Data residency, DSAR orchestration, retention-policy administration, and privacy-by-default controls are inherited platform obligations. AM-specific obligations are to minimize persisted identity data, avoid storing credentials/profile data, and treat IdP-linked payloads as transient administrative data.
-- **Threshold**: 100% of AM-owned persisted data categories mapped to a classification level; zero authentication credentials or IdP profile PII stored by AM outside the platform audit infrastructure.
+- **Threshold**: 100% of AM-owned persisted data categories mapped to a classification level; zero authentication credentials or IdP profile PII stored by AM outside the platform audit infrastructure; zero plaintext client secrets in debug-formatted output or in any serialized representation other than the two credential-bearing responses; zero occurrences of provider-supplied service-account failure text in any response or log record.
 
 ### 6.10 Reliability
 
@@ -997,6 +1065,15 @@ The authoritative wire contract for the public REST surface is [account-manageme
 - **Description**: API for tenant-scoped user provisioning, update, deprovisioning, and query operations delegated to the configured IdP provider contract.
 - **Breaking Change Policy**: Major version bump required for endpoint removal or incompatible request/response schema changes.
 
+#### Service Account API
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-interface-service-account-api`
+
+- **Type**: REST API + in-process Rust SDK (`AccountManagementClient` via ClientHub)
+- **Stability**: stable
+- **Description**: API for the tenant-scoped machine-identity lifecycle delegated to the configured IdP provider contract. Both public channels expose exactly four operations — provision/create, list, rotate-secret, revoke — addressed by owning tenant and, for rotate-secret and revoke, by client identifier; the SDK implementation delegates to the same authorized service layer as REST. There is deliberately no single-item read: the collection listing and the address returned by a provision are the only ways to learn an account's non-secret state, and no path returns an existing secret. HTTP credential responses are non-cacheable; SDK credential results retain the secret in a redacting, non-serializable wrapper for immediate transfer to the caller's credential custodian. Authorization uses four independently grantable permissions on a resource type distinct from the user type.
+- **Breaking Change Policy**: Major version bump required for endpoint removal, incompatible request/response schema changes, or incompatible SDK signature changes. Resource and action identifiers cannot change within a major version.
+
 ### 7.2 External Integration Contracts
 
 IdP implementations may align with standards such as SCIM 2.0 and OIDC where applicable, but AM defines stable behavior in terms of lifecycle outcomes rather than provider protocol details.
@@ -1007,9 +1084,10 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 
 - **Direction**: required from client (IdP implementation via pluggable IdP integration contract)
 - **Protocol/Format**: Pluggable contract (in-process or remote)
-- **Consumed / Provided Data**: tenant lifecycle intent, user lifecycle intent, and provider-specific provisioning context.
+- **Consumed / Provided Data**: tenant lifecycle intent, user lifecycle intent, service-account lifecycle intent, and provider-specific provisioning context.
 - **Availability / Fallback**: AM tolerates IdP unavailability during bootstrap with retry/backoff. Read-only tenant and metadata operations remain available during IdP outages; IdP-dependent operations fail deterministically.
-- **Compatibility**: Provider implementations are vendor-replaceable. Breaking changes require a versioned contract and migration path.
+- **Compatibility**: Provider implementations are vendor-replaceable. Breaking changes require a versioned contract and migration path. Every operation ships a default implementation that declines as unsupported, so a partial adapter — tenant-only, or users without machine identities — is legal and declines explicitly rather than no-opping silently.
+- **Service-account obligations**: an adapter that implements the machine-identity half MUST address `(tenant_id, client_id)` as the scoped resource and report an address that does not resolve within that tenant as absent; MUST reject a provision whose name is already live in the tenant, atomically with respect to concurrent calls, and never resume or reveal the existing account; MUST report the creator-supplied name verbatim on every listed account, since that is the only provider-independent correlation key when client identifiers are unpredictable; MUST return a secret only from provision and rotate-secret; MUST report transport uncertainty as ambiguous rather than as success; MUST delete a tenant's accounts when that tenant is deprovisioned; and MUST log its own diagnostics in-process, because AM relays and records none of the text the adapter returns with a failure.
 
 #### GTS Registry Contract
 

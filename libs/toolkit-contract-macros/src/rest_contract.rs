@@ -12,7 +12,8 @@ use syn::{Ident, TraitItem, Type};
 
 use crate::projection::{
     build_delegation_body, client_struct_ident, generate_projection_impl_for_client,
-    is_security_context_type, rewrite_streaming_signature, strip_method_attrs, type_path_ends_with,
+    is_platform_security_context_type, is_security_context_type, rewrite_streaming_signature,
+    strip_method_attrs,
 };
 use crate::rest_contract_parse::{HttpVerb, RestContractModel, RestMethodModel, RestParam};
 use crate::support::contract_support_path;
@@ -701,7 +702,7 @@ fn generate_client_method(
     let sig = render_method_signature(method);
     let fields_init = build_fields_json(method, support);
     let query_init = build_query_string(method, support);
-    let bearer_capture = capture_bearer_token(method);
+    let auth_capture = capture_auth_credentials(method, support);
     let body_capture = capture_body_param(method);
 
     // Per-method client span (baked-in telemetry) — see `client_span_ctor`.
@@ -715,7 +716,7 @@ fn generate_client_method(
             &method_name_str,
             &fields_init,
             &query_init,
-            &bearer_capture,
+            &auth_capture,
             &span_ctor,
             support,
         );
@@ -790,15 +791,29 @@ fn generate_client_method(
                 )
                 .map_err(#convert_err)?;
 
-                #bearer_capture
+                #auth_capture
 
                 let __attempt = || async {
                     // Tenant bearer forwarded via a sensitive `Authorization`
                     // header (never logged); see `RequestBuilder::bearer_auth`.
+                    // Platform-plane calls instead carry the runtime internal
+                    // credential as a sensitive `X-ToolKit-Internal-Token`
+                    // (never `Authorization`); at most one of the two is Some.
+                    // The platform credential is resolved fresh on every
+                    // attempt (not once before the retry loop) so a
+                    // rotated/refreshed token is used on retries.
                     let mut __builder = self.http.#verb_call(&__url);
                     if let Some(ref __t) = __bearer {
                         __builder = __builder.bearer_auth(__t);
                     }
+                    // Platform-plane credential attach routed through the single
+                    // audited runtime helper (shared with the SSE factory), which
+                    // re-resolves per attempt and warns on an unavailable source.
+                    __builder = #support::runtime::http::attach_internal_token(
+                        __builder,
+                        __internal_token_provider.as_ref(),
+                        #method_name_str,
+                    );
                     #body_apply
                     let __build_result: ::std::result::Result<
                         ::toolkit_http::RequestBuilder,
@@ -831,7 +846,7 @@ fn generate_streaming_method_body(
     method_name: &str,
     fields_init: &TokenStream,
     query_init: &TokenStream,
-    bearer_capture: &TokenStream,
+    auth_capture: &TokenStream,
     span_ctor: &TokenStream,
     support: &TokenStream,
 ) -> TokenStream {
@@ -880,7 +895,7 @@ fn generate_streaming_method_body(
 
             #fields_init
             #query_init
-            #bearer_capture
+            #auth_capture
 
             // Bind the convert closure once so we can both call it
             // imperatively (URL-build error path) and pass it to the map_err
@@ -934,10 +949,23 @@ fn generate_streaming_method_body(
                 let mut __builder = __http
                     .#verb_call(&__url)
                     .header("accept", "text/event-stream");
-                // Tenant bearer via a sensitive `Authorization` header.
+                // Tenant bearer via a sensitive `Authorization` header, or the
+                // platform-plane runtime credential via a sensitive
+                // `X-ToolKit-Internal-Token` (never `Authorization`); at most one
+                // of the two is Some. The platform credential is resolved fresh
+                // on every reconnect attempt (not once before the stream
+                // started) so a rotated/refreshed token is used on reconnects.
                 if let Some(ref __t) = __bearer {
                     __builder = __builder.bearer_auth(__t);
                 }
+                // Platform-plane credential attach routed through the single
+                // audited runtime helper (shared with the unary path), which
+                // re-resolves per reconnect and warns on an unavailable source.
+                __builder = #support::runtime::http::attach_internal_token(
+                    __builder,
+                    __internal_token_provider.as_ref(),
+                    #method_name,
+                );
                 if let Some(__id) = last {
                     __builder = __builder.header("Last-Event-ID", __id);
                 }
@@ -1107,28 +1135,99 @@ fn build_query_string(method: &RestMethodModel, support: &TokenStream) -> TokenS
     }
 }
 
-fn capture_bearer_token(method: &RestMethodModel) -> TokenStream {
-    let ctx_ident = method.params.iter().find_map(|p| {
-        if type_path_ends_with(&p.ty, "SecurityContext") {
-            Some(p.ident.clone())
-        } else {
-            None
-        }
-    });
+/// Capture the outbound auth credential(s) for a method, binding two locals the
+/// request-build closures consume: `__bearer` (tenant plane, a resolved
+/// `String`) and `__internal_token_provider` (platform plane, the
+/// [`InternalTokenProvider`] itself — NOT a pre-resolved token). At most one
+/// yields a credential; the plane is selected at compile time by the context
+/// type (`cpt-cf-adr-two-plane-auth`).
+///
+/// - Tenant `SecurityContext` → `__bearer` from the argument's bearer token
+///   (attached as `Authorization: Bearer`).
+/// - Platform `PlatformSecurityContext` → `__internal_token_provider` is a
+///   clone of `self.config.internal_token_provider`. The provider — not a
+///   token resolved once here — is what's captured, because both the retry
+///   loop (`__attempt`) and the SSE reconnect factory (`__factory`) may issue
+///   the request long after this line runs; each of those call sites resolves
+///   the credential fresh via `InternalTokenProvider::current` right before
+///   sending, so a rotated/refreshed credential is picked up on every attempt
+///   instead of a stale one captured at method-call time. The credential is
+///   sourced from the runtime, **never** from the argument (which carries no
+///   secret). Permissive: with no provider configured
+///   (`InternalCredential::None`) nothing is attached — the requirement is
+///   enforced server-side.
+/// - No context parameter → both `None`.
+fn capture_auth_credentials(method: &RestMethodModel, support: &TokenStream) -> TokenStream {
+    let secctx = method
+        .params
+        .iter()
+        .find(|p| is_security_context_type(&p.ty));
 
-    if let Some(ident) = ctx_ident {
-        quote! {
-            let __bearer: ::std::option::Option<::std::string::String> = #ident
-                .bearer_token()
-                .map(|__t| {
-                    use ::secrecy::ExposeSecret as _;
-                    __t.expose_secret().to_owned()
-                });
+    match secctx {
+        Some(p) if is_platform_security_context_type(&p.ty) => {
+            let ident = &p.ident;
+            let base_ty = strip_type_refs(&p.ty);
+            quote! {
+                // Compile-time plane guard: the argument selected as the platform
+                // plane must be *exactly* `toolkit_security::PlatformSecurityContext`,
+                // not merely a local type whose name ends in
+                // `PlatformSecurityContext`. Plane selection on REST is otherwise
+                // by name only, so without this a look-alike type would silently
+                // switch a method off the tenant bearer. This mirrors the gRPC
+                // `SecurityContextMarker` guard (`cpt-cf-adr-two-plane-auth`). The
+                // identity function type-checks only when the two types are equal.
+                const _: () = {
+                    #[allow(dead_code)]
+                    fn __assert_platform_plane(
+                        __x: #base_ty,
+                    ) -> ::toolkit_security::PlatformSecurityContext {
+                        __x
+                    }
+                };
+                // The `PlatformSecurityContext` argument is a compile-time plane
+                // marker kept off the wire; consume it so it is not an unused
+                // parameter (the credential is sourced from the runtime below,
+                // never from the argument, which holds no secret).
+                let _ = &#ident;
+                let __bearer: ::std::option::Option<::std::string::String> =
+                    ::std::option::Option::None;
+                let __internal_token_provider: ::std::option::Option<
+                    #support::runtime::config::InternalTokenProvider,
+                > = self.config.internal_token_provider.clone();
+            }
         }
-    } else {
-        quote! {
-            let __bearer: ::std::option::Option<::std::string::String> = ::std::option::Option::None;
+        Some(p) => {
+            let ident = &p.ident;
+            quote! {
+                let __bearer: ::std::option::Option<::std::string::String> = #ident
+                    .bearer_token()
+                    .map(|__t| {
+                        use ::secrecy::ExposeSecret as _;
+                        __t.expose_secret().to_owned()
+                    });
+                let __internal_token_provider: ::std::option::Option<
+                    #support::runtime::config::InternalTokenProvider,
+                > = ::std::option::Option::None;
+            }
         }
+        None => quote! {
+            let __bearer: ::std::option::Option<::std::string::String> =
+                ::std::option::Option::None;
+            let __internal_token_provider: ::std::option::Option<
+                #support::runtime::config::InternalTokenProvider,
+            > = ::std::option::Option::None;
+        },
+    }
+}
+
+/// Strip any leading references (`&T`, `&mut T`) from a type, returning the
+/// underlying value type. Used to build a by-value type-equality assertion for
+/// the platform-plane guard regardless of whether the context argument was
+/// written by-value or by-reference (both forms are accepted, see DESIGN §2.2).
+fn strip_type_refs(ty: &syn::Type) -> &syn::Type {
+    match ty {
+        syn::Type::Reference(r) => strip_type_refs(&r.elem),
+        other => other,
     }
 }
 
@@ -1298,7 +1397,20 @@ fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) ->
     // `.no_license_required()` must NOT follow it — that method only exists on
     // `LicenseNotSet`. `.authenticated()` leaves the license state unset, hence
     // the pairing.
-    let auth_registration = if method.anonymous {
+    //
+    // A platform-plane method (`PlatformSecurityContext` marker) is authorized
+    // by the platform-plane `internal_auth_middleware` (which validates the
+    // `X-ToolKit-Internal-Token` and inserts the `Extension<PlatformSecurityContext>`
+    // the handler reads) — NOT by the tenant-plane `security_context_middleware`.
+    // `.authenticated()` would demand a tenant JWT and 401 a legitimate
+    // internal-token caller before the handler runs, so the tenant auth axis
+    // must be left off (`.anonymous()`) until `OperationBuilder` grows a
+    // dedicated platform axis (`cpt-cf-adr-two-plane-auth`).
+    let is_platform_plane = method
+        .params
+        .iter()
+        .any(|p| is_platform_security_context_type(&p.ty));
+    let auth_registration = if method.anonymous || is_platform_plane {
         quote! { .anonymous() }
     } else {
         quote! { .authenticated().no_license_required() }

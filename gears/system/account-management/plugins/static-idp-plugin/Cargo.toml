@@ -36,6 +36,10 @@ async-trait = { workspace = true }
 # Data structures
 uuid = { workspace = true }
 
+# `IdpServiceAccountCredentials::client_secret` is a `SecretString`
+# per the SDK contract: redacted `Debug`, zeroize-on-drop, no Serde.
+secrecy = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }
 

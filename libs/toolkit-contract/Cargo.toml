@@ -30,6 +30,7 @@ runtime-client = [
     "dep:futures-core",
     "dep:rand",
     "dep:async-stream",
+    "dep:secrecy",
 ]
 # Client-side REST: gates the `runtime::resolving` module here, and in the SDK
 # crate the `rest_contract` codegen puts both the generated `<Trait>RestClient`
@@ -98,6 +99,7 @@ futures-core = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
 tonic = { workspace = true, features = ["transport"], optional = true }
+secrecy = { workspace = true, optional = true }
 toolkit-security = { workspace = true, optional = true }
 toolkit-transport-grpc = { workspace = true, optional = true }
 toolkit-canonical-errors = { workspace = true, optional = true }

@@ -18,7 +18,7 @@ build whenever feasible.
 |-------|-------|---------|--------------|------------|
 | **Unit** | Single function / struct / gear in isolation | `cargo test --workspace` | none (always compiled) | Every PR (`ci.yml` — `test` job, all OS) |
 | **Integration** | Cross-crate or DB-backed logic (SQLite, Postgres, MySQL) | `cargo test -p <pkg> --features integration` | `#[cfg(feature = "integration")]` | Every PR (`ci.yml` — `integration` job, Ubuntu) |
-| **E2E** | Full HTTP request → response through a running server | pytest + httpx against `cf-gears-e2e-server` | n/a (Python tests) | PRs to `main`, nightly schedule (`e2e.yml`) |
+| **E2E** | Full HTTP request → response through a running server | pytest + httpx against `cf-gears-example-server` | n/a (Python tests) | PRs to `main`, nightly schedule (`e2e.yml`) |
 | **Fuzz** | Parser / validator robustness against arbitrary input | `cargo-fuzz` (libFuzzer) | nightly toolchain | PRs + nightly (`clusterfuzzlite.yml`) |
 | **Static analysis** | Architectural rules, unsafe code, dependency licenses | clippy, `cargo gears lint`, cargo-deny, cargo-kani, cargo-geiger | varies | Every PR (`ci.yml` — `test`, `security`, `lint` jobs) |
 
@@ -31,6 +31,8 @@ make check                  # full quality gate (fmt + clippy + test + security)
 ### Quick-reference commands
 
 ```bash
+make build                 # whole-project example server release binary
+make run                   # default example server
 make test                  # unit tests (workspace, all OS)
 make test-sqlite           # integration — SQLite
 make test-pg               # integration — PostgreSQL
@@ -39,14 +41,21 @@ make test-db               # all DB integration tests
 make test-users-info-pg    # users-info gear integration (Postgres)
 make e2e-docker            # E2E — Docker environment
 make e2e-docker-smoke      # E2E — Docker environment (smoke subset only)
-make e2e-local             # E2E — local server (builds + starts automatically)
+make e2e-local             # E2E — local: run every shared-server suite against one shared server
 make e2e-local-smoke       # E2E — smoke subset only
 make e2e-mini-chat         # E2E — mini-chat lane (dedicated binary, offline mode)
-make e2e-tr-authz          # E2E — AuthZ -> TR -> RG chain (local mode, e2e-tr-authz.yaml)
+make e2e-tr-authz          # E2E — AuthZ -> TR -> RG chain (resource_group/e2e.yaml, profile: tr-authz)
 make e2e-usage-collector   # E2E — usage-collector lane (dedicated binary; needs Docker)
 make fuzz                  # fuzz — 30 s smoke per target
 make check                 # full quality gate (fmt + clippy + test + security)
 make all                   # full pipeline (build + check + test-sqlite + e2e-local)
+
+make build GEAR=file-parser      # one gear package plus SDK package
+make test GEAR=file-parser       # one gear package plus SDK package
+make run GEAR=file-parser        # server with only this gear feature set
+make e2e-local SUITE=file-parser # focused run: just this suite's tests
+make e2e-local GEAR=credstore    # run every shared-server suite that exercises a gear
+make coverage GEAR=file-parser   # unit + E2E coverage for one gear scope
 ```
 
 ---
@@ -104,10 +113,15 @@ Local coverage commands produce four report formats under `coverage/<mode>/`:
 ### 3.2 Running
 
 ```bash
-cargo test --workspace          # all unit tests
-cargo test -p cf-gears-oagw           # single package
+make test                              # workspace unit tests via nextest
+make test GEAR=file-parser             # one gear plus SDK package scope
+make test GEAR=file-parser GEAR_FEATURES=integration
+cargo test --workspace                 # all unit tests
+cargo test -p cf-gears-oagw            # single package
 cargo test -p cf-gears-toolkit-db -- cursor  # filtered by name
 ```
+
+`GEAR=<name>` defaults to packages `cf-gears-<name>` and `cf-gears-<name>-sdk`. Override `GEAR_PKG`, `GEAR_SDK_PKG`, `GEAR_FEATURES`, or `GEAR_TEST_ARGS` when a gear has non-standard package names or needs extra Cargo flags.
 
 ---
 
@@ -156,10 +170,22 @@ httpx).
 
 ### 5.2 Modes
 
-| Mode | Backend | Use case |
+A **suite** is one E2E scenario under `testing/e2e/suites/` (usually a gear).
+A **shared-server suite** (marked `launcher: e2e-launcher` in its `e2e.yaml`) can
+run against one common server; a **self-managed suite** (`launcher: pytest`)
+starts its own server and must be run on its own.
+
+`make e2e-local GEAR=<gear>` discovers and runs every shared-server suite whose
+Cargo `features` (in its `e2e.yaml`, including features pulled in via
+`features_file`) include that gear — no separate declaration is needed. `SUITE=`
+and `GEAR=` are mutually exclusive.
+
+| Mode | What it does | Use case |
 |------|---------|----------|
-| **Local** (`make e2e-local`) | Builds a release binary, starts it locally | Development, CI |
-| **Docker** (`make e2e-docker`) | Builds a Docker image, runs in container | Isolation, reproducibility |
+| **Local, many suites** (`make e2e-local`) | Builds one server and runs **every shared-server suite** against it. Self-managed suites are skipped — run those with their own target (see 5.3). | Development, CI |
+| **Local, one suite** (`make e2e-local SUITE=file-parser`) | Builds a server for just that suite and runs only its tests (`testing/e2e/suites/file_parser`). Works for shared-server and self-managed suites. | Focused suite iteration |
+| **Local, one gear** (`make e2e-local GEAR=credstore`) | Discovers every shared-server suite whose `e2e.yaml` features include the gear (e.g. `credstore` → the `credstore` and `oagw` suites) and runs each as its own focused build+run. Self-managed suites are skipped. | Gear-scoped iteration |
+| **Docker** (`make e2e-docker`) | Builds a Docker image and runs the tests in a container | Isolation, reproducibility |
 
 ### 5.3 CI
 
@@ -170,12 +196,17 @@ The `e2e.yml` workflow runs:
 - **Specialized lanes**: the same workflow also runs the mini-chat E2E suite, the
   RG + AuthZ end-to-end chain tests, and the usage-collector suite.
 
-The `tr-authz` lane is ordinary local mode with a different config
-(`config/e2e-tr-authz.yaml`) and a `-k resource_group` selection. The `mini-chat` and
+The `tr-authz` lane is ordinary local mode with a full-config profile
+(`testing/e2e/suites/resource_group/e2e.yaml`, profile `tr-authz`, applied over
+`config/e2e-local.yaml`) and a `-k resource_group` selection. The `mini-chat` and
 `usage-collector` lanes each build their own `cf-gears-example-server` with a feature
-set the default local-mode binary does not carry, so a plain `make e2e-local` collects
-their tests but skips them all: both gate on `E2E_BINARY`, which only their own make
-target sets.
+set the default local-mode binary does not carry, so they cannot share the common
+server: they are `launcher: pytest` suites that own their server (and, for
+usage-collector, a TimescaleDB container) in their own `conftest.py`. A plain
+`make e2e-local` (no `SUITE`) runs **only** the shared-server suites (`launcher:
+e2e-launcher`) and therefore **skips these** — run them via their dedicated
+`make e2e-mini-chat` / `make e2e-usage-collector` targets (or `make e2e-local
+SUITE=<suite>`), which CI invokes as separate steps.
 
 The usage-collector lane additionally needs a reachable Docker daemon — its storage
 plugin connects and migrates a real TimescaleDB at gear init, which `lib/sidecars.py`
@@ -195,8 +226,21 @@ workflow:
 
 ### 5.4 Writing E2E tests
 
-See [`testing/e2e/README.md`](../testing/e2e/README.md) for fixtures, examples, and
-environment variables.
+The detailed E2E guide is [`testing/e2e/README.md`](../testing/e2e/README.md). Use it as
+the source of truth for:
+
+- **Adding a new suite** — naming conventions, `testing/e2e/suites/<suite>/` layout,
+  `e2e.yaml` fields, focused builds, config pruning, overlays, and profiles.
+- **Choosing who starts the server (`launcher`)** — use `launcher: e2e-launcher`
+  when tests are only HTTP clients and can run against the standard shared E2E
+  server started by the framework; use `launcher: pytest` only when the suite's
+  own `conftest.py` must start the server, choose ports/config, or manage sidecars.
+- **Running tests** — `make e2e-local` runs all shared-server suites, while
+  `make e2e-local SUITE=<suite>` focuses one suite and works for self-managed suites.
+- **Writing test files** — pytest/httpx examples, common fixtures, smoke markers,
+  deterministic data, and HTTP contract assertions.
+- **Validating manifests** — use `python3 tools/scripts/run_e2e.py --suite <suite>
+  --dry-run` before relying on a changed `e2e.yaml`.
 
 ---
 
@@ -290,6 +334,8 @@ The `Makefile` wraps the same operations for convenience:
 ```bash
 make all        # build + check + test-sqlite + e2e-local
 make check      # fmt + clippy + test + security
+make build      # whole-project example server release binary
+make run        # default example server
 make fmt        # formatting check (cargo fmt --all -- --check)
 make dev-fmt    # auto-format (cargo fmt --all)
 make clippy     # linting (clippy --workspace --all-targets --all-features)
@@ -299,6 +345,10 @@ make deny       # cargo deny check
 make kani       # Kani formal verification (optional)
 make safety     # clippy + kani + lint + gears-lint
 ```
+
+Common gear-scoped targets accept `GEAR=<name>` for focused local iteration. `make build GEAR=<name>` and `make test GEAR=<name>` select the gear crate plus its SDK crate. `make run GEAR=<name>` composes `cf-gears-example-server` with the gear feature and the static local development system gears. E2E instead uses `SUITE=<name>`: `make e2e-local SUITE=<name>` maps kebab-case suite names to `testing/e2e/suites/<name_with_underscores>` (a suite is often, but not always, a gear).
+
+Gear runtime settings are YAML-driven under `gears:<gear_name>:` with a `config` section and optional gear-owned `database` section. Build-time Cargo features decide which gear code is present in the server binary; runtime YAML decides how those gears are configured.
 
 ## 7.3 CI Pipeline Summary
 

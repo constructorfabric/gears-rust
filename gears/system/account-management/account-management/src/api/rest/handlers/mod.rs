@@ -4,6 +4,7 @@ pub mod common;
 pub mod conversions;
 pub mod me;
 pub mod metadata;
+pub mod service_accounts;
 pub mod tenants;
 pub mod users;
 
@@ -14,6 +15,10 @@ pub(crate) use conversions::{
 pub(crate) use me::get_me;
 pub(crate) use metadata::{
     delete_metadata, get_metadata, list_metadata, resolve_metadata, upsert_metadata,
+};
+pub(crate) use service_accounts::{
+    create_service_account, list_service_accounts, revoke_service_account,
+    rotate_service_account_secret,
 };
 pub(crate) use tenants::{
     create_tenant, delete_tenant, get_tenant, list_tenant_children, suspend_tenant,

@@ -41,6 +41,12 @@ uuid = { workspace = true, features = ["serde"] }
 # pass `&str` through `gts::GtsID::new` for full chain validation.
 gts = { workspace = true }
 
+# `IdpServiceAccountCredentials::client_secret` is a `SecretString`
+# per the workspace MUST-wrap rule for secret-shaped strings: redacted
+# `Debug`, zeroize-on-drop, and no Serde — so a credential cannot be
+# logged or serialised into a response body by accident.
+secrecy = { workspace = true }
+
 # Tenant-resolver SDK is the canonical home for the public-facing
 # `TenantInfo` / `TenantStatus` shapes (slim, no internal storage
 # fields). AM's tenant CRUD output reuses these directly so the

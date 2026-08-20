@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::error::UnsupportedResource;
 use uuid::Uuid;
 
 /// Stable test tenant id used by every conversion test below. Its
@@ -25,9 +26,13 @@ fn provision_unsupported_operation_maps_to_unsupported_operation() {
         detail: "not supported by provider".into(),
     }
     .into_domain_error(fixture_tenant_id());
-    let DomainError::UnsupportedOperation { detail } = err else {
+    let DomainError::UnsupportedOperation { detail, resource } = err else {
         panic!("expected UnsupportedOperation");
     };
+    // The tenant half must tag itself as such: the boundary picks the
+    // envelope's `resource_type` from this, and all three halves collapse
+    // into the same variant.
+    assert_eq!(resource, UnsupportedResource::Tenant);
     // Public detail MUST carry the redaction marker and MUST NOT
     // leak the raw provider string.
     assert!(

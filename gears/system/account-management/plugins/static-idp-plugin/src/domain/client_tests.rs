@@ -9,8 +9,10 @@ use std::collections::HashSet;
 use toolkit_gts::gts_id;
 
 use account_management_sdk::{
-    IdpDeprovisionTenantRequest, IdpDeprovisionUserRequest, IdpListUsersRequest, IdpNewUser,
-    IdpPluginClient, IdpProvisionTenantRequest, IdpProvisionUserRequest, IdpTenantContext,
+    IdpDeprovisionTenantRequest, IdpDeprovisionUserRequest, IdpListServiceAccountsRequest,
+    IdpListUsersRequest, IdpNewUser, IdpPluginClient, IdpProvisionServiceAccountRequest,
+    IdpProvisionTenantRequest, IdpProvisionUserRequest, IdpRevokeServiceAccountRequest,
+    IdpRotateServiceAccountSecretRequest, IdpServiceAccountFailure, IdpTenantContext,
     IdpUpdateUserRequest, IdpUserDuplicateField, IdpUserFilterField, IdpUserOperationFailure,
     IdpUserPagination, IdpUserPatch,
 };
@@ -866,4 +868,364 @@ async fn update_user_rename_collision_returns_duplicate() {
             ..
         }
     ));
+}
+
+// ─── Service accounts ──────────────────────────────────────────────
+//
+// The four overrides exist so AM's machine-identity surface is a working
+// lifecycle in dev deploys and E2E rather than a uniform 501. These pin
+// the two obligations a caller can actually observe — `(tenant_id, name)`
+// uniqueness over live accounts, and a secret that changes on rotation
+// — plus the scoped-addressing rule that keeps one tenant out of
+// another's accounts.
+
+fn sa_provision_req(tenant_id: Uuid, name: &str) -> IdpProvisionServiceAccountRequest {
+    IdpProvisionServiceAccountRequest::new(
+        tenant_ctx(tenant_id),
+        name.to_owned(),
+        vec!["platform.read".to_owned()],
+    )
+}
+
+#[tokio::test]
+async fn provision_service_account_returns_credentials_and_records_the_account() {
+    let svc = Service::new();
+    let tenant = Uuid::from_u128(0x5001);
+
+    let creds = svc
+        .provision_service_account(&ctx(), &sa_provision_req(tenant, "ci"))
+        .await
+        .expect("provision succeeds");
+
+    assert_eq!(creds.client_id, format!("svc-{tenant}-ci"));
+    assert!(!creds.token_url.is_empty(), "token_url must be populated");
+    assert!(!creds.subject_id.is_nil(), "subject_id must be assigned");
+
+    let listed = svc
+        .list_service_accounts(
+            &ctx(),
+            &IdpListServiceAccountsRequest::new(tenant_ctx(tenant)),
+        )
+        .await
+        .expect("list succeeds");
+    assert_eq!(listed.len(), 1);
+    // Reported verbatim: the only contractual bridge from a submitted
+    // name back to an adapter-assigned client id.
+    assert_eq!(listed[0].name, "ci");
+    assert_eq!(listed[0].client_id, creds.client_id);
+    assert!(listed[0].enabled);
+    assert_eq!(listed[0].scopes, vec!["platform.read".to_owned()]);
+}
+
+/// The contract requires a name already live in the tenant to be refused
+/// *and* the existing account left unrevealed — the failure carries no
+/// client id, and AM discards the text anyway.
+#[tokio::test]
+async fn provision_service_account_rejects_a_name_already_live_in_the_tenant() {
+    let svc = Service::new();
+    let tenant = Uuid::from_u128(0x5002);
+    let first = svc
+        .provision_service_account(&ctx(), &sa_provision_req(tenant, "ci"))
+        .await
+        .expect("first provision succeeds");
+
+    let err = svc
+        .provision_service_account(&ctx(), &sa_provision_req(tenant, "ci"))
+        .await
+        .expect_err("duplicate name is refused");
+
+    assert!(matches!(err, IdpServiceAccountFailure::InvalidInput { .. }));
+    assert!(
+        !err.detail().contains(&first.client_id),
+        "the refusal must not reveal the existing account: {}",
+        err.detail()
+    );
+    // The existing account is untouched — still exactly one, still
+    // answering on its original credentials' client id.
+    let listed = svc
+        .list_service_accounts(
+            &ctx(),
+            &IdpListServiceAccountsRequest::new(tenant_ctx(tenant)),
+        )
+        .await
+        .expect("list succeeds");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].client_id, first.client_id);
+}
+
+/// Uniqueness is per tenant, not global.
+#[tokio::test]
+async fn the_same_name_is_available_in_a_different_tenant() {
+    let svc = Service::new();
+    let (a, b) = (Uuid::from_u128(0x5003), Uuid::from_u128(0x5004));
+
+    let ca = svc
+        .provision_service_account(&ctx(), &sa_provision_req(a, "ci"))
+        .await
+        .expect("tenant a provision succeeds");
+    let cb = svc
+        .provision_service_account(&ctx(), &sa_provision_req(b, "ci"))
+        .await
+        .expect("tenant b provision succeeds");
+
+    assert_ne!(ca.client_id, cb.client_id);
+    for (tenant, expected) in [(a, &ca.client_id), (b, &cb.client_id)] {
+        let listed = svc
+            .list_service_accounts(
+                &ctx(),
+                &IdpListServiceAccountsRequest::new(tenant_ctx(tenant)),
+            )
+            .await
+            .expect("list succeeds");
+        assert_eq!(listed.len(), 1, "listing must be tenant-scoped");
+        assert_eq!(&listed[0].client_id, expected);
+    }
+}
+
+/// Rotation must be observably different from a no-op while leaving the
+/// identity intact.
+#[tokio::test]
+async fn rotate_changes_the_secret_but_not_the_identity() {
+    use secrecy::ExposeSecret as _;
+
+    let svc = Service::new();
+    let tenant = Uuid::from_u128(0x5005);
+    let before = svc
+        .provision_service_account(&ctx(), &sa_provision_req(tenant, "ci"))
+        .await
+        .expect("provision succeeds");
+
+    let after = svc
+        .rotate_service_account_secret(
+            &ctx(),
+            &IdpRotateServiceAccountSecretRequest::new(
+                tenant_ctx(tenant),
+                before.client_id.clone(),
+            ),
+        )
+        .await
+        .expect("rotate succeeds");
+
+    assert_eq!(after.client_id, before.client_id, "client id is stable");
+    assert_eq!(after.subject_id, before.subject_id, "subject id is stable");
+    assert_ne!(
+        after.client_secret.expose_secret(),
+        before.client_secret.expose_secret(),
+        "a rotation that returned the same secret would be a silent no-op"
+    );
+}
+
+#[tokio::test]
+async fn rotate_on_an_absent_account_is_not_found() {
+    let svc = Service::new();
+    let tenant = Uuid::from_u128(0x5006);
+
+    let err = svc
+        .rotate_service_account_secret(
+            &ctx(),
+            &IdpRotateServiceAccountSecretRequest::new(tenant_ctx(tenant), "svc-nope".to_owned()),
+        )
+        .await
+        .expect_err("absent account is NotFound");
+
+    assert!(matches!(err, IdpServiceAccountFailure::NotFound { .. }));
+}
+
+/// Scoped addressing: holding another tenant's exact client id must not
+/// grant rotation, and the answer is indistinguishable from "never
+/// existed" so it cannot be used as a probe.
+#[tokio::test]
+async fn rotate_cannot_reach_another_tenants_account() {
+    let svc = Service::new();
+    let (a, b) = (Uuid::from_u128(0x5007), Uuid::from_u128(0x5008));
+    let owned_by_a = svc
+        .provision_service_account(&ctx(), &sa_provision_req(a, "ci"))
+        .await
+        .expect("tenant a provision succeeds");
+
+    let err = svc
+        .rotate_service_account_secret(
+            &ctx(),
+            &IdpRotateServiceAccountSecretRequest::new(tenant_ctx(b), owned_by_a.client_id.clone()),
+        )
+        .await
+        .expect_err("cross-tenant rotate is refused");
+
+    assert!(matches!(err, IdpServiceAccountFailure::NotFound { .. }));
+}
+
+#[tokio::test]
+async fn revoke_removes_the_account_then_reports_absence() {
+    let svc = Service::new();
+    let tenant = Uuid::from_u128(0x5009);
+    let creds = svc
+        .provision_service_account(&ctx(), &sa_provision_req(tenant, "ci"))
+        .await
+        .expect("provision succeeds");
+    let first_req =
+        IdpRevokeServiceAccountRequest::new(tenant_ctx(tenant), creds.client_id.clone());
+    svc.revoke_service_account(&ctx(), &first_req)
+        .await
+        .expect("first revoke removes it");
+
+    // Second revoke reports absence 1:1 — AM is what turns that into an
+    // idempotent 204, so the plugin must NOT fold it into success here.
+    let repeat_req =
+        IdpRevokeServiceAccountRequest::new(tenant_ctx(tenant), creds.client_id.clone());
+    let err = svc
+        .revoke_service_account(&ctx(), &repeat_req)
+        .await
+        .expect_err("repeat revoke reports absence to AM");
+    assert!(matches!(err, IdpServiceAccountFailure::NotFound { .. }));
+
+    let listed = svc
+        .list_service_accounts(
+            &ctx(),
+            &IdpListServiceAccountsRequest::new(tenant_ctx(tenant)),
+        )
+        .await
+        .expect("list succeeds");
+    assert!(listed.is_empty(), "revoked account must be gone");
+}
+
+/// Uniqueness is over *live* accounts, which is what makes
+/// revoke-then-provision a valid recovery from an ambiguous outcome.
+#[tokio::test]
+async fn revoke_frees_the_name_for_a_fresh_provision() {
+    use secrecy::ExposeSecret as _;
+
+    let svc = Service::new();
+    let tenant = Uuid::from_u128(0x500A);
+    let first = svc
+        .provision_service_account(&ctx(), &sa_provision_req(tenant, "ci"))
+        .await
+        .expect("provision succeeds");
+    svc.revoke_service_account(
+        &ctx(),
+        &IdpRevokeServiceAccountRequest::new(tenant_ctx(tenant), first.client_id.clone()),
+    )
+    .await
+    .expect("revoke succeeds");
+
+    let second = svc
+        .provision_service_account(&ctx(), &sa_provision_req(tenant, "ci"))
+        .await
+        .expect("the freed name is available again");
+
+    // Re-provisioning the same name must not hand back the revoked
+    // credential. An earlier revision derived the secret from
+    // `(client_id, generation)`, both of which are pure functions of
+    // `(tenant_id, name)` — so this recovery path reproduced the
+    // original secret byte-for-byte and revocation did not revoke.
+    assert_eq!(
+        second.client_id, first.client_id,
+        "identity is still derived from (tenant_id, name)"
+    );
+    assert_ne!(
+        second.client_secret.expose_secret(),
+        first.client_secret.expose_secret(),
+        "a revoked secret must never be resurrected by re-provisioning the freed name"
+    );
+}
+
+/// A name that could not survive being embedded in the client id is
+/// rejected before anything is stored, rather than minting an account the
+/// item routes can never address.
+#[tokio::test]
+async fn unaddressable_name_is_rejected_and_stores_nothing() {
+    let svc = Service::new();
+    let tenant = Uuid::from_u128(0x500F);
+
+    for bad in ["a/b", "", "a b", "a%2Fb"] {
+        let err = svc
+            .provision_service_account(&ctx(), &sa_provision_req(tenant, bad))
+            .await
+            .expect_err("an unaddressable name must be refused");
+        assert!(
+            matches!(
+                err,
+                IdpServiceAccountFailure::InvalidInput { ref field, .. }
+                    if field.as_deref() == Some("name")
+            ),
+            "expected InvalidInput on the name field, got {err:?}"
+        );
+    }
+
+    let listed = svc
+        .list_service_accounts(
+            &ctx(),
+            &IdpListServiceAccountsRequest::new(tenant_ctx(tenant)),
+        )
+        .await
+        .expect("listing succeeds");
+    assert!(
+        listed.is_empty(),
+        "a rejected name must leave no account behind"
+    );
+}
+
+/// Two accounts must not share secret material, and a secret must not be
+/// derivable from the identity a `list` caller can already see.
+#[tokio::test]
+async fn secrets_are_unguessable_and_unique_per_account() {
+    use secrecy::ExposeSecret as _;
+
+    let svc = Service::new();
+    let tenant = Uuid::from_u128(0x500E);
+    let a = svc
+        .provision_service_account(&ctx(), &sa_provision_req(tenant, "one"))
+        .await
+        .expect("provision succeeds");
+    let b = svc
+        .provision_service_account(&ctx(), &sa_provision_req(tenant, "two"))
+        .await
+        .expect("provision succeeds");
+
+    assert_ne!(
+        a.client_secret.expose_secret(),
+        b.client_secret.expose_secret()
+    );
+    // The client id and the subject id are both public (the listing
+    // exposes the name, and AM hands the subject id to RBAC). Neither may
+    // appear in the secret, or reading the listing would be enough to
+    // reconstruct it.
+    for cred in [&a, &b] {
+        let secret = cred.client_secret.expose_secret();
+        assert!(
+            !secret.contains(&cred.client_id),
+            "secret must not embed the client id"
+        );
+        assert!(
+            !secret.contains(&cred.subject_id.to_string()),
+            "secret must not embed the subject id"
+        );
+    }
+}
+
+#[tokio::test]
+async fn listing_is_name_ordered_and_carries_no_secret() {
+    let svc = Service::new();
+    let tenant = Uuid::from_u128(0x500B);
+    for name in ["zeta", "alpha", "mid"] {
+        svc.provision_service_account(&ctx(), &sa_provision_req(tenant, name))
+            .await
+            .expect("provision succeeds");
+    }
+
+    let listed = svc
+        .list_service_accounts(
+            &ctx(),
+            &IdpListServiceAccountsRequest::new(tenant_ctx(tenant)),
+        )
+        .await
+        .expect("list succeeds");
+
+    // Stable ordering matters: the backing map's iteration order is not
+    // deterministic, and a caller reconciling an ambiguous provision
+    // scans this listing.
+    let names: Vec<&str> = listed.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    // The summary type carries no secret field at all; assert the debug
+    // form is clean as a belt-and-braces guard against a future field.
+    assert!(!format!("{listed:?}").contains("static-idp-secret"));
 }

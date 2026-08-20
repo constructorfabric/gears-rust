@@ -60,10 +60,26 @@ See also [REPO_PLAYBOOK](docs/REPO_PLAYBOOK.md) with the registry of repository-
 git clone --recurse-submodules <repository-url>
 cd gears-rust
 
-make build      # Build libraries and example server binary
-make test       # Run tests
-make example    # Run toolkit example gear
+make build      # Build the whole-project example server release binary
+make test       # Run workspace tests
+make check      # Run formatting, validation, linting, security, docs, and tests
+make all        # Build + check + SQLite integration + local E2E + OpenAPI
+make run        # Run the default example server
+make example    # Run the example server with the default E2E feature set
 ```
+
+Most top-level development targets can also be scoped to one gear:
+
+```bash
+make build GEAR=file-parser      # Build cf-gears-file-parser and its SDK crate
+make test GEAR=file-parser       # Test cf-gears-file-parser and its SDK crate
+make run GEAR=file-parser        # Run the example server with only this gear feature set
+make e2e-local SUITE=file-parser  # Run this one E2E suite plus the default E2E target
+make e2e-local GEAR=credstore    # Run every shared-server E2E suite that exercises a gear
+make coverage GEAR=file-parser   # Collect unit + E2E coverage for this gear scope
+```
+
+`GEAR=<name>` defaults package names to `cf-gears-<name>` and `cf-gears-<name>-sdk`. Use `GEAR_PKG`, `GEAR_SDK_PKG`, `GEAR_FEATURES`, `GEAR_BUILD_ARGS`, `GEAR_TEST_ARGS`, or `GEAR_RUN_ARGS` when a gear uses non-default package names or needs extra Cargo/server flags.
 
 ### Running the Server
 
@@ -71,7 +87,7 @@ The Gears repository comes with an example server illustrating the gears APIs:
 
 ```bash
 # Run an example server, see the API docs @ http://127.0.0.1:8087/cf/docs
-make exammple
+make example
 
 # See API documentation:
 # $ make example
@@ -134,6 +150,8 @@ gears:
 ### Creating Your First Gear
 
 See [TOOLKIT UNIFIED SYSTEM](docs/toolkit_unified_system/README.md) and [TOOLKIT_PLUGINS.md](docs/TOOLKIT_PLUGINS.md) for details.
+
+Individual gears live under `gears/<name>/`, usually with a gear crate and an SDK crate. The Makefile builds a single gear by selecting those packages, while `make run GEAR=<name>` composes the example server with `--no-default-features` and the gear feature plus the static local development system gears. Runtime settings stay in YAML under `gears:<gear_name>:` with separate `config` and optional gear-owned `database` sections.
 
 ## Documentation
 
@@ -223,11 +241,13 @@ Other tests:
 
 ```bash
 make test            # unit tests (workspace)
+make test GEAR=file-parser  # unit tests for one gear and its SDK crate
 make test-sqlite     # integration tests (SQLite, no external DB required)
 make e2e-local       # end-to-end tests (builds + starts server automatically)
-make e2e-local E2E_TARGET=testing/e2e/gears/file_parser/  # targeted end-to-end scope
+make e2e-local SUITE=file-parser  # suite E2E scope plus the default E2E target
 make e2e-docker      # end-to-end tests (builds + starts server in Docker)
 make coverage-unit   # unit test code coverage
+make coverage GEAR=file-parser  # unit + E2E coverage for one gear scope
 make fuzz            # fuzz smoke tests (30 s per target)
 ```
 
@@ -237,7 +257,7 @@ On **Windows** (no `make`), use the cross-platform Python scripts directly
 ```bash
 python tools/scripts/ci.py check          # full CI suite
 python tools/scripts/ci.py e2e-local      # end-to-end tests
-python tools/scripts/ci.py e2e-local -- testing/e2e/gears/file_parser/  # targeted end-to-end scope
+python tools/scripts/ci.py e2e-local -- testing/e2e/suites/file_parser/  # targeted end-to-end scope
 python tools/scripts/ci.py fuzz --seconds 60  # fuzz smoke run
 
 python tools/scripts/coverage.py unit      # unit-test code coverage

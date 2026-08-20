@@ -98,6 +98,13 @@ pub struct OopSpawnOptions {
 }
 
 /// Options for running the `ToolKit` runner.
+///
+/// `#[non_exhaustive]`: construct via [`RunOptions::new`] + the `with_*`
+/// builders rather than a struct literal, so adding a new optional field does
+/// not break every call site (and out-of-crate consumers get a deprecation-free
+/// upgrade path). The four arguments to `new` are the always-required fields;
+/// everything else defaults to "off".
+#[non_exhaustive]
 pub struct RunOptions {
     /// Provider of gear config sections (raw JSON by gear name).
     pub gears_cfg: Arc<dyn ConfigProvider>,
@@ -128,6 +135,68 @@ pub struct RunOptions {
     /// See `HostRuntime::with_shutdown_deadline` for details on the relationship
     /// with `WithLifecycle::stop_timeout`.
     pub shutdown_deadline: Option<std::time::Duration>,
+    /// Process-wide platform-plane credential source (the selected
+    /// `InternalCredential`), threaded into every [`GearCtx`] so
+    /// `#[toolkit::provides]`-generated clients attach `X-ToolKit-Internal-Token`
+    /// on platform-plane (`PlatformSecurityContext`) methods. `None` (Profile 1
+    /// / in-process, or no credential configured) attaches nothing.
+    pub internal_token_provider: Option<toolkit_contract::runtime::config::InternalTokenProvider>,
+}
+
+impl RunOptions {
+    /// Create `RunOptions` with the four always-required fields; all optional
+    /// fields default to "off" (`clients` empty, no `oop`, default shutdown
+    /// deadline, no platform credential). Layer options on with the `with_*`
+    /// builders.
+    #[must_use]
+    pub fn new(
+        gears_cfg: Arc<dyn ConfigProvider>,
+        db: DbOptions,
+        shutdown: ShutdownOptions,
+        instance_id: Uuid,
+    ) -> Self {
+        Self {
+            gears_cfg,
+            db,
+            shutdown,
+            clients: Vec::new(),
+            instance_id,
+            oop: None,
+            shutdown_deadline: None,
+            internal_token_provider: None,
+        }
+    }
+
+    /// Pre-register clients to inject into the `ClientHub` before gear init.
+    #[must_use]
+    pub fn with_clients(mut self, clients: Vec<ClientRegistration>) -> Self {
+        self.clients = clients;
+        self
+    }
+
+    /// Set the `OoP` gear spawn configuration.
+    #[must_use]
+    pub fn with_oop(mut self, oop: Option<OopSpawnOptions>) -> Self {
+        self.oop = oop;
+        self
+    }
+
+    /// Override the per-gear graceful-shutdown deadline.
+    #[must_use]
+    pub fn with_shutdown_deadline(mut self, deadline: Option<std::time::Duration>) -> Self {
+        self.shutdown_deadline = deadline;
+        self
+    }
+
+    /// Set the process-wide platform-plane credential source (see the field).
+    #[must_use]
+    pub fn with_internal_token_provider(
+        mut self,
+        provider: Option<toolkit_contract::runtime::config::InternalTokenProvider>,
+    ) -> Self {
+        self.internal_token_provider = provider;
+        self
+    }
 }
 
 /// Construct a `HostRuntime` by wiring shutdown, discovering gears, building
@@ -198,6 +267,7 @@ fn build_host_runtime(opts: RunOptions) -> anyhow::Result<HostRuntime> {
     if let Some(deadline) = opts.shutdown_deadline {
         host = host.with_shutdown_deadline(deadline);
     }
+    host = host.with_internal_token_provider(opts.internal_token_provider);
 
     Ok(host)
 }

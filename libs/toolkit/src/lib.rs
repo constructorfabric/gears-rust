@@ -111,7 +111,7 @@ pub mod contract_support {
     #[cfg(feature = "contract-grpc-client")]
     pub use toolkit_contract::grpc;
     pub use toolkit_contract::{
-        contract, descriptor, error, grpc_repr, ir, policy, query, runtime,
+        contract, descriptor, error, grpc_repr, ir, policy, query, runtime, wiring,
     };
 }
 

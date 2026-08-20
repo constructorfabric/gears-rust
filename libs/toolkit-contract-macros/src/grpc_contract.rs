@@ -22,8 +22,8 @@ use syn::{TraitItem, Type};
 use crate::grpc_contract_parse::{GrpcContractModel, GrpcIdempotency, GrpcMethodModel, GrpcParam};
 use crate::projection::{
     build_delegation_body, client_struct_ident, generate_projection_impl_for_client,
-    render_method_inputs, render_method_return_ty, rewrite_streaming_signature, strip_method_attrs,
-    type_path_ends_with,
+    is_platform_security_context_type, is_security_context_type, render_method_inputs,
+    render_method_return_ty, rewrite_streaming_signature, strip_method_attrs,
 };
 use crate::support::contract_support_path;
 
@@ -70,7 +70,7 @@ fn generate_synthesized_request_from_impls(model: &GrpcContractModel) -> TokenSt
             let wire_params: Vec<&GrpcParam> = method
                 .params
                 .iter()
-                .filter(|p| p.ident != "self" && !type_path_ends_with(&p.ty, "SecurityContext"))
+                .filter(|p| p.ident != "self" && !is_security_context_type(&p.ty))
                 .collect();
             // Exactly one wire param of a proto-direct primitive type.
             let [param] = wire_params.as_slice() else {
@@ -142,7 +142,7 @@ fn generate_repr_guards(model: &GrpcContractModel, support: &TokenStream) -> Tok
             if param.ident == "self" {
                 continue;
             }
-            if type_path_ends_with(&param.ty, "SecurityContext") {
+            if is_security_context_type(&param.ty) {
                 let ty = &param.ty;
                 let key = quote!(#ty).to_string();
                 if seen_secctx_keys.insert(key) {
@@ -348,6 +348,24 @@ fn generate_client_struct(model: &GrpcContractModel, support: &TokenStream) -> T
                 Self,
                 #support::runtime::transport_error::TransportError,
             > {
+                // Honor `require_tls`: refuse to build the channel over a
+                // plaintext (`http://`) scheme so the long-lived, process-scoped
+                // platform-plane credential is never sent over cleartext h2c
+                // (`cpt-cf-adr-two-plane-auth`). When it is unset, the platform's
+                // deliberate in-mesh plaintext service-to-service convention
+                // is preserved (see `ClientConfig::require_tls`).
+                if config.require_tls
+                    && !config.base_url.trim_start().starts_with("https://")
+                {
+                    return ::std::result::Result::Err(
+                        #support::runtime::transport_error::TransportError::network(
+                            ::std::format!(
+                                "require_tls is set but the gRPC endpoint scheme is not https: {}",
+                                config.base_url,
+                            ),
+                        ),
+                    );
+                }
                 let endpoint = ::tonic::transport::Endpoint::from_shared(config.base_url.clone())
                     .map_err(|e| #support::runtime::transport_error::TransportError::network(e))?;
                 let endpoint = endpoint.timeout(config.timeout);
@@ -412,7 +430,12 @@ fn generate_client_method(
         );
         return quote::quote_spanned! { span => compile_error!(#msg); };
     };
-    let ctx_ident = security_context_param(method);
+    // A single value carries both the token-attachment ident and the plane
+    // classification, so a method can never attach a tenant bearer token while
+    // classifying itself as platform-plane (or vice versa): the two are no
+    // longer a separable `(Option<ident>, bool)` pair the three generators
+    // could receive inconsistently.
+    let plane = auth_plane(method);
 
     if method.server_streaming {
         return generate_streaming_client_method(
@@ -423,7 +446,7 @@ fn generate_client_method(
             &sig_inputs,
             &return_ty,
             &body_ident,
-            ctx_ident.as_ref(),
+            plane,
             ok_ty,
             err_ty,
         );
@@ -436,7 +459,7 @@ fn generate_client_method(
             &sig_inputs,
             &return_ty,
             &body_ident,
-            ctx_ident.as_ref(),
+            plane,
             ok_ty,
             &proto_request_ty,
             support,
@@ -450,12 +473,41 @@ fn generate_client_method(
         &sig_inputs,
         &return_ty,
         &body_ident,
-        ctx_ident.as_ref(),
+        plane,
         ok_ty,
         &proto_request_ty,
         support,
         &err_convert,
     )
+}
+
+/// The authentication plane of a method, derived **once** from its single
+/// security-context parameter. Collapsing the former `(Option<&Ident>, bool)`
+/// pair into one value makes it impossible for the token-attachment ident and
+/// the plane classification to be passed inconsistently to the code generators
+/// (`cpt-cf-adr-two-plane-auth`).
+#[derive(Clone, Copy)]
+enum AuthPlane<'a> {
+    /// No security-context parameter: no credential is attached.
+    None,
+    /// Tenant plane (`SecurityContext`): attach the caller's bearer token,
+    /// sourced from the named argument.
+    Tenant(&'a syn::Ident),
+    /// Platform plane (`PlatformSecurityContext`): the off-wire marker (named by
+    /// the ident) is consumed and the runtime internal token is attached — never
+    /// from the argument.
+    Platform(&'a syn::Ident),
+}
+
+/// Classify a method's authentication plane from its (at most one)
+/// security-context parameter. `parse_params` rejects more than one such
+/// parameter, so the selection is unambiguous.
+fn auth_plane(method: &GrpcMethodModel) -> AuthPlane<'_> {
+    match security_context_param(method) {
+        Some(p) if is_platform_security_context_type(&p.ty) => AuthPlane::Platform(&p.ident),
+        Some(p) => AuthPlane::Tenant(&p.ident),
+        None => AuthPlane::None,
+    }
 }
 
 /// Emit a non-retryable unary method body. Converts the DTO to the proto
@@ -467,18 +519,32 @@ fn generate_one_shot_unary_method(
     sig_inputs: &TokenStream,
     return_ty: &TokenStream,
     body_ident: &syn::Ident,
-    ctx_ident: Option<&syn::Ident>,
+    plane: AuthPlane<'_>,
     ok_ty: &Type,
     proto_request_ty: &TokenStream,
     support: &TokenStream,
     err_convert: &TokenStream,
 ) -> TokenStream {
     let method_ident = &method.ident;
-    let attach_metadata = match ctx_ident {
-        Some(ctx) => quote! {
+    let rpc_name = method.ident.to_string();
+    let attach_metadata = match plane {
+        // Platform plane: source the credential from the runtime provider on
+        // `self.config`, not from the `PlatformSecurityContext` argument (which
+        // carries no secret). The marker stays off the wire; `let _ = &#ctx`
+        // consumes it so it is not an unused parameter. Permissive when no
+        // provider is configured.
+        AuthPlane::Platform(ctx) => quote! {
+            let _ = &#ctx;
+            #support::grpc::attach_internal_token(
+                __request.metadata_mut(),
+                self.config.internal_token_provider.as_ref(),
+                #rpc_name,
+            )?;
+        },
+        AuthPlane::Tenant(ctx) => quote! {
             #support::grpc::attach_bearer(__request.metadata_mut(), &#ctx)?;
         },
-        None => quote! {},
+        AuthPlane::None => quote! {},
     };
 
     // Wrap the body in an inner closure that yields
@@ -524,25 +590,42 @@ fn generate_retryable_unary_method(
     sig_inputs: &TokenStream,
     return_ty: &TokenStream,
     body_ident: &syn::Ident,
-    ctx_ident: Option<&syn::Ident>,
+    plane: AuthPlane<'_>,
     ok_ty: &Type,
     proto_request_ty: &TokenStream,
     support: &TokenStream,
     err_convert: &TokenStream,
 ) -> TokenStream {
     let method_ident = &method.ident;
+    let rpc_name = method.ident.to_string();
     // Inside the per-attempt async block we hold a CLONE of the context
     // (cheap if the context wraps an `Arc`). The outer binding of `__ctx`
     // captures by reference so the FnMut closure can re-clone on each retry.
-    let (ctx_outer, attempt_ctx_clone, attach_metadata) = match ctx_ident {
-        Some(ctx) => (
+    let (ctx_outer, attempt_ctx_clone, attach_metadata) = match plane {
+        // Platform plane: no per-attempt context clone — the credential comes
+        // from the runtime provider on `self.config` (accessible inside the
+        // per-attempt `async move`, which already borrows `self`). `let _ =
+        // &#ctx` consumes the off-wire marker so it is not unused. Permissive
+        // when no provider is configured.
+        AuthPlane::Platform(ctx) => (
+            quote! { let _ = &#ctx; },
+            quote! {},
+            quote! {
+                #support::grpc::attach_internal_token(
+                    __request.metadata_mut(),
+                    self.config.internal_token_provider.as_ref(),
+                    #rpc_name,
+                )?;
+            },
+        ),
+        AuthPlane::Tenant(ctx) => (
             quote! { let __ctx = #ctx; },
             quote! { let __ctx_attempt = __ctx.clone(); },
             quote! {
                 #support::grpc::attach_bearer(__request.metadata_mut(), &__ctx_attempt)?;
             },
         ),
-        None => (quote! {}, quote! {}, quote! {}),
+        AuthPlane::None => (quote! {}, quote! {}, quote! {}),
     };
 
     quote! {
@@ -594,16 +677,21 @@ fn body_param_ident(method: &GrpcMethodModel) -> Option<syn::Ident> {
     method
         .params
         .iter()
-        .find(|p| p.ident != "self" && !type_path_ends_with(&p.ty, "SecurityContext"))
+        .find(|p| p.ident != "self" && !is_security_context_type(&p.ty))
         .map(|p| p.ident.clone())
 }
 
-fn security_context_param(method: &GrpcMethodModel) -> Option<syn::Ident> {
+/// The method's single security-context parameter, if any. `parse_params`
+/// (`grpc_contract_parse.rs`) rejects methods with more than one such
+/// parameter, so `.find` here is unambiguous — callers MUST derive both the
+/// token-attachment ident and the plane classification (via
+/// [`is_platform_security_context_type`]) from this same param, to avoid
+/// mixing tenant and platform auth.
+fn security_context_param(method: &GrpcMethodModel) -> Option<&GrpcParam> {
     method
         .params
         .iter()
-        .find(|p| type_path_ends_with(&p.ty, "SecurityContext"))
-        .map(|p| p.ident.clone())
+        .find(|p| is_security_context_type(&p.ty))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -615,25 +703,46 @@ fn generate_streaming_client_method(
     sig_inputs: &TokenStream,
     return_ty: &TokenStream,
     body_ident: &syn::Ident,
-    ctx_ident: Option<&syn::Ident>,
+    plane: AuthPlane<'_>,
     ok_ty: &Type,
     err_ty: &Type,
 ) -> TokenStream {
     let method_ident = &method.ident;
+    let rpc_name = method.ident.to_string();
 
-    let attach_metadata = match ctx_ident {
-        Some(_) => quote! {
-            if let Err(__e) = #support::grpc::attach_bearer(__request.metadata_mut(), &__ctx_clone) {
-                let __out_err: #err_ty = ::std::convert::From::from(__e);
-                Err(__out_err)?;
-            }
-        },
-        None => quote! {},
-    };
-
-    let ctx_clone = match ctx_ident {
-        Some(ctx) => quote! { let __ctx_clone = #ctx.clone(); },
-        None => quote! {},
+    // The returned stream is `'static`, so it cannot borrow `self`; any credential
+    // source must be cloned out *before* the `try_stream!` block. For the tenant
+    // plane that is the context clone; for the platform plane it is the runtime
+    // provider (`Option<InternalTokenProvider>`, cheap `Arc` clone), with the
+    // off-wire marker consumed via `let _ = &#ctx`.
+    let (ctx_clone, attach_metadata) = match plane {
+        AuthPlane::Platform(ctx) => (
+            quote! {
+                let _ = &#ctx;
+                let __internal_token_provider =
+                    self.config.internal_token_provider.clone();
+            },
+            quote! {
+                if let Err(__e) = #support::grpc::attach_internal_token(
+                    __request.metadata_mut(),
+                    __internal_token_provider.as_ref(),
+                    #rpc_name,
+                ) {
+                    let __out_err: #err_ty = ::std::convert::From::from(__e);
+                    Err(__out_err)?;
+                }
+            },
+        ),
+        AuthPlane::Tenant(ctx) => (
+            quote! { let __ctx_clone = #ctx.clone(); },
+            quote! {
+                if let Err(__e) = #support::grpc::attach_bearer(__request.metadata_mut(), &__ctx_clone) {
+                    let __out_err: #err_ty = ::std::convert::From::from(__e);
+                    Err(__out_err)?;
+                }
+            },
+        ),
+        AuthPlane::None => (quote! {}, quote! {}),
     };
 
     quote! {
@@ -685,4 +794,200 @@ fn generate_projection_impl(model: &GrpcContractModel) -> TokenStream {
         &client_struct_ident(&model.trait_ident),
         "grpc-client",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grpc_contract_parse::{self, GrpcContractAttr};
+    use quote::quote;
+
+    fn build_model(tokens: TokenStream) -> GrpcContractModel {
+        let attr: GrpcContractAttr = syn::parse2(quote! {
+            package = "test.v1",
+            stubs_module = "crate::stubs"
+        })
+        .unwrap();
+        let item: syn::ItemTrait = syn::parse2(tokens).unwrap();
+        grpc_contract_parse::parse(attr, item).unwrap()
+    }
+
+    fn expand(tokens: TokenStream) -> String {
+        generate(&build_model(tokens)).to_string()
+    }
+
+    /// Concatenate the token strings of every generated `fn` body whose ident
+    /// matches `method`, across all `impl` blocks in the expansion. Parsing the
+    /// expansion as a `syn::File` and locating the statement is robust against
+    /// proc-macro2 pretty-printing whitespace (`& ctx` vs `&ctx`) and lets a
+    /// per-method assertion detect cross-method plane leakage that a whole-file
+    /// `contains` on a single-method trait cannot.
+    fn method_bodies(tokens: TokenStream, method: &str) -> String {
+        use quote::ToTokens as _;
+        let file: syn::File =
+            syn::parse2(generate(&build_model(tokens))).expect("expansion parses as a syn::File");
+        let mut out = String::new();
+        for item in &file.items {
+            let syn::Item::Impl(imp) = item else { continue };
+            for impl_item in &imp.items {
+                if let syn::ImplItem::Fn(f) = impl_item
+                    && f.sig.ident == method
+                {
+                    out.push_str(&f.block.to_token_stream().to_string());
+                    out.push('\n');
+                }
+            }
+        }
+        assert!(!out.is_empty(), "no fn `{method}` found in expansion");
+        out
+    }
+
+    #[test]
+    fn tenant_plane_method_attaches_bearer_not_internal_token() {
+        let body = method_bodies(
+            quote! {
+                pub trait FooApiGrpc: FooApi {
+                    async fn get_thing(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+                }
+            },
+            "get_thing",
+        );
+        assert!(body.contains("attach_bearer"), "got:\n{body}");
+        assert!(!body.contains("attach_internal_token"), "got:\n{body}");
+    }
+
+    #[test]
+    fn platform_plane_method_attaches_internal_token_not_bearer() {
+        let body = method_bodies(
+            quote! {
+                pub trait FooApiGrpc: FooApi {
+                    async fn get_thing(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+                }
+            },
+            "get_thing",
+        );
+        assert!(body.contains("attach_internal_token"), "got:\n{body}");
+        assert!(!body.contains("attach_bearer"), "got:\n{body}");
+        // The credential is wired to the runtime provider on `self.config`, not
+        // sourced from the (off-wire) argument.
+        assert!(
+            body.contains("internal_token_provider"),
+            "attach must be wired to self.config.internal_token_provider; got:\n{body}"
+        );
+    }
+
+    /// A trait mixing a tenant method and a platform method: each generated body
+    /// must carry ONLY its own plane's attacher. This is the case a single-method
+    /// trait cannot cover — it detects plane classification derived from the
+    /// wrong method.
+    #[test]
+    fn mixed_trait_keeps_each_method_on_its_own_plane() {
+        let tokens = quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn tenant_call(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+                async fn platform_call(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        };
+        let tenant = method_bodies(tokens.clone(), "tenant_call");
+        assert!(tenant.contains("attach_bearer"), "got:\n{tenant}");
+        assert!(!tenant.contains("attach_internal_token"), "got:\n{tenant}");
+
+        let platform = method_bodies(tokens, "platform_call");
+        assert!(
+            platform.contains("attach_internal_token"),
+            "got:\n{platform}"
+        );
+        assert!(!platform.contains("attach_bearer"), "got:\n{platform}");
+    }
+
+    #[test]
+    fn platform_plane_retryable_method_attaches_internal_token() {
+        let out = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[retryable]
+                #[idempotency_level(Idempotent)]
+                async fn get_thing(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(out.contains("attach_internal_token"), "got:\n{out}");
+        assert!(!out.contains("attach_bearer"), "got:\n{out}");
+    }
+
+    #[test]
+    fn platform_plane_streaming_method_attaches_internal_token() {
+        let out = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[streaming]
+                async fn watch_thing(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(out.contains("attach_internal_token"), "got:\n{out}");
+        assert!(!out.contains("attach_bearer"), "got:\n{out}");
+    }
+
+    #[test]
+    fn tenant_plane_streaming_method_attaches_bearer_not_internal_token() {
+        let out = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[streaming]
+                async fn watch_thing(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(out.contains("attach_bearer"), "got:\n{out}");
+        assert!(!out.contains("attach_internal_token"), "got:\n{out}");
+    }
+
+    #[test]
+    fn method_with_no_wire_body_emits_compile_error() {
+        let out = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn get_thing(&self, ctx: SecurityContext) -> Result<Resp, Err>;
+            }
+        });
+        assert!(out.contains("compile_error"), "got:\n{out}");
+        assert!(out.contains("no wire-body parameter"), "got:\n{out}");
+    }
+
+    #[test]
+    fn security_context_param_selects_the_only_secctx_param() {
+        let model = build_model(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn get_thing(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        let param = security_context_param(&model.methods[0]).expect("secctx present");
+        assert_eq!(param.ident, "ctx");
+        assert!(is_platform_security_context_type(&param.ty));
+    }
+
+    #[test]
+    fn security_context_param_is_none_when_absent() {
+        let model = build_model(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn get_thing(&self, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(security_context_param(&model.methods[0]).is_none());
+    }
+
+    #[test]
+    fn body_param_ident_skips_security_context() {
+        let model = build_model(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn get_thing(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        let body = body_param_ident(&model.methods[0]).expect("body param present");
+        assert_eq!(body, "id");
+    }
+
+    #[test]
+    fn body_param_ident_none_when_only_security_context() {
+        let model = build_model(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn get_thing(&self, ctx: SecurityContext) -> Result<Resp, Err>;
+            }
+        });
+        assert!(body_param_ident(&model.methods[0]).is_none());
+    }
 }

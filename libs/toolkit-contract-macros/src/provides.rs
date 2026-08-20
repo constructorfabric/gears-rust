@@ -311,8 +311,14 @@ pub fn generate(attr: &ProvidesAttr, item: &ItemStruct) -> SynResult<TokenStream
         quote! {
             ::toolkit_contract::wiring::ClientWiring::Rest { endpoint, tuning } => {
                 #rest_policy_warning
+                // Thread the process's platform-plane credential source onto the
+                // client config so platform-plane (`PlatformSecurityContext`)
+                // methods attach `X-ToolKit-Internal-Token`. `None` (Profile 1 /
+                // no credential) attaches nothing (cpt-cf-adr-two-plane-auth).
+                let __cfg = tuning.apply_to(endpoint)
+                    .with_internal_token_provider(ctx.internal_token_provider());
                 ::std::sync::Arc::new(
-                    #rest_client_path::new(tuning.apply_to(endpoint))
+                    #rest_client_path::new(__cfg)
                         .map_err(|e| ::anyhow::anyhow!(
                             concat!("building REST client for `", stringify!(#contract_ident), "`: {}"), e
                         ))?
@@ -336,8 +342,12 @@ pub fn generate(attr: &ProvidesAttr, item: &ItemStruct) -> SynResult<TokenStream
         quote! {
             ::toolkit_contract::wiring::ClientWiring::Grpc { endpoint, tuning } => {
                 #grpc_policy_warning
+                // See the REST arm: platform-plane methods attach the runtime
+                // internal credential as `x-toolkit-internal-token` metadata.
+                let __cfg = tuning.apply_to(endpoint)
+                    .with_internal_token_provider(ctx.internal_token_provider());
                 ::std::sync::Arc::new(
-                    #grpc_client_path::connect(tuning.apply_to(endpoint)).await
+                    #grpc_client_path::connect(__cfg).await
                         .map_err(|e| ::anyhow::anyhow!(
                             concat!("connecting gRPC client for `", stringify!(#contract_ident), "`: {}"), e
                         ))?

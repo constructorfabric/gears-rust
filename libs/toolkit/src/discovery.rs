@@ -178,9 +178,20 @@ pub struct ConsumerRegistration {
     /// Provider gear name the contract resolves against (diagnostics).
     pub dep_gear: &'static str,
     /// Wiring action: register the client into the hub; reports whether the
-    /// dependency was satisfied locally or bound to a remote client.
-    pub wire: fn(&ClientHub, Arc<dyn EndpointResolver>) -> anyhow::Result<WireOutcome>,
+    /// dependency was satisfied locally or bound to a remote client. See
+    /// [`WireFn`] for the argument roles.
+    pub wire: WireFn,
 }
+
+/// The wiring function pointer emitted by `#[toolkit::consumes]`. Registers the
+/// client into the `ClientHub`, given the endpoint resolver and the process's
+/// platform-plane credential source (threaded onto a directory-resolving remote
+/// client). Aliased to keep the fn-pointer type readable.
+pub type WireFn = fn(
+    &ClientHub,
+    Arc<dyn EndpointResolver>,
+    Option<&toolkit_contract::runtime::config::InternalTokenProvider>,
+) -> anyhow::Result<WireOutcome>;
 
 inventory::collect!(ConsumerRegistration);
 

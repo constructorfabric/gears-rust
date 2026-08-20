@@ -97,7 +97,9 @@ inventory::submit! {
     toolkit::discovery::ConsumerRegistration {
         owner_gear: "orders",
         dep_gear:   "billing",
-        wire: |hub: &ClientHub, resolver: Arc<dyn EndpointResolver>|
+        wire: |hub: &ClientHub,
+               resolver: Arc<dyn EndpointResolver>,
+               internal_token_provider: Option<&InternalTokenProvider>|
               -> anyhow::Result<WireOutcome> {
             // Short-circuit: Profile 1 in-process impl already present.
             if hub.try_get_local::<dyn billing_sdk::BillingApi>().is_some() {
@@ -107,7 +109,12 @@ inventory::submit! {
             if hub.has_remote_proxy::<dyn billing_sdk::BillingApi>() {
                 return Ok(WireOutcome::Remote);
             }
-            let client = billing_sdk::BillingApiRestResolvingClient::new(resolver);
+            // The process's platform-plane credential source is threaded onto the
+            // resolving client so its platform-plane methods attach
+            // `X-ToolKit-Internal-Token` (`None` in Profile 1 attaches nothing).
+            let tuning = ClientTuning::default()
+                .with_internal_token_provider(internal_token_provider.cloned());
+            let client = billing_sdk::BillingApiRestResolvingClient::new(resolver, "billing", tuning);
             hub.register_remote_proxy::<dyn billing_sdk::BillingApi>(Arc::new(client));
             Ok(WireOutcome::Remote)
         },
@@ -152,7 +159,7 @@ resolve loop for those that bound remotely:
 
 ```text
 for each ConsumerRegistration where owner_gear == this_gear:
-    outcome = ConsumerRegistration.wire(client_hub, resolver_for(dep_gear))?
+    outcome = ConsumerRegistration.wire(client_hub, resolver_for(dep_gear), internal_token_provider)?
     if outcome == Local:
         mark dep_gear readiness-resolved       // no directory probe at all
     else:

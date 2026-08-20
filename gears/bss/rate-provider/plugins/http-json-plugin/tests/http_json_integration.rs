@@ -162,13 +162,11 @@ async fn health_probe_passes_on_a_non_success_status() {
 
 #[tokio::test]
 async fn health_probe_fails_only_when_nothing_gets_through() {
-    // The other side of the bound: bind then drop, so the port is free and the
-    // request dies at the transport level — the one genuinely unreachable case.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-
-    let p = provider(format!("http://{addr}/rates"), Auth::None {});
+    // The other side of the bound: a `.invalid` host (RFC 6761) can never
+    // resolve, so the request dies at the transport level — the one
+    // genuinely unreachable case — deterministically, with no ephemeral port
+    // for another test's listener to race for.
+    let p = provider("http://unreachable.invalid/rates".to_owned(), Auth::None {});
     let ctx = SecurityContext::anonymous();
     let err = p.health(&ctx, "req").await.unwrap_err();
     assert!(
@@ -316,14 +314,11 @@ async fn upstream_503_maps_to_upstream_status() {
 }
 
 #[tokio::test]
-async fn connection_refused_maps_to_unreachable() {
-    // Bind then immediately drop the listener: the port is free, but nothing
-    // is listening, so any request to it fails at the transport level.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-
-    let p = provider(format!("http://{addr}/rates"), Auth::None {});
+async fn unresolvable_host_maps_to_unreachable() {
+    // A `.invalid` host (RFC 6761) can never resolve, so the request fails at
+    // the transport level deterministically — no ephemeral port involved, so
+    // no other test can ever race for it.
+    let p = provider("http://unreachable.invalid/rates".to_owned(), Auth::None {});
     let ctx = SecurityContext::anonymous();
     let err = p.fetch_latest(&ctx, &[], "req").await.unwrap_err();
     assert!(matches!(err, RateProviderError::Unreachable(_)));

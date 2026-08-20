@@ -1264,7 +1264,7 @@ mod pg {
 
     // ── Full-flow integration (real client + real Postgres; only the PDP +
     //    tenant-type reader are fakes). NOT the project e2e suite — those are the
-    //    pytest black-box tests under testing/e2e/gears/ledger/. ──
+    //    pytest black-box tests under testing/e2e/suites/ledger/. ──
 
     /// Full ledger flow: provision → post → read → reverse → tie-out.
     /// Drives the real `LedgerLocalClient` against a real database: provision a

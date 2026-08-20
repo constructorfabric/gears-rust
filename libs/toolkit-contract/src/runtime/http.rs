@@ -9,8 +9,10 @@ use http_body::Body;
 use http_body_util::BodyStream;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use toolkit_canonical_errors::Problem;
+use toolkit_http::RequestBuilder;
 
 use crate::ir::binding::{HttpFieldBinding, HttpMethod, HttpMethodBindingIr};
+use crate::runtime::config::InternalTokenProvider;
 use crate::runtime::transport_error::TransportError;
 
 // RFC 3986 path-segment encode set: encode everything except unreserved
@@ -124,6 +126,24 @@ pub fn build_request_url(
     }
 
     Ok(url)
+}
+
+/// Attach the platform-plane credential from `provider` (if any) to a REST
+/// [`RequestBuilder`] as the sensitive `X-ToolKit-Internal-Token` header.
+///
+/// The single audited REST emit point, shared by the unary-attempt closure and
+/// the SSE reconnect factory (so both re-resolve per attempt and pick up
+/// rotation). REST sibling of [`crate::grpc::attach_internal_token`]; both
+/// delegate the attach policy to [`InternalTokenProvider::resolve_for_attach`].
+pub fn attach_internal_token(
+    builder: RequestBuilder,
+    provider: Option<&InternalTokenProvider>,
+    rpc: &str,
+) -> RequestBuilder {
+    match InternalTokenProvider::resolve_for_attach(provider, rpc) {
+        Some(token) => builder.internal_token_auth(&token),
+        None => builder,
+    }
 }
 
 /// Map an HTTP method enum to [`http::Method`].

@@ -198,6 +198,20 @@ impl HostRuntime {
         self
     }
 
+    /// Set the process-wide platform-plane credential source, applied to every
+    /// [`GearCtx`](crate::context::GearCtx) this runtime builds so
+    /// `#[toolkit::provides]`-generated clients attach `X-ToolKit-Internal-Token`
+    /// on platform-plane methods. `None` (Profile 1 / in-process, or no
+    /// credential configured) attaches nothing.
+    #[must_use]
+    pub fn with_internal_token_provider(
+        mut self,
+        provider: Option<toolkit_contract::runtime::config::InternalTokenProvider>,
+    ) -> Self {
+        self.ctx_builder = self.ctx_builder.with_internal_token_provider(provider);
+        self
+    }
+
     /// `PRE_INIT` phase: wire runtime internals into system gears.
     ///
     /// This phase runs before init and only for gears with the "system" capability.
@@ -512,11 +526,19 @@ impl HostRuntime {
                     (Arc::clone(&resolver), false)
                 };
 
-            let outcome = (reg.wire)(&self.client_hub, reg_resolver).map_err(|source| {
-                RegistryError::ProxyWiring {
-                    gear: reg.owner_gear,
-                    source,
-                }
+            // Thread the process's platform-plane credential onto the wired
+            // (directory-resolving) client so its platform-plane methods attach
+            // `X-ToolKit-Internal-Token` (`cpt-cf-adr-two-plane-auth`). This is
+            // the genuine remote inter-gear path (Profile 2/3); a co-located
+            // local impl short-circuits before the credential is used.
+            let outcome = (reg.wire)(
+                &self.client_hub,
+                reg_resolver,
+                self.ctx_builder.internal_token_provider(),
+            )
+            .map_err(|source| RegistryError::ProxyWiring {
+                gear: reg.owner_gear,
+                source,
             })?;
             self.dep_checker.register_dep(reg.dep_gear.to_owned());
             match outcome {

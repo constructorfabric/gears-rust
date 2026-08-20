@@ -1,0 +1,270 @@
+# Gear Scoped CI is an opportunistic PR accelerator for small, isolated gear changes.
+#
+# It inspects the PR diff before running expensive Rust checks:
+# - if every changed file is under exactly one supported scope root —
+#   `gears/<gear>/...`, `gears/*/<gear>/...`, or `libs/<gear>/...` — it runs a
+#   scoped Makefile fast path;
+# - both executable gear scopes under `gears/` and library scopes under `libs/`
+#   run `make gear-ci GEAR=<gear>` (fmt + clippy + test, no extra tools)
+#   so the Makefile limits scoped work to that gear and its dependency graph;
+# - if the diff touches multiple supported scopes, workspace files, docs, CI, or any
+#   non-gear path, this workflow intentionally does not run tests and leaves a summary
+#   note that full CI should be run without `GEAR=...`.
+#
+# This workflow is additive. It does not replace the full CI workflow; it only provides
+# a fast path for PRs that are structurally safe to validate with a single gear scope.
+name: Gear Scoped CI
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  detect:
+    name: Detect gear scope
+    runs-on: ubuntu-latest
+    outputs:
+      scoped: ${{ steps.scope.outputs.scoped }}
+      gear: ${{ steps.scope.outputs.gear }}
+      scope_path: ${{ steps.scope.outputs.scope_path }}
+      scope_kind: ${{ steps.scope.outputs.scope_kind }}
+      scope_id: ${{ steps.scope.outputs.scope_id }}
+      make_cmd: ${{ steps.scope.outputs.make_cmd }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Analyze changed files
+        id: scope
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA" || true
+
+          python <<'PY'
+          import os
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          ROOT = Path.cwd()
+
+          def write_output(name: str, value: str) -> None:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                  fh.write(f"{name}={value}\n")
+
+          def write_summary(message: str) -> None:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+                  fh.write(message + "\n")
+
+          def read_package_name(manifest: Path) -> str:
+              if not manifest.is_file():
+                  return ""
+              data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+              return str(data.get("package", {}).get("name", ""))
+
+          def is_gear_root(path: Path) -> bool:
+              name = path.name
+              if (path / "Cargo.toml").is_file():
+                  return True
+              if (path / name / "Cargo.toml").is_file():
+                  return True
+              if (path / f"{name}-sdk" / "Cargo.toml").is_file():
+                  return True
+              return False
+
+          def discover_scope_roots() -> list[Path]:
+              roots: list[Path] = []
+
+              gears_dir = ROOT / "gears"
+              if gears_dir.is_dir():
+                  for child in sorted(gears_dir.iterdir()):
+                      if not child.is_dir():
+                          continue
+                      if is_gear_root(child):
+                          roots.append(child)
+                          continue
+                      for grandchild in sorted(child.iterdir()):
+                          if grandchild.is_dir() and is_gear_root(grandchild):
+                              roots.append(grandchild)
+
+              libs_dir = ROOT / "libs"
+              if libs_dir.is_dir():
+                  for child in sorted(libs_dir.iterdir()):
+                      if child.is_dir() and (child / "Cargo.toml").is_file():
+                          roots.append(child)
+
+              return roots
+
+          def classify_scope(scope_rel: str, scope_path: Path) -> tuple[str, str, str, str]:
+              gear = scope_path.name
+              scope_kind = "lib" if scope_rel.startswith("libs/") else "gear"
+              gear_pkg = read_package_name(scope_path / "Cargo.toml") or read_package_name(scope_path / gear / "Cargo.toml")
+
+              if not gear_pkg:
+                  raise RuntimeError(f"Unable to resolve package metadata for scope {scope_rel}")
+
+              cmd = f"make GEAR={gear} gear-ci"
+
+              return scope_kind, gear, gear_pkg, cmd
+
+          # Use merge-base for three-dot semantics: only the PR's own changes,
+          # not commits merged into the base branch since the PR was opened.
+          merge_base = subprocess.run(
+              ["git", "merge-base", os.environ["BASE_SHA"], os.environ["HEAD_SHA"]],
+              check=True, capture_output=True, text=True,
+          ).stdout.strip()
+
+          diff = subprocess.run(
+              ["git", "diff", "--name-only", merge_base, os.environ["HEAD_SHA"]],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          changed_files = [line.strip() for line in diff.stdout.splitlines() if line.strip()]
+
+          for key in ("scoped", "gear", "scope_path", "scope_kind", "scope_id", "make_cmd"):
+              write_output(key, "")
+
+          if not changed_files:
+              write_output("scoped", "false")
+              write_summary("No changed files detected. Full CI should run without `GEAR=...`.")
+              raise SystemExit(0)
+
+          scope_roots = [(path.relative_to(ROOT).as_posix(), path) for path in discover_scope_roots()]
+
+          selected_scope: tuple[str, Path] | None = None
+          failure_reason = "Changes are not limited to exactly one supported gear scope. Full CI should run without `GEAR=...`."
+
+          for file in changed_files:
+              matches = [scope for scope in scope_roots if file == scope[0] or file.startswith(scope[0] + "/")]
+              if len(matches) != 1:
+                  selected_scope = None
+                  break
+              if selected_scope is None:
+                  selected_scope = matches[0]
+                  continue
+              if selected_scope[0] != matches[0][0]:
+                  selected_scope = None
+                  break
+
+          if selected_scope is None:
+              write_output("scoped", "false")
+              write_summary(failure_reason)
+              raise SystemExit(0)
+
+          scope_rel, scope_path = selected_scope
+          try:
+              scope_kind, gear, gear_pkg, make_cmd = classify_scope(scope_rel, scope_path)
+          except RuntimeError as exc:
+              write_output("scoped", "false")
+              write_summary(f"{exc}. Full CI should run without `GEAR=...`.")
+              raise SystemExit(0)
+
+          write_output("scoped", "true")
+          write_output("gear", gear)
+          write_output("scope_path", scope_rel)
+          write_output("scope_kind", scope_kind)
+          write_output("scope_id", scope_rel.replace("/", "-"))
+          write_output("make_cmd", make_cmd)
+          write_summary(f"All changed files are inside one {scope_kind} scope: `{scope_rel}`. Running `{make_cmd}`.")
+          PY
+
+  scoped-ci:
+    name: Scoped CI (${{ needs.detect.outputs.scope_path }})
+    needs: detect
+    if: needs.detect.outputs.scoped == 'true'
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C debuginfo=0"
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: '1.21.x'
+          cache: false
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: cargo-hack, nextest, cargo-llvm-cov
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Probe sccache & set RUSTC_WRAPPER
+        shell: bash
+        run: |
+          if sccache --start-server >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          else
+            echo "sccache failed, falling back to plain rustc"
+          fi
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-gear-scoped-${{ hashFiles('rust-toolchain.toml') }}
+
+      - name: Mark required tools installed
+        run: touch .setup-stamp
+
+      - name: Run scoped CI command
+        run: ${{ needs.detect.outputs.make_cmd }}
+
+  not-scoped:
+    name: Full CI required
+    needs: detect
+    if: needs.detect.outputs.scoped != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report non-scoped changes
+        run: echo "Changes are not limited to exactly one supported gear or library scope. Full CI should run without GEAR=..." >> "$GITHUB_STEP_SUMMARY"

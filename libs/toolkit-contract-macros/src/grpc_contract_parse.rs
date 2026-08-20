@@ -314,6 +314,26 @@ fn parse_params(method: &TraitItemFn) -> syn::Result<Vec<GrpcParam>> {
             ty: (*pat_type.ty).clone(),
         });
     }
+
+    // Exactly one security-plane context per method: the client codegen
+    // (`security_context_param` / plane detection in `grpc_contract.rs`)
+    // picks a single param to source the auth metadata from. A second
+    // context param (e.g. a stray `PlatformSecurityContext` alongside a
+    // tenant `SecurityContext`) would silently be dropped from the wire
+    // without ever being consulted for token attachment, mixing planes.
+    let secctx_count = params
+        .iter()
+        .filter(|p| crate::projection::is_security_context_type(&p.ty))
+        .count();
+    if secctx_count > 1 {
+        return Err(syn::Error::new(
+            method.sig.ident.span(),
+            "grpc_contract method must take at most one security-plane context \
+             parameter (`SecurityContext` or `PlatformSecurityContext`); found more \
+             than one",
+        ));
+    }
+
     Ok(params)
 }
 
@@ -368,5 +388,160 @@ impl GrpcIdempotency {
             GrpcIdempotency::Idempotent => "Idempotent",
             GrpcIdempotency::NotIdempotent => "NotIdempotent",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    fn parse_trait(tokens: proc_macro2::TokenStream) -> syn::Result<GrpcContractModel> {
+        let attr: GrpcContractAttr = syn::parse2(quote! {
+            package = "test.v1",
+            stubs_module = "crate::stubs"
+        })?;
+        let item: syn::ItemTrait = syn::parse2(tokens)?;
+        parse(attr, item)
+    }
+
+    /// Like [`parse_trait`], but discards the (non-`Debug`) model on success
+    /// so the error path can use `.expect_err`.
+    fn parse_trait_err(tokens: proc_macro2::TokenStream) -> syn::Error {
+        parse_trait(tokens)
+            .map(|_| ())
+            .expect_err("expected a parse error")
+    }
+
+    #[test]
+    fn rejects_methods_with_two_security_context_params() {
+        let err = parse_trait_err(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn do_it(
+                    &self,
+                    ctx: SecurityContext,
+                    other: PlatformSecurityContext,
+                    id: String,
+                ) -> Result<Resp, Err>;
+            }
+        });
+        assert!(
+            err.to_string()
+                .contains("at most one security-plane context"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_single_security_context_param() {
+        let model = parse_trait(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn do_it(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        })
+        .expect("a single security-context param is valid");
+        assert_eq!(model.methods.len(), 1);
+        // `self` (a `Receiver`, not `FnArg::Typed`) never lands in `params`.
+        assert_eq!(model.methods[0].params.len(), 2);
+    }
+
+    #[test]
+    fn accepts_platform_security_context_param() {
+        let model = parse_trait(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn do_it(&self, ctx: PlatformSecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        })
+        .expect("a single platform security-context param is valid");
+        // Assert the CLASSIFICATION, not just the param count: counting params
+        // cannot tell a `PlatformSecurityContext` recognized as a plane marker
+        // from one mistakenly treated as an ordinary wire param.
+        assert_eq!(model.methods[0].params.len(), 2);
+        assert!(
+            crate::projection::is_platform_security_context_type(&model.methods[0].params[0].ty),
+            "first param must be recognized as the platform-plane marker"
+        );
+        // And the wire body is the OTHER param (`id`) — a non-context payload,
+        // i.e. the platform context is excluded from the wire message.
+        assert_eq!(model.methods[0].params[1].ident, "id");
+        assert!(
+            !crate::projection::is_security_context_type(&model.methods[0].params[1].ty),
+            "the wire body param must not be classified as a security context"
+        );
+    }
+
+    #[test]
+    fn methods_without_a_security_context_are_still_valid() {
+        // gRPC parsing does not itself require a security-context parameter
+        // (unlike the REST projection) — absence just means no auth metadata
+        // is attached by the generated client.
+        let model = parse_trait(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn do_it(&self, id: String) -> Result<Resp, Err>;
+            }
+        })
+        .expect("no security-context param is valid");
+        assert_eq!(model.methods[0].params.len(), 1);
+    }
+
+    #[test]
+    fn retryable_non_idempotent_is_rejected() {
+        let err = parse_trait_err(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[retryable]
+                async fn do_it(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(err.to_string().contains("NotIdempotent"), "got: {err}");
+    }
+
+    #[test]
+    fn retryable_idempotent_is_accepted() {
+        let model = parse_trait(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[retryable]
+                #[idempotency_level(Idempotent)]
+                async fn do_it(&self, ctx: SecurityContext, id: String) -> Result<Resp, Err>;
+            }
+        })
+        .expect("retryable + Idempotent is valid");
+        assert!(model.methods[0].retryable);
+        assert_eq!(model.methods[0].idempotency, GrpcIdempotency::Idempotent);
+    }
+
+    #[test]
+    fn duplicate_rpc_names_are_rejected() {
+        let err = parse_trait_err(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[rpc(name = "Shared")]
+                async fn one(&self, ctx: SecurityContext) -> Result<Resp, Err>;
+                #[rpc(name = "Shared")]
+                async fn two(&self, ctx: SecurityContext) -> Result<Resp, Err>;
+            }
+        });
+        assert!(
+            err.to_string().contains("duplicate gRPC rpc_name"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn wrong_projection_name_is_rejected() {
+        let err = parse_trait_err(quote! {
+            pub trait NotTheRightNameGrpc: FooApi {
+                async fn do_it(&self, ctx: SecurityContext) -> Result<Resp, Err>;
+            }
+        });
+        assert!(err.to_string().contains("FooApiGrpc"), "got: {err}");
+    }
+
+    #[test]
+    fn non_remote_capable_base_is_rejected() {
+        let err = parse_trait_err(quote! {
+            pub trait FooEmbeddedGrpc: FooEmbedded {
+                async fn do_it(&self, ctx: SecurityContext) -> Result<Resp, Err>;
+            }
+        });
+        assert!(err.to_string().contains("not allowed"), "got: {err}");
     }
 }

@@ -1,6 +1,6 @@
 # E2E Test Scenario Map
 
-Maps DESIGN.md requirements to e2e test classes in `testing/e2e/gears/mini_chat/`.
+Maps DESIGN.md requirements to e2e test classes in `testing/e2e/suites/mini_chat/`.
 
 **Convention:** Scenario IDs use `{area}-{number}` format (e.g., `10-01`).
 Tests reference scenarios in comments: `# 10-01: Upload Attachment → 201`.

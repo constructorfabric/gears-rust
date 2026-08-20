@@ -75,7 +75,7 @@ cargo clippy -p file-storage -p file-storage-sdk --all-targets -- -D warnings
 cargo test -p file-storage -p file-storage-sdk
 # e2e lifecycle (real server + sidecar) — gated, opt-in:
 #   build sidecar, export FS_E2E_BINARY / FS_SIDECAR_BINARY per tools/scripts/ci.py, then:
-#   pytest testing/e2e/gears/file_storage -q
+#   pytest testing/e2e/suites/file_storage -q
 ```
 
 ---
@@ -249,9 +249,9 @@ missing input validation) and should be reviewed together.
   - **E2E** (justified negative — real cross-**subject**, same-tenant AuthZ
     decision is a genuine seam unit tests can't prove): add
     `test_cross_user_policy_write_denied_by_real_authz` to
-    `testing/e2e/gears/file_storage/test_file_storage_seams.py`. Introduce
+    `testing/e2e/suites/file_storage/test_file_storage_seams.py`. Introduce
     `E2E_AUTH_TOKEN_USER_B` (new optional env var, same shape as
-    `E2E_AUTH_TOKEN_TENANT_B` in `testing/e2e/gears/resource_group/test_integration_seams.py:207`)
+    `E2E_AUTH_TOKEN_TENANT_B` in `testing/e2e/suites/resource_group/test_integration_seams.py:207`)
     mapped to a second subject in the *same* tenant; `pytest.skip(...)` when
     unset. Do not block landing 0.7 on this env var existing — the unit
     tests above are sufficient sole coverage until it does.
@@ -413,7 +413,7 @@ missing input validation) and should be reviewed together.
     the real `.public()` route + real token verification, which a unit test
     calling the Rust function directly cannot prove is wired correctly):
     add `test_finalize_forged_size_hash_is_rejected` to
-    `testing/e2e/gears/file_storage/lifecycle/test_file_storage_lifecycle.py`
+    `testing/e2e/suites/file_storage/lifecycle/test_file_storage_lifecycle.py`
     — presign, skip the real PUT (or PUT different bytes), POST finalize
     with a forged `size`/`hash_hex` carrying the real token; assert the real
     server rejects it (400), and `GET /files/{id}/versions` still shows the
@@ -1362,9 +1362,9 @@ Two independent fixes, verifiable separately.
   3. Same curl **after** the fix (with `FS_SIDECAR_MAX_BODY_BYTES` at its default or unset): expected `403` (or `401`) — the request now reaches `extract_token`/`verifier.verify`, which rejects the garbage token; the status flipping from `413` to `403` is the observable proof the body-size floor was lifted, without needing a real signed token for this specific check.
 
 - **New/changed tests**:
-  - E2E only (this is a real HTTP-layer/axum-wiring fact that no unit test calling Rust functions directly can observe — `bin/sidecar.rs`'s actual compiled `Router`/`main()` is the seam). Add to `testing/e2e/gears/file_storage/lifecycle/test_file_storage_lifecycle.py`:
+  - E2E only (this is a real HTTP-layer/axum-wiring fact that no unit test calling Rust functions directly can observe — `bin/sidecar.rs`'s actual compiled `Router`/`main()` is the seam). Add to `testing/e2e/suites/file_storage/lifecycle/test_file_storage_lifecycle.py`:
     - `test_upload_over_2mib_succeeds_once_policy_allows` (positive, justified new case since no existing lifecycle test uploads a body >2MiB) — run the same create → upload → bind → download flow as `test_localfs_single_part_full_lifecycle` but with a >2MiB `PAYLOAD`; assert the `PUT` returns `200` (not `413`) and the downloaded bytes match.
-  Run: `FS_E2E_BINARY=<path> pytest testing/e2e/gears/file_storage/lifecycle/ -k test_upload_over_2mib_succeeds_once_policy_allows -v` — passes once the layer lands (currently would fail with `413`).
+  Run: `FS_E2E_BINARY=<path> pytest testing/e2e/suites/file_storage/lifecycle/ -k test_upload_over_2mib_succeeds_once_policy_allows -v` — passes once the layer lands (currently would fail with `413`).
 
 - **Done-check**: `rg -n "DefaultBodyLimit::max" src/bin/sidecar.rs` returns one match, and the curl in step 3 above returns `403`/`401`, not `413`, for a 3 MiB body.
 
@@ -1422,7 +1422,7 @@ Two independent fixes, verifiable separately.
   Run: `cargo test -p cf-gears-file-storage --lib -- put_stream` — both pass.
   - E2E — genuine HTTP seam (only a real compiled sidecar binary proves the handler doesn't buffer): extend `lifecycle/test_file_storage_lifecycle.py`:
     - `test_upload_exceeding_policy_max_size_rejected_mid_stream` (justified negative) — issue an upload URL whose token carries a small `max_size` (needs a control-plane API surface that lets the test request a size-constrained upload URL, or directly mint a constrained token via the lifecycle conftest's key material if `create` doesn't expose a `max_size` param yet — check `POST /files` request DTO for an existing `max_size`/policy field before adding one), PUT a body larger than that `max_size`; assert the sidecar returns an error status and that no on-disk temp file (`*.tmp.*`) remains under `fs_storage_root` afterward — this is the wiring proof; the abort-mid-stream *logic* itself is already unit-tested above.
-  Run: `FS_E2E_BINARY=<path> pytest testing/e2e/gears/file_storage/lifecycle/ -k test_upload_exceeding_policy_max_size_rejected_mid_stream -v` — passes.
+  Run: `FS_E2E_BINARY=<path> pytest testing/e2e/suites/file_storage/lifecycle/ -k test_upload_exceeding_policy_max_size_rejected_mid_stream -v` — passes.
 
 - **Done-check**: `cargo test -p cf-gears-file-storage --lib -- put_stream` green AND `rg -n "async fn put_stream" src/infra/backend/mod.rs` shows the new trait method.
 
@@ -1482,7 +1482,7 @@ Two independent fixes, verifiable separately.
   - `sidecar_healthz_returns_200` (unit, `#[cfg(test)]` in `src/bin/sidecar.rs`) — build a `SidecarState` with a throwaway `InMemoryBackend`/verifier, call `build_router(state).oneshot(Request::get("/healthz").body(Body::empty()).unwrap())`, assert `response.status() == StatusCode::OK`. This is the `Router::oneshot` route-smoke pattern `13_e2e_testing.md` explicitly endorses for unit tests.
   Run: `cargo test --bin sidecar -p cf-gears-file-storage -- sidecar_healthz_returns_200` — passes.
   - E2E (cheap, optional per the plan) — add to `lifecycle/test_file_storage_lifecycle.py`: `test_sidecar_healthz_reachable` — `httpx.get(f"{sidecar_base_url}/healthz")`, assert `200`. **Why not redundant with the unit test**: the unit test only proves the handler function exists and is wired into a `Router` built in-test; it does not prove `bin/sidecar.rs`'s real `main()` actually calls `build_router` and binds it to the listening socket the lifecycle suite's `lifecycle_sidecar` fixture spawns.
-  Run: `FS_E2E_BINARY=<path> pytest testing/e2e/gears/file_storage/lifecycle/ -k test_sidecar_healthz_reachable -v` — passes.
+  Run: `FS_E2E_BINARY=<path> pytest testing/e2e/suites/file_storage/lifecycle/ -k test_sidecar_healthz_reachable -v` — passes.
 
 - **Done-check**: `cargo test --bin sidecar -p cf-gears-file-storage -- sidecar_healthz_returns_200` green.
 
@@ -1705,7 +1705,7 @@ This is the largest item — four sub-items plus a dedicated test strategy. Re-v
 - **Test tier classification**: all of the above are **unit/integration tier**, not e2e — `s3s-fs` is spun up and torn down inside the test process, with no `cf-gears-server`, real PostgreSQL, or real AuthZ involved (same category as SQLite `:memory:` on the DB side, per `12_unit_testing.md`'s philosophy section).
 - **Known limitation — flag, don't paper over**: upstream issue `s3s-project/s3s#395` ("Streaming Multipart FileStream") is still **open** as of this writing — `s3s-fs` may not fully support genuinely streamed multipart uploads end-to-end under real network partial-write/backpressure conditions. The tests above validate API shape, single/multi-part correctness, range reads, and copy/metadata semantics in CI with zero external infra, but do **not** by themselves prove `S3Backend`'s streaming multipart path (1.7.4) behaves identically against a real object store. Track real-object-store validation under Tier 4 item 4.10 (load/perf validation) — do not treat `s3s-fs`-only coverage as full production sign-off for the S3 backend.
 - **E2E option (optional, not required for 1.7 to land)**: gate a new optional suite on `FS_E2E_S3_ENDPOINT` (skip gracefully via `pytest.skip(...)` when unset, exactly like `13_e2e_testing.md`'s "Optional Test Suites" pattern for `E2E_AUTH_TOKEN_TENANT_B`): run the existing `lifecycle/test_file_storage_lifecycle.py` suite with the sidecar's `FS_SIDECAR_S3_BACKENDS` (from 1.7.3) pointed at a locally-started `s3s-fs` instance instead of `local-fs`, covering one real put→get→multipart-complete round trip through real signed URLs and 1.7.2's `claims.backend_id` dispatch — something the in-process `s3s-fs` unit tests above cannot prove, since they call `S3Backend` directly and never exercise the sidecar's HTTP layer or token-driven dispatch.
-  Run (when infra is provided): `FS_E2E_BINARY=<path> FS_E2E_S3_ENDPOINT=http://127.0.0.1:<port> pytest testing/e2e/gears/file_storage/lifecycle/ -v`.
+  Run (when infra is provided): `FS_E2E_BINARY=<path> FS_E2E_S3_ENDPOINT=http://127.0.0.1:<port> pytest testing/e2e/suites/file_storage/lifecycle/ -v`.
 
 - **Done-check (1.7 overall)**: `cargo test -p cf-gears-file-storage --lib -- s3_backend` green, `rg -n "s3s-fs" Cargo.toml` shows the dev-dependency, and `rg -n "claims.backend_id" src/bin/sidecar.rs` shows the sidecar dispatch from 1.7.2 wired in.
 

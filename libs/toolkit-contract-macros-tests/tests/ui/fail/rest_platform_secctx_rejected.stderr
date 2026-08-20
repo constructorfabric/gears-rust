@@ -1,5 +1,0 @@
-error: platform-plane REST projections are not supported yet: the generated client cannot source the internal token, so it would emit an unauthenticated request. Serve this contract over gRPC (`#[toolkit::grpc_contract]` + `InternalAuthInterceptor`) or write a manual client. See DESIGN section 2.2 (cpt-cf-binding-constraint-security-context)
-  --> tests/ui/fail/rest_platform_secctx_rejected.rs:24:14
-   |
-24 |         ctx: &PlatformSecurityContext,
-   |              ^^^^^^^^^^^^^^^^^^^^^^^^

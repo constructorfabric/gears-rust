@@ -95,6 +95,7 @@ members = [
     "gears/system/account-management/account-management",
     "gears/system/account-management/account-management-sdk",
     "gears/system/account-management/plugins/static-idp-plugin",
+    "gears/system/account-management/plugins/keycloak-idp-plugin",
     "gears/system/api-gateway",
     "gears/system/cluster/cluster",
     "gears/system/cluster/cluster-sdk",
@@ -347,6 +348,7 @@ cf-gears-cluster-conformance = { version = "0.3.1", path = "gears/system/cluster
 
 # System gears SDKs
 account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.5.6", path = "gears/system/account-management/account-management-sdk" }
+keycloak-idp-plugin = { package = "cf-gears-keycloak-idp-plugin", version = "0.1.0", path = "gears/system/account-management/plugins/keycloak-idp-plugin" }
 cluster-sdk = { package = "cf-gears-cluster-sdk", version = "0.2.1", path = "gears/system/cluster/cluster-sdk" }
 types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.5", path = "gears/system/types-registry/types-registry-sdk" }
 tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.20", path = "gears/system/tenant-resolver/tenant-resolver-sdk" }
@@ -379,6 +381,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 serde-saphyr = "0.0.22"
+humantime-serde = "1.1"
 secrecy = { version = "0.10", features = ["serde"] }
 serde_urlencoded = "0.7"
 # Query-string codec shared by the generated REST client and its server
@@ -552,6 +555,10 @@ humantime = "2.3.0"
 # URL parsing
 url = "2.5"
 urlencoding = "2.1"
+# RFC 3986 percent-encoding. Already in the tree via `toolkit-contract`,
+# which uses it to build path segments; promoted to a workspace dep so
+# gears encoding provider-chosen identifiers into URLs share one version.
+percent-encoding = "2"
 
 # Regex for env expansion
 regex = "1.10"
@@ -665,6 +672,7 @@ kreuzberg = { version = "=4.9.8", features = ["html", "excel", "office", "pdf", 
 tokio-test = "0.4"
 mockall = "0.13"
 temp-env = { version = "0.3", features = ["async_closure"] }
+wiremock = "0.6"
 
 # Additional utilities
 nanoid = "0.4"

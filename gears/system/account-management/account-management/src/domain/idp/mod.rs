@@ -32,14 +32,21 @@
 //! through [`redact_provider_detail`] and emits a `tracing::warn!` on
 //! `am.idp` so operators can correlate the redacted public envelope
 //! back to the raw provider response via the digest + length pair.
+//!
+//! [`ServiceAccountFailureExt`] — the third mapping in this file — is
+//! deliberately stricter: it forwards no digest either, discarding the
+//! adapter's text outright in favour of fixed AM-owned messages. See the
+//! rationale block above that trait.
 
 use std::hash::Hasher;
 
-use account_management_sdk::{IdpProvisionFailure, IdpUserOperationFailure};
+use account_management_sdk::{
+    IdpProvisionFailure, IdpServiceAccountFailure, IdpUserOperationFailure,
+};
 use fnv::FnvHasher;
 use uuid::Uuid;
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, UnsupportedResource};
 
 /// Stable, non-secret correlation handle for a provider-supplied error
 /// detail. The raw text can carry vendor SDK strings, hostnames, or
@@ -199,6 +206,7 @@ impl ProvisionFailureExt for IdpProvisionFailure {
                     "IdP provision UnsupportedOperation; raw detail redacted"
                 );
                 DomainError::UnsupportedOperation {
+                    resource: UnsupportedResource::Tenant,
                     detail: format!(
                         "provider declined the operation (detail redacted; \
                          digest=0x{digest:016x} len={len})"
@@ -340,6 +348,7 @@ impl UserOperationFailureExt for IdpUserOperationFailure {
                     "IdP user operation UnsupportedOperation; raw detail redacted"
                 );
                 DomainError::UnsupportedOperation {
+                    resource: UnsupportedResource::User,
                     detail: format!(
                         "provider declined the user operation (detail redacted; \
                          digest=0x{digest:016x} len={len})"
@@ -482,6 +491,247 @@ impl UserOperationFailureExt for IdpUserOperationFailure {
                     cause: None,
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Service-account failures — discard, do not digest
+// ---------------------------------------------------------------------------
+
+// Adapter-supplied `detail`/`field` text is UNTRUSTED, and on the
+// service-account surface it is never relayed to a caller nor logged,
+// in any form — not even as the digest the tenant / user halves above
+// forward. Character filtering was tried and removed: it cannot tell a
+// credential (`secret=abc123` is pure ASCII graphic text) from
+// legitimate operator prose, so it launders a leak into a "sanitized"
+// response instead of preventing it, and no heuristic closes that gap.
+// Length caps and control-character stripping likewise only bound the
+// size of a leak.
+//
+// The asymmetry with `ProvisionFailureExt` / `UserOperationFailureExt`
+// is deliberate: those surfaces provision *humans*, whose vendor errors
+// describe profile fields, while every service-account call is about a
+// live machine credential — the one place a vendor error string is most
+// likely to quote the secret it just minted. So the conversions below
+// discard the adapter's text entirely and substitute one of these fixed,
+// AM-owned messages; adapters that need diagnostics MUST log them
+// in-process, where they hold the context to decide what is safe (see
+// `IdpServiceAccountFailure` in the SDK). ASCII only:
+// `non_ascii_literal` is denied workspace-wide.
+
+/// Public message for a provider-reported invalid-input rejection (400).
+pub(crate) const SA_INVALID_INPUT_MESSAGE: &str = "the provider rejected the request as invalid";
+
+/// Public message for a provider-reported clean failure (503). Names no
+/// vendor, host, or internal condition, and says retry is safe.
+pub(crate) const SA_UPSTREAM_MESSAGE: &str =
+    "the service-account provider could not complete the request";
+
+/// Public message for a provider-reported ambiguous outcome (409).
+/// Worded to steer the caller into reconciliation (list the tenant,
+/// match the submitted name) rather than a blind retry, which could
+/// collide with an account the uncertain call already created.
+pub(crate) const SA_AMBIGUOUS_MESSAGE: &str =
+    "list the tenant and reconcile by the submitted name instead of retrying";
+
+/// Public message for a provider that does not implement
+/// service-account management at all (501).
+pub(crate) const SA_UNSUPPORTED_MESSAGE: &str =
+    "the identity provider does not support service accounts";
+
+/// Record the operator's breadcrumb for an adapter-sourced failure: the
+/// variant label, how long the discarded text was, and whether a field
+/// was attributed. Deliberately no text argument anywhere — the
+/// adapter's `detail`/`field` never reach a `tracing` macro, so no
+/// subscriber, log file, or aggregator can hold what the response
+/// withholds. Adapters that need the vendor's reason recorded must log
+/// it themselves.
+// Inflated by the `tracing` macros, which each expand to a callsite
+// guard plus a field-recording closure. The function itself is one flat
+// match over a closed taxonomy; splitting it would only scatter the
+// log-safety argument above across several call sites.
+#[allow(clippy::cognitive_complexity)]
+// @cpt-begin:cpt-cf-account-management-algo-service-accounts-adapter-text-discard:p1:inst-algo-sa-text-discard-log-level
+fn log_service_account_failure(err: &IdpServiceAccountFailure, tenant_id: Uuid) {
+    let failure = err.as_metric_label();
+    let detail_len = err.detail().len();
+    match err {
+        // `debug!`, not `warn!`: a 400 is caller-attributable input
+        // rejection, so it belongs in a diagnosis session, not in the
+        // default-level stream an operator watches for provider trouble.
+        IdpServiceAccountFailure::InvalidInput { field, .. } => tracing::debug!(
+            target: "am.idp",
+            tenant_id = %tenant_id,
+            failure,
+            detail_len,
+            field_present = field.is_some(),
+            "service-account provider rejected the request as invalid"
+        ),
+        // Routine and expected (it is how an idempotent revoke confirms
+        // absence), so it earns no record of its own.
+        IdpServiceAccountFailure::NotFound { .. } => {}
+        IdpServiceAccountFailure::CleanFailure { .. } => tracing::warn!(
+            target: "am.idp",
+            tenant_id = %tenant_id,
+            failure,
+            detail_len,
+            "service-account provider reported a clean failure"
+        ),
+        IdpServiceAccountFailure::Ambiguous { .. } => tracing::warn!(
+            target: "am.idp",
+            tenant_id = %tenant_id,
+            failure,
+            detail_len,
+            "service-account provider reported an ambiguous outcome"
+        ),
+        IdpServiceAccountFailure::UnsupportedOperation { .. } => tracing::warn!(
+            target: "am.idp",
+            tenant_id = %tenant_id,
+            failure,
+            detail_len,
+            "service-account provider declined the operation as unsupported"
+        ),
+        other => tracing::error!(
+            target: "am.idp",
+            tenant_id = %tenant_id,
+            variant = other.as_metric_label(),
+            "unknown IdpServiceAccountFailure variant; update ServiceAccountFailureExt::into_domain_error"
+        ),
+    }
+}
+// @cpt-end:cpt-cf-account-management-algo-service-accounts-adapter-text-discard:p1:inst-algo-sa-text-discard-log-level
+
+/// Map [`IdpServiceAccountFailure`] onto the [`DomainError`] taxonomy
+/// with caller-supplied `tenant_id` context.
+///
+/// * `InvalidInput` → [`DomainError::ServiceAccountInvalidInput`]
+///   (HTTP 400). The provider retained no state; the violation is
+///   attributed to the request as a whole, never to the adapter's own
+///   field name.
+/// * `NotFound` → [`DomainError::ServiceAccountNotFound`] (HTTP 404)
+///   carrying `resource` — see the parameter note below. `revoke` folds
+///   the variant into success before reaching here.
+/// * `CleanFailure` → [`DomainError::IdpUnavailable`] (HTTP 503) —
+///   nothing was retained, so retrying the same request is safe.
+/// * `Ambiguous` → [`DomainError::ServiceAccountAmbiguous`] (HTTP
+///   409), NOT 503: a half-applied provision means "retry the same
+///   request" would hit `InvalidInput` ("name already live"), so the
+///   caller is steered to reconcile instead.
+/// * `UnsupportedOperation` → [`DomainError::UnsupportedOperation`]
+///   (HTTP 501) — the deployment's adapter ships no service-account
+///   support (the SDK default impls).
+///
+/// Every arm drops the adapter's payload and answers with a fixed
+/// message, so no binding from the failure can reach the constructed
+/// variant.
+///
+/// # The `resource` parameter
+///
+/// `resource` is the address the CALLER supplied for this operation —
+/// the `client_id` on rotate / revoke, the submitted `name` on create.
+/// It is the caller's own input, never adapter text, so echoing it into
+/// the AIP-193 envelope's `resource_name` is safe and is what makes a
+/// 404 actionable. Pass `""` only where the operation addresses no
+/// single account (a tenant-wide `list`), which is also the one path
+/// where the provider reporting `NotFound` is a contract violation
+/// rather than a real miss.
+pub(crate) trait ServiceAccountFailureExt {
+    fn into_domain_error(self, tenant_id: Uuid, resource: &str) -> DomainError;
+
+    /// Map a failure from the non-retaining list operation. Provider
+    /// uncertainty is retry-safe for a read and therefore becomes 503 rather
+    /// than the mutation-oriented 409 reconciliation response. Every branch
+    /// still emits the same safe failure metadata as the shared mapping.
+    fn into_list_domain_error(self, tenant_id: Uuid) -> DomainError;
+}
+
+impl ServiceAccountFailureExt for IdpServiceAccountFailure {
+    // @cpt-begin:cpt-cf-account-management-algo-service-accounts-adapter-text-discard:p1:inst-algo-sa-text-discard-select-fixed-message
+    // @cpt-begin:cpt-cf-account-management-algo-service-accounts-adapter-text-discard:p1:inst-algo-sa-text-discard-neutral-field
+    // @cpt-begin:cpt-cf-account-management-dod-service-accounts-no-adapter-text:p1:inst-dod-sa-no-adapter-text-boundary
+    fn into_domain_error(self, tenant_id: Uuid, resource: &str) -> DomainError {
+        // @cpt-begin:cpt-cf-account-management-algo-service-accounts-adapter-text-discard:p1:inst-algo-sa-text-discard-safe-metadata-log
+        log_service_account_failure(&self, tenant_id);
+        // @cpt-end:cpt-cf-account-management-algo-service-accounts-adapter-text-discard:p1:inst-algo-sa-text-discard-safe-metadata-log
+        match self {
+            // @cpt-begin:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-invalid-input-return
+            Self::InvalidInput { .. } => DomainError::ServiceAccountInvalidInput {
+                detail: SA_INVALID_INPUT_MESSAGE.to_owned(),
+            },
+            // @cpt-end:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-invalid-input-return
+            // @cpt-begin:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-not-found-return
+            Self::NotFound { .. } => DomainError::ServiceAccountNotFound {
+                detail: format!("service account not found in tenant {tenant_id}"),
+                resource: resource.to_owned(),
+            },
+            // @cpt-end:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-not-found-return
+            // @cpt-begin:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-clean-failure-return
+            Self::CleanFailure { .. } => DomainError::IdpUnavailable {
+                detail: SA_UPSTREAM_MESSAGE.to_owned(),
+            },
+            // @cpt-end:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-clean-failure-return
+            // @cpt-begin:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-ambiguous-return
+            // @cpt-begin:cpt-cf-account-management-dod-service-accounts-ambiguous-outcome:p1:inst-dod-sa-ambiguous-outcome-domain
+            Self::Ambiguous { .. } => DomainError::ServiceAccountAmbiguous {
+                detail: SA_AMBIGUOUS_MESSAGE.to_owned(),
+            },
+            // @cpt-end:cpt-cf-account-management-dod-service-accounts-ambiguous-outcome:p1:inst-dod-sa-ambiguous-outcome-domain
+            // @cpt-end:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-ambiguous-return
+            // @cpt-begin:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-unsupported-return
+            Self::UnsupportedOperation { .. } => DomainError::UnsupportedOperation {
+                resource: UnsupportedResource::ServiceAccount,
+                detail: SA_UNSUPPORTED_MESSAGE.to_owned(),
+            },
+            // @cpt-end:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-unsupported-return
+            // SDK enum is `#[non_exhaustive]`. A new variant added in a
+            // future SDK release lands here until the AM-side mapping is
+            // updated. It maps to `Internal` for the same reason
+            // `UserOperationFailureExt` does: an unclassified provider
+            // outcome is an AM-side mapping gap, and answering 500
+            // states that honestly instead of asserting the 503
+            // "nothing was retained, retry is safe" contract we cannot
+            // actually vouch for. `log_service_account_failure` has
+            // already emitted the loud `error!` that surfaces the gap.
+            //
+            // `diagnostic` names only the category label — never the
+            // provider's text. It does not reach the public envelope
+            // either (the canonical boundary keeps it in a
+            // `#[serde(skip)]` field), so an unmapped variant cannot
+            // become the one path that leaks what every other arm
+            // discards.
+            // @cpt-begin:cpt-cf-account-management-algo-service-accounts-adapter-text-discard:p1:inst-algo-sa-text-discard-unknown-category
+            other => DomainError::Internal {
+                diagnostic: format!(
+                    "service-account provider returned unmapped failure category \
+                     `{}` (adapter detail discarded; update \
+                     ServiceAccountFailureExt::into_domain_error)",
+                    other.as_metric_label()
+                ),
+                cause: None,
+            },
+            // @cpt-end:cpt-cf-account-management-algo-service-accounts-adapter-text-discard:p1:inst-algo-sa-text-discard-unknown-category
+        }
+    }
+    // @cpt-end:cpt-cf-account-management-dod-service-accounts-no-adapter-text:p1:inst-dod-sa-no-adapter-text-boundary
+    // @cpt-end:cpt-cf-account-management-algo-service-accounts-adapter-text-discard:p1:inst-algo-sa-text-discard-neutral-field
+    // @cpt-end:cpt-cf-account-management-algo-service-accounts-adapter-text-discard:p1:inst-algo-sa-text-discard-select-fixed-message
+
+    fn into_list_domain_error(self, tenant_id: Uuid) -> DomainError {
+        match self {
+            ambiguous @ Self::Ambiguous { .. } => {
+                // The list-specific 503 remap must not bypass the mandatory
+                // safe metadata record. Log the category and discarded-text
+                // length exactly once, then return an AM-owned message.
+                log_service_account_failure(&ambiguous, tenant_id);
+                DomainError::IdpUnavailable {
+                    detail: SA_UPSTREAM_MESSAGE.to_owned(),
+                }
+            }
+            // `list` addresses the tenant rather than one account. Reuse the
+            // shared mapper for every other category so logging, redaction,
+            // unknown-variant handling, and fixed messages cannot drift.
+            other => other.into_domain_error(tenant_id, ""),
         }
     }
 }

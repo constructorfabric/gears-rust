@@ -1,0 +1,9 @@
+suite: file-parser
+features:
+  - file-parser
+  - static-tenants
+  - static-authn
+  - static-authz
+launcher: e2e-launcher
+config_gears:
+  - file-parser

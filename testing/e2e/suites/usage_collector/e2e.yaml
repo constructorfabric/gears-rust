@@ -1,0 +1,10 @@
+suite: usage-collector
+features:
+  - usage-collector
+  - timescaledb-usage-collector
+  - static-tenants
+  - static-authn
+  - static-authz
+launcher: pytest
+pytest_args:
+  - -vv

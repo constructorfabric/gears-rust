@@ -28,7 +28,7 @@ For background on how AuthZ uses RG data, see [RESOURCE_GROUP_MODEL.md](./RESOUR
 ## Planned File Layout
 
 ```
-testing/e2e/gears/resource_group/        ← E2E tests (pytest, HTTP against running server)
+testing/e2e/suites/resource_group/         ← E2E tests (pytest, HTTP against running server)
   conftest.py                              ← Fixtures: base_url, auth headers, type/group factories
   test_authz_tenant_scoping.py             ← Phase 1: CRUD + tenant isolation + hierarchy + membership
 
@@ -38,7 +38,7 @@ gears/system/resource-group/
     tenant_scoping_test.rs                 ← AccessScope scoping: 10 tests
 ```
 
-Follows existing project conventions: `testing/e2e/gears/{gear}/` for HTTP-level tests (see `oagw/`, `mini_chat/`, `types_registry/`), `gears/.../tests/` for Rust in-process tests.
+Follows existing project conventions: `testing/e2e/suites/{gear}/` for HTTP-level tests (see `oagw/`, `mini_chat/`, `types_registry/`), `gears/.../tests/` for Rust in-process tests.
 
 ---
 
@@ -92,7 +92,7 @@ cargo run --bin cf-gears-server \
 cargo test -p cf-gears-resource-group --test authz_integration_test --test tenant_scoping_test
 
 # E2E tests (requires running server + PostgreSQL)
-E2E_BASE_URL=http://localhost:8087 pytest testing/e2e/gears/resource_group/ -v
+E2E_BASE_URL=http://localhost:8087 pytest testing/e2e/suites/resource_group/ -v
 ```
 
 ---
@@ -305,7 +305,7 @@ curl -H "Authorization: Bearer test" \
 
 ## E2E Test Hierarchy Fixture (AuthZ plugins)
 
-E2E tests using AuthZ plugins (config: `config/e2e-tr-authz.yaml`) require a pre-seeded tenant hierarchy. A session-scoped pytest fixture creates the hierarchy via REST API before any tests run, then all tests reuse it.
+E2E tests using AuthZ plugins (profile `tr-authz` in `testing/e2e/suites/resource_group/e2e.yaml`, applied over `config/e2e-local.yaml`) require a pre-seeded tenant hierarchy. A session-scoped pytest fixture creates the hierarchy via REST API before any tests run, then all tests reuse it.
 
 **Available AuthZ plugins:**
 - `tr-authz-plugin` (priority 50) — resolves tenants via `TenantResolverClient` (recommended, no direct RG dependency)
@@ -328,7 +328,7 @@ Tenant-type recognition is code-prefix-driven: any GTS type whose path starts wi
 
 1. Create tenant type (code starts with `TENANT_RG_TYPE_PATH`, `can_be_root=true`, `allowed_parent_types=[self]`)
 2. Create department type (code outside the tenant prefix, `can_be_root=false`, `allowed_parent_types=[tenant_type]`)
-3. **Seed T1 root tenant** directly in the DB backend used by `config/e2e-tr-authz.yaml` — SQLite in CI/e2e; in production deployments the same seeding query runs against the configured SQL-compatible backend (PostgreSQL by default). `id` = token-a `subject_tenant_id`. Root tenants are created via DB seeding, not API.
+3. **Seed T1 root tenant** directly in the DB backend used by the tr-authz overlay — SQLite in CI/e2e; in production deployments the same seeding query runs against the configured SQL-compatible backend (PostgreSQL by default). `id` = token-a `subject_tenant_id`. Root tenants are created via DB seeding, not API.
 4. `POST /groups` -- T_normal (parent=T1) -- `tenant_id = T_normal.id`
 5. `POST /groups` -- T_barrier (parent=T1, metadata=`{"self_managed": true}`) -- `tenant_id = T_barrier.id`
 6. `POST /groups` -- T_behind (parent=T_barrier) -- `tenant_id = T_behind.id`
@@ -359,8 +359,8 @@ make build
 # Run RG + AuthZ e2e tests (uses whichever authz plugin has higher priority)
 make e2e-tr-authz
 
-# Or manually:
-python3 scripts/ci.py e2e-local --config config/e2e-tr-authz.yaml -- -k "resource_group"
+# Or manually (applies the tr-authz profile, then runs the RG subset):
+python3 tools/scripts/run_e2e.py --suite resource-group --profile tr-authz
 ```
 
 ---

@@ -545,12 +545,22 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
         .oop_http
         .as_ref()
         .and_then(|h| h.internal_auth.as_ref());
-    let directory_client = if let Some(cfg) = internal_auth_cfg {
-        let interceptor = toolkit_transport_grpc::build_internal_auth_interceptor(cfg).await?;
+    // Build the outbound DirectoryService interceptor and the
+    // `InternalTokenProvider` (for `#[toolkit::provides]` clients) from one
+    // credential source so they can't diverge after a rotation — see
+    // `build_platform_credentials`. `None` => no outbound platform credential.
+    let (directory_client, internal_token_provider) = if let Some(cfg) = internal_auth_cfg {
+        let (interceptor, provider) = build_platform_credentials(cfg, &cancel).await?;
         info!("Attaching platform-plane credential to outbound DirectoryService calls");
-        DirectoryGrpcClient::connect_with_interceptor(&opts.directory_endpoint, interceptor).await?
+        let client =
+            DirectoryGrpcClient::connect_with_interceptor(&opts.directory_endpoint, interceptor)
+                .await?;
+        (client, provider)
     } else {
-        DirectoryGrpcClient::connect(&opts.directory_endpoint).await?
+        (
+            DirectoryGrpcClient::connect(&opts.directory_endpoint).await?,
+            None,
+        )
     };
     let directory_api: Arc<dyn DirectoryClient> = Arc::new(directory_client);
 
@@ -563,17 +573,17 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
     let config_provider = Arc::new(final_config);
 
     // The DirectoryClient (gRPC client) is injected into the ClientHub so gears can access it.
-    let run_options = RunOptions {
-        gears_cfg: config_provider,
-        db: db_options,
-        shutdown: ShutdownOptions::Token(cancel.clone()),
-        clients: vec![ClientRegistration::new::<dyn DirectoryClient>(Arc::clone(
-            &directory_api,
-        ))],
+    // `oop` is left unset: OoP gears don't spawn other OoP gears.
+    let run_options = RunOptions::new(
+        config_provider,
+        db_options,
+        ShutdownOptions::Token(cancel.clone()),
         instance_id,
-        oop: None, // OoP gears don't spawn other OoP gears
-        shutdown_deadline: None,
-    };
+    )
+    .with_clients(vec![ClientRegistration::new::<dyn DirectoryClient>(
+        Arc::clone(&directory_api),
+    )])
+    .with_internal_token_provider(internal_token_provider);
 
     // When `oop_http` is configured, run the HTTP-serving lifecycle:
     // Axum server + probes + directory presence (registration + heartbeat +
@@ -743,6 +753,84 @@ async fn build_internal_authenticator(
     }
 
     Ok(None)
+}
+
+/// Build the platform-plane credential material from config: the **outbound**
+/// gRPC [`InternalAuthInterceptor`] (for `DirectoryService` calls) and the
+/// transport-agnostic
+/// [`InternalTokenProvider`](toolkit_contract::runtime::config::InternalTokenProvider)
+/// that `#[toolkit::provides]` clients attach as `X-ToolKit-Internal-Token` on
+/// platform-plane methods (`cpt-cf-adr-two-plane-auth`).
+///
+/// Both derive from ONE credential source so they never disagree after a
+/// rotation:
+/// - `shared_secret` → a static token for both.
+/// - `kube` with `token_path` → one [`ServiceAccountTokenReader`] drives both;
+///   its "no token yet" maps to [`CredentialState::Unavailable`] so an attach
+///   site warns rather than silently sending nothing.
+/// - `kube` without `token_path` → inbound-only: disabled interceptor + `None`
+///   provider (warned).
+///
+/// The `match` is exhaustive so a future variant fails to compile here rather
+/// than silently downgrading to no outbound credential.
+async fn build_platform_credentials(
+    cfg: &toolkit_security::InternalAuthConfig,
+    cancel: &CancellationToken,
+) -> Result<(
+    toolkit_transport_grpc::InternalAuthInterceptor,
+    Option<toolkit_contract::runtime::config::InternalTokenProvider>,
+)> {
+    use secrecy::SecretString;
+    use toolkit_contract::runtime::config::{CredentialState, InternalTokenProvider};
+    use toolkit_security::InternalAuthConfig;
+    use toolkit_transport_grpc::{
+        DEFAULT_REFRESH_INTERVAL, InternalAuthInterceptor, ServiceAccountTokenReader,
+    };
+
+    match cfg {
+        InternalAuthConfig::SharedSecret { secret, .. } => {
+            let token = SecretString::from(secret.clone());
+            Ok((
+                InternalAuthInterceptor::from_token(token.clone()),
+                Some(InternalTokenProvider::from_token(token)),
+            ))
+        }
+        InternalAuthConfig::Kube {
+            token_path: Some(path),
+            ..
+        } => {
+            let reader = ServiceAccountTokenReader::with_cancellation(
+                path,
+                DEFAULT_REFRESH_INTERVAL,
+                cancel.child_token(),
+            )
+            .await
+            .context("failed to read projected service-account token for outbound credential")?;
+            let interceptor = reader.interceptor();
+            // The reader yields `None` while the projected file is empty or the
+            // refresh has not populated it; surface that as `Unavailable` (warn)
+            // rather than `NotConfigured` (silent).
+            let token_fn = reader.token_provider();
+            let provider = InternalTokenProvider::new(move || match token_fn() {
+                Some(token) => CredentialState::Available(token),
+                None => CredentialState::Unavailable(
+                    "projected service-account token is currently unavailable \
+                     (file empty or not yet read)"
+                        .into(),
+                ),
+            });
+            Ok((interceptor, Some(provider)))
+        }
+        InternalAuthConfig::Kube {
+            token_path: None, ..
+        } => {
+            warn!(
+                "oop_http.internal_auth: provider=kube without token_path - this participant \
+                 validates inbound platform tokens but will attach NO outbound credential"
+            );
+            Ok((InternalAuthInterceptor::disabled(), None))
+        }
+    }
 }
 
 /// Derive a default advertise URI from the bind address. Unspecified hosts

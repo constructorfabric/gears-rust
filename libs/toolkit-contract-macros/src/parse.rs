@@ -225,7 +225,7 @@ fn parse_params(
             ));
         };
 
-        let role = determine_param_role(&pat_ident.ident, &pat_type.ty, &pat_type.attrs);
+        let role = determine_param_role(&pat_type.ty, &pat_type.attrs);
 
         params.push(ParamModel {
             name: pat_ident.ident.clone(),
@@ -240,30 +240,23 @@ fn parse_params(
 /// Classify a parameter:
 ///
 /// - explicit `#[secctx]` / `#[security_context]` attribute wins (future-proof);
-/// - otherwise the legacy heuristic — `ctx: …::SecurityContext` — keeps
-///   existing code compiling without an attribute migration.
-fn determine_param_role(name: &syn::Ident, ty: &Type, attrs: &[syn::Attribute]) -> ParamRole {
+/// - otherwise a security-context type — the tenant [`SecurityContext`] **or**
+///   the platform [`PlatformSecurityContext`], in value or reference form — is
+///   the plane marker and is kept off the wire.
+///
+/// This delegates to [`crate::projection::is_security_context_type`] so the IR
+/// (and therefore protogen's request-message field selection) agrees exactly
+/// with the projection layer on which parameters are off-wire. Matching only the
+/// bare `SecurityContext` ident here previously let a `PlatformSecurityContext`
+/// leak into the generated `.proto` request as a `Wire` field.
+fn determine_param_role(ty: &Type, attrs: &[syn::Attribute]) -> ParamRole {
     if attrs.iter().any(is_secctx_attr) {
         return ParamRole::SecurityContext;
     }
-    if name == "ctx" && type_last_segment_is(ty, "SecurityContext") {
+    if crate::projection::is_security_context_type(ty) {
         return ParamRole::SecurityContext;
     }
     ParamRole::Wire
-}
-
-fn type_last_segment_is(ty: &Type, name: &str) -> bool {
-    // Reference-transparent: `&SecurityContext` classifies the same as the
-    // by-value form (DESIGN §2.2 permits either).
-    match ty {
-        Type::Reference(r) => type_last_segment_is(&r.elem, name),
-        Type::Path(p) => p
-            .path
-            .segments
-            .last()
-            .is_some_and(|last| last.ident == name),
-        _ => false,
-    }
 }
 
 fn parse_return_type(

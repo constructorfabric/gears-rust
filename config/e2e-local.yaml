@@ -302,7 +302,7 @@ gears:
             token_scopes: ["*"]
         # Nil-tenant token: static-authz denies requests with the nil UUID
         # tenant, producing a clean 403 Forbidden. Used by
-        # testing/e2e/gears/oagw/test_authz.py::test_proxy_authz_forbidden_nil_tenant
+        # testing/e2e/suites/oagw/test_authz.py::test_proxy_authz_forbidden_nil_tenant
         - token: "e2e-token-nil-tenant"
           identity:
             subject_id: "33333333-6a88-4768-9dfc-6bcd5187d9ed"

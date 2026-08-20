@@ -7,17 +7,12 @@
 //! process must re-read the file rather than caching the first value forever.
 //!
 //! [`ServiceAccountTokenReader`] reads the token once at construction and then
-//! refreshes it on a fixed interval (TTL re-read) from a background task. It
+//! re-reads it every [`DEFAULT_REFRESH_INTERVAL`] from a background task. It
 //! exposes a [`token_provider`](ServiceAccountTokenReader::token_provider)
-//! closure suitable for
-//! [`InternalAuthInterceptor::new`](crate::internal_auth::InternalAuthInterceptor::new),
-//! which is invoked on every outbound request and therefore always attaches the
+//! closure for
+//! [`InternalAuthInterceptor::new`](crate::internal_auth::InternalAuthInterceptor::new)
+//! that is invoked on every outbound request, so it always attaches the
 //! *current* (post-rotation) token.
-//!
-//! The default refresh cadence is deliberately short relative to a
-//! `ServiceAccount` token's lifetime; a projected token is typically valid for
-//! an hour, so a re-read every [`DEFAULT_REFRESH_INTERVAL`] keeps the cached
-//! value fresh with negligible cost.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
@@ -25,6 +20,7 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use secrecy::SecretString;
+use tokio_util::sync::CancellationToken;
 
 use crate::internal_auth::InternalAuthInterceptor;
 
@@ -72,7 +68,34 @@ impl ServiceAccountTokenReader {
         let token = read_token(&path).await?;
         let current: SharedToken = Arc::new(RwLock::new(token));
 
-        spawn_refresh_task(path.clone(), Arc::downgrade(&current), interval);
+        spawn_refresh_task(path.clone(), Arc::downgrade(&current), interval, None);
+
+        Ok(Self { path, current })
+    }
+
+    /// Like [`new`](Self::new) but ties the refresh task to a
+    /// [`CancellationToken`] so it stops promptly on shutdown rather than
+    /// lingering (and re-reading the file) for up to a full interval. Used from
+    /// the bootstrap layer with the process cancel token.
+    ///
+    /// # Errors
+    /// Returns an error if the token file cannot be read or is empty on the
+    /// initial read.
+    pub async fn with_cancellation(
+        path: impl Into<PathBuf>,
+        interval: Duration,
+        cancel: CancellationToken,
+    ) -> std::io::Result<Self> {
+        let path = path.into();
+        let token = read_token(&path).await?;
+        let current: SharedToken = Arc::new(RwLock::new(token));
+
+        spawn_refresh_task(
+            path.clone(),
+            Arc::downgrade(&current),
+            interval,
+            Some(cancel),
+        );
 
         Ok(Self { path, current })
     }
@@ -116,11 +139,27 @@ impl ServiceAccountTokenReader {
 }
 
 /// Spawn the TTL re-read loop. Terminates when `current` can no longer be
-/// upgraded (the reader and all providers have been dropped).
-fn spawn_refresh_task(path: PathBuf, current: Weak<RwLock<Arc<str>>>, interval: Duration) {
+/// upgraded (the reader and all providers have been dropped) or, if a
+/// [`CancellationToken`] is supplied, when it is cancelled — so the task cannot
+/// linger for up to a full refresh interval (or re-read the token file) after
+/// shutdown has begun.
+fn spawn_refresh_task(
+    path: PathBuf,
+    current: Weak<RwLock<Arc<str>>>,
+    interval: Duration,
+    cancel: Option<CancellationToken>,
+) {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
+            match &cancel {
+                Some(token) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(interval) => {}
+                        () = token.cancelled() => break,
+                    }
+                }
+                None => tokio::time::sleep(interval).await,
+            }
             let Some(current) = current.upgrade() else {
                 break;
             };

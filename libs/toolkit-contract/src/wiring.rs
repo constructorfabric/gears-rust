@@ -37,6 +37,14 @@ pub struct ClientTuning {
     /// while forwarding a tenant bearer token over it.
     #[serde(default)]
     pub require_tls: Option<bool>,
+
+    /// Platform-plane credential source forwarded onto the built
+    /// [`ClientConfig`](crate::runtime::config::ClientConfig). Injected by the
+    /// runtime's proxy-wiring phase, never from config (`#[serde(skip)]`); gated
+    /// on `runtime-client` since the type lives there.
+    #[cfg(feature = "runtime-client")]
+    #[serde(skip)]
+    pub internal_token_provider: Option<crate::runtime::config::InternalTokenProvider>,
 }
 
 /// Deserializable mirror of
@@ -119,6 +127,20 @@ impl ClientTuning {
         if let Some(require_tls) = self.require_tls {
             cfg = cfg.with_require_tls(require_tls);
         }
+        cfg = cfg.with_internal_token_provider(self.internal_token_provider.clone());
         cfg
+    }
+
+    /// Attach the platform-plane credential source forwarded onto the built
+    /// [`ClientConfig`](crate::runtime::config::ClientConfig). Used by the
+    /// proxy-wiring phase to thread the process credential into a
+    /// directory-resolving (`#[toolkit::consumes]`) client.
+    #[must_use]
+    pub fn with_internal_token_provider(
+        mut self,
+        provider: Option<crate::runtime::config::InternalTokenProvider>,
+    ) -> Self {
+        self.internal_token_provider = provider;
+        self
     }
 }
