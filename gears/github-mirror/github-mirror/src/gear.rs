@@ -13,9 +13,12 @@ use crate::api::rest::routes;
 use crate::config::GithubMirrorConfig;
 use crate::domain::local_client::LocalClient;
 use crate::domain::service::{Service, ServiceConfig};
-use crate::infra::storage::sea_orm_repo::{SeaOrmIssueRepository, SeaOrmRepoRepository};
+use crate::infra::storage::sea_orm_repo::{
+    SeaOrmIssueRepository, SeaOrmPullRequestRepository, SeaOrmRepoRepository,
+};
 
-type ConcreteService = Service<SeaOrmRepoRepository, SeaOrmIssueRepository>;
+type ConcreteService =
+    Service<SeaOrmRepoRepository, SeaOrmIssueRepository, SeaOrmPullRequestRepository>;
 
 #[toolkit::gear(
     name = "github-mirror",
@@ -50,6 +53,7 @@ impl Gear for GithubMirrorGear {
         let db = Arc::new(ctx.db_required()?);
         let repo = Arc::new(SeaOrmRepoRepository::new());
         let issues = Arc::new(SeaOrmIssueRepository::new());
+        let pull_requests = Arc::new(SeaOrmPullRequestRepository::new());
 
         let authz = ctx
             .client_hub()
@@ -61,6 +65,7 @@ impl Gear for GithubMirrorGear {
             db,
             repo,
             issues,
+            pull_requests,
             policy_enforcer,
             ServiceConfig {
                 api_base_url: cfg.api_base_url,
@@ -112,6 +117,6 @@ mod tests {
     fn gear_provides_all_migrations() {
         use toolkit::contracts::DatabaseCapability;
         let gear = GithubMirrorGear::default();
-        assert_eq!(gear.migrations().len(), 2);
+        assert_eq!(gear.migrations().len(), 3);
     }
 }

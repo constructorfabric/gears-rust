@@ -77,3 +77,42 @@ pub mod issues {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod pull_requests {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    /// Mirrored GitHub pull request, tenant-scoped like every mirror table.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_pull_requests")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        /// GitHub pull-request id.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: i64,
+        /// Owning repository's GitHub id.
+        pub repo_id: i64,
+        pub number: i64,
+        pub title: String,
+        pub body: Option<String>,
+        pub state: String,
+        pub draft: bool,
+        pub merged: bool,
+        pub head_sha: Option<String>,
+        pub base_sha: Option<String>,
+        pub lines_added: i64,
+        pub lines_removed: i64,
+        /// RFC3339 timestamps kept as text (engine-agnostic), as in the reference.
+        pub created_at: String,
+        pub updated_at: String,
+        pub closed_at: Option<String>,
+        pub merged_at: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

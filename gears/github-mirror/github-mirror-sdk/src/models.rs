@@ -53,3 +53,27 @@ pub struct Issue {
     pub closed_at: Option<String>,
     pub html_url: Option<String>,
 }
+
+/// A mirrored GitHub pull request (read-slice shape).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    /// GitHub's numeric pull-request id.
+    pub id: i64,
+    /// Owning repository's GitHub id.
+    pub repo_id: i64,
+    pub number: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    pub draft: bool,
+    pub merged: bool,
+    pub head_sha: Option<String>,
+    pub base_sha: Option<String>,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub merged_at: Option<String>,
+}

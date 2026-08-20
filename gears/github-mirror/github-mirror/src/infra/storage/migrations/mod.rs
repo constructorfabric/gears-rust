@@ -2,6 +2,7 @@ use sea_orm_migration::prelude::*;
 
 pub mod initial_001;
 pub mod issues_002;
+pub mod pull_requests_003;
 
 pub struct Migrator;
 
@@ -11,6 +12,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(initial_001::Migration),
             Box::new(issues_002::Migration),
+            Box::new(pull_requests_003::Migration),
         ]
     }
 }

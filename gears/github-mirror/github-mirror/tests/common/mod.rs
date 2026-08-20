@@ -10,14 +10,17 @@ use authz_resolver_sdk::{
 };
 use github_mirror::domain::service::{Service, ServiceConfig};
 use github_mirror::infra::storage::migrations::Migrator;
-use github_mirror::infra::storage::sea_orm_repo::{SeaOrmIssueRepository, SeaOrmRepoRepository};
+use github_mirror::infra::storage::sea_orm_repo::{
+    SeaOrmIssueRepository, SeaOrmPullRequestRepository, SeaOrmRepoRepository,
+};
 use toolkit::{ClientHub, ConfigProvider, GearCtx};
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, Db, connect_db};
 use toolkit_security::{SecurityContext, pep_properties};
 use uuid::Uuid;
 
-pub type ConcreteService = Service<SeaOrmRepoRepository, SeaOrmIssueRepository>;
+pub type ConcreteService =
+    Service<SeaOrmRepoRepository, SeaOrmIssueRepository, SeaOrmPullRequestRepository>;
 
 /// PDP fake: allows everything, constrained to the caller's tenant.
 pub struct MockAuthZResolver;
@@ -87,6 +90,7 @@ pub fn service_over(db: Db, api_base_url: &str) -> Arc<ConcreteService> {
         Arc::new(DBProvider::new(db)),
         Arc::new(SeaOrmRepoRepository::new()),
         Arc::new(SeaOrmIssueRepository::new()),
+        Arc::new(SeaOrmPullRequestRepository::new()),
         enforcer(),
         ServiceConfig {
             api_base_url: api_base_url.to_owned(),

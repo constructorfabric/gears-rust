@@ -1,4 +1,4 @@
-use github_mirror_sdk::{Issue, Repository};
+use github_mirror_sdk::{Issue, PullRequest, Repository};
 
 use crate::domain::service::MirrorStatus;
 
@@ -76,6 +76,51 @@ impl From<Issue> for IssueDto {
             updated_at: issue.updated_at,
             closed_at: issue.closed_at,
             html_url: issue.html_url,
+        }
+    }
+}
+
+/// A mirrored GitHub pull request as served by the read API.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct PullRequestDto {
+    pub id: i64,
+    pub repo_id: i64,
+    pub number: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    pub draft: bool,
+    pub merged: bool,
+    pub head_sha: Option<String>,
+    pub base_sha: Option<String>,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub merged_at: Option<String>,
+}
+
+impl From<PullRequest> for PullRequestDto {
+    fn from(pr: PullRequest) -> Self {
+        Self {
+            id: pr.id,
+            repo_id: pr.repo_id,
+            number: pr.number,
+            title: pr.title,
+            body: pr.body,
+            state: pr.state,
+            draft: pr.draft,
+            merged: pr.merged,
+            head_sha: pr.head_sha,
+            base_sha: pr.base_sha,
+            lines_added: pr.lines_added,
+            lines_removed: pr.lines_removed,
+            created_at: pr.created_at,
+            updated_at: pr.updated_at,
+            closed_at: pr.closed_at,
+            merged_at: pr.merged_at,
         }
     }
 }

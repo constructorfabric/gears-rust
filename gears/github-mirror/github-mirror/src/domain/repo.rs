@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use github_mirror_sdk::{Issue, Repository};
+use github_mirror_sdk::{Issue, PullRequest, Repository};
 use toolkit_db::secure::DBRunner;
 use toolkit_macros::domain_model;
 use toolkit_security::AccessScope;
@@ -82,4 +82,45 @@ pub trait IssueRepository: Send + Sync {
         repo_id: i64,
         limit: u64,
     ) -> Result<Vec<Issue>, DomainError>;
+}
+
+/// Write-side record for a mirrored pull request.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub number: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    pub draft: bool,
+    pub merged: bool,
+    pub head_sha: Option<String>,
+    pub base_sha: Option<String>,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub merged_at: Option<String>,
+}
+
+#[async_trait]
+pub trait PullRequestRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: PullRequestRecord,
+    ) -> Result<PullRequest, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<PullRequest>, DomainError>;
 }
