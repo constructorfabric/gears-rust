@@ -34,6 +34,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 secrecy = { workspace = true }
 parking_lot = { workspace = true }
+tower = { workspace = true }
+http = { workspace = true }
 
 [dev-dependencies]
-http = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

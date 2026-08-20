@@ -15,12 +15,20 @@ metadata.docs.rs.all-features = true
 [lib]
 name = "grpc_hub"
 
+[features]
+default = []
+# Enable the Kubernetes TokenReview validator for `internal_auth: { provider:
+# kube }` on the inbound gRPC platform-plane middleware (Profile 3 platform host).
+k8s-auth = ["dep:toolkit-k8s-auth"]
+
 [lints]
 workspace = true
 
 [dependencies]
 toolkit = { workspace = true }
 toolkit-transport-grpc = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-k8s-auth = { workspace = true, optional = true }
 cf-gears-system-sdks = { workspace = true }
 inventory = { workspace = true }
 anyhow = { workspace = true }

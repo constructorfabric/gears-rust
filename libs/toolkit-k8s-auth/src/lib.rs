@@ -26,6 +26,10 @@
 //! # }
 //! ```
 
+pub mod cache;
+
+pub use cache::{CachingInternalAuthenticator, DEFAULT_TOKEN_REVIEW_CACHE_TTL};
+
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use kube::api::{Api, PostParams};
 use toolkit_security::{InternalAuthNError, InternalAuthenticator, PlatformIdentity};
