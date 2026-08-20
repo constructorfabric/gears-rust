@@ -836,6 +836,19 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         validation::validate_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
 
+        let is_tenant = req.code.starts_with(TENANT_RG_TYPE_PATH);
+        Self::reject_tenant_id_on_tenant_type(is_tenant, req.tenant_id)?;
+
+        if let Some(req_tenant_id) = req.tenant_id
+            && req_tenant_id != tenant_id
+        {
+            return Err(DomainError::validation(format!(
+                "create_group_unscoped: req.tenant_id ({req_tenant_id}) disagrees with the \
+                 trusted tenant_id argument ({tenant_id}); this indicates a caller bug, not a \
+                 policy decision to make silently"
+            )));
+        }
+
         // Before `BEGIN`, for the reason spelled out in `create_group`.
         validation::validate_metadata_via_gts(
             req.metadata.as_ref(),
@@ -938,10 +951,11 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // Skip tenant enforcement for tenant-typed groups — they intentionally
             // create a new tenant scope (tenant_id = group.id != parent.tenant_id).
             if !is_tenant_type && parent.tenant_id != tenant_id {
-                return Err(DomainError::validation(format!(
-                    "Child group tenant_id ({tenant_id}) must match parent tenant_id ({})",
-                    parent.tenant_id
-                )));
+                return Err(DomainError::validation(
+                    "Child group tenant must match parent tenant -- cannot create a child \
+                     group in a tenant different from its parent group"
+                        .to_owned(),
+                ));
             }
             // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-5
             // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-3

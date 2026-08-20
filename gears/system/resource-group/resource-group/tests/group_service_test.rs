@@ -297,7 +297,7 @@ async fn group_create_cross_tenant_parent() {
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::Validation { ref message } if message.contains("must match parent tenant_id")),
+        matches!(err, DomainError::Validation { ref message } if message.contains("must match parent tenant")),
         "Expected Validation with tenant mismatch, got: {err:?}"
     );
 }
