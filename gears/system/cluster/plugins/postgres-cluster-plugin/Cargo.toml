@@ -22,7 +22,7 @@ name = "postgres_cluster_plugin"
 # dependency" heuristic flags that placement; ignore it here since the placement
 # is required, not accidental.
 [package.metadata.cargo-shear]
-ignored = ["testcontainers", "testcontainers-modules", "cf-gears-test-containers"]
+ignored = ["testcontainers", "testcontainers-modules"]
 
 [lints]
 workspace = true
@@ -36,11 +36,7 @@ workspace = true
 # docs/TESTING.md §7; every reference to them lives in `tests/`, so enabling
 # this feature has no effect on the plugin's own compiled artifact. Run with
 # `cargo test -p cf-postgres-cluster-plugin --features integration`.
-integration = [
-    "dep:testcontainers",
-    "dep:testcontainers-modules",
-    "dep:cf-gears-test-containers",
-]
+integration = ["dep:testcontainers", "dep:testcontainers-modules"]
 
 [dependencies]
 # `otel` pulls in the SDK's OpenTelemetry-backed `ClusterMetrics` adapter
@@ -102,10 +98,15 @@ rand = { workspace = true }
 # `[dev-dependencies]`.
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
-# Database image pins: see libs/test-containers.
-cf-gears-test-containers = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Database image pins: see libs/test-containers. A dev-dependency rather than an
+# optional regular one — that crate is `publish = false`, and a path dependency
+# with no version in `[dependencies]` fails the packaging check because
+# `cargo publish` strips the path. Dev-dependencies are dropped on publish, and
+# are available to tests regardless of the `integration` feature, which gates
+# only whether the test code itself compiles.
+cf-gears-test-containers = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # `pg_spec_006` reads the `cluster_postgres_lock_active_names` gauge back through
 # an in-process OTel reader (`InMemoryMetricExporter`, gated by the `testing`

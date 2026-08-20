@@ -22,7 +22,7 @@ name = "cluster"
 # cargo-shear's "misplaced optional dependency" heuristic flags that placement —
 # it is required here, not accidental.
 [package.metadata.cargo-shear]
-ignored = ["testcontainers", "testcontainers-modules", "cf-gears-test-containers"]
+ignored = ["testcontainers", "testcontainers-modules"]
 
 [lints]
 workspace = true
@@ -32,11 +32,7 @@ workspace = true
 # (`tests/mixed_backend_integration.rs`), mirroring the Postgres plugin's own
 # `integration` feature so a default `cargo test` never requires a Docker
 # daemon. Run with `cargo test -p cf-gears-cluster --features integration`.
-integration = [
-    "dep:testcontainers",
-    "dep:testcontainers-modules",
-    "dep:cf-gears-test-containers",
-]
+integration = ["dep:testcontainers", "dep:testcontainers-modules"]
 
 [dependencies]
 cluster-sdk = { workspace = true }
@@ -55,10 +51,15 @@ serde_json = { workspace = true }
 # Optional, test-only — see the `[features]` and `cargo-shear` notes above.
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
-# Database image pins: see libs/test-containers.
-cf-gears-test-containers = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Database image pins: see libs/test-containers. A dev-dependency rather than an
+# optional regular one — that crate is `publish = false`, and a path dependency
+# with no version in `[dependencies]` fails the packaging check because
+# `cargo publish` strips the path. Dev-dependencies are dropped on publish, and
+# are available to tests regardless of the `integration` feature, which gates
+# only whether the test code itself compiles.
+cf-gears-test-containers = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 serde-saphyr = { workspace = true }
 uuid = { workspace = true }

@@ -23,7 +23,6 @@ use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::ODataQuery;
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};

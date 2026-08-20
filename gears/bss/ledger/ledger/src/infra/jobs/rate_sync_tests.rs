@@ -20,7 +20,6 @@ use bss_ledger_sdk::{CurrencyPair, UnconfiguredRateProviderV1};
 use chrono::Utc;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::{ConnectOpts, connect_db};
 

@@ -1,3 +1,4 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 //! SQL/PGQ (`GRAPH_TABLE`) syntax for `sea_query`.
 //!
 //! `sea_query` models no part of SQL/PGQ — verified against the pinned
