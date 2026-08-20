@@ -89,3 +89,6 @@ use usage_collector as _;
 
 #[cfg(feature = "timescaledb-usage-collector")]
 use timescaledb_usage_collector_plugin as _;
+
+#[cfg(feature = "clickhouse-usage-collector")]
+use clickhouse_usage_collector_plugin as _;
