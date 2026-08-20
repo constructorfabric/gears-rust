@@ -12,7 +12,9 @@ use github_mirror_sdk::GithubMirrorClientV1;
 use crate::api::rest::routes;
 use crate::config::GithubMirrorConfig;
 use crate::domain::local_client::LocalClient;
+use crate::domain::ports::github::GithubPort;
 use crate::domain::service::{Service, ServiceConfig};
+use crate::infra::github::client::GithubClient;
 use crate::infra::storage::sea_orm_repo::{
     SeaOrmCommitRepository, SeaOrmIssueRepository, SeaOrmPullRequestRepository,
     SeaOrmRepoRepository,
@@ -60,6 +62,10 @@ impl Gear for GithubMirrorGear {
         let issues = Arc::new(SeaOrmIssueRepository::new());
         let pull_requests = Arc::new(SeaOrmPullRequestRepository::new());
         let commits = Arc::new(SeaOrmCommitRepository::new());
+        let github: Arc<dyn GithubPort> = Arc::new(GithubClient::new(
+            cfg.api_base_url.clone(),
+            cfg.github_token.clone(),
+        )?);
 
         let authz = ctx
             .client_hub()
@@ -73,6 +79,7 @@ impl Gear for GithubMirrorGear {
             issues,
             pull_requests,
             commits,
+            github,
             policy_enforcer,
             ServiceConfig {
                 api_base_url: cfg.api_base_url,

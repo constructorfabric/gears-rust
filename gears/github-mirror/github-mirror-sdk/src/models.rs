@@ -95,3 +95,13 @@ pub struct Commit {
     pub additions: i64,
     pub deletions: i64,
 }
+
+/// Result of one sync pass.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncSummary {
+    pub repository: String,
+    pub issues_synced: u64,
+    pub pull_requests_synced: u64,
+    pub commits_synced: u64,
+}

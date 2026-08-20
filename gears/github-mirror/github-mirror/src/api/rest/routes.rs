@@ -147,5 +147,29 @@ pub fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
+    router = OperationBuilder::post("/github-mirror/v1/repos/{owner}/{name}/sync")
+        .operation_id("github_mirror.sync_repository")
+        .summary("Sync a repository from GitHub into the mirror")
+        .description(
+            "Fetches the repository plus the first page of its issues, pull requests, and              commits from GitHub and upserts them into the caller's tenant mirror. First              slice of the sync engine: no pagination, conditional requests, or rate-limit              budgeting yet.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("owner", "Repository owner login")
+        .path_param("name", "Repository name")
+        .handler(handlers::sync_repository)
+        .json_response_with_schema::<dto::SyncSummaryDto>(
+            openapi,
+            StatusCode::OK,
+            "Repository synced into the mirror",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
     router.layer(Extension(service))
 }

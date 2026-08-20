@@ -32,6 +32,7 @@ serde = { workspace = true }
 utoipa = { workspace = true }
 axum = { workspace = true, features = ["macros"] }
 
+reqwest = { workspace = true, features = ["json"] }
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
 thiserror = { workspace = true }
@@ -46,6 +47,7 @@ toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-security = { workspace = true }
 
 [dev-dependencies]
+httpmock = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use github_mirror_sdk::{GithubMirrorClientV1, MirrorStatus, Repository};
+use github_mirror_sdk::{GithubMirrorClientV1, MirrorStatus, Repository, SyncSummary};
 use toolkit_canonical_errors::{CanonicalError, resource_error};
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
@@ -96,5 +96,24 @@ impl<
             .list_repositories(ctx, &query)
             .await
             .map_err(CanonicalError::from)
+    }
+
+    async fn sync_repository(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+    ) -> Result<SyncSummary, CanonicalError> {
+        let summary = self
+            .service
+            .sync_repository(ctx, owner, name)
+            .await
+            .map_err(CanonicalError::from)?;
+        Ok(SyncSummary {
+            repository: summary.repository,
+            issues_synced: summary.issues_synced,
+            pull_requests_synced: summary.pull_requests_synced,
+            commits_synced: summary.commits_synced,
+        })
     }
 }

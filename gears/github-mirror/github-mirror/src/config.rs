@@ -4,12 +4,18 @@ use serde::Deserialize;
 pub struct GithubMirrorConfig {
     #[serde(default = "default_api_base_url")]
     pub api_base_url: String,
+    /// Temporary shortcut until credstore integration (gears-rust#4534):
+    /// GitHub token used by sync. Unauthenticated requests work for public
+    /// repositories at a much lower rate limit.
+    #[serde(default)]
+    pub github_token: Option<String>,
 }
 
 impl Default for GithubMirrorConfig {
     fn default() -> Self {
         Self {
             api_base_url: default_api_base_url(),
+            github_token: None,
         }
     }
 }

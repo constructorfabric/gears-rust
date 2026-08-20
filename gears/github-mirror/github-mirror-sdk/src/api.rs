@@ -9,7 +9,7 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 
-use crate::models::{MirrorStatus, Repository};
+use crate::models::{MirrorStatus, Repository, SyncSummary};
 
 /// Public API trait for the github-mirror gear (Version 1).
 ///
@@ -38,4 +38,14 @@ pub trait GithubMirrorClientV1: Send + Sync {
         ctx: &SecurityContext,
         query: ODataQuery,
     ) -> Result<Page<Repository>, CanonicalError>;
+
+    /// Fetch one repository from GitHub and upsert it into the caller's
+    /// tenant mirror (the PRD's `sync_repo` entry point; first slice —
+    /// repo + first page of issues, pull requests, commits).
+    async fn sync_repository(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+    ) -> Result<SyncSummary, CanonicalError>;
 }

@@ -1,6 +1,6 @@
 use github_mirror_sdk::{Commit, Issue, PullRequest, Repository};
 
-use crate::domain::service::MirrorStatus;
+use crate::domain::service::{MirrorStatus, SyncSummary};
 
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
@@ -152,6 +152,27 @@ impl From<Commit> for CommitDto {
             committed_at: c.committed_at,
             additions: c.additions,
             deletions: c.deletions,
+        }
+    }
+}
+
+/// Result of one sync pass, as served by the sync endpoint.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SyncSummaryDto {
+    pub repository: String,
+    pub issues_synced: u64,
+    pub pull_requests_synced: u64,
+    pub commits_synced: u64,
+}
+
+impl From<SyncSummary> for SyncSummaryDto {
+    fn from(s: SyncSummary) -> Self {
+        Self {
+            repository: s.repository,
+            issues_synced: s.issues_synced,
+            pull_requests_synced: s.pull_requests_synced,
+            commits_synced: s.commits_synced,
         }
     }
 }

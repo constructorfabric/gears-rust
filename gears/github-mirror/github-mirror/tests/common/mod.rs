@@ -8,6 +8,8 @@ use authz_resolver_sdk::{
     constraints::{Constraint, InPredicate, Predicate},
     models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
 };
+use github_mirror::domain::error::DomainError;
+use github_mirror::domain::ports::github::{FetchedRepository, GithubPort};
 use github_mirror::domain::service::{Service, ServiceConfig};
 use github_mirror::infra::storage::migrations::Migrator;
 use github_mirror::infra::storage::sea_orm_repo::{
@@ -66,6 +68,22 @@ impl AuthZResolverClient for MockAuthZResolver {
     }
 }
 
+/// GitHub fake: serves a pre-baked fetch result, or `NotFound` when empty.
+pub struct FakeGithub {
+    pub result: Option<FetchedRepository>,
+}
+
+#[async_trait]
+impl GithubPort for FakeGithub {
+    async fn fetch_repository(
+        &self,
+        _owner: &str,
+        _name: &str,
+    ) -> Result<FetchedRepository, DomainError> {
+        self.result.clone().ok_or(DomainError::NotFound)
+    }
+}
+
 pub async fn inmem_db() -> Db {
     use sea_orm_migration::MigratorTrait;
 
@@ -90,18 +108,27 @@ pub fn enforcer() -> PolicyEnforcer {
     PolicyEnforcer::new(authz)
 }
 
-pub fn service_over(db: Db, api_base_url: &str) -> Arc<ConcreteService> {
+pub fn service_with_github(
+    db: Db,
+    api_base_url: &str,
+    github: Arc<dyn GithubPort>,
+) -> Arc<ConcreteService> {
     Arc::new(Service::new(
         Arc::new(DBProvider::new(db)),
         Arc::new(SeaOrmRepoRepository::new()),
         Arc::new(SeaOrmIssueRepository::new()),
         Arc::new(SeaOrmPullRequestRepository::new()),
         Arc::new(SeaOrmCommitRepository::new()),
+        github,
         enforcer(),
         ServiceConfig {
             api_base_url: api_base_url.to_owned(),
         },
     ))
+}
+
+pub fn service_over(db: Db, api_base_url: &str) -> Arc<ConcreteService> {
+    service_with_github(db, api_base_url, Arc::new(FakeGithub { result: None }))
 }
 
 pub async fn service(api_base_url: &str) -> Arc<ConcreteService> {

@@ -5,6 +5,8 @@ mod common;
 use std::sync::Arc;
 
 use github_mirror::GithubMirrorGear;
+use github_mirror::domain::local_client::LocalClient;
+use github_mirror::domain::ports::github::FetchedRepository;
 use github_mirror::domain::repo::RepositoryRecord;
 use github_mirror_sdk::GithubMirrorClientV1;
 use toolkit::{ClientHub, Gear};
@@ -83,4 +85,38 @@ async fn list_repositories_via_hub_returns_seeded_rows() {
     assert_eq!(page.items[0].full_name, "constructorfabric/gears-rust");
     assert_eq!(page.items[1].full_name, "constructorfabric/github-repotap");
     assert_eq!(page.items[0].id, 101);
+}
+
+#[tokio::test]
+async fn sync_repository_via_sdk_trait_fills_the_mirror() {
+    let db = common::inmem_db().await;
+    let fetched = FetchedRepository {
+        repository: record(500, "constructorfabric", "gears-rust"),
+        issues: vec![],
+        pull_requests: vec![],
+        commits: vec![],
+    };
+    let service = common::service_with_github(
+        db,
+        "https://api.github.com",
+        Arc::new(common::FakeGithub {
+            result: Some(fetched),
+        }),
+    );
+    let client: Arc<dyn GithubMirrorClientV1> = Arc::new(LocalClient::new(service));
+
+    let ctx = common::caller();
+    let summary = client
+        .sync_repository(&ctx, "constructorfabric", "gears-rust")
+        .await
+        .unwrap_or_else(|e| panic!("sync must succeed: {e}"));
+
+    assert_eq!(summary.repository, "constructorfabric/gears-rust");
+    assert_eq!(summary.issues_synced, 0);
+
+    let page = client
+        .list_repositories(&ctx, ODataQuery::default())
+        .await
+        .unwrap_or_else(|e| panic!("list must succeed: {e}"));
+    assert_eq!(page.items.len(), 1);
 }

@@ -40,3 +40,50 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructors_carry_their_messages() {
+        assert_eq!(
+            (DomainError::Validation {
+                field: "title".to_owned(),
+                message: "too long".to_owned()
+            })
+            .to_string(),
+            "Validation error on field 'title': too long"
+        );
+        assert_eq!(
+            DomainError::forbidden("nope").to_string(),
+            "Access forbidden: nope"
+        );
+        assert_eq!(
+            DomainError::internal("boom").to_string(),
+            "Internal error: boom"
+        );
+        assert_eq!(DomainError::NotFound.to_string(), "Repository not found");
+    }
+
+    #[test]
+    fn enforcer_denial_maps_to_forbidden() {
+        let denied = authz_resolver_sdk::EnforcerError::Denied { deny_reason: None };
+        assert!(matches!(
+            DomainError::from(denied),
+            DomainError::Forbidden(_)
+        ));
+    }
+
+    #[test]
+    fn enforcer_evaluation_failure_maps_to_internal() {
+        let failed = authz_resolver_sdk::EnforcerError::EvaluationFailed(
+            authz_resolver_sdk::AuthZResolverError::Internal("pdp unreachable".to_owned()),
+        );
+        assert!(matches!(
+            DomainError::from(failed),
+            DomainError::Internal(_)
+        ));
+    }
+}

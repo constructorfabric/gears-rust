@@ -8,6 +8,7 @@ use toolkit_odata::{ODataQuery, Page, PageInfo};
 use toolkit_security::{SecurityContext, pep_properties};
 
 use super::error::DomainError;
+use super::ports::github::GithubPort;
 use super::repo::{
     CommitRecord, CommitRepository, IssueRecord, IssueRepository, PullRequestRecord,
     PullRequestRepository, RepoRepository, RepositoryRecord,
@@ -39,9 +40,13 @@ pub(crate) const COMMIT_RESOURCE: ResourceType = ResourceType::from_static(
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+pub(crate) const SYNC_RESOURCE: ResourceType =
+    ResourceType::from_static("github_mirror.sync", &[pep_properties::OWNER_TENANT_ID]);
+
 pub(crate) mod actions {
     pub const LIST: &str = "list";
     pub const UPSERT: &str = "upsert";
+    pub const SYNC: &str = "sync";
 }
 
 #[domain_model]
@@ -58,6 +63,16 @@ pub struct MirrorStatus {
     pub api_base_url: String,
 }
 
+/// What one sync pass wrote, returned to the caller.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncSummary {
+    pub repository: String,
+    pub issues_synced: u64,
+    pub pull_requests_synced: u64,
+    pub commits_synced: u64,
+}
+
 #[domain_model]
 pub struct Service<
     R: RepoRepository,
@@ -70,6 +85,7 @@ pub struct Service<
     issues: Arc<I>,
     pull_requests: Arc<P>,
     commits: Arc<C>,
+    github: Arc<dyn GithubPort>,
     policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
 }
@@ -77,12 +93,14 @@ pub struct Service<
 impl<R: RepoRepository, I: IssueRepository, P: PullRequestRepository, C: CommitRepository>
     Service<R, I, P, C>
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<DbProvider>,
         repo: Arc<R>,
         issues: Arc<I>,
         pull_requests: Arc<P>,
         commits: Arc<C>,
+        github: Arc<dyn GithubPort>,
         policy_enforcer: PolicyEnforcer,
         config: ServiceConfig,
     ) -> Self {
@@ -92,6 +110,7 @@ impl<R: RepoRepository, I: IssueRepository, P: PullRequestRepository, C: CommitR
             issues,
             pull_requests,
             commits,
+            github,
             policy_enforcer,
             config,
         }
@@ -440,5 +459,73 @@ impl<R: RepoRepository, I: IssueRepository, P: PullRequestRepository, C: CommitR
             ..record
         };
         self.commits.upsert(&conn, &scope, tenant_id, record).await
+    }
+
+    /// Fetch one repository from GitHub (first slice: repo + first page of
+    /// issues, pull requests, and commits) and upsert it into the mirror.
+    ///
+    /// The REST face of the PRD's `sync_repo` entry point; the inline fetch
+    /// is replaced by a queued sync session when the engine lands
+    /// (gears-rust#4632).
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when GitHub does not know the repository,
+    /// `Forbidden` on PDP denial, `Internal` on GitHub/storage failures.
+    #[allow(clippy::cast_possible_truncation)]
+    pub async fn sync_repository(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+    ) -> Result<SyncSummary, DomainError> {
+        let tenant_id = ctx.subject_tenant_id();
+
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &SYNC_RESOURCE,
+                actions::SYNC,
+                None,
+                &AccessRequest::new().resource_property(pep_properties::OWNER_TENANT_ID, tenant_id),
+            )
+            .await?;
+
+        let fetched = self.github.fetch_repository(owner, name).await?;
+
+        let conn = self.db.conn()?;
+        let repository = self
+            .repo
+            .upsert(&conn, &scope, tenant_id, fetched.repository)
+            .await?;
+
+        let mut issues_synced: u64 = 0;
+        for record in fetched.issues {
+            self.issues.upsert(&conn, &scope, tenant_id, record).await?;
+            issues_synced += 1;
+        }
+
+        let mut pull_requests_synced: u64 = 0;
+        for record in fetched.pull_requests {
+            self.pull_requests
+                .upsert(&conn, &scope, tenant_id, record)
+                .await?;
+            pull_requests_synced += 1;
+        }
+
+        let mut commits_synced: u64 = 0;
+        for record in fetched.commits {
+            self.commits
+                .upsert(&conn, &scope, tenant_id, record)
+                .await?;
+            commits_synced += 1;
+        }
+
+        Ok(SyncSummary {
+            repository: repository.full_name,
+            issues_synced,
+            pull_requests_synced,
+            commits_synced,
+        })
     }
 }
