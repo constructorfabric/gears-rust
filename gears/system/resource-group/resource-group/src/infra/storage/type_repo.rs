@@ -496,7 +496,7 @@ impl TypeRepositoryTrait for TypeRepository {
         let updated_at = time::OffsetDateTime::now_utc();
 
         // Use SecureUpdateMany for scoped update
-        GtsTypeEntity::update_many()
+        let result = GtsTypeEntity::update_many()
             .filter(gts_type::Column::Id.eq(current.id))
             .secure()
             .col_expr(
@@ -508,6 +508,10 @@ impl TypeRepositoryTrait for TypeRepository {
             .exec(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
+
+        if result.rows_affected == 0 {
+            return Err(DomainError::type_not_found(current.schema_id));
+        }
 
         Ok(gts_type::Model {
             metadata_schema: metadata_schema.cloned(),

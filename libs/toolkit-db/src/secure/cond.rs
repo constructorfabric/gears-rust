@@ -108,7 +108,7 @@ where
             ScopeFilter::InGroup(gf) => {
                 // col IN (SELECT resource_id FROM resource_group_membership
                 //          WHERE group_id IN (...))
-                // @wontfix(Defect B, VHP-2344): the subquery does not filter by
+                // @wontfix(Defect B): the subquery does not filter by
                 // `gts_type_id`, so a resource_id from a different type (same
                 // string, different gts_type_id) could match. Fixing this
                 // requires a correlated EXISTS with gts_type_id, which would

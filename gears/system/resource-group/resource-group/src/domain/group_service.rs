@@ -584,7 +584,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
-        let metrics = Arc::clone(&self.metrics);
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-2
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-12
@@ -595,7 +594,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 let profile = profile.clone();
                 let group_repo = group_repo.clone();
                 let type_repo = type_repo.clone();
-                let metrics = Arc::clone(&metrics);
                 Box::pin(async move {
                     Self::move_group_inner(
                         &*group_repo,
@@ -604,14 +602,18 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                         group_id,
                         new_parent_id,
                         &profile,
-                        &*metrics,
                     )
                     .await
                 })
             })
             .await;
         self.record_op(Operation::Move, started, &result);
-        result
+        // Record closure-row metrics outside the retry closure so retries
+        // do not double-count (CodeRabbit).
+        if let Ok((_, closure_rows)) = &result {
+            self.metrics.closure_rows_written(Operation::Move, *closure_rows);
+        }
+        result.map(|(group, _)| group)
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-13
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-11
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-12
@@ -643,8 +645,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
 
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
-        let metrics = Arc::clone(&self.metrics);
-
         // A force delete rewrites a whole subtree -- closure rows for every
         // node, memberships, the group rows themselves -- and races a
         // concurrent create or move anywhere inside it. That is write skew,
@@ -679,13 +679,16 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .transaction_with_retry(config, DomainError::db_err, |tx| {
                 let scope = scope.clone();
                 let group_repo = group_repo.clone();
-                let metrics = Arc::clone(&metrics);
                 Box::pin(async move {
-                    Self::delete_group_inner(&*group_repo, tx, &scope, group_id, force, &*metrics)
+                    Self::delete_group_inner(&*group_repo, tx, &scope, group_id, force)
                         .await
                 })
             })
             .await;
+        // Record subtree-node metric outside the retry closure (CodeRabbit).
+        if let Ok(Some(subtree_count)) = &result {
+            self.metrics.subtree_nodes(Operation::ForceDelete, *subtree_count);
+        }
         self.record_op(
             if force {
                 Operation::ForceDelete
@@ -695,7 +698,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             started,
             &result,
         );
-        result
+        result.map(|_| ())
     }
 
     /// Get descendants of a group (depth >= 0, AuthZ-scoped).
@@ -1293,6 +1296,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     }
 
     /// Inner logic for `move_group`, runs inside a SERIALIZABLE transaction.
+    /// Returns the moved group and the number of closure rows written.
     async fn move_group_inner(
         group_repo: &GR,
         type_repo: &TR,
@@ -1300,8 +1304,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
         profile: &QueryProfile,
-        metrics: &dyn RgMetricsPort,
-    ) -> Result<ResourceGroup, DomainError> {
+    ) -> Result<(ResourceGroup, u64), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-3
         // Load group and new parent in transaction
         let existing = group_repo
@@ -1396,32 +1399,38 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         }
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-10
 
-        metrics.closure_rows_written(Operation::Move, outcome.closure_rows);
-
         // Assembled rather than read back, as in `update_group_inner`: a move
         // writes exactly one column, and the rest of the row is `existing`
         // unchanged.
-        Ok(ResourceGroup {
-            id: group_id,
-            code: type_path,
-            name: existing.name,
-            hierarchy: GroupHierarchy {
-                parent_id: new_parent_id,
-                tenant_id: existing.tenant_id,
+        //
+        // `closure_rows` is returned alongside the group so the caller can
+        // record the metric outside the retryable transaction, avoiding
+        // double-count on retry.
+        let closure_rows = outcome.closure_rows;
+        Ok((
+            ResourceGroup {
+                id: group_id,
+                code: type_path,
+                name: existing.name,
+                hierarchy: GroupHierarchy {
+                    parent_id: new_parent_id,
+                    tenant_id: existing.tenant_id,
+                },
+                metadata: existing.metadata,
             },
-            metadata: existing.metadata,
-        })
+            closure_rows,
+        ))
     }
 
     /// Inner logic for `delete_group`, runs inside a SERIALIZABLE transaction.
+    /// Returns the subtree node count (for metric recording) on force delete.
     async fn delete_group_inner(
         group_repo: &GR,
         tx: &impl DBRunner,
         scope: &toolkit_security::AccessScope,
         group_id: Uuid,
         force: bool,
-        metrics: &dyn RgMetricsPort,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Option<u64>, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-2
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-3
         // DB: SELECT FROM resource_group WHERE id = {group_id}
@@ -1444,7 +1453,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5d
             // Force delete: cascade entire subtree + memberships + closure
             #[allow(clippy::let_and_return)]
-            let result = Self::force_delete_subtree(group_repo, tx, group_id, metrics).await;
+            let result = Self::force_delete_subtree(group_repo, tx, group_id)
+                .await
+                .map(Some);
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5d
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5c
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5b
@@ -1497,7 +1508,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             group_repo.delete_all_closure_rows(tx, group_id).await?;
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6a
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6b
-            group_repo.delete_by_id(tx, group_id).await
+            group_repo.delete_by_id(tx, group_id).await.map(|_| None)
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6b
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6
         }
@@ -1666,8 +1677,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_repo: &GR,
         conn: &impl DBRunner,
         root_id: Uuid,
-        metrics: &dyn RgMetricsPort,
-    ) -> Result<(), DomainError> {
+    ) -> Result<u64, DomainError> {
         let descendants_with_depth = group_repo
             .get_descendant_ids_with_depth(conn, root_id)
             .await?;
@@ -1675,14 +1685,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let all_ids: Vec<Uuid> = std::iter::once(root_id)
             .chain(descendants_with_depth.iter().map(|(id, _depth)| *id))
             .collect();
-
-        // The input this operation's cost is a function of. Recorded so a
-        // slow tail can be read against the shape of the subtree rather than
-        // guessed at.
-        metrics.subtree_nodes(
-            Operation::ForceDelete,
-            all_ids.len().try_into().unwrap_or(u64::MAX),
-        );
+        let subtree_count: u64 = all_ids.len().try_into().unwrap_or(u64::MAX);
 
         // Memberships and closure rows have no FK ordering constraint among
         // themselves, so both go in one statement for the whole subtree
@@ -1706,7 +1709,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             group_repo.delete_by_id_many(conn, &ids).await?;
         }
 
-        Ok(())
+        Ok(subtree_count)
     }
 
     /// Get direct children of a group.

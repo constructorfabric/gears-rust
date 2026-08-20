@@ -1373,12 +1373,13 @@ impl GroupRepositoryTrait for GroupRepository {
             // with nothing to insert, and the DELETE above would have
             // already dropped the subtree's real ancestors on the strength of
             // the reparent this claims to perform.
-            tracing::warn!(
-                %group_id,
-                deleted,
-                "closure rebuild inserted no rows for a reparent -- the parent has no \
-                 closure rows, which the NOT IN delete would then silently preserve"
-            );
+            //
+            // Return an error so the transaction rolls back rather than
+            // committing a broken closure table.
+            return Err(DomainError::database(format!(
+                "closure rebuild for group {group_id} inserted no rows for reparent \
+                 (deleted {deleted}); parent has no closure rows"
+            )));
         }
         Ok(inserted)
         // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-5
