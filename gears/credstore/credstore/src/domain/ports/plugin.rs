@@ -1,3 +1,8 @@
+//! Storage-plugin selection boundary.
+//!
+//! The domain resolves a value-store implementation lazily without depending
+//! on types-registry or `ClientHub` details.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

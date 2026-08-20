@@ -19,6 +19,11 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Local dev enables incremental compilation via [profile.dev]; CI does not want
+  # the extra codegen and disk churn.
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   gts_validate:
     name: Validate GTS Identifiers

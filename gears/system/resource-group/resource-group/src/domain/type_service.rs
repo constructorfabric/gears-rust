@@ -19,6 +19,7 @@ use crate::domain::error::DomainError;
 use crate::domain::repo::TypeRepositoryTrait;
 #[allow(unused_imports)]
 use crate::domain::validation;
+use crate::infra::storage::entity::gts_type;
 
 // @cpt-dod:cpt-cf-resource-group-dod-type-mgmt-service-crud:p1
 /// Service for GTS type lifecycle management.
@@ -95,7 +96,10 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
                 // conflicting schema_id. Performed in-tx so a concurrent create
                 // cannot slip a duplicate row in between this read and the
                 // insert below.
-                if type_repo.find_by_code(tx, &req.code).await?.is_some() {
+                // Existence only: `find_by_code` assembles the full type,
+                // reading both junction tables to answer a question that the
+                // surrogate id alone settles (RG-13).
+                if type_repo.resolve_id(tx, &req.code).await?.is_some() {
                     debug!(code = %req.code, "Type already exists, rejecting create");
                     return Err(DomainError::type_already_exists(&req.code));
                 }
@@ -244,10 +248,14 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
                 // DB: SELECT FROM gts_type WHERE schema_id = {code} — load existing type
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-3
                 // IF type not found → RETURN NotFound
-                let existing = type_repo
-                    .find_by_code(tx, &code)
+                // One lookup for both the row and its surrogate id: the
+                // update path needs each, and resolving the code twice cost
+                // a second `gts_type` SELECT per update (RG-11).
+                let (type_model, existing) = type_repo
+                    .find_by_code_with_model(tx, &code)
                     .await?
                     .ok_or_else(|| DomainError::type_not_found(&code))?;
+                let type_id = type_model.id;
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-3
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-2
 
@@ -268,11 +276,6 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
                         .await?
                 };
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-5
-
-                let type_id = type_repo
-                    .resolve_id(tx, &code)
-                    .await?
-                    .ok_or_else(|| DomainError::type_not_found(&code))?;
 
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-6
                 // Invoke hierarchy safety check algorithm for
@@ -313,9 +316,21 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-12
                 // DB: UPDATE gts_type SET metadata_schema = {new}, updated_at = now().
-                let updated_model = type_repo
-                    .update_type(tx, type_id, &code, Some(&stored_schema))
+                let updated_at = type_repo
+                    .update_type(tx, type_id, Some(&stored_schema))
                     .await?;
+
+                // Assembled, not read back (RG-08). `metadata_schema` and
+                // `updated_at` are what the write just set, `id` and
+                // `schema_id` are the keys it was addressed by, and
+                // `created_at` is immutable -- carried from the row this
+                // transaction read at the top. The re-read this replaces
+                // could only return these same five values.
+                let updated_model = gts_type::Model {
+                    metadata_schema: Some(stored_schema),
+                    updated_at: Some(updated_at),
+                    ..type_model
+                };
                 // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-12
                 // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-13
                 // RETURN updated ResourceGroupType (loaded with refreshed junctions).
@@ -417,34 +432,53 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-1
         // Compute removed parent types: old_allowed_parent_types - new_allowed_parent_types
-        let removed_parents: Vec<&String> = existing
+        let removed_parents: Vec<String> = existing
             .allowed_parent_types
             .iter()
             .filter(|p| !req.allowed_parent_types.contains(p))
+            .cloned()
             .collect();
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-1
 
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2
-        for removed_parent in &removed_parents {
+        if !removed_parents.is_empty() {
             // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
-            let parent_id = type_repo.resolve_id(conn, removed_parent).await?;
-            if let Some(parent_id) = parent_id {
-                let violations = type_repo
-                    .find_groups_using_parent_type(conn, type_id, parent_id)
-                    .await?;
-                // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
+            // One call for every removed parent, instead of a `resolve_id`
+            // plus a single-parent lookup per removed parent (N+1 audit
+            // finding (b): two SELECTs per element of the request). The
+            // instruction below covers the lookup step it replaces.
+            let violations = type_repo
+                .find_groups_violating_removed_parents(conn, type_id, &removed_parents)
+                .await?;
+            // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
 
-                // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
-                if !violations.is_empty() {
-                    let names: Vec<String> =
-                        violations.iter().map(|(_, name)| name.clone()).collect();
-                    return Err(DomainError::allowed_parent_types_violation(format!(
-                        "Cannot remove allowed parent '{removed_parent}': groups using this parent relationship: {}",
-                        names.join(", ")
-                    )));
-                }
-                // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
+            // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
+            // Group violations by parent code in one pass instead of
+            // rescanning `violations` once per removed parent
+            // (`removed_parents.iter().find(|p| violations.iter().any(...))`
+            // was O(removed_parents * violations)). `entry(...).or_default()`
+            // preserves each code's names in `violations`' original order, so
+            // the lookup below reports the same first-hit-in-request-order
+            // parent and the same name list the quadratic scan did.
+            let mut names_by_parent: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for (code, _, name) in &violations {
+                names_by_parent
+                    .entry(code.as_str())
+                    .or_default()
+                    .push(name.as_str());
             }
+
+            if let Some((removed_parent, names)) = removed_parents
+                .iter()
+                .find_map(|p| names_by_parent.get(p.as_str()).map(|names| (p, names)))
+            {
+                return Err(DomainError::allowed_parent_types_violation(format!(
+                    "Cannot remove allowed parent '{removed_parent}': groups using this parent relationship: {}",
+                    names.join(", ")
+                )));
+            }
+            // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
         }
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2
 

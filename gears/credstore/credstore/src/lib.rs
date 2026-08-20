@@ -1,4 +1,4 @@
-//! credstore — `CredStore` module: tenant-scoped secrets over pluggable backends.
+#![doc = include_str!("../README.md")]
 pub mod api;
 pub mod client;
 pub mod config;

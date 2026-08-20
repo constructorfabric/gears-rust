@@ -31,6 +31,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
+  # Local dev enables incremental via [profile.dev]; CI does not want the churn.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   e2e:

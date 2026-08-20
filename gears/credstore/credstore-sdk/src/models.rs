@@ -1,5 +1,9 @@
 // Updated: 2026-04-07 by Constructor Tech
 // Updated: 2026-03-18 by Constructor Tech
+//! Public credential references, values, metadata, sharing, expiry, and write
+//! preconditions.
+//!
+//! Secret values redact formatting output and zeroize their bytes on drop.
 use std::fmt;
 
 use serde::de::Deserializer;

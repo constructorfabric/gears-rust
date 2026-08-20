@@ -1,3 +1,9 @@
+//! Authorization policy-enforcement helpers for typed secrets.
+//!
+//! Builds the concrete GTS resource type for each secret and converts PDP
+//! decisions into tenant-scoped [`AccessScope`]
+//! values or fail-closed domain errors.
+
 use authz_resolver_sdk::pep::{AccessRequest, EnforcerError, PolicyEnforcer, ResourceType};
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 

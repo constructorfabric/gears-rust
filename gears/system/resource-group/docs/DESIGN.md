@@ -1593,10 +1593,20 @@ Hierarchy mutations (`create/move/delete`) use `SERIALIZABLE` isolation with bou
 
 **Serialization retry policy**:
 
-- max retries: 3 (configurable)
-- backoff: none (immediate retry — serialization conflicts resolve within microseconds)
-- on exhaustion: return `ServiceUnavailable` with retry-after hint
-- transaction timeout: 5s (configurable)
+- max retries: 3 (`toolkit_db::secure::DEFAULT_TX_RETRY_ATTEMPTS`, overridable per call)
+- backoff: jittered exponential between attempts — base 2 ms, factor 5, capped at
+  100 ms (`retry_backoff_delay`). The success path never waits. An earlier
+  revision of this section said "none (immediate retry)"; that was true until
+  the retry loop gained backoff, and an immediate retry is what made two
+  colliding transactions recompute the same zero delay and collide again.
+- on exhaustion: the **last** error is returned unchanged. There is no
+  `ServiceUnavailable` variant to return and no retry-after hint; the caller
+  surfaces whatever the database said, which today reaches HTTP as a 500.
+  Whether an exhausted retry deserves its own status is an open contract
+  question, tracked in `db-behavior-audit.md` under Deferred.
+- transaction timeout: none. `TxConfig` carries `isolation` and `access_mode`
+  and nothing else — there is no timeout mechanism to configure. The "5s
+  (configurable)" this list used to claim never existed.
 
 **Concurrency test pattern** (E2E test level — requires real PostgreSQL for SERIALIZABLE isolation):
 

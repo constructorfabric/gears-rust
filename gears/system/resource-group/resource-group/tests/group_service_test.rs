@@ -32,7 +32,9 @@ use resource_group::infra::storage::entity::resource_group_membership::{
 };
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::{CreateGroupRequest, CreateTypeRequest, UpdateGroupRequest};
+use resource_group_sdk::{
+    CreateGroupRequest, CreateTypeRequest, UpdateGroupRequest, UpdateTypeRequest,
+};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use toolkit_db::secure::{SecureEntityExt, secure_insert};
 use toolkit_odata::ODataQuery;
@@ -446,6 +448,212 @@ async fn group_move_closure_rebuild() {
     assert_eq!(model.parent_id, Some(root2.id));
     assert_eq!(model.tenant_id, tenant_id);
     assert_eq!(model.name, "Child");
+}
+
+/// A type that allows itself as a parent, so a chain of arbitrary depth can
+/// be built. `resolve_ids` rejects a parent path that does not exist yet, so
+/// the self-reference is added by a follow-up update.
+async fn create_self_parenting_type(
+    type_svc: &TypeService<TypeRepository>,
+    suffix: &str,
+) -> resource_group_sdk::ResourceGroupType {
+    let code = format!(
+        "{}x.test.{}.i{}.v1~",
+        gts_id!("cf.core.rg.type.v1~"),
+        suffix.to_ascii_lowercase(),
+        Uuid::now_v7().as_simple()
+    );
+    type_svc
+        .create_type(CreateTypeRequest {
+            code: code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .expect("create self-parenting type");
+    type_svc
+        .update_type(
+            &code,
+            UpdateTypeRequest {
+                can_be_root: true,
+                allowed_parent_types: vec![code.clone()],
+                allowed_membership_types: vec![],
+                metadata_schema: None,
+            },
+        )
+        .await
+        .expect("add the self-reference")
+}
+
+/// Move a two-level subtree under a parent that is itself two levels down.
+///
+/// `group_move_closure_rebuild` above moves under a *root*, so every new
+/// closure row gets its depth from the subtree side alone. Here the new
+/// parent has ancestors of its own, so each rebuilt row's depth is a sum of
+/// both sides plus one -- the arithmetic that a rebuild can get wrong in a
+/// way a move-to-root never exposes.
+#[tokio::test]
+async fn group_move_under_deep_parent_rebuilds_every_depth() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t = create_self_parenting_type(&type_svc, "deepmv").await;
+
+    // Destination chain: root -> mid -> target. `target` sits at depth 2, so
+    // it has three closure rows of its own (itself, mid, root).
+    let root = common::create_root_group(&group_svc, &ctx, &t.code, "root", tenant_id).await;
+    let mid =
+        common::create_child_group(&group_svc, &ctx, &t.code, root.id, "mid", tenant_id).await;
+    let target =
+        common::create_child_group(&group_svc, &ctx, &t.code, mid.id, "target", tenant_id).await;
+
+    // Subtree to move: other -> moved -> leaf.
+    let other = common::create_root_group(&group_svc, &ctx, &t.code, "other", tenant_id).await;
+    let moved =
+        common::create_child_group(&group_svc, &ctx, &t.code, other.id, "moved", tenant_id).await;
+    let leaf =
+        common::create_child_group(&group_svc, &ctx, &t.code, moved.id, "leaf", tenant_id).await;
+
+    group_svc
+        .move_group(moved.id, Some(target.id))
+        .await
+        .expect("move under the deep parent");
+
+    let conn = db.conn().expect("conn");
+
+    // moved: self, target(1), mid(2), root(3) -- and nothing from `other`.
+    common::assert_closure_rows(
+        &conn,
+        moved.id,
+        &[(moved.id, 0), (target.id, 1), (mid.id, 2), (root.id, 3)],
+    )
+    .await;
+
+    // leaf: one deeper on every path, and its link to `moved` is preserved
+    // rather than rewritten -- internal subtree rows are not part of a move.
+    common::assert_closure_rows(
+        &conn,
+        leaf.id,
+        &[
+            (leaf.id, 0),
+            (moved.id, 1),
+            (target.id, 2),
+            (mid.id, 3),
+            (root.id, 4),
+        ],
+    )
+    .await;
+
+    // The old parent keeps only itself.
+    common::assert_closure_rows(&conn, other.id, &[(other.id, 0)]).await;
+
+    common::assert_closure_matches_parent_links(&conn).await;
+}
+
+/// A move whose new parent belongs to another tenant is refused.
+///
+/// `tenant_id` is immutable gear-wide, so accepting the move would either
+/// carry a group out of its tenant or leave it parented across the boundary.
+/// Nothing covered this: the check could be deleted outright and the whole
+/// suite stayed green.
+#[tokio::test]
+async fn group_move_to_parent_in_another_tenant_rejected() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+
+    let t = create_self_parenting_type(&type_svc, "xtenant").await;
+
+    let tenant_a = Uuid::now_v7();
+    let ctx_a = common::make_ctx(tenant_a);
+    let tenant_b = Uuid::now_v7();
+    let ctx_b = common::make_ctx(tenant_b);
+
+    let root_a = common::create_root_group(&group_svc, &ctx_a, &t.code, "a-root", tenant_a).await;
+    let child_a =
+        common::create_child_group(&group_svc, &ctx_a, &t.code, root_a.id, "a-child", tenant_a)
+            .await;
+    let root_b = common::create_root_group(&group_svc, &ctx_b, &t.code, "b-root", tenant_b).await;
+
+    let err = group_svc
+        .move_group(child_a.id, Some(root_b.id))
+        .await
+        .expect_err("a move across the tenant boundary must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("different tenant"),
+        "expected a cross-tenant rejection, got: {msg}"
+    );
+    // The caller cannot act on a foreign tenant id, and naming it would
+    // disclose ownership of `root_b` across the boundary.
+    assert!(
+        !msg.contains(&tenant_b.to_string()),
+        "the message names the foreign tenant: {msg}"
+    );
+
+    // The transaction rolled back: the child still hangs off its own root,
+    // and the closure table still mirrors the parent links.
+    let conn = db.conn().expect("conn");
+    common::assert_closure_rows(&conn, child_a.id, &[(child_a.id, 0), (root_a.id, 1)]).await;
+    common::assert_closure_matches_parent_links(&conn).await;
+}
+
+/// The same boundary, reached through `update_group`'s `parent_id` instead
+/// of `move_group`.
+///
+/// `update_group_inner` carries its own copy of the check, and that copy was
+/// the uncovered one: deleting it left the whole suite green.
+#[tokio::test]
+async fn group_update_parent_to_another_tenant_rejected() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+
+    let t = create_self_parenting_type(&type_svc, "xtenantupd").await;
+
+    let tenant_a = Uuid::now_v7();
+    let ctx_a = common::make_ctx(tenant_a);
+    let tenant_b = Uuid::now_v7();
+    let ctx_b = common::make_ctx(tenant_b);
+
+    let root_a = common::create_root_group(&group_svc, &ctx_a, &t.code, "a-root", tenant_a).await;
+    let child_a =
+        common::create_child_group(&group_svc, &ctx_a, &t.code, root_a.id, "a-child", tenant_a)
+            .await;
+    let root_b = common::create_root_group(&group_svc, &ctx_b, &t.code, "b-root", tenant_b).await;
+
+    let err = group_svc
+        .update_group(
+            &ctx_a,
+            child_a.id,
+            UpdateGroupRequest {
+                name: "a-child".to_owned(),
+                parent_id: Some(root_b.id),
+                metadata: None,
+            },
+        )
+        .await
+        .expect_err("re-parenting across the tenant boundary must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("different tenant"),
+        "expected a cross-tenant rejection, got: {msg}"
+    );
+    assert!(
+        !msg.contains(&tenant_b.to_string()),
+        "the message names the foreign tenant: {msg}"
+    );
+
+    let conn = db.conn().expect("conn");
+    common::assert_closure_rows(&conn, child_a.id, &[(child_a.id, 0), (root_a.id, 1)]).await;
+    common::assert_closure_matches_parent_links(&conn).await;
 }
 
 /// TC-GRP-06: Move under descendant -> CycleDetected.
@@ -2816,4 +3024,159 @@ async fn group_create_duplicate_id_same_tenant_is_already_exists() {
         matches!(err, DomainError::GroupAlreadyExists { id: got } if got == id),
         "expected GroupAlreadyExists({id}), got: {err:?}"
     );
+}
+
+// =========================================================================
+// `$filter` type-path resolution
+//
+// A `type` filter names a GTS path; the column holds a surrogate SMALLINT.
+// `list_groups` therefore walks the filter AST, collects every type literal,
+// resolves them in one query, and substitutes the ids back. Each node shape
+// is a separate arm of that walk, and the scale test elsewhere in this suite
+// only ever builds `type in (...)` -- so the plain comparison, the boolean
+// combinations, the negation and the unknown-path rejection went unexercised.
+// =========================================================================
+
+/// Build a `list_groups` query from an OData filter string.
+fn filter_query(expr: &str) -> ODataQuery {
+    let parsed = toolkit_odata::parse_filter_string(expr).expect("filter should parse");
+    ODataQuery::new().with_filter(parsed.into_expr())
+}
+
+#[tokio::test]
+async fn list_groups_filters_by_a_single_type() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t_a = common::create_root_type(&type_svc, "fone").await;
+    let t_b = common::create_root_type(&type_svc, "ftwo").await;
+    let a = common::create_root_group(&group_svc, &ctx, &t_a.code, "a", tenant_id).await;
+    common::create_root_group(&group_svc, &ctx, &t_b.code, "b", tenant_id).await;
+
+    let page = group_svc
+        .list_groups(&ctx, &filter_query(&format!("type eq '{}'", t_a.code)))
+        .await
+        .expect("list_groups with a type filter should succeed");
+
+    let ids: Vec<Uuid> = page.items.iter().map(|g| g.id).collect();
+    assert_eq!(ids, vec![a.id], "only the group of the filtered type");
+    assert_eq!(
+        page.items[0].code, t_a.code,
+        "the surrogate id must be mapped back to the GTS path on the way out"
+    );
+}
+
+#[tokio::test]
+async fn list_groups_filters_by_either_of_two_types() {
+    // `or` is a Composite node: the walk has to recurse into every child to
+    // find the literals, and again to substitute them.
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t_a = common::create_root_type(&type_svc, "fora").await;
+    let t_b = common::create_root_type(&type_svc, "forb").await;
+    let t_c = common::create_root_type(&type_svc, "forc").await;
+    let a = common::create_root_group(&group_svc, &ctx, &t_a.code, "a", tenant_id).await;
+    let b = common::create_root_group(&group_svc, &ctx, &t_b.code, "b", tenant_id).await;
+    common::create_root_group(&group_svc, &ctx, &t_c.code, "c", tenant_id).await;
+
+    let page = group_svc
+        .list_groups(
+            &ctx,
+            &filter_query(&format!("type eq '{}' or type eq '{}'", t_a.code, t_b.code)),
+        )
+        .await
+        .expect("list_groups with an or-filter should succeed");
+
+    let mut ids: Vec<Uuid> = page.items.iter().map(|g| g.id).collect();
+    ids.sort();
+    let mut want = vec![a.id, b.id];
+    want.sort();
+    assert_eq!(ids, want, "both branches of the or, and nothing else");
+}
+
+#[tokio::test]
+async fn list_groups_filters_by_negated_type() {
+    // `not` wraps a single child; the walk descends through it in both
+    // passes, and a miss there would silently drop the substitution and leave
+    // a GTS path where the column wants a SMALLINT.
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t_a = common::create_root_type(&type_svc, "fnota").await;
+    let t_b = common::create_root_type(&type_svc, "fnotb").await;
+    common::create_root_group(&group_svc, &ctx, &t_a.code, "a", tenant_id).await;
+    let b = common::create_root_group(&group_svc, &ctx, &t_b.code, "b", tenant_id).await;
+
+    let page = group_svc
+        .list_groups(
+            &ctx,
+            &filter_query(&format!("not (type eq '{}')", t_a.code)),
+        )
+        .await
+        .expect("list_groups with a negated type filter should succeed");
+
+    let ids: Vec<Uuid> = page.items.iter().map(|g| g.id).collect();
+    assert_eq!(ids, vec![b.id], "everything except the excluded type");
+}
+
+#[tokio::test]
+async fn list_groups_rejects_an_unknown_type_in_the_filter() {
+    // The resolution map is built from the paths that exist. A path that is
+    // absent has no id to substitute, and the request is a client error --
+    // not an empty page, which would read as "no such groups" rather than
+    // "no such type", and not a 500.
+    let db = common::test_db().await;
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let err = group_svc
+        .list_groups(
+            &ctx,
+            &filter_query("type eq 'gts.cf.core.rg.type.v1~x.test.absent.v1~'"),
+        )
+        .await
+        .expect_err("an unresolvable type path must be refused");
+
+    assert!(
+        matches!(err, DomainError::Validation { .. }),
+        "expected a validation error, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("Unknown type in filter"),
+        "the message should name the problem: {err}"
+    );
+}
+
+#[tokio::test]
+async fn list_groups_leaves_a_filter_without_a_type_alone() {
+    // Nothing to resolve: the walk must pass the node through untouched
+    // rather than rewriting or rejecting it.
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t = common::create_root_type(&type_svc, "fnamed").await;
+    let a = common::create_root_group(&group_svc, &ctx, &t.code, "keep-me", tenant_id).await;
+    common::create_root_group(&group_svc, &ctx, &t.code, "drop-me", tenant_id).await;
+
+    let page = group_svc
+        .list_groups(&ctx, &filter_query("name eq 'keep-me'"))
+        .await
+        .expect("a non-type filter should pass through untouched");
+
+    let ids: Vec<Uuid> = page.items.iter().map(|g| g.id).collect();
+    assert_eq!(ids, vec![a.id]);
 }

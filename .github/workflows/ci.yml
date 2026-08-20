@@ -342,6 +342,13 @@ jobs:
       - name: Test postgres-cluster-plugin (pg integration)
         run: make test-cluster-pg
 
+      - name: Test resource-group (pg smoke, integration)
+        # Fail if Docker is unreachable instead of letting the suite skip itself
+        # into a green step that asserted nothing.
+        env:
+          RG_PG_REQUIRE_DOCKER: "1"
+        run: make test-rg-pg
+
       - name: Test toolkit-db (sqlite integration)
         run: make test-sqlite
 

@@ -1,10 +1,10 @@
-# CredStore SDK
+# `CredStore` SDK
 
-SDK crate for the CredStore gear, providing public API contracts for credential storage in Gears.
+SDK crate for the `CredStore` gear, providing public API contracts for credential storage in Gears.
 
 ## Overview
 
-This crate defines the transport-agnostic interface for the CredStore gear:
+This crate defines the transport-agnostic interface for the `CredStore` gear:
 
 - **`CredStoreClientV1`** — consumer-facing trait (`get`/`put`/`create`/`delete`);
   `get` returns the value plus metadata (`owner_tenant_id`, `sharing`,
@@ -18,23 +18,26 @@ This crate defines the transport-agnostic interface for the CredStore gear:
 
 ## Usage
 
-### Getting the client
+A `ToolKit` consumer normally obtains `CredStoreClientV1` from `ClientHub`. The SDK
+itself is transport-independent, so the example accepts the resolved client directly:
 
-```rust
-use credstore_sdk::CredStoreClientV1;
+```no_run
+use credstore_sdk::{CredStoreClientV1, CredStoreError, SecretRef};
+use toolkit_security::SecurityContext;
 
-let credstore = hub.get::<dyn CredStoreClientV1>()?;
-```
+async fn secret_length(
+    credstore: &dyn CredStoreClientV1,
+    security: &SecurityContext,
+) -> Result<Option<usize>, CredStoreError> {
+    let key = SecretRef::new("my-api-key")?;
+    let response = credstore.get(security, &key).await?;
 
-### Retrieving a secret
-
-```rust
-if let Some(resp) = credstore.get(&ctx, &SecretRef::new("my-api-key")?).await? {
-    let bytes = resp.value.as_bytes();
+    Ok(response.map(|secret| secret.value.as_bytes().len()))
 }
 ```
 
-Access denial is expressed as `Ok(None)`, not as an error — this prevents secret enumeration.
+A missing or out-of-scope secret is expressed as `Ok(None)`, preventing existence
+leaks. An explicit denial of the read action is returned as `CredStoreError::AccessDenied`.
 
 ## License
 

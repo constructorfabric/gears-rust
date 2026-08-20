@@ -1,4 +1,8 @@
 // Updated: 2026-06-06 — adapted to the per-tenant value-store `CredStorePluginClientV1`.
+//! Thread-safe in-memory secret-value store.
+//!
+//! Configuration seeds private, tenant, shared, and global key classes; runtime
+//! writes mutate only private and tenant classes.
 use std::collections::HashMap;
 use std::sync::RwLock;
 

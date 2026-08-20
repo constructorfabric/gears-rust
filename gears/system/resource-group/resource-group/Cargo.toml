@@ -22,6 +22,13 @@ workspace = true
 default = ["odata"]
 odata = []
 
+# Gates the PostgreSQL smoke suite (tests/pg_smoke_test.rs), needs Docker:
+# it spins up a real Postgres via `testcontainers` to run the set-based
+# `INSERT ... SELECT` / derived-table `DELETE` / chunked-delete statements
+# against a backend SQLite can't tell apart from ordinary row-by-row SQL.
+# Disabled by default; enable with `--features integration`.
+integration = []
+
 [dependencies]
 # SDK - public API, models, and errors
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.6", path = "../resource-group-sdk", features = ["odata"] }
@@ -76,7 +83,18 @@ toolkit-macros = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-toolkit-db = { workspace = true, features = ["sqlite"] }
+# "test-support" enables `connect_db_with_metric_callback` and
+# `secure::in_transaction_for_testing`, which the DB-behaviour audit's
+# `QueryRecorder` needs. Test-only: the production dependency above pulls in
+# toolkit-db without it.
+# "pg" (on top of "sqlite") lets tests/pg_smoke_test.rs connect to a real
+# PostgreSQL via connect_db() when built with --features integration.
+toolkit-db = { workspace = true, features = ["sqlite", "pg", "test-support"] }
+# PostgreSQL smoke suite (tests/pg_smoke_test.rs) -- brings up a real
+# PostgreSQL via Docker. Both already workspace dependencies (root
+# Cargo.toml), used here as test-only dev-dependencies.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
 tower = { workspace = true }
 http-body-util = { workspace = true }
 # Enable the SDK `test-util` feature so integration-test fakes can build the

@@ -19,6 +19,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # `cargo publish` compiles every crate; CI does not want incremental churn
+  # (see [profile.dev] in Cargo.toml, which enables it for local dev).
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   # `release-plz release` publishes only versions present in the manifests and absent
   # from crates.io, so running it on every push is safe and makes an interrupted release

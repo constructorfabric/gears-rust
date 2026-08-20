@@ -465,7 +465,7 @@ dev: dev-fmt dev-clippy dev-test
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-cluster-pg test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-cluster-pg test-rg-pg test-fips
 
 # Run all tests
 test: install-tools
@@ -515,6 +515,12 @@ test-usage-collector-pg: install-tools
 ## Docker churn without masking one.
 test-cluster-pg: install-tools
 	cargo nextest run -p cf-postgres-cluster-plugin --features integration --retries 1
+
+## Run resource-group gear PostgreSQL smoke tests (Docker required; spins up
+## its own postgres container via testcontainers -- see
+## gears/system/resource-group/resource-group/tests/pg_smoke_test.rs)
+test-rg-pg: install-tools
+	cargo nextest run -p cf-gears-resource-group --features integration
 
 ## Run FIPS-mode integration tests (requires Go for aws-lc-fips-sys).
 ## Covers:
@@ -856,7 +862,7 @@ mini-chat-down:
 
 # -------- Main targets --------
 
-.PHONY: all check ci ci_test ci_docs build .cargo-build .split-debug quickstart example mini-chat mini-chat-docker mini-chat-helm mini-chat-helm-template mini-chat-up mini-chat-down mini-chat-port-forward
+.PHONY: all check ci ci_test ci_docs build build-debug .cargo-build .split-debug quickstart example mini-chat mini-chat-docker mini-chat-helm mini-chat-helm-template mini-chat-up mini-chat-down mini-chat-port-forward
 
 # Start server with quickstart config
 quickstart:
@@ -900,6 +906,13 @@ ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-u
 # Use 'make cargo-build' if you don't need stripped artifacts or lack
 # platform debug-splitting tools (objcopy, dsymutil).
 build: .cargo-build .split-debug
+
+# Build the cf-gears-example-server with full debuginfo (the 'debugging' profile)
+# Artifacts land in target/debugging/ and are not stripped, so no split-debug step
+# here. Costs a separate rebuild of the dependency graph; target/debug is untouched.
+build-debug:
+	cargo build --profile debugging --bin cf-gears-example-server $(E2E_ARGS)
+	@echo "binary: target/debugging/cf-gears-example-server"
 
 # Run all necessary quality checks and tests and then build the release binary
 all: build check test-sqlite e2e-local openapi

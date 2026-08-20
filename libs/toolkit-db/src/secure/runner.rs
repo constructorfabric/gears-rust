@@ -41,6 +41,19 @@ impl<'a> SeaOrmRunner<'a> {
             Self::Tx(t) => sea_orm::DatabaseExecutor::Transaction(t),
         }
     }
+
+    /// Which SQL dialect to render for.
+    ///
+    /// `DBRunner` is deliberately method-free, so callers that must build a
+    /// statement themselves (rather than letting `SeaORM` do it) have no other
+    /// way to learn the backend. Kept `pub(crate)` so no `SeaORM` type leaks.
+    pub(crate) fn backend(&self) -> sea_orm::DbBackend {
+        use sea_orm::ConnectionTrait;
+        match *self {
+            Self::Conn(c) => c.get_database_backend(),
+            Self::Tx(t) => t.get_database_backend(),
+        }
+    }
 }
 
 /// Internal-only bridge to `SeaORM`'s executor types.

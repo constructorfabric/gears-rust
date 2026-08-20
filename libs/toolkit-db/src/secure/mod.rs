@@ -104,6 +104,7 @@
 
 // Gear declarations
 mod cond;
+mod cte;
 mod db;
 mod db_ops;
 pub mod docs;
@@ -140,6 +141,8 @@ pub use runner::DBRunner;
 pub(crate) use runner::{DBRunnerInternal, SeaOrmRunner};
 
 // Primary database types (new secure API)
+#[cfg(feature = "test-support")]
+pub use db::in_transaction_for_testing;
 pub use db::{DEFAULT_TX_RETRY_ATTEMPTS, Db, DbConn, DbTx};
 
 // Transaction error types (no SeaORM types leaked)
@@ -154,11 +157,15 @@ pub use select::{
     SecureSelectTwoMany, Unscoped,
 };
 
+// CTE (`WITH`) operations -- see docs/arch/secure-orm/ADR/0001-secure-cte-policy.md
+pub use cte::{RecursiveCte, RecursiveDedup, SecureCteSelect};
+
 // Update/Delete/Insert operations
 pub use db_ops::{
     SecureDeleteExt, SecureDeleteMany, SecureInsertExt, SecureInsertMany, SecureInsertManyExt,
-    SecureInsertOne, SecureOnConflict, SecureUpdateExt, SecureUpdateMany, secure_insert,
-    secure_update_with_scope, validate_tenant_in_scope,
+    SecureInsertOne, SecureOnConflict, SecureUpdateExt, SecureUpdateMany, max_bind_params_for,
+    secure_insert, secure_insert_from_select, secure_insert_many, secure_update_with_scope,
+    validate_tenant_in_scope,
 };
 
 // Provider pattern for advanced tenant filtering

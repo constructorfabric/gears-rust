@@ -1,3 +1,8 @@
+//! Consumer contract for tenant-scoped credential operations.
+//!
+//! Defines anti-enumerating reads and explicit optimistic-concurrency semantics
+//! for create, update, and delete operations.
+
 use async_trait::async_trait;
 use toolkit_security::SecurityContext;
 
