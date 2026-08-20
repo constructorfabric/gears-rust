@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use github_mirror_sdk::{Commit, Issue, PullRequest, Repository};
+use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository};
 use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, Order};
 use toolkit_db::secure::{
     DBRunner, ScopeError, SecureEntityExt, SecureInsertExt, SecureOnConflict,
@@ -9,10 +9,11 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
-    CommitRecord, CommitRepository, IssueRecord, IssueRepository, PullRequestRecord,
-    PullRequestRepository, RepoRepository, RepositoryRecord,
+    CommentRecord, CommentRepository, CommitRecord, CommitRepository, IssueRecord, IssueRepository,
+    PullRequestRecord, PullRequestRepository, RepoRepository, RepositoryRecord,
 };
 
+use super::entity::comments::{self, Entity as CommentEntity};
 use super::entity::commits::{self, Entity as CommitEntity};
 use super::entity::issues::{self, Entity as IssueEntity};
 use super::entity::pull_requests::{self, Entity as PullRequestEntity};
@@ -453,6 +454,106 @@ impl CommitRepository for SeaOrmCommitRepository {
             .scope_with(scope)
             .filter(sea_orm::Condition::all().add(commits::Column::RepoId.eq(repo_id)))
             .order_by(commits::Column::CommittedAt, Order::Desc)
+            .limit(limit)
+            .all(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+
+pub struct SeaOrmCommentRepository;
+
+impl SeaOrmCommentRepository {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SeaOrmCommentRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn comment_active_model(tenant_id: Uuid, r: &CommentRecord) -> comments::ActiveModel {
+    comments::ActiveModel {
+        tenant_id: ActiveValue::Set(tenant_id),
+        id: ActiveValue::Set(r.id),
+        repo_id: ActiveValue::Set(r.repo_id),
+        issue_number: ActiveValue::Set(r.issue_number),
+        author_login: ActiveValue::Set(r.author_login.clone()),
+        body: ActiveValue::Set(r.body.clone()),
+        created_at: ActiveValue::Set(r.created_at.clone()),
+        updated_at: ActiveValue::Set(r.updated_at.clone()),
+        html_url: ActiveValue::Set(r.html_url.clone()),
+    }
+}
+
+#[async_trait]
+impl CommentRepository for SeaOrmCommentRepository {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: CommentRecord,
+    ) -> Result<Comment, DomainError> {
+        let on_conflict = SecureOnConflict::<CommentEntity>::columns([
+            comments::Column::TenantId,
+            comments::Column::Id,
+        ])
+        .update_columns([
+            comments::Column::RepoId,
+            comments::Column::IssueNumber,
+            comments::Column::AuthorLogin,
+            comments::Column::Body,
+            comments::Column::CreatedAt,
+            comments::Column::UpdatedAt,
+            comments::Column::HtmlUrl,
+        ])
+        .map_err(map_scope_error)?;
+
+        CommentEntity::insert(comment_active_model(tenant_id, &record))
+            .secure()
+            .scope_with_model(scope, &comment_active_model(tenant_id, &record))
+            .map_err(map_scope_error)?
+            .on_conflict(on_conflict)
+            .exec(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(Comment {
+            id: record.id,
+            repo_id: record.repo_id,
+            issue_number: record.issue_number,
+            author_login: record.author_login,
+            body: record.body,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            html_url: record.html_url,
+        })
+    }
+
+    async fn list_by_issue<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        issue_number: i64,
+        limit: u64,
+    ) -> Result<Vec<Comment>, DomainError> {
+        let rows = CommentEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                sea_orm::Condition::all()
+                    .add(comments::Column::RepoId.eq(repo_id))
+                    .add(comments::Column::IssueNumber.eq(issue_number)),
+            )
+            .order_by(comments::Column::CreatedAt, Order::Asc)
             .limit(limit)
             .all(conn)
             .await

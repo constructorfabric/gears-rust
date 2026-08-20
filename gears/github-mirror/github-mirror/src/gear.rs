@@ -16,8 +16,8 @@ use crate::domain::ports::github::GithubPort;
 use crate::domain::service::{Service, ServiceConfig};
 use crate::infra::github::client::GithubClient;
 use crate::infra::storage::sea_orm_repo::{
-    SeaOrmCommitRepository, SeaOrmIssueRepository, SeaOrmPullRequestRepository,
-    SeaOrmRepoRepository,
+    SeaOrmCommentRepository, SeaOrmCommitRepository, SeaOrmIssueRepository,
+    SeaOrmPullRequestRepository, SeaOrmRepoRepository,
 };
 
 type ConcreteService = Service<
@@ -25,6 +25,7 @@ type ConcreteService = Service<
     SeaOrmIssueRepository,
     SeaOrmPullRequestRepository,
     SeaOrmCommitRepository,
+    SeaOrmCommentRepository,
 >;
 
 #[toolkit::gear(
@@ -62,6 +63,7 @@ impl Gear for GithubMirrorGear {
         let issues = Arc::new(SeaOrmIssueRepository::new());
         let pull_requests = Arc::new(SeaOrmPullRequestRepository::new());
         let commits = Arc::new(SeaOrmCommitRepository::new());
+        let comments = Arc::new(SeaOrmCommentRepository::new());
         let github: Arc<dyn GithubPort> = Arc::new(GithubClient::new(
             cfg.api_base_url.clone(),
             cfg.github_token.clone(),
@@ -79,6 +81,7 @@ impl Gear for GithubMirrorGear {
             issues,
             pull_requests,
             commits,
+            comments,
             github,
             policy_enforcer,
             ServiceConfig {
@@ -131,6 +134,6 @@ mod tests {
     fn gear_provides_all_migrations() {
         use toolkit::contracts::DatabaseCapability;
         let gear = GithubMirrorGear::default();
-        assert_eq!(gear.migrations().len(), 4);
+        assert_eq!(gear.migrations().len(), 5);
     }
 }

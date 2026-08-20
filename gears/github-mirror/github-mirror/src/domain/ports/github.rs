@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
-use crate::domain::repo::{CommitRecord, IssueRecord, PullRequestRecord, RepositoryRecord};
+use crate::domain::repo::{
+    CommentRecord, CommitRecord, IssueRecord, PullRequestRecord, RepositoryRecord,
+};
 
 /// What one sync-lite pass fetched from GitHub for a repository.
 #[domain_model]
@@ -12,6 +14,7 @@ pub struct FetchedRepository {
     pub issues: Vec<IssueRecord>,
     pub pull_requests: Vec<PullRequestRecord>,
     pub commits: Vec<CommitRecord>,
+    pub comments: Vec<CommentRecord>,
 }
 
 /// Outbound port to GitHub's REST API (implemented in `infra/github`).

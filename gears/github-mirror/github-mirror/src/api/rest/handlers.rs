@@ -10,7 +10,8 @@ use axum::extract::Path;
 use crate::api::rest::routes::ConcreteService;
 
 use super::dto::{
-    CommitDto, GithubMirrorHealthDto, IssueDto, PullRequestDto, RepositoryDto, SyncSummaryDto,
+    CommentDto, CommitDto, GithubMirrorHealthDto, IssueDto, PullRequestDto, RepositoryDto,
+    SyncSummaryDto,
 };
 
 pub async fn health(
@@ -66,4 +67,16 @@ pub async fn sync_repository(
 ) -> ApiResult<JsonBody<SyncSummaryDto>> {
     let summary = svc.sync_repository(&ctx, &owner, &name).await?;
     Ok(Json(summary.into()))
+}
+
+pub async fn list_comments(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    OData(query): OData,
+) -> ApiResult<JsonPage<CommentDto>> {
+    let page: Page<_> = svc
+        .list_comments(&ctx, &owner, &name, number, &query)
+        .await?;
+    Ok(Json(page.map_items(CommentDto::from)))
 }

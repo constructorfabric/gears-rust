@@ -9,7 +9,7 @@ use toolkit_security::SecurityContext;
 
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
-    CommitRepository, IssueRepository, PullRequestRepository, RepoRepository,
+    CommentRepository, CommitRepository, IssueRepository, PullRequestRepository, RepoRepository,
 };
 use crate::domain::service::Service;
 
@@ -53,8 +53,9 @@ pub struct LocalClient<
     I: IssueRepository + 'static,
     P: PullRequestRepository + 'static,
     C: CommitRepository + 'static,
+    M: CommentRepository + 'static,
 > {
-    service: Arc<Service<R, I, P, C>>,
+    service: Arc<Service<R, I, P, C, M>>,
 }
 
 impl<
@@ -62,10 +63,11 @@ impl<
     I: IssueRepository + 'static,
     P: PullRequestRepository + 'static,
     C: CommitRepository + 'static,
-> LocalClient<R, I, P, C>
+    M: CommentRepository + 'static,
+> LocalClient<R, I, P, C, M>
 {
     #[must_use]
-    pub fn new(service: Arc<Service<R, I, P, C>>) -> Self {
+    pub fn new(service: Arc<Service<R, I, P, C, M>>) -> Self {
         Self { service }
     }
 }
@@ -76,7 +78,8 @@ impl<
     I: IssueRepository + 'static,
     P: PullRequestRepository + 'static,
     C: CommitRepository + 'static,
-> GithubMirrorClientV1 for LocalClient<R, I, P, C>
+    M: CommentRepository + 'static,
+> GithubMirrorClientV1 for LocalClient<R, I, P, C, M>
 {
     async fn status(&self, _ctx: &SecurityContext) -> Result<MirrorStatus, CanonicalError> {
         let status = self.service.status();

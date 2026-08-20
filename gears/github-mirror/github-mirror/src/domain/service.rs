@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
-use github_mirror_sdk::{Commit, Issue, PullRequest, Repository};
+use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository};
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page, PageInfo};
 use toolkit_security::{SecurityContext, pep_properties};
@@ -10,8 +10,8 @@ use toolkit_security::{SecurityContext, pep_properties};
 use super::error::DomainError;
 use super::ports::github::GithubPort;
 use super::repo::{
-    CommitRecord, CommitRepository, IssueRecord, IssueRepository, PullRequestRecord,
-    PullRequestRepository, RepoRepository, RepositoryRecord,
+    CommentRecord, CommentRepository, CommitRecord, CommitRepository, IssueRecord, IssueRepository,
+    PullRequestRecord, PullRequestRepository, RepoRepository, RepositoryRecord,
 };
 
 pub const GEAR_NAME: &str = "github-mirror";
@@ -37,6 +37,11 @@ pub(crate) const PULL_REQUEST_RESOURCE: ResourceType = ResourceType::from_static
 
 pub(crate) const COMMIT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.commit",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
+
+pub(crate) const COMMENT_RESOURCE: ResourceType = ResourceType::from_static(
+    "github_mirror.comment",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
@@ -71,6 +76,7 @@ pub struct SyncSummary {
     pub issues_synced: u64,
     pub pull_requests_synced: u64,
     pub commits_synced: u64,
+    pub comments_synced: u64,
 }
 
 #[domain_model]
@@ -79,19 +85,26 @@ pub struct Service<
     I: IssueRepository,
     P: PullRequestRepository,
     C: CommitRepository,
+    M: CommentRepository,
 > {
     db: Arc<DbProvider>,
     repo: Arc<R>,
     issues: Arc<I>,
     pull_requests: Arc<P>,
     commits: Arc<C>,
+    comments: Arc<M>,
     github: Arc<dyn GithubPort>,
     policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
 }
 
-impl<R: RepoRepository, I: IssueRepository, P: PullRequestRepository, C: CommitRepository>
-    Service<R, I, P, C>
+impl<
+    R: RepoRepository,
+    I: IssueRepository,
+    P: PullRequestRepository,
+    C: CommitRepository,
+    M: CommentRepository,
+> Service<R, I, P, C, M>
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -100,6 +113,7 @@ impl<R: RepoRepository, I: IssueRepository, P: PullRequestRepository, C: CommitR
         issues: Arc<I>,
         pull_requests: Arc<P>,
         commits: Arc<C>,
+        comments: Arc<M>,
         github: Arc<dyn GithubPort>,
         policy_enforcer: PolicyEnforcer,
         config: ServiceConfig,
@@ -110,6 +124,7 @@ impl<R: RepoRepository, I: IssueRepository, P: PullRequestRepository, C: CommitR
             issues,
             pull_requests,
             commits,
+            comments,
             github,
             policy_enforcer,
             config,
@@ -461,6 +476,96 @@ impl<R: RepoRepository, I: IssueRepository, P: PullRequestRepository, C: CommitR
         self.commits.upsert(&conn, &scope, tenant_id, record).await
     }
 
+    /// List mirrored comments of one issue/PR (`owner/name` + number),
+    /// tenant-scoped, oldest first.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored for this
+    /// tenant; `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn list_comments(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        issue_number: i64,
+        query: &ODataQuery,
+    ) -> Result<Page<Comment>, DomainError> {
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &COMMENT_RESOURCE,
+                actions::LIST,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+        let items = self
+            .comments
+            .list_by_issue(&conn, &scope, repository.id, issue_number, limit)
+            .await?;
+
+        Ok(Page::new(
+            items,
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit,
+            },
+        ))
+    }
+
+    /// Insert or update a mirrored comment row for the caller's tenant.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored;
+    /// `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn upsert_comment(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        record: CommentRecord,
+    ) -> Result<Comment, DomainError> {
+        let tenant_id = ctx.subject_tenant_id();
+
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &COMMENT_RESOURCE,
+                actions::UPSERT,
+                None,
+                &AccessRequest::new().resource_property(pep_properties::OWNER_TENANT_ID, tenant_id),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let record = CommentRecord {
+            repo_id: repository.id,
+            ..record
+        };
+        self.comments.upsert(&conn, &scope, tenant_id, record).await
+    }
+
     /// Fetch one repository from GitHub (first slice: repo + first page of
     /// issues, pull requests, and commits) and upsert it into the mirror.
     ///
@@ -521,11 +626,20 @@ impl<R: RepoRepository, I: IssueRepository, P: PullRequestRepository, C: CommitR
             commits_synced += 1;
         }
 
+        let mut comments_synced: u64 = 0;
+        for record in fetched.comments {
+            self.comments
+                .upsert(&conn, &scope, tenant_id, record)
+                .await?;
+            comments_synced += 1;
+        }
+
         Ok(SyncSummary {
             repository: repository.full_name,
             issues_synced,
             pull_requests_synced,
             commits_synced,
+            comments_synced,
         })
     }
 }

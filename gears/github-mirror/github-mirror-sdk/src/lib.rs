@@ -21,4 +21,4 @@ pub mod api;
 pub mod models;
 
 pub use api::GithubMirrorClientV1;
-pub use models::{Commit, Issue, MirrorStatus, PullRequest, Repository, SyncSummary};
+pub use models::{Comment, Commit, Issue, MirrorStatus, PullRequest, Repository, SyncSummary};

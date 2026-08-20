@@ -3,7 +3,9 @@ use serde::Deserialize;
 
 use crate::domain::error::DomainError;
 use crate::domain::ports::github::{FetchedRepository, GithubPort};
-use crate::domain::repo::{CommitRecord, IssueRecord, PullRequestRecord, RepositoryRecord};
+use crate::domain::repo::{
+    CommentRecord, CommitRecord, IssueRecord, PullRequestRecord, RepositoryRecord,
+};
 
 const FIRST_PAGE_SIZE: u32 = 50;
 const USER_AGENT: &str = concat!("cf-gears-github-mirror/", env!("CARGO_PKG_VERSION"));
@@ -140,6 +142,18 @@ struct GhActor {
 }
 
 #[derive(Debug, Deserialize)]
+struct GhComment {
+    id: i64,
+    #[serde(default)]
+    user: Option<GhActor>,
+    body: Option<String>,
+    created_at: String,
+    updated_at: String,
+    html_url: Option<String>,
+    issue_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GhCommit {
     sha: String,
     commit: GhCommitDetails,
@@ -199,6 +213,27 @@ fn pull_request_record(repo_id: i64, p: GhPullRequest) -> PullRequestRecord {
     }
 }
 
+fn issue_number_from_url(issue_url: Option<&str>) -> i64 {
+    issue_url
+        .and_then(|u| u.rsplit('/').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+fn comment_record(repo_id: i64, c: GhComment) -> CommentRecord {
+    let issue_number = issue_number_from_url(c.issue_url.as_deref());
+    CommentRecord {
+        id: c.id,
+        repo_id,
+        issue_number,
+        author_login: c.user.map(|u| u.login),
+        body: c.body,
+        created_at: c.created_at,
+        updated_at: c.updated_at,
+        html_url: c.html_url,
+    }
+}
+
 fn commit_record(repo_id: i64, c: GhCommit) -> CommitRecord {
     CommitRecord {
         repo_id,
@@ -238,6 +273,11 @@ impl GithubPort for GithubClient {
                 "/repos/{owner}/{name}/commits?per_page={FIRST_PAGE_SIZE}"
             ))
             .await?;
+        let comments: Vec<GhComment> = self
+            .get_json(&format!(
+                "/repos/{owner}/{name}/issues/comments?per_page={FIRST_PAGE_SIZE}"
+            ))
+            .await?;
 
         Ok(FetchedRepository {
             repository: repository_record(repo),
@@ -252,6 +292,10 @@ impl GithubPort for GithubClient {
             commits: commits
                 .into_iter()
                 .map(|c| commit_record(repo_id, c))
+                .collect(),
+            comments: comments
+                .into_iter()
+                .map(|c| comment_record(repo_id, c))
                 .collect(),
         })
     }

@@ -105,3 +105,20 @@ pub struct SyncSummary {
     pub pull_requests_synced: u64,
     pub commits_synced: u64,
 }
+
+/// A mirrored GitHub issue/PR comment (read-slice shape).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Comment {
+    /// GitHub's numeric comment id.
+    pub id: i64,
+    /// Owning repository's GitHub id.
+    pub repo_id: i64,
+    /// Owning issue/PR number.
+    pub issue_number: i64,
+    pub author_login: Option<String>,
+    pub body: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: Option<String>,
+}

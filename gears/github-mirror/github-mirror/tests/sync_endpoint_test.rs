@@ -9,7 +9,9 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use github_mirror::api::rest::routes::{ConcreteService, register_routes};
 use github_mirror::domain::ports::github::FetchedRepository;
-use github_mirror::domain::repo::{CommitRecord, IssueRecord, PullRequestRecord, RepositoryRecord};
+use github_mirror::domain::repo::{
+    CommentRecord, CommitRecord, IssueRecord, PullRequestRecord, RepositoryRecord,
+};
 use toolkit::api::OpenApiRegistryImpl;
 use toolkit_security::SecurityContext;
 use tower::ServiceExt;
@@ -84,6 +86,16 @@ fn fetched() -> FetchedRepository {
                 deletions: 0,
             },
         ],
+        comments: vec![CommentRecord {
+            id: 9,
+            repo_id: 42,
+            issue_number: 11,
+            author_login: Some("carol".to_owned()),
+            body: Some("looks good".to_owned()),
+            created_at: "2026-08-20T00:00:00Z".to_owned(),
+            updated_at: "2026-08-20T00:00:00Z".to_owned(),
+            html_url: None,
+        }],
     }
 }
 
@@ -135,6 +147,7 @@ async fn sync_fills_all_four_tables_and_reads_serve_them() {
     assert_eq!(summary["issues_synced"], 1);
     assert_eq!(summary["pull_requests_synced"], 1);
     assert_eq!(summary["commits_synced"], 2);
+    assert_eq!(summary["comments_synced"], 1);
 
     let repos = body_json(get(router.clone(), "/github-mirror/v1/repos").await).await;
     assert_eq!(repos["items"][0]["full_name"], "rust-lang/rust");
@@ -159,10 +172,28 @@ async fn sync_fills_all_four_tables_and_reads_serve_them() {
     .await;
     assert_eq!(pulls["items"].as_array().expect("items").len(), 1);
 
-    let commits =
-        body_json(get(router, "/github-mirror/v1/repos/rust-lang/rust/commits").await).await;
+    let commits = body_json(
+        get(
+            router.clone(),
+            "/github-mirror/v1/repos/rust-lang/rust/commits",
+        )
+        .await,
+    )
+    .await;
+    let router2 = router;
     assert_eq!(commits["items"].as_array().expect("items").len(), 2);
     assert_eq!(commits["items"][0]["sha"], "c2");
+
+    let comments = body_json(
+        get(
+            router2,
+            "/github-mirror/v1/repos/rust-lang/rust/issues/11/comments",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(comments["items"].as_array().expect("items").len(), 1);
+    assert_eq!(comments["items"][0]["author_login"], "carol");
 }
 
 #[tokio::test]
