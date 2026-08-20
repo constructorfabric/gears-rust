@@ -134,10 +134,16 @@ impl AuthZResolverClient for GroupScopeMock {
             decision: true,
             context: EvaluationResponseContext {
                 constraints: vec![Constraint {
-                    predicates: vec![Predicate::InGroup(InGroupPredicate::new(
-                        pep_properties::RESOURCE_ID,
-                        [uuid(RESOURCE)],
-                    ))],
+                    predicates: vec![
+                        Predicate::In(InPredicate::new(
+                            pep_properties::OWNER_TENANT_ID,
+                            [uuid(TENANT)],
+                        )),
+                        Predicate::InGroup(InGroupPredicate::new(
+                            pep_properties::RESOURCE_ID,
+                            [uuid(RESOURCE)],
+                        )),
+                    ],
                 }],
                 ..Default::default()
             },
@@ -247,15 +253,31 @@ fn build_request_with_overrides_tenant() {
 #[tokio::test]
 async fn access_scope_carries_resource_group_membership_type_into_filter() {
     let scope = enforcer(GroupScopeMock)
+        .with_capabilities(vec![Capability::GroupMembership])
         .access_scope(&test_ctx(), &GROUP_TYPED_TEST_RESOURCE, "list", None)
         .await
-        .expect("typed resource must compile the native group predicate");
+        .expect("typed resource must compile the negotiated native group predicate");
 
-    let filter = &scope.constraints()[0].filters()[0];
+    let filter = &scope.constraints()[0].filters()[1];
     let toolkit_security::ScopeFilter::InGroup(filter) = filter else {
         panic!("expected InGroup filter, got {filter:?}");
     };
     assert_eq!(filter.membership_resource_type(), GROUP_MEMBERSHIP_TYPE);
+}
+
+#[tokio::test]
+async fn access_scope_rejects_unadvertised_native_group_predicate() {
+    let error = enforcer(GroupScopeMock)
+        .access_scope(&test_ctx(), &GROUP_TYPED_TEST_RESOURCE, "list", None)
+        .await
+        .expect_err("a native group predicate must have been advertised");
+
+    let EnforcerError::CompileFailed(ConstraintCompileError::AllConstraintsFailed { reason }) =
+        error
+    else {
+        panic!("expected fail-closed compilation error, got: {error:?}");
+    };
+    assert!(reason.contains("unadvertised capabilities: group_membership"));
 }
 
 #[tokio::test]

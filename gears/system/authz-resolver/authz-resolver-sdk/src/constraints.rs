@@ -98,7 +98,9 @@ impl InPredicate {
 /// to text to match RG's opaque `resource_id` storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InGroupPredicate {
-    /// Resource property to filter (e.g., `pep_properties::RESOURCE_ID`).
+    /// Resource property to filter. Native compilation currently requires
+    /// `pep_properties::RESOURCE_ID`; other properties need a future
+    /// per-property RG member-type mapping.
     pub property: String,
     /// Group UUIDs - the resource must be a member of at least one.
     pub group_ids: Vec<Value>,
@@ -130,7 +132,9 @@ impl InGroupPredicate {
 /// `resource_group_closure`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InGroupSubtreePredicate {
-    /// Resource property to filter (e.g., `pep_properties::RESOURCE_ID`).
+    /// Resource property to filter. Native compilation currently requires
+    /// `pep_properties::RESOURCE_ID`; other properties need a future
+    /// per-property RG member-type mapping.
     pub property: String,
     /// Ancestor group UUIDs - the resource must be a member of any descendant.
     pub ancestor_ids: Vec<Value>,

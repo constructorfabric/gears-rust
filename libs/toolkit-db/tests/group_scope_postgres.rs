@@ -91,7 +91,7 @@ impl mig::MigrationTrait for CreateGroupScopeSchema {
                             .uuid()
                             .not_null(),
                     )
-                    .col(mig::ColumnDef::new(ResourceTable::Name).string().not_null())
+                    .col(mig::ColumnDef::new(ResourceTable::Name).text().not_null())
                     .to_owned(),
             )
             .await?;
@@ -107,7 +107,7 @@ impl mig::MigrationTrait for CreateGroupScopeSchema {
                     )
                     .col(
                         mig::ColumnDef::new(GtsTypeTable::SchemaId)
-                            .string()
+                            .text()
                             .not_null()
                             .unique_key(),
                     )
@@ -130,7 +130,7 @@ impl mig::MigrationTrait for CreateGroupScopeSchema {
                     )
                     .col(
                         mig::ColumnDef::new(MembershipTable::ResourceId)
-                            .string()
+                            .text()
                             .not_null(),
                     )
                     .primary_key(
@@ -382,28 +382,44 @@ async fn in_group_casts_uuid_to_text_and_excludes_other_member_types() -> Result
     let (_container, db) = setup().await?;
     let conn = db.conn()?;
     let tenant_id = Uuid::new_v4();
+    let foreign_tenant_id = Uuid::new_v4();
     let group_id = Uuid::new_v4();
     let matching_id = Uuid::new_v4();
     let wrong_type_id = Uuid::new_v4();
+    let foreign_tenant_resource_id = Uuid::new_v4();
 
     seed_type(&conn, 1, RESOURCE_MEMBER_TYPE).await?;
     seed_type(&conn, 2, OTHER_MEMBER_TYPE).await?;
     seed_resource(&conn, matching_id, tenant_id, "matching").await?;
     seed_resource(&conn, wrong_type_id, tenant_id, "wrong-type").await?;
+    seed_resource(
+        &conn,
+        foreign_tenant_resource_id,
+        foreign_tenant_id,
+        "foreign-tenant",
+    )
+    .await?;
     seed_membership(&conn, group_id, 1, matching_id.to_string()).await?;
+    // Even a correctly typed membership cannot escape the mandatory tenant
+    // predicate carried in the same AND constraint.
+    seed_membership(&conn, group_id, 1, foreign_tenant_resource_id.to_string()).await?;
     // External IDs are unique only within an RG member-handle type, so the same
     // text may legitimately occur under another type.
     seed_membership(&conn, group_id, 2, matching_id.to_string()).await?;
     seed_membership(&conn, group_id, 2, wrong_type_id.to_string()).await?;
-    // This is a valid RG membership for an opaque-ID member type. Casting the
-    // membership side to UUID would make the whole PostgreSQL query throw.
-    seed_membership(&conn, group_id, 2, "opaque-resource-id").await?;
+    // RG does not validate ID syntax per member type. Even a selected type can
+    // contain an opaque ID, so casting the membership side to UUID would make
+    // the PostgreSQL query throw before it can return the UUID-backed entity.
+    seed_membership(&conn, group_id, 1, "opaque-resource-id").await?;
 
-    let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_group_typed(
-        pep_properties::RESOURCE_ID,
-        RESOURCE_MEMBER_TYPE,
-        vec![ScopeValue::Uuid(group_id)],
-    )]));
+    let scope = AccessScope::single(ScopeConstraint::new(vec![
+        ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+        ScopeFilter::in_group_typed(
+            pep_properties::RESOURCE_ID,
+            RESOURCE_MEMBER_TYPE,
+            vec![ScopeValue::Uuid(group_id)],
+        ),
+    ]));
     let rows = resource::Entity::find()
         .secure()
         .scope_with(&scope)
@@ -413,6 +429,24 @@ async fn in_group_casts_uuid_to_text_and_excludes_other_member_types() -> Result
     assert_eq!(rows.len(), 1, "only the correctly typed member must match");
     assert_eq!(rows[0].id, matching_id);
     assert_eq!(rows[0].name, "matching");
+
+    let unknown_type_scope = AccessScope::single(ScopeConstraint::new(vec![
+        ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+        ScopeFilter::in_group_typed(
+            pep_properties::RESOURCE_ID,
+            "gts.cf.core.rg.type.v1~example.core.rg.missing.v1~",
+            vec![ScopeValue::Uuid(group_id)],
+        ),
+    ]));
+    let unknown_type_rows = resource::Entity::find()
+        .secure()
+        .scope_with(&unknown_type_scope)
+        .all(&conn)
+        .await?;
+    assert!(
+        unknown_type_rows.is_empty(),
+        "an unknown external member type must match no membership rows"
+    );
     Ok(())
 }
 
@@ -425,12 +459,21 @@ async fn in_group_subtree_matches_descendants_but_not_unrelated_groups() -> Resu
     let descendant_id = Uuid::new_v4();
     let unrelated_id = Uuid::new_v4();
     let descendant_resource = Uuid::new_v4();
+    let wrong_type_resource = Uuid::new_v4();
     let unrelated_resource = Uuid::new_v4();
 
     seed_type(&conn, 1, RESOURCE_MEMBER_TYPE).await?;
+    seed_type(&conn, 2, OTHER_MEMBER_TYPE).await?;
     seed_resource(&conn, descendant_resource, tenant_id, "descendant").await?;
+    seed_resource(&conn, wrong_type_resource, tenant_id, "wrong-type").await?;
     seed_resource(&conn, unrelated_resource, tenant_id, "unrelated").await?;
     seed_membership(&conn, descendant_id, 1, descendant_resource.to_string()).await?;
+    // Duplicate external IDs across types are valid, while a row belonging
+    // only to the wrong type must never grant access.
+    seed_membership(&conn, descendant_id, 2, descendant_resource.to_string()).await?;
+    seed_membership(&conn, descendant_id, 2, wrong_type_resource.to_string()).await?;
+    // A selected-type opaque ID proves the query never casts membership IDs.
+    seed_membership(&conn, descendant_id, 1, "opaque-descendant-id").await?;
     seed_membership(&conn, unrelated_id, 1, unrelated_resource.to_string()).await?;
     secure_insert::<closure::Entity>(
         closure::ActiveModel {
@@ -443,6 +486,7 @@ async fn in_group_subtree_matches_descendants_but_not_unrelated_groups() -> Resu
     .await?;
 
     let scope = AccessScope::single(ScopeConstraint::new(vec![
+        ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
         ScopeFilter::in_group_subtree_typed(
             pep_properties::RESOURCE_ID,
             RESOURCE_MEMBER_TYPE,
