@@ -5,6 +5,7 @@ use crate::secure::{AccessScope, ScopableEntity};
 use toolkit_security::access_scope::{
     ScopeConstraint, ScopeFilter, ScopeValue, rg_tables, tenant_tables,
 };
+use toolkit_security::pep_properties;
 
 /// Convert a [`ScopeValue`] to a `sea_query::SimpleExpr` for SQL binding.
 fn scope_value_to_sea_expr(v: &ScopeValue) -> sea_orm::sea_query::SimpleExpr {
@@ -25,6 +26,23 @@ fn scope_values_to_sea_values(values: &[ScopeValue]) -> Vec<sea_orm::Value> {
             ScopeValue::String(s) => sea_orm::Value::from(s.clone()),
             ScopeValue::Int(n) => sea_orm::Value::from(*n),
             ScopeValue::Bool(b) => sea_orm::Value::from(*b),
+        })
+        .collect()
+}
+
+/// Convert values for RG hierarchy columns, which are UUID-backed on
+/// `PostgreSQL`. Valid UUID strings remain accepted for compatibility with
+/// directly constructed filters; every other scalar shape fails closed before
+/// SQL generation instead of producing a UUID/text operator error.
+fn uuid_scope_values_to_sea_values(values: &[ScopeValue]) -> Option<Vec<sea_orm::Value>> {
+    values
+        .iter()
+        .map(|value| match value {
+            ScopeValue::Uuid(uuid) => Some(sea_orm::Value::from(*uuid)),
+            ScopeValue::String(value) => {
+                uuid::Uuid::parse_str(value).ok().map(sea_orm::Value::from)
+            }
+            ScopeValue::Int(_) | ScopeValue::Bool(_) => None,
         })
         .collect()
 }
@@ -93,6 +111,30 @@ where
     if constraint.is_empty() {
         return Some(Condition::all());
     }
+
+    // Resource groups are tenant-scoped. A group predicate without a tenant
+    // filter in the same AND constraint would become an independent access
+    // path when constraints are OR-ed, allowing group membership to escape the
+    // mandatory tenant boundary. Enforce this at the SQL compiler as well as
+    // the AuthZ response compiler so direct `AccessScope` construction cannot
+    // bypass the invariant.
+    let has_group_filter = constraint.filters().iter().any(|filter| {
+        matches!(
+            filter,
+            ScopeFilter::InGroup(_) | ScopeFilter::InGroupSubtree(_)
+        )
+    });
+    let has_tenant_filter = constraint.filters().iter().any(|filter| {
+        filter.property() == pep_properties::OWNER_TENANT_ID
+            && matches!(
+                filter,
+                ScopeFilter::Eq(_) | ScopeFilter::In(_) | ScopeFilter::InTenantSubtree(_)
+            )
+    });
+    if has_group_filter && !has_tenant_filter {
+        return None;
+    }
+
     let mut and_cond = Condition::all();
     for filter in constraint.filters() {
         let col = E::resolve_property(filter.property())?;
@@ -129,7 +171,10 @@ where
                 // qualifier can exclude them.
                 let membership = Alias::new("membership");
                 let member_type = Alias::new("member_type");
-                let group_values = scope_values_to_sea_values(gf.group_ids());
+                let Some(group_values) = uuid_scope_values_to_sea_values(gf.group_ids()) else {
+                    and_cond = and_cond.add(Expr::value(false));
+                    continue;
+                };
                 let type_subquery = Query::select()
                     .column((member_type.clone(), Alias::new(rg_tables::GTS_TYPE_ID)))
                     .from_as(Alias::new(rg_tables::GTS_TYPE_TABLE), member_type.clone())
@@ -173,7 +218,11 @@ where
                 let closure = Alias::new("group_closure");
                 let membership = Alias::new("membership");
                 let member_type = Alias::new("member_type");
-                let ancestor_values = scope_values_to_sea_values(sf.ancestor_ids());
+                let Some(ancestor_values) = uuid_scope_values_to_sea_values(sf.ancestor_ids())
+                else {
+                    and_cond = and_cond.add(Expr::value(false));
+                    continue;
+                };
                 let closure_subquery = Query::select()
                     .column((
                         closure.clone(),
@@ -410,7 +459,9 @@ mod tests {
     #[test]
     fn test_in_group_filter_produces_typed_text_subquery_condition() {
         let group_id = uuid::Uuid::new_v4();
+        let tenant_id = uuid::Uuid::new_v4();
         let scope = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
             ScopeFilter::in_group_typed(
                 pep_properties::RESOURCE_ID,
                 MEMBERSHIP_TYPE,
@@ -448,6 +499,23 @@ mod tests {
     }
 
     #[test]
+    fn test_typed_group_filter_without_tenant_constraint_denies_all() {
+        let group_id = uuid::Uuid::new_v4();
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_group_typed(
+            pep_properties::RESOURCE_ID,
+            MEMBERSHIP_TYPE,
+            vec![ScopeValue::Uuid(group_id)],
+        )]));
+
+        let cond = build_scope_condition::<custom_prop_entity::Entity>(&scope);
+        let cond_str = format!("{cond:?}");
+        assert!(
+            cond_str.contains("Value(Bool(Some(false)))"),
+            "a group filter without tenant scope must fail closed, got: {cond_str}"
+        );
+    }
+
+    #[test]
     fn test_legacy_untyped_in_group_filter_denies_all() {
         let group_id = uuid::Uuid::new_v4();
         let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_group(
@@ -460,6 +528,52 @@ mod tests {
         assert!(
             cond_str.contains("Value(Bool(Some(false)))"),
             "an untyped group filter must fail closed, got: {cond_str}"
+        );
+    }
+
+    #[test]
+    fn test_malformed_direct_group_ids_deny_before_sql_generation() {
+        let tenant_id = uuid::Uuid::new_v4();
+        let group_scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group_typed(
+                pep_properties::RESOURCE_ID,
+                MEMBERSHIP_TYPE,
+                vec![ScopeValue::String("not-a-uuid".to_owned())],
+            ),
+        ]));
+        let subtree_scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group_subtree_typed(
+                pep_properties::RESOURCE_ID,
+                MEMBERSHIP_TYPE,
+                vec![ScopeValue::Int(7)],
+            ),
+        ]));
+
+        for scope in [&group_scope, &subtree_scope] {
+            let cond = build_scope_condition::<custom_prop_entity::Entity>(scope);
+            let cond_str = format!("{cond:?}");
+            assert!(
+                cond_str.contains("Value(Bool(Some(false)))"),
+                "malformed UUID hierarchy keys must fail closed, got: {cond_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_legacy_untyped_in_group_subtree_filter_denies_all() {
+        let ancestor_id = uuid::Uuid::new_v4();
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_group_subtree(
+            pep_properties::RESOURCE_ID,
+            vec![ScopeValue::Uuid(ancestor_id)],
+        )]));
+
+        let cond = build_scope_condition::<custom_prop_entity::Entity>(&scope);
+        let cond_str = format!("{cond:?}");
+        assert!(
+            cond_str.contains("Value(Bool(Some(false)))"),
+            "an untyped group subtree filter must fail closed, got: {cond_str}"
         );
     }
 
@@ -619,7 +733,9 @@ mod tests {
     #[test]
     fn test_in_group_subtree_filter_produces_subquery_condition() {
         let ancestor_id = uuid::Uuid::new_v4();
+        let tenant_id = uuid::Uuid::new_v4();
         let scope = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
             ScopeFilter::in_group_subtree_typed(
                 pep_properties::RESOURCE_ID,
                 MEMBERSHIP_TYPE,

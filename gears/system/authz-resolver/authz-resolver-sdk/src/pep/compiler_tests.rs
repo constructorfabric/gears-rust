@@ -338,10 +338,16 @@ fn in_group_predicate_compiles_to_type_qualified_in_group_filter() {
         decision: true,
         context: EvaluationResponseContext {
             constraints: vec![Constraint {
-                predicates: vec![Predicate::InGroup(InGroupPredicate {
-                    property: pep_properties::RESOURCE_ID.to_owned(),
-                    group_ids: vec![jid(g1)],
-                })],
+                predicates: vec![
+                    Predicate::In(InPredicate {
+                        property: pep_properties::OWNER_TENANT_ID.to_owned(),
+                        values: vec![jid(T1)],
+                    }),
+                    Predicate::InGroup(InGroupPredicate {
+                        property: pep_properties::RESOURCE_ID.to_owned(),
+                        group_ids: vec![jid(g1)],
+                    }),
+                ],
             }],
             ..Default::default()
         },
@@ -349,7 +355,7 @@ fn in_group_predicate_compiles_to_type_qualified_in_group_filter() {
 
     let scope = compile_group_scope(&response).unwrap();
     assert_eq!(scope.constraints().len(), 1);
-    let filter = &scope.constraints()[0].filters()[0];
+    let filter = &scope.constraints()[0].filters()[1];
     assert_eq!(filter.property(), pep_properties::RESOURCE_ID);
     let ScopeFilter::InGroup(filter) = filter else {
         panic!("expected InGroup filter, got: {filter:?}");
@@ -366,10 +372,16 @@ fn in_group_subtree_predicate_compiles_to_type_qualified_subtree_filter() {
         decision: true,
         context: EvaluationResponseContext {
             constraints: vec![Constraint {
-                predicates: vec![Predicate::InGroupSubtree(InGroupSubtreePredicate {
-                    property: pep_properties::RESOURCE_ID.to_owned(),
-                    ancestor_ids: vec![jid(ancestor)],
-                })],
+                predicates: vec![
+                    Predicate::In(InPredicate {
+                        property: pep_properties::OWNER_TENANT_ID.to_owned(),
+                        values: vec![jid(T1)],
+                    }),
+                    Predicate::InGroupSubtree(InGroupSubtreePredicate {
+                        property: pep_properties::RESOURCE_ID.to_owned(),
+                        ancestor_ids: vec![jid(ancestor)],
+                    }),
+                ],
             }],
             ..Default::default()
         },
@@ -377,7 +389,7 @@ fn in_group_subtree_predicate_compiles_to_type_qualified_subtree_filter() {
 
     let scope = compile_group_scope(&response).unwrap();
     assert_eq!(scope.constraints().len(), 1);
-    let filter = &scope.constraints()[0].filters()[0];
+    let filter = &scope.constraints()[0].filters()[1];
     let ScopeFilter::InGroupSubtree(filter) = filter else {
         panic!("expected InGroupSubtree filter, got: {filter:?}");
     };
@@ -386,6 +398,36 @@ fn in_group_subtree_predicate_compiles_to_type_qualified_subtree_filter() {
 
 #[test]
 fn native_group_predicate_without_membership_type_fails_closed() {
+    use crate::constraints::InGroupPredicate;
+
+    let response = EvaluationResponse {
+        decision: true,
+        context: EvaluationResponseContext {
+            constraints: vec![Constraint {
+                predicates: vec![
+                    Predicate::In(InPredicate {
+                        property: pep_properties::OWNER_TENANT_ID.to_owned(),
+                        values: vec![jid(T1)],
+                    }),
+                    Predicate::InGroup(InGroupPredicate::new(
+                        pep_properties::RESOURCE_ID,
+                        [uuid(R1)],
+                    )),
+                ],
+            }],
+            ..Default::default()
+        },
+    };
+
+    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+    let Err(ConstraintCompileError::AllConstraintsFailed { reason }) = result else {
+        panic!("untyped native group predicate must fail closed: {result:?}");
+    };
+    assert!(reason.contains("requires a configured RG membership resource type"));
+}
+
+#[test]
+fn group_predicate_without_tenant_in_same_constraint_fails_closed() {
     use crate::constraints::InGroupPredicate;
 
     let response = EvaluationResponse {
@@ -401,11 +443,210 @@ fn native_group_predicate_without_membership_type_fails_closed() {
         },
     };
 
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+    let result = compile_group_scope(&response);
     let Err(ConstraintCompileError::AllConstraintsFailed { reason }) = result else {
-        panic!("untyped native group predicate must fail closed: {result:?}");
+        panic!("group-only constraint must fail closed: {result:?}");
     };
-    assert!(reason.contains("requires a configured RG membership resource type"));
+    assert!(reason.contains("owner_tenant_id predicate in the same constraint"));
+}
+
+#[test]
+fn malformed_group_uuid_fails_before_sql_generation() {
+    use crate::constraints::InGroupPredicate;
+
+    let response = EvaluationResponse {
+        decision: true,
+        context: EvaluationResponseContext {
+            constraints: vec![Constraint {
+                predicates: vec![
+                    Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [uuid(T1)],
+                    )),
+                    Predicate::InGroup(InGroupPredicate {
+                        property: pep_properties::RESOURCE_ID.to_owned(),
+                        group_ids: vec![json!("not-a-uuid")],
+                    }),
+                ],
+            }],
+            ..Default::default()
+        },
+    };
+
+    let result = compile_group_scope(&response);
+    let Err(ConstraintCompileError::AllConstraintsFailed { reason }) = result else {
+        panic!("malformed group UUID must fail closed: {result:?}");
+    };
+    assert!(reason.contains("group_ids must contain UUID strings"));
+}
+
+#[test]
+fn malformed_tenant_predicate_cannot_satisfy_group_tenant_guard() {
+    use crate::constraints::InGroupPredicate;
+
+    let response = EvaluationResponse {
+        decision: true,
+        context: EvaluationResponseContext {
+            constraints: vec![Constraint {
+                predicates: vec![
+                    Predicate::Eq(EqPredicate {
+                        property: pep_properties::OWNER_TENANT_ID.to_owned(),
+                        value: json!(false),
+                    }),
+                    Predicate::InGroup(InGroupPredicate::new(
+                        pep_properties::RESOURCE_ID,
+                        [uuid(R1)],
+                    )),
+                ],
+            }],
+            ..Default::default()
+        },
+    };
+
+    let result = compile_group_scope(&response);
+    let Err(ConstraintCompileError::AllConstraintsFailed { reason }) = result else {
+        panic!("malformed tenant scope must fail closed: {result:?}");
+    };
+    assert!(reason.contains("owner_tenant_id must contain UUID strings"));
+}
+
+#[test]
+fn group_predicate_on_non_resource_property_fails_closed() {
+    use crate::constraints::InGroupPredicate;
+
+    let response = EvaluationResponse {
+        decision: true,
+        context: EvaluationResponseContext {
+            constraints: vec![Constraint {
+                predicates: vec![
+                    Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [uuid(T1)],
+                    )),
+                    Predicate::InGroup(InGroupPredicate::new(pep_properties::OWNER_ID, [uuid(R1)])),
+                ],
+            }],
+            ..Default::default()
+        },
+    };
+    let supported = &[
+        pep_properties::OWNER_TENANT_ID,
+        pep_properties::RESOURCE_ID,
+        pep_properties::OWNER_ID,
+    ];
+
+    let result = compile_to_access_scope_with_group_membership_type(
+        &response,
+        true,
+        supported,
+        Some(GROUP_MEMBERSHIP_TYPE),
+    );
+    let Err(ConstraintCompileError::AllConstraintsFailed { reason }) = result else {
+        panic!("group predicate on owner_id must fail closed: {result:?}");
+    };
+    assert!(reason.contains("must target 'id'"));
+}
+
+#[test]
+fn unadvertised_native_group_predicate_fails_closed() {
+    use crate::constraints::InGroupPredicate;
+
+    let response = EvaluationResponse {
+        decision: true,
+        context: EvaluationResponseContext {
+            constraints: vec![Constraint {
+                predicates: vec![
+                    Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [uuid(T1)],
+                    )),
+                    Predicate::InGroup(InGroupPredicate::new(
+                        pep_properties::RESOURCE_ID,
+                        [uuid(R1)],
+                    )),
+                ],
+            }],
+            ..Default::default()
+        },
+    };
+
+    let result = compile_to_access_scope_with_negotiated_capabilities(
+        &response,
+        true,
+        DEFAULT_PROPS,
+        Some(GROUP_MEMBERSHIP_TYPE),
+        &[Capability::TenantHierarchy],
+    );
+    let Err(ConstraintCompileError::AllConstraintsFailed { reason }) = result else {
+        panic!("unadvertised group predicate must fail closed: {result:?}");
+    };
+    assert!(reason.contains("unadvertised capabilities: group_membership"));
+}
+
+#[test]
+fn unadvertised_tenant_subtree_predicate_fails_closed() {
+    use crate::constraints::InTenantSubtreePredicate;
+
+    let response = EvaluationResponse {
+        decision: true,
+        context: EvaluationResponseContext {
+            constraints: vec![Constraint {
+                predicates: vec![Predicate::InTenantSubtree(InTenantSubtreePredicate {
+                    property: pep_properties::OWNER_TENANT_ID.to_owned(),
+                    root_tenant_id: jid(T1),
+                    barrier_mode: BarrierMode::Respect,
+                    descendant_status: Vec::new(),
+                })],
+            }],
+            ..Default::default()
+        },
+    };
+
+    let result = compile_to_access_scope_with_negotiated_capabilities(
+        &response,
+        true,
+        DEFAULT_PROPS,
+        None,
+        &[],
+    );
+    let Err(ConstraintCompileError::AllConstraintsFailed { reason }) = result else {
+        panic!("unadvertised tenant subtree must fail closed: {result:?}");
+    };
+    assert!(reason.contains("unadvertised capabilities: tenant_hierarchy"));
+}
+
+#[test]
+fn tenant_and_group_in_separate_or_branches_drops_unsafe_group_branch() {
+    use crate::constraints::InGroupPredicate;
+
+    let response = EvaluationResponse {
+        decision: true,
+        context: EvaluationResponseContext {
+            constraints: vec![
+                Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [uuid(T1)],
+                    ))],
+                },
+                Constraint {
+                    predicates: vec![Predicate::InGroup(InGroupPredicate::new(
+                        pep_properties::RESOURCE_ID,
+                        [uuid(R1)],
+                    ))],
+                },
+            ],
+            ..Default::default()
+        },
+    };
+
+    let scope = compile_group_scope(&response).expect("safe tenant branch should remain");
+    assert_eq!(scope.constraints().len(), 1);
+    assert_eq!(scope.constraints()[0].filters().len(), 1);
+    assert_eq!(
+        scope.constraints()[0].filters()[0].property(),
+        pep_properties::OWNER_TENANT_ID
+    );
 }
 
 #[test]

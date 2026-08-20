@@ -72,9 +72,24 @@ must not be used as an implicit replacement: a gear may deliberately use a
 different GTS path for policy matching.
 
 A resource descriptor without the mapping does not advertise group capabilities,
-so the PDP returns degraded explicit `in` predicates. The native SQL casts the
-querying entity's ID to text, rather than casting RG's opaque `resource_id` to
-UUID, because non-UUID member identifiers are valid.
+so the PDP returns degraded explicit `in` predicates. The PEP also rejects a
+native group predicate that was not among the capabilities actually advertised
+for that request.
+
+Native group predicates currently target only `id`: one resource descriptor
+carries one RG member-handle type, so applying that mapping to another property
+could compare identifiers from unrelated resource types. Every group predicate
+must also have an `owner_tenant_id` predicate in the same AND constraint. Keeping
+the tenant predicate in a separate OR branch would let the group branch escape
+the platform's mandatory tenant boundary and is rejected fail-closed.
+
+The native SQL casts the querying entity's ID to text, rather than casting RG's
+opaque `resource_id` to UUID, because non-UUID member identifiers are valid.
+Casting the entity key can prevent PostgreSQL from using its ordinary native-type
+index for the group condition alone. Deployments that enable native predicates
+for large tables should confirm plans with `EXPLAIN` and consider an expression
+index on the exact `CAST(id AS text)` expression when profiling shows it is
+needed.
 
 - RG canonical table schemas: [RG DESIGN §Database Schemas](../../../gears/system/resource-group/docs/DESIGN.md#37-database-schemas--tables)
 - When to use which table: [AUTHZ_USAGE_SCENARIOS §Choosing Projection Tables](./AUTHZ_USAGE_SCENARIOS.md#choosing-projection-tables)

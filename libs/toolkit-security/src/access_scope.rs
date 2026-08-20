@@ -293,6 +293,9 @@ impl InGroupScopeFilter {
 
     /// Create a group membership scope filter qualified by the external GTS
     /// schema id stored for the member handle in RG's local type registry.
+    ///
+    /// The containing [`ScopeConstraint`] must also include an
+    /// `owner_tenant_id` filter; SQL compilation rejects group-only constraints.
     #[must_use]
     pub fn new_typed(
         property: impl Into<String>,
@@ -353,6 +356,9 @@ impl InGroupSubtreeScopeFilter {
 
     /// Create a group subtree scope filter qualified by the external GTS schema
     /// id stored for the member handle in RG's local type registry.
+    ///
+    /// The containing [`ScopeConstraint`] must also include an
+    /// `owner_tenant_id` filter; SQL compilation rejects group-only constraints.
     #[must_use]
     pub fn new_typed(
         property: impl Into<String>,

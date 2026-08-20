@@ -4,7 +4,7 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, Capability, PolicyEnforcer};
 use resource_group_sdk::{
     ResourceGroupClient, ResourceGroupReadHierarchy, ResourceGroupTypeBootstrap,
 };
@@ -74,7 +74,14 @@ impl Gear for ResourceGroup {
             .client_hub()
             .get::<dyn AuthZResolverApi>()
             .map_err(|e| anyhow::anyhow!("failed to get AuthZ resolver: {e}"))?;
-        let enforcer = PolicyEnforcer::new(authz);
+        // RG owns the canonical membership and closure tables, so it can
+        // execute both native group predicate shapes. Resource descriptors
+        // without a member-type mapping still suppress these capabilities per
+        // request in `PolicyEnforcer`.
+        let enforcer = PolicyEnforcer::new(authz).with_capabilities(vec![
+            Capability::GroupMembership,
+            Capability::GroupHierarchy,
+        ]);
 
         // Create repo instances
         let group_repo = Arc::new(GroupRepository);

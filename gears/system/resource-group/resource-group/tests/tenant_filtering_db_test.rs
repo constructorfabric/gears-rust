@@ -520,7 +520,8 @@ async fn group_based_in_group_predicate_produces_combined_scope() {
     let authz: Arc<dyn AuthZResolverApi> = Arc::new(GroupScopingAuthZ {
         allowed_group_ids: vec![group_a, group_b],
     });
-    let enforcer = PolicyEnforcer::new(authz);
+    let enforcer = PolicyEnforcer::new(authz)
+        .with_capabilities(vec![authz_resolver_sdk::Capability::GroupMembership]);
     let ctx = make_ctx(tenant_id);
 
     let scope = enforcer

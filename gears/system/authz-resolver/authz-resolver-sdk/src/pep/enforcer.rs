@@ -27,7 +27,7 @@ use crate::models::{
     Subject, TenantContext, TenantMode,
 };
 use crate::pep::compiler::{
-    ConstraintCompileError, compile_to_access_scope_with_group_membership_type,
+    ConstraintCompileError, compile_to_access_scope_with_negotiated_capabilities,
 };
 
 /// Error from the PEP enforcement flow.
@@ -507,6 +507,11 @@ impl PolicyEnforcer {
         let require = request.require_constraints.unwrap_or(true);
         let eval_request =
             self.build_request_with(ctx, resource, action, resource_id, require, request);
+        // Preserve the exact post-filter capability set sent to the PDP. The
+        // response compiler rejects native predicates that were not negotiated,
+        // preventing missing-table errors or stronger hierarchy predicates than
+        // the querying service advertised.
+        let negotiated_capabilities = eval_request.context.capabilities.clone();
         let authz = self.resolve_authz()?;
         // `evaluate` is a platform-plane method: the transport attaches this
         // gear's service-identity credential below the contract layer to
@@ -544,11 +549,12 @@ impl PolicyEnforcer {
             });
         }
 
-        Ok(compile_to_access_scope_with_group_membership_type(
+        Ok(compile_to_access_scope_with_negotiated_capabilities(
             &response,
             require,
             resource.supported_properties,
             resource.group_membership_type,
+            &negotiated_capabilities,
         )?)
     }
 }

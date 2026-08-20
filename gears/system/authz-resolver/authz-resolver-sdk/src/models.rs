@@ -79,8 +79,11 @@ pub enum Capability {
     /// PEP understands tenant hierarchy constraints.
     TenantHierarchy,
     /// PEP can join against `resource_group_membership` to resolve group membership.
+    /// Required by both `InGroup` and `InGroupSubtree`.
     GroupMembership,
     /// PEP can join against `resource_group_closure` to resolve group hierarchy.
+    /// `InGroupSubtree` additionally requires [`Self::GroupMembership`] because
+    /// closure traversal supplies groups while membership supplies resources.
     GroupHierarchy,
 }
 
