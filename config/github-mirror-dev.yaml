@@ -220,6 +220,12 @@ gears:
       file: "resource_group.db"
     config: {}
 
+  static-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+
   github-mirror:
     database:
       server: "sqlite_users"
