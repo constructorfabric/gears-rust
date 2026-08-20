@@ -35,10 +35,11 @@ use testcontainers_modules::postgres::Postgres;
 
 /// Official `postgres` image tag used by the whole workspace.
 ///
-/// This is the value `testcontainers-modules` 0.15 defaults to. It is stated
-/// here explicitly so that raising the floor is a visible, single-line change
-/// rather than a side effect of a dependency bump.
-pub const POSTGRES_TAG: &str = "11-alpine";
+/// `PostgreSQL` 18 is the floor. `testcontainers-modules` still defaults to
+/// `11-alpine`, which has been EOL since November 2023; that default is
+/// asserted by [`tests::default_postgres_tag_is_unchanged`] so a dependency
+/// bump cannot move the database under the tests without someone noticing.
+pub const POSTGRES_TAG: &str = "18-alpine";
 
 /// `PostgreSQL` 19, reserved for the graph-storage gear (SQL/PGQ, `GRAPH_TABLE`).
 ///
@@ -48,23 +49,25 @@ pub const POSTGRES_TAG: &str = "11-alpine";
 pub const POSTGRES_GRAPH_TAG: &str = "19beta3-alpine";
 
 /// Official `mysql` image tag used by the whole workspace.
-pub const MYSQL_TAG: &str = "8.1";
+///
+/// Upstream defaults to `8.1`, which is EOL.
+pub const MYSQL_TAG: &str = "9.7";
 
 /// `TimescaleDB` image, which is not an official `postgres` build.
 pub const TIMESCALEDB_IMAGE: &str = "timescale/timescaledb";
 
-/// `TimescaleDB` tag. Non-OSS variant, matching the usage-collector pin.
-pub const TIMESCALEDB_TAG: &str = "2.17.2-pg16";
+/// `TimescaleDB` tag, on the same `PostgreSQL` major as the floor above.
+pub const TIMESCALEDB_TAG: &str = "2.29.2-pg18";
 
 /// `MariaDB` image, used by the outbox throughput benchmark.
 pub const MARIADB_IMAGE: &str = "mariadb";
 
 /// `MariaDB` tag.
 ///
-/// Still the floating `lts` tag the benchmark used before this crate existed;
-/// pinning it to an exact version is deliberately left to the version bump so
-/// that introducing this crate changes no behaviour.
-pub const MARIADB_TAG: &str = "lts";
+/// An exact version rather than the floating `lts` the outbox benchmark used
+/// before: a moving tag means a benchmark can change what it measures without
+/// any commit.
+pub const MARIADB_TAG: &str = "11.8";
 
 /// Postgres tag in effect, honouring `GEARS_TEST_PG_TAG`.
 #[must_use]
@@ -158,17 +161,17 @@ mod tests {
     use super::*;
     use testcontainers::Image as _;
 
-    /// The constants above claim to restate the upstream defaults. If a
-    /// `testcontainers-modules` bump moves one, this fails and forces someone to
-    /// re-read the decision instead of silently changing the database under
-    /// every test in the repository.
+    /// The workspace pins deliberately differ from the upstream defaults, which
+    /// are EOL. Pinning the *default* too means a `testcontainers-modules` bump
+    /// that changes it fails here and forces a decision, instead of quietly
+    /// altering what every fixture in the repository runs against.
     #[test]
     fn default_postgres_tag_is_unchanged() {
         assert_eq!(
             Postgres::default().tag(),
-            POSTGRES_TAG,
+            "11-alpine",
             "testcontainers-modules changed its default Postgres tag; \
-             decide deliberately whether POSTGRES_TAG should follow"
+             re-read libs/test-containers and decide whether POSTGRES_TAG follows"
         );
     }
 
@@ -176,10 +179,18 @@ mod tests {
     fn default_mysql_tag_is_unchanged() {
         assert_eq!(
             Mysql::default().tag(),
-            MYSQL_TAG,
+            "8.1",
             "testcontainers-modules changed its default MySQL tag; \
-             decide deliberately whether MYSQL_TAG should follow"
+             re-read libs/test-containers and decide whether MYSQL_TAG follows"
         );
+    }
+
+    /// The pins must actually be ahead of those defaults, or this crate is
+    /// documentation rather than a floor.
+    #[test]
+    fn the_pins_are_not_the_eol_defaults() {
+        assert_ne!(POSTGRES_TAG, Postgres::default().tag());
+        assert_ne!(MYSQL_TAG, Mysql::default().tag());
     }
 
     /// An exported-but-empty variable must not produce `postgres:`.

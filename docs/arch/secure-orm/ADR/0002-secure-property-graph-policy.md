@@ -479,10 +479,13 @@ against a live PostgreSQL 19 beta 2 server by @vasylcf (probe branch
   mechanism and its two-branch gate (`Alias::new` always escapes; a `&'static str` used as an
   `Iden` escapes unless it passes `is_static_iden()`); the same reasoning must be applied here
   and pinned by hostile-name tests.
-- **PostgreSQL 19 is pre-GA and untested in this repo.** The PG integration harness starts
-  `Postgres::default()`, which is `postgres:11-alpine`
-  ([tests/common.rs:55](../../../../libs/toolkit-db/tests/common.rs#L55)), so live coverage
-  needs an explicit PG19 image tag and must be skipped where that image is unavailable.
+- **PostgreSQL 19 is pre-GA.** The image pin is no longer a blocker: database images now come
+  from `cf-gears-test-containers` ([libs/test-containers](../../../../libs/test-containers/src/lib.rs)),
+  whose `POSTGRES_GRAPH_TAG` / `postgres_graph()` exist for this feature and whose
+  `graph_lane_required()` decides whether an unavailable PG19 image is a skip or a failure —
+  the default is a skip while the image is pre-GA, and `GEARS_TEST_PG_GRAPH_REQUIRED=1` makes
+  a lane that is supposed to cover PG19 unable to pass vacuously. The workspace floor is now
+  PostgreSQL 18, not `postgres:11-alpine`.
 - **Privileges give no isolation help — and no escalation risk.** Verbatim from the
   documentation: *"Access to the base relations underlying the `GRAPH_TABLE` clause is
   determined by the permissions of the user executing the query, rather than the property
