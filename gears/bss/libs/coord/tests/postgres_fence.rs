@@ -47,7 +47,6 @@ use toolkit_security::AccessScope;
 
 use coord::{AckError, LeaseManager};
 
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const KEY: &str = "fence-job";
