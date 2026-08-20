@@ -108,7 +108,7 @@ reason = "Ignore module 'approval-service' (PRD/DESIGN are placeholders). Remove
 patterns = ["gears/approval-service/*"]
 
 [[ignore]]
-reason = "Ignore module 'location-manager' (PRD/DESIGN are placeholders; intake requirements in UPSTREAM_REQS.md). Remove this ignore after PRD/DESIGN conform to template."
+reason = "Ignore module 'location-manager' (PRD authored; DESIGN not yet authored). Remove this ignore after DESIGN conforms to template."
 patterns = ["gears/location-manager/*"]
 
 [[systems]]
