@@ -92,7 +92,10 @@ impl InPredicate {
 
 /// Group membership predicate: resource is visible if it belongs to any of the listed groups.
 ///
-/// Compiles to: `property IN (SELECT resource_id FROM resource_group_membership WHERE group_id IN (group_ids))`
+/// The PEP compiler combines this wire-level predicate with the current
+/// [`crate::pep::ResourceType`]'s RG member-handle type. `SecureORM` compiles the
+/// result to a type-qualified membership subquery and casts the entity property
+/// to text to match RG's opaque `resource_id` storage.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct InGroupPredicate {
     /// Resource property to filter (e.g., `pep_properties::RESOURCE_ID`).
@@ -121,8 +124,10 @@ impl InGroupPredicate {
 /// Group subtree predicate: resource is visible if it belongs to any group
 /// that is a descendant of the listed ancestor groups.
 ///
-/// Compiles to: `property IN (SELECT resource_id FROM resource_group_membership
-///   WHERE group_id IN (SELECT descendant_id FROM resource_group_closure WHERE ancestor_id IN (ancestor_ids)))`
+/// The PEP compiler combines this wire-level predicate with the current
+/// [`crate::pep::ResourceType`]'s RG member-handle type. `SecureORM` compiles the
+/// result to a type-qualified membership subquery whose group set comes from
+/// `resource_group_closure`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct InGroupSubtreePredicate {
     /// Resource property to filter (e.g., `pep_properties::RESOURCE_ID`).

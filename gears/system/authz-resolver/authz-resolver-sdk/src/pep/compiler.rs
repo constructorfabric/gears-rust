@@ -68,7 +68,10 @@ pub enum ConstraintCompileError {
 ///
 /// The compiler is property-agnostic: it validates predicates against the
 /// provided `supported_properties` list and converts them structurally.
-/// Unknown properties fail that constraint (fail-closed).
+/// Unknown properties fail that constraint (fail-closed). Native group
+/// predicates also fail closed through this entry point because their RG
+/// member-handle type is absent; use
+/// [`compile_to_access_scope_with_group_membership_type`] for those predicates.
 /// If ALL constraints fail compilation, returns `AllConstraintsFailed`.
 ///
 /// # Errors
@@ -79,6 +82,33 @@ pub fn compile_to_access_scope(
     response: &EvaluationResponse,
     require_constraints: bool,
     supported_properties: &[&str],
+) -> Result<AccessScope, ConstraintCompileError> {
+    compile_to_access_scope_with_group_membership_type(
+        response,
+        require_constraints,
+        supported_properties,
+        None,
+    )
+}
+
+/// Compile constraints with the RG member-handle type required by native group
+/// predicates.
+///
+/// Kept separate from [`compile_to_access_scope`] so existing low-level callers
+/// remain source-compatible. A native `InGroup`/`InGroupSubtree` predicate sent
+/// through the untyped entry point fails closed instead of querying membership
+/// rows across unrelated resource types.
+///
+/// # Errors
+///
+/// Returns the same errors as [`compile_to_access_scope`]. Native group
+/// predicates additionally fail compilation when `group_membership_type` is
+/// absent or empty.
+pub fn compile_to_access_scope_with_group_membership_type(
+    response: &EvaluationResponse,
+    require_constraints: bool,
+    supported_properties: &[&str],
+    group_membership_type: Option<&str>,
 ) -> Result<AccessScope, ConstraintCompileError> {
     // Step 1: Handle empty constraints based on require_constraints flag.
     if response.context.constraints.is_empty() {
@@ -93,7 +123,7 @@ pub fn compile_to_access_scope(
     let mut fail_reasons: Vec<String> = Vec::new();
 
     for constraint in &response.context.constraints {
-        match compile_constraint(constraint, supported_properties) {
+        match compile_constraint(constraint, supported_properties, group_membership_type) {
             Ok(sc) => constraints.push(sc),
             Err(reason) => {
                 tracing::warn!(
@@ -127,6 +157,7 @@ pub fn compile_to_access_scope(
 fn compile_constraint(
     constraint: &Constraint,
     supported_properties: &[&str],
+    group_membership_type: Option<&str>,
 ) -> Result<ScopeConstraint, String> {
     let mut filters = Vec::new();
 
@@ -162,9 +193,11 @@ fn compile_constraint(
                         p.property
                     ));
                 }
+                let membership_type =
+                    required_group_membership_type(group_membership_type, "InGroup", &p.property)?;
                 (
                     p.property.as_str(),
-                    ScopeFilter::in_group(&p.property, group_ids),
+                    ScopeFilter::in_group_typed(&p.property, membership_type, group_ids),
                 )
             }
             Predicate::InGroupSubtree(p) => {
@@ -179,9 +212,14 @@ fn compile_constraint(
                         p.property
                     ));
                 }
+                let membership_type = required_group_membership_type(
+                    group_membership_type,
+                    "InGroupSubtree",
+                    &p.property,
+                )?;
                 (
                     p.property.as_str(),
-                    ScopeFilter::in_group_subtree(&p.property, ancestor_ids),
+                    ScopeFilter::in_group_subtree_typed(&p.property, membership_type, ancestor_ids),
                 )
             }
             Predicate::InTenantSubtree(p) => {
@@ -227,6 +265,20 @@ fn compile_constraint(
     }
 
     Ok(ScopeConstraint::new(filters))
+}
+
+/// Return the configured RG member-handle type or a fail-closed compilation
+/// reason suitable for the enclosing constraint.
+fn required_group_membership_type<'a>(
+    group_membership_type: Option<&'a str>,
+    predicate: &str,
+    property: &str,
+) -> Result<&'a str, String> {
+    group_membership_type.filter(|value| !value.is_empty()).ok_or_else(|| {
+        format!(
+            "{predicate} predicate on '{property}' requires a configured RG membership resource type (fail-closed)"
+        )
+    })
 }
 
 /// Convert a `serde_json::Value` to a UUID `ScopeValue`.

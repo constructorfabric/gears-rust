@@ -73,10 +73,10 @@ The SDK provides [`PolicyEnforcer`](authz-resolver-sdk/src/pep/enforcer.rs) — 
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
 use toolkit_security::pep_properties;
 
-const USER: ResourceType = ResourceType {
-    name: "gts.cf.core.users.user.v1~",
-    supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
-};
+const USER: ResourceType = ResourceType::from_static(
+    "gts.cf.core.users.user.v1~",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
 
 let enforcer = PolicyEnforcer::new(authz_client.clone());
 
@@ -161,5 +161,5 @@ let response = authz.evaluate(ctx.clone(), EvaluationRequest {
 
 ### Phase 2: Production PDP Plugin (Planned)
 
-- Advanced predicates: `in_tenant_subtree`, `in_group`, `in_group_subtree` (group predicates are RG-internal only; domain services receive degraded `in` predicates)
+- Advanced predicates: `in_tenant_subtree`, `in_group`, `in_group_subtree`. Native group predicates require co-located/projected RG membership tables and a `ResourceType::with_group_membership_type(...)` mapping; other resources receive degraded `in` predicates.
 - Local projection tables for hierarchy-aware constraints (`tenant_closure`, `resource_group_closure`; `resource_group_membership` projection not recommended but not forbidden)
