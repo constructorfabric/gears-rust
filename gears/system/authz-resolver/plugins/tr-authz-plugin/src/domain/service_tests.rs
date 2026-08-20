@@ -377,6 +377,31 @@ async fn group_predicates_from_request_properties() {
 }
 
 #[tokio::test]
+async fn empty_group_selector_is_denied_instead_of_widened() {
+    let tenant_id = Uuid::now_v7();
+    let mock = MockTenantResolver::with_tenants(tenant_id, vec![]);
+    let svc = Service::new(Arc::new(mock));
+
+    for property in ["group_ids", "ancestor_group_ids"] {
+        let mut request = make_request(tenant_id);
+        request.context.capabilities = vec![
+            authz_resolver_sdk::Capability::GroupMembership,
+            authz_resolver_sdk::Capability::GroupHierarchy,
+        ];
+        request
+            .resource
+            .properties
+            .insert(property.to_owned(), serde_json::json!([]));
+
+        let response = svc.evaluate(&request).await;
+        assert!(
+            !response.decision,
+            "an empty {property} selector must match nothing, not tenant-wide scope"
+        );
+    }
+}
+
+#[tokio::test]
 async fn unadvertised_group_predicate_is_denied() {
     let tenant_id = Uuid::now_v7();
     let mock = MockTenantResolver::with_tenants(tenant_id, vec![]);
