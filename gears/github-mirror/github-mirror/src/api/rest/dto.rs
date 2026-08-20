@@ -1,4 +1,4 @@
-use github_mirror_sdk::Repository;
+use github_mirror_sdk::{Issue, Repository};
 
 use crate::domain::service::MirrorStatus;
 
@@ -41,6 +41,41 @@ impl From<Repository> for RepositoryDto {
             full_name: repo.full_name,
             private: repo.private,
             description: repo.description,
+        }
+    }
+}
+
+/// A mirrored GitHub issue as served by the read API.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct IssueDto {
+    pub id: i64,
+    pub repo_id: i64,
+    pub number: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    pub is_pull_request: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub html_url: Option<String>,
+}
+
+impl From<Issue> for IssueDto {
+    fn from(issue: Issue) -> Self {
+        Self {
+            id: issue.id,
+            repo_id: issue.repo_id,
+            number: issue.number,
+            title: issue.title,
+            body: issue.body,
+            state: issue.state,
+            is_pull_request: issue.is_pull_request,
+            created_at: issue.created_at,
+            updated_at: issue.updated_at,
+            closed_at: issue.closed_at,
+            html_url: issue.html_url,
         }
     }
 }

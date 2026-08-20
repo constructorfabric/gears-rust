@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
-use github_mirror_sdk::Repository;
+use github_mirror_sdk::{Issue, Repository};
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page, PageInfo};
 use toolkit_security::{SecurityContext, pep_properties};
 
 use super::error::DomainError;
-use super::repo::{GithubRepoRepository, RepositoryRecord};
+use super::repo::{IssueRecord, IssueRepository, RepoRepository, RepositoryRecord};
 
 pub const GEAR_NAME: &str = "github-mirror";
 
@@ -18,6 +18,11 @@ pub(crate) type DbProvider = toolkit_db::DBProvider<toolkit_db::DbError>;
 
 pub(crate) const REPOSITORY_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.repository",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
+
+pub(crate) const ISSUE_RESOURCE: ResourceType = ResourceType::from_static(
+    "github_mirror.issue",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
@@ -41,23 +46,26 @@ pub struct MirrorStatus {
 }
 
 #[domain_model]
-pub struct Service<R: GithubRepoRepository> {
+pub struct Service<R: RepoRepository, I: IssueRepository> {
     db: Arc<DbProvider>,
     repo: Arc<R>,
+    issues: Arc<I>,
     policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
 }
 
-impl<R: GithubRepoRepository> Service<R> {
+impl<R: RepoRepository, I: IssueRepository> Service<R, I> {
     pub fn new(
         db: Arc<DbProvider>,
         repo: Arc<R>,
+        issues: Arc<I>,
         policy_enforcer: PolicyEnforcer,
         config: ServiceConfig,
     ) -> Self {
         Self {
             db,
             repo,
+            issues,
             policy_enforcer,
             config,
         }
@@ -133,5 +141,95 @@ impl<R: GithubRepoRepository> Service<R> {
 
         let conn = self.db.conn()?;
         self.repo.upsert(&conn, &scope, tenant_id, record).await
+    }
+
+    /// List mirrored issues of one repository (`owner/name`), tenant-scoped.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored for this
+    /// tenant; `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn list_issues(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        query: &ODataQuery,
+    ) -> Result<Page<Issue>, DomainError> {
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &ISSUE_RESOURCE,
+                actions::LIST,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+        let items = self
+            .issues
+            .list_by_repo(&conn, &scope, repository.id, limit)
+            .await?;
+
+        Ok(Page::new(
+            items,
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit,
+            },
+        ))
+    }
+
+    /// Insert or update a mirrored issue row for the caller's tenant.
+    ///
+    /// The owning repository must already be mirrored (`DomainError::NotFound`
+    /// otherwise) so issues can never dangle.
+    ///
+    /// # Errors
+    /// `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn upsert_issue(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        record: IssueRecord,
+    ) -> Result<Issue, DomainError> {
+        let tenant_id = ctx.subject_tenant_id();
+
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &ISSUE_RESOURCE,
+                actions::UPSERT,
+                None,
+                &AccessRequest::new().resource_property(pep_properties::OWNER_TENANT_ID, tenant_id),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let record = IssueRecord {
+            repo_id: repository.id,
+            ..record
+        };
+        self.issues.upsert(&conn, &scope, tenant_id, record).await
     }
 }

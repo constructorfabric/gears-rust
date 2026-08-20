@@ -8,7 +8,7 @@ use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 
 use crate::domain::error::DomainError;
-use crate::domain::repo::GithubRepoRepository;
+use crate::domain::repo::{IssueRepository, RepoRepository};
 use crate::domain::service::Service;
 
 #[resource_error(gts_id!("cf.core.github_mirror.repository.v1~"))]
@@ -46,19 +46,21 @@ impl From<DomainError> for CanonicalError {
 }
 
 #[domain_model]
-pub struct LocalClient<R: GithubRepoRepository + 'static> {
-    service: Arc<Service<R>>,
+pub struct LocalClient<R: RepoRepository + 'static, I: IssueRepository + 'static> {
+    service: Arc<Service<R, I>>,
 }
 
-impl<R: GithubRepoRepository + 'static> LocalClient<R> {
+impl<R: RepoRepository + 'static, I: IssueRepository + 'static> LocalClient<R, I> {
     #[must_use]
-    pub fn new(service: Arc<Service<R>>) -> Self {
+    pub fn new(service: Arc<Service<R, I>>) -> Self {
         Self { service }
     }
 }
 
 #[async_trait]
-impl<R: GithubRepoRepository + 'static> GithubMirrorClientV1 for LocalClient<R> {
+impl<R: RepoRepository + 'static, I: IssueRepository + 'static> GithubMirrorClientV1
+    for LocalClient<R, I>
+{
     async fn status(&self, _ctx: &SecurityContext) -> Result<MirrorStatus, CanonicalError> {
         let status = self.service.status();
         Ok(MirrorStatus {

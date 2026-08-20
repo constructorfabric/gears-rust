@@ -7,9 +7,9 @@ use toolkit::api::{OpenApiRegistry, OperationBuilder};
 
 use crate::api::rest::{dto, handlers};
 use crate::domain::service::Service;
-use crate::infra::storage::sea_orm_repo::SeaOrmGithubRepoRepository;
+use crate::infra::storage::sea_orm_repo::{SeaOrmIssueRepository, SeaOrmRepoRepository};
 
-pub type ConcreteService = Service<SeaOrmGithubRepoRepository>;
+pub type ConcreteService = Service<SeaOrmRepoRepository, SeaOrmIssueRepository>;
 
 const API_TAG: &str = "GitHub Mirror";
 
@@ -63,6 +63,31 @@ pub fn register_routes(
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/github-mirror/v1/repos/{owner}/{name}/issues")
+        .operation_id("github_mirror.list_issues")
+        .summary("List mirrored issues of a repository")
+        .description(
+            "Returns issues (pull requests included, flagged by is_pull_request) held in              the local mirror for the caller's tenant",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("owner", "Repository owner login")
+        .path_param("name", "Repository name")
+        .query_param("limit", false, "Maximum number of issues to return")
+        .handler(handlers::list_issues)
+        .json_response_with_schema::<toolkit_odata::Page<dto::IssueDto>>(
+            openapi,
+            StatusCode::OK,
+            "Paginated list of mirrored issues",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
         .error_500(openapi)
         .register(router, openapi);
 
