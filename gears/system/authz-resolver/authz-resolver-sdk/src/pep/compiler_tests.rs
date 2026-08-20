@@ -316,8 +316,21 @@ fn mixed_shape_constraints_produce_or_scope() {
 
 // === InGroup / InGroupSubtree Compilation Tests ===
 
+const GROUP_MEMBERSHIP_TYPE: &str = "gts.cf.core.rg.type.v1~example.core.rg.member.v1~";
+
+fn compile_group_scope(
+    response: &EvaluationResponse,
+) -> Result<AccessScope, ConstraintCompileError> {
+    compile_to_access_scope_with_group_membership_type(
+        response,
+        true,
+        DEFAULT_PROPS,
+        Some(GROUP_MEMBERSHIP_TYPE),
+    )
+}
+
 #[test]
-fn in_group_predicate_compiles_to_in_group_filter() {
+fn in_group_predicate_compiles_to_type_qualified_in_group_filter() {
     use crate::constraints::InGroupPredicate;
 
     let g1 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -334,18 +347,18 @@ fn in_group_predicate_compiles_to_in_group_filter() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_group_scope(&response).unwrap();
     assert_eq!(scope.constraints().len(), 1);
     let filter = &scope.constraints()[0].filters()[0];
-    assert!(
-        matches!(filter, ScopeFilter::InGroup(_)),
-        "expected InGroup filter, got: {filter:?}"
-    );
     assert_eq!(filter.property(), pep_properties::RESOURCE_ID);
+    let ScopeFilter::InGroup(filter) = filter else {
+        panic!("expected InGroup filter, got: {filter:?}");
+    };
+    assert_eq!(filter.membership_resource_type(), GROUP_MEMBERSHIP_TYPE);
 }
 
 #[test]
-fn in_group_subtree_predicate_compiles_to_subtree_filter() {
+fn in_group_subtree_predicate_compiles_to_type_qualified_subtree_filter() {
     use crate::constraints::InGroupSubtreePredicate;
 
     let ancestor = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -362,13 +375,37 @@ fn in_group_subtree_predicate_compiles_to_subtree_filter() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_group_scope(&response).unwrap();
     assert_eq!(scope.constraints().len(), 1);
     let filter = &scope.constraints()[0].filters()[0];
-    assert!(
-        matches!(filter, ScopeFilter::InGroupSubtree(_)),
-        "expected InGroupSubtree filter, got: {filter:?}"
-    );
+    let ScopeFilter::InGroupSubtree(filter) = filter else {
+        panic!("expected InGroupSubtree filter, got: {filter:?}");
+    };
+    assert_eq!(filter.membership_resource_type(), GROUP_MEMBERSHIP_TYPE);
+}
+
+#[test]
+fn native_group_predicate_without_membership_type_fails_closed() {
+    use crate::constraints::InGroupPredicate;
+
+    let response = EvaluationResponse {
+        decision: true,
+        context: EvaluationResponseContext {
+            constraints: vec![Constraint {
+                predicates: vec![Predicate::InGroup(InGroupPredicate::new(
+                    pep_properties::RESOURCE_ID,
+                    [uuid(R1)],
+                ))],
+            }],
+            ..Default::default()
+        },
+    };
+
+    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+    let Err(ConstraintCompileError::AllConstraintsFailed { reason }) = result else {
+        panic!("untyped native group predicate must fail closed: {result:?}");
+    };
+    assert!(reason.contains("requires a configured RG membership resource type"));
 }
 
 #[test]
@@ -394,7 +431,7 @@ fn tenant_plus_in_group_in_single_constraint() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_group_scope(&response).unwrap();
     assert_eq!(scope.constraints().len(), 1);
     // Constraint should have 2 filters: In(tenant) AND InGroup(resource)
     assert_eq!(scope.constraints()[0].filters().len(), 2);

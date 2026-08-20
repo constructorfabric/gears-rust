@@ -43,8 +43,12 @@ pub enum BarrierMode {
 /// Resource Group tables (`resource_group`, `resource_group_membership`, `resource_group_closure`).
 /// Services that can join against these tables may declare the capabilities;
 /// the PDP will then return `InGroup`/`InGroupSubtree` predicates directly.
-/// Services without access should omit these capabilities — the PDP will
-/// degrade group predicates to explicit `In` with pre-resolved resource IDs.
+/// Each capable [`crate::pep::ResourceType`] must also declare its RG
+/// member-handle GTS path with
+/// [`crate::pep::ResourceType::with_group_membership_type`]. The enforcer
+/// suppresses group capabilities on requests for resources without that
+/// mapping. Services without table access should omit these capabilities — the
+/// PDP will degrade group predicates to explicit `In` with pre-resolved IDs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
