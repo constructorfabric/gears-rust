@@ -22,7 +22,7 @@ name = "postgres_cluster_plugin"
 # dependency" heuristic flags that placement; ignore it here since the placement
 # is required, not accidental.
 [package.metadata.cargo-shear]
-ignored = ["testcontainers", "testcontainers-modules"]
+ignored = ["testcontainers", "testcontainers-modules", "cf-gears-test-containers"]
 
 [lints]
 workspace = true
@@ -36,7 +36,11 @@ workspace = true
 # docs/TESTING.md §7; every reference to them lives in `tests/`, so enabling
 # this feature has no effect on the plugin's own compiled artifact. Run with
 # `cargo test -p cf-postgres-cluster-plugin --features integration`.
-integration = ["dep:testcontainers", "dep:testcontainers-modules"]
+integration = [
+    "dep:testcontainers",
+    "dep:testcontainers-modules",
+    "dep:cf-gears-test-containers",
+]
 
 [dependencies]
 # `otel` pulls in the SDK's OpenTelemetry-backed `ClusterMetrics` adapter
@@ -98,6 +102,8 @@ rand = { workspace = true }
 # `[dev-dependencies]`.
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
+# Database image pins: see libs/test-containers.
+cf-gears-test-containers = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

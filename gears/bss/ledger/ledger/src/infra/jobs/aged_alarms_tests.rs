@@ -472,7 +472,7 @@ async fn setup(container_url: &str) -> (DatabaseConnection, DBProvider<DbError>)
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn run_over_empty_ledger_completes() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider) = setup(&url).await;
@@ -488,7 +488,7 @@ async fn run_over_empty_ledger_completes() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn aged_queue_row_is_detected_and_run_completes() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -541,7 +541,7 @@ async fn aged_queue_row_is_detected_and_run_completes() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn aged_chargeback_queue_row_is_detected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -571,7 +571,7 @@ async fn aged_chargeback_queue_row_is_detected() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn aged_refund_clearing_is_detected_and_run_completes() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -653,7 +653,7 @@ async fn aged_refund_clearing_is_detected_and_run_completes() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn stage1_orphan_refund_is_detected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -775,7 +775,7 @@ async fn seed_unallocated_grain(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn aged_unallocated_grain_is_detected_and_run_completes() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -821,7 +821,7 @@ async fn aged_unallocated_grain_is_detected_and_run_completes() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn fresh_or_drained_unallocated_grain_is_not_aged() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -883,7 +883,7 @@ async fn seed_tax_subbalance(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn negative_tax_subbalance_beyond_window_is_detected_and_run_completes() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;

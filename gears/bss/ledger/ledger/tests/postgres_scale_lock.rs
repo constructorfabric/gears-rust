@@ -31,7 +31,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn scale_locked_once_postings_exist() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

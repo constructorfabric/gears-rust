@@ -91,8 +91,7 @@ async fn spawn_postgres() -> (ContainerAsync<Postgres>, String) {
     let attempts = backoffs.len() + 1;
     let mut last_error = String::new();
     for attempt in 1..=attempts {
-        let container = match Postgres::default()
-            .with_db_name("cluster_test")
+        let container = match cf_gears_test_containers::postgres_with_db("cluster_test")
             .start()
             .await
         {

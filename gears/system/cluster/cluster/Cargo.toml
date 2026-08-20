@@ -22,7 +22,7 @@ name = "cluster"
 # cargo-shear's "misplaced optional dependency" heuristic flags that placement —
 # it is required here, not accidental.
 [package.metadata.cargo-shear]
-ignored = ["testcontainers", "testcontainers-modules"]
+ignored = ["testcontainers", "testcontainers-modules", "cf-gears-test-containers"]
 
 [lints]
 workspace = true
@@ -32,7 +32,11 @@ workspace = true
 # (`tests/mixed_backend_integration.rs`), mirroring the Postgres plugin's own
 # `integration` feature so a default `cargo test` never requires a Docker
 # daemon. Run with `cargo test -p cf-gears-cluster --features integration`.
-integration = ["dep:testcontainers", "dep:testcontainers-modules"]
+integration = [
+    "dep:testcontainers",
+    "dep:testcontainers-modules",
+    "dep:cf-gears-test-containers",
+]
 
 [dependencies]
 cluster-sdk = { workspace = true }
@@ -51,6 +55,8 @@ serde_json = { workspace = true }
 # Optional, test-only — see the `[features]` and `cargo-shear` notes above.
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
+# Database image pins: see libs/test-containers.
+cf-gears-test-containers = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

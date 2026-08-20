@@ -369,7 +369,7 @@ fn seg(period_id: &str, amount: i64) -> ChangeSegment {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn replace_prospective_re_plans_remaining_and_old_segments_do_not_release() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -530,7 +530,7 @@ async fn replace_prospective_re_plans_remaining_and_old_segments_do_not_release(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cancel_marks_cancelled_and_later_run_releases_nothing() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -605,7 +605,7 @@ async fn cancel_marks_cancelled_and_later_run_releases_nothing() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn catch_up_treatment_is_review_and_leaves_schedule_active() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -655,7 +655,7 @@ async fn catch_up_treatment_is_review_and_leaves_schedule_active() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn replace_is_idempotent_on_change_id() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -775,7 +775,7 @@ fn replace_cmd(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn replace_with_descending_periods_is_rejected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -815,7 +815,7 @@ async fn replace_with_descending_periods_is_rejected() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn replace_with_duplicate_period_is_rejected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -849,7 +849,7 @@ async fn replace_with_duplicate_period_is_rejected() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn replace_with_malformed_period_is_rejected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -880,7 +880,7 @@ async fn replace_with_malformed_period_is_rejected() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn replace_overlapping_an_already_done_period_is_rejected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;

@@ -136,10 +136,51 @@ make test-db               # all three
 make test-users-info-pg    # users-info Postgres integration
 ```
 
-### 4.3 CI
+### 4.3 Database image versions
+
+Every fixture that starts a database container goes through
+`cf-gears-test-containers` (`libs/test-containers`). **Change a database version
+there and nowhere else.** Calling `Postgres::default()` or `Mysql::default()`
+directly is what this crate exists to replace: those tags are hardcoded inside
+`testcontainers-modules`, so the version was pinned only transitively through
+`Cargo.lock` and a dependency bump changed the database under every test in the
+repository silently.
+
+```rust
+// in a fixture
+let request = cf_gears_test_containers::postgres()
+    .with_env_var("POSTGRES_PASSWORD", "pass");
+
+// when the image itself needs configuring (with_db_name, with_user, ...)
+let request = cf_gears_test_containers::postgres_from(
+    Postgres::default().with_db_name("my_test"),
+);
+```
+
+Tags can be overridden per run, so CI can drive a version matrix without code
+changes:
+
+| Variable | Overrides |
+|---|---|
+| `GEARS_TEST_PG_TAG` | the Postgres tag |
+| `GEARS_TEST_MYSQL_TAG` | the MySQL tag |
+| `GEARS_TEST_PG_GRAPH_TAG` | the PostgreSQL 19 tag used by the graph lane |
+| `GEARS_TEST_PG_GRAPH_REQUIRED` | `1` makes an unavailable PG19 image a failure instead of a skip |
+
+An exported-but-empty variable is treated as unset, so a CI job that declares
+the name without a value gets the pin rather than an image with no tag.
+
+The PostgreSQL 19 helpers (`postgres_graph`, `graph_lane_required`) exist for the
+SQL/PGQ work in `docs/arch/secure-orm/ADR/0002` and are unused until that lands.
+
+### 4.4 CI
 
 The `integration` job in `ci.yml` runs SQLite, Postgres, and MySQL integration tests
 plus macro UI tests on every PR (Ubuntu only).
+
+A guard job asserts that no crate outside `libs/test-containers` constructs a
+database image directly, so a new fixture cannot quietly reintroduce an
+unpinned version.
 
 ---
 

@@ -377,7 +377,7 @@ async fn setup_with_one_balanced_post(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn run_over_clean_tenant_completes() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -418,7 +418,7 @@ async fn run_over_clean_tenant_completes() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn run_over_drifted_tenant_emits_alarm() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -1024,7 +1024,7 @@ fn cache_baseline_rows_roundtrip() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn incremental_tie_out_equals_full_across_periods() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, service, provider, f) = setup(&url).await;

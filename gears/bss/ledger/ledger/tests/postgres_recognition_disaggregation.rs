@@ -303,7 +303,7 @@ async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64>
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn per_stream_bundle_drains_each_stream_and_disaggregates() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -497,7 +497,7 @@ async fn per_stream_bundle_drains_each_stream_and_disaggregates() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn missed_close_disaggregates_under_the_open_period() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await; // setup opens 202606 + seeds accounts

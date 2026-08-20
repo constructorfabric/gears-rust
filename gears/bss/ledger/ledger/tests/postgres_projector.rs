@@ -133,7 +133,7 @@ async fn ar_invoice_stamps(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn projects_deltas_and_enforces_no_negative() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -279,7 +279,7 @@ async fn run_project(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn projects_ar_invoice_and_tax_subgrains() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -373,7 +373,7 @@ async fn projects_ar_invoice_and_tax_subgrains() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn projects_unallocated_balance_and_enforces_no_negative() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -513,7 +513,7 @@ async fn projects_unallocated_balance_and_enforces_no_negative() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn stamps_ar_invoice_original_posted_at_and_due_date_first_write_wins() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

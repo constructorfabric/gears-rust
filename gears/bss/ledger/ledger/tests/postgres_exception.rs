@@ -79,7 +79,7 @@ async fn count_rows(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn route_opens_one_period_bound_row_and_dedups() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -123,7 +123,7 @@ async fn route_opens_one_period_bound_row_and_dedups() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn resolve_transitions_and_list_filters() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -160,7 +160,7 @@ async fn resolve_transitions_and_list_filters() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn gl_writeoff_approved_exception_does_not_block_close() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

@@ -16,7 +16,7 @@
 //! Rows are seeded by RAW SQL `INSERT` directly into `bss.ledger_*` (the simplest
 //! reliable way to populate a read test — mirrors `postgres_refund_dispute_hold.rs`
 //! / `postgres_credit_note.rs`), for two tenants A and B. The shared harness
-//! (the `pg()` helper, `Postgres::default().start()`,
+//! (the `pg()` helper, `cf_gears_test_containers::postgres().start()`,
 //! `Migrator::up`, the `search_path=bss,public` provider) is duplicated from
 //! `postgres_refund.rs` per the established convention (no shared module across
 //! these test files). Ignored by default; run with `-- --ignored` (needs Docker).
@@ -252,7 +252,7 @@ async fn seed_journal_entry(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn refund_list_is_tenant_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -304,7 +304,7 @@ async fn refund_list_is_tenant_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn refund_by_id_foreign_tenant_is_none() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -348,7 +348,7 @@ async fn refund_by_id_foreign_tenant_is_none() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn refund_list_cursor_paginates() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -425,7 +425,7 @@ async fn refund_list_cursor_paginates() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn refund_list_filter_narrows() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -468,7 +468,7 @@ async fn refund_list_filter_narrows() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn credit_note_list_is_tenant_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -494,7 +494,7 @@ async fn credit_note_list_is_tenant_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn credit_note_by_id_foreign_tenant_is_none() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -525,7 +525,7 @@ async fn credit_note_by_id_foreign_tenant_is_none() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn debit_note_list_is_tenant_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -551,7 +551,7 @@ async fn debit_note_list_is_tenant_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn debit_note_by_id_foreign_tenant_is_none() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -582,7 +582,7 @@ async fn debit_note_by_id_foreign_tenant_is_none() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dispute_list_is_tenant_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -608,7 +608,7 @@ async fn dispute_list_is_tenant_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dispute_by_id_foreign_tenant_is_none() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -639,7 +639,7 @@ async fn dispute_by_id_foreign_tenant_is_none() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn recognition_run_list_is_tenant_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -666,7 +666,7 @@ async fn recognition_run_list_is_tenant_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn recognition_run_by_id_foreign_tenant_is_none() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -701,7 +701,7 @@ async fn recognition_run_by_id_foreign_tenant_is_none() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn journal_entries_list_is_tenant_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -748,7 +748,7 @@ async fn journal_entries_list_is_tenant_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dual_control_policy_effective_read_resolves_and_is_scoped() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = boot(&url).await;
@@ -789,7 +789,7 @@ async fn dual_control_policy_effective_read_resolves_and_is_scoped() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dual_control_policy_absent_row_yields_no_effective_version() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (_raw, provider) = boot(&url).await;

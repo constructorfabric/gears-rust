@@ -111,7 +111,7 @@ fn rate_locker(provider: &DBProvider<DbError>, fx_config: &FxConfig) -> RateLock
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

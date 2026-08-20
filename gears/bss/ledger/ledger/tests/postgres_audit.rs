@@ -102,7 +102,7 @@ async fn append(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn appends_first_record_sealed_with_genesis_prev() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -177,7 +177,7 @@ async fn appends_first_record_sealed_with_genesis_prev() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn links_second_record_to_first() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -242,7 +242,7 @@ async fn links_second_record_to_first() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn append_only_trigger_rejects_update_and_delete() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -289,7 +289,7 @@ async fn append_only_trigger_rejects_update_and_delete() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn rewalk_detects_tamper() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -429,7 +429,7 @@ async fn fetch_hex_set(conn: &DatabaseConnection, sql: &str) -> Vec<String> {
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_appends_form_linear_audit_chain() {
     const N: usize = 8;
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

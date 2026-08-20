@@ -408,7 +408,7 @@ fn clawback_req(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn forward_refund_on_payment_with_open_dispute_is_held() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -534,7 +534,7 @@ async fn forward_refund_on_payment_with_open_dispute_is_held() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn clawback_on_payment_with_open_dispute_is_not_held() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -708,7 +708,7 @@ async fn age_dispute_hold_row(raw: &DatabaseConnection, s: &Seller) {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dispute_hold_drain_won_redrives_and_posts() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -776,7 +776,7 @@ async fn dispute_hold_drain_won_redrives_and_posts() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dispute_hold_drain_lost_cancels_never_posts() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -843,7 +843,7 @@ async fn dispute_hold_drain_lost_cancels_never_posts() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dispute_hold_drain_still_open_backs_off() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -896,7 +896,7 @@ async fn dispute_hold_drain_still_open_backs_off() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dispute_hold_aged_out_escalates() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -954,7 +954,7 @@ async fn dispute_hold_aged_out_escalates() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dispute_hold_won_over_threshold_awaits_approval() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;

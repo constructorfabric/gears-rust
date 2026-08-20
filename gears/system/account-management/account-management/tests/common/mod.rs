@@ -1702,7 +1702,8 @@ pub mod pg {
     /// — a missing Docker daemon shows up as a clear container-start
     /// failure rather than a silent skip.
     pub async fn bring_up_postgres() -> Result<PgHarness> {
-        let postgres_image = Postgres::default();
+        // Image tag comes from cf-gears-test-containers; see libs/test-containers.
+        let postgres_image = cf_gears_test_containers::postgres();
         let request = ContainerRequest::from(postgres_image)
             .with_env_var("POSTGRES_PASSWORD", "pass")
             .with_env_var("POSTGRES_USER", "user")
