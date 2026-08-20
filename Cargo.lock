@@ -3559,6 +3559,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-toolkit-sea-orm-pgq"
+version = "0.1.0"
+dependencies = [
+ "sea-orm",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "cf-gears-toolkit-security"
 version = "0.8.0"
 dependencies = [
