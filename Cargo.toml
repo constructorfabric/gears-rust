@@ -333,6 +333,11 @@ cf-gears-system-sdk-directory = { version = "0.1.42", path = "libs/system-sdks/s
 types-registry = { package = "cf-gears-types-registry", version = "0.1.34", path = "gears/system/types-registry/types-registry" }
 authn-resolver = { package = "cf-gears-authn-resolver", version = "0.2.28", path = "gears/system/authn-resolver/authn-resolver" }
 authz-resolver = { package = "cf-gears-authz-resolver", version = "0.1.36", path = "gears/system/authz-resolver/authz-resolver" }
+api-gateway = { package = "cf-gears-api-gateway", version = "0.4.8", path = "gears/system/api-gateway" }
+# Concrete plugins needed to link a standalone-mode binary (eb-single-process-implementation D7).
+static-authn-plugin = { package = "cf-gears-static-authn-plugin", version = "0.3.11", path = "gears/system/authn-resolver/plugins/static-authn-plugin" }
+static-authz-plugin = { package = "cf-gears-static-authz-plugin", version = "0.1.31", path = "gears/system/authz-resolver/plugins/static-authz-plugin" }
+standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", version = "0.2.1", path = "gears/system/cluster/plugins/standalone-cluster-plugin" }
 tenant-resolver = { package = "cf-gears-tenant-resolver", version = "0.1.32", path = "gears/system/tenant-resolver/tenant-resolver" }
 resource-group = { package = "cf-gears-resource-group", version = "0.3.0", path = "gears/system/resource-group/resource-group" }
 credstore = { package = "cf-gears-credstore", version = "0.3.0", path = "gears/credstore/credstore" }
@@ -354,6 +359,7 @@ authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.2
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.6", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.8", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.7", path = "gears/system/usage-collector/usage-collector-sdk" }
+event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.2.0", path = "gears/system/event-broker/event-broker-sdk" }
 
 # BSS gears (ported from vhp-core)
 bss-ledger-sdk = { path = "gears/bss/ledger/ledger-sdk", version = "0.1.2" }
@@ -386,7 +392,7 @@ serde_urlencoded = "0.7"
 # extractor. Unlike `serde_urlencoded` it round-trips repeated keys into a
 # sequence, which is what makes `Vec<T>` query fields work end to end.
 serde_html_form = "0.4"
-schemars = { version = "1.2", features = ["derive", "uuid1"] }
+schemars = { version = "1.2", features = ["derive", "uuid1", "chrono04"] }
 
 # Error handling
 anyhow = "1.0"

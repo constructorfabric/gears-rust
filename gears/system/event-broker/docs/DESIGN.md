@@ -545,7 +545,7 @@ End-to-end flow when a producer publishes an event:
 2. **Schema-level validation** against `event.v1.schema.json` (per [`ADR/0003-event-schema.md`](ADR/0003-event-schema.md)): structural conformance, ASCII encoding of event-field strings, per-field length caps, `trace_parent` format. Violations return `400 InvalidEventFieldEncoding`, `400 EventFieldTooLong`, `400 InvalidTraceParent`, etc.
 3. **Read-only field rejection.** If the publish body contains any `readOnly` field (`partition`, `sequence`, `sequence_time`), the broker rejects with `400 BadRequest` naming the offending field.
 4. **Event-type lookup.** The broker reads `event.type` (a GTS event-type identifier) and resolves it via `types_registry.get(event.type)`. Unknown event types are rejected with `404 EventTypeNotFound`.
-5. **Subject-type membership.** The event's `subject_type` MUST match one of the patterns in `event_type.allowed_subject_types`. Violations return `422 SubjectTypeNotAllowed`.
+5. **Subject-type membership.** `event.subject_type` is a GTS Type id (the *kind* of entity, not one instance of it) that MUST match one of the patterns in `event_type.allowed_subject_types` (concrete Type match, `.*` wildcard suffix, or bare base Type with implicit derived-type coverage). Violations return `400 SubjectTypeNotAllowed`; a malformed or instance-shaped `subject_type` itself returns `400 InvalidSubjectType`. (Corrected from an earlier `422` here, which was never reflected in the authoritative Hard-Error Catalog table below - that table's generic `InvalidArgument`/`400` mapping is what the implementation actually uses.)
 6. **Per-type `data_schema` validation.** The broker fetches `event_type.data_schema` (a JSON Schema embedded in the event-type registration record) and validates `event.data` against it. Validation failure returns `422 PayloadValidationFailed` with the JSON Schema error path. Events declared as body-less (no `data` allowed by the `data_schema`) reject publishes carrying `data`.
 7. **Partition derivation.** Per [`ADR/0002-partition-selection.md`](ADR/0002-partition-selection.md): `partition = murmur3_32(ascii_bytes(partition_key ?? tenant_id)) % topic.partitions`. The broker stamps `partition` server-side.
 8. **Producer-mode shape check.** If `meta` is present, the broker validates `meta.version`, `meta.producer_id`, and the chained / monotonic / stateless mode-shape per [`ADR/0004-idempotent-producer-protocol.md`](ADR/0004-idempotent-producer-protocol.md).
@@ -575,14 +575,20 @@ modules/system/event-broker/
         ├── module.rs              # ModKit module wiring & deployment mode selection
         ├── config.rs              # EventBrokerConfig
         ├── api/rest/              # Transport layer
-        │   ├── handlers/
-        │   │   ├── ingest.rs      # POST /v1/events, POST /v1/events:batch
-        │   │   ├── producers.rs   # POST /v1/producers, GET cursors, POST :reset
-        │   │   ├── delivery.rs    # GET /v1/events:stream, GET /v1/events:sse
-        │   │   ├── topics.rs      # GET /v1/topics, GET /v1/topics/segments
-        │   │   ├── event_types.rs # GET /v1/event-types
-        │   │   ├── consumer_groups.rs # CRUD for consumer groups
-        │   │   └── subscriptions.rs # JOIN, list, read, leave, seek
+        │   ├── handlers/          # Split by domain service, not by entity -
+        │   │   │                 # every handler calls exactly one of
+        │   │   │                 # IngestService/DeliveryService (below)
+        │   │   ├── action_suffix.rs # Shared `:action` path-suffix parsing (matchit
+        │   │   │                    # limitation, gears-rust#4463)
+        │   │   ├── ingest/       # IngestService-backed handlers
+        │   │   │   ├── events.rs      # POST /v1/events, POST /v1/events:batch
+        │   │   │   ├── producers.rs   # POST /v1/producers, GET cursors, POST :reset
+        │   │   │   ├── topics.rs      # GET /v1/topics, GET /v1/topics/segments
+        │   │   │   └── event_types.rs # GET /v1/event-types
+        │   │   └── delivery/     # DeliveryService-backed handlers
+        │   │       ├── streaming.rs   # GET /v1/events:stream, GET /v1/events:sse
+        │   │       ├── consumer_groups.rs # CRUD for consumer groups
+        │   │       └── subscriptions.rs # JOIN, list, read, leave, seek
         │   ├── routes/            # OperationBuilder route registration
         │   ├── dto.rs             # REST DTOs (serde + utoipa)
         │   ├── error.rs           # Error response mapping
@@ -597,10 +603,18 @@ modules/system/event-broker/
         │   ├── idempotency.rs     # Idempotency key computation and checking
         │   └── error.rs           # DomainError
         ├── infra/                 # Infrastructure implementations
-        │   ├── storage/           # Storage backend plugin resolution
-        │   │   ├── registry.rs    # StorageBackendRegistry (GTS discovery + resolution)
-        │   │   └── builtin/      # Built-in backend (in-memory for dev/test)
-        │   │       └── memory.rs  # InMemoryStorageBackend
+        │   ├── storage/           # Storage facade + the real, durable SQLite backend
+        │   │   │                 # (eb-single-process-implementation D3 - superseded
+        │   │   │                 # the planned StorageBackendRegistry/InMemoryStorageBackend
+        │   │   │                 # shells below; backend RESOLUTION itself lives in
+        │   │   │                 # domain/backend.rs's BackendResolver/SingleBackendResolver,
+        │   │   │                 # not here - a domain decision, not infra bookkeeping)
+        │   │   ├── storage.rs     # Storage: ConsumerGroupRepo/CursorRepo/SubscriptionRepo/
+        │   │   │                 # ActiveStreamMarker/DeliveryNotifier
+        │   │   ├── entity/        # SeaORM entities
+        │   │   ├── migrations/    # SeaORM migrations
+        │   │   └── builtin/
+        │   │       └── sqlite.rs  # SqliteEventBackend - the real EventBrokerBackend impl
         │   ├── cluster/           # ClusterCapabilities integration
         │   │   └── notifications.rs # Event notification via cluster.publish/subscribe
         │   ├── workers/           # Background workers (broker-owned only;
@@ -735,6 +749,19 @@ Key methods:
 - `get_topic(gts_id) → Option<Topic>`
 - `get_event_type(gts_id) → Option<EventType>`
 - `validate_event_data(event_type, data) → Result<()>`
+
+**Current implementation status** (`eb-gts-type-registration`): `cf.core.events.topic.v1~`/
+`cf.core.events.event_type.v1~` are registered as base GTS type schemas in `event-broker-sdk`
+(`#[gts_type_schema(..., base = true)]`), discoverable via the process-wide `toolkit-gts` inventory
+and auto-seeded into `types-registry` at startup. `SpecificationManager` itself has a real,
+`types-registry`-backed production implementation (`infra/specification.rs`'s
+`TypesRegistrySpecificationManager`, resolving `TypesRegistryClient` via `ClientHub`) - it queries
+`register_instances`/`get_instance`/`list_instances` directly per call, with no caching,
+hash-based change detection, or indexed UUID lookup yet (all still aspirational, as described above).
+This supersedes the previously-stale `infra/type_provisioning.rs`/`#4346`/`#4347` pointer (that file
+was a dead, never-called `todo!()` stub and has been deleted - those tickets never actually tracked
+this work). `TopicRepo`/`EventRepo` (event/cursor storage, a separate concern from topic/event-type
+*metadata*) remain `InMemoryDomainRepo`-backed, pending `#4347`/`#4348`'s real storage-backend work.
 
 ##### ClusterCapabilities (Platform Dependency)
 
@@ -1494,7 +1521,7 @@ Errors:
 - `400` — Invalid GTS type format, missing required fields, or chained/monotonic mode invariant violated (e.g., `previous` set without `sequence`)
 - `403` — Caller's principal doesn't match the registered owner of `Producer-Id`
 - `404` — Topic, event type, or producer not found
-- `400 SequenceViolation` — chained mode: `meta.previous` doesn't match the broker's `last_sequence` for this `(producer_id, topic, partition)`. Response carries broker's known `last_sequence`. Recover via `GET /v1/producers/{producer_id}/cursors`.
+- `412 SequenceViolation` — chained mode: `meta.previous` doesn't match the broker's `last_sequence` for this `(producer_id, topic, partition)`. Response carries broker's known `last_sequence`. Recover via `GET /v1/producers/{producer_id}/cursors`.
 - `422` — Payload validation failed (data doesn't match event type schema)
 - `503 BackendUnavailable` — (sync mode only) backend is currently unavailable; retry later
 
@@ -1507,7 +1534,7 @@ Limits and rules:
 - Maximum 1MB total payload
 - **All events MUST share the same `topic` AND the same `partition`** — mixed-partition batches are rejected with `400 MixedPartitionBatch`. Reasons: dispatcher routes by `(topic, partition)`; per-partition write is the natural atomic unit; producer SDK batching naturally groups by `(topic, partition)`.
 - All events from the same producer must form a contiguous chain (each event's `previous` matches the prior event's `sequence`) in chained mode
-- All-or-nothing: if any event fails dedup validation, the entire batch is rejected with `400 SequenceViolation` (chained mode) or `400` (chain shape violation)
+- All-or-nothing: if any event fails dedup validation, the entire batch is rejected with `412 SequenceViolation` (chained mode) or `400` (chain shape violation)
 
 **Response shape depends on persist mode** (same async/sync rules as `POST /v1/events`):
 
@@ -1533,9 +1560,9 @@ Limits and rules:
 Errors:
 - `400 MixedPartitionBatch` — Batch contains events from different `(topic, partition)` combinations
 - `400 InvalidPartition` — Partition out of range
-- `400 BatchTooLarge` — Batch exceeds size limits (event count or total bytes)
+- `413 BatchTooLarge` — Batch exceeds size limits (event count or total bytes)
 - `400 SyncNotSupported` — Sync mode requested but backend doesn't support it
-- `400 SequenceViolation` — chained mode: a chain link in the batch doesn't match the broker's `last_sequence`. Atomic batch rejection.
+- `412 SequenceViolation` — chained mode: a chain link in the batch doesn't match the broker's `last_sequence`. Atomic batch rejection.
 - `503 BackendUnavailable` — (sync mode only) backend is currently unavailable
 
 A producer publishing to multiple partitions sends multiple batches (one per partition).
@@ -1575,11 +1602,11 @@ POST   /v1/events                                # PUBLISH (with dedup)
            sequence:    <i64>                   # monotonic chain counter
            previous:    <i64>                   # chained only: last accepted sequence
        Returns 202 | 201 | 200 (duplicate — echoes original event)
-       Returns 400: SequenceViolation            # chain broken; see RECOVERY below
+       Returns 412: SequenceViolation            # chain broken; see RECOVERY below
 
 GET    /v1/producers/{id}/cursors                # RECOVERY — read broker's last_sequence
                                                  # Use when local chain state is lost or diverged
-                                                 # (DB restore, restart, 400 SequenceViolation).
+                                                 # (DB restore, restart, 412 SequenceViolation).
        Returns 200:
          {producer_id, client_agent,             # reconcile local counter against broker's view
           topics:[{topic, partitions:[{partition, last_sequence}]}]}
@@ -1677,11 +1704,6 @@ Each built-in `OffsetManager` (`LocalDbOffsetManager`, `InMemoryOffsetManager`) 
 #### Topic Introspection
 
 **GET /v1/topics** — List available topics.
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `topic` | String (GTS) | No | Filter by topic identifier (wildcards allowed) |
-| `limit` | i32 | No | Records per page (default: 100, max: 100) |
 
 Response: `200 OK`
 
@@ -1847,13 +1869,15 @@ Ungraceful kill (SIGKILL / crash) skips steps 1–3: consumer connections drop, 
 
 **ID**: `cpt-cf-evbk-interface-error-codes`
 
-All errors follow RFC 9457 Problem Details (`application/problem+json`) using the canonical `toolkit-canonical-errors` categories. The `type` field is always a canonical GTS category URI of the form `gts://gts.cf.core.errors.err.v1~cf.core.err.<category>.v1~`. `status` is the value returned by `CanonicalError::status_code()` for that category; Event Broker does not apply local HTTP status overrides. Domain identity (which specific resource was not found, which field failed, etc.) is expressed via `context.resource_type` / `context.resource_name` or structured violation arrays — not via a domain-specific `type` URI.
+All errors follow RFC 9457 Problem Details (`application/problem+json`) using the canonical `toolkit-canonical-errors` categories. The `type` field is always a canonical GTS category URI of the form `gts://gts.cf.core.errors.err.v1~cf.core.err.<category>.v1~`. `status` is the value returned by `CanonicalError::status_code()` for that category, except for `SequenceViolation`/`BatchTooLarge`, which use a `TransportOverride` (`canonical-error-transport-overrides`, `gears-rust#4465`) to surface the literal `412`/`413` this doc's contract has always specified while keeping their canonical `FailedPrecondition`/`InvalidArgument` category (`type`/`title` unaffected). Domain identity (which specific resource was not found, which field failed, etc.) is expressed via `context.resource_type` / `context.resource_name` or structured violation arrays — not via a domain-specific `type` URI.
 
 | Domain error | HTTP | Canonical category | `type` URI suffix | Retriable | `context` |
 |---|---|---|---|---|---|
 | InvalidType, InvalidOffset, InvalidSequence, InvalidPartition | 400 | `InvalidArgument` | `invalid_argument` | No | `field_violations` or `constraint` |
-| MixedPartitionBatch, BatchTooLarge, InvalidConsumerGroupId, NamedGroupRequiresRegistry, SyncNotSupported | 400 | `InvalidArgument` | `invalid_argument` | No | `constraint` |
+| MixedPartitionBatch, InvalidConsumerGroupId, NamedGroupRequiresRegistry, SyncNotSupported | 400 | `InvalidArgument` | `invalid_argument` | No | `constraint` |
+| BatchTooLarge | 413 (`TransportOverride`; category is `InvalidArgument`) | `InvalidArgument` | `invalid_argument` | No | `format: <detail>` |
 | ValidationError | 400 | `InvalidArgument` | `invalid_argument` | No | `field_violations` — one per validator diagnostic |
+| InvalidSubjectType, SubjectTypeNotAllowed, InvalidSubjectTypePattern | 400 | `InvalidArgument` | `invalid_argument` | No | `format: <detail>` |
 | TopicNotFound | 404 | `NotFound` | `not_found` | No | `resource_type: "gts.cf.core.events.topic.v1~"`, `resource_name: <topic>` |
 | EventTypeNotFound | 404 | `NotFound` | `not_found` | No | `resource_type: "gts.cf.core.events.event_type.v1~"`, `resource_name: <type>` |
 | SubscriptionNotFound | 404 | `NotFound` | `not_found` | No | `resource_type: "gts.cf.core.events.subscription.v1~"`, `resource_name: <id>` |
@@ -1863,7 +1887,7 @@ All errors follow RFC 9457 Problem Details (`application/problem+json`) using th
 | ConsumerGroupAlreadyExists | 400 | `FailedPrecondition` | `failed_precondition` | No | `violations: [{type: "already_exists", subject: <group_id>, description: <detail>}]` |
 | ConsumerGroupHasActiveMembers | 400 | `FailedPrecondition` | `failed_precondition` | No | `violations: [{type: "has_active_members", subject: <group_id>, description: <detail>}]` |
 | PositionsNotSet | 400 | `FailedPrecondition` | `failed_precondition` | No | `violations`: one `{type: "cursor_missing", subject: "<topic>:<partition>", description: "no committed cursor"}` per unseeded partition |
-| SequenceViolation | 400 | `FailedPrecondition` | `failed_precondition` | No | `violations: [{type: "sequence_mismatch", subject: "(producer)", description: "expected_previous=<n>"}]` |
+| SequenceViolation | 412 (`TransportOverride`; category is `FailedPrecondition`) | `FailedPrecondition` | `failed_precondition` | No | `violations: [{type: "sequence_mismatch", subject: "(producer)", description: "expected_previous=<n>"}]` |
 | RateLimitExceeded | 429 | `ResourceExhausted` | `resource_exhausted` | Yes | `violations: [{subject: "publish-quota", description: <detail>, retry_after_seconds: <n>}]` |
 | BackendUnavailable, NoIngestForTopic | 503 | `ServiceUnavailable` | `service_unavailable` | Yes | `{}` or `retry_after_seconds: <n>` |
 | Internal broker invariant failure | 500 | `Internal` | `internal` | No | `{}` — no server-side diagnostic on wire |
@@ -1929,6 +1953,22 @@ Both must pass on publish; both must pass at subscribe. They cover different con
 - Combined `AccessScope` from the group + topic + event_type + subject_type checks is cached with the subscription. Every subsequent poll applies these constraints to the read query.
 
 **Stream / seek / leave** — no re-check. Authorization is done at JOIN; the cached AccessScope governs all subsequent reads. `subscription_id` is the bearer of authority for follow-up operations. There is no separate `manage` permission — subscription create / list / read / seek / leave are gated by the same `consume` permission.
+
+**Current implementation status** (`gears-rust#4516`, `eb-authz-enforcement`): the publish and JOIN
+paths above are implemented exactly to the subset `docs/openapi.yaml` documents — `event_type:produce`
+plus tenant scope on publish, and `topic:consume` / `event_type:consume` plus tenant scope on JOIN,
+each `403` before the corresponding lookup/subscription-creation step. `topic:produce`,
+`subject_type:produce`, `subject_type:consume`, and the named/anonymous consumer-group
+ownership check (`403 ConsumerGroupNotOwned`) described above remain unimplemented — this is a
+deliberate scope-cut against `#4516`'s narrower Definition of Done, not a silent omission, and is
+tracked as its own follow-up. Tenant scope is enforced via its own `authz-resolver` PEP call
+(`domain::authz::TENANT_SCOPE_RESOURCE`, `pep_properties::OWNER_TENANT_ID`), not a separate
+`tenant-resolver-sdk` dependency — whether it actually enforces tenant hierarchy (vs. e.g. always
+allowing) is entirely the deployed authz-resolver plugin/policy's concern, mirroring `oagw`'s
+`bind.rs::validate_bind_constraints` precedent. The cached-`AccessScope`-on-JOIN / row-level-read-filtering model
+described above is also not yet implemented: today's checks are a pass/fail gate only
+(`require_constraints(false)`), and `stream`/`seek`/`leave` genuinely do no re-check, matching this
+section's "no re-check" line, but with no `AccessScope` to constrain them either.
 
 **Define path** — ABI / operator registration time:
 - `(topic_resource, "define", topic.id)` for each topic being registered
@@ -2005,7 +2045,7 @@ sequenceDiagram
     alt Duplicate (meta.sequence <= last_sequence)
         IS-->>API: 200 OK (original event)
     else Chain mismatch (chained mode: meta.previous != last_sequence)
-        IS-->>API: 400 SequenceViolation
+        IS-->>API: 412 SequenceViolation
     else Valid (chain advances)
         IS->>OB: BEGIN; outbox.enqueue(topic, partition, event); UPDATE evbk_producer_state SET last_sequence = meta.sequence; UPDATE evbk_producer SET last_seen_at = now(); COMMIT
         Note over IS,OB: Atomic: enqueue + chain advance<br/>Outbox sequencer assigns its internal queue order<br/>(NOT the consumer-visible offset)
@@ -2153,11 +2193,11 @@ Columns: `producer_id` (FK → `evbk_producer`, `ON DELETE CASCADE`), `topic`, `
 
 Producer chain state is keyed by `(producer_id, topic, partition)` — global, not narrowed by tenant. `last_sequence` tracks the highest producer-set `meta.sequence` accepted from this producer for this `(topic, partition)`. The Reaper worker cleans up records where `last_seen_at` is older than the topic's `retention` (capped at `P14D`). Separately, the Reaper cascade-deletes state rows when the parent `evbk_producer` registration row is aged out by the platform-wide producer-registration TTL.
 
-**Chain check at ingest** (chained mode): on incoming event with `meta.{previous, sequence}`, the broker verifies `meta.previous == state.last_sequence` AND `meta.sequence > state.last_sequence`. Match → accept and update `last_sequence = meta.sequence`. Previous mismatch → `400 SequenceViolation` (producer's view of the chain disagrees with the broker's; producer should call `GET /v1/producers/{producer_id}/cursors` to recover). `meta.sequence <= state.last_sequence` → duplicate, return original event with `200 OK`.
+**Chain check at ingest** (chained mode): on incoming event with `meta.{previous, sequence}`, the broker verifies `meta.previous == state.last_sequence` AND `meta.sequence > state.last_sequence`. Match → accept and update `last_sequence = meta.sequence`. Previous mismatch → `412 SequenceViolation` (producer's view of the chain disagrees with the broker's; producer should call `GET /v1/producers/{producer_id}/cursors` to recover). `meta.sequence <= state.last_sequence` → duplicate, return original event with `200 OK`.
 
 **Monotonicity check at ingest** (monotonic mode, `meta.previous` MUST be absent): just `meta.sequence > state.last_sequence`. Gaps allowed in MVP; future enforcement settable at registration.
 
-Concurrent updates to a single `(producer_id, topic, partition)` row act as the fencing mechanism — exactly one writer advances `last_sequence` at a time. Producers that race lose to the unique-index serialization and see `400 SequenceViolation`; recovery via the desync mechanism.
+Concurrent updates to a single `(producer_id, topic, partition)` row act as the fencing mechanism — exactly one writer advances `last_sequence` at a time. Producers that race lose to the unique-index serialization and see `412 SequenceViolation`; recovery via the desync mechanism.
 
 #### Two Sequences (Single Source of Truth Each)
 
@@ -2541,7 +2581,7 @@ The MVP is shaped so that all of the following are **additive non-breaking chang
 - **Topic soft-delete with grace-period serving**: topics marked deleted (or actually deleted in storage) keep being served by the event broker for a configurable grace period — existing consumers continue to drain events; new subscriptions / produces are rejected. Avoids breaking in-flight consumers when an operator decommissions a topic. Not in MVP.
 - **Backend-failure backpressure**: ingest may mark a topic as failed after persistent backend.persist errors and stop accepting new events for that topic, surfacing 503 to producers. Mechanism, thresholds, and recovery semantics are implementation-detail concerns deferred to the implementation phase.
 - **DB-restore resync tooling**: a CLI to recover from a broker DB restore by realigning `evbk_producer_state.last_sequence` per `(producer_id, topic, partition)` to match the storage backend's actual state — **producer-cursor desync**. (Consumer-cursor desync is no longer a DB-level concern: consumer cursors live in the ClusterCapabilities cache, not in SQL — see §3.6 Cursor.) Until the tooling exists, manual operator intervention (`UPDATE evbk_producer_state SET last_sequence = …`; consumer-side seek or cache flush as needed) is the only recovery path.
-- **SDK design and reference implementations**: Rust / TypeScript / Python / Go client trait shapes, error type mappings, retry / backoff defaults, broker discovery, reconnection semantics. The wire contract (REST endpoints, status codes, normative SDK behaviors on `410 Gone`, `400 SequenceViolation`, etc.) is fully specified in this design; per-language SDK realization is implementation-phase work shipping alongside the broker.
+- **SDK design and reference implementations**: Rust / TypeScript / Python / Go client trait shapes, error type mappings, retry / backoff defaults, broker discovery, reconnection semantics. The wire contract (REST endpoints, status codes, normative SDK behaviors on `410 Gone`, `412 SequenceViolation`, etc.) is fully specified in this design; per-language SDK realization is implementation-phase work shipping alongside the broker.
 - **Cross-tenant event sharing**: Hierarchical topic visibility for multi-tenant deployments
 - **Compatible schema evolution**: Forward/backward-compatible changes within a major event-type version (per GTS spec rules), plus broker- or SDK-side **inter-version casting** between minor versions (e.g., a v1.1 consumer reading a v1.2 event sees a v1.1-shaped projection). Allows long-lived event logs to evolve without forcing all consumers to migrate in lockstep.
 - **Backend instance migration**: Operator-driven topic-to-backend rebinding without downtime

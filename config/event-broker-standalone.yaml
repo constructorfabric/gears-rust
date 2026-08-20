@@ -1,0 +1,107 @@
+# Minimal working config for `cf-gears-event-broker-server` in standalone
+# mode (eb-single-process-implementation design.md D7) - one process, one
+# SQLite file, no cluster/network dependencies.
+#
+# Run it from the repo root:
+#   cargo run -p cf-gears-event-broker --bin cf-gears-event-broker-server \
+#     -- --config config/event-broker-standalone.yaml run
+#
+# Then, e.g.:
+#   curl http://127.0.0.1:8080/event-broker/v1/topics       # seeded demo topic below
+#   curl http://127.0.0.1:8080/event-broker/v1/event-types  # seeded demo event type
+#   curl http://127.0.0.1:8080/docs        # Swagger UI (enable_docs: true)
+#
+# Topics/event-types are `types-registry` instances - seeded here via its
+# `entities:` startup config (the same mechanism operators use via its
+# `POST /types-registry/v1/entities` REST API at runtime). Two things had to
+# be fixed in this crate for that seeding to actually reach `GET /v1/topics`:
+# `TopicV1`/`EventTypeV1` (event-broker-sdk/src/gts.rs) used to declare only
+# `id`, rejecting every other field on registration; and
+# `EventBrokerModule`'s `SpecificationManager::bulk_load()` used to run in
+# `init()`, before `types-registry`'s own `post_init` had committed
+# config-seeded entities to queryable storage - moved to `serve()`.
+
+server:
+  home_dir: "~/.cf-gears-event-broker"
+
+# The global `database:` section must be present (even empty) for ANY gear's
+# per-gear `database:` config below to be honored at all - `toolkit::
+# bootstrap::run::resolve_db_options` skips DB wiring entirely otherwise.
+database:
+  servers: {}
+
+gears:
+  types-registry:
+    config:
+      entities:
+        - id: "gts.cf.core.events.topic.v1~cf.core.demo.topic.v1"
+          partitions: 1
+          created_at: "2026-01-01T00:00:00Z"
+        - id: "gts.cf.core.events.event_type.v1~cf.core.demo.greeting.v1"
+          topic_id: "gts.cf.core.events.topic.v1~cf.core.demo.topic.v1"
+          allowed_subject_types: ["gts.cf.core.demo.subject.v1~"]
+          data_schema: {}
+          created_at: "2026-01-01T00:00:00Z"
+
+  # Binds the "event-broker" cluster profile (`domain::cluster::
+  # EventBrokerCluster::resolve`'s profile name) to the zero-dependency
+  # standalone cache provider - no external cache/coordination service
+  # needed for single-process deployments.
+  cluster:
+    config:
+      profiles:
+        event-broker:
+          cache:
+            provider: standalone
+
+  # AuthN/AuthZ pipelines - required for `api-gateway`'s route registration
+  # even with `auth_disabled: true` below (permission checks still run
+  # against a default-tenant SecurityContext). See `config/quickstart.yaml`
+  # for the full multi-gear pattern this is a minimal slice of.
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  authz-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      # `accept_all`: no real bearer-token verification. Fine here since
+      # `api-gateway.auth_disabled: true` below means this plugin's actual
+      # token check is never reached anyway - dev/local only either way.
+      mode: accept_all
+
+  static-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+  event-broker:
+    database:
+      # `engine` must be explicit here - there's no global `servers:`
+      # template to infer it from (see `config/quickstart.yaml`'s
+      # `sqlite_users` template for the alternative, multi-gear-sharing
+      # style).
+      engine: sqlite
+      file: "event_broker.db" # -> ~/.cf-gears-event-broker/event-broker/event_broker.db
+    config:
+      mode: standalone
+      # Not currently wired to anything (`SingleBackendResolver` always
+      # resolves the one compiled-in SQLite `EventBrokerBackend` regardless
+      # of this value) - kept because `EventBrokerConfig` requires it
+      # (deliberately not defaulted, matching `mode`, since a future
+      # multi-backend deployment would need it to be explicit).
+      default_storage_backend: sqlite
+
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8080"
+      enable_docs: true
+      # Single-user/local only - see the warning `api-gateway` itself logs
+      # at startup with this set. Real deployments need a real IdP wired
+      # through `authn-resolver` instead.
+      auth_disabled: true
