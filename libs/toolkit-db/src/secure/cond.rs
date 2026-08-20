@@ -115,9 +115,10 @@ where
     // Resource groups are tenant-scoped. A group predicate without a tenant
     // filter in the same AND constraint would become an independent access
     // path when constraints are OR-ed, allowing group membership to escape the
-    // mandatory tenant boundary. Enforce this at the SQL compiler as well as
-    // the AuthZ response compiler so direct `AccessScope` construction cannot
-    // bypass the invariant.
+    // mandatory tenant boundary. The single membership-type mapping also
+    // describes only the entity resource ID, never another property. Enforce
+    // both rules at the SQL compiler as well as the AuthZ response compiler so
+    // direct `AccessScope` construction cannot bypass either invariant.
     let has_group_filter = constraint.filters().iter().any(|filter| {
         matches!(
             filter,
@@ -131,7 +132,13 @@ where
                 ScopeFilter::Eq(_) | ScopeFilter::In(_) | ScopeFilter::InTenantSubtree(_)
             )
     });
-    if has_group_filter && !has_tenant_filter {
+    let has_group_filter_on_non_resource_property = constraint.filters().iter().any(|filter| {
+        matches!(
+            filter,
+            ScopeFilter::InGroup(_) | ScopeFilter::InGroupSubtree(_)
+        ) && filter.property() != pep_properties::RESOURCE_ID
+    });
+    if has_group_filter && (!has_tenant_filter || has_group_filter_on_non_resource_property) {
         return None;
     }
 
@@ -512,6 +519,27 @@ mod tests {
         assert!(
             cond_str.contains("Value(Bool(Some(false)))"),
             "a group filter without tenant scope must fail closed, got: {cond_str}"
+        );
+    }
+
+    #[test]
+    fn test_direct_group_filter_on_non_resource_property_denies_all() {
+        let tenant_id = uuid::Uuid::new_v4();
+        let group_id = uuid::Uuid::new_v4();
+        let scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group_typed(
+                "department_id",
+                MEMBERSHIP_TYPE,
+                vec![ScopeValue::Uuid(group_id)],
+            ),
+        ]));
+
+        let cond = build_scope_condition::<custom_prop_entity::Entity>(&scope);
+        let cond_str = format!("{cond:?}");
+        assert!(
+            cond_str.contains("Value(Bool(Some(false)))"),
+            "a group filter on a non-resource property must fail closed, got: {cond_str}"
         );
     }
 

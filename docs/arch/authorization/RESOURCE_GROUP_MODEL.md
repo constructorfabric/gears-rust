@@ -85,11 +85,28 @@ the platform's mandatory tenant boundary and is rejected fail-closed.
 
 The native SQL casts the querying entity's ID to text, rather than casting RG's
 opaque `resource_id` to UUID, because non-UUID member identifiers are valid.
+The comparison is intentionally an exact textual comparison: consuming gears
+must write membership IDs in the same canonical representation produced by the
+entity column's text cast. UUID-backed resources should use lowercase hyphenated
+UUID strings (for example, `Uuid::to_string()`); RG treats IDs as opaque and does
+not normalize uppercase, brace, URN, or unhyphenated variants. Text-backed ID
+columns and projections must use deterministic, case-sensitive equality so
+identifiers that differ by case are not conflated.
+
 Casting the entity key can prevent PostgreSQL from using its ordinary native-type
 index for the group condition alone. Deployments that enable native predicates
-for large tables should confirm plans with `EXPLAIN` and consider an expression
-index on the exact `CAST(id AS text)` expression when profiling shows it is
-needed.
+for large tables should confirm plans with `EXPLAIN`. When group filtering is
+selective within a large tenant, a composite expression index matching the
+physical tenant and resource columns lets PostgreSQL drive the entity lookup
+from the membership result instead of scanning all tenant rows:
+
+```sql
+CREATE INDEX resource_tenant_id_text_idx
+    ON resource_table (tenant_id, (CAST(id AS text)));
+```
+
+The exact table and column names belong in the consuming gear's migration; the
+generic toolkit cannot create this index on behalf of arbitrary entities.
 
 - RG canonical table schemas: [RG DESIGN §Database Schemas](../../../gears/system/resource-group/docs/DESIGN.md#37-database-schemas--tables)
 - When to use which table: [AUTHZ_USAGE_SCENARIOS §Choosing Projection Tables](./AUTHZ_USAGE_SCENARIOS.md#choosing-projection-tables)
