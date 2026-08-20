@@ -30,13 +30,18 @@
 //! cannot be handed an edge where a vertex belongs.
 
 use std::collections::BTreeSet;
+use std::marker::PhantomData;
+use std::sync::Arc;
 
-use sea_orm::EntityTrait;
+use sea_orm::sea_query::{Alias, IntoIden, SelectStatement, TableRef};
+use sea_orm::{Condition, EntityTrait, FromQueryResult, QueryTrait, StatementBuilder};
 use toolkit_sea_orm_pgq::{
     EdgeTable, ElementKey, EndpointRef, PropertyGraph as GraphDdl, VertexTable,
 };
 
-use crate::secure::{ScopableEntity, ScopeError};
+use crate::secure::cond::{ColumnAddress, SiblingSupport, build_scope_predicate};
+use crate::secure::select::{Scoped, SecureSelect};
+use crate::secure::{AccessScope, DBRunner, DBRunnerInternal, ScopableEntity, ScopeError};
 
 /// A property graph the platform declares.
 ///
@@ -253,4 +258,400 @@ fn into_endpoint(endpoint: Endpoint) -> Result<EndpointRef, ScopeError> {
 /// caller mistake.
 fn syntax_error(_: toolkit_sea_orm_pgq::PgqError) -> ScopeError {
     ScopeError::Invalid("the property-graph declaration could not be rendered")
+}
+
+// ───────────────────────── the secure graph query ─────────────────────────
+
+/// A graph query whose every element carries the caller's scope.
+///
+/// Reachable only from a scoped select, mirroring `with_ctes`: the scope the
+/// elements inherit is the one the outer query already carries, so a
+/// differently-scoped element cannot be constructed.
+pub struct SecureGraphSelect<E: EntityTrait, G: PropertyGraph> {
+    /// Outer query, scope `WHERE` already embedded by `scope_with`. Its table is
+    /// the anchor a pattern may correlate against.
+    outer: SelectStatement,
+    /// Seeds every element predicate. This is what makes same-scope structural.
+    scope: Arc<AccessScope>,
+    pattern: Option<PathState>,
+    columns: Vec<toolkit_sea_orm_pgq::ProjectedColumn>,
+    /// Relations the element predicates correlate against, deduplicated by
+    /// alias so one relation referenced by several elements is placed once.
+    siblings: Vec<SiblingPlacement>,
+    /// The first refusal raised inside a builder closure.
+    ///
+    /// The closures cannot return `Result`, so a refusal is carried here and
+    /// surfaced at execution. What matters is that it is not silent: the query
+    /// never runs with a missing predicate.
+    error: Option<ScopeError>,
+    graph_alias: &'static str,
+    _marker: PhantomData<(E, G)>,
+}
+
+/// A correlated relation and the alias it is placed under.
+#[derive(Clone)]
+struct SiblingPlacement {
+    alias: String,
+    query: SelectStatement,
+}
+
+/// Pattern under construction, with the pending edge a hop needs.
+#[derive(Default)]
+struct PathState {
+    head: Option<toolkit_sea_orm_pgq::Element>,
+    hops: Vec<(
+        toolkit_sea_orm_pgq::Element,
+        toolkit_sea_orm_pgq::Direction,
+        toolkit_sea_orm_pgq::Element,
+    )>,
+    pending_edge: Option<(toolkit_sea_orm_pgq::Element, toolkit_sea_orm_pgq::Direction)>,
+}
+
+impl<E> SecureSelect<E, Scoped>
+where
+    E: EntityTrait,
+{
+    /// Begin a graph query over `G`.
+    ///
+    /// Every pattern element registered on the result is scoped with **this**
+    /// query's `AccessScope`. The outer query stays in the `FROM` as the anchor,
+    /// which is what lets a pattern correlate against an already-scoped entity
+    /// query — the "start from these rows and walk out one hop" shape.
+    #[must_use]
+    pub fn with_graph<G: PropertyGraph>(self) -> SecureGraphSelect<E, G> {
+        let scope = self.scope_arc();
+        SecureGraphSelect {
+            outer: QueryTrait::into_query(self.into_inner()),
+            scope,
+            pattern: None,
+            columns: Vec::new(),
+            siblings: Vec::new(),
+            error: None,
+            graph_alias: "cf_graph",
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Builds the pattern, attaching scope to every element as it is added.
+///
+/// Elements are addressed by entity type, never by label: security is decided
+/// per entity, and one label may span several element tables, so a
+/// label-addressed element would have several security mappings (Policy 1).
+pub struct PathBuilder<G: PropertyGraph> {
+    scope: Arc<AccessScope>,
+    state: PathState,
+    siblings: Vec<SiblingPlacement>,
+    error: Option<ScopeError>,
+    _marker: PhantomData<G>,
+}
+
+impl<G: PropertyGraph> PathBuilder<G> {
+    /// Start the pattern at a vertex.
+    #[must_use]
+    pub fn vertex<J>(mut self, variable: &'static str) -> Self
+    where
+        J: VertexOf<G>,
+        J::Column: sea_orm::ColumnTrait + Copy,
+    {
+        match self.scoped_element::<J>(variable, J::LABEL) {
+            Ok(element) => {
+                if self.state.head.is_some() {
+                    self.fail(ScopeError::Invalid(
+                        "a pattern has one head vertex; reach the others with edge_to/edge_from",
+                    ));
+                } else {
+                    self.state.head = Some(element);
+                }
+            }
+            Err(e) => self.fail(e),
+        }
+        self
+    }
+
+    /// Follow an edge away from the current vertex.
+    #[must_use]
+    pub fn edge_to<J>(mut self, variable: &'static str) -> Self
+    where
+        J: EdgeOf<G>,
+        J::Column: sea_orm::ColumnTrait + Copy,
+    {
+        self.edge::<J>(variable, toolkit_sea_orm_pgq::Direction::Outgoing);
+        self
+    }
+
+    /// Follow an edge into the current vertex.
+    #[must_use]
+    pub fn edge_from<J>(mut self, variable: &'static str) -> Self
+    where
+        J: EdgeOf<G>,
+        J::Column: sea_orm::ColumnTrait + Copy,
+    {
+        self.edge::<J>(variable, toolkit_sea_orm_pgq::Direction::Incoming);
+        self
+    }
+
+    /// Complete the hop at a vertex.
+    #[must_use]
+    pub fn to<J>(mut self, variable: &'static str) -> Self
+    where
+        J: VertexOf<G>,
+        J::Column: sea_orm::ColumnTrait + Copy,
+    {
+        let Some((edge, direction)) = self.state.pending_edge.take() else {
+            self.fail(ScopeError::Invalid(
+                "to() completes a hop; call edge_to() or edge_from() first",
+            ));
+            return self;
+        };
+        match self.scoped_element::<J>(variable, J::LABEL) {
+            Ok(target) => self.state.hops.push((edge, direction, target)),
+            Err(e) => self.fail(e),
+        }
+        self
+    }
+
+    fn edge<J>(&mut self, variable: &'static str, direction: toolkit_sea_orm_pgq::Direction)
+    where
+        J: EdgeOf<G>,
+        J::Column: sea_orm::ColumnTrait + Copy,
+    {
+        if self.state.head.is_none() {
+            self.fail(ScopeError::Invalid(
+                "a pattern starts at a vertex; call vertex() before an edge",
+            ));
+            return;
+        }
+        if self.state.pending_edge.is_some() {
+            self.fail(ScopeError::Invalid(
+                "two edges in a row; complete the hop with to() first",
+            ));
+            return;
+        }
+        match self.scoped_element::<J>(variable, J::LABEL) {
+            Ok(element) => self.state.pending_edge = Some((element, direction)),
+            Err(e) => self.fail(e),
+        }
+    }
+
+    /// Build one element with its scope predicate attached.
+    ///
+    /// Policy 2 first: an entity that resolves no scope column is refused here,
+    /// because after a condition exists it is indistinguishable from a
+    /// legitimate deny-all.
+    fn scoped_element<J>(
+        &mut self,
+        variable: &'static str,
+        label: &'static str,
+    ) -> Result<toolkit_sea_orm_pgq::Element, ScopeError>
+    where
+        J: ScopableEntity + EntityTrait,
+        J::Column: sea_orm::ColumnTrait + Copy,
+    {
+        if J::scope_columns().is_empty() {
+            return Err(ScopeError::Invalid(
+                "a graph element must resolve at least one scope column; \
+                 an element that resolves none would traverse as a silent deny-all",
+            ));
+        }
+
+        let predicate = build_scope_predicate::<J>(
+            &self.scope,
+            ColumnAddress::GraphElement {
+                var: variable,
+                siblings: SiblingSupport::Allowed,
+            },
+        )?;
+        let (condition, siblings) = predicate.into_parts();
+
+        for sibling in siblings {
+            // Deduplicated by alias: the same scope compiled for two elements
+            // names the same relation, and placing it twice would turn the
+            // correlation into a cross join and multiply rows.
+            if !self.siblings.iter().any(|p| p.alias == sibling.alias) {
+                self.siblings.push(SiblingPlacement {
+                    alias: sibling.alias,
+                    query: sibling.query,
+                });
+            }
+        }
+
+        Ok(toolkit_sea_orm_pgq::Element::new(variable, label).and_where(condition))
+    }
+
+    fn fail(&mut self, error: ScopeError) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+    }
+}
+
+impl<E, G> SecureGraphSelect<E, G>
+where
+    E: EntityTrait,
+    G: PropertyGraph,
+{
+    /// Describe the pattern.
+    ///
+    /// Scope is attached to every element as it is added, so a predicate the
+    /// closure adds afterwards narrows the element rather than replacing what
+    /// the library put there.
+    #[must_use]
+    pub fn match_path(mut self, f: impl FnOnce(PathBuilder<G>) -> PathBuilder<G>) -> Self {
+        let builder = f(PathBuilder {
+            scope: Arc::clone(&self.scope),
+            state: PathState::default(),
+            siblings: Vec::new(),
+            error: None,
+            _marker: PhantomData,
+        });
+
+        if let Some(error) = builder.error {
+            self.fail(error);
+            return self;
+        }
+        if builder.state.pending_edge.is_some() {
+            self.fail(ScopeError::Invalid(
+                "the pattern ends on an edge; complete the hop with to()",
+            ));
+            return self;
+        }
+
+        for sibling in builder.siblings {
+            if !self.siblings.iter().any(|p| p.alias == sibling.alias) {
+                self.siblings.push(sibling);
+            }
+        }
+        self.pattern = Some(builder.state);
+        self
+    }
+
+    /// Project a graph property into the result, and select it in the outer
+    /// query.
+    ///
+    /// Selecting it here as well is deliberate: a `COLUMNS` entry nothing selects
+    /// transfers nothing, and a caller that has just named the properties it
+    /// wants should not have to name them twice.
+    #[must_use]
+    pub fn column(
+        mut self,
+        variable: &'static str,
+        property: &'static str,
+        alias: &'static str,
+    ) -> Self {
+        self.columns.push(toolkit_sea_orm_pgq::ProjectedColumn::new(
+            variable, property, alias,
+        ));
+        // First projected column replaces the anchor's `SELECT *`: a graph query
+        // asked for graph columns.
+        if self.columns.len() == 1 {
+            self.outer.clear_selects();
+        }
+        self.outer.expr_as(
+            sea_orm::sea_query::Expr::col((Alias::new(self.graph_alias), Alias::new(alias))),
+            Alias::new(alias),
+        );
+        self
+    }
+
+    /// Narrow the outer query, on top of the scope the elements already carry.
+    #[must_use]
+    pub fn filter(mut self, filter: Condition) -> Self {
+        self.outer.cond_where(filter);
+        self
+    }
+
+    /// Cap the number of rows.
+    #[must_use]
+    pub fn limit(mut self, limit: u64) -> Self {
+        self.outer.limit(limit);
+        self
+    }
+
+    /// Deduplicate the outer result.
+    #[must_use]
+    pub fn distinct(mut self) -> Self {
+        self.outer.distinct();
+        self
+    }
+
+    fn fail(&mut self, error: ScopeError) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+    }
+
+    /// Assemble the statement: the anchor, the correlated siblings, and the
+    /// pattern, in one `FROM`.
+    fn build(mut self) -> Result<SelectStatement, ScopeError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let Some(state) = self.pattern else {
+            return Err(ScopeError::Invalid(
+                "a graph query needs a pattern; call match_path()",
+            ));
+        };
+        let Some(head) = state.head else {
+            return Err(ScopeError::Invalid(
+                "a graph query needs a head vertex; call vertex()",
+            ));
+        };
+
+        let mut pattern = toolkit_sea_orm_pgq::GraphPattern::new(head);
+        for (edge, direction, target) in state.hops {
+            pattern = pattern.hop(edge, direction, target);
+        }
+
+        let mut table = toolkit_sea_orm_pgq::GraphTable::new(G::GRAPH_NAME, pattern);
+        for column in self.columns {
+            table = table.column(column);
+        }
+
+        // Siblings first, then the pattern: a comma join, which PostgreSQL
+        // treats as an implicit lateral, so the pattern's correlated references
+        // resolve. `LATERAL` itself is refused before `GRAPH_TABLE`.
+        for sibling in self.siblings {
+            self.outer.from(TableRef::SubQuery(
+                Box::new(sibling.query),
+                Alias::new(sibling.alias.as_str()).into_iden(),
+            ));
+        }
+        self.outer.from(
+            table
+                .into_table_ref(self.graph_alias)
+                .map_err(|_| ScopeError::Invalid("the graph pattern could not be rendered"))?,
+        );
+
+        Ok(self.outer)
+    }
+
+    /// Render the statement without executing it.
+    ///
+    /// # Errors
+    /// Returns [`ScopeError::Invalid`] for a pattern that cannot be built.
+    pub fn build_statement(
+        self,
+        backend: sea_orm::DbBackend,
+    ) -> Result<sea_orm::Statement, ScopeError> {
+        let query = self.build()?;
+        Ok(StatementBuilder::build(&query, &backend))
+    }
+
+    /// Execute and deserialize into `T`.
+    ///
+    /// # Errors
+    /// Returns [`ScopeError::Invalid`] for a pattern that cannot be built, or
+    /// [`ScopeError::Db`] when the query fails.
+    pub async fn all_as<T>(self, runner: &impl DBRunner) -> Result<Vec<T>, ScopeError>
+    where
+        T: FromQueryResult + Send + Sync,
+    {
+        let exec = DBRunnerInternal::as_seaorm(runner);
+        let stmt = self.build_statement(exec.backend())?;
+        Ok(match exec {
+            crate::secure::SeaOrmRunner::Conn(db) => T::find_by_statement(stmt).all(db).await?,
+            crate::secure::SeaOrmRunner::Tx(tx) => T::find_by_statement(stmt).all(tx).await?,
+        })
+    }
 }

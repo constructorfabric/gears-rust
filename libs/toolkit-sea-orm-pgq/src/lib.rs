@@ -120,6 +120,14 @@ impl Element {
     /// know it cannot be filtered back off.
     #[must_use]
     pub fn and_where(mut self, condition: Condition) -> Self {
+        // An empty condition constrains nothing, and attaching it would render
+        // as `WHERE TRUE` on every element — noise that also makes "this element
+        // carries no predicate" indistinguishable from "this element carries a
+        // vacuous one" when reading the SQL. Dropping it is safe precisely
+        // because it adds nothing: it cannot be a caller removing scope.
+        if condition.is_empty() {
+            return self;
+        }
         self.filter = Some(match self.filter.take() {
             Some(existing) => Condition::all().add(existing).add(condition),
             None => condition,

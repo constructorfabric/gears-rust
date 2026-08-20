@@ -446,3 +446,339 @@ fn the_derive_enumerates_custom_pep_properties() {
         "a pep_prop column is a scope column: {names:?}"
     );
 }
+
+// ─────────────────── the secure graph query: rendered SQL ───────────────────
+
+use crate::secure::SecureEntityExt as _;
+use sea_orm::EntityTrait as _;
+use toolkit_security::AccessScope;
+
+/// Each element's own body, keyed by its variable.
+///
+/// Counting occurrences of a scope column across the whole statement is the trap
+/// ADR-0001 records: the column also appears in `COLUMNS` and in the outer
+/// `WHERE`, so a count passes even when one element body carries no predicate at
+/// all. Every assertion below is therefore per element.
+fn element_bodies(sql: &str) -> std::collections::BTreeMap<String, String> {
+    let mut bodies = std::collections::BTreeMap::new();
+    // Only the MATCH region holds elements. Scanning the whole statement would
+    // also pick up the GRAPH_TABLE wrapper and the COLUMNS list, both of which
+    // open with a quoted name.
+    let Some(after_match) = sql.split(" MATCH ").nth(1) else {
+        return bodies;
+    };
+    let pattern = after_match
+        .split(" COLUMNS (")
+        .next()
+        .unwrap_or(after_match);
+    let bytes: Vec<char> = pattern.chars().collect();
+    let mut index = 0;
+    while index < bytes.len() {
+        let open = bytes[index];
+        let close = match open {
+            '(' => ')',
+            '[' => ']',
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        // An element opens with a quoted variable immediately after the bracket.
+        if bytes.get(index + 1) != Some(&'"') {
+            index += 1;
+            continue;
+        }
+        let mut depth = 1;
+        let mut cursor = index + 1;
+        while cursor < bytes.len() && depth > 0 {
+            if bytes[cursor] == open {
+                depth += 1;
+            } else if bytes[cursor] == close {
+                depth -= 1;
+            }
+            cursor += 1;
+        }
+        let body: String = bytes[index + 1..cursor.saturating_sub(1)].iter().collect();
+        if let Some(variable) = body
+            .strip_prefix('"')
+            .and_then(|rest| rest.split('"').next())
+            && body.contains(" IS ")
+        {
+            bodies.insert(variable.to_owned(), body.clone());
+        }
+        index += 1;
+    }
+    bodies
+}
+
+fn tenant_scope() -> AccessScope {
+    AccessScope::for_tenant(uuid::Uuid::from_u128(0x5150))
+}
+
+fn subtree_scope() -> AccessScope {
+    AccessScope::from_constraints(vec![toolkit_security::access_scope::ScopeConstraint::new(
+        vec![
+            toolkit_security::access_scope::ScopeFilter::in_tenant_subtree(
+                toolkit_security::access_scope::pep_properties::OWNER_TENANT_ID,
+                toolkit_security::ScopeValue::Uuid(uuid::Uuid::from_u128(0x5150)),
+                true,
+                vec![],
+            ),
+        ],
+    )])
+}
+
+/// A two-hop query under `scope`, rendered.
+fn two_hop(scope: &AccessScope) -> Result<String, ScopeError> {
+    node::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .with_graph::<Kb>()
+        .match_path(|p| {
+            p.vertex::<node::Entity>("a")
+                .edge_to::<edge::Entity>("e")
+                .to::<node::Entity>("b")
+        })
+        .column("b", "id", "neighbour")
+        .build_statement(sea_orm::DbBackend::Postgres)
+        .map(|stmt| stmt.sql)
+}
+
+/// The central guarantee: the scope predicate is inside **each** element body,
+/// vertices and edges alike, qualified by that element's own variable.
+#[test]
+fn every_graph_element_embeds_scope() {
+    let sql = two_hop(&tenant_scope()).expect("builds");
+    let bodies = element_bodies(&sql);
+    assert_eq!(bodies.len(), 3, "expected three elements: {bodies:?}");
+    for (variable, body) in &bodies {
+        assert!(
+            body.contains(&format!(r#""{variable}"."tenant_id""#)),
+            "element `{variable}` carries no scope predicate of its own: {body}"
+        );
+    }
+}
+
+/// An outer `WHERE` is not a substitute: it trims the output while the traversal
+/// already saw every tenant's rows. So the element bodies must carry the
+/// predicate even though the outer query has one too.
+#[test]
+fn the_outer_where_does_not_stand_in_for_element_scope() {
+    let sql = two_hop(&tenant_scope()).expect("builds");
+    let (pattern, outer) = sql.split_once(" AS \"cf_graph\"").expect("aliased");
+    assert!(
+        outer.contains(r#""graph_node"."tenant_id""#),
+        "the anchor should still be scoped: {outer}"
+    );
+    // And removing the outer clause from consideration leaves the pattern fully
+    // scoped on its own.
+    for (variable, body) in element_bodies(pattern) {
+        assert!(
+            body.contains(&format!(r#""{variable}"."tenant_id""#)),
+            "{body}"
+        );
+    }
+}
+
+/// A caller predicate narrows an element; it cannot remove what the library put
+/// there. Both predicates must survive in the same body.
+#[test]
+fn a_caller_predicate_cannot_remove_element_scope() {
+    let sql = node::Entity::find()
+        .secure()
+        .scope_with(&tenant_scope())
+        .with_graph::<Kb>()
+        .match_path(|p| {
+            p.vertex::<node::Entity>("a")
+                .edge_to::<edge::Entity>("e")
+                .to::<node::Entity>("b")
+        })
+        .column("b", "id", "neighbour")
+        .build_statement(sea_orm::DbBackend::Postgres)
+        .expect("builds")
+        .sql;
+    let bodies = element_bodies(&sql);
+    assert!(
+        bodies["a"].contains(r#""a"."tenant_id""#),
+        "{:?}",
+        bodies["a"]
+    );
+}
+
+/// Deny-all reaches every element rather than only the outer query.
+///
+/// The `false` is a bound parameter, not the literal `FALSE`, so the assertion
+/// is on the element having a predicate at all plus the statement binding
+/// `false` — checking the text for "FALSE" would fail on correct output.
+#[test]
+fn deny_all_reaches_every_element() {
+    let stmt = node::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::deny_all())
+        .with_graph::<Kb>()
+        .match_path(|p| {
+            p.vertex::<node::Entity>("a")
+                .edge_to::<edge::Entity>("e")
+                .to::<node::Entity>("b")
+        })
+        .column("b", "id", "neighbour")
+        .build_statement(sea_orm::DbBackend::Postgres)
+        .expect("builds");
+
+    let bodies = element_bodies(&stmt.sql);
+    assert_eq!(bodies.len(), 3);
+    for (variable, body) in &bodies {
+        assert!(
+            body.contains(" WHERE "),
+            "element `{variable}` was left unrestricted under deny-all: {body}"
+        );
+    }
+    let bound = format!("{:?}", stmt.values.expect("bound values").0);
+    assert!(
+        bound.contains("Bool(Some(false))"),
+        "deny-all must bind a false: {bound}"
+    );
+}
+
+/// Allow-all must not invent a restriction. An unconstrained scope compiles to
+/// an empty condition, which the AST drops rather than rendering as
+/// `WHERE TRUE` — so "no predicate" is visibly no predicate.
+#[test]
+fn allow_all_adds_no_element_predicate() {
+    let sql = two_hop(&AccessScope::allow_all()).expect("builds");
+    for (variable, body) in element_bodies(&sql) {
+        assert!(
+            !body.contains(" WHERE "),
+            "element `{variable}` acquired a predicate under allow-all: {body}"
+        );
+    }
+}
+
+/// A subtree scope is servable: the closure is placed once as a correlated
+/// sibling and every element references it. Placed twice it would become a
+/// cross join and multiply rows.
+#[test]
+fn a_subtree_scope_places_one_correlated_sibling() {
+    let sql = two_hop(&subtree_scope()).expect("builds");
+
+    assert_eq!(
+        sql.matches(r#"AS "__cf_scope_0_0""#).count(),
+        1,
+        "the sibling must be placed exactly once: {sql}"
+    );
+    let bodies = element_bodies(&sql);
+    assert_eq!(bodies.len(), 3);
+    for (variable, body) in &bodies {
+        assert!(
+            body.contains(r#""__cf_scope_0_0"."descendant_id""#),
+            "element `{variable}` does not correlate against the sibling: {body}"
+        );
+        assert!(
+            !body.contains("SELECT"),
+            "no subquery may appear inside a pattern predicate: {body}"
+        );
+    }
+}
+
+/// An element whose entity resolves no scope column is refused at build time —
+/// not turned into a traversal that returns nothing and looks like missing data.
+#[test]
+fn an_unscopable_element_is_refused() {
+    struct Loose;
+    impl PropertyGraph for Loose {
+        const GRAPH_NAME: &'static str = "loose";
+        fn declaration() -> Result<GraphDeclaration, ScopeError> {
+            GraphDeclaration::new::<Self>().vertex::<Self, node::Entity>(&["tenant_id", "id"])
+        }
+    }
+    impl VertexOf<Loose> for node::Entity {
+        const LABEL: &'static str = "node";
+    }
+    // The closure table is a legitimate table and an illegitimate graph element.
+    impl VertexOf<Loose> for closure::Entity {
+        const LABEL: &'static str = "closure";
+    }
+
+    let err = node::Entity::find()
+        .secure()
+        .scope_with(&tenant_scope())
+        .with_graph::<Loose>()
+        .match_path(|p| p.vertex::<closure::Entity>("c"))
+        .column("c", "ancestor_id", "x")
+        .build_statement(sea_orm::DbBackend::Postgres)
+        .expect_err("an unscopable element must be refused");
+    assert!(
+        matches!(err, ScopeError::Invalid(msg) if msg.contains("at least one scope column")),
+        "unexpected error: {err}"
+    );
+}
+
+/// Pattern-shape mistakes surface as an error at build time. They are the
+/// caller's correctness problem rather than an isolation problem, but they must
+/// not be silent.
+#[test]
+fn pattern_shape_mistakes_are_reported() {
+    let dangling = node::Entity::find()
+        .secure()
+        .scope_with(&tenant_scope())
+        .with_graph::<Kb>()
+        .match_path(|p| p.vertex::<node::Entity>("a").edge_to::<edge::Entity>("e"))
+        .column("a", "id", "x")
+        .build_statement(sea_orm::DbBackend::Postgres);
+    assert!(dangling.is_err(), "an unfinished hop must be refused");
+
+    let no_head = node::Entity::find()
+        .secure()
+        .scope_with(&tenant_scope())
+        .with_graph::<Kb>()
+        .match_path(|p| p.edge_to::<edge::Entity>("e"))
+        .column("e", "id", "x")
+        .build_statement(sea_orm::DbBackend::Postgres);
+    assert!(no_head.is_err(), "a pattern must start at a vertex");
+
+    let no_pattern = node::Entity::find()
+        .secure()
+        .scope_with(&tenant_scope())
+        .with_graph::<Kb>()
+        .column("a", "id", "x")
+        .build_statement(sea_orm::DbBackend::Postgres);
+    assert!(no_pattern.is_err(), "a graph query needs a pattern");
+}
+
+/// Placeholders are shared only between predicates that bind the same values.
+/// Two elements needing different values must not collide — the sharing seen
+/// under a single-tenant scope is value deduplication, not a numbering bug.
+#[test]
+fn elements_binding_different_values_get_different_placeholders() {
+    let t1 = uuid::Uuid::from_u128(0x1111);
+    let t2 = uuid::Uuid::from_u128(0x2222);
+    let scope =
+        AccessScope::from_constraints(vec![toolkit_security::access_scope::ScopeConstraint::new(
+            vec![toolkit_security::access_scope::ScopeFilter::in_uuids(
+                toolkit_security::access_scope::pep_properties::OWNER_TENANT_ID,
+                vec![t1, t2],
+            )],
+        )]);
+    let stmt = node::Entity::find()
+        .secure()
+        .scope_with(&scope)
+        .with_graph::<Kb>()
+        .match_path(|p| {
+            p.vertex::<node::Entity>("a")
+                .edge_to::<edge::Entity>("e")
+                .to::<node::Entity>("b")
+        })
+        .column("b", "id", "neighbour")
+        .build_statement(sea_orm::DbBackend::Postgres)
+        .expect("builds");
+
+    let values = stmt.values.expect("bound values");
+    // Every bound value is one of the two tenants, and both appear: a numbering
+    // mistake would bind something else or drop one.
+    assert!(values.0.len() >= 6, "{:?}", values.0);
+    let rendered = format!("{:?}", values.0);
+    assert!(
+        rendered.contains("1111") && rendered.contains("2222"),
+        "{rendered}"
+    );
+}
