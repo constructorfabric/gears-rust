@@ -1885,6 +1885,67 @@
         },
         "type": "object"
       },
+      "IssueDto": {
+        "description": "A mirrored GitHub issue as served by the read API.",
+        "properties": {
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "html_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "is_pull_request": {
+            "type": "boolean"
+          },
+          "number": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "repo_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "state": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "repo_id",
+          "number",
+          "title",
+          "state",
+          "is_pull_request",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "ListEntitiesResponse": {
         "description": "Response DTO for listing GTS entities.",
         "properties": {
@@ -2846,6 +2907,24 @@
         ],
         "type": "object"
       },
+      "Page_IssueDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/IssueDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "Page_MembershipDto": {
         "properties": {
           "items": {
@@ -2887,6 +2966,42 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/OwnConversionRequestDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_PullRequestDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PullRequestDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_RepositoryDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RepositoryDto"
             },
             "type": "array"
           },
@@ -3542,6 +3657,93 @@
         ],
         "type": "object"
       },
+      "PullRequestDto": {
+        "description": "A mirrored GitHub pull request as served by the read API.",
+        "properties": {
+          "base_sha": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "draft": {
+            "type": "boolean"
+          },
+          "head_sha": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "lines_added": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "lines_removed": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "merged": {
+            "type": "boolean"
+          },
+          "merged_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "number": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "repo_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "state": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "repo_id",
+          "number",
+          "title",
+          "state",
+          "draft",
+          "merged",
+          "lines_added",
+          "lines_removed",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "PutAddressReq": {
         "description": "REST DTO for creating/upserting an address",
         "properties": {
@@ -3944,6 +4146,41 @@
           "total",
           "succeeded",
           "failed"
+        ],
+        "type": "object"
+      },
+      "RepositoryDto": {
+        "description": "A mirrored GitHub repository as served by the read API.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "full_name": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "private": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "owner",
+          "name",
+          "full_name",
+          "private"
         ],
         "type": "object"
       },
@@ -12779,6 +13016,305 @@
           }
         },
         "summary": "GitHub Mirror health",
+        "tags": [
+          "GitHub Mirror"
+        ]
+      }
+    },
+    "/github-mirror/v1/repos": {
+      "get": {
+        "description": "Returns the GitHub repositories held in the local mirror for the caller's tenant",
+        "operationId": "github_mirror.list_repositories",
+        "parameters": [
+          {
+            "description": "Maximum number of repositories to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_RepositoryDto"
+                }
+              }
+            },
+            "description": "Paginated list of mirrored repositories"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List mirrored repositories",
+        "tags": [
+          "GitHub Mirror"
+        ]
+      }
+    },
+    "/github-mirror/v1/repos/{owner}/{name}/issues": {
+      "get": {
+        "description": "Returns issues (pull requests included, flagged by is_pull_request) held in              the local mirror for the caller's tenant",
+        "operationId": "github_mirror.list_issues",
+        "parameters": [
+          {
+            "description": "Repository owner login",
+            "in": "path",
+            "name": "owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository name",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum number of issues to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_IssueDto"
+                }
+              }
+            },
+            "description": "Paginated list of mirrored issues"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List mirrored issues of a repository",
+        "tags": [
+          "GitHub Mirror"
+        ]
+      }
+    },
+    "/github-mirror/v1/repos/{owner}/{name}/pulls": {
+      "get": {
+        "description": "Returns pull requests held in the local mirror for the caller's tenant",
+        "operationId": "github_mirror.list_pull_requests",
+        "parameters": [
+          {
+            "description": "Repository owner login",
+            "in": "path",
+            "name": "owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository name",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum number of pull requests to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_PullRequestDto"
+                }
+              }
+            },
+            "description": "Paginated list of mirrored pull requests"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List mirrored pull requests of a repository",
         "tags": [
           "GitHub Mirror"
         ]

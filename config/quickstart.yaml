@@ -330,6 +330,14 @@ gears:
           parent_id: "00000000-0000-0000-0000-000000000005"
           status: active
 
+  github-mirror:
+    database:
+      server: "sqlite_users"
+      file: "github_mirror.db"
+    config:
+      api_base_url: "https://api.github.com"
+
+
   credstore:
     database:
       server: "sqlite_users"
