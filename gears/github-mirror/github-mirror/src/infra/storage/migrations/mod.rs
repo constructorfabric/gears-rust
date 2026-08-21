@@ -12,6 +12,7 @@ pub mod pull_requests_003;
 pub mod releases_010;
 pub mod review_comments_006;
 pub mod reviews_007;
+pub mod workflow_runs_013;
 
 pub struct Migrator;
 
@@ -31,6 +32,7 @@ impl MigratorTrait for Migrator {
             Box::new(releases_010::Migration),
             Box::new(branches_011::Migration),
             Box::new(contributors_012::Migration),
+            Box::new(workflow_runs_013::Migration),
         ]
     }
 }

@@ -5,7 +5,7 @@ use crate::domain::error::DomainError;
 use crate::domain::repo::{
     BranchRecord, CommentRecord, CommitRecord, ContributorRecord, IssueRecord, LabelRecord,
     MilestoneRecord, PullRequestRecord, ReleaseRecord, RepositoryRecord, ReviewCommentRecord,
-    ReviewRecord,
+    ReviewRecord, WorkflowRunRecord,
 };
 
 /// What one sync-lite pass fetched from GitHub for a repository.
@@ -24,6 +24,7 @@ pub struct FetchedRepository {
     pub releases: Vec<ReleaseRecord>,
     pub branches: Vec<BranchRecord>,
     pub contributors: Vec<ContributorRecord>,
+    pub workflow_runs: Vec<WorkflowRunRecord>,
 }
 
 /// Outbound port to GitHub's REST API (implemented in `infra/github`).

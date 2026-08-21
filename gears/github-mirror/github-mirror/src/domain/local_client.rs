@@ -11,7 +11,7 @@ use crate::domain::error::DomainError;
 use crate::domain::repo::{
     BranchRepository, CommentRepository, CommitRepository, ContributorRepository, IssueRepository,
     LabelRepository, MilestoneRepository, PullRequestRepository, ReleaseRepository, RepoRepository,
-    ReviewCommentRepository, ReviewRepository,
+    ReviewCommentRepository, ReviewRepository, WorkflowRunRepository,
 };
 use crate::domain::service::Service;
 
@@ -49,8 +49,8 @@ impl From<DomainError> for CanonicalError {
     }
 }
 
-type SharedService<R, I, P, C, M, V, W, L, N, E, B, O> =
-    Arc<Service<R, I, P, C, M, V, W, L, N, E, B, O>>;
+type SharedService<R, I, P, C, M, V, W, L, N, E, B, O, F> =
+    Arc<Service<R, I, P, C, M, V, W, L, N, E, B, O, F>>;
 
 // One generic parameter per aggregate repository; the alias is as small
 // as the type gets.
@@ -69,8 +69,9 @@ pub struct LocalClient<
     E: ReleaseRepository + 'static,
     B: BranchRepository + 'static,
     O: ContributorRepository + 'static,
+    F: WorkflowRunRepository + 'static,
 > {
-    service: SharedService<R, I, P, C, M, V, W, L, N, E, B, O>,
+    service: SharedService<R, I, P, C, M, V, W, L, N, E, B, O, F>,
 }
 
 impl<
@@ -86,11 +87,12 @@ impl<
     E: ReleaseRepository + 'static,
     B: BranchRepository + 'static,
     O: ContributorRepository + 'static,
-> LocalClient<R, I, P, C, M, V, W, L, N, E, B, O>
+    F: WorkflowRunRepository + 'static,
+> LocalClient<R, I, P, C, M, V, W, L, N, E, B, O, F>
 {
     #[must_use]
     #[allow(clippy::type_complexity)]
-    pub fn new(service: SharedService<R, I, P, C, M, V, W, L, N, E, B, O>) -> Self {
+    pub fn new(service: SharedService<R, I, P, C, M, V, W, L, N, E, B, O, F>) -> Self {
         Self { service }
     }
 }
@@ -109,7 +111,8 @@ impl<
     E: ReleaseRepository + 'static,
     B: BranchRepository + 'static,
     O: ContributorRepository + 'static,
-> GithubMirrorClientV1 for LocalClient<R, I, P, C, M, V, W, L, N, E, B, O>
+    F: WorkflowRunRepository + 'static,
+> GithubMirrorClientV1 for LocalClient<R, I, P, C, M, V, W, L, N, E, B, O, F>
 {
     async fn status(&self, _ctx: &SecurityContext) -> Result<MirrorStatus, CanonicalError> {
         let status = self.service.status();
@@ -155,6 +158,7 @@ impl<
             releases_synced: summary.releases_synced,
             branches_synced: summary.branches_synced,
             contributors_synced: summary.contributors_synced,
+            workflow_runs_synced: summary.workflow_runs_synced,
         })
     }
 }

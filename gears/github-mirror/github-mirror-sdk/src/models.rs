@@ -112,6 +112,7 @@ pub struct SyncSummary {
     pub releases_synced: u64,
     pub branches_synced: u64,
     pub contributors_synced: u64,
+    pub workflow_runs_synced: u64,
 }
 
 /// A mirrored GitHub issue/PR comment (read-slice shape).
@@ -262,4 +263,32 @@ pub struct Contributor {
     pub user_type: String,
     pub avatar_url: Option<String>,
     pub html_url: Option<String>,
+}
+
+/// A mirrored GitHub Actions workflow run (read-slice shape).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRun {
+    /// GitHub's numeric run id.
+    pub id: i64,
+    /// Owning repository's GitHub id.
+    pub repo_id: i64,
+    /// Id of the workflow definition this run belongs to.
+    pub workflow_id: i64,
+    pub run_number: i64,
+    /// Retry attempt, 1 for the first run.
+    pub run_attempt: i64,
+    pub name: Option<String>,
+    /// Event that triggered the run (`push`, `pull_request`, ...).
+    pub event: String,
+    /// `queued`, `in_progress`, or `completed`.
+    pub status: Option<String>,
+    /// `success`, `failure`, `cancelled`, ... — absent until completed.
+    pub conclusion: Option<String>,
+    pub head_branch: Option<String>,
+    pub head_sha: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: Option<String>,
+    pub actor_login: Option<String>,
 }

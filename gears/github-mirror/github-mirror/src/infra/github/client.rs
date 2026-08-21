@@ -6,7 +6,7 @@ use crate::domain::ports::github::{FetchedRepository, GithubPort};
 use crate::domain::repo::{
     BranchRecord, CommentRecord, CommitRecord, ContributorRecord, IssueRecord, LabelRecord,
     MilestoneRecord, PullRequestRecord, ReleaseRecord, RepositoryRecord, ReviewCommentRecord,
-    ReviewRecord,
+    ReviewRecord, WorkflowRunRecord,
 };
 
 const FIRST_PAGE_SIZE: u32 = 50;
@@ -240,6 +240,32 @@ struct GhContributor {
 }
 
 #[derive(Debug, Deserialize)]
+struct GhWorkflowRun {
+    id: i64,
+    workflow_id: i64,
+    run_number: i64,
+    run_attempt: Option<i64>,
+    name: Option<String>,
+    event: String,
+    status: Option<String>,
+    conclusion: Option<String>,
+    head_branch: Option<String>,
+    head_sha: String,
+    #[serde(default)]
+    actor: Option<GhActor>,
+    created_at: String,
+    updated_at: String,
+    html_url: Option<String>,
+}
+
+/// `GET .../actions/runs` wraps the list in an object instead of returning a
+/// bare array like every other list endpoint.
+#[derive(Debug, Deserialize)]
+struct GhWorkflowRunsPage {
+    workflow_runs: Vec<GhWorkflowRun>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GhReview {
     id: i64,
     #[serde(default)]
@@ -416,6 +442,26 @@ fn contributor_record(repo_id: i64, c: GhContributor) -> ContributorRecord {
     }
 }
 
+fn workflow_run_record(repo_id: i64, w: GhWorkflowRun) -> WorkflowRunRecord {
+    WorkflowRunRecord {
+        id: w.id,
+        repo_id,
+        workflow_id: w.workflow_id,
+        run_number: w.run_number,
+        run_attempt: w.run_attempt.unwrap_or(1),
+        name: w.name,
+        event: w.event,
+        status: w.status,
+        conclusion: w.conclusion,
+        head_branch: w.head_branch,
+        head_sha: w.head_sha,
+        created_at: w.created_at,
+        updated_at: w.updated_at,
+        html_url: w.html_url,
+        actor_login: w.actor.map(|a| a.login),
+    }
+}
+
 fn review_record(repo_id: i64, pull_number: i64, r: GhReview) -> ReviewRecord {
     ReviewRecord {
         id: r.id,
@@ -510,6 +556,12 @@ impl GithubPort for GithubClient {
             ))
             .await?;
 
+        let workflow_runs: GhWorkflowRunsPage = self
+            .get_json(&format!(
+                "/repos/{owner}/{name}/actions/runs?per_page={FIRST_PAGE_SIZE}"
+            ))
+            .await?;
+
         let mut reviews: Vec<ReviewRecord> = Vec::new();
         for pull in pulls.iter().take(REVIEW_SYNC_PULL_CAP) {
             let page: Vec<GhReview> = self
@@ -566,6 +618,11 @@ impl GithubPort for GithubClient {
             contributors: contributors
                 .into_iter()
                 .map(|c| contributor_record(repo_id, c))
+                .collect(),
+            workflow_runs: workflow_runs
+                .workflow_runs
+                .into_iter()
+                .map(|w| workflow_run_record(repo_id, w))
                 .collect(),
         })
     }

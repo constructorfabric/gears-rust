@@ -420,3 +420,46 @@ pub mod contributors {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod workflow_runs {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    /// Mirrored GitHub Actions workflow run, tenant-scoped.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_workflow_runs")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        /// GitHub run id.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: i64,
+        /// Owning repository's GitHub id.
+        pub repo_id: i64,
+        /// Id of the workflow definition this run belongs to.
+        pub workflow_id: i64,
+        pub run_number: i64,
+        /// Retry attempt, 1 for the first run.
+        pub run_attempt: i64,
+        pub name: Option<String>,
+        /// Event that triggered the run (`push`, `pull_request`, ...).
+        pub event: String,
+        /// `queued`, `in_progress`, or `completed`.
+        pub status: Option<String>,
+        /// `success`, `failure`, `cancelled`, ... — absent until completed.
+        pub conclusion: Option<String>,
+        pub head_branch: Option<String>,
+        pub head_sha: String,
+        /// RFC3339 timestamps kept as text (engine-agnostic), as in the reference.
+        pub created_at: String,
+        pub updated_at: String,
+        pub html_url: Option<String>,
+        pub actor_login: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

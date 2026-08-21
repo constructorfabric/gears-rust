@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use github_mirror_sdk::{
     Branch, Comment, Commit, Contributor, Issue, Label, Milestone, PullRequest, Release,
-    Repository, Review, ReviewComment,
+    Repository, Review, ReviewComment, WorkflowRun,
 };
 use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, Order};
 use toolkit_db::secure::{
@@ -17,6 +17,7 @@ use crate::domain::repo::{
     LabelRecord, LabelRepository, MilestoneRecord, MilestoneRepository, PullRequestRecord,
     PullRequestRepository, ReleaseRecord, ReleaseRepository, RepoRepository, RepositoryRecord,
     ReviewCommentRecord, ReviewCommentRepository, ReviewRecord, ReviewRepository,
+    WorkflowRunRecord, WorkflowRunRepository,
 };
 
 use super::entity::branches::{self, Entity as BranchEntity};
@@ -31,6 +32,7 @@ use super::entity::releases::{self, Entity as ReleaseEntity};
 use super::entity::repositories::{self, Entity as RepoEntity};
 use super::entity::review_comments::{self, Entity as ReviewCommentEntity};
 use super::entity::reviews::{self, Entity as ReviewEntity};
+use super::entity::workflow_runs::{self, Entity as WorkflowRunEntity};
 
 pub struct SeaOrmRepoRepository;
 
@@ -1260,6 +1262,122 @@ impl ContributorRepository for SeaOrmContributorRepository {
             .scope_with(scope)
             .filter(sea_orm::Condition::all().add(contributors::Column::RepoId.eq(repo_id)))
             .order_by(contributors::Column::Contributions, Order::Desc)
+            .limit(limit)
+            .all(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+
+pub struct SeaOrmWorkflowRunRepository;
+
+impl SeaOrmWorkflowRunRepository {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SeaOrmWorkflowRunRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn workflow_run_active_model(tenant_id: Uuid, r: &WorkflowRunRecord) -> workflow_runs::ActiveModel {
+    workflow_runs::ActiveModel {
+        tenant_id: ActiveValue::Set(tenant_id),
+        id: ActiveValue::Set(r.id),
+        repo_id: ActiveValue::Set(r.repo_id),
+        workflow_id: ActiveValue::Set(r.workflow_id),
+        run_number: ActiveValue::Set(r.run_number),
+        run_attempt: ActiveValue::Set(r.run_attempt),
+        name: ActiveValue::Set(r.name.clone()),
+        event: ActiveValue::Set(r.event.clone()),
+        status: ActiveValue::Set(r.status.clone()),
+        conclusion: ActiveValue::Set(r.conclusion.clone()),
+        head_branch: ActiveValue::Set(r.head_branch.clone()),
+        head_sha: ActiveValue::Set(r.head_sha.clone()),
+        created_at: ActiveValue::Set(r.created_at.clone()),
+        updated_at: ActiveValue::Set(r.updated_at.clone()),
+        html_url: ActiveValue::Set(r.html_url.clone()),
+        actor_login: ActiveValue::Set(r.actor_login.clone()),
+    }
+}
+
+#[async_trait]
+impl WorkflowRunRepository for SeaOrmWorkflowRunRepository {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: WorkflowRunRecord,
+    ) -> Result<WorkflowRun, DomainError> {
+        let on_conflict = SecureOnConflict::<WorkflowRunEntity>::columns([
+            workflow_runs::Column::TenantId,
+            workflow_runs::Column::Id,
+        ])
+        .update_columns([
+            workflow_runs::Column::RepoId,
+            workflow_runs::Column::WorkflowId,
+            workflow_runs::Column::RunNumber,
+            workflow_runs::Column::RunAttempt,
+            workflow_runs::Column::Name,
+            workflow_runs::Column::Event,
+            workflow_runs::Column::Status,
+            workflow_runs::Column::Conclusion,
+            workflow_runs::Column::HeadBranch,
+            workflow_runs::Column::HeadSha,
+            workflow_runs::Column::CreatedAt,
+            workflow_runs::Column::UpdatedAt,
+            workflow_runs::Column::HtmlUrl,
+            workflow_runs::Column::ActorLogin,
+        ])
+        .map_err(map_scope_error)?;
+
+        WorkflowRunEntity::insert(workflow_run_active_model(tenant_id, &record))
+            .secure()
+            .scope_with_model(scope, &workflow_run_active_model(tenant_id, &record))
+            .map_err(map_scope_error)?
+            .on_conflict(on_conflict)
+            .exec(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(WorkflowRun {
+            id: record.id,
+            repo_id: record.repo_id,
+            workflow_id: record.workflow_id,
+            run_number: record.run_number,
+            run_attempt: record.run_attempt,
+            name: record.name,
+            event: record.event,
+            status: record.status,
+            conclusion: record.conclusion,
+            head_branch: record.head_branch,
+            head_sha: record.head_sha,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            html_url: record.html_url,
+            actor_login: record.actor_login,
+        })
+    }
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<WorkflowRun>, DomainError> {
+        let rows = WorkflowRunEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(sea_orm::Condition::all().add(workflow_runs::Column::RepoId.eq(repo_id)))
+            .order_by(workflow_runs::Column::CreatedAt, Order::Desc)
             .limit(limit)
             .all(conn)
             .await

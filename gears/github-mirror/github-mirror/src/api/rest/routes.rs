@@ -12,6 +12,7 @@ use crate::infra::storage::sea_orm_repo::{
     SeaOrmContributorRepository, SeaOrmIssueRepository, SeaOrmLabelRepository,
     SeaOrmMilestoneRepository, SeaOrmPullRequestRepository, SeaOrmReleaseRepository,
     SeaOrmRepoRepository, SeaOrmReviewCommentRepository, SeaOrmReviewRepository,
+    SeaOrmWorkflowRunRepository,
 };
 
 pub type ConcreteService = Service<
@@ -27,6 +28,7 @@ pub type ConcreteService = Service<
     SeaOrmReleaseRepository,
     SeaOrmBranchRepository,
     SeaOrmContributorRepository,
+    SeaOrmWorkflowRunRepository,
 >;
 
 const API_TAG: &str = "GitHub Mirror";
@@ -297,6 +299,31 @@ fn register_repo_metadata_routes(mut router: Router, openapi: &dyn OpenApiRegist
             openapi,
             StatusCode::OK,
             "Paginated list of mirrored contributors",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/github-mirror/v1/repos/{owner}/{name}/actions/runs")
+        .operation_id("github_mirror.list_workflow_runs")
+        .summary("List mirrored workflow runs of a repository")
+        .description(
+            "Returns GitHub Actions workflow runs held in the local mirror for the tenant,              newest first",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("owner", "Repository owner login")
+        .path_param("name", "Repository name")
+        .query_param("limit", false, "Maximum number of workflow runs to return")
+        .handler(handlers::list_workflow_runs)
+        .json_response_with_schema::<toolkit_odata::Page<dto::WorkflowRunDto>>(
+            openapi,
+            StatusCode::OK,
+            "Paginated list of mirrored workflow runs",
         )
         .error_400(openapi)
         .error_401(openapi)

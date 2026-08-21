@@ -1,11 +1,11 @@
 use github_mirror_sdk::{
     Branch, Comment, Commit, Contributor, Issue, Label, Milestone, PullRequest, Release,
-    Repository, Review, ReviewComment,
+    Repository, Review, ReviewComment, WorkflowRun,
 };
 
 use super::entity::{
     branches, comments, commits, contributors, issues, labels, milestones, pull_requests, releases,
-    repositories, review_comments, reviews,
+    repositories, review_comments, reviews, workflow_runs,
 };
 
 impl From<repositories::Model> for Repository {
@@ -200,6 +200,28 @@ impl From<contributors::Model> for Contributor {
             user_type: m.user_type,
             avatar_url: m.avatar_url,
             html_url: m.html_url,
+        }
+    }
+}
+
+impl From<workflow_runs::Model> for WorkflowRun {
+    fn from(m: workflow_runs::Model) -> Self {
+        Self {
+            id: m.id,
+            repo_id: m.repo_id,
+            workflow_id: m.workflow_id,
+            run_number: m.run_number,
+            run_attempt: m.run_attempt,
+            name: m.name,
+            event: m.event,
+            status: m.status,
+            conclusion: m.conclusion,
+            head_branch: m.head_branch,
+            head_sha: m.head_sha,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+            html_url: m.html_url,
+            actor_login: m.actor_login,
         }
     }
 }

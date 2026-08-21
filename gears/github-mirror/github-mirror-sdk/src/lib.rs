@@ -23,5 +23,5 @@ pub mod models;
 pub use api::GithubMirrorClientV1;
 pub use models::{
     Branch, Comment, Commit, Contributor, Issue, Label, Milestone, MirrorStatus, PullRequest,
-    Release, Repository, Review, ReviewComment, SyncSummary,
+    Release, Repository, Review, ReviewComment, SyncSummary, WorkflowRun,
 };

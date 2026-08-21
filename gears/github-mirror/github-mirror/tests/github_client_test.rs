@@ -182,6 +182,30 @@ fn gh_contributors_json() -> serde_json::Value {
     ])
 }
 
+fn gh_workflow_runs_json() -> serde_json::Value {
+    json!({
+        "total_count": 1,
+        "workflow_runs": [
+            {
+                "id": 81,
+                "workflow_id": 8,
+                "run_number": 300,
+                "run_attempt": 2,
+                "name": "CI",
+                "event": "push",
+                "status": "completed",
+                "conclusion": "success",
+                "head_branch": "master",
+                "head_sha": "c1",
+                "actor": { "login": "alice" },
+                "created_at": "2026-08-20T00:00:00Z",
+                "updated_at": "2026-08-20T00:00:00Z",
+                "html_url": "https://github.com/rust-lang/rust/actions/runs/81"
+            }
+        ]
+    })
+}
+
 #[tokio::test]
 async fn fetch_repository_maps_github_payloads_into_records() {
     let server = MockServer::start_async().await;
@@ -259,6 +283,13 @@ async fn fetch_repository_maps_github_payloads_into_records() {
             when.method("GET")
                 .path("/repos/rust-lang/rust/contributors");
             then.status(200).json_body(gh_contributors_json());
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method("GET")
+                .path("/repos/rust-lang/rust/actions/runs");
+            then.status(200).json_body(gh_workflow_runs_json());
         })
         .await;
 
@@ -341,6 +372,19 @@ async fn fetch_repository_maps_github_payloads_into_records() {
     assert_eq!(fetched.contributors[0].login, "alice");
     assert_eq!(fetched.contributors[0].contributions, 120);
     assert_eq!(fetched.contributors[0].user_type, "User");
+
+    assert_eq!(fetched.workflow_runs.len(), 1);
+    assert_eq!(fetched.workflow_runs[0].id, 81);
+    assert_eq!(fetched.workflow_runs[0].run_number, 300);
+    assert_eq!(fetched.workflow_runs[0].run_attempt, 2);
+    assert_eq!(
+        fetched.workflow_runs[0].conclusion.as_deref(),
+        Some("success")
+    );
+    assert_eq!(
+        fetched.workflow_runs[0].actor_login.as_deref(),
+        Some("alice")
+    );
 }
 
 #[tokio::test]

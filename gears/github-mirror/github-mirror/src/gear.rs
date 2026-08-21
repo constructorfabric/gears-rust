@@ -20,6 +20,7 @@ use crate::infra::storage::sea_orm_repo::{
     SeaOrmContributorRepository, SeaOrmIssueRepository, SeaOrmLabelRepository,
     SeaOrmMilestoneRepository, SeaOrmPullRequestRepository, SeaOrmReleaseRepository,
     SeaOrmRepoRepository, SeaOrmReviewCommentRepository, SeaOrmReviewRepository,
+    SeaOrmWorkflowRunRepository,
 };
 
 type ConcreteService = Service<
@@ -35,6 +36,7 @@ type ConcreteService = Service<
     SeaOrmReleaseRepository,
     SeaOrmBranchRepository,
     SeaOrmContributorRepository,
+    SeaOrmWorkflowRunRepository,
 >;
 
 #[toolkit::gear(
@@ -80,6 +82,7 @@ impl Gear for GithubMirrorGear {
         let releases = Arc::new(SeaOrmReleaseRepository::new());
         let branches = Arc::new(SeaOrmBranchRepository::new());
         let contributors = Arc::new(SeaOrmContributorRepository::new());
+        let workflow_runs = Arc::new(SeaOrmWorkflowRunRepository::new());
         let github: Arc<dyn GithubPort> = Arc::new(GithubClient::new(
             cfg.api_base_url.clone(),
             cfg.github_token.clone(),
@@ -105,6 +108,7 @@ impl Gear for GithubMirrorGear {
             releases,
             branches,
             contributors,
+            workflow_runs,
             github,
             policy_enforcer,
             ServiceConfig {
@@ -157,6 +161,6 @@ mod tests {
     fn gear_provides_all_migrations() {
         use toolkit::contracts::DatabaseCapability;
         let gear = GithubMirrorGear::default();
-        assert_eq!(gear.migrations().len(), 12);
+        assert_eq!(gear.migrations().len(), 13);
     }
 }

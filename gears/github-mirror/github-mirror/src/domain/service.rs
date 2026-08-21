@@ -4,7 +4,7 @@ use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use github_mirror_sdk::{
     Branch, Comment, Commit, Contributor, Issue, Label, Milestone, PullRequest, Release,
-    Repository, Review, ReviewComment,
+    Repository, Review, ReviewComment, WorkflowRun,
 };
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page, PageInfo};
@@ -18,6 +18,7 @@ use super::repo::{
     LabelRecord, LabelRepository, MilestoneRecord, MilestoneRepository, PullRequestRecord,
     PullRequestRepository, ReleaseRecord, ReleaseRepository, RepoRepository, RepositoryRecord,
     ReviewCommentRecord, ReviewCommentRepository, ReviewRecord, ReviewRepository,
+    WorkflowRunRecord, WorkflowRunRepository,
 };
 
 pub const GEAR_NAME: &str = "github-mirror";
@@ -86,6 +87,11 @@ pub(crate) const CONTRIBUTOR_RESOURCE: ResourceType = ResourceType::from_static(
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+pub(crate) const WORKFLOW_RUN_RESOURCE: ResourceType = ResourceType::from_static(
+    "github_mirror.workflow_run",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
+
 pub(crate) const SYNC_RESOURCE: ResourceType =
     ResourceType::from_static("github_mirror.sync", &[pep_properties::OWNER_TENANT_ID]);
 
@@ -125,6 +131,7 @@ pub struct SyncSummary {
     pub releases_synced: u64,
     pub branches_synced: u64,
     pub contributors_synced: u64,
+    pub workflow_runs_synced: u64,
 }
 
 #[domain_model]
@@ -141,6 +148,7 @@ pub struct Service<
     E: ReleaseRepository,
     B: BranchRepository,
     O: ContributorRepository,
+    F: WorkflowRunRepository,
 > {
     db: Arc<DbProvider>,
     repo: Arc<R>,
@@ -155,6 +163,7 @@ pub struct Service<
     releases: Arc<E>,
     branches: Arc<B>,
     contributors: Arc<O>,
+    workflow_runs: Arc<F>,
     github: Arc<dyn GithubPort>,
     policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
@@ -173,7 +182,8 @@ impl<
     E: ReleaseRepository,
     B: BranchRepository,
     O: ContributorRepository,
-> Service<R, I, P, C, M, V, W, L, N, E, B, O>
+    F: WorkflowRunRepository,
+> Service<R, I, P, C, M, V, W, L, N, E, B, O, F>
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -190,6 +200,7 @@ impl<
         releases: Arc<E>,
         branches: Arc<B>,
         contributors: Arc<O>,
+        workflow_runs: Arc<F>,
         github: Arc<dyn GithubPort>,
         policy_enforcer: PolicyEnforcer,
         config: ServiceConfig,
@@ -208,6 +219,7 @@ impl<
             releases,
             branches,
             contributors,
+            workflow_runs,
             github,
             policy_enforcer,
             config,
@@ -1280,6 +1292,97 @@ impl<
             .await
     }
 
+    /// List mirrored workflow runs of one repository (`owner/name`),
+    /// tenant-scoped, newest first.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored for this
+    /// tenant; `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn list_workflow_runs(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        query: &ODataQuery,
+    ) -> Result<Page<WorkflowRun>, DomainError> {
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &WORKFLOW_RUN_RESOURCE,
+                actions::LIST,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+        let items = self
+            .workflow_runs
+            .list_by_repo(&conn, &scope, repository.id, limit)
+            .await?;
+
+        Ok(Page::new(
+            items,
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit,
+            },
+        ))
+    }
+
+    /// Insert or update a mirrored workflow-run row for the caller's tenant.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored;
+    /// `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn upsert_workflow_run(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        record: WorkflowRunRecord,
+    ) -> Result<WorkflowRun, DomainError> {
+        let tenant_id = ctx.subject_tenant_id();
+
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &WORKFLOW_RUN_RESOURCE,
+                actions::UPSERT,
+                None,
+                &AccessRequest::new().resource_property(pep_properties::OWNER_TENANT_ID, tenant_id),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let record = WorkflowRunRecord {
+            repo_id: repository.id,
+            ..record
+        };
+        self.workflow_runs
+            .upsert(&conn, &scope, tenant_id, record)
+            .await
+    }
+
     /// Fetch one repository from GitHub (first slice: repo + first page of
     /// issues, pull requests, and commits) and upsert it into the mirror.
     ///
@@ -1404,6 +1507,14 @@ impl<
             contributors_synced += 1;
         }
 
+        let mut workflow_runs_synced: u64 = 0;
+        for record in fetched.workflow_runs {
+            self.workflow_runs
+                .upsert(&conn, &scope, tenant_id, record)
+                .await?;
+            workflow_runs_synced += 1;
+        }
+
         Ok(SyncSummary {
             repository: repository.full_name,
             issues_synced,
@@ -1417,6 +1528,7 @@ impl<
             releases_synced,
             branches_synced,
             contributors_synced,
+            workflow_runs_synced,
         })
     }
 }

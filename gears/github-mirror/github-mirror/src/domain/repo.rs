@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use github_mirror_sdk::{
     Branch, Comment, Commit, Contributor, Issue, Label, Milestone, PullRequest, Release,
-    Repository, Review, ReviewComment,
+    Repository, Review, ReviewComment, WorkflowRun,
 };
 use toolkit_db::secure::DBRunner;
 use toolkit_macros::domain_model;
@@ -433,4 +433,44 @@ pub trait ContributorRepository: Send + Sync {
         repo_id: i64,
         limit: u64,
     ) -> Result<Vec<Contributor>, DomainError>;
+}
+
+/// Write-side record for a mirrored workflow run.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub workflow_id: i64,
+    pub run_number: i64,
+    pub run_attempt: i64,
+    pub name: Option<String>,
+    pub event: String,
+    pub status: Option<String>,
+    pub conclusion: Option<String>,
+    pub head_branch: Option<String>,
+    pub head_sha: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: Option<String>,
+    pub actor_login: Option<String>,
+}
+
+#[async_trait]
+pub trait WorkflowRunRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: WorkflowRunRecord,
+    ) -> Result<WorkflowRun, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<WorkflowRun>, DomainError>;
 }

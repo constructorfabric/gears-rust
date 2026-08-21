@@ -1,6 +1,6 @@
 use github_mirror_sdk::{
     Branch, Comment, Commit, Contributor, Issue, Label, Milestone, PullRequest, Release,
-    Repository, Review, ReviewComment,
+    Repository, Review, ReviewComment, WorkflowRun,
 };
 
 use crate::domain::service::{MirrorStatus, SyncSummary};
@@ -175,6 +175,7 @@ pub struct SyncSummaryDto {
     pub releases_synced: u64,
     pub branches_synced: u64,
     pub contributors_synced: u64,
+    pub workflow_runs_synced: u64,
 }
 
 impl From<SyncSummary> for SyncSummaryDto {
@@ -192,6 +193,7 @@ impl From<SyncSummary> for SyncSummaryDto {
             releases_synced: s.releases_synced,
             branches_synced: s.branches_synced,
             contributors_synced: s.contributors_synced,
+            workflow_runs_synced: s.workflow_runs_synced,
         }
     }
 }
@@ -436,6 +438,49 @@ impl From<Contributor> for ContributorDto {
             user_type: c.user_type,
             avatar_url: c.avatar_url,
             html_url: c.html_url,
+        }
+    }
+}
+
+/// A mirrored GitHub Actions workflow run as served by the read API.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct WorkflowRunDto {
+    pub id: i64,
+    pub repo_id: i64,
+    pub workflow_id: i64,
+    pub run_number: i64,
+    pub run_attempt: i64,
+    pub name: Option<String>,
+    pub event: String,
+    pub status: Option<String>,
+    pub conclusion: Option<String>,
+    pub head_branch: Option<String>,
+    pub head_sha: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: Option<String>,
+    pub actor_login: Option<String>,
+}
+
+impl From<WorkflowRun> for WorkflowRunDto {
+    fn from(w: WorkflowRun) -> Self {
+        Self {
+            id: w.id,
+            repo_id: w.repo_id,
+            workflow_id: w.workflow_id,
+            run_number: w.run_number,
+            run_attempt: w.run_attempt,
+            name: w.name,
+            event: w.event,
+            status: w.status,
+            conclusion: w.conclusion,
+            head_branch: w.head_branch,
+            head_sha: w.head_sha,
+            created_at: w.created_at,
+            updated_at: w.updated_at,
+            html_url: w.html_url,
+            actor_login: w.actor_login,
         }
     }
 }

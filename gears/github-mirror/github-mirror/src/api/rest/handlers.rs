@@ -12,7 +12,7 @@ use crate::api::rest::routes::ConcreteService;
 use super::dto::{
     BranchDto, CommentDto, CommitDto, ContributorDto, GithubMirrorHealthDto, IssueDto, LabelDto,
     MilestoneDto, PullRequestDto, ReleaseDto, RepositoryDto, ReviewCommentDto, ReviewDto,
-    SyncSummaryDto,
+    SyncSummaryDto, WorkflowRunDto,
 };
 
 pub async fn health(
@@ -154,4 +154,14 @@ pub async fn list_contributors(
 ) -> ApiResult<JsonPage<ContributorDto>> {
     let page: Page<_> = svc.list_contributors(&ctx, &owner, &name, &query).await?;
     Ok(Json(page.map_items(ContributorDto::from)))
+}
+
+pub async fn list_workflow_runs(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path((owner, name)): Path<(String, String)>,
+    OData(query): OData,
+) -> ApiResult<JsonPage<WorkflowRunDto>> {
+    let page: Page<_> = svc.list_workflow_runs(&ctx, &owner, &name, &query).await?;
+    Ok(Json(page.map_items(WorkflowRunDto::from)))
 }
