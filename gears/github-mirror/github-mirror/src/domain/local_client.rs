@@ -10,6 +10,7 @@ use toolkit_security::SecurityContext;
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
     CommentRepository, CommitRepository, IssueRepository, PullRequestRepository, RepoRepository,
+    ReviewCommentRepository,
 };
 use crate::domain::service::Service;
 
@@ -47,6 +48,8 @@ impl From<DomainError> for CanonicalError {
     }
 }
 
+type SharedService<R, I, P, C, M, V> = Arc<Service<R, I, P, C, M, V>>;
+
 #[domain_model]
 pub struct LocalClient<
     R: RepoRepository + 'static,
@@ -54,8 +57,9 @@ pub struct LocalClient<
     P: PullRequestRepository + 'static,
     C: CommitRepository + 'static,
     M: CommentRepository + 'static,
+    V: ReviewCommentRepository + 'static,
 > {
-    service: Arc<Service<R, I, P, C, M>>,
+    service: SharedService<R, I, P, C, M, V>,
 }
 
 impl<
@@ -64,10 +68,11 @@ impl<
     P: PullRequestRepository + 'static,
     C: CommitRepository + 'static,
     M: CommentRepository + 'static,
-> LocalClient<R, I, P, C, M>
+    V: ReviewCommentRepository + 'static,
+> LocalClient<R, I, P, C, M, V>
 {
     #[must_use]
-    pub fn new(service: Arc<Service<R, I, P, C, M>>) -> Self {
+    pub fn new(service: SharedService<R, I, P, C, M, V>) -> Self {
         Self { service }
     }
 }
@@ -79,7 +84,8 @@ impl<
     P: PullRequestRepository + 'static,
     C: CommitRepository + 'static,
     M: CommentRepository + 'static,
-> GithubMirrorClientV1 for LocalClient<R, I, P, C, M>
+    V: ReviewCommentRepository + 'static,
+> GithubMirrorClientV1 for LocalClient<R, I, P, C, M, V>
 {
     async fn status(&self, _ctx: &SecurityContext) -> Result<MirrorStatus, CanonicalError> {
         let status = self.service.status();
@@ -117,6 +123,8 @@ impl<
             issues_synced: summary.issues_synced,
             pull_requests_synced: summary.pull_requests_synced,
             commits_synced: summary.commits_synced,
+            comments_synced: summary.comments_synced,
+            review_comments_synced: summary.review_comments_synced,
         })
     }
 }

@@ -79,6 +79,24 @@ fn gh_comments_json() -> serde_json::Value {
     ])
 }
 
+fn gh_review_comments_json() -> serde_json::Value {
+    json!([
+        {
+            "id": 21,
+            "user": { "login": "dave" },
+            "body": "rename this",
+            "path": "src/lib.rs",
+            "diff_hunk": "@@ -1 +1 @@",
+            "in_reply_to_id": null,
+            "commit_id": "h1",
+            "created_at": "2026-08-20T00:00:00Z",
+            "updated_at": "2026-08-20T00:00:00Z",
+            "html_url": "https://github.com/rust-lang/rust/pull/13#discussion_r21",
+            "pull_request_url": "https://api.github.com/repos/rust-lang/rust/pulls/13"
+        }
+    ])
+}
+
 #[tokio::test]
 async fn fetch_repository_maps_github_payloads_into_records() {
     let server = MockServer::start_async().await;
@@ -111,6 +129,13 @@ async fn fetch_repository_maps_github_payloads_into_records() {
             when.method("GET")
                 .path("/repos/rust-lang/rust/issues/comments");
             then.status(200).json_body(gh_comments_json());
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method("GET")
+                .path("/repos/rust-lang/rust/pulls/comments");
+            then.status(200).json_body(gh_review_comments_json());
         })
         .await;
 
@@ -147,6 +172,17 @@ async fn fetch_repository_maps_github_payloads_into_records() {
     assert_eq!(fetched.comments.len(), 1);
     assert_eq!(fetched.comments[0].issue_number, 11);
     assert_eq!(fetched.comments[0].author_login.as_deref(), Some("carol"));
+
+    assert_eq!(fetched.review_comments.len(), 1);
+    assert_eq!(fetched.review_comments[0].pull_number, 13);
+    assert_eq!(
+        fetched.review_comments[0].author_login.as_deref(),
+        Some("dave")
+    );
+    assert_eq!(
+        fetched.review_comments[0].path.as_deref(),
+        Some("src/lib.rs")
+    );
 }
 
 #[tokio::test]

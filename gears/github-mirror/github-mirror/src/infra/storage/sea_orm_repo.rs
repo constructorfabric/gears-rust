@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository};
+use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository, ReviewComment};
 use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, Order};
 use toolkit_db::secure::{
     DBRunner, ScopeError, SecureEntityExt, SecureInsertExt, SecureOnConflict,
@@ -11,6 +11,7 @@ use crate::domain::error::DomainError;
 use crate::domain::repo::{
     CommentRecord, CommentRepository, CommitRecord, CommitRepository, IssueRecord, IssueRepository,
     PullRequestRecord, PullRequestRepository, RepoRepository, RepositoryRecord,
+    ReviewCommentRecord, ReviewCommentRepository,
 };
 
 use super::entity::comments::{self, Entity as CommentEntity};
@@ -18,6 +19,7 @@ use super::entity::commits::{self, Entity as CommitEntity};
 use super::entity::issues::{self, Entity as IssueEntity};
 use super::entity::pull_requests::{self, Entity as PullRequestEntity};
 use super::entity::repositories::{self, Entity as RepoEntity};
+use super::entity::review_comments::{self, Entity as ReviewCommentEntity};
 
 pub struct SeaOrmRepoRepository;
 
@@ -554,6 +556,121 @@ impl CommentRepository for SeaOrmCommentRepository {
                     .add(comments::Column::IssueNumber.eq(issue_number)),
             )
             .order_by(comments::Column::CreatedAt, Order::Asc)
+            .limit(limit)
+            .all(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+
+pub struct SeaOrmReviewCommentRepository;
+
+impl SeaOrmReviewCommentRepository {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SeaOrmReviewCommentRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn review_comment_active_model(
+    tenant_id: Uuid,
+    r: &ReviewCommentRecord,
+) -> review_comments::ActiveModel {
+    review_comments::ActiveModel {
+        tenant_id: ActiveValue::Set(tenant_id),
+        id: ActiveValue::Set(r.id),
+        repo_id: ActiveValue::Set(r.repo_id),
+        pull_number: ActiveValue::Set(r.pull_number),
+        author_login: ActiveValue::Set(r.author_login.clone()),
+        body: ActiveValue::Set(r.body.clone()),
+        path: ActiveValue::Set(r.path.clone()),
+        diff_hunk: ActiveValue::Set(r.diff_hunk.clone()),
+        in_reply_to_id: ActiveValue::Set(r.in_reply_to_id),
+        commit_id: ActiveValue::Set(r.commit_id.clone()),
+        created_at: ActiveValue::Set(r.created_at.clone()),
+        updated_at: ActiveValue::Set(r.updated_at.clone()),
+        html_url: ActiveValue::Set(r.html_url.clone()),
+    }
+}
+
+#[async_trait]
+impl ReviewCommentRepository for SeaOrmReviewCommentRepository {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: ReviewCommentRecord,
+    ) -> Result<ReviewComment, DomainError> {
+        let on_conflict = SecureOnConflict::<ReviewCommentEntity>::columns([
+            review_comments::Column::TenantId,
+            review_comments::Column::Id,
+        ])
+        .update_columns([
+            review_comments::Column::RepoId,
+            review_comments::Column::PullNumber,
+            review_comments::Column::AuthorLogin,
+            review_comments::Column::Body,
+            review_comments::Column::Path,
+            review_comments::Column::DiffHunk,
+            review_comments::Column::InReplyToId,
+            review_comments::Column::CommitId,
+            review_comments::Column::CreatedAt,
+            review_comments::Column::UpdatedAt,
+            review_comments::Column::HtmlUrl,
+        ])
+        .map_err(map_scope_error)?;
+
+        ReviewCommentEntity::insert(review_comment_active_model(tenant_id, &record))
+            .secure()
+            .scope_with_model(scope, &review_comment_active_model(tenant_id, &record))
+            .map_err(map_scope_error)?
+            .on_conflict(on_conflict)
+            .exec(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(ReviewComment {
+            id: record.id,
+            repo_id: record.repo_id,
+            pull_number: record.pull_number,
+            author_login: record.author_login,
+            body: record.body,
+            path: record.path,
+            diff_hunk: record.diff_hunk,
+            in_reply_to_id: record.in_reply_to_id,
+            commit_id: record.commit_id,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            html_url: record.html_url,
+        })
+    }
+
+    async fn list_by_pull<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        pull_number: i64,
+        limit: u64,
+    ) -> Result<Vec<ReviewComment>, DomainError> {
+        let rows = ReviewCommentEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                sea_orm::Condition::all()
+                    .add(review_comments::Column::RepoId.eq(repo_id))
+                    .add(review_comments::Column::PullNumber.eq(pull_number)),
+            )
+            .order_by(review_comments::Column::CreatedAt, Order::Asc)
             .limit(limit)
             .all(conn)
             .await

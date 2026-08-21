@@ -1,4 +1,4 @@
-use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository};
+use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository, ReviewComment};
 
 use crate::domain::service::{MirrorStatus, SyncSummary};
 
@@ -165,6 +165,7 @@ pub struct SyncSummaryDto {
     pub pull_requests_synced: u64,
     pub commits_synced: u64,
     pub comments_synced: u64,
+    pub review_comments_synced: u64,
 }
 
 impl From<SyncSummary> for SyncSummaryDto {
@@ -175,6 +176,7 @@ impl From<SyncSummary> for SyncSummaryDto {
             pull_requests_synced: s.pull_requests_synced,
             commits_synced: s.commits_synced,
             comments_synced: s.comments_synced,
+            review_comments_synced: s.review_comments_synced,
         }
     }
 }
@@ -201,6 +203,43 @@ impl From<Comment> for CommentDto {
             issue_number: c.issue_number,
             author_login: c.author_login,
             body: c.body,
+            created_at: c.created_at,
+            updated_at: c.updated_at,
+            html_url: c.html_url,
+        }
+    }
+}
+
+/// A mirrored GitHub PR review comment as served by the read API.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ReviewCommentDto {
+    pub id: i64,
+    pub repo_id: i64,
+    pub pull_number: i64,
+    pub author_login: Option<String>,
+    pub body: Option<String>,
+    pub path: Option<String>,
+    pub diff_hunk: Option<String>,
+    pub in_reply_to_id: Option<i64>,
+    pub commit_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: Option<String>,
+}
+
+impl From<ReviewComment> for ReviewCommentDto {
+    fn from(c: ReviewComment) -> Self {
+        Self {
+            id: c.id,
+            repo_id: c.repo_id,
+            pull_number: c.pull_number,
+            author_login: c.author_login,
+            body: c.body,
+            path: c.path,
+            diff_hunk: c.diff_hunk,
+            in_reply_to_id: c.in_reply_to_id,
+            commit_id: c.commit_id,
             created_at: c.created_at,
             updated_at: c.updated_at,
             html_url: c.html_url,

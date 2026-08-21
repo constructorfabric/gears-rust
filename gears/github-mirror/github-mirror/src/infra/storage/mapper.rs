@@ -1,6 +1,6 @@
-use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository};
+use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository, ReviewComment};
 
-use super::entity::{comments, commits, issues, pull_requests, repositories};
+use super::entity::{comments, commits, issues, pull_requests, repositories, review_comments};
 
 impl From<repositories::Model> for Repository {
     fn from(m: repositories::Model) -> Self {
@@ -80,6 +80,25 @@ impl From<comments::Model> for Comment {
             issue_number: m.issue_number,
             author_login: m.author_login,
             body: m.body,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+            html_url: m.html_url,
+        }
+    }
+}
+
+impl From<review_comments::Model> for ReviewComment {
+    fn from(m: review_comments::Model) -> Self {
+        Self {
+            id: m.id,
+            repo_id: m.repo_id,
+            pull_number: m.pull_number,
+            author_login: m.author_login,
+            body: m.body,
+            path: m.path,
+            diff_hunk: m.diff_hunk,
+            in_reply_to_id: m.in_reply_to_id,
+            commit_id: m.commit_id,
             created_at: m.created_at,
             updated_at: m.updated_at,
             html_url: m.html_url,

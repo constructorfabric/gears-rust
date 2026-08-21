@@ -9,7 +9,7 @@ use crate::api::rest::{dto, handlers};
 use crate::domain::service::Service;
 use crate::infra::storage::sea_orm_repo::{
     SeaOrmCommentRepository, SeaOrmCommitRepository, SeaOrmIssueRepository,
-    SeaOrmPullRequestRepository, SeaOrmRepoRepository,
+    SeaOrmPullRequestRepository, SeaOrmRepoRepository, SeaOrmReviewCommentRepository,
 };
 
 pub type ConcreteService = Service<
@@ -18,6 +18,7 @@ pub type ConcreteService = Service<
     SeaOrmPullRequestRepository,
     SeaOrmCommitRepository,
     SeaOrmCommentRepository,
+    SeaOrmReviewCommentRepository,
 >;
 
 const API_TAG: &str = "GitHub Mirror";
@@ -191,6 +192,33 @@ pub fn register_routes(
                 openapi,
                 StatusCode::OK,
                 "Paginated list of mirrored comments",
+            )
+            .error_400(openapi)
+            .error_401(openapi)
+            .error_403(openapi)
+            .error_404(openapi)
+            .error_500(openapi)
+            .register(router, openapi);
+
+    router =
+        OperationBuilder::get("/github-mirror/v1/repos/{owner}/{name}/pulls/{number}/comments")
+            .operation_id("github_mirror.list_review_comments")
+            .summary("List mirrored review comments of a pull request")
+            .description(
+                "Returns code review comments held in the local mirror for the tenant,                  oldest first",
+            )
+            .tag(API_TAG)
+            .authenticated()
+            .require_license_features::<License>([])
+            .path_param("owner", "Repository owner login")
+            .path_param("name", "Repository name")
+            .path_param("number", "Pull request number")
+            .query_param("limit", false, "Maximum number of review comments to return")
+            .handler(handlers::list_review_comments)
+            .json_response_with_schema::<toolkit_odata::Page<dto::ReviewCommentDto>>(
+                openapi,
+                StatusCode::OK,
+                "Paginated list of mirrored review comments",
             )
             .error_400(openapi)
             .error_401(openapi)

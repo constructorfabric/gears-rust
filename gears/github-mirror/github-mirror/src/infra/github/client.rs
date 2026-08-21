@@ -5,6 +5,7 @@ use crate::domain::error::DomainError;
 use crate::domain::ports::github::{FetchedRepository, GithubPort};
 use crate::domain::repo::{
     CommentRecord, CommitRecord, IssueRecord, PullRequestRecord, RepositoryRecord,
+    ReviewCommentRecord,
 };
 
 const FIRST_PAGE_SIZE: u32 = 50;
@@ -154,6 +155,22 @@ struct GhComment {
 }
 
 #[derive(Debug, Deserialize)]
+struct GhReviewComment {
+    id: i64,
+    #[serde(default)]
+    user: Option<GhActor>,
+    body: Option<String>,
+    path: Option<String>,
+    diff_hunk: Option<String>,
+    in_reply_to_id: Option<i64>,
+    commit_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+    html_url: Option<String>,
+    pull_request_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GhCommit {
     sha: String,
     commit: GhCommitDetails,
@@ -234,6 +251,24 @@ fn comment_record(repo_id: i64, c: GhComment) -> CommentRecord {
     }
 }
 
+fn review_comment_record(repo_id: i64, c: GhReviewComment) -> ReviewCommentRecord {
+    let pull_number = issue_number_from_url(c.pull_request_url.as_deref());
+    ReviewCommentRecord {
+        id: c.id,
+        repo_id,
+        pull_number,
+        author_login: c.user.map(|u| u.login),
+        body: c.body,
+        path: c.path,
+        diff_hunk: c.diff_hunk,
+        in_reply_to_id: c.in_reply_to_id,
+        commit_id: c.commit_id,
+        created_at: c.created_at,
+        updated_at: c.updated_at,
+        html_url: c.html_url,
+    }
+}
+
 fn commit_record(repo_id: i64, c: GhCommit) -> CommitRecord {
     CommitRecord {
         repo_id,
@@ -278,6 +313,11 @@ impl GithubPort for GithubClient {
                 "/repos/{owner}/{name}/issues/comments?per_page={FIRST_PAGE_SIZE}"
             ))
             .await?;
+        let review_comments: Vec<GhReviewComment> = self
+            .get_json(&format!(
+                "/repos/{owner}/{name}/pulls/comments?per_page={FIRST_PAGE_SIZE}"
+            ))
+            .await?;
 
         Ok(FetchedRepository {
             repository: repository_record(repo),
@@ -296,6 +336,10 @@ impl GithubPort for GithubClient {
             comments: comments
                 .into_iter()
                 .map(|c| comment_record(repo_id, c))
+                .collect(),
+            review_comments: review_comments
+                .into_iter()
+                .map(|c| review_comment_record(repo_id, c))
                 .collect(),
         })
     }

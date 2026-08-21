@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository};
+use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository, ReviewComment};
 use toolkit_db::secure::DBRunner;
 use toolkit_macros::domain_model;
 use toolkit_security::AccessScope;
@@ -191,4 +191,42 @@ pub trait CommentRepository: Send + Sync {
         issue_number: i64,
         limit: u64,
     ) -> Result<Vec<Comment>, DomainError>;
+}
+
+/// Write-side record for a mirrored PR review comment.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCommentRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub pull_number: i64,
+    pub author_login: Option<String>,
+    pub body: Option<String>,
+    pub path: Option<String>,
+    pub diff_hunk: Option<String>,
+    pub in_reply_to_id: Option<i64>,
+    pub commit_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: Option<String>,
+}
+
+#[async_trait]
+pub trait ReviewCommentRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: ReviewCommentRecord,
+    ) -> Result<ReviewComment, DomainError>;
+
+    async fn list_by_pull<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        pull_number: i64,
+        limit: u64,
+    ) -> Result<Vec<ReviewComment>, DomainError>;
 }

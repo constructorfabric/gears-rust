@@ -11,6 +11,7 @@ use github_mirror::api::rest::routes::{ConcreteService, register_routes};
 use github_mirror::domain::ports::github::FetchedRepository;
 use github_mirror::domain::repo::{
     CommentRecord, CommitRecord, IssueRecord, PullRequestRecord, RepositoryRecord,
+    ReviewCommentRecord,
 };
 use toolkit::api::OpenApiRegistryImpl;
 use toolkit_security::SecurityContext;
@@ -96,6 +97,20 @@ fn fetched() -> FetchedRepository {
             updated_at: "2026-08-20T00:00:00Z".to_owned(),
             html_url: None,
         }],
+        review_comments: vec![ReviewCommentRecord {
+            id: 21,
+            repo_id: 42,
+            pull_number: 12,
+            author_login: Some("dave".to_owned()),
+            body: Some("rename this".to_owned()),
+            path: Some("src/lib.rs".to_owned()),
+            diff_hunk: None,
+            in_reply_to_id: None,
+            commit_id: Some("h1".to_owned()),
+            created_at: "2026-08-20T00:00:00Z".to_owned(),
+            updated_at: "2026-08-20T00:00:00Z".to_owned(),
+            html_url: None,
+        }],
     }
 }
 
@@ -124,7 +139,7 @@ async fn get(router: Router, uri: &str) -> axum::http::Response<Body> {
 }
 
 #[tokio::test]
-async fn sync_fills_all_four_tables_and_reads_serve_them() {
+async fn sync_fills_all_six_tables_and_reads_serve_them() {
     let ctx = common::caller_in(Uuid::new_v4());
     let db = common::inmem_db().await;
     let service = common::service_with_github(
@@ -148,6 +163,7 @@ async fn sync_fills_all_four_tables_and_reads_serve_them() {
     assert_eq!(summary["pull_requests_synced"], 1);
     assert_eq!(summary["commits_synced"], 2);
     assert_eq!(summary["comments_synced"], 1);
+    assert_eq!(summary["review_comments_synced"], 1);
 
     let repos = body_json(get(router.clone(), "/github-mirror/v1/repos").await).await;
     assert_eq!(repos["items"][0]["full_name"], "rust-lang/rust");
@@ -186,7 +202,7 @@ async fn sync_fills_all_four_tables_and_reads_serve_them() {
 
     let comments = body_json(
         get(
-            router2,
+            router2.clone(),
             "/github-mirror/v1/repos/rust-lang/rust/issues/11/comments",
         )
         .await,
@@ -194,6 +210,18 @@ async fn sync_fills_all_four_tables_and_reads_serve_them() {
     .await;
     assert_eq!(comments["items"].as_array().expect("items").len(), 1);
     assert_eq!(comments["items"][0]["author_login"], "carol");
+
+    let review_comments = body_json(
+        get(
+            router2,
+            "/github-mirror/v1/repos/rust-lang/rust/pulls/12/comments",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(review_comments["items"].as_array().expect("items").len(), 1);
+    assert_eq!(review_comments["items"][0]["author_login"], "dave");
+    assert_eq!(review_comments["items"][0]["path"], "src/lib.rs");
 }
 
 #[tokio::test]

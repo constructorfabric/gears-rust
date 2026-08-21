@@ -104,6 +104,8 @@ pub struct SyncSummary {
     pub issues_synced: u64,
     pub pull_requests_synced: u64,
     pub commits_synced: u64,
+    pub comments_synced: u64,
+    pub review_comments_synced: u64,
 }
 
 /// A mirrored GitHub issue/PR comment (read-slice shape).
@@ -118,6 +120,30 @@ pub struct Comment {
     pub issue_number: i64,
     pub author_login: Option<String>,
     pub body: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: Option<String>,
+}
+
+/// A mirrored GitHub pull-request review comment (inline diff comment).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewComment {
+    /// GitHub's numeric review-comment id.
+    pub id: i64,
+    /// Owning repository's GitHub id.
+    pub repo_id: i64,
+    /// Owning pull-request number.
+    pub pull_number: i64,
+    pub author_login: Option<String>,
+    pub body: Option<String>,
+    /// File path the comment is attached to.
+    pub path: Option<String>,
+    pub diff_hunk: Option<String>,
+    /// Id of the comment this one replies to.
+    pub in_reply_to_id: Option<i64>,
+    /// Commit SHA the comment pins to.
+    pub commit_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub html_url: Option<String>,
