@@ -13,8 +13,17 @@ pub trait FileParserBackend: Send + Sync {
     /// File extensions this parser supports (without the dot)
     fn supported_extensions(&self) -> &'static [&'static str];
 
-    /// Parse a file from a local path
-    async fn parse_local_path(&self, path: &Path) -> Result<ParsedDocument, DomainError>;
+    /// Parse a file from a local path.
+    ///
+    /// `resolved_content_type` is the canonical MIME for the extension that
+    /// selected this backend, which may come from detection overriding the
+    /// file's own extension. When `Some`, use it instead of re-deriving one from
+    /// `path`; `None` means route by `path`'s extension.
+    async fn parse_local_path(
+        &self,
+        path: &Path,
+        resolved_content_type: Option<&str>,
+    ) -> Result<ParsedDocument, DomainError>;
 
     /// Parse a file from bytes
     async fn parse_bytes(

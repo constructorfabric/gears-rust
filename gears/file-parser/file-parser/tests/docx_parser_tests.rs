@@ -35,7 +35,7 @@ async fn test_docx_parser_with_working_file() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),
@@ -64,7 +64,7 @@ async fn test_docx_parser_with_two_page_file() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     // Note: docx-rust has issues with files containing gradient fills without
     // the "rotate_with_shape" field, so this may fail
@@ -92,7 +92,7 @@ async fn test_docx_parser_with_big_english_file() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     // Note: docx-rust has issues with files containing gradient fills without
     // the "rotate_with_shape" field, so this may fail
@@ -121,7 +121,7 @@ async fn test_docx_parser_with_edge_cases_file_returns_error() {
     }
 
     // This should return an error due to parser limitations
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
     assert!(
         result.is_ok(),
         "Failed to parse DOCX from bytes: {:?}",
@@ -145,7 +145,7 @@ async fn test_docx_parser_with_image_multilingual_file() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),
@@ -232,7 +232,7 @@ async fn test_docx_parser_nonexistent_file() {
     let parser = DocxParser::new();
     let nonexistent = PathBuf::from("/nonexistent/path/to/file.docx");
 
-    let result = parser.parse_local_path(&nonexistent).await;
+    let result = parser.parse_local_path(&nonexistent, None).await;
 
     assert!(result.is_err(), "Should fail on nonexistent file");
 
@@ -279,7 +279,7 @@ async fn test_docx_parser_extracts_tables() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
     assert!(
         result.is_ok(),
         "Failed to parse DOCX file: {:?}",
@@ -343,7 +343,7 @@ async fn test_docx_parser_table_edge_cases() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
     assert!(
         result.is_ok(),
         "Failed to parse DOCX file: {:?}",

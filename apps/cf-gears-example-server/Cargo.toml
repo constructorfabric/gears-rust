@@ -49,6 +49,9 @@ bss-rate-provider = [
 bss-ledger = ["dep:bss_ledger"]
 usage-collector = ["dep:usage_collector"]
 timescaledb-usage-collector = ["dep:timescaledb_usage_collector_plugin"]
+# Content-based file type detection in file-parser (see that crate's `magika`
+# feature doc comment for what it pulls in).
+magika = ["file_parser/magika"]
 
 [dependencies]
 mimalloc = { version = "0.1" }

@@ -175,7 +175,10 @@ pub fn map_http_error(
     body: String,
     retry_after: Option<std::time::Duration>,
 ) -> TransportError {
-    if let Ok(problem) = serde_json::from_str::<Problem>(&body) {
+    if let Ok(mut problem) = serde_json::from_str::<Problem>(&body) {
+        // RFC 9457 §3.1 makes `status` advisory; if the peer omitted it,
+        // the real response status is right here.
+        problem.status.get_or_insert(status);
         return TransportError::Problem {
             problem: Box::new(problem),
             retry_after,
@@ -325,9 +328,36 @@ mod tests {
         let err = map_http_error(500, body, None);
         match err {
             TransportError::Problem { problem: p, .. } => {
-                assert_eq!(p.status, 500);
+                assert_eq!(p.status, Some(500));
                 assert_eq!(p.detail, "broke");
                 assert!(p.problem_type.contains("internal"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_a_minimal_spec_compliant_problem_envelope() {
+        // RFC 9457 §3.1 makes `detail` and `context` optional. A genuinely
+        // foreign peer's Problem can omit both and still be fully
+        // spec-compliant - it must still map to `TransportError::Problem`
+        // (preserving the real `type`/`title`), not silently degrade to the
+        // generic `HttpStatus` fallback meant for peers that don't speak the
+        // canonical-errors envelope at all.
+        let body = serde_json::json!({
+            "type": "https://example.com/probs/out-of-credit",
+            "title": "You do not have enough credit.",
+            "status": 409
+        })
+        .to_string();
+        let err = map_http_error(409, body, None);
+        match err {
+            TransportError::Problem { problem: p, .. } => {
+                assert_eq!(p.problem_type, "https://example.com/probs/out-of-credit");
+                assert_eq!(p.title, "You do not have enough credit.");
+                assert_eq!(p.status, Some(409));
+                assert_eq!(p.detail, "");
+                assert_eq!(p.context, serde_json::json!({}));
             }
             other => panic!("unexpected {other:?}"),
         }

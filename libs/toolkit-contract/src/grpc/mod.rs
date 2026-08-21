@@ -179,7 +179,7 @@ mod tests {
         match map_tonic_status(&status) {
             TransportError::Problem { problem: p, .. } => {
                 assert_eq!(p.title, "Internal");
-                assert_eq!(p.status, 500);
+                assert_eq!(p.status, Some(500));
                 assert!(
                     p.problem_type.contains("internal"),
                     "expected canonical internal GTS URI, got {}",

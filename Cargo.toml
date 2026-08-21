@@ -667,6 +667,20 @@ docx-rust = "0.1.11"
 # `bundled-pdfium` downloads a prebuilt libpdfium at build time rather than vendoring one;
 # Cargo.lock does not pin it. The version lives in .cargo/config.toml as PDFIUM_VERSION.
 kreuzberg = { version = "=4.9.8", features = ["html", "excel", "office", "pdf", "bundled-pdfium"] }
+# Content-based file type detection (ONNX model, embedded weights). Used
+# only by file-parser's optional `magika` feature.
+magika = "1.1"
+# Pinned to match magika 1.1's own `ort` dependency exactly (`=2.0.0-rc.12`).
+# `load-dynamic` is added on top of magika's own feature set (`ndarray`, `std`) so the
+# ONNX Runtime shared library is resolved via `dlopen` at process start (`ORT_DYLIB_PATH`)
+# instead of being statically linked at build time — the gear's build environment never
+# needs the ONNX Runtime dev headers, only wherever the `magika`-enabled binary runs.
+# `download-binaries` (which would fetch a prebuilt runtime over the network during
+# `cargo build`) stays off; magika's own manifest already builds with default features off.
+# `api-24` is required to compile this rc — without it, `ort`'s own `ep/vitis.rs` (compiled
+# unconditionally, not feature-gated) references an `OrtApi` struct field that only exists
+# at the api-24 ABI level; this is unrelated to which execution providers we actually use.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"] }
 
 # Additional testing utilities
 tokio-test = "0.4"

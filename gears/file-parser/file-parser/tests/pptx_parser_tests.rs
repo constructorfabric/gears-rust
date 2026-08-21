@@ -36,7 +36,7 @@ async fn test_pptx_parser_with_simple_file() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),
@@ -73,7 +73,7 @@ async fn test_pptx_parser_with_multislide_file() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),
@@ -112,7 +112,7 @@ async fn test_pptx_parser_nonexistent_file() {
     let parser = KreuzbergParser::new();
     let test_file = PathBuf::from("/nonexistent/path/to/file.pptx");
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(result.is_err(), "Should fail for non-existent file");
 }
@@ -166,7 +166,7 @@ async fn test_pptx_parser_extracts_text() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
     let document = result.expect("Failed to parse PPTX");
 
     // Find paragraph blocks with text content
@@ -196,7 +196,7 @@ async fn test_pptx_parser_with_tables() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),
@@ -229,7 +229,7 @@ async fn test_pptx_parser_with_lists() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),

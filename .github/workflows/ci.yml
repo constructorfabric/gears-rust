@@ -57,6 +57,7 @@ jobs:
     outputs:
       rust:   ${{ steps.filter.outputs.rust }}
       fips:   ${{ steps.filter.outputs.fips }}
+      magika: ${{ steps.filter.outputs.magika }}
       dylint: ${{ steps.filter.outputs.dylint }}
       deps:   ${{ steps.filter.outputs.deps }}
       ci:     ${{ steps.filter.outputs.ci }}
@@ -83,6 +84,8 @@ jobs:
               - 'libs/toolkit/**'
               - 'libs/toolkit-http/**'
               - 'libs/rustls-*/**'
+            magika:
+              - 'gears/file-parser/**'
             dylint:
               - 'tools/dylint_lints/**'
             deps:
@@ -467,6 +470,95 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
+
+  # Builds and tests file-parser's optional `magika` feature so it doesn't
+  # silently rot. `ort`'s own `download-binaries` feature is NOT used here —
+  # it always links statically, which conflicts with `load-dynamic` (baked
+  # into the workspace `ort` dependency for production) and reliably
+  # deadlocks `ort` 2.0.0-rc.12 (confirmed via stack sampling: its
+  # error-reporting path for a failed/incompatible runtime recursively
+  # re-enters the same `OnceLock` it's initializing, blocking the thread
+  # forever instead of returning an error). Instead, this job downloads a
+  # real ONNX Runtime shared library and points `ORT_DYLIB_PATH` at it —
+  # exactly the mechanism production uses. `timeout-minutes` on the test step
+  # is a backstop in case a future regression reintroduces that hang.
+  test-magika:
+    name: Magika feature verification
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.magika == 'true'
+      || needs.changes.outputs.deps == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    env:
+      # api-24 (see workspace Cargo.toml `ort` entry) requires an ONNX
+      # Runtime with minor version >= 24; older builds fail `ort`'s version
+      # check on load. Bump alongside `ort`'s pinned version.
+      ONNXRUNTIME_VERSION: "1.29.0"
+      # sha256 of onnxruntime-linux-x64-1.29.0.tgz. Recompute and bump
+      # alongside ONNXRUNTIME_VERSION.
+      ONNXRUNTIME_SHA256: "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-magika
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - name: Probe sccache & set RUSTC_WRAPPER
+        shell: bash
+        run: |
+          if sccache --start-server >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          else
+            echo "sccache failed, falling back to plain rustc"
+          fi
+
+      - name: Fetch ONNX Runtime shared library
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sL --fail -o /tmp/onnxruntime.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz"
+          echo "${ONNXRUNTIME_SHA256}  /tmp/onnxruntime.tgz" | sha256sum --check
+          tar xzf /tmp/onnxruntime.tgz -C /tmp
+          echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+
+      - name: cargo test (file-parser, magika feature)
+        shell: bash
+        timeout-minutes: 10
+        run: cargo test -p cf-gears-file-parser --features magika
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: cargo deny check (magika feature)
+        run: make deny-magika
 
   cfs:
     name: CFS

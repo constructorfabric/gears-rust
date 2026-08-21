@@ -44,7 +44,7 @@ async fn test_xlsx_parser_with_simple_file() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),
@@ -77,7 +77,7 @@ async fn test_xlsx_parser_with_multisheet_file() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),
@@ -106,7 +106,7 @@ async fn test_xlsx_parser_nonexistent_file() {
     let parser = KreuzbergParser::new();
     let test_file = PathBuf::from("/nonexistent/path/to/file.xlsx");
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(result.is_err(), "Should fail for non-existent file");
 }
@@ -190,7 +190,7 @@ async fn test_xlsx_parser_extracts_tables() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
     let document = result.expect("Failed to parse XLSX");
 
     // Find table blocks
@@ -216,7 +216,7 @@ async fn test_xlsx_parser_merged_cells() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),
@@ -262,7 +262,7 @@ async fn test_xlsx_parser_formula_cells() {
         return;
     }
 
-    let result = parser.parse_local_path(&test_file).await;
+    let result = parser.parse_local_path(&test_file, None).await;
 
     assert!(
         result.is_ok(),

@@ -1,3 +1,4 @@
+pub(crate) mod bounded_read;
 pub mod docx_parser;
 pub mod image_parser;
 pub mod ir_convert;

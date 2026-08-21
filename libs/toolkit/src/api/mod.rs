@@ -11,6 +11,7 @@ pub mod odata;
 pub mod openapi_registry;
 pub mod operation_builder;
 pub mod response;
+pub mod rest;
 pub mod select;
 
 #[cfg(test)]
@@ -47,6 +48,7 @@ pub mod canonical_prelude {
     // Same response sugar / OData / axum re-exports as the legacy prelude
     pub use super::odata::OData;
     pub use super::response::{JsonBody, JsonPage, created_json, no_content, ok_json};
+    pub use super::rest::extract;
     pub use super::select::apply_select;
     pub use axum::{Json, http::StatusCode, response::IntoResponse};
 }

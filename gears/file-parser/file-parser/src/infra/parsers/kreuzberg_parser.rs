@@ -26,6 +26,11 @@ use super::ir_convert::result_to_blocks;
 /// | `pptx`                 | `application/vnd.openxmlformats-officedocument.presentationml.presentation`  |
 pub struct KreuzbergParser;
 
+/// Extensions this backend can extract; standalone so `mime_for_ext` can
+/// filter against it too.
+const SUPPORTED_EXTENSIONS: &[&str] =
+    &["pdf", "html", "htm", "xlsx", "xls", "xlsm", "xlsb", "pptx"];
+
 impl KreuzbergParser {
     #[must_use]
     pub fn new() -> Self {
@@ -39,21 +44,18 @@ impl KreuzbergParser {
         }
     }
 
-    /// Map a file extension to its canonical MIME type.
+    /// Map an extension to its canonical MIME, restricted to
+    /// `supported_extensions()`: the shared table also carries extensions other
+    /// backends own, which Kreuzberg would extract wrong.
     #[must_use]
     fn mime_for_ext(ext: &str) -> Option<&'static str> {
-        match ext.to_lowercase().as_str() {
-            "pdf" => Some("application/pdf"),
-            "html" | "htm" => Some("text/html"),
-            "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-            "xls" => Some("application/vnd.ms-excel"),
-            "xlsm" => Some("application/vnd.ms-excel.sheet.macroEnabled.12"),
-            "xlsb" => Some("application/vnd.ms-excel.sheet.binary.macroEnabled.12"),
-            "pptx" => {
-                Some("application/vnd.openxmlformats-officedocument.presentationml.presentation")
-            }
-            _ => None,
+        if !SUPPORTED_EXTENSIONS
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(ext))
+        {
+            return None;
         }
+        crate::domain::mime_table::mime_for_extension(ext)
     }
 }
 
@@ -70,19 +72,23 @@ impl FileParserBackend for KreuzbergParser {
     }
 
     fn supported_extensions(&self) -> &'static [&'static str] {
-        &["pdf", "html", "htm", "xlsx", "xls", "xlsm", "xlsb", "pptx"]
+        SUPPORTED_EXTENSIONS
     }
 
     async fn parse_local_path(
         &self,
         path: &Path,
+        resolved_content_type: Option<&str>,
     ) -> Result<crate::domain::ir::ParsedDocument, DomainError> {
         let path_str = path
             .to_str()
             .ok_or_else(|| DomainError::io_error("File path is not valid UTF-8"))?;
 
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let mime = Self::mime_for_ext(ext);
+        // Prefer the resolved MIME type over re-deriving one from `path`.
+        let mime = resolved_content_type.or_else(|| {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            Self::mime_for_ext(ext)
+        });
 
         let config = Self::config();
         let result = extract_file(path_str, mime, &config)

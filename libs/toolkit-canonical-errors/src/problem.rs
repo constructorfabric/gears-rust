@@ -151,17 +151,45 @@ impl ProblemCategory {
 // Problem (RFC 9457)
 // ---------------------------------------------------------------------------
 
+/// RFC 9457 §3.1.1's own designated default for `type` when a Problem
+/// carries no more specific type than its HTTP status code.
+fn default_problem_type() -> String {
+    "about:blank".to_owned()
+}
+
+/// Deserialize default for `context` when a foreign peer's Problem omits it.
+/// `serde_json::Value`'s own `Default` is `Value::Null`, which is wrong here:
+/// `TryFrom<Problem>` dispatches a category's context type by deserializing
+/// this value, and context-free categories (`NotFoundV1 {}` and similar) fail
+/// to deserialize from `null` ("invalid type: null, expected struct") but
+/// succeed from an empty object - `{}` is the value that actually round-trips.
+fn default_context() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+/// RFC 9457 §3.1 makes every member but this struct's Rust type reflects
+/// optional on the wire; `status` is `Option<u16>` rather than a defaulted
+/// `u16` since a synthetic `0` would be an actively wrong status, not an
+/// honest "wasn't there" (same reasoning as `default_context`, below).
+/// Callers that have a real status to fall back to normalize `None` after
+/// parsing (`enrich_problem_response`, `map_http_error`); SSE has none and
+/// preserves the absence. `Serialize` is unaffected - `from_error` always
+/// populates every field, so wire output is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Problem {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_problem_type")]
     pub problem_type: String,
+    #[serde(default)]
     pub title: String,
-    pub status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default)]
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    #[serde(default = "default_context")]
     pub context: serde_json::Value,
 
     /// Machine-readable identifier of the typed error variant inside its
@@ -207,7 +235,7 @@ impl Problem {
         Ok(Problem {
             problem_type,
             title,
-            status,
+            status: Some(status),
             detail,
             instance: None,
             trace_id: None,
@@ -254,7 +282,7 @@ impl Problem {
         Problem {
             problem_type: format!("gts://{}", category.gts_fragment()),
             title: category.title().to_owned(),
-            status: category.http_status(),
+            status: Some(category.http_status()),
             detail: detail.into(),
             instance: None,
             trace_id: None,
@@ -340,7 +368,7 @@ impl From<CanonicalError> for Problem {
             Err(ser_err) => Problem {
                 problem_type: gts_uri!(err.gts_type()),
                 title: err.title().to_owned(),
-                status: err.status_code(),
+                status: Some(err.status_code()),
                 detail: err.detail().to_owned(),
                 instance: None,
                 trace_id: None,
@@ -598,22 +626,27 @@ impl TryFrom<Problem> for CanonicalError {
             }
         };
 
-        if !(100..=599).contains(&problem.status) {
-            return Err(ProblemConversionError::InvalidStatus(problem.status));
-        }
+        // A genuinely absent `status` isn't an error - `canonical` just
+        // keeps the category's own default status untouched.
+        if let Some(status) = problem.status {
+            if !(100..=599).contains(&status) {
+                return Err(ProblemConversionError::InvalidStatus(status));
+            }
 
-        if !canonical.is_same_status_class(problem.status) {
-            return Err(ProblemConversionError::CategoryStatusMismatch {
-                category: canonical.category_name(),
-                status: problem.status,
-            });
-        }
+            if !canonical.is_same_status_class(status) {
+                return Err(ProblemConversionError::CategoryStatusMismatch {
+                    category: canonical.category_name(),
+                    status,
+                });
+            }
 
-        // Recover any transport override purely from the wire `status` — no
-        // additional field on `Problem` is needed since the category's
-        // default status is already known (`default_http_status`).
-        if problem.status != canonical.default_http_status() {
-            canonical.transport_overrides_mut().http_status = Some(problem.status);
+            // Recover any transport override purely from the wire `status`
+            // — no additional field on `Problem` is needed since the
+            // category's default status is already known
+            // (`default_http_status`).
+            if status != canonical.default_http_status() {
+                canonical.transport_overrides_mut().http_status = Some(status);
+            }
         }
 
         Ok(canonical)
@@ -640,7 +673,9 @@ impl axum::response::IntoResponse for Problem {
     fn into_response(self) -> axum::response::Response {
         match serde_json::to_vec(&self) {
             Ok(body) => {
-                let status = http::StatusCode::from_u16(self.status)
+                let status = self
+                    .status
+                    .and_then(|s| http::StatusCode::from_u16(s).ok())
                     .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
                 let retry_after_seconds = service_unavailable_retry_after_seconds(&self);
                 let mut response = (
@@ -662,7 +697,7 @@ impl axum::response::IntoResponse for Problem {
                 tracing::error!(
                     error = %e,
                     problem_type = %self.problem_type,
-                    status = self.status,
+                    status = ?self.status,
                     "failed to serialize Problem; emitting fallback body",
                 );
                 let body = format!(
@@ -759,70 +794,5 @@ impl utoipa::ToSchema for Problem {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn not_found_round_trips_through_problem() {
-        let original = CanonicalError::__not_found(crate::context::NotFound::new())
-            .with_detail("invoice 42 missing")
-            .with_resource_type("invoice")
-            .with_resource("42");
-
-        let problem = Problem::from(original.clone());
-        let recovered = CanonicalError::try_from(problem).expect("known problem_type");
-
-        assert!(matches!(recovered, CanonicalError::NotFound { .. }));
-        assert_eq!(recovered.detail(), original.detail());
-        assert_eq!(recovered.resource_type(), Some("invoice"));
-        assert_eq!(recovered.resource_name(), Some("42"));
-    }
-
-    #[test]
-    fn already_exists_round_trips_through_problem() {
-        let original = CanonicalError::__already_exists(crate::context::AlreadyExists::new())
-            .with_detail("duplicate payment")
-            .with_resource_type("payment")
-            .with_resource("xyz");
-
-        let problem = Problem::from(original);
-        let recovered = CanonicalError::try_from(problem).expect("known problem_type");
-
-        assert!(matches!(recovered, CanonicalError::AlreadyExists { .. }));
-        assert_eq!(recovered.resource_type(), Some("payment"));
-        assert_eq!(recovered.resource_name(), Some("xyz"));
-    }
-
-    #[test]
-    fn permission_denied_round_trips_through_problem() {
-        let original = CanonicalError::__permission_denied(crate::context::PermissionDenied::new(
-            "missing scope",
-        ))
-        .with_detail("forbidden")
-        .with_resource_type("invoice")
-        .with_resource("42");
-
-        let problem = Problem::from(original);
-        let recovered = CanonicalError::try_from(problem).expect("known problem_type");
-
-        assert!(matches!(recovered, CanonicalError::PermissionDenied { .. }));
-        assert_eq!(recovered.resource_type(), Some("invoice"));
-        assert_eq!(recovered.resource_name(), Some("42"));
-    }
-
-    #[test]
-    fn unknown_problem_type_errors() {
-        let problem = Problem {
-            problem_type: "gts://something.else.unknown".to_owned(),
-            title: "X".to_owned(),
-            status: 500,
-            detail: String::new(),
-            instance: None,
-            trace_id: None,
-            context: serde_json::json!({}),
-            error_code: None,
-            error_domain: None,
-        };
-        assert!(CanonicalError::try_from(problem).is_err());
-    }
-}
+#[path = "problem_tests.rs"]
+mod tests;

@@ -425,7 +425,7 @@ check-release-config: py-env
 
 # -------- Code security checks --------
 
-.PHONY: deny fips-policy security
+.PHONY: deny deny-magika fips-policy security
 
 # Check licenses and dependencies
 deny:
@@ -433,6 +433,13 @@ deny:
 	$(call check_tool,cargo-deny)
 	$(call check_tool_version,cargo-deny,>=$(DENY_MIN_VERSION))
 	cargo deny check
+
+# Same as `deny`, but with the file-parser `magika` feature enabled so the
+# ort/ndarray dependency tree it pulls in is also audited.
+deny-magika:
+	$(call check_tool,cargo-deny)
+	$(call check_deny_version)
+	cargo deny --features magika check
 
 ## FIPS dependency-graph policy (see deny-fips.toml + ADR 0005).
 ## Refuses the build if any non-FIPS-validated crypto crate enters the

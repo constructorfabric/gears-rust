@@ -85,7 +85,6 @@ No gear-specific environment constraints. The canonical error system runs within
 - gRPC transport mapping — future work
 - SSE error event format — future work
 - W3C trace ID extraction — separate workstream
-- Error middleware catch-all — depends on foundation phase
 - Error extensibility rules (custom gear-specific error types beyond the 16 categories) — future work
 
 ## 5. Functional Requirements
@@ -127,6 +126,15 @@ Every error response MUST include a trace ID for request correlation.
 
 - **Rationale**: Trace IDs enable end-to-end debugging across gears and support integration.
 - **Actors**: `cpt-cf-errors-actor-api-consumer`, `cpt-cf-errors-actor-gear-developer`
+
+#### Error Middleware Catch-All
+
+- [ ] `p1` - **ID**: `cpt-cf-errors-fr-middleware-catchall`
+
+The system MUST guarantee every HTTP error response is a syntactically valid RFC 9457 `Problem`, even when the originating failure was never explicitly typed as `CanonicalError` (an axum extractor rejection, a tower-layer short-circuit, or any other pre-handler failure). Where the failure's shape is known ahead of time, the response MUST also carry the precise canonical category and a machine-readable reason code; where it is not, a minimal `Problem` using RFC 9457's `about:blank` convention is sufficient.
+
+- **Rationale**: Without this guarantee, a client cannot reliably parse every error response as `Problem` JSON — some failures (extraction rejections, tower-layer short-circuits) bypass every handler-level `CanonicalError` conversion and previously rendered as plain text.
+- **Actors**: `cpt-cf-errors-actor-gear-developer`, `cpt-cf-errors-actor-api-consumer`
 
 #### Public vs Private Detail Isolation
 
