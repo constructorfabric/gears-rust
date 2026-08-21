@@ -56,19 +56,8 @@ pub const MYSQL_TAG: &str = "9.7";
 /// `TimescaleDB` image, which is not an official `postgres` build.
 pub const TIMESCALEDB_IMAGE: &str = "timescale/timescaledb";
 
-/// `TimescaleDB` tag.
-///
-/// Deliberately **not** on the same `PostgreSQL` major as [`POSTGRES_TAG`].
-/// `2.29.2-pg18` makes `pg_delete_referenced_is_usage_type_referenced` in
-/// `cf-gears-timescaledb-usage-collector-plugin` fail: deleting a referenced
-/// `usage_type_catalog` row no longer surfaces as a classified foreign-key
-/// violation, so the store answers `Internal` instead of `UsageTypeReferenced`.
-/// That is a behavioural change in the usage-collector plugin's error
-/// classification, not in the pin, and it belongs to that gear to diagnose and
-/// fix; bumping it here would only turn one gear's regression into a red CI on
-/// every branch. Centralising the constant is what lets that bump be a one-line
-/// change once the plugin handles it.
-pub const TIMESCALEDB_TAG: &str = "2.17.2-pg16";
+/// `TimescaleDB` tag, on the same `PostgreSQL` major as the floor above.
+pub const TIMESCALEDB_TAG: &str = "2.29.2-pg18";
 
 /// `MariaDB` image, used by the outbox throughput benchmark.
 pub const MARIADB_IMAGE: &str = "mariadb";
