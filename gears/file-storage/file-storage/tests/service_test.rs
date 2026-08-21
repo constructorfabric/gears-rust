@@ -53,15 +53,7 @@ async fn build_service_with_page_sizes(
     // pooled connection its own empty DB; a temp file is shared by construction.
     let mut path = std::env::temp_dir();
     path.push(format!("cf-fs-test-{}.db", Uuid::now_v7().simple()));
-    // Build a cross-platform SQLite file URL: forward slashes only, and an
-    // absolute path must lead with '/' so the URL keeps sqlite's triple-slash
-    // form. On Windows `C:\dir\f.db` becomes `/C:/dir/f.db`; on Unix the path
-    // already starts with '/'.
-    let mut file = path.to_string_lossy().replace('\\', "/");
-    if !file.starts_with('/') {
-        file.insert(0, '/');
-    }
-    let dsn = format!("sqlite://{file}?mode=rwc");
+    let dsn = format!("sqlite://{}?mode=rwc", path.display());
     let opts = ConnectOpts {
         max_conns: Some(1),
         min_conns: Some(1),

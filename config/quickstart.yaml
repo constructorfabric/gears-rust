@@ -336,6 +336,22 @@ gears:
           parent_id: "00000000-0000-0000-0000-000000000005"
           status: active
 
+  types-registry:
+    database:
+      server: "sqlite_users"
+      file: "types_registry.db"
+    config:
+      entities:
+        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+          $schema: "http://json-schema.org/draft-07/schema#"
+          description: "Platform-root tenant type (no parents)."
+          type: "object"
+          allOf:
+            - $ref: "gts://gts.cf.core.am.tenant_type.v1~"
+          x-gts-traits:
+            allowed_parent_types: []
+            idp_provisioning: false
+
   credstore:
     database:
       server: "sqlite_users"

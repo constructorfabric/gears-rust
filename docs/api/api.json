@@ -2812,6 +2812,67 @@
         ],
         "type": "object"
       },
+      "EntityDto": {
+        "description": "One entity with its authored content and the artifacts materialized at\nadmission (D3). No consumer recomputes an effective form.",
+        "properties": {
+          "content": {},
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "effective_traits": {},
+          "effective_traits_schema": {},
+          "gts_id": {
+            "type": "string"
+          },
+          "gts_uuid": {
+            "description": "The Registry Reference: a deterministic `UUIDv5` of the identifier.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/EntityKindDto"
+          },
+          "lifecycle_status": {
+            "$ref": "#/components/schemas/LifecycleStatusDto",
+            "description": "A tombstone stays exact-readable and only leaves discovery."
+          },
+          "owning_gear": {
+            "description": "Caller-declared attribution. It MUST NOT be used to authorize.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolved_schema": {},
+          "resource_version": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "gts_id",
+          "gts_uuid",
+          "kind",
+          "lifecycle_status",
+          "resource_version",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "EntityKindDto": {
+        "description": "`type_schema` or `instance`.",
+        "enum": [
+          "type_schema",
+          "instance"
+        ],
+        "type": "string"
+      },
       "EntryAnnotationRequestDto": {
         "description": "The `PATCH /journal-entries/{entryId}/annotation` request body (Group 2B,\nVariant C): set the typed controlled non-financial `description` note on the\nentry (or one of its lines). `description` is screened for raw customer PII\nbefore any write (`PII_IN_METADATA_VALUE`); `null` clears the note.",
         "properties": {
@@ -4239,6 +4300,14 @@
         ],
         "type": "object"
       },
+      "LifecycleStatusDto": {
+        "description": "`active` or `deleted`.",
+        "enum": [
+          "active",
+          "deleted"
+        ],
+        "type": "string"
+      },
       "LineDto": {
         "description": "A read-back journal line in a response (a row of [`EntryDto`] or of the\n`GET /journal-lines` `Page<LineDto>`). Enum fields render as their canonical\nstring literals (`account_class`, `side`, `mapping_status`).",
         "properties": {
@@ -5248,6 +5317,134 @@
           "collected_at"
         ],
         "type": "object"
+      },
+      "OperationAcceptedDto": {
+        "description": "The receipt returned by a submission: `202` for accepted work, `200` only when\na replayed operation is already terminal.",
+        "properties": {
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "replayed": {
+            "description": "`true` when this submission resolved to an operation that already existed\nunder its `Idempotency-Key` with a matching request.",
+            "type": "boolean"
+          },
+          "status": {
+            "$ref": "#/components/schemas/OperationStatusDto"
+          }
+        },
+        "required": [
+          "operation_id",
+          "status",
+          "replayed"
+        ],
+        "type": "object"
+      },
+      "OperationDto": {
+        "description": "An operation as a caller polls it.",
+        "properties": {
+          "completed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/OperationItemDto"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/OperationKindDto"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/OperationStatusDto",
+            "description": "Progress only — the outcomes are on the items and are deliberately not\naggregated here."
+          }
+        },
+        "required": [
+          "operation_id",
+          "kind",
+          "dry_run",
+          "status",
+          "created_at",
+          "items"
+        ],
+        "type": "object"
+      },
+      "OperationItemDto": {
+        "description": "One candidate's durable outcome.",
+        "properties": {
+          "error": {
+            "description": "The structured refusal reason, when this candidate failed."
+          },
+          "gts_id": {
+            "type": "string"
+          },
+          "resource_version": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/OperationItemStatusDto"
+          }
+        },
+        "required": [
+          "gts_id",
+          "status"
+        ],
+        "type": "object"
+      },
+      "OperationItemStatusDto": {
+        "description": "`pending`, `running`, `succeeded`, `unchanged` or `failed`.",
+        "enum": [
+          "pending",
+          "running",
+          "succeeded",
+          "unchanged",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "OperationKindDto": {
+        "description": "`registration` or `deletion`.",
+        "enum": [
+          "registration",
+          "deletion"
+        ],
+        "type": "string"
+      },
+      "OperationStatusDto": {
+        "description": "`pending`, `running` or `completed`.",
+        "enum": [
+          "pending",
+          "running",
+          "completed"
+        ],
+        "type": "string"
       },
       "OsInfoDto": {
         "properties": {
@@ -9265,6 +9462,61 @@
         },
         "required": [
           "subject_id"
+        ],
+        "type": "object"
+      },
+      "SubmitEntitiesRequest": {
+        "description": "A submission of one or more entities.\n\n`items` and not `entities`: the operation result, the discovery page and\n`Page<T>` all call their array `items`, so this is the house word for \"the\narray in this envelope\". It is also the name v1 does *not* use, which keeps\nthe T24a promotion a loud break rather than one that turns on the element\nshape.",
+        "properties": {
+          "dry_run": {
+            "description": "Run every check and commit nothing. Part of the request fingerprint, so\nreusing one `Idempotency-Key` for a dry run and then a commit is a\nconflict, not a replay of the dry-run result.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SubmitEntityDto"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "SubmitEntityDto": {
+        "description": "One entity in a submission.\n\n`SubmitEntityDto` and not `SubmitCandidateDto`: \"candidate\" is the domain's\nword for a submitted-but-not-yet-admitted entity, and this type is the wire\nform, whose name reaches callers as an `OpenAPI` component.",
+        "properties": {
+          "content": {
+            "description": "The authored document."
+          },
+          "expected_resource_version": {
+            "description": "Optimistic precondition. **Omit** to require that the identifier does not\nexist; a literal `0` is refused. `>= 1` is the version to match.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "force": {
+            "description": "ADR-0004 `force`: waive one cross-minor compatibility check. Refused where\nthe deployment disallows it, or where the candidate has no such check.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "gts_id": {
+            "description": "The canonical GTS identifier. A non-canonical spelling is refused rather\nthan normalized.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "gts_id",
+          "content"
         ],
         "type": "object"
       },
@@ -29969,6 +30221,36 @@
             },
             "description": "Conflict"
           },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Payload Too Large"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
           "429": {
             "content": {
               "application/problem+json": {
@@ -30471,6 +30753,411 @@
         "summary": "Update GTS type",
         "tags": [
           "Resource Group Types"
+        ]
+      }
+    },
+    "/types-registry/v2/entities": {
+      "post": {
+        "description": "Submit one or more GTS entities for admission. Returns 202 with the operation's Location; poll GET /types-registry/v2/operations/{operation_id} for the per-candidate outcome. A replay of a terminal operation returns 200. An Idempotency-Key header is required: a replay with the same body returns the same operation, and a different body under the same key is a conflict.",
+        "operationId": "types_registry.submit_entities",
+        "parameters": [
+          {
+            "description": "Caller-supplied key scoping the retry of this submission. A replay with the same body returns the same operation; a different body under the same key is a conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitEntitiesRequest"
+              }
+            }
+          },
+          "description": "Entities to admit",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationAcceptedDto"
+                }
+              }
+            },
+            "description": "Replay of an operation that is already terminal"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationAcceptedDto"
+                }
+              }
+            },
+            "description": "Accepted; poll the operation at the returned Location"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Payload Too Large"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Submit GTS entities for registration",
+        "tags": [
+          "Types Registry"
+        ]
+      }
+    },
+    "/types-registry/v2/entities/{entity_key}": {
+      "get": {
+        "description": "Return one entity with its authored document and the effective artifacts materialized at admission. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it. A deleted entity is still readable and reports its lifecycle status.",
+        "operationId": "types_registry.get_entity",
+        "parameters": [
+          {
+            "description": "A GTS identifier (e.g. gts.acme.core.events.user_created.v1~) or a Registry Reference UUID",
+            "in": "path",
+            "name": "entity_key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityDto"
+                }
+              }
+            },
+            "description": "The requested entity"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get a GTS entity by identifier or Registry Reference",
+        "tags": [
+          "Types Registry"
+        ]
+      }
+    },
+    "/types-registry/v2/operations/{operation_id}": {
+      "get": {
+        "description": "Return one operation and the durable per-candidate outcomes. `status` is progress only: `completed` means every item is terminal, and the outcomes are on the items.",
+        "operationId": "types_registry.get_operation",
+        "parameters": [
+          {
+            "description": "The operation UUID returned by a submission",
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationDto"
+                }
+              }
+            },
+            "description": "The operation"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get an admission operation",
+        "tags": [
+          "Types Registry"
         ]
       }
     },

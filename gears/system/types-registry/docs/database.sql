@@ -368,6 +368,7 @@ CREATE TABLE types_registry__operation_item (
             AND result_revision_no IS NULL
             AND result_resource_version IS NULL
             AND error_payload IS NOT NULL
+            AND started_at IS NOT NULL
             AND completed_at IS NOT NULL)
     )
 );

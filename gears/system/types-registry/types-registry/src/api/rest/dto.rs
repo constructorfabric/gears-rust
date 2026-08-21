@@ -5,7 +5,11 @@ use uuid::Uuid;
 use gts::GtsIdSegment;
 use types_registry_sdk::RegisterSummary;
 
+use crate::domain::enums::{
+    EntityKind, LifecycleStatus, OperationItemStatus, OperationKind, OperationStatus,
+};
 use crate::domain::model::{GtsEntity, ListQuery, SegmentMatchScope};
+use crate::domain::registry_service::{EntityRecord, OperationItemRecord, OperationRecord};
 
 /// DTO for a GTS ID segment.
 #[derive(Debug, Clone)]
@@ -30,7 +34,7 @@ impl From<&GtsIdSegment> for GtsIdSegmentDto {
             package: segment.package().to_owned(),
             namespace: segment.namespace().to_owned(),
             type_name: segment.type_name().to_owned(),
-            ver_major: segment.ver_major(),
+            ver_major: segment.ver_major_opt().unwrap_or(0),
         }
     }
 }
@@ -428,16 +432,286 @@ mod tests {
         assert_eq!(query.pattern, None);
         assert_eq!(query.is_type, None);
     }
+}
 
-    #[test]
-    fn test_register_summary_dto() {
-        let summary = RegisterSummary {
-            succeeded: 5,
-            failed: 2,
-        };
-        let dto: RegisterSummaryDto = summary.into();
-        assert_eq!(dto.total, 7);
-        assert_eq!(dto.succeeded, 5);
-        assert_eq!(dto.failed, 2);
+// ---------------------------------------------------------------------------
+// The submit-then-poll contract (D10, SPEC §8.1)
+// ---------------------------------------------------------------------------
+//
+// `POST /entities` breaks its old synchronous `200` shape: the response is now a
+// receipt for an operation, and the outcome is polled. These DTOs are the wire
+// form of that contract, and they exist only here — nothing outside `api/rest`
+// references them (DE0201).
+
+/// One entity in a submission.
+///
+/// `SubmitEntityDto` and not `SubmitCandidateDto`: "candidate" is the domain's
+/// word for a submitted-but-not-yet-admitted entity, and this type is the wire
+/// form, whose name reaches callers as an `OpenAPI` component.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+pub struct SubmitEntityDto {
+    /// The canonical GTS identifier. A non-canonical spelling is refused rather
+    /// than normalized.
+    pub gts_id: String,
+    /// The authored document.
+    pub content: serde_json::Value,
+    /// Optimistic precondition. **Omit** to require that the identifier does not
+    /// exist; a literal `0` is refused. `>= 1` is the version to match.
+    #[serde(default)]
+    pub expected_resource_version: Option<i64>,
+    /// ADR-0004 `force`: waive one cross-minor compatibility check. Refused where
+    /// the deployment disallows it, or where the candidate has no such check.
+    #[serde(default)]
+    pub force: Option<bool>,
+}
+
+/// A submission of one or more entities.
+///
+/// `items` and not `entities`: the operation result, the discovery page and
+/// `Page<T>` all call their array `items`, so this is the house word for "the
+/// array in this envelope". It is also the name v1 does *not* use, which keeps
+/// the T24a promotion a loud break rather than one that turns on the element
+/// shape.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+pub struct SubmitEntitiesRequest {
+    #[schema(min_items = 1)]
+    pub items: Vec<SubmitEntityDto>,
+    /// Run every check and commit nothing. Part of the request fingerprint, so
+    /// reusing one `Idempotency-Key` for a dry run and then a commit is a
+    /// conflict, not a replay of the dry-run result.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
+/// The receipt returned by a submission: `202` for accepted work, `200` only when
+/// a replayed operation is already terminal.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct OperationAcceptedDto {
+    pub operation_id: Uuid,
+    pub status: OperationStatusDto,
+    /// `true` when this submission resolved to an operation that already existed
+    /// under its `Idempotency-Key` with a matching request.
+    pub replayed: bool,
+}
+
+/// One candidate's durable outcome.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct OperationItemDto {
+    pub gts_id: String,
+    pub status: OperationItemStatusDto,
+    pub resource_version: Option<i64>,
+    /// The structured refusal reason, when this candidate failed.
+    pub error: Option<serde_json::Value>,
+}
+
+/// An operation as a caller polls it.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct OperationDto {
+    pub operation_id: Uuid,
+    pub kind: OperationKindDto,
+    pub dry_run: bool,
+    /// Progress only — the outcomes are on the items and are deliberately not
+    /// aggregated here.
+    pub status: OperationStatusDto,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub started_at: Option<time::OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub completed_at: Option<time::OffsetDateTime>,
+    pub items: Vec<OperationItemDto>,
+}
+
+/// One entity with its authored content and the artifacts materialized at
+/// admission (D3). No consumer recomputes an effective form.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct EntityDto {
+    pub gts_id: String,
+    /// The Registry Reference: a deterministic `UUIDv5` of the identifier.
+    pub gts_uuid: Uuid,
+    pub kind: EntityKindDto,
+    /// A tombstone stays exact-readable and only leaves discovery.
+    pub lifecycle_status: LifecycleStatusDto,
+    pub resource_version: i64,
+    /// Caller-declared attribution. It MUST NOT be used to authorize.
+    pub owning_gear: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
+    pub content: Option<serde_json::Value>,
+    pub resolved_schema: Option<serde_json::Value>,
+    pub effective_traits: Option<serde_json::Value>,
+    pub effective_traits_schema: Option<serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
+// Domain -> DTO. Mapping only: every value below is already decided by the
+// domain, and nothing here consults a policy, a limit or the database.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The wire vocabularies
+// ---------------------------------------------------------------------------
+//
+// Neither the domain nor the storage enums derive `Serialize`, on purpose (T3): the
+// storage side must not leak its smallint numbering and the domain side has no wire
+// spelling of its own. These types are the wire spellings.
+//
+// Enums rather than `&'static str` helpers, and the difference is not internal: a
+// `String` field publishes an unconstrained `string` in the served `OpenAPI`, so a
+// generated client gets no vocabulary and a value this gear never emits type-checks
+// against it. `#[api_dto]` renames variants to `snake_case`.
+
+/// `pending`, `running` or `completed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum OperationStatusDto {
+    Pending,
+    Running,
+    Completed,
+}
+
+impl From<OperationStatus> for OperationStatusDto {
+    fn from(status: OperationStatus) -> Self {
+        match status {
+            OperationStatus::Pending => Self::Pending,
+            OperationStatus::Running => Self::Running,
+            OperationStatus::Completed => Self::Completed,
+        }
+    }
+}
+
+/// `pending`, `running`, `succeeded`, `unchanged` or `failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum OperationItemStatusDto {
+    Pending,
+    Running,
+    Succeeded,
+    Unchanged,
+    Failed,
+}
+
+impl From<OperationItemStatus> for OperationItemStatusDto {
+    fn from(status: OperationItemStatus) -> Self {
+        match status {
+            OperationItemStatus::Pending => Self::Pending,
+            OperationItemStatus::Running => Self::Running,
+            OperationItemStatus::Succeeded => Self::Succeeded,
+            OperationItemStatus::Unchanged => Self::Unchanged,
+            OperationItemStatus::Failed => Self::Failed,
+        }
+    }
+}
+
+/// `registration` or `deletion`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum OperationKindDto {
+    Registration,
+    Deletion,
+}
+
+impl From<OperationKind> for OperationKindDto {
+    fn from(kind: OperationKind) -> Self {
+        match kind {
+            OperationKind::Registration => Self::Registration,
+            OperationKind::Deletion => Self::Deletion,
+        }
+    }
+}
+
+/// `type_schema` or `instance`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum EntityKindDto {
+    TypeSchema,
+    Instance,
+}
+
+impl From<EntityKind> for EntityKindDto {
+    fn from(kind: EntityKind) -> Self {
+        match kind {
+            EntityKind::TypeSchema => Self::TypeSchema,
+            EntityKind::Instance => Self::Instance,
+        }
+    }
+}
+
+/// `active` or `deleted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum LifecycleStatusDto {
+    Active,
+    Deleted,
+}
+
+impl From<LifecycleStatus> for LifecycleStatusDto {
+    fn from(status: LifecycleStatus) -> Self {
+        match status {
+            LifecycleStatus::Active => Self::Active,
+            LifecycleStatus::Deleted => Self::Deleted,
+        }
+    }
+}
+
+impl From<OperationItemRecord> for OperationItemDto {
+    fn from(item: OperationItemRecord) -> Self {
+        Self {
+            gts_id: item.gts_id,
+            status: item.status.into(),
+            resource_version: item.resource_version,
+            // The stored payload is already a JSON object; re-parsing it keeps the
+            // response a document rather than a string containing one. A payload
+            // that does not parse is surfaced as a string field rather than
+            // dropped, so a corrupt row is visible instead of invisible.
+            error: item.error.map(|payload| {
+                match serde_json::from_str::<serde_json::Value>(&payload) {
+                    Ok(value) => value,
+                    Err(_) => serde_json::Value::String(payload),
+                }
+            }),
+        }
+    }
+}
+
+impl From<OperationRecord> for OperationDto {
+    fn from(record: OperationRecord) -> Self {
+        Self {
+            operation_id: record.operation_id,
+            kind: record.kind.into(),
+            dry_run: record.dry_run,
+            status: record.status.into(),
+            created_at: record.created_at,
+            started_at: record.started_at,
+            completed_at: record.completed_at,
+            items: record.items.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<EntityRecord> for EntityDto {
+    fn from(record: EntityRecord) -> Self {
+        Self {
+            gts_id: record.gts_id,
+            gts_uuid: record.gts_uuid,
+            kind: record.kind.into(),
+            lifecycle_status: record.lifecycle_status.into(),
+            resource_version: record.resource_version,
+            owning_gear: record.owning_gear,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            content: record.content,
+            resolved_schema: record.resolved_schema,
+            effective_traits: record.effective_traits,
+            effective_traits_schema: record.effective_traits_schema,
+        }
     }
 }
