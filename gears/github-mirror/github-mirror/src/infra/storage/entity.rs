@@ -356,3 +356,33 @@ pub mod releases {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod branches {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    /// Mirrored GitHub branch head, tenant-scoped.
+    ///
+    /// Branches have no numeric GitHub id, so the key is
+    /// `(tenant_id, repo_id, name)` — like `gm_commits` keys by sha.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_branches")]
+    #[secure(tenant_col = "tenant_id", resource_col = "name", no_owner, no_type)]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        /// Owning repository's GitHub id.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub repo_id: i64,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub name: String,
+        /// SHA the branch currently points at.
+        pub commit_sha: String,
+        pub protected: bool,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

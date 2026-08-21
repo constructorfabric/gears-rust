@@ -10,8 +10,8 @@ use axum::extract::Path;
 use crate::api::rest::routes::ConcreteService;
 
 use super::dto::{
-    CommentDto, CommitDto, GithubMirrorHealthDto, IssueDto, LabelDto, MilestoneDto, PullRequestDto,
-    ReleaseDto, RepositoryDto, ReviewCommentDto, ReviewDto, SyncSummaryDto,
+    BranchDto, CommentDto, CommitDto, GithubMirrorHealthDto, IssueDto, LabelDto, MilestoneDto,
+    PullRequestDto, ReleaseDto, RepositoryDto, ReviewCommentDto, ReviewDto, SyncSummaryDto,
 };
 
 pub async fn health(
@@ -133,4 +133,14 @@ pub async fn list_releases(
 ) -> ApiResult<JsonPage<ReleaseDto>> {
     let page: Page<_> = svc.list_releases(&ctx, &owner, &name, &query).await?;
     Ok(Json(page.map_items(ReleaseDto::from)))
+}
+
+pub async fn list_branches(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path((owner, name)): Path<(String, String)>,
+    OData(query): OData,
+) -> ApiResult<JsonPage<BranchDto>> {
+    let page: Page<_> = svc.list_branches(&ctx, &owner, &name, &query).await?;
+    Ok(Json(page.map_items(BranchDto::from)))
 }

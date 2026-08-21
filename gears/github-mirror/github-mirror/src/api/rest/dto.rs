@@ -1,5 +1,5 @@
 use github_mirror_sdk::{
-    Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
+    Branch, Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
     ReviewComment,
 };
 
@@ -173,6 +173,7 @@ pub struct SyncSummaryDto {
     pub labels_synced: u64,
     pub milestones_synced: u64,
     pub releases_synced: u64,
+    pub branches_synced: u64,
 }
 
 impl From<SyncSummary> for SyncSummaryDto {
@@ -188,6 +189,7 @@ impl From<SyncSummary> for SyncSummaryDto {
             labels_synced: s.labels_synced,
             milestones_synced: s.milestones_synced,
             releases_synced: s.releases_synced,
+            branches_synced: s.branches_synced,
         }
     }
 }
@@ -384,6 +386,27 @@ impl From<Release> for ReleaseDto {
             created_at: r.created_at,
             published_at: r.published_at,
             html_url: r.html_url,
+        }
+    }
+}
+
+/// A mirrored GitHub branch head as served by the read API.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct BranchDto {
+    pub repo_id: i64,
+    pub name: String,
+    pub commit_sha: String,
+    pub protected: bool,
+}
+
+impl From<Branch> for BranchDto {
+    fn from(b: Branch) -> Self {
+        Self {
+            repo_id: b.repo_id,
+            name: b.name,
+            commit_sha: b.commit_sha,
+            protected: b.protected,
         }
     }
 }

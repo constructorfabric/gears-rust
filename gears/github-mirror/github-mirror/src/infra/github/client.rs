@@ -4,8 +4,8 @@ use serde::Deserialize;
 use crate::domain::error::DomainError;
 use crate::domain::ports::github::{FetchedRepository, GithubPort};
 use crate::domain::repo::{
-    CommentRecord, CommitRecord, IssueRecord, LabelRecord, MilestoneRecord, PullRequestRecord,
-    ReleaseRecord, RepositoryRecord, ReviewCommentRecord, ReviewRecord,
+    BranchRecord, CommentRecord, CommitRecord, IssueRecord, LabelRecord, MilestoneRecord,
+    PullRequestRecord, ReleaseRecord, RepositoryRecord, ReviewCommentRecord, ReviewRecord,
 };
 
 const FIRST_PAGE_SIZE: u32 = 50;
@@ -215,6 +215,19 @@ struct GhRelease {
 }
 
 #[derive(Debug, Deserialize)]
+struct GhBranchCommit {
+    sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhBranch {
+    name: String,
+    commit: GhBranchCommit,
+    #[serde(default)]
+    protected: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct GhReview {
     id: i64,
     #[serde(default)]
@@ -370,6 +383,15 @@ fn release_record(repo_id: i64, r: GhRelease) -> ReleaseRecord {
     }
 }
 
+fn branch_record(repo_id: i64, b: GhBranch) -> BranchRecord {
+    BranchRecord {
+        repo_id,
+        name: b.name,
+        commit_sha: b.commit.sha,
+        protected: b.protected,
+    }
+}
+
 fn review_record(repo_id: i64, pull_number: i64, r: GhReview) -> ReviewRecord {
     ReviewRecord {
         id: r.id,
@@ -452,6 +474,12 @@ impl GithubPort for GithubClient {
             ))
             .await?;
 
+        let branches: Vec<GhBranch> = self
+            .get_json(&format!(
+                "/repos/{owner}/{name}/branches?per_page={FIRST_PAGE_SIZE}"
+            ))
+            .await?;
+
         let mut reviews: Vec<ReviewRecord> = Vec::new();
         for pull in pulls.iter().take(REVIEW_SYNC_PULL_CAP) {
             let page: Vec<GhReview> = self
@@ -500,6 +528,10 @@ impl GithubPort for GithubClient {
             releases: releases
                 .into_iter()
                 .map(|r| release_record(repo_id, r))
+                .collect(),
+            branches: branches
+                .into_iter()
+                .map(|b| branch_record(repo_id, b))
                 .collect(),
         })
     }

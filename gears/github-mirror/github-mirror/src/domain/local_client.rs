@@ -9,9 +9,9 @@ use toolkit_security::SecurityContext;
 
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
-    CommentRepository, CommitRepository, IssueRepository, LabelRepository, MilestoneRepository,
-    PullRequestRepository, ReleaseRepository, RepoRepository, ReviewCommentRepository,
-    ReviewRepository,
+    BranchRepository, CommentRepository, CommitRepository, IssueRepository, LabelRepository,
+    MilestoneRepository, PullRequestRepository, ReleaseRepository, RepoRepository,
+    ReviewCommentRepository, ReviewRepository,
 };
 use crate::domain::service::Service;
 
@@ -49,7 +49,7 @@ impl From<DomainError> for CanonicalError {
     }
 }
 
-type SharedService<R, I, P, C, M, V, W, L, N, E> = Arc<Service<R, I, P, C, M, V, W, L, N, E>>;
+type SharedService<R, I, P, C, M, V, W, L, N, E, B> = Arc<Service<R, I, P, C, M, V, W, L, N, E, B>>;
 
 // One generic parameter per aggregate repository; the alias is as small
 // as the type gets.
@@ -66,8 +66,9 @@ pub struct LocalClient<
     L: LabelRepository + 'static,
     N: MilestoneRepository + 'static,
     E: ReleaseRepository + 'static,
+    B: BranchRepository + 'static,
 > {
-    service: SharedService<R, I, P, C, M, V, W, L, N, E>,
+    service: SharedService<R, I, P, C, M, V, W, L, N, E, B>,
 }
 
 impl<
@@ -81,11 +82,12 @@ impl<
     L: LabelRepository + 'static,
     N: MilestoneRepository + 'static,
     E: ReleaseRepository + 'static,
-> LocalClient<R, I, P, C, M, V, W, L, N, E>
+    B: BranchRepository + 'static,
+> LocalClient<R, I, P, C, M, V, W, L, N, E, B>
 {
     #[must_use]
     #[allow(clippy::type_complexity)]
-    pub fn new(service: SharedService<R, I, P, C, M, V, W, L, N, E>) -> Self {
+    pub fn new(service: SharedService<R, I, P, C, M, V, W, L, N, E, B>) -> Self {
         Self { service }
     }
 }
@@ -102,7 +104,8 @@ impl<
     L: LabelRepository + 'static,
     N: MilestoneRepository + 'static,
     E: ReleaseRepository + 'static,
-> GithubMirrorClientV1 for LocalClient<R, I, P, C, M, V, W, L, N, E>
+    B: BranchRepository + 'static,
+> GithubMirrorClientV1 for LocalClient<R, I, P, C, M, V, W, L, N, E, B>
 {
     async fn status(&self, _ctx: &SecurityContext) -> Result<MirrorStatus, CanonicalError> {
         let status = self.service.status();
@@ -146,6 +149,7 @@ impl<
             labels_synced: summary.labels_synced,
             milestones_synced: summary.milestones_synced,
             releases_synced: summary.releases_synced,
+            branches_synced: summary.branches_synced,
         })
     }
 }

@@ -159,6 +159,16 @@ fn gh_releases_json() -> serde_json::Value {
     ])
 }
 
+fn gh_branches_json() -> serde_json::Value {
+    json!([
+        {
+            "name": "master",
+            "commit": { "sha": "c1" },
+            "protected": true
+        }
+    ])
+}
+
 #[tokio::test]
 async fn fetch_repository_maps_github_payloads_into_records() {
     let server = MockServer::start_async().await;
@@ -223,6 +233,12 @@ async fn fetch_repository_maps_github_payloads_into_records() {
         .mock_async(|when, then| {
             when.method("GET").path("/repos/rust-lang/rust/releases");
             then.status(200).json_body(gh_releases_json());
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method("GET").path("/repos/rust-lang/rust/branches");
+            then.status(200).json_body(gh_branches_json());
         })
         .await;
 
@@ -294,6 +310,11 @@ async fn fetch_repository_maps_github_payloads_into_records() {
     assert_eq!(fetched.releases[0].tag_name, "v1.0.0");
     assert!(!fetched.releases[0].draft);
     assert_eq!(fetched.releases[0].author_login.as_deref(), Some("erin"));
+
+    assert_eq!(fetched.branches.len(), 1);
+    assert_eq!(fetched.branches[0].name, "master");
+    assert_eq!(fetched.branches[0].commit_sha, "c1");
+    assert!(fetched.branches[0].protected);
 }
 
 #[tokio::test]

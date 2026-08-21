@@ -10,8 +10,8 @@ use axum::http::{Request, StatusCode};
 use github_mirror::api::rest::routes::{ConcreteService, register_routes};
 use github_mirror::domain::ports::github::FetchedRepository;
 use github_mirror::domain::repo::{
-    CommentRecord, CommitRecord, IssueRecord, LabelRecord, MilestoneRecord, PullRequestRecord,
-    ReleaseRecord, RepositoryRecord, ReviewCommentRecord, ReviewRecord,
+    BranchRecord, CommentRecord, CommitRecord, IssueRecord, LabelRecord, MilestoneRecord,
+    PullRequestRecord, ReleaseRecord, RepositoryRecord, ReviewCommentRecord, ReviewRecord,
 };
 use toolkit::api::OpenApiRegistryImpl;
 use toolkit_security::SecurityContext;
@@ -158,6 +158,12 @@ fn fetched() -> FetchedRepository {
             published_at: Some("2026-08-20T00:00:00Z".to_owned()),
             html_url: None,
         }],
+        branches: vec![BranchRecord {
+            repo_id: 42,
+            name: "master".to_owned(),
+            commit_sha: "c2".to_owned(),
+            protected: true,
+        }],
     }
 }
 
@@ -186,7 +192,7 @@ async fn get(router: Router, uri: &str) -> axum::http::Response<Body> {
 }
 
 #[tokio::test]
-async fn sync_fills_all_ten_tables_and_reads_serve_them() {
+async fn sync_fills_all_eleven_tables_and_reads_serve_them() {
     let ctx = common::caller_in(Uuid::new_v4());
     let db = common::inmem_db().await;
     let service = common::service_with_github(
@@ -215,6 +221,7 @@ async fn sync_fills_all_ten_tables_and_reads_serve_them() {
     assert_eq!(summary["labels_synced"], 1);
     assert_eq!(summary["milestones_synced"], 1);
     assert_eq!(summary["releases_synced"], 1);
+    assert_eq!(summary["branches_synced"], 1);
 
     let repos = body_json(get(router.clone(), "/github-mirror/v1/repos").await).await;
     assert_eq!(repos["items"][0]["full_name"], "rust-lang/rust");
@@ -310,11 +317,23 @@ async fn sync_fills_all_ten_tables_and_reads_serve_them() {
     assert_eq!(milestones["items"][0]["title"], "v1.0");
     assert_eq!(milestones["items"][0]["closed_issues"], 7);
 
-    let releases =
-        body_json(get(router2, "/github-mirror/v1/repos/rust-lang/rust/releases").await).await;
+    let releases = body_json(
+        get(
+            router2.clone(),
+            "/github-mirror/v1/repos/rust-lang/rust/releases",
+        )
+        .await,
+    )
+    .await;
     assert_eq!(releases["items"].as_array().expect("items").len(), 1);
     assert_eq!(releases["items"][0]["tag_name"], "v1.0.0");
     assert_eq!(releases["items"][0]["author_login"], "erin");
+
+    let branches =
+        body_json(get(router2, "/github-mirror/v1/repos/rust-lang/rust/branches").await).await;
+    assert_eq!(branches["items"].as_array().expect("items").len(), 1);
+    assert_eq!(branches["items"][0]["name"], "master");
+    assert_eq!(branches["items"][0]["commit_sha"], "c2");
 }
 
 #[tokio::test]

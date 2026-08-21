@@ -1,10 +1,10 @@
 use github_mirror_sdk::{
-    Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
+    Branch, Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
     ReviewComment,
 };
 
 use super::entity::{
-    comments, commits, issues, labels, milestones, pull_requests, releases, repositories,
+    branches, comments, commits, issues, labels, milestones, pull_requests, releases, repositories,
     review_comments, reviews,
 };
 
@@ -175,6 +175,17 @@ impl From<releases::Model> for Release {
             created_at: m.created_at,
             published_at: m.published_at,
             html_url: m.html_url,
+        }
+    }
+}
+
+impl From<branches::Model> for Branch {
+    fn from(m: branches::Model) -> Self {
+        Self {
+            repo_id: m.repo_id,
+            name: m.name,
+            commit_sha: m.commit_sha,
+            protected: m.protected,
         }
     }
 }

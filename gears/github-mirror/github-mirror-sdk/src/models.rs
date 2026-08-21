@@ -110,6 +110,7 @@ pub struct SyncSummary {
     pub labels_synced: u64,
     pub milestones_synced: u64,
     pub releases_synced: u64,
+    pub branches_synced: u64,
 }
 
 /// A mirrored GitHub issue/PR comment (read-slice shape).
@@ -231,4 +232,17 @@ pub struct Release {
     /// Absent for drafts.
     pub published_at: Option<String>,
     pub html_url: Option<String>,
+}
+
+/// A mirrored GitHub branch head (read-slice shape).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Branch {
+    /// Owning repository's GitHub id.
+    pub repo_id: i64,
+    /// Branch name — branches have no numeric GitHub id.
+    pub name: String,
+    /// SHA the branch currently points at.
+    pub commit_sha: String,
+    pub protected: bool,
 }

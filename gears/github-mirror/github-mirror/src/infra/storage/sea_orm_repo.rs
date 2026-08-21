@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use github_mirror_sdk::{
-    Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
+    Branch, Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
     ReviewComment,
 };
 use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, Order};
@@ -12,12 +12,14 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
-    CommentRecord, CommentRepository, CommitRecord, CommitRepository, IssueRecord, IssueRepository,
-    LabelRecord, LabelRepository, MilestoneRecord, MilestoneRepository, PullRequestRecord,
-    PullRequestRepository, ReleaseRecord, ReleaseRepository, RepoRepository, RepositoryRecord,
-    ReviewCommentRecord, ReviewCommentRepository, ReviewRecord, ReviewRepository,
+    BranchRecord, BranchRepository, CommentRecord, CommentRepository, CommitRecord,
+    CommitRepository, IssueRecord, IssueRepository, LabelRecord, LabelRepository, MilestoneRecord,
+    MilestoneRepository, PullRequestRecord, PullRequestRepository, ReleaseRecord,
+    ReleaseRepository, RepoRepository, RepositoryRecord, ReviewCommentRecord,
+    ReviewCommentRepository, ReviewRecord, ReviewRepository,
 };
 
+use super::entity::branches::{self, Entity as BranchEntity};
 use super::entity::comments::{self, Entity as CommentEntity};
 use super::entity::commits::{self, Entity as CommitEntity};
 use super::entity::issues::{self, Entity as IssueEntity};
@@ -1085,6 +1087,86 @@ impl ReleaseRepository for SeaOrmReleaseRepository {
             .scope_with(scope)
             .filter(sea_orm::Condition::all().add(releases::Column::RepoId.eq(repo_id)))
             .order_by(releases::Column::CreatedAt, Order::Desc)
+            .limit(limit)
+            .all(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+
+pub struct SeaOrmBranchRepository;
+
+impl SeaOrmBranchRepository {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SeaOrmBranchRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn branch_active_model(tenant_id: Uuid, r: &BranchRecord) -> branches::ActiveModel {
+    branches::ActiveModel {
+        tenant_id: ActiveValue::Set(tenant_id),
+        repo_id: ActiveValue::Set(r.repo_id),
+        name: ActiveValue::Set(r.name.clone()),
+        commit_sha: ActiveValue::Set(r.commit_sha.clone()),
+        protected: ActiveValue::Set(r.protected),
+    }
+}
+
+#[async_trait]
+impl BranchRepository for SeaOrmBranchRepository {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: BranchRecord,
+    ) -> Result<Branch, DomainError> {
+        let on_conflict = SecureOnConflict::<BranchEntity>::columns([
+            branches::Column::TenantId,
+            branches::Column::RepoId,
+            branches::Column::Name,
+        ])
+        .update_columns([branches::Column::CommitSha, branches::Column::Protected])
+        .map_err(map_scope_error)?;
+
+        BranchEntity::insert(branch_active_model(tenant_id, &record))
+            .secure()
+            .scope_with_model(scope, &branch_active_model(tenant_id, &record))
+            .map_err(map_scope_error)?
+            .on_conflict(on_conflict)
+            .exec(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(Branch {
+            repo_id: record.repo_id,
+            name: record.name,
+            commit_sha: record.commit_sha,
+            protected: record.protected,
+        })
+    }
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Branch>, DomainError> {
+        let rows = BranchEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(sea_orm::Condition::all().add(branches::Column::RepoId.eq(repo_id)))
+            .order_by(branches::Column::Name, Order::Asc)
             .limit(limit)
             .all(conn)
             .await

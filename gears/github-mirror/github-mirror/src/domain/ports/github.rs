@@ -3,8 +3,8 @@ use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
-    CommentRecord, CommitRecord, IssueRecord, LabelRecord, MilestoneRecord, PullRequestRecord,
-    ReleaseRecord, RepositoryRecord, ReviewCommentRecord, ReviewRecord,
+    BranchRecord, CommentRecord, CommitRecord, IssueRecord, LabelRecord, MilestoneRecord,
+    PullRequestRecord, ReleaseRecord, RepositoryRecord, ReviewCommentRecord, ReviewRecord,
 };
 
 /// What one sync-lite pass fetched from GitHub for a repository.
@@ -21,6 +21,7 @@ pub struct FetchedRepository {
     pub labels: Vec<LabelRecord>,
     pub milestones: Vec<MilestoneRecord>,
     pub releases: Vec<ReleaseRecord>,
+    pub branches: Vec<BranchRecord>,
 }
 
 /// Outbound port to GitHub's REST API (implemented in `infra/github`).
