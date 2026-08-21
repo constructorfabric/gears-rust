@@ -124,6 +124,24 @@ fn histogram_has_attributes(
     false
 }
 
+/// Extract the explicit bucket boundaries of the named histogram, if exported.
+fn histogram_bounds(exporter: &InMemoryMetricExporter, name: &str) -> Option<Vec<f64>> {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    for resource_metrics in &metrics {
+        for scope_metrics in resource_metrics.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                if metric.name() == name
+                    && let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data()
+                    && let Some(dp) = hist.data_points().next()
+                {
+                    return Some(dp.bounds().collect());
+                }
+            }
+        }
+    }
+    None
+}
+
 async fn ok_handler() -> impl IntoResponse {
     StatusCode::OK
 }
@@ -437,6 +455,53 @@ async fn metrics_unmatched_route() -> Result<()> {
             ]
         ),
         "unmatched route should have http.route='unmatched' and status 404"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_duration_uses_second_scale_bucket_boundaries() -> Result<()> {
+    let _lock = METER_LOCK.lock().await;
+    let (provider, exporter) = install_test_meter_provider();
+    let ctx = create_api_gateway_ctx(base_config());
+    let api = api_gateway::ApiGateway::default();
+    api.init(&ctx).await?;
+
+    let router = OperationBuilder::get("/tests/v1/items")
+        .operation_id("test:list-items")
+        .summary("List items")
+        .anonymous()
+        .json_response(StatusCode::OK, "OK")
+        .handler(axum::routing::get(ok_handler))
+        .register(Router::new(), &api);
+    let app = api.rest_finalize(
+        &ctx,
+        router,
+        Arc::new(toolkit::RestHealthcheckRegistry::new()),
+    )?;
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/tests/v1/items")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    provider.force_flush().unwrap();
+
+    let bounds = histogram_bounds(&exporter, "http.server.request.duration")
+        .expect("duration histogram should be exported with at least one data point");
+    assert_eq!(
+        bounds,
+        vec![
+            0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0
+        ],
+        "http.server.request.duration must use semconv seconds-scale bucket \
+         boundaries, not the SDK's millisecond-scale defaults"
     );
 
     Ok(())
