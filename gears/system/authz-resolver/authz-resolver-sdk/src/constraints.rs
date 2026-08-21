@@ -95,7 +95,9 @@ impl InPredicate {
 /// The PEP compiler combines this wire-level predicate with the current
 /// [`crate::pep::ResourceType`]'s RG member-handle type. `SecureORM` compiles the
 /// result to a type-qualified membership subquery and casts the entity property
-/// to text to match RG's opaque `resource_id` storage.
+/// to text to match RG's opaque `resource_id` storage. Compilation fails closed
+/// when the resource descriptor has no membership mapping; a degraded PDP
+/// response must use an explicit [`InPredicate`] instead.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct InGroupPredicate {
     /// Resource property to filter. Native compilation currently requires
@@ -129,7 +131,9 @@ impl InGroupPredicate {
 /// The PEP compiler combines this wire-level predicate with the current
 /// [`crate::pep::ResourceType`]'s RG member-handle type. `SecureORM` compiles the
 /// result to a type-qualified membership subquery whose group set comes from
-/// `resource_group_closure`.
+/// `resource_group_closure`. Compilation fails closed when the resource
+/// descriptor has no membership mapping; a degraded PDP response must use an
+/// explicit [`InPredicate`] instead.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct InGroupSubtreePredicate {
     /// Resource property to filter. Native compilation currently requires
