@@ -32,6 +32,22 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         id: Uuid,
     ) -> Result<Option<rg_entity::Model>, DomainError>;
 
+    /// Same read, taking a row lock on the group for the rest of the
+    /// transaction.
+    ///
+    /// For the paths that decide something from rows *related* to this group
+    /// -- its children, its memberships -- and then write based on that
+    /// decision. Serializing those writers on the group row is what keeps the
+    /// decision true, and is why such a path does not need SERIALIZABLE.
+    ///
+    /// Backends without row locks (`SQLite`) ignore the clause; they are
+    /// serializable regardless, so the guarantee is unchanged.
+    async fn find_model_by_id_for_update<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<Option<rg_entity::Model>, DomainError>;
+
     /// Return the id of *any* existing root group (`parent_id` IS NULL) whose
     /// `gts_type.schema_id` starts with the given prefix, or `None` when no
     /// such root exists. Used to enforce tenant-root uniqueness
@@ -112,12 +128,15 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         group_id: Uuid,
     ) -> Result<(), DomainError>;
 
+    /// Returns the number of closure rows written, as the database counted
+    /// them: the statement is an `INSERT ... SELECT`, so the rows never reach
+    /// this process and nothing here can derive the figure.
     async fn insert_ancestor_closure_rows<C: DBRunner>(
         &self,
         db: &C,
         child_id: Uuid,
         parent_id: Uuid,
-    ) -> Result<(), DomainError>;
+    ) -> Result<u64, DomainError>;
 
     /// Delete every group in `group_ids` in one statement per bind-parameter
     /// chunk, not one per group (RG-10).
@@ -153,6 +172,17 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
 
     async fn get_depth<C: DBRunner>(&self, db: &C, group_id: Uuid) -> Result<i32, DomainError>;
 
+    /// Deepest descendant of `group_id` relative to it, or `0` when it has
+    /// none. A single `MAX(depth)` aggregate over the closure table, for
+    /// callers -- the move path's depth-limit check -- that need only the
+    /// scalar; see [`Self::get_descendant_ids_with_depth`] for callers
+    /// (force delete) that need the row set itself.
+    async fn get_max_descendant_depth<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<i32, DomainError>;
+
     async fn count_children<C: DBRunner>(
         &self,
         db: &C,
@@ -179,12 +209,15 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         group_id: Uuid,
     ) -> Result<(), DomainError>;
 
+    /// Returns the number of closure rows written; see
+    /// [`Self::insert_ancestor_closure_rows`] for why the caller cannot
+    /// compute it.
     async fn rebuild_subtree_closure<C: DBRunner>(
         &self,
         db: &C,
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
-    ) -> Result<(), DomainError>;
+    ) -> Result<u64, DomainError>;
 
     async fn has_memberships<C: DBRunner>(
         &self,
@@ -270,16 +303,17 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
 
     /// Update `metadata_schema` and `updated_at` on one `gts_type` row.
     ///
-    /// Returns the `updated_at` it wrote rather than the row: every other
-    /// column is either the key it was addressed by or immutable, so the
-    /// caller can assemble the new row from what it already holds. Reading
-    /// it back cost a second `gts_type` SELECT per update (RG-08).
+    /// Returns the row as the database now holds it: assembled from
+    /// `current` plus the two columns this write just set, not re-read.
+    /// Every other column is either the key `current` was addressed by or
+    /// immutable, so a second `gts_type` SELECT per update could not have
+    /// told the caller anything `current` didn't already have (RG-08).
     async fn update_type<C: DBRunner>(
         &self,
         db: &C,
-        type_id: i16,
+        current: gts_type::Model,
         metadata_schema: Option<&serde_json::Value>,
-    ) -> Result<time::OffsetDateTime, DomainError>;
+    ) -> Result<gts_type::Model, DomainError>;
 
     async fn delete_by_id<C: DBRunner>(&self, db: &C, type_id: i16) -> Result<(), DomainError>;
 
@@ -321,6 +355,13 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
         db: &C,
         type_id: i16,
     ) -> Result<Vec<(Uuid, String)>, DomainError>;
+
+    async fn find_groups_violating_removed_membership_types<C: DBRunner>(
+        &self,
+        db: &C,
+        child_type_id: i16,
+        membership_codes: &[String],
+    ) -> Result<Vec<(String, Uuid, String)>, DomainError>;
 
     async fn list_types<C: DBRunner>(
         &self,
@@ -373,4 +414,42 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
         gts_type_id: i16,
         resource_id: &str,
     ) -> Result<Vec<Uuid>, DomainError>;
+
+    /// Try to claim the guard row for a resource membership.
+    ///
+    /// Reads the existing guard row for PK `(gts_type_id, resource_id)`
+    /// first; if none exists, inserts one and falls back to re-reading it on
+    /// a unique-violation race. Serializes the first membership of a
+    /// resource. Returns the `tenant_id` that was either just inserted or
+    /// already present.
+    ///
+    /// The caller must then compare the returned tenant against the group's
+    /// own tenant and reject the `add_membership` if they differ. To keep
+    /// the claim from outliving the memberships it guards, run this in the
+    /// same transaction as the membership insert it gates, and release the
+    /// guard via [`Self::delete_membership_guard`] once
+    /// [`Self::count_memberships`] reports none remain for the pair.
+    async fn ensure_membership_guard<C: DBRunner>(
+        &self,
+        db: &C,
+        gts_type_id: i16,
+        resource_id: &str,
+        tenant_id: Uuid,
+    ) -> Result<Uuid, DomainError>;
+
+    /// Count memberships still referencing `(gts_type_id, resource_id)`.
+    async fn count_memberships<C: DBRunner>(
+        &self,
+        db: &C,
+        gts_type_id: i16,
+        resource_id: &str,
+    ) -> Result<u64, DomainError>;
+
+    /// Delete the membership-tenant guard row for `(gts_type_id, resource_id)`.
+    async fn delete_membership_guard<C: DBRunner>(
+        &self,
+        db: &C,
+        gts_type_id: i16,
+        resource_id: &str,
+    ) -> Result<(), DomainError>;
 }

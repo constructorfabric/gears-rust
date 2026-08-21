@@ -22,13 +22,25 @@ to be reused — this gear is the worked example, not the point.
 
 ## Scope of this branch
 
-This report is the full audit. The branch carrying it fixes the **query-count**
-subset only — the N+1 and redundant-I/O findings — and leaves the
-transaction-boundary, retry, isolation and error-classification findings to the
-branch they came from. The Status column says which is which, and the audit
-suite carries only the tests that exercise what is here: a test asserting a
-fix that is absent would be noise, not coverage, so those tests stay with the
-branch that carries their fixes.
+This report is the full audit. The branch carrying it started as the
+**query-count** subset — the N+1 and redundant-I/O findings — and has since
+taken the transaction-boundary, retry and isolation findings that are about
+*performance*: RG-02, RG-03, RG-09 and RG-15, plus the isolation decisions
+they unblock. It later added the membership-tenant guard table (Section 8)
+and, on 2026-08-21, RG-01 and RG-14 themselves: the guard claim/release this
+same branch introduced needed the transaction boundary those two findings
+asked for, so leaving them for a different branch stopped making sense.
+
+What still stays out is tenant scoping, the authorization gates, and the
+wider error-mapping changes. Two error classifications did come along, but
+only where a constraint was already enforcing the invariant and what was
+missing was the translation — the duplicate type code and the in-use type —
+because an isolation level was standing in for it.
+
+The Status column says which is which, and the audit suite carries only the
+tests that exercise what is here: a test asserting a fix that is absent would
+be noise, not coverage, so those tests stay with the branch that carries their
+fixes.
 
 ## What was found
 
@@ -47,21 +59,21 @@ depth-10 parent issued roughly 100 000 separate `INSERT`s.
 
 | ID | Class | Severity | Where | Status |
 |----|-------|----------|-------|--------|
-| RG-01 | no-tx-write | **Critical** | `membership_service.rs` `add_membership_inner` — check-then-insert on a bare connection; the PK includes `group_id`, so two concurrent first-memberships in different tenants both commit and the "one tenant per resource" invariant breaks | Fixed on the source branch; not in this one — a transaction boundary, not a query count |
-| RG-02 | no-tx-write | Medium | `type_service.rs` `delete_type` — resolve/count/delete outside any transaction | Fixed on the source branch; not in this one — a transaction boundary, not a query count |
-| RG-03 | no-retry-serializable | **Critical** | `type_service.rs` `create_type`/`update_type` — `SERIALIZABLE` without retry, so a `40001` reaches the caller raw. Live call sites: account-management's gear-init type registration, i.e. a startup path, not latent code | Fixed on the source branch; not in this one — retry, not a query count |
+| RG-01 | no-tx-write | **Critical** | `membership_service.rs` `add_membership_inner` — check-then-insert on a bare connection; the PK includes `group_id`, so two concurrent first-memberships in different tenants both commit and the "one tenant per resource" invariant breaks | Fixed 2026-08-21. The guard claim (`ensure_membership_guard`) and the membership insert now share one transaction via `transaction_with_retry`, so a failed insert rolls the claim back instead of leaving it behind. Guarded by `trace_add_membership` |
+| RG-02 | no-tx-write | Medium | `type_service.rs` `delete_type` — resolve/count/delete outside any transaction | Fixed. One transaction with bounded retry, at the backend default: `ON DELETE RESTRICT` is what makes a type in use undeletable, and `delete_by_id` maps that constraint to the same conflict the count reports. Guarded by `trace_delete_type` |
+| RG-03 | no-retry-serializable | **Critical** | `type_service.rs` `create_type`/`update_type` — `SERIALIZABLE` without retry, so a `40001` reaches the caller raw. Live call sites: account-management's gear-init type registration, i.e. a startup path, not latent code | Fixed. Both moved to `transaction_with_retry`, each attempt on its own clones. Guarded by a Section 4 rule |
 | RG-04 | n-plus-one | High | `group_repo.rs` `rebuild_subtree_closure` — one `INSERT` per closure row, `A×N` of them | Fixed |
 | RG-05 | n-plus-one | Medium | `group_service.rs` `move_group_internal_impl` — `is_descendant` + `get_relative_depth` per descendant; both answers were already in the rows loaded a moment earlier | Fixed |
 | RG-06 | n-plus-one | Medium-High | `group_repo.rs` `insert_ancestor_closure_rows` — one `INSERT` per ancestor | Fixed |
 | RG-07 | n-plus-one | Low-Medium | `type_repo.rs` — junction rows inserted one per allowed parent/membership type | Fixed |
-| RG-08 | redundant-io | Low-Medium | `group_repo.rs`/`type_repo.rs`/`membership_repo.rs` — insert discards the model it just got back, then re-reads the row by id | Fixed in all three, both halves. Inserts return what they wrote or assemble it from the values they were given; the `update_many` + re-read shape is gone too — `group_repo::update` returns `rows_affected` and `type_repo::update_type` returns only the timestamp it chose, and both callers build the response from what they wrote. `find_by_code_with_model` now hands back the row itself, not just its id, so `update_type` has the immutable `created_at` without a second read |
-| RG-09 | external-call-in-tx | High | `group_service.rs` — a cross-gear `types_registry` call plus JSON-Schema compilation inside a `SERIALIZABLE` transaction, repeated on every retry | Fixed on the source branch; not in this one — transaction duration, not a query count |
+| RG-08 | redundant-io | Low-Medium | `group_repo.rs`/`type_repo.rs`/`membership_repo.rs` — insert discards the model it just got back, then re-reads the row by id | Fixed in all three, both halves. Inserts return what they wrote or assemble it from the values they were given; the `update_many` + re-read shape is gone too — `group_repo::update` returns `rows_affected`, and `type_repo::update_type` assembles the updated row inside the repository from the values it wrote, so the column set the UPDATE touches lives in one place. `find_by_code_with_model` hands back the row itself, not just its id, so the update path has the immutable `created_at` without a second read |
+| RG-09 | external-call-in-tx | High | `group_service.rs` — a cross-gear `types_registry` call plus JSON-Schema compilation inside a `SERIALIZABLE` transaction, repeated on every retry | Fixed. Both entry points validate before `BEGIN`; the transaction-inner functions no longer take a `TypesRegistryClient`, so the call cannot return by accident. Guarded by a Section 4 rule |
 | RG-10 | n-plus-one | High | `group_service.rs` `force_delete_subtree` — ~4 statements per node | Fixed |
 | RG-11 | redundant-io | Low | `group_service.rs` — the same type resolved twice per create/update (`resolve_id` then `find_by_code`) | Fixed |
 | RG-12 | n-plus-one | Medium | `type_repo.rs` `list_types` — junction reads per row, so a page of N types costs `2N+1` queries. **Read path** — the only finding not on a write path | Fixed |
 | RG-13 | redundant-io | Low | `type_service.rs` — the duplicate-check loads full junction data just to test existence | Fixed |
-| RG-14 | no-tx-write | Medium | `membership_service.rs` `remove_membership` — same check-then-write shape as RG-01 | Fixed on the source branch; not in this one — a transaction boundary, not a query count |
-| RG-15 | error-shape-swallowing | **Critical** | Platform-wide: repositories map every `sea_orm::DbErr` through `.to_string()` into `DbErr::Custom`, and `is_retryable_contention` only recognized `Exec`/`Query`. `transaction_with_retry` could therefore never tell a serialization failure was retryable when it surfaced inside a repository call — the retry loop was dead code on every write path in the gear | Fixed on the source branch; not in this one — error classification, not a query count |
+| RG-14 | no-tx-write | Medium | `membership_service.rs` `remove_membership` — same check-then-write shape as RG-01 | Fixed 2026-08-21. The membership delete, the remaining-membership count, and the guard-row release now share one transaction, so a membership this call just removed cannot be double-counted by a concurrent `add_membership` |
+| RG-15 | error-shape-swallowing | **Critical** | Platform-wide: repositories map every `sea_orm::DbErr` through `.to_string()` into `DbErr::Custom`, and `is_retryable_contention` only recognized `Exec`/`Query`. `transaction_with_retry` could therefore never tell a serialization failure was retryable when it surfaced inside a repository call — the retry loop was dead code on every write path in the gear | Fixed. `is_retryable_contention` matches `DbErr::Custom` on the same message patterns, with five regression tests. Without it the jittered backoff added alongside these fixes would never have fired |
 
 RG-11 through RG-15 were **not** in the original problem statement — the
 detector found them. RG-15 is the one worth remembering: it was found by a
@@ -169,11 +181,13 @@ Three mechanisms, all deterministic and CI-runnable:
   *slope*, not the offset: statement count must not grow with N. This is what
   makes N+1 detection mechanical rather than a matter of noticing a loop.
 - **Static source scans** for the classes that leave no SQL trace. Text
-  heuristics, explicitly interim until a dylint late lint replaces them. This
-  branch carries the `SERIALIZABLE`-without-retry rule (Section 4 of the audit
-  suite), which both guards `group_service.rs` as a negative control and pins
-  the defect that is still present in `type_service.rs` at its current count;
-  the external-call-in-tx rule travels with the transaction-boundary fixes.
+  heuristics, explicitly interim until a dylint late lint replaces them.
+  Section 4 of the audit suite carries four rules here: retry on every
+  transaction in both service files (RG-03 is fixed in this branch, so both
+  scans are negative controls), the external call kept out of the transaction
+  (RG-09), and the row lock the non-force delete takes in place of
+  `SERIALIZABLE` — scoped to the function bodies they are about, because a
+  whole-file scan passes on someone else's code.
 - **Real PostgreSQL races** (not in this branch — see the deviation section
   below). Barrier-synchronized task pairs on `testcontainers`, each ending in
   a post-state invariant check against the tables — closure agrees with
@@ -278,9 +292,6 @@ The point of the exercise. Nothing needs copying: the recorder lives in
 - **`TxRunner` marker and a dylint lint series** — the compile-time and
   lint-time layers that would prevent reintroduction. The static rules here are
   text heuristics standing in for them.
-- **Membership ownership guard table** — a schema-level alternative to RG-01's
-  fix. SSI plus retry is sufficient for correctness; the guard row would be
-  stronger, opt-in hardening.
 (RG-08's `update` re-read was listed here on the grounds that removing the
 follow-up read meant restructuring the write to a read-then-`ActiveModel::update`
 shape, trading one read for another. That was wrong about the callers: both

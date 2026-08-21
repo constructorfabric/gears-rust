@@ -1,5 +1,5 @@
 <!-- Created: 2026-04-07 by Constructor Tech -->
-<!-- Updated: 2026-04-20 by Constructor Tech -->
+<!-- Updated: 2026-08-21 by Constructor Tech -->
 
 # Feature: Membership Management
 
@@ -117,7 +117,8 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 2. [x] - `p1` - Resolve resource_type GTS path to surrogate ID - `inst-remove-memb-2`
 3. [x] - `p1` - DB: DELETE FROM resource_group_membership WHERE group_id = {group_id} AND gts_type_id = {type_id} AND resource_id = {resource_id} - `inst-remove-memb-3`
 4. [x] - `p1` - **IF** no rows affected → **RETURN** NotFound: membership does not exist - `inst-remove-memb-4`
-5. [x] - `p1` - **RETURN** success (204 No Content) - `inst-remove-memb-5`
+5. [x] - `p1` - Added 2026-08-21: **IF** no memberships remain for `(gts_type_id, resource_id)` → DB: DELETE FROM resource_membership_tenant WHERE gts_type_id = {type_id} AND resource_id = {resource_id} — release the tenant guard so a future membership from another tenant is not blocked - `inst-remove-memb-6`
+6. [x] - `p1` - **RETURN** success (204 No Content) - `inst-remove-memb-5`
 
 ### List Memberships
 
@@ -145,14 +146,17 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 
 **Input**: resource_type, resource_id, target group's tenant_id
 
-**Output**: Pass or TenantIncompatibility with conflicting tenant details
+**Output**: Pass or TenantIncompatibility (message names neither tenant, to avoid disclosing the other tenant's id to the caller)
 
 **Steps**:
-1. [x] - `p1` - DB: SELECT rgm.group_id, rg.tenant_id FROM resource_group_membership rgm JOIN resource_group rg ON rgm.group_id = rg.id WHERE rgm.gts_type_id = {resource_type_id} AND rgm.resource_id = {resource_id} — find existing memberships for this resource - `inst-tenant-check-1`
-2. [x] - `p1` - **IF** no existing memberships → **RETURN** pass (first membership, any tenant allowed) - `inst-tenant-check-2`
-3. [x] - `p1` - Collect distinct tenant_ids from existing memberships - `inst-tenant-check-3`
-4. [x] - `p1` - **IF** target group's tenant_id is in the same tenant scope as existing memberships (same tenant or related via tenant hierarchy) → **RETURN** pass - `inst-tenant-check-4`
-5. [x] - `p1` - **RETURN** TenantIncompatibility: resource already linked in tenant {existing_tenant}, cannot add to tenant {target_tenant} - `inst-tenant-check-5`
+
+Superseded 2026-08-21: the per-membership scan below (steps 1-3 as originally written) was replaced with a single-row guard table, `resource_membership_tenant`, keyed on `(gts_type_id, resource_id)`. The guard is claimed and read atomically with the membership insert (same transaction), and released once no membership references the pair — see `ensure_membership_guard`/`count_memberships`/`delete_membership_guard` in `membership_repo.rs`.
+
+1. [x] - `p1` - DB: SELECT tenant_id FROM resource_membership_tenant WHERE gts_type_id = {resource_type_id} AND resource_id = {resource_id} — read the existing guard row for this resource - `inst-tenant-check-1`
+2. [x] - `p1` - **IF** no guard row exists → INSERT INTO resource_membership_tenant (gts_type_id, resource_id, tenant_id) claiming the resource for the target tenant (first membership, any tenant allowed) - `inst-tenant-check-2`
+3. [x] - `p1` - **IF** the claim races and loses to a UNIQUE violation on `(gts_type_id, resource_id)` → re-read the guard row to find the tenant that won it - `inst-tenant-check-3`
+4. [x] - `p1` - **IF** the guard row's tenant_id equals the target group's tenant_id → **RETURN** pass - `inst-tenant-check-4`
+5. [x] - `p1` - **RETURN** TenantIncompatibility: resource already linked to another tenant, cannot add to the target tenant - `inst-tenant-check-5`
 
 ### Membership Data Seeding
 

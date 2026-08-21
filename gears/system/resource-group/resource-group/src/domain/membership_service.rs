@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
 use resource_group_sdk::{GROUP_MEMBERSHIP_RESOURCE_TYPE, models::ResourceGroupMembership};
+use toolkit_db::secure::TxConfig;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::{SecurityContext, pep_properties};
 use uuid::Uuid;
@@ -172,52 +173,66 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         }
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
 
-        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-9
-        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-10
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-1
-        // Tenant compatibility: check existing memberships for this resource
-        let existing_tenants = self
-            .membership_repo
-            .get_existing_membership_tenant_ids(&conn, gts_type_id, resource_id)
+        // Tenant compatibility via the guard table `resource_membership_tenant`,
+        // run in the same transaction as the membership insert below: a failed
+        // insert (e.g. a duplicate membership) rolls the guard claim back
+        // instead of leaving a claim behind with no membership to justify it
+        // (RG-01, and the guard-lifecycle fix that came with it).
+        let db = self.db.db();
+        let membership_repo = self.membership_repo.clone();
+        let resource_type_owned = resource_type.to_owned();
+        let resource_id_owned = resource_id.to_owned();
+        let target_tenant_id = group_model.tenant_id;
+
+        let model = db
+            .transaction_with_retry(TxConfig::default(), DomainError::db_err, |tx| {
+                let membership_repo = membership_repo.clone();
+                let resource_type = resource_type_owned.clone();
+                let resource_id = resource_id_owned.clone();
+                Box::pin(async move {
+                    // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-9
+                    // Invoke the tenant compatibility check: reads the
+                    // existing guard row, or claims it for `target_tenant_id`
+                    // when absent, re-reading the winner on a
+                    // unique-violation race.
+                    let guard_tenant = membership_repo
+                        .ensure_membership_guard(tx, gts_type_id, &resource_id, target_tenant_id)
+                        .await?;
+                    // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-9
+
+                    // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-10
+                    // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-4
+                    // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-5
+                    if guard_tenant != target_tenant_id {
+                        debug!(
+                            resource_type = %resource_type,
+                            resource_id = %resource_id,
+                            "Tenant incompatibility on membership add (guard table)"
+                        );
+                        // The message stays generic about *which* tenant holds the
+                        // claim: `guard_tenant` belongs to a tenant other than the
+                        // caller's, and this error reaches the caller verbatim
+                        // over the API (api/rest/error.rs), so it must not name it.
+                        return Err(DomainError::tenant_incompatibility(format!(
+                            "Resource ({resource_type}, {resource_id}) is already \
+                             linked to a different tenant"
+                        )));
+                    }
+                    // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-5
+                    // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-4
+                    // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-10
+
+                    // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-11
+                    // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12
+                    // Insert the membership (repo handles duplicate detection)
+                    membership_repo
+                        .insert(tx, group_id, gts_type_id, &resource_id)
+                        .await
+                    // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12
+                    // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-11
+                })
+            })
             .await?;
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-1
-
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-2
-        // IF no existing memberships → pass (first membership, any tenant allowed)
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-2
-
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-3
-        // Collect distinct tenant_ids from existing memberships (existing_tenants)
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-3
-
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-4
-        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-5
-        if !existing_tenants.is_empty() && !existing_tenants.contains(&group_model.tenant_id) {
-            debug!(
-                group_id = %group_id,
-                resource_type = %resource_type,
-                resource_id = %resource_id,
-                "Tenant incompatibility on membership add"
-            );
-            return Err(DomainError::tenant_incompatibility(format!(
-                "Resource ({resource_type}, {resource_id}) is already linked in tenant {:?}, cannot add to tenant {}",
-                existing_tenants, group_model.tenant_id
-            )));
-        }
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-5
-        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-4
-        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-10
-        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-9
-
-        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-11
-        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12
-        // Insert the membership (repo handles duplicate detection)
-        let model = self
-            .membership_repo
-            .insert(&conn, group_id, gts_type_id, resource_id)
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12
-        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-11
 
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-13
         // Resolve back to GTS path for the SDK model
@@ -275,10 +290,38 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
             })?;
         // @cpt-end:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-4
 
-        // Delete the membership
-        self.membership_repo
-            .delete(&conn, group_id, gts_type_id, resource_id)
-            .await?;
+        // Delete the membership, then release the tenant guard once nothing
+        // references the resource any more -- both in one transaction, so a
+        // membership this call just removed cannot be double-counted by a
+        // concurrent `add_membership`'s guard check.
+        let db = self.db.db();
+        let membership_repo = self.membership_repo.clone();
+        let resource_id_owned = resource_id.to_owned();
+
+        db.transaction_with_retry(TxConfig::default(), DomainError::db_err, |tx| {
+            let membership_repo = membership_repo.clone();
+            let resource_id = resource_id_owned.clone();
+            Box::pin(async move {
+                membership_repo
+                    .delete(tx, group_id, gts_type_id, &resource_id)
+                    .await?;
+
+                // @cpt-begin:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-6
+                if membership_repo
+                    .count_memberships(tx, gts_type_id, &resource_id)
+                    .await?
+                    == 0
+                {
+                    membership_repo
+                        .delete_membership_guard(tx, gts_type_id, &resource_id)
+                        .await?;
+                }
+                // @cpt-end:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-6
+
+                Ok(())
+            })
+        })
+        .await?;
         // @cpt-end:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-3
         // @cpt-begin:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-5
         Ok(())

@@ -72,7 +72,11 @@ impl Gear for ResourceGroup {
         let membership_repo = Arc::new(MembershipRepository);
 
         // Create TypeService
-        let type_service = Arc::new(TypeService::new(db.clone(), type_repo.clone()));
+        let type_service = Arc::new(TypeService::new(
+            db.clone(),
+            enforcer.clone(),
+            type_repo.clone(),
+        ));
 
         self.type_service
             .set(type_service)
@@ -86,14 +90,23 @@ impl Gear for ResourceGroup {
 
         // Create GroupService with default query profile and PolicyEnforcer
         let profile = QueryProfile::default();
-        let group_service = Arc::new(GroupService::new(
-            db.clone(),
-            profile,
-            enforcer.clone(),
-            group_repo.clone(),
-            type_repo.clone(),
-            types_registry,
-        ));
+        // The composition root is where the metrics recorder is chosen. The
+        // service itself defaults to the no-op one, so nothing that builds a
+        // `GroupService` outside this path -- tests, mostly -- records or
+        // pays for anything.
+        let group_service = Arc::new(
+            GroupService::new(
+                db.clone(),
+                profile,
+                enforcer.clone(),
+                group_repo.clone(),
+                type_repo.clone(),
+                types_registry,
+            )
+            .with_metrics(Arc::new(
+                crate::infra::metrics::RgMetricsMeter::from_global(),
+            )),
+        );
 
         self.group_service
             .set(group_service)

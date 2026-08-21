@@ -108,6 +108,14 @@ where
             ScopeFilter::InGroup(gf) => {
                 // col IN (SELECT resource_id FROM resource_group_membership
                 //          WHERE group_id IN (...))
+                // @wontfix(Defect B): the subquery does not filter by
+                // `gts_type_id`, so a resource_id from a different type (same
+                // string, different gts_type_id) could match. Fixing this
+                // requires a correlated EXISTS with gts_type_id, which would
+                // need that internal surrogate id to flow through the PDP/PEP
+                // contract — a breaking change. Accepted limitation: in
+                // practice, resource_id uniqueness across types is enforced
+                // by the application, not by this scope filter.
                 let group_values = scope_values_to_sea_values(gf.group_ids());
                 let subquery = Query::select()
                     .column(Alias::new(rg_tables::MEMBERSHIP_RESOURCE_ID))
