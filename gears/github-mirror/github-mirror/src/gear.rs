@@ -16,10 +16,10 @@ use crate::domain::ports::github::GithubPort;
 use crate::domain::service::{Service, ServiceConfig};
 use crate::infra::github::client::GithubClient;
 use crate::infra::storage::sea_orm_repo::{
-    SeaOrmBranchRepository, SeaOrmCommentRepository, SeaOrmCommitRepository, SeaOrmIssueRepository,
-    SeaOrmLabelRepository, SeaOrmMilestoneRepository, SeaOrmPullRequestRepository,
-    SeaOrmReleaseRepository, SeaOrmRepoRepository, SeaOrmReviewCommentRepository,
-    SeaOrmReviewRepository,
+    SeaOrmBranchRepository, SeaOrmCommentRepository, SeaOrmCommitRepository,
+    SeaOrmContributorRepository, SeaOrmIssueRepository, SeaOrmLabelRepository,
+    SeaOrmMilestoneRepository, SeaOrmPullRequestRepository, SeaOrmReleaseRepository,
+    SeaOrmRepoRepository, SeaOrmReviewCommentRepository, SeaOrmReviewRepository,
 };
 
 type ConcreteService = Service<
@@ -34,6 +34,7 @@ type ConcreteService = Service<
     SeaOrmMilestoneRepository,
     SeaOrmReleaseRepository,
     SeaOrmBranchRepository,
+    SeaOrmContributorRepository,
 >;
 
 #[toolkit::gear(
@@ -78,6 +79,7 @@ impl Gear for GithubMirrorGear {
         let milestones = Arc::new(SeaOrmMilestoneRepository::new());
         let releases = Arc::new(SeaOrmReleaseRepository::new());
         let branches = Arc::new(SeaOrmBranchRepository::new());
+        let contributors = Arc::new(SeaOrmContributorRepository::new());
         let github: Arc<dyn GithubPort> = Arc::new(GithubClient::new(
             cfg.api_base_url.clone(),
             cfg.github_token.clone(),
@@ -102,6 +104,7 @@ impl Gear for GithubMirrorGear {
             milestones,
             releases,
             branches,
+            contributors,
             github,
             policy_enforcer,
             ServiceConfig {
@@ -154,6 +157,6 @@ mod tests {
     fn gear_provides_all_migrations() {
         use toolkit::contracts::DatabaseCapability;
         let gear = GithubMirrorGear::default();
-        assert_eq!(gear.migrations().len(), 11);
+        assert_eq!(gear.migrations().len(), 12);
     }
 }

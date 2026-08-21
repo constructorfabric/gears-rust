@@ -25,6 +25,7 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_milestones",
         "gm_releases",
         "gm_branches",
+        "gm_contributors",
     ] {
         assert!(
             manager.has_table(table).await.unwrap(),
@@ -48,6 +49,7 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_milestones",
         "gm_releases",
         "gm_branches",
+        "gm_contributors",
     ] {
         assert!(
             !manager.has_table(table).await.unwrap(),

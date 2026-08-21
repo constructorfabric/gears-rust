@@ -3,8 +3,8 @@ use std::sync::Arc;
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use github_mirror_sdk::{
-    Branch, Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
-    ReviewComment,
+    Branch, Comment, Commit, Contributor, Issue, Label, Milestone, PullRequest, Release,
+    Repository, Review, ReviewComment,
 };
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page, PageInfo};
@@ -14,10 +14,10 @@ use super::error::DomainError;
 use super::ports::github::GithubPort;
 use super::repo::{
     BranchRecord, BranchRepository, CommentRecord, CommentRepository, CommitRecord,
-    CommitRepository, IssueRecord, IssueRepository, LabelRecord, LabelRepository, MilestoneRecord,
-    MilestoneRepository, PullRequestRecord, PullRequestRepository, ReleaseRecord,
-    ReleaseRepository, RepoRepository, RepositoryRecord, ReviewCommentRecord,
-    ReviewCommentRepository, ReviewRecord, ReviewRepository,
+    CommitRepository, ContributorRecord, ContributorRepository, IssueRecord, IssueRepository,
+    LabelRecord, LabelRepository, MilestoneRecord, MilestoneRepository, PullRequestRecord,
+    PullRequestRepository, ReleaseRecord, ReleaseRepository, RepoRepository, RepositoryRecord,
+    ReviewCommentRecord, ReviewCommentRepository, ReviewRecord, ReviewRepository,
 };
 
 pub const GEAR_NAME: &str = "github-mirror";
@@ -81,6 +81,11 @@ pub(crate) const BRANCH_RESOURCE: ResourceType = ResourceType::from_static(
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+pub(crate) const CONTRIBUTOR_RESOURCE: ResourceType = ResourceType::from_static(
+    "github_mirror.contributor",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
+
 pub(crate) const SYNC_RESOURCE: ResourceType =
     ResourceType::from_static("github_mirror.sync", &[pep_properties::OWNER_TENANT_ID]);
 
@@ -119,6 +124,7 @@ pub struct SyncSummary {
     pub milestones_synced: u64,
     pub releases_synced: u64,
     pub branches_synced: u64,
+    pub contributors_synced: u64,
 }
 
 #[domain_model]
@@ -134,6 +140,7 @@ pub struct Service<
     N: MilestoneRepository,
     E: ReleaseRepository,
     B: BranchRepository,
+    O: ContributorRepository,
 > {
     db: Arc<DbProvider>,
     repo: Arc<R>,
@@ -147,6 +154,7 @@ pub struct Service<
     milestones: Arc<N>,
     releases: Arc<E>,
     branches: Arc<B>,
+    contributors: Arc<O>,
     github: Arc<dyn GithubPort>,
     policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
@@ -164,7 +172,8 @@ impl<
     N: MilestoneRepository,
     E: ReleaseRepository,
     B: BranchRepository,
-> Service<R, I, P, C, M, V, W, L, N, E, B>
+    O: ContributorRepository,
+> Service<R, I, P, C, M, V, W, L, N, E, B, O>
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -180,6 +189,7 @@ impl<
         milestones: Arc<N>,
         releases: Arc<E>,
         branches: Arc<B>,
+        contributors: Arc<O>,
         github: Arc<dyn GithubPort>,
         policy_enforcer: PolicyEnforcer,
         config: ServiceConfig,
@@ -197,6 +207,7 @@ impl<
             milestones,
             releases,
             branches,
+            contributors,
             github,
             policy_enforcer,
             config,
@@ -1178,6 +1189,97 @@ impl<
         self.branches.upsert(&conn, &scope, tenant_id, record).await
     }
 
+    /// List mirrored contributors of one repository (`owner/name`),
+    /// tenant-scoped, most contributions first.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored for this
+    /// tenant; `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn list_contributors(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        query: &ODataQuery,
+    ) -> Result<Page<Contributor>, DomainError> {
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &CONTRIBUTOR_RESOURCE,
+                actions::LIST,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+        let items = self
+            .contributors
+            .list_by_repo(&conn, &scope, repository.id, limit)
+            .await?;
+
+        Ok(Page::new(
+            items,
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit,
+            },
+        ))
+    }
+
+    /// Insert or update a mirrored contributor row for the caller's tenant.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored;
+    /// `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn upsert_contributor(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        record: ContributorRecord,
+    ) -> Result<Contributor, DomainError> {
+        let tenant_id = ctx.subject_tenant_id();
+
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &CONTRIBUTOR_RESOURCE,
+                actions::UPSERT,
+                None,
+                &AccessRequest::new().resource_property(pep_properties::OWNER_TENANT_ID, tenant_id),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let record = ContributorRecord {
+            repo_id: repository.id,
+            ..record
+        };
+        self.contributors
+            .upsert(&conn, &scope, tenant_id, record)
+            .await
+    }
+
     /// Fetch one repository from GitHub (first slice: repo + first page of
     /// issues, pull requests, and commits) and upsert it into the mirror.
     ///
@@ -1294,6 +1396,14 @@ impl<
             branches_synced += 1;
         }
 
+        let mut contributors_synced: u64 = 0;
+        for record in fetched.contributors {
+            self.contributors
+                .upsert(&conn, &scope, tenant_id, record)
+                .await?;
+            contributors_synced += 1;
+        }
+
         Ok(SyncSummary {
             repository: repository.full_name,
             issues_synced,
@@ -1306,6 +1416,7 @@ impl<
             milestones_synced,
             releases_synced,
             branches_synced,
+            contributors_synced,
         })
     }
 }

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use github_mirror_sdk::{
-    Branch, Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
-    ReviewComment,
+    Branch, Comment, Commit, Contributor, Issue, Label, Milestone, PullRequest, Release,
+    Repository, Review, ReviewComment,
 };
 use toolkit_db::secure::DBRunner;
 use toolkit_macros::domain_model;
@@ -401,4 +401,36 @@ pub trait BranchRepository: Send + Sync {
         repo_id: i64,
         limit: u64,
     ) -> Result<Vec<Branch>, DomainError>;
+}
+
+/// Write-side record for a mirrored contributor.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContributorRecord {
+    pub repo_id: i64,
+    pub user_id: i64,
+    pub login: String,
+    pub contributions: i64,
+    pub user_type: String,
+    pub avatar_url: Option<String>,
+    pub html_url: Option<String>,
+}
+
+#[async_trait]
+pub trait ContributorRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: ContributorRecord,
+    ) -> Result<Contributor, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Contributor>, DomainError>;
 }

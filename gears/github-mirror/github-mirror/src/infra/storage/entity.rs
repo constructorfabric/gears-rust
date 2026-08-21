@@ -386,3 +386,37 @@ pub mod branches {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod contributors {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    /// Mirrored GitHub repository contributor, tenant-scoped.
+    ///
+    /// A row is one user's contribution count in one repository, so the key
+    /// is `(tenant_id, repo_id, user_id)`.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_contributors")]
+    #[secure(tenant_col = "tenant_id", resource_col = "user_id", no_owner, no_type)]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        /// Owning repository's GitHub id.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub repo_id: i64,
+        /// The contributor's GitHub user id.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub user_id: i64,
+        pub login: String,
+        pub contributions: i64,
+        /// User, Bot, or Organization.
+        pub user_type: String,
+        pub avatar_url: Option<String>,
+        pub html_url: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

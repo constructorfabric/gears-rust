@@ -3,6 +3,7 @@ use sea_orm_migration::prelude::*;
 pub mod branches_011;
 pub mod comments_005;
 pub mod commits_004;
+pub mod contributors_012;
 pub mod initial_001;
 pub mod issues_002;
 pub mod labels_008;
@@ -29,6 +30,7 @@ impl MigratorTrait for Migrator {
             Box::new(milestones_009::Migration),
             Box::new(releases_010::Migration),
             Box::new(branches_011::Migration),
+            Box::new(contributors_012::Migration),
         ]
     }
 }

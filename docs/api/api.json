@@ -1396,6 +1396,49 @@
         ],
         "type": "object"
       },
+      "ContributorDto": {
+        "description": "A mirrored GitHub contributor as served by the read API.",
+        "properties": {
+          "avatar_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "contributions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "html_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "login": {
+            "type": "string"
+          },
+          "repo_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "user_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "user_type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_id",
+          "user_id",
+          "login",
+          "contributions",
+          "user_type"
+        ],
+        "type": "object"
+      },
       "ControlFeedAck": {
         "description": "Ack for a control-feed push: the feed + the `(tenant, period)` grain it landed\non. The push is last-writer-wins, so a re-push of the same grain overwrites.",
         "properties": {
@@ -5863,6 +5906,24 @@
         ],
         "type": "object"
       },
+      "Page_ContributorDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ContributorDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "Page_CreditNoteView": {
         "properties": {
           "items": {
@@ -10135,6 +10196,11 @@
             "minimum": 0,
             "type": "integer"
           },
+          "contributors_synced": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "issues_synced": {
             "format": "int64",
             "minimum": 0,
@@ -10185,7 +10251,8 @@
           "labels_synced",
           "milestones_synced",
           "releases_synced",
-          "branches_synced"
+          "branches_synced",
+          "contributors_synced"
         ],
         "type": "object"
       },
@@ -26403,6 +26470,112 @@
           }
         ],
         "summary": "List mirrored commits of a repository",
+        "tags": [
+          "GitHub Mirror"
+        ]
+      }
+    },
+    "/github-mirror/v1/repos/{owner}/{name}/contributors": {
+      "get": {
+        "description": "Returns contributors held in the local mirror for the tenant, most contributions              first",
+        "operationId": "github_mirror.list_contributors",
+        "parameters": [
+          {
+            "description": "Repository owner login",
+            "in": "path",
+            "name": "owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository name",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum number of contributors to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ContributorDto"
+                }
+              }
+            },
+            "description": "Paginated list of mirrored contributors"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List mirrored contributors of a repository",
         "tags": [
           "GitHub Mirror"
         ]

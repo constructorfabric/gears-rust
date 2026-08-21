@@ -169,6 +169,19 @@ fn gh_branches_json() -> serde_json::Value {
     ])
 }
 
+fn gh_contributors_json() -> serde_json::Value {
+    json!([
+        {
+            "id": 71,
+            "login": "alice",
+            "contributions": 120,
+            "type": "User",
+            "avatar_url": "https://avatars.githubusercontent.com/u/71",
+            "html_url": "https://github.com/alice"
+        }
+    ])
+}
+
 #[tokio::test]
 async fn fetch_repository_maps_github_payloads_into_records() {
     let server = MockServer::start_async().await;
@@ -239,6 +252,13 @@ async fn fetch_repository_maps_github_payloads_into_records() {
         .mock_async(|when, then| {
             when.method("GET").path("/repos/rust-lang/rust/branches");
             then.status(200).json_body(gh_branches_json());
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method("GET")
+                .path("/repos/rust-lang/rust/contributors");
+            then.status(200).json_body(gh_contributors_json());
         })
         .await;
 
@@ -315,6 +335,12 @@ async fn fetch_repository_maps_github_payloads_into_records() {
     assert_eq!(fetched.branches[0].name, "master");
     assert_eq!(fetched.branches[0].commit_sha, "c1");
     assert!(fetched.branches[0].protected);
+
+    assert_eq!(fetched.contributors.len(), 1);
+    assert_eq!(fetched.contributors[0].user_id, 71);
+    assert_eq!(fetched.contributors[0].login, "alice");
+    assert_eq!(fetched.contributors[0].contributions, 120);
+    assert_eq!(fetched.contributors[0].user_type, "User");
 }
 
 #[tokio::test]

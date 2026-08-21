@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use github_mirror_sdk::{
-    Branch, Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
-    ReviewComment,
+    Branch, Comment, Commit, Contributor, Issue, Label, Milestone, PullRequest, Release,
+    Repository, Review, ReviewComment,
 };
 use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, Order};
 use toolkit_db::secure::{
@@ -13,15 +13,16 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
     BranchRecord, BranchRepository, CommentRecord, CommentRepository, CommitRecord,
-    CommitRepository, IssueRecord, IssueRepository, LabelRecord, LabelRepository, MilestoneRecord,
-    MilestoneRepository, PullRequestRecord, PullRequestRepository, ReleaseRecord,
-    ReleaseRepository, RepoRepository, RepositoryRecord, ReviewCommentRecord,
-    ReviewCommentRepository, ReviewRecord, ReviewRepository,
+    CommitRepository, ContributorRecord, ContributorRepository, IssueRecord, IssueRepository,
+    LabelRecord, LabelRepository, MilestoneRecord, MilestoneRepository, PullRequestRecord,
+    PullRequestRepository, ReleaseRecord, ReleaseRepository, RepoRepository, RepositoryRecord,
+    ReviewCommentRecord, ReviewCommentRepository, ReviewRecord, ReviewRepository,
 };
 
 use super::entity::branches::{self, Entity as BranchEntity};
 use super::entity::comments::{self, Entity as CommentEntity};
 use super::entity::commits::{self, Entity as CommitEntity};
+use super::entity::contributors::{self, Entity as ContributorEntity};
 use super::entity::issues::{self, Entity as IssueEntity};
 use super::entity::labels::{self, Entity as LabelEntity};
 use super::entity::milestones::{self, Entity as MilestoneEntity};
@@ -1167,6 +1168,98 @@ impl BranchRepository for SeaOrmBranchRepository {
             .scope_with(scope)
             .filter(sea_orm::Condition::all().add(branches::Column::RepoId.eq(repo_id)))
             .order_by(branches::Column::Name, Order::Asc)
+            .limit(limit)
+            .all(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+
+pub struct SeaOrmContributorRepository;
+
+impl SeaOrmContributorRepository {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SeaOrmContributorRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn contributor_active_model(tenant_id: Uuid, r: &ContributorRecord) -> contributors::ActiveModel {
+    contributors::ActiveModel {
+        tenant_id: ActiveValue::Set(tenant_id),
+        repo_id: ActiveValue::Set(r.repo_id),
+        user_id: ActiveValue::Set(r.user_id),
+        login: ActiveValue::Set(r.login.clone()),
+        contributions: ActiveValue::Set(r.contributions),
+        user_type: ActiveValue::Set(r.user_type.clone()),
+        avatar_url: ActiveValue::Set(r.avatar_url.clone()),
+        html_url: ActiveValue::Set(r.html_url.clone()),
+    }
+}
+
+#[async_trait]
+impl ContributorRepository for SeaOrmContributorRepository {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: ContributorRecord,
+    ) -> Result<Contributor, DomainError> {
+        let on_conflict = SecureOnConflict::<ContributorEntity>::columns([
+            contributors::Column::TenantId,
+            contributors::Column::RepoId,
+            contributors::Column::UserId,
+        ])
+        .update_columns([
+            contributors::Column::Login,
+            contributors::Column::Contributions,
+            contributors::Column::UserType,
+            contributors::Column::AvatarUrl,
+            contributors::Column::HtmlUrl,
+        ])
+        .map_err(map_scope_error)?;
+
+        ContributorEntity::insert(contributor_active_model(tenant_id, &record))
+            .secure()
+            .scope_with_model(scope, &contributor_active_model(tenant_id, &record))
+            .map_err(map_scope_error)?
+            .on_conflict(on_conflict)
+            .exec(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(Contributor {
+            repo_id: record.repo_id,
+            user_id: record.user_id,
+            login: record.login,
+            contributions: record.contributions,
+            user_type: record.user_type,
+            avatar_url: record.avatar_url,
+            html_url: record.html_url,
+        })
+    }
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Contributor>, DomainError> {
+        let rows = ContributorEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(sea_orm::Condition::all().add(contributors::Column::RepoId.eq(repo_id)))
+            .order_by(contributors::Column::Contributions, Order::Desc)
             .limit(limit)
             .all(conn)
             .await

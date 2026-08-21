@@ -102,6 +102,7 @@ async fn sync_repository_via_sdk_trait_fills_the_mirror() {
         milestones: vec![],
         releases: vec![],
         branches: vec![],
+        contributors: vec![],
     };
     let service = common::service_with_github(
         db,

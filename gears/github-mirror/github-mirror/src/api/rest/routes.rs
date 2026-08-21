@@ -8,10 +8,10 @@ use toolkit::api::{OpenApiRegistry, OperationBuilder};
 use crate::api::rest::{dto, handlers};
 use crate::domain::service::Service;
 use crate::infra::storage::sea_orm_repo::{
-    SeaOrmBranchRepository, SeaOrmCommentRepository, SeaOrmCommitRepository, SeaOrmIssueRepository,
-    SeaOrmLabelRepository, SeaOrmMilestoneRepository, SeaOrmPullRequestRepository,
-    SeaOrmReleaseRepository, SeaOrmRepoRepository, SeaOrmReviewCommentRepository,
-    SeaOrmReviewRepository,
+    SeaOrmBranchRepository, SeaOrmCommentRepository, SeaOrmCommitRepository,
+    SeaOrmContributorRepository, SeaOrmIssueRepository, SeaOrmLabelRepository,
+    SeaOrmMilestoneRepository, SeaOrmPullRequestRepository, SeaOrmReleaseRepository,
+    SeaOrmRepoRepository, SeaOrmReviewCommentRepository, SeaOrmReviewRepository,
 };
 
 pub type ConcreteService = Service<
@@ -26,6 +26,7 @@ pub type ConcreteService = Service<
     SeaOrmMilestoneRepository,
     SeaOrmReleaseRepository,
     SeaOrmBranchRepository,
+    SeaOrmContributorRepository,
 >;
 
 const API_TAG: &str = "GitHub Mirror";
@@ -271,6 +272,31 @@ fn register_repo_metadata_routes(mut router: Router, openapi: &dyn OpenApiRegist
             openapi,
             StatusCode::OK,
             "Paginated list of mirrored branch heads",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/github-mirror/v1/repos/{owner}/{name}/contributors")
+        .operation_id("github_mirror.list_contributors")
+        .summary("List mirrored contributors of a repository")
+        .description(
+            "Returns contributors held in the local mirror for the tenant, most contributions              first",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("owner", "Repository owner login")
+        .path_param("name", "Repository name")
+        .query_param("limit", false, "Maximum number of contributors to return")
+        .handler(handlers::list_contributors)
+        .json_response_with_schema::<toolkit_odata::Page<dto::ContributorDto>>(
+            openapi,
+            StatusCode::OK,
+            "Paginated list of mirrored contributors",
         )
         .error_400(openapi)
         .error_401(openapi)

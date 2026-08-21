@@ -1,6 +1,6 @@
 use github_mirror_sdk::{
-    Branch, Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
-    ReviewComment,
+    Branch, Comment, Commit, Contributor, Issue, Label, Milestone, PullRequest, Release,
+    Repository, Review, ReviewComment,
 };
 
 use crate::domain::service::{MirrorStatus, SyncSummary};
@@ -174,6 +174,7 @@ pub struct SyncSummaryDto {
     pub milestones_synced: u64,
     pub releases_synced: u64,
     pub branches_synced: u64,
+    pub contributors_synced: u64,
 }
 
 impl From<SyncSummary> for SyncSummaryDto {
@@ -190,6 +191,7 @@ impl From<SyncSummary> for SyncSummaryDto {
             milestones_synced: s.milestones_synced,
             releases_synced: s.releases_synced,
             branches_synced: s.branches_synced,
+            contributors_synced: s.contributors_synced,
         }
     }
 }
@@ -407,6 +409,33 @@ impl From<Branch> for BranchDto {
             name: b.name,
             commit_sha: b.commit_sha,
             protected: b.protected,
+        }
+    }
+}
+
+/// A mirrored GitHub contributor as served by the read API.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ContributorDto {
+    pub repo_id: i64,
+    pub user_id: i64,
+    pub login: String,
+    pub contributions: i64,
+    pub user_type: String,
+    pub avatar_url: Option<String>,
+    pub html_url: Option<String>,
+}
+
+impl From<Contributor> for ContributorDto {
+    fn from(c: Contributor) -> Self {
+        Self {
+            repo_id: c.repo_id,
+            user_id: c.user_id,
+            login: c.login,
+            contributions: c.contributions,
+            user_type: c.user_type,
+            avatar_url: c.avatar_url,
+            html_url: c.html_url,
         }
     }
 }

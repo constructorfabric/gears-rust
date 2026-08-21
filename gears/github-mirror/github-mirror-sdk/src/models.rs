@@ -111,6 +111,7 @@ pub struct SyncSummary {
     pub milestones_synced: u64,
     pub releases_synced: u64,
     pub branches_synced: u64,
+    pub contributors_synced: u64,
 }
 
 /// A mirrored GitHub issue/PR comment (read-slice shape).
@@ -245,4 +246,20 @@ pub struct Branch {
     /// SHA the branch currently points at.
     pub commit_sha: String,
     pub protected: bool,
+}
+
+/// A mirrored GitHub repository contributor (read-slice shape).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contributor {
+    /// Owning repository's GitHub id.
+    pub repo_id: i64,
+    /// The contributor's GitHub user id.
+    pub user_id: i64,
+    pub login: String,
+    pub contributions: i64,
+    /// User, Bot, or Organization.
+    pub user_type: String,
+    pub avatar_url: Option<String>,
+    pub html_url: Option<String>,
 }
