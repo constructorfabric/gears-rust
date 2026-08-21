@@ -24,6 +24,7 @@ pub use gear::TypesRegistryGear;
 
 // === CONFIGURATION ===
 pub mod config;
+mod policy_config;
 
 // === INTERNAL MODULES ===
 #[doc(hidden)]

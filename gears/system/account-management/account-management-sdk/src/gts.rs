@@ -405,7 +405,7 @@ pub struct TenantTypeTraits {
 )]
 #[schemars(extend("required" = ["payload"]))]
 pub struct TenantTypeEnvelopeV1<P> {
-    /// Inert; see the type docs.
+    /// Inert: present only to satisfy the gts-macros base-struct contract. Not required.
     pub id: gts::GtsInstanceId,
     /// The open container (§4.4.1). Generic like `BaseEventV1<P>` in
     /// `gts-macros-cli`: a derived Rust struct declared `base = TenantTypeEnvelopeV1`
@@ -468,8 +468,7 @@ pub struct TenantMetadataTraits {
 )]
 #[schemars(extend("required" = ["payload"]))]
 pub struct TenantMetadataEnvelopeV1<P> {
-    /// Required by the `gts-macros` base-struct contract; inert, and not
-    /// `required` — see [`TenantTypeEnvelopeV1`].
+    /// Inert: present only to satisfy the gts-macros base-struct contract. Not required.
     pub id: gts::GtsInstanceId,
     /// The open container (§4.4.1): a metadata value's own fields live here.
     pub payload: P,
@@ -668,14 +667,10 @@ mod tenant_schema_constraints_tests {
 
 #[cfg(test)]
 mod sync_tests {
-    //! Drift guard: the macro-generated envelope's **trait contract**
-    //! (`x-gts-traits-schema` shape + the envelope's `x-gts-traits`
-    //! defaults) MUST agree with the documented
-    //! `docs/schemas/<name>.v1.schema.json`. The macro additionally emits
-    //! a data-type top-level shape (`id`/`properties`/`required`/
-    //! `additionalProperties`) that the docs omit by design and that is
-    //! inert at runtime (see gear docs), so only the trait subtrees are
-    //! compared.
+    //! Drift guard: the macro-generated envelope's root data shape and trait
+    //! contract MUST agree with `docs/schemas/<name>.v1.schema.json`. Runtime-only
+    //! trait defaults are asserted separately because the published schemas do
+    //! not carry `x-gts-traits`.
 
     use std::fs;
     use std::path::PathBuf;
@@ -743,17 +738,32 @@ mod sync_tests {
         );
     }
 
+    /// Assert the closed envelope and designated open payload container stay in
+    /// sync with the published schema, without coupling descriptive metadata or
+    /// JSON object key ordering to this test.
+    fn assert_data_shape(generated: &Value, disk: &Value, type_id: &str) {
+        for field in ["additionalProperties", "properties", "required"] {
+            assert_eq!(
+                generated.get(field),
+                disk.get(field),
+                "macro root field `{field}` for {type_id} drifted from docs/schemas/",
+            );
+        }
+    }
+
     #[test]
     fn tenant_type_envelope_trait_contract_matches_docs() {
         // `()` is the empty container: this asserts the *envelope's* contract, which
         // is the same whatever a derived type puts in the slot.
         let generated = TenantTypeEnvelopeV1::<()>::gts_schema_with_refs();
+        let disk = read_disk_schema("tenant_type.v1.schema.json");
         assert_trait_contract(
             &generated,
-            &read_disk_schema("tenant_type.v1.schema.json"),
+            &disk,
             TenantTypeEnvelopeV1::<()>::TYPE_ID,
             &serde_json::json!({ "allowed_parent_types": [], "idp_provisioning": false }),
         );
+        assert_data_shape(&generated, &disk, TenantTypeEnvelopeV1::<()>::TYPE_ID);
         // `type_id` and the `allowed_parent_types` `x-gts-ref` are separate
         // attribute literals (Rust attributes can't reference a const), so
         // guard that they agree: the ref must equal this envelope's TYPE_ID
@@ -769,11 +779,14 @@ mod sync_tests {
 
     #[test]
     fn tenant_metadata_envelope_trait_contract_matches_docs() {
+        let generated = TenantMetadataEnvelopeV1::<()>::gts_schema_with_refs();
+        let disk = read_disk_schema("tenant_metadata.v1.schema.json");
         assert_trait_contract(
-            &TenantMetadataEnvelopeV1::<()>::gts_schema_with_refs(),
-            &read_disk_schema("tenant_metadata.v1.schema.json"),
+            &generated,
+            &disk,
             TenantMetadataEnvelopeV1::<()>::TYPE_ID,
             &serde_json::json!({ "inheritance_policy": "override_only" }),
         );
+        assert_data_shape(&generated, &disk, TenantMetadataEnvelopeV1::<()>::TYPE_ID);
     }
 }

@@ -1,44 +1,39 @@
 //! The transient `gts-rust` store: one owned [`GtsStore`] per admission unit,
 //! built from database rows and dropped when the unit ends (SPEC D2, §8.2).
 //!
-//! Nothing here is cached, published or shared. There is no `ArcSwap`, no
-//! snapshot, no process-lifetime store and no lock: reads are served from the
-//! database (§8.2), and this store exists only so one worker invocation can run
-//! the semantic computations that need related documents — resolution,
-//! `compare_documents`, derivation chains, Instance validation.
+//! Nothing here is cached, published or shared — no `ArcSwap`, no snapshot, no
+//! process-lifetime store, no lock. Reads are served from the database (§8.2), and
+//! this store exists only so one worker invocation can run the computations that
+//! need related documents: resolution, `compare_documents`, derivation chains,
+//! Instance validation.
 //!
 //! `GtsStore` is `Send` but not `Sync`, because `GtsReader` has no `Sync`
-//! supertrait. That was the reason the old in-memory repository held a
-//! `Mutex<GtsOps>`. A store owned by one invocation is never shared, so here the
-//! missing `Sync` is irrelevant rather than worked around — it can still cross an
-//! `.await`, which is all an admission unit needs.
+//! supertrait — the reason the old in-memory repository held a `Mutex<GtsOps>`. A
+//! store owned by one invocation is never shared, so the missing `Sync` is
+//! irrelevant here; it can still cross an `.await`.
 //!
 //! # Three properties of `gts` 0.12.0 this module is shaped by
 //!
 //! **There is no builder.** `GtsStore` offers `new()`, `with_reader()` and
 //! `register*`; its map is private and `with_reader` merely drains a reader
-//! eagerly. For a row set that is already fully known, `new()` plus a loop is the
-//! whole vocabulary available, so implementing `GtsReader` would buy nothing.
+//! eagerly. For a fully known row set, `new()` plus a loop is the whole vocabulary,
+//! so implementing `GtsReader` would buy nothing.
 //!
 //! **Registration is order-free; validation is not.** `register_schema` inserts
-//! into a map and checks nothing. It is `validate_schema` / `resolve_schema_refs`
-//! that walk `GtsId::chain_ids()` and fail on a base that is not present. So
-//! loading in `gts_id` order does not make registration succeed — it makes the
-//! failure *impossible* instead of latent, because the store is complete before
-//! anything is asked of it. The order is kept because a caller that registers
-//! incrementally and validates as it goes would otherwise be one refactor away
-//! from a spurious "base schema not found".
+//! into a map and checks nothing; `validate_schema` / `resolve_schema_refs` walk
+//! `GtsId::chain_ids()` and fail on an absent base. Loading in `gts_id` order does
+//! not make registration succeed — the store is complete before anything is asked
+//! of it — but it is kept so a caller that later registers incrementally is not one
+//! refactor away from a spurious "base schema not found".
 //!
 //! **A document with no `$schema` is silently not a schema.** `register_schema`
-//! passes `is_schema: true` to `GtsEntity::new`, which then overwrites it with
-//! `has_schema_field()`. A dialect-less document therefore registers as an
-//! *Instance*, after which `$ref`s pointing at it stay unresolved with no error
-//! anywhere. [`build_store`] rejects such a document by name rather than letting
-//! it corrupt a resolution two layers away; the acceptance path's dialect gate
-//! (T7) is the same rule applied earlier, to authored input.
-//!
-//! That rule is asked of **Type Schemas only**: an Instance legitimately has no
-//! `$schema`, so the gate is keyed on the identifier's `~`.
+//! passes `is_schema: true` to `GtsEntity::new`, which overwrites it with
+//! `has_schema_field()`, so a dialect-less document registers as an *Instance* and
+//! `$ref`s pointing at it stay unresolved with no error anywhere. [`build_store`]
+//! rejects such a document by name rather than letting it corrupt a resolution two
+//! layers away; the acceptance dialect gate (T7) is the same rule applied earlier.
+//! It is asked of **Type Schemas only** — an Instance legitimately has no
+//! `$schema` — so the gate is keyed on the identifier's `~`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -47,6 +42,7 @@ use serde_json::Value;
 use thiserror::Error;
 use toolkit_db::DbTx;
 use toolkit_db::secure::{AccessScope, ScopeError};
+use toolkit_macros::domain_model;
 
 use crate::domain::enums::EntityKind;
 use crate::domain::ports::Stores;
@@ -57,6 +53,7 @@ use crate::domain::ports::Stores;
 /// the store cannot tell them apart and must not: an in-batch reference resolves
 /// against the candidate, not against whatever is committed under that
 /// identifier.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct UnitDocument {
     pub gts_id: String,
@@ -67,6 +64,7 @@ pub struct UnitDocument {
 ///
 /// Deliberately not `Arc`, not behind a lock, and with no way to clone the store
 /// out: one admission unit owns this and drops it.
+#[domain_model]
 pub struct UnitStore {
     store: GtsStore,
     load_order: Vec<String>,
@@ -115,6 +113,7 @@ impl UnitStore {
 /// with a REST surface to map onto, and `DomainError` has no `From<ScopeError>`
 /// yet. Adding a variant and a `CanonicalError` arm now would be a guess about a
 /// mapping that does not exist.
+#[domain_model]
 #[derive(Debug, Error)]
 pub enum StoreBuildError {
     #[error("reading the dependency closure failed: {0}")]
@@ -180,15 +179,15 @@ fn register_instance(store: &mut GtsStore, doc: &UnitDocument) -> Result<(), Sto
             gts_id: doc.gts_id.clone(),
         })?;
     let entity = GtsEntity::new(
-        None,
-        None,
-        &doc.content,
-        None,
-        Some(gts_id),
-        false,
-        String::new(),
-        None,
-        Some(type_id),
+        /* file */ None,
+        /* list_sequence */ None,
+        /* content */ &doc.content,
+        /* cfg */ None,
+        /* gts_id */ Some(gts_id),
+        /* is_schema */ false,
+        /* label */ String::new(),
+        /* validation */ None,
+        /* type_id */ Some(type_id),
     );
     store
         .register(entity)
@@ -266,17 +265,15 @@ pub fn build_store(mut documents: Vec<UnitDocument>) -> Result<UnitStore, StoreB
 /// nothing downstream, because compatibility compares two documents passed to
 /// `compare_documents` directly and reads its baseline revision separately.
 ///
-/// Nothing is retained: the store is built inside this call and handed to the
-/// caller, which drops it with the unit. Two sequential calls after a committed
-/// revision each see that revision, with no invalidation step, because each one
-/// re-reads.
+/// Nothing is retained: the store is built here and dropped with the unit, so two
+/// sequential calls after a committed revision each see it with no invalidation
+/// step.
 ///
 /// **Both reads run in the caller's transaction.** The edge set and the documents
-/// it names are two statements, so under two independent snapshots a concurrent
-/// revision could hand this function edges from one state and content from
-/// another. The caller opens `ports::snapshot_read()` around it; the guard that
-/// makes the *evaluation* safe against a commit landing afterwards is the revision
-/// vector (D4), which is T15's.
+/// it names are two statements, so under independent snapshots a concurrent
+/// revision could hand this function edges from one state and content from another.
+/// The caller opens `ports::snapshot_read()` around it; the guard against a commit
+/// landing *afterwards* is the revision vector (D4), which is T15's.
 ///
 /// # Errors
 /// Propagates the closure and document reads, and every [`StoreBuildError`] the

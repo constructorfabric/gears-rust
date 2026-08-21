@@ -13,17 +13,20 @@
 //! to have no database in scope at all.
 
 pub mod acceptance;
+mod errors;
 pub mod fingerprint;
 pub mod unit;
 pub mod worker;
 
 use serde_json::Value;
 use toolkit_db::DbTx;
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::domain::enums::{OperationKind, OperationStatus};
 
 /// One candidate in a submitted request.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct Candidate {
     /// The identifier as authored. Canonicalized through `GtsId::try_new` during
@@ -45,6 +48,7 @@ pub struct Candidate {
 /// REST spells creation as an absent `expected_resource_version`; storage spells
 /// it as `0`. Neither representation crosses the domain pipeline: adapters map
 /// them to and from this enum at their respective boundaries.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Precondition {
     MustNotExist,
@@ -83,6 +87,7 @@ impl Precondition {
 }
 
 /// A submitted request, before acceptance.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct SubmitRequest {
     /// Mandatory. Absence is a synchronous refusal, not a generated key: a
@@ -94,6 +99,7 @@ pub struct SubmitRequest {
 }
 
 /// What acceptance decided.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Accepted {
     pub operation_id: Uuid,
@@ -153,6 +159,7 @@ pub trait OperationDispatch: Send + Sync {
 /// outbox"*), and API traffic until T21 starts the outbox worker. The dispatch call
 /// still happens inside the acceptance transaction, so the shape T21 needs is
 /// already in place and swapping the implementation is the whole change.
+#[domain_model]
 pub struct NullDispatch;
 
 #[async_trait::async_trait]

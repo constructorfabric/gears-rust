@@ -1,34 +1,25 @@
 //! The adapter behind the domain's persistence ports.
 //!
 //! [`Repos`] implements every trait in [`crate::domain::ports`] over the
-//! repositories in [`super::repo`]. It holds no state and — since the
-//! repositories speak the domain's row types themselves — no mapping either:
-//! every method forwards the transaction and returns what the repository
-//! returned. That is the same shape as `credstore`'s `repo_impl.rs` and
-//! `account-management`'s `repo_impl/mod.rs`.
+//! repositories in [`super::repo`]. It holds no state and — since the repositories
+//! speak the domain's row types themselves — no mapping either: every method
+//! forwards the transaction verbatim, the same shape as `credstore`'s
+//! `repo_impl.rs` and `account-management`'s `repo_impl/mod.rs`.
 //!
 //! # Why this file exists at all, given it only forwards
 //!
-//! Because the domain holds one `Arc<dyn Stores>`, and
-//! [`Stores`](crate::domain::ports::Stores) is the conjunction of six traits. Something has to be a single type implementing all
-//! six; the repositories are five separate unit structs, so that something is
-//! this. The alternative — six `Arc<dyn XStore>` in the service — is more wiring
-//! at every call site for no gain.
-//!
-//! # Why the ports take a transaction rather than a runner
-//!
-//! `crate::domain::ports` carries that argument; the short form is that a dyn-safe
-//! trait cannot take `&impl DBRunner`, and the secure query API's implicit `Sized`
-//! bound rules out `&dyn DBRunner`. So the port passes `&DbTx<'_>` and this layer
-//! forwards it verbatim — the repositories accept any `&impl DBRunner`, and a
-//! transaction is one.
+//! The domain holds one `Arc<dyn Stores>`, and
+//! [`Stores`](crate::domain::ports::Stores) is the conjunction of six traits, so
+//! something has to be a single type implementing all six — the repositories are
+//! five separate unit structs. The alternative, six `Arc<dyn XStore>` in the
+//! service, is more wiring at every call site for no gain.
 //!
 //! # Not every repository method is a port
 //!
 //! Only the calls the domain makes are here. `list_page`, `mark_deleted`,
 //! `compare_and_swap_version`, `replace_outgoing` and the batch reads stay as
-//! inherent methods on the repositories until a domain rule needs them: a port
-//! method with no domain caller is an abstraction with nothing to abstract.
+//! inherent methods until a domain rule needs them: a port method with no domain
+//! caller is an abstraction with nothing to abstract.
 
 use async_trait::async_trait;
 use time::OffsetDateTime;

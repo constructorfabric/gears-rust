@@ -1,57 +1,46 @@
 //! The persistence ports the domain calls, and the row and input types that cross
 //! them.
 //!
-//! The domain orchestrates the transaction — SPEC §8 makes acceptance and
-//! admission each one transaction, and the transaction boundary is a business
-//! rule, not a storage detail. So the ports are **not** "a repository that hides
-//! the database": the transaction crosses the boundary as `&DbTx<'_>`, and the
-//! domain decides what runs inside which one. What the ports do hide is every
-//! `SeaORM` type — entities, active models, column enums — so the domain names
-//! `toolkit_db` and nothing below it.
-//!
-//! The types below are what the repositories in `infra::storage::repo` themselves
-//! take and return; each maps its own `SeaORM` models at the edge. `store.rs` is
-//! therefore a forwarding block with no translation in it — see that file for why
-//! it exists anyway.
+//! SPEC §8 makes acceptance and admission each one transaction, so the transaction
+//! boundary is a business rule and the domain orchestrates it: the transaction
+//! crosses the boundary as `&DbTx<'_>`. What the ports hide is every `SeaORM` type
+//! — entities, active models, column enums — so the domain names `toolkit_db` and
+//! nothing below it. The row and input types below are what the repositories in
+//! `infra::storage::repo` themselves take and return, which is why `store.rs`
+//! forwards without translating.
 //!
 //! # Why every port takes `&DbTx<'_>` and not a runner
 //!
 //! Three candidates, and the first two are unavailable rather than unattractive:
 //!
 //! - `&impl DBRunner` on a trait method makes the trait non-dyn-safe, which would
-//!   push a type parameter through every domain function and into the gear's
-//!   wiring. `Arc<dyn Stores>` would be impossible.
+//!   push a type parameter through every domain function into the gear's wiring.
+//!   `Arc<dyn Stores>` would be impossible.
 //! - `&dyn DBRunner` *can be built* — sealing prevents implementing the trait, not
-//!   coercing to it, and `mini-chat`'s `OutboxEnqueuer` takes exactly that. But it
-//!   cannot be *executed on*: the secure query API spells its parameter
-//!   `&impl DBRunner` (`toolkit-db/src/secure/select.rs`), whose implicit `Sized`
-//!   bound an unsized `dyn` runner fails. `toolkit_db::outbox` opted out with
-//!   `&(impl DBRunner + Sync + ?Sized)`; the secure API has not, and until it does
-//!   a dyn runner can be held but not queried with.
-//! - `&DbTx<'_>` is concrete, so the traits stay dyn-safe and nothing needs a
-//!   match in the adapter. Its cost is that **every** port call runs inside a
-//!   transaction, reads included. That is the deliberate choice: a read that
-//!   consults two tables must not straddle a concurrent commit (see
-//!   [`snapshot_read`]), and `mini-chat`'s `QuotaSettler` takes `&DbTx` for the
-//!   same reason.
+//!   coercing to it — but cannot be *executed on*: the secure query API spells its
+//!   parameter `&impl DBRunner` (`toolkit-db/src/secure/select.rs`), whose implicit
+//!   `Sized` bound an unsized `dyn` runner fails. `toolkit_db::outbox` opted out
+//!   with `&(impl DBRunner + Sync + ?Sized)`; the secure API has not.
+//! - `&DbTx<'_>` is concrete, so the traits stay dyn-safe. Its cost is that
+//!   **every** port call runs inside a transaction, reads included — the
+//!   deliberate choice, because a read that consults two tables must not straddle
+//!   a concurrent commit (see [`snapshot_read`]).
 //!
-//! The repositories underneath keep `runner: &impl DBRunner`, which is what
-//! `11_database_patterns.md` prescribes — they stay usable outside a transaction,
-//! and their own tests use them that way. That is the whole difference between a
-//! repository and a port here: the same call, one reachable without a transaction
-//! and one not.
+//! The repositories underneath keep `runner: &impl DBRunner` as
+//! `11_database_patterns.md` prescribes, so they stay usable outside a
+//! transaction. That is the whole difference between a repository and a port here.
 //!
 //! # Rows mirror their tables
 //!
 //! Each `*Row` carries every column of its table rather than the subset today's
-//! callers read. A narrower projection would mean re-plumbing the port each time a
-//! rule starts consulting one more column, and the mapping is a field-for-field
-//! move the compiler checks.
+//! callers read, so a rule that starts consulting one more column needs no port
+//! change. The mapping is a field-for-field move the compiler checks.
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, ScopeError, TxAccessMode, TxConfig, TxIsolationLevel};
 use toolkit_db::{Db, DbTx};
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::domain::admission::Precondition;
@@ -71,27 +60,20 @@ use crate::domain::family::FamilyKey;
 /// A transaction alone is not enough on every backend. `PostgreSQL` defaults to
 /// `READ COMMITTED`, where every statement takes a fresh snapshot — so two reads
 /// inside one such transaction can still straddle a concurrent commit and compose a
-/// state that never existed. `RepeatableRead` is snapshot isolation there.
+/// state that never existed. `RepeatableRead` is snapshot isolation there;
 /// `MySQL`/`InnoDB` is already at that level, and asking makes the requirement
-/// explicit rather than inherited from a server default.
-///
-/// `ReadOnly` is an assertion rather than an optimisation: these paths must not
-/// write, and both engines reject a write inside such a transaction instead of
-/// letting one slip in later.
+/// explicit rather than inherited from a server default. `ReadOnly` is an
+/// assertion, not an optimisation: both engines reject a write inside such a
+/// transaction.
 ///
 /// **`SQLite` is asked for nothing, deliberately.** Its transactions are
-/// serializable by construction — a reader either holds a WAL snapshot or a shared
-/// lock for the duration, so two reads in one transaction cannot straddle a commit
-/// — and `SeaORM` does not translate the request: `sqlx_sqlite`'s
-/// `set_transaction_config` logs one `WARN` per setting saying it is unsupported,
-/// and moves on. Asking anyway put two `WARN` lines in the log for every read on the
-/// backend `quickstart.yaml` binds, which is noise about a guarantee the engine
-/// already gives. Measured, not assumed: a probe against the in-memory test
-/// database emitted both lines.
+/// serializable by construction — a reader holds a WAL snapshot or a shared lock
+/// for the duration — and `SeaORM` does not translate the request anyway:
+/// `sqlx_sqlite`'s `set_transaction_config` logs one `WARN` per unsupported setting
+/// (observed: two lines per read on the backend `quickstart.yaml` binds).
 ///
-/// A **single**-statement read needs none of this: one statement is atomic on its
-/// own, so those paths use a plain transaction (they still need one, because the
-/// ports take `&DbTx`).
+/// A **single**-statement read needs none of this — one statement is atomic on its
+/// own — so those paths use a plain transaction, which the ports still require.
 #[must_use]
 pub fn snapshot_read(db: &Db) -> TxConfig {
     snapshot_read_for(db.db_engine())
@@ -113,16 +95,15 @@ fn snapshot_read_for(engine: &str) -> TxConfig {
 /// [`snapshot_read`], and for the same reason — a server default is not a contract.
 ///
 /// A commit transaction rechecks and writes, so it wants the *latest* committed
-/// state, not a snapshot: every recheck in SPEC §8.1 step 4 exists to see what
-/// another admission just did. `PostgreSQL` gives that by default; `MySQL`/`InnoDB`
-/// defaults to `REPEATABLE READ`, where a read after a lost insert race still
-/// returns the transaction's opening snapshot — so the re-read that recovers from an
-/// absorbed unique conflict (`repo::conflict_do_nothing`) would not see the winner's
-/// row at all. Asking for `READ COMMITTED` makes the two backends agree, and makes
-/// the requirement visible where the recovery is written.
+/// state: every recheck in SPEC §8.1 step 4 exists to see what another admission
+/// just did. `PostgreSQL` gives that by default; `MySQL`/`InnoDB` defaults to
+/// `REPEATABLE READ`, where the re-read that recovers from an absorbed unique
+/// conflict (`repo::conflict_do_nothing`) would still see the transaction's opening
+/// snapshot and miss the winner's row. `READ COMMITTED` makes the two backends
+/// agree.
 ///
 /// No `access_mode`: this transaction writes. `SQLite` is asked for nothing, as in
-/// [`snapshot_read`] and for the same measured reason.
+/// [`snapshot_read`].
 #[must_use]
 pub fn commit_write(db: &Db) -> TxConfig {
     commit_write_for(db.db_engine())
@@ -197,6 +178,7 @@ mod snapshot_read_tests {
 // ---------------------------------------------------------------------------
 
 /// One `entity` row.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntityRow {
     pub id: i64,
@@ -215,6 +197,7 @@ pub struct EntityRow {
 }
 
 /// One `version_family` row.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VersionFamilyRow {
     pub id: i64,
@@ -225,6 +208,7 @@ pub struct VersionFamilyRow {
 }
 
 /// One `operation` row.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OperationRow {
     pub id: Uuid,
@@ -243,6 +227,7 @@ pub struct OperationRow {
 }
 
 /// One `operation_item` row.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OperationItemRow {
     pub id: i64,
@@ -264,6 +249,7 @@ pub struct OperationItemRow {
 
 /// One `type_schema` current-state row: the revision pointer plus D3's
 /// materialized artifacts.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CurrentTypeSchemaRow {
     pub entity_id: i64,
@@ -281,6 +267,7 @@ pub struct CurrentTypeSchemaRow {
 /// This is the *authored* document on the revision, never the materialized
 /// artifacts: those are outputs of the very resolution the store performs (D3), so
 /// feeding them back in would compose an already-composed document.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct CurrentDocument {
     pub entity_id: i64,
@@ -292,6 +279,7 @@ pub struct CurrentDocument {
 }
 
 /// The result of a dependency-closure read.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct DependencyClosure {
     /// The resolved roots plus everything they transitively consume, `gts_id`
@@ -312,6 +300,7 @@ pub struct DependencyClosure {
 /// Everything an entity needs at first admission. `resource_version`,
 /// `lifecycle_status` and `deleted_at` are not parameters: a new entity is always
 /// active at version 1 with no tombstone.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct NewEntity {
     /// The `UUIDv5` Registry Reference derived from `gts_id` by the caller, which
@@ -327,6 +316,7 @@ pub struct NewEntity {
 }
 
 /// One immutable authored revision.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct NewRevision {
     pub entity_id: i64,
@@ -342,6 +332,7 @@ pub struct NewRevision {
 
 /// The current-state row to write: the revision pointer plus D3's materialized
 /// artifacts.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct NewCurrentTypeSchema {
     pub entity_id: i64,
@@ -357,6 +348,7 @@ pub struct NewCurrentTypeSchema {
 ///
 /// Thinner than [`CurrentTypeSchemaRow`]: an Instance has no artifact and no
 /// fingerprint — nothing about it is derived from other entities.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct CurrentInstanceRow {
     pub entity_id: i64,
@@ -370,6 +362,7 @@ pub struct CurrentInstanceRow {
 ///
 /// The schema pair travels with the value: knowing *why* it is valid needs the exact
 /// revision, and that schema's current revision may already have moved.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct CurrentInstanceValue {
     pub entity_id: i64,
@@ -385,6 +378,7 @@ pub struct CurrentInstanceValue {
 ///
 /// No `compat_forced` counterpart to [`NewRevision`]: an Instance is either valid
 /// against its schema revision or refused, so `force` has nothing to waive.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct NewInstanceRevision {
     pub entity_id: i64,
@@ -401,6 +395,7 @@ pub struct NewInstanceRevision {
 }
 
 /// The current-revision pointer to write. Carries no artifact — there is none.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct NewCurrentInstance {
     pub entity_id: i64,
@@ -413,6 +408,7 @@ pub struct NewCurrentInstance {
 /// `status`, `started_at` and `completed_at` are not parameters: an accepted
 /// operation is always pending with neither timestamp, and the stored CHECK
 /// enforces that pairing.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct NewOperation {
     pub id: Uuid,
@@ -434,6 +430,7 @@ pub struct NewOperation {
 /// [`OperationStore::insert_items`] rather than being fields here, because the
 /// composite foreign key ties them to the parent's and letting a caller pass them
 /// separately would let the two disagree.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct NewOperationItem {
     pub item_no: i32,

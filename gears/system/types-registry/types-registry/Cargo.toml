@@ -56,7 +56,9 @@ time = { workspace = true }
 # `toolkit_db::outbox` needs no feature: it stopped being a preview in
 # toolkit-db 0.12.0 and is now unconditional.
 toolkit = { workspace = true }
-toolkit-db = { workspace = true }
+# Quickstart and the default unit/integration path bind this gear to SQLite at
+# runtime; dev-dependency feature unification must not be what enables it.
+toolkit-db = { workspace = true, features = ["sqlite"] }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }

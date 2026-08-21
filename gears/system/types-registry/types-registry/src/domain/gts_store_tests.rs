@@ -134,14 +134,13 @@ fn an_instance_registers_beside_the_type_it_conforms_to() {
 
 /// A one-segment Instance identifier conforms to nothing, and **`gts-id` owns that
 /// rule** — `GtsId::try_new` refuses the shape before this module can ask
-/// `get_type_id()` about it. Asserted as the library's verdict rather than as one of
-/// ours, exactly as `an_unparsable_identifier_carries_the_library_verdict` does:
-/// re-deciding a grammar `gts-rust` already decides is the local approximation
+/// `get_type_id()`. Asserted as the library's verdict, not ours: re-deciding a
+/// grammar `gts-rust` already decides is the local approximation
 /// `constraint-gts-implementation` forbids.
 ///
-/// This is also why [`StoreBuildError::InstanceWithoutType`] is documented as
-/// unreachable-by-construction rather than deleted — it is the branch that would
-/// fire if that library rule ever relaxed.
+/// Also why [`StoreBuildError::InstanceWithoutType`] is documented as
+/// unreachable-by-construction rather than deleted — it is the branch that would fire
+/// if that library rule ever relaxed.
 #[test]
 fn a_single_segment_instance_is_refused_by_the_library() {
     let orphan = UnitDocument {

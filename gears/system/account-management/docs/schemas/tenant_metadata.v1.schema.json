@@ -7,13 +7,18 @@
   "properties": {
     "id": {
       "description": "Inert: present only to satisfy the gts-macros base-struct contract. Not required.",
-      "type": "string",
-      "format": "gts-instance-id"
+      "allOf": [
+        {
+          "description": "GTS instance identifier",
+          "format": "gts-instance-id",
+          "title": "GTS Instance ID",
+          "type": "string",
+          "x-gts-ref": "gts.*"
+        }
+      ]
     },
     "payload": {
-      "description": "A metadata value's own fields live here (GTS spec 4.4.1 designated open container).",
-      "type": "object",
-      "additionalProperties": true
+      "type": "object"
     }
   },
   "required": [

@@ -293,11 +293,10 @@ async fn the_resolution_fingerprint_is_stable_across_two_admissions_of_identical
 // ---------------------------------------------------------------------------
 
 /// An item's outcome is written once and stands. Two passes over one operation can
-/// overlap — a retry under the same `Idempotency-Key` arriving while the first pass
-/// is still admitting, and at-least-once delivery from T21 — and the losing pass
-/// must neither overwrite the outcome nor leave an entity behind an item that says
-/// something else. Both halves, in order: the item write is a CAS, and losing it
-/// rolls the whole commit back.
+/// overlap — a retry under the same `Idempotency-Key` mid-flight, and at-least-once
+/// delivery from T21 — and the loser must neither overwrite the outcome nor leave an
+/// entity behind an item that says otherwise. Both halves: the item write is a CAS,
+/// and losing it rolls the whole commit back.
 #[tokio::test]
 async fn a_pass_that_loses_the_item_cas_writes_nothing_at_all() {
     let db = test_db().await;
@@ -456,10 +455,9 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
 ///
 /// Acceptance no longer produces such a row — it refuses a positive
 /// `expected_resource_version` until T11 — so this manufactures one, which is also
-/// the shape a row accepted by an earlier build has after an upgrade. What must
-/// not happen is what the Checkpoint 1 review reproduced: committing it as an
-/// ordinary creation at `resource_version = 1`, with the policy gate never
-/// applied because the caller called it a revision.
+/// the shape a row accepted by an earlier build has after an upgrade. What must not
+/// happen: committing it as an ordinary creation at `resource_version = 1`, with the
+/// policy gate never applied because the caller called it a revision.
 #[tokio::test]
 async fn an_item_naming_a_version_fails_terminally_and_writes_nothing() {
     let db = test_db().await;

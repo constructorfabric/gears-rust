@@ -20,11 +20,10 @@
 //! | 7 ADR-0015 major-0 quarantine | **T18** — it needs the reference extractor |
 //! | 8 canonicalize, fingerprint, idempotency | here |
 //!
-//! Step 7 is the one gap, and it is a gap by dependency rather than by choice: it
-//! refuses a stable candidate whose base, `$ref` or `x-gts-ref` targets include a
-//! major-0 identifier, and the extractor that finds those targets is T13's. A
-//! `TODO` marks the position it slots into, between steps 6 and 8, so it lands as
-//! an insertion rather than a reordering.
+//! Step 7 is a gap by dependency: it refuses a stable candidate whose base, `$ref`
+//! or `x-gts-ref` targets include a major-0 identifier, and the extractor that
+//! finds those targets is T13's. A `TODO` marks its position between steps 6 and 8,
+//! so it lands as an insertion rather than a reordering.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -34,6 +33,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, ScopeError};
 use toolkit_db::{DBProvider, DbError};
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use super::fingerprint::{
@@ -63,6 +63,7 @@ const DRAFT_07_SPELLINGS: [&str; 4] = [
 ///
 /// One variant per reason, so T16 can count them separately: a single
 /// `Refused(String)` would make "refusals by reason" a log-parsing exercise.
+#[domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum AcceptanceError {
     #[error("an Idempotency-Key is required")]
@@ -131,11 +132,13 @@ pub enum AcceptanceError {
 
 /// Wrapper so [`PolicyRefusal`] — which is a value, not an error — can be a
 /// `#[source]` without implementing `Error` in the policy module.
+#[domain_model]
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct PolicyRefusalError(pub PolicyRefusal);
 
 /// What acceptance needs besides the request: the compiled policy and the limits.
+#[domain_model]
 #[derive(Clone, Copy, Debug)]
 pub struct AcceptanceContext<'a> {
     pub policy: &'a RegistrationPolicy,
@@ -144,6 +147,7 @@ pub struct AcceptanceContext<'a> {
 
 /// A validated request: everything the transaction needs, and nothing that would
 /// require another look at the request.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct Validated {
     pub kind: OperationKind,
@@ -236,13 +240,11 @@ pub fn validate(
                 });
             }
             // A positive precondition claims the candidate is a revision, and
-            // nothing in P0 can check the claim: `commit_creation` ignores the
-            // field, so the candidate would commit as an ordinary creation at
-            // `resource_version = 1` — with step 3 skipped, because step 3 is
-            // skipped for revisions. Naming a version would then be enough to
-            // register inside a region the deployment closes, and the policy *is*
-            // the deployment allowlist. Refused loudly until T11, exactly as
-            // deletion is refused until T20.
+            // nothing in P0 can check the claim: `commit_creation` ignores the field,
+            // so it would commit as an ordinary creation at `resource_version = 1` —
+            // with step 3 skipped, because step 3 is skipped for revisions. Naming a
+            // version would then be enough to register inside a region the deployment
+            // closes. Refused loudly until T11, as deletion is until T20.
             Some(v) => {
                 return Err(AcceptanceError::RevisionNotAccepted {
                     gts_id: id.id().to_owned(),
@@ -462,12 +464,10 @@ pub async fn accept(
 
     match insert {
         Ok(accepted) => Ok(accepted),
-        // The unique constraint on (idempotency_scope_hash, idempotency_key) is
-        // the serialization point between two concurrent acceptances — this layer
-        // has no row to lock, and the read above cannot close the window. The
-        // loser re-reads the winner **outside** the rolled-back transaction: on
-        // PostgreSQL a constraint violation poisons the transaction, so a re-read
-        // inside it would fail for a second, unrelated reason.
+        // The unique constraint on (idempotency_scope_hash, idempotency_key) is the
+        // serialization point between two concurrent acceptances — this layer has no
+        // row to lock, and the read above cannot close the window. The loser re-reads
+        // the winner outside the rolled-back transaction; see `load_replay`.
         Err(AcceptanceError::Storage(e)) if e.is_unique_violation() => {
             let winner = find_operation_by_key(stores, db, scope, &validated)
                 .await?

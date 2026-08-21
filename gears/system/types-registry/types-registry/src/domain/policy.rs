@@ -7,47 +7,40 @@
 //! platform-vendor (`cf`) registration.
 //!
 //! Policy decides *what* a region admits; authorization decides *who* may write
-//! there. It runs before the PDP and before any existence lookup, so a grant
-//! cannot open a closed region and a refusal cannot probe the namespace — the
-//! gate's placement is acceptance step 3 (T7); what lives here is the
-//! resolution.
+//! there. It runs before the PDP and before any existence lookup (acceptance step
+//! 3, T7), so a grant cannot open a closed region and a refusal cannot probe the
+//! namespace.
 //!
 //! # Why an exact key is compared by string equality and not as a pattern
 //!
-//! DESIGN §3.2 says *"the exact entry separates the base type from `…~*`, which
-//! also matches that base"*, and the P0 matrix relies on it: the exact key
-//! `gts.cf.core.rg.type.v1~` keeps the base type closed while
-//! `gts.cf.core.rg.type.v1~*` opens its subtree.
-//!
-//! That separation is **not** expressible through `GtsIdPattern`. A bare
-//! identifier is an implicit derived-type coverage envelope (GTS spec §3.6), so
-//! `…v1~` and `…v1~*` accept the *same* set — the finding T4 recorded when its
-//! wildcard fixture asserted the wrong expectation. Matching an exact key with
-//! `matches_pattern` would therefore make it govern the whole subtree, which is
-//! the opposite of what the matrix says. So a key without a wildcard is
-//! canonicalized through `GtsId::try_new` and compared by equality; only a key
-//! carrying `*` becomes a `GtsIdPattern`.
+//! The P0 matrix relies on DESIGN §3.2's separation of the base type from `…~*`:
+//! the exact key `gts.cf.core.rg.type.v1~` keeps the base closed while
+//! `gts.cf.core.rg.type.v1~*` opens its subtree. That is **not** expressible
+//! through `GtsIdPattern` — a bare identifier is an implicit derived-type coverage
+//! envelope (GTS spec §3.6), so `…v1~` and `…v1~*` accept the same set, and
+//! `matches_pattern` on an exact key would make it govern the whole subtree. So a
+//! key without a wildcard is canonicalized through `GtsId::try_new` and compared by
+//! equality; only a key carrying `*` becomes a `GtsIdPattern`.
 //!
 //! # `tenant_ownable` is resolved and not consulted
 //!
 //! ponytail: ceiling C6 / SPEC §9 fix every P0 row to `ownership_scope = 1`,
-//! `owner_tenant_id = NULL`, so no candidate can be tenant-owned and the
-//! parameter has nothing to decide. It is still parsed, validated and
-//! *resolvable* — [`RegistrationPolicy::tenant_ownable`] — because a P1-ready
-//! deployment carries it and silently dropping it would let an operator believe
-//! a parameter is enforced. [`RegistrationPolicy::admits`] refuses any candidate
-//! asking for tenant ownership **whatever the entry says**, which is a
-//! fail-closed assertion about an unreachable request shape rather than a
-//! feature. The upgrade path is one line: consult the resolved value instead of
-//! refusing.
+//! `owner_tenant_id = NULL`, so the parameter has nothing to decide. It is still
+//! parsed, validated and *resolvable* ([`RegistrationPolicy::tenant_ownable`])
+//! because a P1-ready deployment carries it and silently dropping it would let an
+//! operator believe a parameter is enforced. [`RegistrationPolicy::admits`] refuses
+//! any candidate asking for tenant ownership **whatever the entry says** — a
+//! fail-closed assertion about an unreachable request shape. The upgrade is one
+//! line: consult the resolved value instead of refusing.
 
 use std::collections::BTreeMap;
 
 use gts::{GtsId, GtsIdPattern};
 use thiserror::Error;
+use toolkit_macros::domain_model;
 
-use crate::config::PolicyEntry;
 use crate::domain::enums::OwnershipScope;
+use crate::policy_config::PolicyEntry;
 
 /// The vendor whose global registrations are admitted without an entry.
 const PLATFORM_VENDOR: &str = "cf";
@@ -56,6 +49,7 @@ const PLATFORM_VENDOR: &str = "cf";
 const ANY_VENDOR: &str = "*";
 
 /// Why a configured policy cannot be compiled.
+#[domain_model]
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PolicyConfigError {
     #[error("region '{key}' is not a valid GTS identifier or pattern: {reason}")]
@@ -70,6 +64,7 @@ pub enum PolicyConfigError {
 /// operator has to edit. A `region` of `None` means no entry provided the
 /// parameter at all and the closed default applied — a distinct situation from
 /// an entry that provided it and excluded this vendor.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRefusal {
     pub gts_id: String,
@@ -137,6 +132,7 @@ impl CompiledEntry {
 
 /// A compiled registration policy. Immutable, cheap to consult, and holding no
 /// entity state.
+#[domain_model]
 #[derive(Debug, Default)]
 pub struct RegistrationPolicy {
     entries: Vec<CompiledEntry>,
@@ -184,7 +180,12 @@ impl RegistrationPolicy {
                 key: key.clone(),
                 matcher,
                 literal_prefix,
-                allowed_vendors: entry.allowed_vendors.clone(),
+                allowed_vendors: entry.allowed_vendors.as_ref().map(|vendors| {
+                    vendors
+                        .iter()
+                        .map(|vendor| vendor.trim().to_owned())
+                        .collect()
+                }),
                 tenant_ownable: entry.tenant_ownable,
             });
         }

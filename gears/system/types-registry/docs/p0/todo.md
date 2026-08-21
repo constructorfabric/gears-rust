@@ -430,8 +430,8 @@ Outcome and evidence: the criteria below. The per-task report was folded into th
 - [x] Routes are `/types-registry/v1/...` and `.authenticated()`; DTOs live only in `api/rest/dto.rs`
 - [x] Added at the review gate: the four wire vocabularies — operation status and kind, item status, entity kind, lifecycle status — are `#[api_dto]` **enums**, not `String` fields whose admissible values lived in a docstring. A `String` publishes an unconstrained `string` in the served `OpenAPI`, so a generated client gets no vocabulary and a value this gear never emits type-checks against it; the five `*_str` helpers are gone with it (found at the Checkpoint 1 review)
 - [x] `GET /entities/{entity_key}` accepts a GTS identifier or a `gts_uuid` — classified by `EntityKey::parse` in the **domain**, so a future gRPC adapter with the same field gets it for free
-- [x] These routes are the **platform-plane** API for global entities: they keep the authentication they have and no handler assumes a tenant scope. `.anonymous()` is **not** used. Ceiling C8 is commented where the routes are registered. **Corrected after the PR's contract check:** the routes were initially `.exposed()`, but `exposed` gates gateway visibility, not `OpenAPI` inclusion — every registered operation lands in `docs/api/api.json` either way — so it bought a published interim surface with no consumer (the database path has none until T24) and cost a stale `api.json`. The v2 routes are now **internal-only** (no `.exposed()`): documented in the spec, invisible to the gateway. T24a restores `.exposed()` when it promotes them onto `V1`
-- [x] **Handlers are mapping steps only.** `RegistryService` has three methods taking and returning domain values with no `StatusCode`, `HeaderMap` or `Json`. Two decisions that could have leaked and did not: the identifier-versus-UUID classification, and the `expected_resource_version` vocabulary — the stored `0` means must-not-exist and the wire spells that as an absent field, translated in the service so both adapters see one closed vocabulary. `Idempotency-Key` is read from the header and passed as a parameter
+- [x] These routes are the **platform-plane** API for global entities: they keep the authentication they have and no handler assumes a tenant scope. `.anonymous()` is **not** used. Ceiling C8 is commented where the routes are registered. **Corrected after the PR's contract check:** the routes were initially `.exposed()`, but `exposed` gates gateway visibility, not `OpenAPI` inclusion — every registered operation lands in `docs/api/api.json` either way — so it bought a published interim surface with no consumer (the database path has none until T24) and cost a stale `api.json`. The v2 routes are now **internal-only** (no `.exposed()`): documented in the spec and invisible to the gateway. T24a changes their paths but must not expose mutations while C8 remains open
+- [x] **Handlers are mapping steps only.** `RegistryService` has three methods taking and returning domain values with no `StatusCode`, `HeaderMap` or `Json`. The identifier-versus-UUID classification stays in the domain. The request's `expected_resource_version` is persisted as the worker precondition (`0` means must-not-exist) but is not echoed by the public operation outcome. The created `revision_no` likewise remains internal admission provenance; only the resulting `resource_version`, which future writes accept as their precondition, crosses that response boundary. `Idempotency-Key` is read from the header and passed as a parameter
 
 **Verification:**
 - [x] `cargo test -p cf-gears-types-registry` — `api_rest_test.rs` via `Router::oneshot`, 10 cases, driving the **real** `register_routes` with a stub `OpenApiRegistry` rather than a hand-built router: a bare router would pass while a route was registered at the wrong path or without its auth stage. 226 lib + 195 integration tests pass
@@ -577,15 +577,15 @@ the last `~`, and the immutable schema-revision pair.
 - [x] The closure reaches a candidate's derivation chain with **no `dependency` row present** — `closure` seeds its worklist with `GtsId::chain_ids()`, and `missing_roots` is still computed over the original roots so a chain member the seed added is not reported as one. The Phase 1 test is inverted, and its old comment was half wrong: it blamed T13's missing edges, but a derivation base is a pure function of the identifier
 - [x] A family holds one kind — `family_kind_conflict`, checked under the family lock and only for a family that already existed. Distinct from `already_exists` because the identifier *is* free; saying otherwise sends a caller looking for a conflicting entity that does not exist. Both orders are tested
 - [x] No `$ref`/`x-gts-ref` target is expected to resolve yet — `a_ref_outside_the_chain_still_fails` pins it, so T10's chain seed cannot be mistaken for T13 having landed early
-- [x] **An admitted Instance reads back with its value.** *Added after the task was marked done — see the correction below.* `GET /v2/entities/{entity_key}` returns the authored value and its `revision_no` for an Instance as it does the document for a Type Schema. The three `effective_*` artifacts stay absent, and that is the contract rather than the same omission: an Instance has no derived state, so there is nothing to materialize
+- [x] **An admitted Instance reads back with its value.** *Added after the task was marked done — see the correction below.* `GET /v2/entities/{entity_key}` returns either kind's authored document under the single public field `content`. The immutable `revision_no` remains an internal current-pointer and provenance detail; the public entity exposes `resource_version`, which is the token future writes accept. The three `effective_*` artifacts stay absent for an Instance, and that is the contract rather than the same omission: an Instance has no derived state, so there is nothing to materialize
 
 **The read path was missed, and the task's criteria are why.** Every criterion above is about
 admission — the write path, the transient store and the family rule — and none names the public
 read. `RegistryService::entity()` was built at T9, when only Type Schemas existed, and kept asking
 `TypeSchemaStore::{find_current_schema, current_documents}` for **both** kinds. An Instance has no
-row in either table, so an admitted Instance answered `200` with `content: null` and
-`revision_no: null` while its operation reported `succeeded` — the value was durable, correct, and
-unreachable through the API. `InstanceStore::current_values` already existed and was already
+row in either table, so an admitted Instance answered `200` with `content: null` while its
+operation reported `succeeded` — the value was durable, correct, and unreachable through the
+API. `InstanceStore::current_values` already existed and was already
 correct; it had one caller, `gts_store.rs`, which is the **transient validation** store and not a
 read path. `api_rest_test.rs` contained no Instance case at all, which is why 454 green tests said
 nothing about it.
@@ -593,7 +593,8 @@ nothing about it.
 The read now branches on the row's kind into a `CurrentState` enum — the same shape
 `EvaluatedOutcome` has on the write side, so "an Instance carrying a resolved schema" is not a
 representable value rather than a mismatch a later edit could introduce. One statement, not two:
-`current_values` returns the pointer's revision number with the value it points at.
+`current_values` returns the pointer's revision number with the value it points at; the service
+uses that pairing internally and does not publish the revision number.
 
 **Consequence for later tasks, since it would have surfaced there as a regression.** T23's
 `get_instance` and T27's `batchGet` both sit on this method; the SDK helpers that hydrate a
@@ -606,7 +607,7 @@ content-free page through `batchGet` would have returned pages of null values.
 - [x] Test: an Instance admits against a Type Schema committed by an **earlier** operation, with the `dependency` table asserted empty
 - [x] Test: a derived Type Schema admits against a committed base, with the `dependency` table empty
 - [x] Test: Type Schema then Instance under one `family_key` — second is refused; and the reverse order
-- [x] Test: an admitted Instance reads back over the **real routes** with its authored value and `revision_no`, and with the three `effective_*` artifacts asserted absent — `api_rest_test.rs::an_instance_reads_back_with_its_authored_value`, which polls the operation first so a refused candidate cannot be mistaken for a value the read failed to reach. Plus the same Instance by its Registry Reference, pinning that the kind branch is chosen by the row and not by how it was found. Both are genuine RED→GREEN: they failed on `content: null` before the fix. Re-run on all three backends — 457 on `SQLite`, `make test-types-registry-db` green
+- [x] Test: an admitted Instance reads back over the **real routes** with its authored value under `content`, without exposing internal `revision_no`, and with the three `effective_*` artifacts asserted absent — `api_rest_test.rs::an_instance_reads_back_with_its_authored_value`, which polls the operation first so a refused candidate cannot be mistaken for a value the read failed to reach. Plus the same Instance by its Registry Reference, pinning that the kind branch is chosen by the row and not by how it was found. Both are genuine RED→GREEN: they failed on `content: null` before the fix. Re-run on all three backends — 457 on `SQLite`, `make test-types-registry-db` green
 
 **Interim, and stated rather than discovered later:** *"fails retryably"* is exercisable only as a
 unit call on `run_operation`, because there is no outbox to redeliver until T21 and inline
@@ -1210,6 +1211,8 @@ and `make example` instead. Before T24 the suite stays green, which is what T9a 
 
 **Acceptance criteria:**
 - [ ] No `/v2/` path remains in the crate, in OpenAPI or in `QUICKSTART.md`
+- [ ] The promotion changes paths only: registration and deletion routes remain internal-only
+      (`exposed = false`) until C8's platform listener and authorization gate exist
 - [ ] `operation_id`s are unchanged by the move — `types_registry.submit_entities`, `.get_operation`, `.get_entity` and T27's additions keep their names, so the promotion is a path change and nothing else. A client that already followed v2 sees only the prefix move
 - [ ] Old v1 handlers, DTOs and routes are **deleted**, not repointed — verified by T24's own criterion that the in-memory repository is gone; `grep -r 'types_registry\.register\|RegisterEntitiesRequest'` finds nothing outside history
 - [ ] Every surviving v1 route reads the database; none reads process memory
@@ -1314,8 +1317,13 @@ the `POST /entities` break, and `QUICKSTART.md`.
 - [ ] `EntityRepo::list_page` gets its first real consumer here: its scan budget (`SCAN_BUDGET`, `SCAN_BATCH`) and prefix-range logic (`prefilter_prefix`, `range_upper_bound`) are the most intricate in the layer and have only ever been unit-tested — a test must exercise the budget boundary and a prefix range **through the route**
 - [ ] Both read routes go through T4's database read primitives; pattern filtering is `GtsId::matches_pattern` in Rust over prefiltered rows, never SQL that reimplements identifier matching
 - [ ] All **seven** routes appear in the OpenAPI document with RFC-9457 error responses registered — the four reads (`GET /entities/{entity_key}`, `GET /entities`, `:batchGet`, `GET /operations/{operation_id}`) and the three mutations (`POST /entities`, `:batchDelete`, `DELETE /entities/{entity_key}`)
+- [ ] The three mutation operations are not gateway-published: their operation specs keep
+      `exposed = false` until platform identity and a PDP decision are enforced before dispatch
 - [ ] `QUICKSTART.md` exists per `02_gear_layout_and_sdk_pattern.md` — description, features, link to `/docs`, one or two working `curl` examples
-- [ ] OpenAPI and `QUICKSTART.md` describe this as the platform-plane API for global entities, and say plainly that platform identity (`X-ToolKit-Internal-Token` / `PlatformIdentity`) and a separate platform listener are not yet enforced (C8) — a reader must not conclude the plane is authenticated as such
+- [ ] OpenAPI and `QUICKSTART.md` describe this as the platform-plane API for global entities,
+      state that mutation routes remain internal-only while platform identity
+      (`X-ToolKit-Internal-Token` / `PlatformIdentity`) and the separate listener are unavailable
+      (C8), and do not present a gateway mutation `curl` as usable
 - [ ] Changelog records the `POST /entities` break
 - [ ] No handler added in this task carries logic the domain service does not already expose — the REST surface stays a mapping layer, so a later gRPC surface cannot diverge from it (SPEC §8.4)
 

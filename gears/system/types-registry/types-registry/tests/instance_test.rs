@@ -160,10 +160,9 @@ async fn an_instance_records_the_schema_revision_that_validated_it() {
         revision.type_schema_revision_no, 1,
         "the conforming type's current revision at validation time",
     );
-    assert!(
-        revision.canonical_value.contains("first"),
-        "the authored value is stored as submitted: {}",
-        revision.canonical_value,
+    assert_eq!(
+        revision.canonical_value, r#"{"name":"first"}"#,
+        "the canonical authored value must be stored exactly",
     );
 
     // A pointer and nothing more: no artifact, no fingerprint.

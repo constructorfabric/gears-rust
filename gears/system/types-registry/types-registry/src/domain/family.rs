@@ -1,24 +1,21 @@
 //! Version-family key derivation.
 //!
-//! A family groups every version of one logical entity: `v1~`, `v1.4~` and `v2~`
-//! of the same type are one family, because the shape and contiguity rules of
-//! `database.sql` are asked of the family row and that row is their only
-//! serialization point.
+//! A family groups every version of one logical entity — `v1~`, `v1.4~` and `v2~`
+//! of the same type — because `database.sql`'s shape and contiguity rules are asked
+//! of the family row, their only serialization point.
 //!
 //! The key is the identifier with **the last segment's version removed** and the
-//! trailing `~` normalized away. A minor in a *preceding* segment survives
-//! verbatim: it identifies which base was derived from, which is part of the
-//! entity's identity rather than its own version.
+//! trailing `~` normalized away. A minor in a *preceding* segment survives verbatim:
+//! it names which base was derived from, part of the entity's identity rather than
+//! its own version. `family_key` is **not** a GTS Identifier and MUST NOT be parsed
+//! as one (`database.sql`) — it is a byte key, hence the column's binary collation.
 //!
-//! `family_key` is **not** a GTS Identifier and MUST NOT be parsed as one
-//! (`database.sql`) — it is a byte key, which is why the column carries binary
-//! collation.
-//!
-//! The three non-stored family rules — kind, minor shape and contiguity — are
-//! T12's. What lives here is the derivation the first admission needs to find or
-//! create the row at all.
+//! The three non-stored family rules — kind, minor shape, contiguity — are T12's.
+//! What lives here is the derivation the first admission needs to find or create the
+//! row at all.
 
 use gts::{GtsId, GtsIdSegment};
+use toolkit_macros::domain_model;
 
 /// A version-family lookup key.
 ///
@@ -26,6 +23,7 @@ use gts::{GtsId, GtsIdSegment};
 /// version and the value MUST NOT be parsed through [`GtsId`]. Keeping the bytes
 /// private prevents a family key from being passed to a GTS-id keyed port by
 /// accident while leaving the storage adapter free to persist it as text.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FamilyKey(String);
 

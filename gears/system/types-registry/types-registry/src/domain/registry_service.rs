@@ -19,9 +19,8 @@
 //!
 //! **The scope is `allow_all`.** ponytail: ceiling C6 — there is no PDP, the
 //! managed entities are `#[secure(unrestricted)]`, and no `SecurityContext` reaches
-//! this layer yet. `allow_all` is the honest value rather than a bypass: it is a
-//! legitimate authorization outcome with no row-level filtering, and
-//! `AccessScope::default()` — deny-all — is what an unset scope would give. The P1
+//! this layer yet. `allow_all` is a legitimate authorization outcome with no
+//! row-level filtering, not a bypass; `AccessScope::default()` is deny-all. The P1
 //! upgrade is a request-scoped `AccessScope` derived from the `SecurityContext`,
 //! which is why every repository method already takes one.
 
@@ -31,6 +30,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, ScopeError};
 use toolkit_db::{DBProvider, Db, DbError};
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::config::TypesRegistryConfig;
@@ -50,6 +50,7 @@ use crate::domain::ports::{
 /// Both name the same row: the Registry Reference is `GtsId::to_uuid()`, a
 /// deterministic derivation of the identifier. Parsing which one the caller meant
 /// is a domain decision, not a transport one, so it lives in [`EntityKey::parse`].
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntityKey {
     GtsId(String),
@@ -73,6 +74,7 @@ impl EntityKey {
 }
 
 /// One operation and its per-candidate outcomes, as a caller polls it.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct OperationRecord {
     pub operation_id: Uuid,
@@ -86,20 +88,18 @@ pub struct OperationRecord {
 }
 
 /// One candidate's durable outcome.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct OperationItemRecord {
     pub gts_id: String,
     pub status: OperationItemStatus,
-    /// `None` when the request required the identifier to be absent — the stored
-    /// `0` is translated back into the absent form the wire vocabulary uses.
-    pub expected_resource_version: Option<i64>,
     pub resource_version: Option<i64>,
-    pub revision_no: Option<i32>,
     /// The stored structured reason, verbatim.
     pub error: Option<String>,
 }
 
-/// One entity with its authored content and D3's materialized artifacts.
+/// One entity with its content and D3's materialized artifacts.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct EntityRecord {
     pub gts_id: String,
@@ -110,10 +110,10 @@ pub struct EntityRecord {
     pub owning_gear: Option<String>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
-    pub revision_no: Option<i32>,
-    /// The authored document. Absent only if the current-state row is missing,
-    /// which is a corrupt row rather than a state a reader should expect.
-    pub authored: Option<Value>,
+    /// The authored document under the public resource name. Absent only if the
+    /// current-state row is missing, which is a corrupt row rather than a state a
+    /// reader should expect.
+    pub content: Option<Value>,
     pub resolved_schema: Option<Value>,
     pub effective_traits: Option<Value>,
     pub effective_traits_schema: Option<Value>,
@@ -137,6 +137,7 @@ enum CurrentState {
 
 /// What the service can fail with. One layer above the two admission halves, so a
 /// transport adapter maps one type.
+#[domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
     #[error(transparent)]
@@ -152,6 +153,7 @@ pub enum ServiceError {
 }
 
 /// How accepted operations are driven after their acceptance transaction commits.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionMode {
     /// Drive the worker before returning. Used by P0 API traffic and seeding.
@@ -161,6 +163,7 @@ pub enum AdmissionMode {
 }
 
 /// The database-backed registry service.
+#[domain_model]
 pub struct RegistryService {
     db: Db,
     /// The persistence ports. Injected rather than named concretely, which is what
@@ -298,9 +301,7 @@ impl RegistryService {
                 .map(|item| OperationItemRecord {
                     gts_id: item.gts_id,
                     status: item.status,
-                    expected_resource_version: item.precondition.expected_resource_version(),
                     resource_version: item.result_resource_version,
-                    revision_no: item.result_revision_no,
                     error: item.error_payload,
                 })
                 .collect(),
@@ -369,37 +370,34 @@ impl RegistryService {
             return Ok(None);
         };
 
-        let (revision_no, authored, resolved_schema, effective_traits, effective_traits_schema) =
-            match current {
-                CurrentState::TypeSchema { current, document } => {
-                    let authored = document
-                        .map(|doc| parse_stored(&doc.raw_schema, &row.gts_id))
-                        .transpose()?;
-                    match current {
-                        Some(current) => (
-                            Some(current.revision_no),
-                            authored,
-                            Some(parse_stored(&current.resolved_schema, &row.gts_id)?),
-                            Some(parse_stored(&current.effective_traits, &row.gts_id)?),
-                            Some(parse_stored(&current.effective_traits_schema, &row.gts_id)?),
-                        ),
-                        None => (None, authored, None, None, None),
-                    }
-                }
-                // The three artifacts are `None` by construction rather than by
-                // omission: an Instance has no derived state, so there is nothing a
-                // later task could materialize into them.
-                CurrentState::Instance { value } => match value {
-                    Some(value) => (
-                        Some(value.revision_no),
-                        Some(parse_stored(&value.canonical_value, &row.gts_id)?),
-                        None,
-                        None,
-                        None,
+        let (content, resolved_schema, effective_traits, effective_traits_schema) = match current {
+            CurrentState::TypeSchema { current, document } => {
+                let content = document
+                    .map(|doc| parse_stored(&doc.raw_schema, &row.gts_id))
+                    .transpose()?;
+                match current {
+                    Some(current) => (
+                        content,
+                        Some(parse_stored(&current.resolved_schema, &row.gts_id)?),
+                        Some(parse_stored(&current.effective_traits, &row.gts_id)?),
+                        Some(parse_stored(&current.effective_traits_schema, &row.gts_id)?),
                     ),
-                    None => (None, None, None, None, None),
-                },
-            };
+                    None => (content, None, None, None),
+                }
+            }
+            // The three artifacts are `None` by construction rather than by
+            // omission: an Instance has no derived state, so there is nothing a
+            // later task could materialize into them.
+            CurrentState::Instance { value } => match value {
+                Some(value) => (
+                    Some(parse_stored(&value.canonical_value, &row.gts_id)?),
+                    None,
+                    None,
+                    None,
+                ),
+                None => (None, None, None, None),
+            },
+        };
 
         Ok(Some(EntityRecord {
             gts_id: row.gts_id,
@@ -410,8 +408,7 @@ impl RegistryService {
             owning_gear: row.owning_gear,
             created_at: row.created_at,
             updated_at: row.updated_at,
-            revision_no,
-            authored,
+            content,
             resolved_schema,
             effective_traits,
             effective_traits_schema,

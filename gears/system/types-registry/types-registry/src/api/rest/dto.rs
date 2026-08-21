@@ -34,12 +34,6 @@ impl From<&GtsIdSegment> for GtsIdSegmentDto {
             package: segment.package().to_owned(),
             namespace: segment.namespace().to_owned(),
             type_name: segment.type_name().to_owned(),
-            // 0.12.0 replaced `ver_major() -> u32` with `ver_major_opt() -> Option<u32>`
-            // so an unspecified version is no longer indistinguishable from `v0`.
-            // `unwrap_or(0)` reproduces 0.11.0 exactly — it returned
-            // `parts().map_or(0, ..)`, i.e. 0 for a UUID-tail segment — so this
-            // response shape does not change. Surfacing the distinction belongs to
-            // the major-0 quarantine slice (ADR-0015), not to the upgrade.
             ver_major: segment.ver_major_opt().unwrap_or(0),
         }
     }
@@ -482,6 +476,7 @@ pub struct SubmitEntityDto {
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct SubmitEntitiesRequest {
+    #[schema(min_items = 1)]
     pub items: Vec<SubmitEntityDto>,
     /// Run every check and commit nothing. Part of the request fingerprint, so
     /// reusing one `Idempotency-Key` for a dry run and then a commit is a
@@ -508,10 +503,7 @@ pub struct OperationAcceptedDto {
 pub struct OperationItemDto {
     pub gts_id: String,
     pub status: OperationItemStatusDto,
-    /// Absent when the request required the identifier to be absent.
-    pub expected_resource_version: Option<i64>,
     pub resource_version: Option<i64>,
-    pub revision_no: Option<i32>,
     /// The structured refusal reason, when this candidate failed.
     pub error: Option<serde_json::Value>,
 }
@@ -553,7 +545,6 @@ pub struct EntityDto {
     pub created_at: time::OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: time::OffsetDateTime,
-    pub revision_no: Option<i32>,
     pub content: Option<serde_json::Value>,
     pub resolved_schema: Option<serde_json::Value>,
     pub effective_traits: Option<serde_json::Value>,
@@ -571,14 +562,12 @@ pub struct EntityDto {
 //
 // Neither the domain nor the storage enums derive `Serialize`, on purpose (T3): the
 // storage side must not leak its smallint numbering and the domain side has no wire
-// spelling of its own. These types are the wire spellings — the boundary that keeps
-// the two vocabularies out of each other.
+// spelling of its own. These types are the wire spellings.
 //
-// They are enums rather than the `&'static str` helpers they replace, and the
-// difference is not internal: a `String` field publishes an unconstrained `string`
-// in the served `OpenAPI`, so a generated client gets no vocabulary at all and a
-// value this gear never emits type-checks against it. `#[api_dto]` renames variants
-// to `snake_case`, which is exactly the set the docstrings used to promise in prose.
+// Enums rather than `&'static str` helpers, and the difference is not internal: a
+// `String` field publishes an unconstrained `string` in the served `OpenAPI`, so a
+// generated client gets no vocabulary and a value this gear never emits type-checks
+// against it. `#[api_dto]` renames variants to `snake_case`.
 
 /// `pending`, `running` or `completed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -678,9 +667,7 @@ impl From<OperationItemRecord> for OperationItemDto {
         Self {
             gts_id: item.gts_id,
             status: item.status.into(),
-            expected_resource_version: item.expected_resource_version,
             resource_version: item.resource_version,
-            revision_no: item.revision_no,
             // The stored payload is already a JSON object; re-parsing it keeps the
             // response a document rather than a string containing one. A payload
             // that does not parse is surfaced as a string field rather than
@@ -721,8 +708,7 @@ impl From<EntityRecord> for EntityDto {
             owning_gear: record.owning_gear,
             created_at: record.created_at,
             updated_at: record.updated_at,
-            revision_no: record.revision_no,
-            content: record.authored,
+            content: record.content,
             resolved_schema: record.resolved_schema,
             effective_traits: record.effective_traits,
             effective_traits_schema: record.effective_traits_schema,

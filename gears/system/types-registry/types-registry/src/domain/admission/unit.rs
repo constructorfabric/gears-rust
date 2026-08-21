@@ -4,16 +4,14 @@
 //! The split between the two halves is the point of this module. Evaluation is
 //! everything expensive and everything fallible for content reasons — building the
 //! store, resolving references, composing effective traits, meta-compiling the
-//! schema — and it happens with **no transaction open**. The transaction that
-//! follows contains only the rechecks that must hold at commit time and the
-//! writes, so a slow validation never holds a row lock and a failed validation
-//! never opened one.
+//! schema — and runs with **no transaction open**. The transaction that follows
+//! holds only the commit-time rechecks and the writes, so a slow validation never
+//! holds a row lock and a failed one never opened it.
 //!
-//! P0 scope of this file is T8's: one acyclic, reference-free candidate per unit.
-//! In-batch reference resolution and SCC ordering are T19, compatibility against a
-//! baseline is T17, dependency edges are T13, and the revision-vector guard is
-//! T15. Each of those adds a step to `evaluate` or to `commit` without moving the
-//! boundary between them.
+//! P0 scope here is T8's: one acyclic, reference-free candidate per unit. In-batch
+//! resolution and SCC ordering are T19, compatibility T17, dependency edges T13,
+//! the revision-vector guard T15 — each adds a step to `evaluate` or `commit`
+//! without moving the boundary between them.
 
 use std::sync::Arc;
 
@@ -22,8 +20,10 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{DBProvider, DbTx};
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+use super::errors::{ItemFailure, WorkerError};
 use super::fingerprint::canonical_text;
 use crate::domain::artifacts::{MaterializedArtifacts, content_hash, materialize};
 use crate::domain::enums::{EntityKind, OwnershipScope};
@@ -33,8 +33,6 @@ use crate::domain::ports::{
     NewCurrentInstance, NewCurrentTypeSchema, NewEntity, NewInstanceRevision, NewRevision, Stores,
     snapshot_read,
 };
-
-use super::worker::{ItemFailure, WorkerError};
 
 /// The owning gear recorded on a P0 admission.
 ///
@@ -50,6 +48,7 @@ pub const P0_OWNING_GEAR: &str = "types-registry";
 /// Variants rather than two `Option`s beside a `kind` discriminant: with `Option`s a
 /// commit path reading the wrong one sees `None` at runtime, and a `kind` that
 /// disagrees with its payload is representable. Here the kind *is* the variant.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub enum EvaluatedOutcome {
     /// D3's artifacts, materialized at admission so the read path recomputes
@@ -80,6 +79,7 @@ impl EvaluatedOutcome {
 /// What evaluation produced, and what the commit needs. Owned, because it crosses
 /// into a transaction closure that may not borrow anything shorter-lived than
 /// `'static`.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct EvaluatedUnit {
     pub gts_id: String,
@@ -92,6 +92,7 @@ pub struct EvaluatedUnit {
 }
 
 /// The commit's result for one item.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommittedUnit {
     pub gts_uuid: Uuid,
@@ -437,11 +438,10 @@ pub async fn commit_creation(
     }
 
     // The write is a CAS on the item's status, and its `false` must roll this
-    // transaction back rather than be discarded: an overlapping pass has already
-    // recorded an outcome for this item, and committing here would leave an entity
-    // and a revision behind an item that says otherwise. Everything written above
-    // goes with the rollback, which is why the check belongs at the end of the
-    // transaction rather than before it.
+    // transaction back rather than be discarded: an overlapping pass already
+    // recorded an outcome, and committing would leave an entity and a revision
+    // behind an item that says otherwise. Everything written above goes with the
+    // rollback — which is why the check belongs at the end of the transaction.
     if !stores
         .mark_item_succeeded(
             tx,

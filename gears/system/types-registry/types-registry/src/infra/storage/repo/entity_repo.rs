@@ -105,6 +105,9 @@ pub struct EntityRepo;
 impl EntityRepo {
     /// Exact read by GTS Identifier. Tombstones are returned: a DELETED entity
     /// stays reverse-resolvable until purge.
+    ///
+    /// # Errors
+    /// Propagates scope validation and database query failures.
     pub async fn find_by_gts_id(
         runner: &impl DBRunner,
         scope: &AccessScope,
@@ -145,6 +148,9 @@ impl EntityRepo {
 
     /// Batch exact read, chunked to stay inside every backend's parameter limit.
     /// Identifiers with no row are simply absent from the result.
+    ///
+    /// # Errors
+    /// Propagates scope validation and database query failures from any chunk.
     pub async fn find_by_gts_ids(
         runner: &impl DBRunner,
         scope: &AccessScope,
@@ -188,6 +194,9 @@ impl EntityRepo {
 
     /// Batch read by surrogate id, chunked. Used by the closure walk, which
     /// discovers ids rather than identifiers.
+    ///
+    /// # Errors
+    /// Propagates scope validation and database query failures from any chunk.
     pub async fn find_by_ids(
         runner: &impl DBRunner,
         scope: &AccessScope,
@@ -211,6 +220,10 @@ impl EntityRepo {
 
     /// First admission of an entity: active, `resource_version = 1`, no tombstone.
     /// `None` means a concurrent writer already holds this `gts_id` or `gts_uuid`.
+    ///
+    /// # Errors
+    /// Propagates scope validation and database insert/read failures other than
+    /// the deliberately absorbed uniqueness race.
     pub async fn insert(
         runner: &impl DBRunner,
         scope: &AccessScope,
@@ -244,10 +257,10 @@ impl EntityRepo {
             Ok(_) => Self::find_by_gts_id(runner, scope, &gts_id).await,
             // `uq_tr_entity_gts_id` or `uq_tr_entity_gts_uuid` already holds this
             // identifier — a concurrent admission of the same candidate. Absorbed
-            // rather than raised because this runs inside the commit transaction:
-            // see `conflict_do_nothing`. The caller turns `None` into the item's
-            // `already_exists` outcome, which is the same answer the pre-insert
-            // existence check gives when the winner committed a moment earlier.
+            // rather than raised because this runs inside the commit transaction
+            // (see `conflict_do_nothing`). The caller turns `None` into the item's
+            // `already_exists` outcome, the same answer the pre-insert existence
+            // check gives when the winner committed a moment earlier.
             Err(ScopeError::Db(DbErr::RecordNotInserted)) => Ok(None),
             Err(e) => Err(e),
         }
@@ -259,6 +272,9 @@ impl EntityRepo {
     /// between the check and the write, and the affected-row count is the success
     /// signal. A stale precondition is `Ok(false)` rather than an error — it is an
     /// ordinary concurrent-writer outcome the caller turns into `412`, not a fault.
+    ///
+    /// # Errors
+    /// Propagates scope validation and database update failures.
     pub async fn compare_and_swap_version(
         runner: &impl DBRunner,
         scope: &AccessScope,
@@ -290,6 +306,9 @@ impl EntityRepo {
     /// `ck_tr_entity_lifecycle` constrains the pair; the `WHERE` also requires the
     /// row to be active, so a second deletion reports failure instead of moving
     /// `deleted_at`.
+    ///
+    /// # Errors
+    /// Propagates scope validation and database update failures.
     pub async fn mark_deleted(
         runner: &impl DBRunner,
         scope: &AccessScope,
@@ -327,10 +346,12 @@ impl EntityRepo {
     /// way an offset can: a row inserted mid-traversal either sorts ahead of the
     /// cursor and is seen, or behind it and is not.
     ///
-    /// The whole match set is never loaded to be sliced in memory. SQL is asked
-    /// for bounded batches within the prefix range; each row is tested against the
-    /// pattern as it arrives, and the scan stops on the page limit or the scan
-    /// budget.
+    /// The whole match set is never loaded to be sliced in memory: SQL is asked for
+    /// bounded batches within the prefix range, each row is tested against the
+    /// pattern as it arrives, and the scan stops on the page limit or scan budget.
+    ///
+    /// # Errors
+    /// Propagates scope validation and database query failures from any scan batch.
     pub async fn list_page(
         runner: &impl DBRunner,
         scope: &AccessScope,
@@ -352,13 +373,11 @@ impl EntityRepo {
         let mut exhausted = false;
 
         'scan: while items.len() < limit && scanned < SCAN_BUDGET {
-            // With no pattern every row that SQL returns is a match, so reading
-            // more than the page still needs would be discarded. With a pattern
-            // the batch has to be larger than the remainder, or a page over a
-            // sparse match set would cost one round trip per matching row.
-            //
-            // `SCAN_BATCH` caps it either way: the remainder is caller-supplied,
-            // and one round trip's memory must not be.
+            // With no pattern every row SQL returns is a match, so reading past the
+            // remainder would be discarded. With a pattern the batch must exceed the
+            // remainder, or a page over a sparse match set costs one round trip per
+            // matching row. `SCAN_BATCH` caps it either way: the remainder is
+            // caller-supplied, and one round trip's memory must not be.
             let batch_size = if pattern.is_some() {
                 SCAN_BATCH
             } else {
@@ -414,10 +433,9 @@ impl EntityRepo {
 /// Test a stored identifier against a pattern, treating an unparsable stored
 /// identifier as a non-match.
 ///
-/// Nothing writes an invalid identifier — admission parses every candidate before
-/// it reaches the table — so this arm is unreachable through the write path. It
-/// stays because the alternative is failing a whole discovery page on one bad row,
-/// and a row that cannot be parsed cannot be claimed to match either.
+/// Admission parses every candidate before it reaches the table, so that arm is
+/// unreachable through the write path. It stays because the alternative is failing a
+/// whole discovery page on one bad row.
 fn matches_pattern(gts_id: &str, pattern: Option<&GtsIdPattern>) -> bool {
     let Some(pattern) = pattern else {
         return true;
@@ -428,16 +446,13 @@ fn matches_pattern(gts_id: &str, pattern: Option<&GtsIdPattern>) -> bool {
 /// The literal prefix a pattern's matches must all share, or `None` when the
 /// pattern constrains nothing usable.
 ///
-/// The rule is: cut at the first wildcard, then **drop the final segment**. The
-/// second step is what makes the range safe rather than merely narrow. A pattern
-/// segment matches with minor-version flexibility — `…type.v1~` also matches
-/// `…type.v1.0~` — so a range built from the full literal string would exclude
-/// `…type.v1.0~`, whose bytes do not start with `…type.v1~`. Dropping the final
-/// segment removes exactly the part that flexibility can vary.
-///
-/// The cost is a wider range and therefore some rows the pattern rejects. That is
-/// the right direction: over-admitting costs a comparison, under-admitting loses a
-/// real match silently.
+/// Cut at the first wildcard, then **drop the final segment**. The second step is
+/// what makes the range safe rather than merely narrow: a pattern segment matches
+/// with minor-version flexibility — `…type.v1~` also matches `…type.v1.0~`, whose
+/// bytes do not start with `…type.v1~` — and dropping the final segment removes
+/// exactly the part that flexibility can vary. The cost is some rows the pattern
+/// then rejects, which is the right direction: over-admitting costs a comparison,
+/// under-admitting loses a real match silently.
 fn prefilter_prefix(pattern: &GtsIdPattern) -> Option<String> {
     let raw = pattern.pattern();
     let head = raw.split('*').next().unwrap_or_default();

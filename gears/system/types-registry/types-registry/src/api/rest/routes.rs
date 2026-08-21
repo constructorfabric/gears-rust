@@ -14,20 +14,11 @@ use super::dto::{
     RegisterEntitiesRequest, RegisterEntitiesResponse, SubmitEntitiesRequest,
 };
 use super::handlers;
+pub use super::paths::{V1, V2};
 use crate::domain::registry_service::RegistryService;
 use crate::domain::service::TypesRegistryService;
 
 const API_TAG: &str = "Types Registry";
-
-/// Base path of the pre-database contract. `main`'s routes, unchanged, served
-/// from the in-memory service until T24 deletes them with their repository.
-pub const V1: &str = "/types-registry/v1";
-
-/// Base path of the database-backed async surface. Interim by design: T24a
-/// promotes these operations onto [`V1`] once the in-memory path is gone, so P0
-/// ends on one version (P12). Route paths are built from these two constants and
-/// nowhere else — the promotion is then a constant change, not a sweep.
-pub const V2: &str = "/types-registry/v2";
 
 struct License;
 
@@ -49,22 +40,22 @@ pub fn register_routes(
 ) -> Router {
     // ponytail: ceiling C8 — every P0 operation is platform-plane (`plane = 1`),
     // but the plane is expressed by the contract and the data, **not enforced by
-    // the transport**. An in-process gear has no inbound platform-identity
+    // the transport**: an in-process gear has no inbound platform-identity
     // validator, api-gateway has no platform listener, and `OperationBuilder`
-    // cannot mark a route platform-only. So these routes keep the authentication
-    // they have; `.anonymous()` is deliberately **not** used, because without a
-    // platform identity to replace the current gate it would be a regression
-    // rather than a step toward one. The upgrade path is a platform listener
-    // with `X-ToolKit-Internal-Token` / `PlatformIdentity` plus a declarative
-    // route marker — both toolkit/api-gateway work outside this gear
+    // cannot mark a route platform-only. Mutation routes therefore stay
+    // internal-only (`exposed = false`) until a platform listener can authenticate
+    // a platform principal and a PDP decision is enforced before dispatch.
+    // `.anonymous()` is deliberately **not** used — without a platform identity to
+    // replace the current gate it would be a regression. The upgrade path is a
+    // platform listener with `X-ToolKit-Internal-Token` / `PlatformIdentity` plus a
+    // declarative route marker: toolkit/api-gateway work outside this gear
     // (SPEC §9 C8, §8.4).
     //
-    // The v2 routes below are **internal-only** (no `.exposed()`): the gateway
-    // does not publish them, because v2 is an interim surface until T24a
-    // promotes it onto `V1`. They still register in the `OpenAPI` document —
-    // `exposed` gates gateway visibility, not spec inclusion — so the contract
-    // check sees them. T24a restores `.exposed()` together with the `V2` → `V1`
-    // constant change.
+    // The v2 routes below are internal-only for a second reason too: v2 is an
+    // interim surface until T24a promotes it onto `V1`. They still register in the
+    // `OpenAPI` document — `exposed` gates gateway visibility, not spec inclusion —
+    // so the contract check sees them. T24a changes the path constant only; it must
+    // not expose mutation routes while ceiling C8 remains open.
 
     // -----------------------------------------------------------------------
     // v1 — the pre-database contract, unchanged from `main`
@@ -96,6 +87,9 @@ pub fn register_routes(
             "Registration results",
         )
         .standard_errors(openapi)
+        .error_413(openapi)
+        .error_415(openapi)
+        .error_422(openapi)
         .register(router, openapi);
 
     // GET /types-registry/v1/entities - List GTS entities
@@ -146,8 +140,9 @@ pub fn register_routes(
     // -----------------------------------------------------------------------
     //
     // Interim: T24a promotes these onto v1 once the in-memory path is deleted.
-    // Internal-only until then — no `.exposed()`, so the gateway does not
-    // publish the interim surface (see the ceiling-C8 note above).
+    // They are internal-only — no `.exposed()`, so the gateway does not publish
+    // the surface (see the ceiling-C8 note above). The path promotion does not
+    // change that posture for mutations.
 
     // POST /types-registry/v2/entities — submit a registration (D10)
     //
@@ -203,6 +198,9 @@ pub fn register_routes(
             "The Idempotency-Key is bound to a different request",
         )
         .standard_errors(openapi)
+        .error_413(openapi)
+        .error_415(openapi)
+        .error_422(openapi)
         // `require_registry` answers 503 where no database is bound
         // (`no-db.yaml`, `--mock`): declared, not merely enforced.
         .error_503(openapi)

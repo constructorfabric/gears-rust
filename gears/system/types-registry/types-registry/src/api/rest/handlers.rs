@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Extension, OriginalUri, Path, Query};
+use axum::extract::{Extension, OriginalUri};
 use axum::http::{HeaderMap, HeaderValue, header};
 use toolkit::api::canonical_prelude::*;
+use toolkit::api::rest::extract;
 use uuid::Uuid;
 
 use super::dto::{
@@ -13,7 +14,7 @@ use super::dto::{
     OperationDto, RegisterEntitiesRequest, RegisterEntitiesResponse, RegisterResultDto,
     RegisterSummaryDto, SubmitEntitiesRequest,
 };
-use super::routes::V2;
+use super::paths::V2;
 use crate::domain::admission::{Candidate, SubmitRequest};
 use crate::domain::enums::OperationKind;
 use crate::domain::error::DomainError;
@@ -27,7 +28,7 @@ use crate::domain::service::TypesRegistryService;
 /// However, REST API is blocked until service is ready.
 pub async fn register_entities(
     Extension(service): Extension<Arc<TypesRegistryService>>,
-    Json(req): Json<RegisterEntitiesRequest>,
+    extract::Json(req): extract::Json<RegisterEntitiesRequest>,
 ) -> ApiResult<(StatusCode, Json<RegisterEntitiesResponse>)> {
     if !service.is_ready() {
         return Err(DomainError::NotInReadyMode.into());
@@ -71,7 +72,7 @@ pub async fn register_entities(
 /// List GTS entities with optional filtering.
 pub async fn list_entities(
     Extension(service): Extension<Arc<TypesRegistryService>>,
-    Query(query): Query<ListEntitiesQuery>,
+    extract::Query(query): extract::Query<ListEntitiesQuery>,
 ) -> ApiResult<Json<ListEntitiesResponse>> {
     if !service.is_ready() {
         return Err(DomainError::NotInReadyMode.into());
@@ -95,7 +96,7 @@ pub async fn list_entities(
 /// Get a single GTS entity by its identifier.
 pub async fn get_entity(
     Extension(service): Extension<Arc<TypesRegistryService>>,
-    Path(gts_id): Path<String>,
+    extract::Path(gts_id): extract::Path<String>,
 ) -> ApiResult<Json<GtsEntityDto>> {
     if !service.is_ready() {
         return Err(DomainError::NotInReadyMode.into());
@@ -110,15 +111,12 @@ pub async fn get_entity(
 // The database-backed platform-plane handlers (T9)
 // ---------------------------------------------------------------------------
 //
-// Mapping steps only. Every one of these reads a request, calls exactly one
-// domain method, and maps the result — no policy, no limit, no existence check
-// and no vocabulary decision lives here, which is what makes a future
-// `api/grpc` adapter able to reuse the same domain surface (SPEC §8.4).
+// Mapping steps only. Every one of these reads a request, calls exactly one domain
+// method, and maps the result — no policy, no limit, no existence check and no
+// vocabulary decision lives here, which is what lets a future `api/grpc` adapter
+// reuse the same domain surface (SPEC §8.4).
 //
-// The handlers above this line are the pre-database path T27 deletes. The boundary
-// is a section banner and nothing else: it used to be a second `use` block, which
-// read like a module seam inside one file, and a reader cannot tell a seam from an
-// oversight.
+// The handlers above this line are the pre-database path T27 deletes.
 
 /// Advisory only: how long a client should wait before its first poll. The
 /// operation may well be terminal sooner — while admission is inline (T21) it
@@ -140,7 +138,7 @@ pub async fn submit_entities(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    Json(req): Json<SubmitEntitiesRequest>,
+    extract::Json(req): extract::Json<SubmitEntitiesRequest>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<OperationAcceptedDto>)> {
     let service = require_registry(service)?;
     // Absent and unusable are kept apart. An absent header is the domain's refusal
@@ -207,12 +205,10 @@ pub async fn submit_entities(
         );
     }
 
-    // The status comes from the receipt, not from a second read. `submit` already
-    // knows it: `pending` when the operation is queued, `completed` once inline
-    // admission has run — which is why reporting a constant `pending` here would be
-    // wrong, and why the read this replaced existed at all. What the read also cost
-    // was a snapshot transaction over two statements and a `"pending"` fallback for
-    // an operation that had just been committed and so cannot be absent.
+    // The status comes from the receipt, not from a second read: `submit` already
+    // knows it — `pending` when the operation is queued, `completed` once inline
+    // admission has run — so a constant `pending` here would be wrong and a re-read
+    // would cost a snapshot transaction over two statements.
     Ok((
         status,
         out,
@@ -229,19 +225,16 @@ pub async fn submit_entities(
 ///
 /// **Not the gear-relative constant.** api-gateway mounts every gear under
 /// `prefix_path` with `Router::nest`, so a hardcoded
-/// `/types-registry/v2/operations/{id}` is a `404` for any client that follows it:
+/// `/types-registry/v2/operations/{id}` is a `404` for any client that follows it —
 /// RFC 9110 §10.2.2 resolves `Location` against the effective request URI, and an
-/// absolute-path reference discards the prefix. Measured on a live server, not
-/// reasoned about — see the Checkpoint 1 report §8.1.
-///
-/// [`OriginalUri`] rather than `Uri` for the same reason: `nest` rewrites the URI
-/// the inner handler sees, stripping exactly the prefix that has to survive here.
+/// absolute-path reference discards the prefix (measured on a live server; see the
+/// Checkpoint 1 report §8.1). [`OriginalUri`] rather than `Uri` for the same
+/// reason: `nest` strips exactly the prefix that has to survive here.
 ///
 /// The receipt is a **sibling** of the submit path — `…/v1/entities` answers with
-/// `…/v1/operations/{id}` — so the last segment is replaced rather than appended to.
-/// If the route is ever mounted somewhere that does not end in `/entities`, the
-/// gear-relative path is the fallback: a wrong prefix is better than a path with two
-/// resources in it.
+/// `…/v1/operations/{id}` — so the last segment is replaced, not appended to. If the
+/// route is ever mounted somewhere not ending in `/entities`, the gear-relative path
+/// is the fallback: a wrong prefix beats a path with two resources in it.
 fn operation_location(request_path: &str, operation_id: Uuid) -> String {
     let trimmed = request_path.trim_end_matches('/');
     match trimmed.strip_suffix("/entities") {
@@ -253,7 +246,7 @@ fn operation_location(request_path: &str, operation_id: Uuid) -> String {
 /// `GET /types-registry/v2/operations/{operation_id}`
 pub async fn get_operation(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
-    Path(operation_id): Path<Uuid>,
+    extract::Path(operation_id): extract::Path<Uuid>,
 ) -> ApiResult<Json<OperationDto>> {
     let service = require_registry(service)?;
     let record = service
@@ -270,7 +263,7 @@ pub async fn get_operation(
 /// domain's classification, not this handler's.
 pub async fn get_entity_by_key(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
-    Path(key): Path<String>,
+    extract::Path(key): extract::Path<String>,
 ) -> ApiResult<Json<EntityDto>> {
     let service = require_registry(service)?;
     let parsed = EntityKey::parse(&key);
@@ -326,7 +319,7 @@ mod tests {
         // Service is not ready yet
 
         let query = ListEntitiesQuery::default();
-        let result = list_entities(Extension(service), Query(query)).await;
+        let result = list_entities(Extension(service), extract::Query(query)).await;
         assert!(result.is_err());
     }
 
@@ -350,7 +343,7 @@ mod tests {
         service.switch_to_ready().unwrap();
 
         let query = ListEntitiesQuery::default();
-        let result = list_entities(Extension(service), Query(query)).await;
+        let result = list_entities(Extension(service), extract::Query(query)).await;
         assert!(result.is_ok());
 
         let Json(response) = result.unwrap();

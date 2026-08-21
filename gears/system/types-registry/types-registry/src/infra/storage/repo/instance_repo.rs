@@ -15,7 +15,7 @@ use crate::domain::ports::{
 use crate::infra::storage::entity::{instance, instance_revision};
 
 /// Half of [`super::IN_CHUNK`]: each pair binds two parameters rather than one.
-const PAIR_CHUNK: usize = 100;
+const PAIR_CHUNK: usize = IN_CHUNK.checked_div(2).expect("pair width is non-zero");
 
 /// One current-state row as the domain names it. By reference, unlike
 /// `type_schema_repo`'s counterpart: every field is `Copy`.

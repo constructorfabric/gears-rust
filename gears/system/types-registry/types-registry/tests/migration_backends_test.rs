@@ -1,22 +1,21 @@
 //! Real up/down of the P0 initial migration on `PostgreSQL` and `MySQL`.
 //!
 //! `SQLite` is covered unconditionally by `migration_test.rs`; the other two
-//! dialects — identity columns, `bytea` / `VARBINARY`, `COLLATE "C"` /
-//! `ascii_bin`, `DATETIME(6)`, FK `RESTRICT`, and `MySQL`'s inline `KEY`
-//! declarations — cannot be reached from `SQLite` at all. Each test spins up a
-//! container, applies the migration, asserts the nine tables answer, checks the
-//! two CHECK constraints the task names by hand, and rolls back.
+//! dialects — identity columns, `bytea` / `VARBINARY`, `COLLATE "C"` / `ascii_bin`,
+//! `DATETIME(6)`, FK `RESTRICT`, and `MySQL`'s inline `KEY` declarations — cannot be
+//! reached from `SQLite` at all. Each test spins up a container, applies the
+//! migration, asserts the nine tables answer, checks the two CHECK constraints by
+//! hand, and rolls back.
+//!
+//! `constraint-multi-backend` makes this a correctness requirement: the CHECK
+//! expressions lower differently on each engine (`NOT dry_run` over `TINYINT(1)`
+//! versus a real `boolean`), so `SQLite`-only evidence does not carry.
 //!
 //! Gated behind `--features integration` because it needs a Docker daemon:
 //!
 //! ```text
 //! cargo test -p cf-gears-types-registry --features integration --test migration_backends_test
 //! ```
-//!
-//! `constraint-multi-backend` makes this a correctness requirement, not a
-//! nice-to-have: the CHECK expressions lower differently on each engine
-//! (`NOT dry_run` over `TINYINT(1)` versus a real `boolean`), so
-//! `SQLite`-only evidence does not carry.
 
 #![cfg(feature = "integration")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
@@ -229,9 +228,14 @@ async fn migration_applies_and_rolls_back_on_postgres() {
         .get_host_port_ipv4(5432)
         .await
         .expect("postgres port");
-    wait_for_tcp("127.0.0.1", port, Duration::from_mins(1)).await;
+    let host = container
+        .get_host()
+        .await
+        .expect("postgres container host")
+        .to_string();
+    wait_for_tcp(host.trim_matches(['[', ']']), port, Duration::from_mins(1)).await;
 
-    let db = Database::connect(format!("postgres://user:pass@127.0.0.1:{port}/app"))
+    let db = Database::connect(format!("postgres://user:pass@{host}:{port}/app"))
         .await
         .expect("connect postgres");
 
@@ -263,9 +267,14 @@ async fn migration_applies_and_rolls_back_on_mysql() {
         .get_host_port_ipv4(3306)
         .await
         .expect("mysql port");
-    wait_for_tcp("127.0.0.1", port, Duration::from_mins(2)).await;
+    let host = container
+        .get_host()
+        .await
+        .expect("mysql container host")
+        .to_string();
+    wait_for_tcp(host.trim_matches(['[', ']']), port, Duration::from_mins(2)).await;
 
-    let db = Database::connect(format!("mysql://root@127.0.0.1:{port}/test"))
+    let db = Database::connect(format!("mysql://root@{host}:{port}/test"))
         .await
         .expect("connect mysql");
 

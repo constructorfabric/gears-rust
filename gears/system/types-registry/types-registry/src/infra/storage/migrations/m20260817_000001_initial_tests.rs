@@ -161,8 +161,12 @@ fn boolean_columns_are_domain_constrained_where_the_backend_has_no_boolean() {
         !pg.contains("_bool CHECK"),
         "postgres needs no boolean-domain CHECK"
     );
-    assert_eq!(pg.matches("boolean      NOT NULL").count(), 2);
-    assert_eq!(pg.matches("boolean       NOT NULL").count(), 1);
+    let normalized = pg.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        normalized.matches("boolean NOT NULL").count(),
+        3,
+        "Postgres must retain the three non-null boolean columns regardless of alignment"
+    );
 }
 
 /// The composite FK is what keeps an item's copied `kind` / `dry_run` in step
@@ -183,9 +187,24 @@ fn every_backend_carries_the_composite_operation_item_foreign_key() {
 }
 
 #[test]
-fn unsupported_backend_is_rejected_rather_than_guessed() {
+fn unsupported_backend_diagnostic_names_the_supported_set() {
     let err = super::unsupported_backend(sea_orm::DatabaseBackend::Postgres);
     assert!(format!("{err}").contains("Postgres, SQLite and MySQL only"));
+}
+
+#[test]
+fn each_supported_backend_dispatches_to_its_own_statement_list() {
+    for (backend, expected) in [
+        (sea_orm::DatabaseBackend::Postgres, PG_UP_STATEMENTS),
+        (sea_orm::DatabaseBackend::Sqlite, SQLITE_UP_STATEMENTS),
+        (sea_orm::DatabaseBackend::MySql, MYSQL_UP_STATEMENTS),
+    ] {
+        let got = super::up_statements(backend).expect("supported backend");
+        assert_eq!(
+            got, expected,
+            "{backend:?} resolved to the wrong statement list"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,8 +214,7 @@ fn unsupported_backend_is_rejected_rather_than_guessed() {
 /// Constraint names that legitimately exist on some backends and not others, each
 /// with the dialect reason. Anything asymmetric that is *not* in this table is drift.
 ///
-/// Three families, and each one is a substitution rather than a difference in what
-/// the schema means:
+/// Three families, each a substitution rather than a difference in meaning:
 ///
 /// * `*_uuid_len` — `SQLite` only. It is typeless, so a `length(x) = 16` CHECK is
 ///   what stands in for `uuid` / `BINARY(16)`.

@@ -42,16 +42,15 @@ impl TypeSchemaRepo {
     /// `type_schema` for the `(entity_id, revision_no)` pairs, then exactly those
     /// pairs from `type_schema_revision`.
     ///
-    /// The second read is a disjunction of **exact pairs**, not
-    /// `entity_id IN (…)`. The revision table is history, so a plain `IN` would
-    /// return every revision ever admitted for these entities and leave the caller
-    /// to pick the current one — reading, on a long-lived entity, arbitrarily more
-    /// than the closure needs.
+    /// The second read is a disjunction of **exact pairs**, not `entity_id IN (…)`:
+    /// the revision table is history, so a plain `IN` would return every revision
+    /// ever admitted — on a long-lived entity, arbitrarily more than the closure
+    /// needs.
     ///
     /// An entity with no `type_schema` row is simply **absent** from the result
-    /// rather than an error. That is the honest shape here: a registered Instance
-    /// has no row in this table by construction — its current pointer lives in
-    /// `instance` (T10) — and only the caller knows whether an absence is a fault.
+    /// rather than an error: a registered Instance has no row in this table by
+    /// construction (its current pointer lives in `instance`, T10), and only the
+    /// caller knows whether an absence is a fault.
     ///
     /// # Errors
     /// Propagates the scoped query's failure.

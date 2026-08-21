@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, de};
 
 use crate::domain::policy::{PolicyConfigError, RegistrationPolicy};
 use crate::infra::cache::{CacheConfig, DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_TTL};
+pub use crate::policy_config::PolicyEntry;
 
 /// Configuration for the Types Registry gear.
 #[derive(Debug, Clone, Deserialize)]
@@ -82,10 +83,9 @@ pub struct Limits {
     /// Largest resolved document the registry will materialize (§3.2).
     ///
     /// **Accepted, not enforced in P0.** Its place is D3's materialization
-    /// (`domain::artifacts::materialize`), which has no configuration in scope —
-    /// evaluation is reached through `worker::run_operation`, and threading the
-    /// limits there is T14's change (see [`Self::activation_write_set`]). Also the
-    /// figure T30's SDK cache sizes its byte bound against.
+    /// (`domain::artifacts::materialize`), which has no configuration in scope;
+    /// threading the limits through `worker::run_operation` is T14's change. Also
+    /// the figure T30's SDK cache sizes its byte bound against.
     pub resolved_document: ByteSize,
     /// Largest reference-resolution closure one candidate may need.
     ///
@@ -137,28 +137,6 @@ impl Default for Limits {
             page_size_max: 1000,
         }
     }
-}
-
-/// One registration-policy entry: either or both parameters (DESIGN §3.2).
-///
-/// Both are `Option` because *omitting* a parameter is meaningful and distinct
-/// from setting it closed: a matching entry that omits one is **skipped** for
-/// that parameter, and a less-specific entry may still supply it. Collapsing
-/// the absent case onto `[]` / `false` would make a narrow entry silently close
-/// what a broader one opened.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct PolicyEntry {
-    /// Vendors admitted in the candidate's **last** identifier segment. `["*"]`
-    /// admits any vendor. The selected set *replaces* a less-specific one.
-    pub allowed_vendors: Option<Vec<String>>,
-    /// Whether an entity in this region may be tenant-owned.
-    ///
-    /// Parsed and validated, **inert in P0**: SPEC §9 fixes every row to
-    /// `ownership_scope = 1`, so nothing can be tenant-owned in the first place.
-    /// Kept rather than rejected because a P1-ready deployment carries it, and
-    /// rejecting a valid configuration would fail a boot for no reason.
-    pub tenant_ownable: Option<bool>,
 }
 
 /// Admission-worker tuning.
@@ -391,19 +369,16 @@ impl TypesRegistryConfig {
     /// The keys this deployment moved off their default that P0 accepts **without
     /// enforcing**, ready to be named in one boot-time line.
     ///
-    /// Not a validation failure, deliberately: a P1-ready configuration legitimately
-    /// carries every one of them, and failing a boot over a key that the next task
-    /// honours would be worse than useless. But an operator who writes
-    /// `activation_write_set: 1024` and silently gets the hardcoded 512 has no way to
-    /// find that out from the outside, and *that* is the defect — not the missing
-    /// enforcement, which is scheduled. Each name here matches the field's docstring,
-    /// which says which task binds it.
+    /// Not a validation failure: a P1-ready configuration legitimately carries every
+    /// one of them. But an operator who writes `activation_write_set: 1024` and
+    /// silently gets the hardcoded 512 has no way to find that out — that is the
+    /// defect, not the missing enforcement, which is scheduled. Each field's
+    /// docstring says which task binds it.
     ///
     /// Comparison is against the default rather than against presence, because
-    /// `#[serde(default)]` erases the difference: a key written with its default value
-    /// is indistinguishable from an absent one by the time this sees it. That errs
-    /// towards silence — setting `resolution_closure: 64` explicitly gets no warning —
-    /// which is the right direction, since that deployment gets what it asked for.
+    /// `#[serde(default)]` erases the difference. That errs towards silence — an
+    /// explicit `resolution_closure: 64` gets no warning — which is the right
+    /// direction, since that deployment gets what it asked for.
     #[must_use]
     pub fn inert_limit_keys(&self) -> Vec<&'static str> {
         let limits = Limits::default();

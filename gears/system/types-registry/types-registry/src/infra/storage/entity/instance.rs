@@ -15,12 +15,10 @@ use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 
-// ponytail: ceiling C6 — no PDP, as on `entity`. This table carries no owner
-// column of its own: ownership is a property of the entity it hangs off, reached
-// through `entity_id`. `unrestricted` is therefore the only honest marker today,
-// and the P1 upgrade is a join-free copy of the owner onto this row *or* a
-// scoped read of the parent — that choice belongs with the `PolicyEnforcer` work,
-// not here (SPEC §9 C6, §12).
+// ponytail: ceiling C6 — no PDP, as on `entity`. This table has no owner column:
+// ownership is the parent entity's, reached through `entity_id`, so `unrestricted`
+// is the only honest marker today. The P1 upgrade — copy the owner onto this row or
+// scope-read the parent — belongs with the `PolicyEnforcer` work (SPEC §9 C6, §12).
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "types_registry__instance")]
 #[secure(unrestricted)]

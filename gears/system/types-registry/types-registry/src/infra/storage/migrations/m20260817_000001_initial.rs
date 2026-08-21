@@ -37,45 +37,35 @@
 //!
 //! Five points that are decisions rather than mechanics:
 //!
-//! * **`uuid` lowers to 16 raw bytes, not to the 36-character text form.**
-//!   This is dictated by the driver, not chosen for compactness. `sqlx` encodes
-//!   `Uuid` as `self.as_bytes()` on both backends — `impl Type<MySql> for Uuid`
-//!   delegates to `<&[u8]>` and the `SQLite` one reports `DataType::Blob` — and
-//!   `sea-query` binds `Value::Uuid` straight through. A `CHAR(36)` column
-//!   therefore receives binary and `MySQL` refuses it outright with
-//!   `1366 Incorrect string value`; `SQLite` accepts it silently because it is
-//!   dynamically typed, storing a blob in a column declared `TEXT`. Declaring
-//!   `BINARY(16)` / `BLOB` describes what is actually stored, and needs no
-//!   per-column Rust type: the entities keep `Uuid`.
-//!
-//!   `SQLite` gets a `length(x) = 16` CHECK on every uuid column
-//!   (`ck_tr_*_uuid_len`) because a declared `BLOB` there constrains nothing —
-//!   the CHECK is what rejects a 36-character text uuid arriving from raw SQL
-//!   outside the ORM. `MySQL` needs none: `BINARY(16)` is fixed-width and
-//!   enforced by the type. `PostgreSQL` keeps its native `uuid`, which `sqlx`
-//!   binds natively.
+//! * **`uuid` lowers to 16 raw bytes, not the 36-character text form** — dictated
+//!   by the driver. `sqlx` encodes `Uuid` as `self.as_bytes()` on both backends and
+//!   `sea-query` binds `Value::Uuid` straight through, so a `CHAR(36)` column
+//!   receives binary: `MySQL` refuses it with `1366 Incorrect string value`, and
+//!   `SQLite`, being dynamically typed, silently stores a blob in a `TEXT` column.
+//!   `BINARY(16)` / `BLOB` describes what is actually stored and needs no
+//!   per-column Rust type — the entities keep `Uuid`. `SQLite` also gets a
+//!   `length(x) = 16` CHECK (`ck_tr_*_uuid_len`), because a declared `BLOB`
+//!   constrains nothing there and raw SQL outside the ORM could still write text.
+//!   `MySQL` needs none (fixed-width type); `PostgreSQL` keeps native `uuid`.
 //! * **Identifier columns** (`entity.gts_id`, `version_family.family_key`,
 //!   `operation_item.gts_id`) get binary collation on every backend, because
-//!   pattern and derivation prefix ranges compile to explicit range bounds and
-//!   must be exact. `SQLite`'s TEXT default *is* `BINARY`; it is stated anyway
-//!   so a future `COLLATE NOCASE` cannot creep in unnoticed. `MySQL` also gets
-//!   an ASCII charset, which keeps `uq_tr_entity_gts_id` inside `InnoDB`'s
-//!   3072-byte key limit — exact, because the GTS grammar is ASCII-only.
+//!   pattern and derivation prefix ranges compile to explicit range bounds and must
+//!   be exact. `SQLite`'s TEXT default *is* `BINARY`, stated anyway so a future
+//!   `COLLATE NOCASE` cannot creep in. `MySQL` also gets an ASCII charset, keeping
+//!   `uq_tr_entity_gts_id` inside `InnoDB`'s 3072-byte key limit — exact, because
+//!   the GTS grammar is ASCII-only.
 //! * **`MySQL` uses `DATETIME(6)`, not `TIMESTAMP(6)`.** With
-//!   `explicit_defaults_for_timestamp` off, the first `TIMESTAMP` column of a
-//!   table silently acquires `DEFAULT CURRENT_TIMESTAMP ON UPDATE
-//!   CURRENT_TIMESTAMP`, which would rewrite `created_at` on every update.
-//!   `DATETIME` has no such implicit clause. Both store the UTC instant the
-//!   application supplies.
+//!   `explicit_defaults_for_timestamp` off, a table's first `TIMESTAMP` column
+//!   silently acquires `DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`,
+//!   which would rewrite `created_at` on every update.
 //! * **The boolean-domain CHECKs on `SQLite` / `MySQL` are not additions to
-//!   `database.sql`.** Neither backend has a boolean type, so `IN (0, 1)`
-//!   reproduces what Postgres's `boolean` already guarantees. Without it
-//!   `dry_run = 7` would store, and `NOT dry_run` would then read as false
-//!   inside `ck_tr_operation_item_state`.
-//! * **`MySQL` declares its indexes inline** as `KEY` clauses instead of
-//!   separate `CREATE INDEX` statements. `MySQL` has no `CREATE INDEX IF NOT
-//!   EXISTS` and its DDL is not transactional, so an inline declaration is the
-//!   only form covered by the table's own `IF NOT EXISTS`.
+//!   `database.sql`**: neither backend has a boolean type, so `IN (0, 1)`
+//!   reproduces what Postgres's `boolean` guarantees. Without it `dry_run = 7`
+//!   would store and `NOT dry_run` read as false inside
+//!   `ck_tr_operation_item_state`.
+//! * **`MySQL` declares its indexes inline** as `KEY` clauses. It has no
+//!   `CREATE INDEX IF NOT EXISTS` and its DDL is not transactional, so an inline
+//!   declaration is the only form covered by the table's own `IF NOT EXISTS`.
 //!
 //! No other CHECK, UNIQUE, PK, FK or index is added or dropped: the constraint
 //! set is `database.sql`'s, one for one.
@@ -220,6 +210,7 @@ const PG_UP_STATEMENTS: &[&str] = &[
                 AND result_revision_no IS NULL
                 AND result_resource_version IS NULL
                 AND error_payload IS NOT NULL
+                AND started_at IS NOT NULL
                 AND completed_at IS NOT NULL)
         )
     )",
@@ -527,6 +518,7 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
                 AND result_revision_no IS NULL
                 AND result_resource_version IS NULL
                 AND error_payload IS NOT NULL
+                AND started_at IS NOT NULL
                 AND completed_at IS NOT NULL)
         )
     )",
@@ -831,6 +823,7 @@ const MYSQL_UP_STATEMENTS: &[&str] = &[
                 AND result_revision_no IS NULL
                 AND result_resource_version IS NULL
                 AND error_payload IS NOT NULL
+                AND started_at IS NOT NULL
                 AND completed_at IS NOT NULL)
         )
     )",

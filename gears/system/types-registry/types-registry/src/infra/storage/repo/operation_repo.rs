@@ -12,12 +12,16 @@ use toolkit_db::secure::{
 };
 use uuid::Uuid;
 
-use super::IN_CHUNK;
 use crate::domain::admission::Precondition;
 use crate::domain::admission::fingerprint::{RequestFingerprint, ScopeHash};
 use crate::domain::ports::{NewOperation, NewOperationItem, OperationItemRow, OperationRow};
 use crate::infra::storage::entity::enums::{OperationItemStatus, OperationStatus};
 use crate::infra::storage::entity::{operation, operation_item};
+
+/// The multi-row insert budget for `operation_item`, where every row binds 14
+/// columns rather than the one parameter per row that `IN_CHUNK`'s
+/// `SQLITE_MAX_VARIABLE_NUMBER = 999` reasoning budgets for: 70 × 14 = 980.
+const ITEM_INSERT_CHUNK: usize = 70;
 
 /// One stored operation as the domain names it. See `entity_repo::row` for why the
 /// mapper sits beside the repository rather than on the entity.
@@ -118,17 +122,16 @@ impl OperationRepo {
 
     /// Insert an accepted operation.
     ///
-    /// A duplicate `(idempotency_scope_hash, idempotency_key)` surfaces as a
-    /// unique violation, which the caller reads as the serialization point between
-    /// two concurrent acceptances rather than as a fault — the same protocol
-    /// [`VersionFamilyRepo::create_or_get`] uses, and for the same reason: the
-    /// constraint is the only thing that can decide a race this layer cannot lock.
+    /// A duplicate `(idempotency_scope_hash, idempotency_key)` surfaces as a unique
+    /// violation, which the caller reads as the serialization point between two
+    /// concurrent acceptances rather than as a fault — the same protocol
+    /// [`VersionFamilyRepo::create_or_get`] uses, and for the same reason.
     ///
-    /// ponytail: ceiling C5 — there is no operation-retention sweep in P0, so
-    /// terminal operations accumulate here. Rows are small and bounded by request
-    /// volume rather than by entity count. Upgrade path: the DESIGN §3.2 sweep,
-    /// which deletes a completed operation only when no revision pins any of its
-    /// items — `idx_tr_operation_status` exists for exactly that query.
+    /// ponytail: ceiling C5 — no operation-retention sweep in P0, so terminal
+    /// operations accumulate here; rows are small and bounded by request volume.
+    /// Upgrade path: the DESIGN §3.2 sweep, which deletes a completed operation only
+    /// when no revision pins any of its items — `idx_tr_operation_status` exists for
+    /// exactly that query.
     ///
     /// # Errors
     /// Propagates the insert's failure, including the unique violation above.
@@ -188,7 +191,7 @@ impl OperationRepo {
                 ..Default::default()
             })
             .collect();
-        for chunk in rows.chunks(IN_CHUNK) {
+        for chunk in rows.chunks(ITEM_INSERT_CHUNK) {
             operation_item::Entity::insert_many(chunk.to_vec())
                 .secure()
                 // `operation_item` carries no security dimension of its own: an
@@ -368,10 +371,9 @@ impl OperationRepo {
 ///
 /// The status half is the guard: an item's outcome is written once and stands
 /// (`database.sql`). Two passes over one operation can overlap — at-least-once
-/// delivery (T21), or a retry under the same `Idempotency-Key` arriving while the
-/// first pass is still admitting — and filtering on `id` alone let the loser
-/// overwrite a `succeeded` item with `failed`. Both writers now report `false`
-/// instead, which is what their callers act on.
+/// delivery (T21), or a retry under the same `Idempotency-Key` arriving mid-flight —
+/// and filtering on `id` alone would let the loser overwrite a `succeeded` item with
+/// `failed`. Both writers report `false` instead.
 fn non_terminal(item_id: i64) -> Condition {
     Condition::all()
         .add(operation_item::Column::Id.eq(item_id))

@@ -6,14 +6,13 @@
 //! Two primitives are worth reading the tests for:
 //!
 //! * **The list read never translates GTS matching into SQL.** SQL narrows by a
-//!   prefix range over `gts_id` — exact, because the column has binary collation
-//!   on every backend — and `GtsId::matches_pattern` then decides. Translating
-//!   the pattern grammar into SQL would be a local approximation of GTS
-//!   semantics, which `constraint-gts-implementation` forbids outright.
-//! * **The closure walks direct edges iteratively, not with a recursive CTE.** A
-//!   CTE cannot be expressed through the typed builder, and raw SQL outside
-//!   migrations is forbidden by `11_database_patterns.md`, so the worklist is the
-//!   only shape available here (SPEC D5).
+//!   prefix range over `gts_id` — exact, because the column has binary collation on
+//!   every backend — and `GtsId::matches_pattern` decides. Translating the pattern
+//!   grammar into SQL would be the local approximation of GTS semantics that
+//!   `constraint-gts-implementation` forbids.
+//! * **The closure walks direct edges iteratively, not with a recursive CTE.** A CTE
+//!   cannot be expressed through the typed builder, and `11_database_patterns.md`
+//!   forbids raw SQL outside migrations (SPEC D5).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -28,7 +27,7 @@ use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::gts_id;
 use uuid::Uuid;
 
-use common::{allow_all, test_db, test_db_file};
+use common::{TestDir, allow_all, test_db, test_db_file};
 use types_registry::domain::enums::{DependencyKind, EntityKind, LifecycleStatus, OwnershipScope};
 use types_registry::domain::ports::NewEntity;
 use types_registry::infra::storage::repo::{
@@ -139,9 +138,8 @@ async fn family_create_or_get_creates_once_then_reads() {
 /// state, which is what the constraint promises.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_family_creation_yields_exactly_one_row() {
-    let dir = std::env::temp_dir().join(format!("tr-repo-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let db = test_db_file(&dir.join("families.db")).await;
+    let dir = TestDir::new("tr-repo");
+    let db = test_db_file(&dir.path().join("families.db")).await;
 
     let mut handles = Vec::new();
     for _ in 0..8 {
@@ -161,10 +159,17 @@ async fn concurrent_family_creation_yields_exactly_one_row() {
                 .await
                 {
                     Ok(result) => return result,
-                    Err(e) if format!("{e}").to_lowercase().contains("locked") => {
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    Err(e) => {
+                        // Both contention spellings: `SQLITE_LOCKED` renders
+                        // "table is locked", `SQLITE_BUSY` may render "busy"
+                        // depending on the driver and the statement.
+                        let text = format!("{e}").to_lowercase();
+                        if text.contains("locked") || text.contains("busy") {
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        } else {
+                            panic!("create_or_get failed: {e}");
+                        }
                     }
-                    Err(e) => panic!("create_or_get failed: {e}"),
                 }
             }
             panic!("gave up waiting for the SQLite write lock");
@@ -186,7 +191,6 @@ async fn concurrent_family_creation_yields_exactly_one_row() {
         ids.windows(2).all(|w| w[0] == w[1]),
         "every caller must agree on the family row: {ids:?}"
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -482,19 +486,17 @@ async fn a_row_inserted_mid_traversal_neither_duplicates_nor_hides() {
     );
 }
 
-/// The list read must never load the whole match set to slice it in memory. That
-/// is a claim about work, not about results, so it needs a fixture where the two
-/// differ: a range full of rows the pattern rejects, with the single match sorted
-/// last.
+/// The list read must never load the whole match set to slice it in memory. That is
+/// a claim about work, not results, so the fixture makes the two differ: a range
+/// full of rows the pattern rejects, with the single match sorted last.
 ///
-/// A read that materialised the range would return the match on the first page.
-/// A bounded scan cannot, and says so with `has_more` — so the observable
-/// signature of boundedness is *at least one page that found nothing and asked to
-/// be called again*, followed by the match arriving exactly once.
+/// A read that materialised the range would return the match on the first page; a
+/// bounded scan cannot, and says so with `has_more`. So the observable signature is
+/// *at least one page that found nothing and asked to be called again*, then the
+/// match arriving exactly once.
 ///
-/// `v9~` sorts after every `v2xxx~` in byte order (`'9' > '2'`), which is what
-/// puts the match beyond the first scan. The decoy count only has to exceed the
-/// scan budget; the loop below does not depend on its value.
+/// `v9~` sorts after every `v2xxx~` in byte order (`'9' > '2'`), which puts the
+/// match beyond the first scan. The decoy count only has to exceed the scan budget.
 #[tokio::test]
 async fn a_page_over_a_sparse_pattern_stays_bounded_and_still_progresses() {
     const MATCH: &str = gts_id!("acme.crm.customer.type.v9~");
@@ -523,6 +525,7 @@ async fn a_page_over_a_sparse_pattern_stays_bounded_and_still_progresses() {
     let pattern = GtsIdPattern::try_new(MATCH).expect("pattern");
     let mut found: Vec<String> = Vec::new();
     let mut empty_pages = 0;
+    let mut completed = false;
     let mut request = PageRequest::first(10);
     for _ in 0..64 {
         let page = EntityRepo::list_page(&conn, &allow_all(), Some(&pattern), request)
@@ -533,11 +536,16 @@ async fn a_page_over_a_sparse_pattern_stays_bounded_and_still_progresses() {
         }
         found.extend(page.items.iter().map(|m| m.gts_id.clone()));
         if !page.has_more {
+            completed = true;
             break;
         }
         request = PageRequest::after(page.next_after.expect("cursor when more remains"), 10);
     }
 
+    assert!(
+        completed,
+        "the bounded page walk exhausted its 64-request test budget"
+    );
     assert!(
         empty_pages > 0,
         "a bounded scan must return at least one page that found nothing; a read \
@@ -646,6 +654,32 @@ async fn closure_reports_candidates_that_have_no_entity_row() {
     assert_eq!(
         closure.missing_roots,
         vec![gts_id!("acme.crm.brand.new.v1~")]
+    );
+}
+
+/// The closure bound applies to roots resolved before the first dependency hop.
+/// A large independent root set must not bypass it merely because no edge is
+/// discovered and the worklist loop exits immediately.
+#[tokio::test]
+async fn closure_rejects_more_than_512_resolved_roots_before_the_first_hop() {
+    let db = test_db().await;
+    let roots: Vec<String> = (0..513)
+        .map(|i| format!("gts.acme.crm.bound{i:03}.type.v1~"))
+        .collect();
+    let root_refs: Vec<&str> = roots.iter().map(String::as_str).collect();
+    seed(&db, &root_refs).await;
+
+    let conn = db.conn().expect("conn");
+    let err = DependencyRepo::closure(&conn, &allow_all(), &roots)
+        .await
+        .expect_err("513 resolved roots must exceed the store-build bound");
+    assert!(
+        matches!(
+            err,
+            toolkit_db::secure::ScopeError::Invalid(message)
+                if message.contains("512-entity store-build bound")
+        ),
+        "unexpected closure error: {err}"
     );
 }
 

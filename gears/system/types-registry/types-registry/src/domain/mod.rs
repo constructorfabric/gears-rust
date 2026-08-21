@@ -1,13 +1,9 @@
 //! Domain layer for the Types Registry gear.
 //!
-//! Contains business logic, error types, and repository traits.
-//!
 //! # Two paths live here at once, and three pairs of names collide
 //!
 //! P0 builds a database-backed path beside the pre-P0 in-memory one and cuts over
-//! at T24–T30, so until then both are present. The sections below are marked
-//! because the two halves picked confusingly close names, and they sort next to
-//! each other:
+//! at T24–T30, so until then both are present under confusingly close names:
 //!
 //! | new (keep) | legacy (goes at T24–T30) | what the pair is |
 //! |---|---|---|
@@ -18,11 +14,9 @@
 //! # One concept per file until a concept earns a directory
 //!
 //! [`admission`] is a directory because the operation pipeline has six modules.
-//! Everything else is one file per concept and stays that way until it has a
-//! second — `family` at T12, `dependency` at T13/T14, `compat` at T17/T18. The
-//! grouping axis is the concept (which is also the table in `database.sql`), never
-//! "these are all pure functions": `docs/p0/todo.md` carries the table of triggers
-//! and why a `rules/`-style bucket was rejected.
+//! The grouping axis is the concept — which is also the table in `database.sql` —
+//! never "these are all pure functions"; `docs/p0/todo.md` records why a
+//! `rules/`-style bucket was rejected.
 
 // ---------------------------------------------------------------------------
 // The database-backed path (P0)
@@ -55,15 +49,12 @@ pub mod error;
 // LEGACY — the pre-P0 in-memory path, deleted at T24-T30
 // ---------------------------------------------------------------------------
 //
-// `repo` is `GtsRepository`, whose `switch_to_ready` is the ready-mode split T24
-// removes along with `InMemoryGtsRepository`. `service` is the old
-// `TypesRegistryService` over that trait. `model` is the old `GtsEntity` /
-// `ListQuery` / `SegmentMatchScope`, which go with `TypesRegistryClient` at T26
-// (D6) and the cache retyping at T30.
+// `repo`/`GtsRepository` (with `InMemoryGtsRepository` and the `switch_to_ready`
+// ready-mode split) goes at T24; `service` with it; `model` follows
+// `TypesRegistryClient` at T26 (D6) and the cache retyping at T30.
 //
-// Nothing new should reference these three. A read that needs the database goes
-// through `ports`; a transport that needs the domain goes through
-// `registry_service`.
+// Nothing new should reference these three: a read that needs the database goes
+// through `ports`, a transport that needs the domain through `registry_service`.
 
 pub mod model;
 pub mod repo;

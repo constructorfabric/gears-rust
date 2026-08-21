@@ -2849,13 +2849,6 @@
             "format": "int64",
             "type": "integer"
           },
-          "revision_no": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "updated_at": {
             "format": "date-time",
             "type": "string"
@@ -5405,26 +5398,11 @@
           "error": {
             "description": "The structured refusal reason, when this candidate failed."
           },
-          "expected_resource_version": {
-            "description": "Absent when the request required the identifier to be absent.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "gts_id": {
             "type": "string"
           },
           "resource_version": {
             "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "revision_no": {
-            "format": "int32",
             "type": [
               "integer",
               "null"
@@ -9501,6 +9479,7 @@
             "items": {
               "$ref": "#/components/schemas/SubmitEntityDto"
             },
+            "minItems": 1,
             "type": "array"
           }
         },
@@ -30242,6 +30221,36 @@
             },
             "description": "Conflict"
           },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Payload Too Large"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
           "429": {
             "content": {
               "application/problem+json": {
@@ -30843,6 +30852,36 @@
               }
             },
             "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Payload Too Large"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
           },
           "429": {
             "content": {

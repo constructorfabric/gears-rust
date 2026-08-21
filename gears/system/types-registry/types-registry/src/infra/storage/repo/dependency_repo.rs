@@ -113,18 +113,15 @@ impl DependencyRepo {
     /// # The worklist is seeded from the identifier, not only from the edge table
     ///
     /// Each root contributes its whole `GtsId::chain_ids()` — every prefix of its
-    /// `~`-chain — before the edge walk starts (T10). This is not a shortcut for
-    /// T13's edges; it is a **different relation** that needs no table at all.
-    /// A derivation base is a pure function of the identifier: `base~derived~`
-    /// consumes `base~` by being named that way, and an Instance `base~thing.v1`
-    /// conforms to `base~` the same way. Nothing writes a `dependency` row for
-    /// either, and nothing should — the identifier already carries it, and a stored
-    /// edge could disagree with the name.
-    ///
-    /// Without this seed, `validate_schema` on a derived candidate and
-    /// `validate_instance` on any Instance would both fail with a missing base,
-    /// because the edge table is empty until T13. T13 adds what is *genuinely*
-    /// edge-derived: `$ref` and `x-gts-ref` targets, which no identifier implies.
+    /// `~`-chain — before the edge walk starts (T10). That is a **different
+    /// relation**, not a shortcut for T13's edges: a derivation base is a pure
+    /// function of the identifier (`base~derived~` consumes `base~` by being named
+    /// so, and an Instance `base~thing.v1` conforms to `base~` likewise). Nothing
+    /// writes a `dependency` row for either, and nothing should — a stored edge
+    /// could disagree with the name. Without the seed, `validate_schema` on a
+    /// derived candidate and `validate_instance` on any Instance would fail with a
+    /// missing base. T13 adds what is *genuinely* edge-derived: `$ref` and
+    /// `x-gts-ref` targets, which no identifier implies.
     ///
     /// Candidates with no entity row are reported in
     /// [`DependencyClosure::missing_roots`] rather than failing the read, because a
@@ -165,6 +162,12 @@ impl DependencyRepo {
         let mut frontier: Vec<i64> = seen.iter().copied().collect();
         let mut by_id: HashMap<i64, EntityRow> = resolved.into_iter().map(|r| (r.id, r)).collect();
 
+        // The bound covers the seeded roots too, not only what the walk adds: a
+        // batch of chained identifiers can already exceed it before the first
+        // hop, and a first hop that discovers nothing new would break the loop
+        // before the guard below ever runs.
+        Self::ensure_within_bound(roots, by_id.len(), 0)?;
+
         while !frontier.is_empty() {
             let discovered = Self::direct_dependencies(runner, scope, &frontier).await?;
             let fresh: Vec<i64> = discovered
@@ -174,19 +177,7 @@ impl DependencyRepo {
             if fresh.is_empty() {
                 break;
             }
-            if by_id.len() + fresh.len() > CLOSURE_BOUND {
-                tracing::warn!(
-                    roots = ?roots,
-                    closure_bound = CLOSURE_BOUND,
-                    resolved_entities = by_id.len(),
-                    newly_discovered = fresh.len(),
-                    "types_registry dependency closure exceeded its safety bound"
-                );
-                return Err(ScopeError::Invalid(
-                    "dependency closure exceeds the 512-entity store-build bound; see the \
-                     structured warning for roots and reached size",
-                ));
-            }
+            Self::ensure_within_bound(roots, by_id.len(), fresh.len())?;
             for row in EntityRepo::find_by_ids(runner, scope, &fresh).await? {
                 by_id.insert(row.id, row);
             }
@@ -199,5 +190,36 @@ impl DependencyRepo {
             entities,
             missing_roots,
         })
+    }
+
+    /// Refuse a closure that has exceeded or would exceed [`CLOSURE_BOUND`].
+    ///
+    /// Called once over the seeded roots (`newly_discovered = 0`) and once per
+    /// hop over the entities that hop adds; the structured warning names the
+    /// roots and the reached size so the operator can tell a cyclic graph from
+    /// an oversized batch.
+    ///
+    /// # Errors
+    /// [`ScopeError::Invalid`] when `resolved_entities + newly_discovered`
+    /// exceeds the bound.
+    fn ensure_within_bound(
+        roots: &[String],
+        resolved_entities: usize,
+        newly_discovered: usize,
+    ) -> Result<(), ScopeError> {
+        if resolved_entities + newly_discovered > CLOSURE_BOUND {
+            tracing::warn!(
+                roots = ?roots,
+                closure_bound = CLOSURE_BOUND,
+                resolved_entities,
+                newly_discovered,
+                "types_registry dependency closure exceeded its safety bound"
+            );
+            return Err(ScopeError::Invalid(
+                "dependency closure exceeds the 512-entity store-build bound; see the \
+                 structured warning for roots and reached size",
+            ));
+        }
+        Ok(())
     }
 }

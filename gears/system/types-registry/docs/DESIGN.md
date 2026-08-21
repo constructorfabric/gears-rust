@@ -690,7 +690,7 @@ These regions do not ship open because `~*` matches both Instances and derived t
 
 Policy gates declared creation: absent `expected_resource_version` means creation; present means revision. Revisions and deletions bypass policy, so closing a region blocks new entities without freezing existing ones. Correcting an accidental opening requires deletion and ADR-0013 purge. Policy is not stored on revisions (§3.8).
 
-**The bypass is conditional on the claim being verified, not on the claim.** `expected_resource_version` is what the caller *says*; the entity's existence is what makes it true. The gate may only be skipped where the commit transaction enforces the precondition — creation requires the identifier absent, a revision requires the stored `resource_version` to match — so that a candidate whose identifier does not exist is refused rather than committed as a creation the gate never saw. Without that pairing, naming a version is enough to register inside a closed region, which is a control bypass and not a cosmetic gap: until the precondition lands, acceptance refuses a positive `expected_resource_version` outright and the gate stays unconditional.
+**The bypass is conditional on the claim being verified, not on the claim.** `expected_resource_version` is what the caller *says*; the entity's existence is what makes it true. The gate may only be skipped where the commit transaction enforces the precondition — creation requires the identifier absent, a revision requires the stored `resource_version` to match — so that a candidate whose identifier does not exist is refused rather than committed as a creation the gate never saw. Without that pairing, naming a version is enough to register inside a closed region, which is a control bypass and not a cosmetic gap: until the precondition lands, acceptance refuses a positive `expected_resource_version` on a *registration* candidate outright and the gate stays unconditional; deletion, which is exempt from the gate and always names a positive version, is unaffected.
 
 A policy refusal is a configuration error returned before the PDP. It names the failed region and parameter, differs from invalid identifier and denied grant, and reveals no existence state.
 
@@ -1538,6 +1538,8 @@ That gives three read operations with three different completeness contracts:
 They remain separate because filters cannot carry per-key validators, page absence is not a key answer, and their failure/completeness rules differ.
 
 Exact reads return deleted entities as deleted/unavailable rather than conflating them with never-issued IDs; discovery and expansion exclude them. Their `content` and derived documents remain readable because live gear-owned data may still conform under `cpt-cf-types-registry-fr-lifecycle` and `cpt-cf-types-registry-principle-contract-not-object`.
+
+`lifecycle_status: DELETED` is mandatory exact-read metadata, outside `$select` — like the freshness validator below. A projection that names only `content` still carries the deleted status on a deleted entity, because a caller selecting documents must be able to distinguish a retired contract from an identifier that never existed; stripping it would make the two responses identical.
 
 Authorization runs first, then visibility, so a denial is uniform and out-of-scope remains indistinguishable from absent.
 

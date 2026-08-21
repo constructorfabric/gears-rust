@@ -232,9 +232,11 @@ Two NFRs about two different sides of the wire were treated as one.
 
 So P0 builds DESIGN's cache minus what needs absent inputs: bounded store, freshness window,
 `fresh` bypass, invalidation on an observed terminal outcome, dual identifier/UUID indexing,
-and DESIGN's list of what is never cached. Deferred with tenancy: batched conditional
-revalidation against freshness validators, and the projection / visibility / Context-Tenant
-key dimensions. Recorded as ceiling **C7** rather than left implicit.
+and DESIGN's list of what is never cached. Batched conditional revalidation against freshness
+validators was first deferred here with tenancy, but P9 moves it into P0 once the validator
+inputs are shown to be platform-plane computable. Deferred with tenancy, then, are only the
+projection / visibility / Context-Tenant key dimensions. Recorded as ceiling **C7** rather
+than left implicit.
 
 Two things this changes beyond the decision:
 
@@ -453,7 +455,7 @@ per phase it is cheap enough to actually run. The exposure is bounded — phases
 to four tasks each.
 
 **The per-task standing bar had to move with it.** `todo.md` required *"`make ci` green"* of every
-task, and `make ci` ends in `dylint` (`Makefile:907`) — so the old bar cancelled this decision on
+task, and `make ci` ends in `dylint` — so the old bar cancelled this decision on
 the line above it, which is why T1–T9 each recorded `make ci` as *partial*. The bar is now
 `make fmt`, `make clippy` and gear tests per task; the full `make ci` — `dylint`, `deny`,
 `lychee`, `gts-docs` and four container targets — is a checkpoint gate. Bare `make ci` lines are
@@ -463,7 +465,7 @@ documentation tasks) that check stayed and only `ci` went.
 **And `make test-db` was never the right command for this gear.** It runs `cf-gears-toolkit-db`'s
 own suite and never builds `cf-gears-types-registry` — a task could satisfy that line without
 executing one line of the gear, which T2, T4, T5, T7 and T8 each noticed separately. The two
-container suites now have a target of their own, `make test-types-registry-db` (`Makefile:516`),
+container suites now have a target of their own, `make test-types-registry-db`,
 in `make ci` beside `test-users-info-pg` and `test-usage-collector-pg`. `todo.md`'s Commands
 section is the single definition; the tasks say *gear tests* and point at it.
 
@@ -626,8 +628,10 @@ e2e file was edited.** An Instance registers against a Type Schema committed by 
 operation, and a derived Type Schema admits against a committed base with the `dependency` table
 empty (T10, P13). Consumers are untouched: the old trait is still served from its existing in-memory
 repository, while the new path reads from the database and holds no store between admissions
-(P6). `make test-db` green on three backends, and `make dylint` re-run after T9a and T10 — the
-recorded run covers T1–T9 only (P13). This checkpoint proves the architecture.
+(P6). The plain gear tests are green on SQLite,
+`make test-types-registry-db` is green on PostgreSQL and MySQL, and `make dylint` is re-run
+after T9a and T10 — the recorded run covers T1–T9 only (P13). This checkpoint proves the
+architecture.
 
 **Checkpoint 2** — equal content reports `unchanged` without a revision;
 a stale `expected_resource_version` fails `precondition_failed`; family shape and contiguity
@@ -653,7 +657,7 @@ the platform boots; the old trait is gone and no consumer references it. The SDK
 is in place on the new models, with its window, byte bound and `fresh` bypass (P7) — P0 does
 not finish with an uncached read path. **One REST version: no `/v2/` path survives, and the
 in-memory repository and its routes are gone (T24a, P12).** All 15 success criteria of SPEC §16;
-`make ci`, `make test-db`, `make e2e-local`, `make dylint` green.
+`make ci`, `make test-types-registry-db`, `make e2e-local`, `make dylint` green.
 
 ## Risks and mitigations
 
@@ -670,7 +674,7 @@ in-memory repository and its routes are gone (T24a, P12).** All 15 success crite
 | A materialized `effective_*` value differs from the deleted client-side computation | Medium — reads as a regression, invites a "fix" back to the old wrong answer | 12 call sites in `account-management`, `resource-group`, `credstore` consume those methods today. The old ones resolved only the parent `$ref` and approximated trait defaults (`TODO(#1723)`), so `gts-rust` is authoritative; T25/T26 carry an explicit criterion to accept the new value, and SPEC §13 pins the outside-the-chain `$ref` case as a test |
 | Content-free discovery turns one-step list reads into list + `batchGet` at ~87 call sites | Medium | The SDK helpers hydrate internally, so call shapes survive (P10); the client cache absorbs the second trip; T23 fixes the helper shape before T25/T26 touch a consumer |
 | `GET /entities` shape change reaches e2e alongside the `POST` break | Medium | Both are the same migration in T28, behind the one shared helper it already owns; the route's declared stability is `unstable`. Under P12 both arrive at the same moment by construction: T24 deletes old v1, T24a promotes the whole async surface at once |
-| Concurrency protocol wrong under the least-tested backend (MySQL) | Medium | `make test-db` on all three at every checkpoint |
+| Concurrency protocol wrong under the least-tested backend (MySQL) | Medium | Plain gear tests on SQLite plus `make test-types-registry-db` on PostgreSQL/MySQL at every checkpoint |
 | The `POST /entities` 202 break reaches other gears' e2e suites | Medium | Confirmed surface: 6 types-registry e2e files (~95 references to `/entities`) plus `account_management/conftest.py` and — **missed until P12** — `oagw/helpers.py`, which registers a batch of schemas *and* instances and reads them back through the list route. T28 owns the migration behind one shared polling helper, not open-coded loops. The break itself no longer arrives at T9: T9a keeps v1 intact, so the suite goes red at T24 and green at T28 rather than being red for ~19 tasks |
 | Activation write set exceeds the measured 27 in a future deployment | Low | Configured bound 512, refuses rather than partially commits (T14) |
 

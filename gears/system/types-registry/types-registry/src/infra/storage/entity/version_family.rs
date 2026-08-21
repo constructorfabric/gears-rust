@@ -16,20 +16,9 @@ use uuid::Uuid;
 
 use super::enums::OwnershipScope;
 
-// ponytail: ceiling C6 — no PDP. P0 reads and writes are authenticated but not
-// authorized, which deviates from `06_authn_authz_secure_orm.md`'s "every sensitive
-// DB access MUST be covered by a PDP decision". `unrestricted` is chosen here
-// rather than `tenant_col = "owner_tenant_id"` because P0 never populates tenant
-// scope: every row carries `ownership_scope = 1` and a NULL owner, so a
-// tenant-scoped predicate would match nothing and `unrestricted` states that
-// intent instead of faking a dimension. It fails closed either way — a
-// tenant-scoped query against a tenant-scoped entity with an empty scope yields
-// `WHERE 1=0`.
-//
-// Upgrade path, and the reason the column exists already: switch this attribute
-// to `#[secure(tenant_col = "owner_tenant_id", ...)]` and add the
-// `PolicyEnforcer` calls once the identity-to-permission binding lands (SPEC §9
-// C6, §12). The DDL needs no migration for that step.
+// ponytail: ceiling C6 — no PDP. `unrestricted` for the reason given in full on
+// `entity`: P0 never populates tenant scope, so a `tenant_col = "owner_tenant_id"`
+// predicate would match nothing. Same upgrade path, and no DDL migration for it.
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "types_registry__version_family")]
 #[secure(unrestricted)]

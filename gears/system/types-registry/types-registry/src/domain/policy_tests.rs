@@ -132,13 +132,9 @@ fn the_documented_policy_matrix_behaves_as_specified() {
     }
 }
 
-/// The third row of the matrix is the one that needs the exact-key rule: an
-/// exact entry governs **only** the base, while `…~*` governs the subtree.
-///
-/// This is not expressible through `GtsIdPattern` — a bare identifier is an
-/// implicit derived-type coverage envelope, so `…v1~` and `…v1~*` accept the
-/// same set. Compiling an exact key to a pattern would make it close the whole
-/// subtree, which is what this test pins.
+/// The third row of the matrix is the one that needs the exact-key rule: an exact
+/// entry governs **only** the base, while `…~*` governs the subtree. Not expressible
+/// through `GtsIdPattern` — see the header of `domain/policy.rs`.
 #[test]
 fn an_exact_key_governs_only_the_base_not_its_subtree() {
     let p = policy(vec![
@@ -362,6 +358,21 @@ fn a_blank_vendor_token_is_rejected() {
     }
 }
 
+/// Configuration whitespace is not part of a vendor token. Normalize it once
+/// at compile time so the exact admission comparison cannot silently turn an
+/// otherwise valid entry into a region that matches nothing.
+#[test]
+fn vendor_tokens_are_trimmed_when_the_policy_is_compiled() {
+    let p = policy(vec![(gts_id!("acme.*"), vendors(&["  acme\t"]))]);
+    let (region, allowed) = p
+        .allowed_vendors(&id(ACME_OWN))
+        .expect("the configured region must resolve");
+
+    assert_eq!(region, gts_id!("acme.*"));
+    assert_eq!(allowed, ["acme"]);
+    assert!(p.admits(&id(ACME_OWN), OwnershipScope::Global).is_ok());
+}
+
 /// An empty vendor list is *not* an error: it is how the matrix keeps a base type
 /// closed while its subtree is open.
 #[test]
@@ -374,12 +385,11 @@ fn an_empty_vendor_list_compiles_and_closes_the_region() {
     assert_eq!(refusal.region.as_deref(), Some(gts_id!("acme.*")));
 }
 
-/// The evidence for the exact-key rule, asserted against `gts-rust` directly
-/// rather than taken on trust: a **bare** identifier used as a pattern accepts
-/// its derivations too (GTS spec §3.6 implicit derived-type coverage). If exact
-/// keys were compiled to patterns, `gts.cf.core.rg.type.v1~` would therefore
-/// close its whole subtree — and, being exact, would outrank the `…~*` entry
-/// that opens it.
+/// The evidence for the exact-key rule, asserted against `gts-rust` directly rather
+/// than taken on trust: a **bare** identifier used as a pattern accepts its
+/// derivations too (GTS spec §3.6 implicit derived-type coverage). Compiled to a
+/// pattern, `gts.cf.core.rg.type.v1~` would close its whole subtree — and, being
+/// exact, outrank the `…~*` entry that opens it.
 #[test]
 fn a_bare_identifier_used_as_a_pattern_covers_its_derivations() {
     let pattern = gts::GtsIdPattern::try_new(RG_BASE).expect("a bare identifier is a pattern");

@@ -20,7 +20,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use toolkit::api::OpenApiRegistry;
-use toolkit_gts::gts_id;
+use toolkit_gts::{gts_id, gts_uri};
 use tower::ServiceExt;
 
 use types_registry::api::rest::routes::{V1, V2};
@@ -37,10 +37,15 @@ use common::{stores, test_db};
 const CF_TYPE: &str = gts_id!("cf.core.example.type.v1~");
 /// An Instance of [`CF_TYPE`]: a full five-token last segment with no trailing `~`.
 const CF_INSTANCE: &str = gts_id!("cf.core.example.type.v1~cf.core.example.first.v1");
+const INVALID_ARGUMENT_TYPE: &str =
+    gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~");
+const HTTP_REQUEST_RESOURCE_TYPE: &str = gts_id!("cf.core.http.request.v1~");
 
 /// One parameter as the generated document will carry it: name, location, and
 /// whether it is required.
 type DeclaredParam = (String, String, bool);
+/// One response as the generated document will carry it: status and content type.
+type DeclaredResponse = (u16, String);
 
 /// Records what `register_routes` declares, so the generated document is
 /// assertable instead of eyeballed in `/cf/docs`.
@@ -50,6 +55,10 @@ struct TestOpenApi {
     operations: std::sync::Mutex<Vec<(String, String, String)>>,
     /// `operation_id -> [(param name, location, required)]`.
     params: std::sync::Mutex<Vec<(String, Vec<DeclaredParam>)>>,
+    /// `operation_id -> [(status, content type)]`.
+    responses: std::sync::Mutex<Vec<(String, Vec<DeclaredResponse>)>>,
+    /// `operation_id -> gateway visibility`.
+    exposure: std::sync::Mutex<Vec<(String, bool)>>,
 }
 
 impl OpenApiRegistry for TestOpenApi {
@@ -66,6 +75,17 @@ impl OpenApiRegistry for TestOpenApi {
                 .map(|p| (p.name.clone(), format!("{:?}", p.location), p.required))
                 .collect(),
         ));
+        self.responses.lock().expect("responses lock").push((
+            spec.operation_id.clone().unwrap_or_default(),
+            spec.responses
+                .iter()
+                .map(|r| (r.status, r.content_type.to_owned()))
+                .collect(),
+        ));
+        self.exposure
+            .lock()
+            .expect("exposure lock")
+            .push((spec.operation_id.clone().unwrap_or_default(), spec.exposed));
     }
     fn ensure_schema_raw(
         &self,
@@ -84,6 +104,16 @@ impl OpenApiRegistry for TestOpenApi {
 
 /// A router with both services wired, as `register_rest` builds it.
 async fn router_with_db() -> Router {
+    router_with(false).await
+}
+
+/// The same router with the legacy service ready, so v1 answers instead of refusing
+/// on `is_ready()`.
+async fn router_with_v1_ready() -> Router {
+    router_with(true).await
+}
+
+async fn router_with(v1_ready: bool) -> Router {
     let db = test_db().await;
     let openapi = TestOpenApi::default();
     let config = TypesRegistryConfig::default();
@@ -91,6 +121,9 @@ async fn router_with_db() -> Router {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config.clone(),
     ));
+    if v1_ready {
+        legacy.switch_to_ready().expect("switch legacy to ready");
+    }
     let dispatch: Arc<dyn OperationDispatch> = Arc::new(NullDispatch);
     let registry = Arc::new(RegistryService::new(
         db.db(),
@@ -99,34 +132,6 @@ async fn router_with_db() -> Router {
         config,
         dispatch,
         // Admission inline, as `init()` wires it until T21.
-        AdmissionMode::Inline,
-    ));
-    types_registry::api::rest::routes::register_routes(
-        Router::new(),
-        &openapi,
-        legacy,
-        Some(registry),
-    )
-}
-
-/// The same router with the legacy service ready, so v1 answers instead of refusing
-/// on `is_ready()`.
-async fn router_with_v1_ready() -> Router {
-    let db = test_db().await;
-    let openapi = TestOpenApi::default();
-    let config = TypesRegistryConfig::default();
-    let legacy = Arc::new(TypesRegistryService::new(
-        Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
-        config.clone(),
-    ));
-    legacy.switch_to_ready().expect("switch legacy to ready");
-    let dispatch: Arc<dyn OperationDispatch> = Arc::new(NullDispatch);
-    let registry = Arc::new(RegistryService::new(
-        db.db(),
-        stores(),
-        RegistrationPolicy::default(),
-        config,
-        dispatch,
         AdmissionMode::Inline,
     ));
     types_registry::api::rest::routes::register_routes(
@@ -161,6 +166,7 @@ fn schema(gts_id: &str) -> Value {
 
 struct Response {
     status: StatusCode,
+    content_type: Option<String>,
     location: Option<String>,
     retry_after: Option<String>,
     idempotency_replayed: Option<String>,
@@ -170,6 +176,11 @@ struct Response {
 async fn call(router: &Router, req: Request<Body>) -> Response {
     let resp = router.clone().oneshot(req).await.expect("router dispatch");
     let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let location = resp
         .headers()
         .get(axum::http::header::LOCATION)
@@ -196,10 +207,53 @@ async fn call(router: &Router, req: Request<Body>) -> Response {
     };
     Response {
         status,
+        content_type,
         location,
         retry_after,
         idempotency_replayed,
         body,
+    }
+}
+
+fn assert_invalid_argument_rejection(
+    response: &Response,
+    expected_status: StatusCode,
+    expected_field: &str,
+    expected_reason: &str,
+) {
+    assert_eq!(response.status, expected_status, "got: {:?}", response.body);
+    assert_eq!(
+        response.content_type.as_deref(),
+        Some("application/problem+json"),
+    );
+    assert_eq!(response.body["type"], json!(INVALID_ARGUMENT_TYPE));
+    assert_eq!(response.body["title"], json!("Invalid Argument"));
+    assert_eq!(response.body["status"], json!(expected_status.as_u16()));
+    assert_eq!(response.body["detail"], json!("Request validation failed"));
+    assert_eq!(
+        response.body["context"]["resource_type"],
+        json!(HTTP_REQUEST_RESOURCE_TYPE),
+    );
+
+    let violations = response.body["context"]["field_violations"]
+        .as_array()
+        .expect("field_violations is an array");
+    assert_eq!(violations.len(), 1, "got: {:?}", response.body);
+    assert_eq!(violations[0]["field"], json!(expected_field));
+    assert_eq!(violations[0]["reason"], json!(expected_reason));
+    assert!(
+        violations[0]["description"]
+            .as_str()
+            .is_some_and(|description| !description.is_empty()),
+        "the rejection carries a public description: {:?}",
+        response.body,
+    );
+    for forbidden in ["stack", "trace", "backtrace"] {
+        assert!(
+            response.body.get(forbidden).is_none(),
+            "the Problem must not expose `{forbidden}`: {:?}",
+            response.body,
+        );
     }
 }
 
@@ -230,6 +284,57 @@ fn get(uri: &str) -> Request<Body> {
 
 fn one_candidate(gts_id: &str) -> Value {
     json!({ "items": [{ "gts_id": gts_id, "content": schema(gts_id) }] })
+}
+
+// ---------------------------------------------------------------------------
+// Canonical extractor rejections
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn malformed_submission_json_is_a_canonical_invalid_argument() {
+    let router = router_with_db().await;
+    let request = Request::post(format!("{V2}/entities"))
+        .header("content-type", "application/json")
+        .header("idempotency-key", "malformed-json")
+        .body(Body::from("{not-json}"))
+        .expect("request");
+
+    let response = call(&router, request).await;
+
+    assert_invalid_argument_rejection(
+        &response,
+        StatusCode::BAD_REQUEST,
+        "body",
+        "json_syntax_error",
+    );
+}
+
+#[tokio::test]
+async fn invalid_list_query_is_a_canonical_invalid_argument() {
+    let router = router_with_v1_ready().await;
+
+    let response = call(&router, get(&format!("{V1}/entities?is_schema=not-a-bool"))).await;
+
+    assert_invalid_argument_rejection(
+        &response,
+        StatusCode::BAD_REQUEST,
+        "query",
+        "invalid_query_string",
+    );
+}
+
+#[tokio::test]
+async fn invalid_operation_uuid_is_a_canonical_invalid_argument() {
+    let router = router_with_db().await;
+
+    let response = call(&router, get(&format!("{V2}/operations/not-a-uuid"))).await;
+
+    assert_invalid_argument_rejection(
+        &response,
+        StatusCode::BAD_REQUEST,
+        "path",
+        "invalid_path_params",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -272,10 +377,13 @@ async fn a_registration_is_accepted_polled_and_read_back() {
     assert_eq!(item["gts_id"], json!(CF_TYPE));
     assert_eq!(item["status"], json!("succeeded"));
     assert_eq!(item["resource_version"], json!(1));
-    assert_eq!(item["revision_no"], json!(1));
     assert!(
-        item["expected_resource_version"].is_null(),
-        "must-not-exist is spelled as an absent field on the wire, not as 0",
+        item.get("expected_resource_version").is_none(),
+        "the operation outcome must not echo the request precondition",
+    );
+    assert!(
+        item.get("revision_no").is_none(),
+        "the operation outcome must expose resource_version, not an internal revision number",
     );
 
     let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
@@ -293,14 +401,12 @@ async fn a_registration_is_accepted_polled_and_read_back() {
 /// An Instance reads back with its authored value, exactly as a Type Schema reads
 /// back with its document.
 ///
-/// The read path was built when only Type Schemas existed (T9) and kept asking the
-/// Type Schema store alone after T10 added Instances, so an admitted Instance
-/// answered `200` with `content: null` and `revision_no: null` — the operation
-/// reported `succeeded` and the value was unreachable through the API.
+/// Regression: the read path once asked the Type Schema store alone, so an admitted
+/// Instance answered `200` with `content: null` while its operation said `succeeded`.
 ///
 /// The three `effective_*` artifacts stay absent, and that is the contract rather
 /// than the same gap: an Instance has no derived state (T10 — its value is authored
-/// and its schema revision is immutable), so there is nothing to materialize.
+/// and its schema revision immutable), so there is nothing to materialize.
 #[tokio::test]
 async fn an_instance_reads_back_with_its_authored_value() {
     let router = router_with_db().await;
@@ -324,7 +430,7 @@ async fn an_instance_reads_back_with_its_authored_value() {
         .expect("operation_id");
     let operation = call(&router, get(&format!("{V2}/operations/{operation_id}"))).await;
     assert_eq!(operation.body["items"][0]["status"], json!("succeeded"));
-    assert_eq!(operation.body["items"][0]["revision_no"], json!(1));
+    assert!(operation.body["items"][0].get("revision_no").is_none());
 
     let entity = call(&router, get(&format!("{V2}/entities/{CF_INSTANCE}"))).await;
     assert_eq!(entity.status, StatusCode::OK);
@@ -336,10 +442,9 @@ async fn an_instance_reads_back_with_its_authored_value() {
         entity.body["content"], value,
         "the authored value, byte for byte what was submitted",
     );
-    assert_eq!(
-        entity.body["revision_no"],
-        json!(1),
-        "the current revision the value came from",
+    assert!(
+        entity.body.get("revision_no").is_none(),
+        "the immutable content revision remains internal; writes use resource_version",
     );
     assert!(
         entity.body["resolved_schema"].is_null()
@@ -444,12 +549,11 @@ async fn a_different_request_under_one_key_is_a_conflict_problem() {
 /// how every gear is actually mounted (`api-gateway` nests the router under
 /// `prefix_path`, `/cf` in `quickstart.yaml`).
 ///
-/// The gear-relative constant this replaced was a `404` for any client that took the
-/// receipt at its word: RFC 9110 §10.2.2 resolves `Location` against the effective
-/// request URI, and an absolute-path reference discards the prefix. `nest` also
-/// rewrites the URI the handler sees, which is why the path comes from `OriginalUri`
-/// and not from `Uri` — with `Uri` this test fails exactly as the hardcoded string
-/// did.
+/// A gear-relative constant would be a `404` for any client that took the receipt at
+/// its word: RFC 9110 §10.2.2 resolves `Location` against the effective request URI,
+/// and an absolute-path reference discards the prefix. `nest` also rewrites the URI
+/// the handler sees, which is why the path comes from `OriginalUri` — with `Uri` this
+/// test fails exactly as the hardcoded string does.
 #[tokio::test]
 async fn the_receipt_is_followable_under_a_gateway_prefix() {
     let prefixed = Router::new().nest("/cf", router_with_db().await);
@@ -865,11 +969,11 @@ fn both_versions_are_declared_with_distinct_operation_ids() {
 
     let mut ids: Vec<&str> = declared.iter().map(|(_, _, id)| id.as_str()).collect();
     ids.sort_unstable();
-    let unique = ids.len();
+    let total = ids.len();
     ids.dedup();
     assert_eq!(
         ids.len(),
-        unique,
+        total,
         "duplicate operation id among {declared:?}"
     );
 
@@ -912,6 +1016,34 @@ fn both_versions_are_declared_with_distinct_operation_ids() {
     assert_eq!(actual, expected);
 }
 
+/// Ceiling C8's fail-closed fallback is executable: until a platform listener
+/// authenticates and authorizes mutations, neither registration spelling may
+/// be published through api-gateway.
+#[test]
+fn mutation_routes_are_internal_only() {
+    let openapi = TestOpenApi::default();
+    let config = TypesRegistryConfig::default();
+    let legacy = Arc::new(TypesRegistryService::new(
+        Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
+        config,
+    ));
+    let _router =
+        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+
+    let exposure = openapi.exposure.lock().expect("exposure lock");
+    for operation_id in ["types_registry.register", "types_registry.submit_entities"] {
+        let exposed = exposure
+            .iter()
+            .find(|(id, _)| id == operation_id)
+            .map(|(_, exposed)| *exposed)
+            .expect("mutation operation is registered");
+        assert!(
+            !exposed,
+            "{operation_id} must remain internal-only while ceiling C8 is open",
+        );
+    }
+}
+
 /// `Idempotency-Key` is declared in the generated document, not only enforced.
 ///
 /// The route once asserted the opposite — that `OperationBuilder` could not declare a
@@ -940,4 +1072,34 @@ fn the_idempotency_key_header_is_declared_as_a_required_parameter() {
         submit.contains(&("Idempotency-Key".to_owned(), "Header".to_owned(), true)),
         "submit must declare a required Idempotency-Key header, got: {submit:?}",
     );
+}
+
+/// `extract::Json<T>` can reject a request before its handler with three statuses
+/// that `standard_errors` intentionally does not add. Keep the generated contract
+/// aligned with both JSON request extractors.
+#[test]
+fn json_extractor_error_statuses_are_declared_for_both_post_operations() {
+    let openapi = TestOpenApi::default();
+    let config = TypesRegistryConfig::default();
+    let legacy = Arc::new(TypesRegistryService::new(
+        Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
+        config,
+    ));
+    let _router =
+        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+
+    let responses = openapi.responses.lock().expect("responses lock");
+    for operation_id in ["types_registry.register", "types_registry.submit_entities"] {
+        let declared = responses
+            .iter()
+            .find(|(id, _)| id == operation_id)
+            .map(|(_, responses)| responses)
+            .expect("JSON operation is registered");
+        for status in [413, 415, 422] {
+            assert!(
+                declared.contains(&(status, "application/problem+json".to_owned())),
+                "{operation_id} must declare {status} as a Problem response: {declared:?}",
+            );
+        }
+    }
 }

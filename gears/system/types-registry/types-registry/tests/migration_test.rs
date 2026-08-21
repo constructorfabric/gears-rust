@@ -824,6 +824,25 @@ async fn operation_item_failed_requires_an_error_payload() {
     .expect_err("a failed item distinguishes its cause through error_payload");
 }
 
+#[tokio::test]
+async fn operation_item_failed_requires_started_at_before_completed_at() {
+    let db = migrated_db().await;
+    insert_operation(&db, OP_ID, 1, 0).await;
+    exec(
+        &db,
+        format!(
+            "INSERT INTO types_registry__operation_item \
+             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+              request_payload, result_revision_no, result_resource_version, error_payload, \
+              created_at, started_at, completed_at) \
+             VALUES ({OP_ID}, 0, '{GTS_TYPE}', 0, 1, 0, 5, NULL, NULL, NULL, '{{}}', \
+                     '{TS}', NULL, '{TS}')"
+        ),
+    )
+    .await
+    .expect_err("a failed item cannot complete without first recording started_at");
+}
+
 // ---------------------------------------------------------------------------
 // The whole nine-table graph, inserted in order. This is what proves the FK
 // chain is usable end to end: entity -> operation_item -> type_schema_revision

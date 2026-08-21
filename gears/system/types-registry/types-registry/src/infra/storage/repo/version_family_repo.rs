@@ -28,6 +28,9 @@ pub struct VersionFamilyRepo;
 
 impl VersionFamilyRepo {
     /// Exact read by family key.
+    ///
+    /// # Errors
+    /// Propagates scope validation and database query failures.
     pub async fn find_by_key(
         runner: &impl DBRunner,
         scope: &AccessScope,
@@ -47,22 +50,22 @@ impl VersionFamilyRepo {
     ///
     /// The winner is decided by `uq_tr_version_family_key`, not by the read that
     /// precedes the insert: two callers can both see no row, and the constraint
-    /// then keeps the loser's row out. That is why the conflict is handled rather
-    /// than propagated — it is the serialization point, not a fault.
-    ///
-    /// The conflict must not be *raised*, though, only absorbed: this method runs
-    /// inside the admission commit transaction, and a raised unique violation aborts
-    /// that transaction on `PostgreSQL`, taking the recovering re-read with it. See
-    /// [`conflict_do_nothing`].
+    /// keeps the loser's out. The conflict is the serialization point, not a fault,
+    /// so it is handled — and it must be *absorbed*, not raised, because this runs
+    /// inside the admission commit transaction and a raised unique violation aborts
+    /// that transaction on `PostgreSQL`. See [`conflict_do_nothing`].
     ///
     /// **This is not a row lock.** `database.sql` describes the family row as the
-    /// lock that serializes concurrent first admission, and `SELECT … FOR UPDATE`
-    /// is how that reads on Postgres and `MySQL` — but `DBRunner` deliberately
-    /// hides the raw executor and the secure builder exposes no lock clause, so a
-    /// repository cannot take one. Serializing the *validation* window (the
-    /// version-family shape and contiguity rules) needs the toolkit advisory lock,
-    /// which lives on the `Db` handle and therefore belongs to the service layer;
-    /// [`Self::lock_order`] is the ordering half of it.
+    /// lock that serializes concurrent first admission — `SELECT … FOR UPDATE` on
+    /// Postgres and `MySQL` — but `DBRunner` hides the raw executor and the secure
+    /// builder exposes no lock clause, so a repository cannot take one. Serializing
+    /// the *validation* window (family shape and contiguity) needs the toolkit
+    /// advisory lock, which lives on the `Db` handle and so belongs to the service
+    /// layer; [`Self::lock_order`] is its ordering half.
+    ///
+    /// # Errors
+    /// Propagates scope validation and database failures. Returns
+    /// [`ScopeError::Invalid`] if the winning family disappears before re-read.
     pub async fn create_or_get(
         runner: &impl DBRunner,
         scope: &AccessScope,

@@ -10,49 +10,41 @@
 //! **equality only, never ordering** (`database.sql`): a digest, unlike a counter,
 //! stays stable when recomputation yields identical artifacts, which is how a
 //! dependency-driven read change is detected without moving
-//! `entity.resource_version` — reserved for optimistic writes.
-//!
-//! The canonical form is the one from [`crate::domain::admission::fingerprint`],
-//! for the same reason stated there: `serde_json`'s map ordering depends on a
-//! feature this crate does not control, and a fingerprint that flapped with map
-//! iteration order would make every read look changed.
+//! `entity.resource_version` — reserved for optimistic writes. The canonical form
+//! is [`crate::domain::admission::fingerprint`]'s, for the reason stated there.
 //!
 //! # Why FNV-1a and not SHA-256
 //!
-//! Both digests here answer *"is this byte-identical to what I had?"* and nothing
-//! else. Neither input is client-controlled: `content_hash` covers a document that
-//! has already been validated, and `resolution_fingerprint` covers artifacts this
-//! server computed. So collision *resistance against a chosen input* buys nothing,
-//! and `SECURITY.md §9` puts direct `sha2` imports behind the DE0708 allow-list
-//! precisely to keep unreviewed hashing out — the two sites it names as migrated
-//! (`toolkit-odata` cursor consistency, `oidc-authn-plugin` cache key) moved to
-//! inline FNV-1a for the same reason.
+//! Both digests here answer *"is this byte-identical to what I had?"* over input
+//! that is **not** client-controlled: `content_hash` covers an already-validated
+//! document, `resolution_fingerprint` covers artifacts this server computed. So
+//! collision resistance against a chosen input buys nothing, and `SECURITY.md §9`
+//! puts direct `sha2` imports behind the DE0708 allow-list precisely to keep
+//! unreviewed hashing out (`toolkit-odata`'s cursor and `oidc-authn-plugin`'s cache
+//! key moved to inline FNV-1a for the same reason).
 //!
 //! Neither use is weakened by the narrower digest:
 //!
-//! * `content_hash` is a **prefilter** (ADR-0012). A collision proposes
-//!   `unchanged` and T11's exact byte comparison then rejects the proposal, so a
-//!   collision costs one wasted comparison and cannot produce a wrong answer.
+//! * `content_hash` is a **prefilter** (ADR-0012): a collision proposes
+//!   `unchanged`, T11's exact byte comparison rejects it, and the cost is one
+//!   wasted comparison.
 //! * `resolution_fingerprint` is compared old-versus-new **for one entity**, not
-//!   across a population, so this is not a birthday problem: a missed refresh
-//!   needs the new artifacts to collide with that entity's specific previous
-//!   digest, at ~2⁻⁶⁴ per comparison.
+//!   across a population — not a birthday problem, ~2⁻⁶⁴ per comparison.
 //!
-//! [`crate::domain::admission::fingerprint`] keeps SHA-256, because its inputs
-//! *are* client-controlled and its equality decides a replay. It takes it from
-//! `aws-lc-rs` rather than `sha2`, so no allow-list entry is spent there either —
-//! see that module's header.
+//! [`crate::domain::admission::fingerprint`] keeps SHA-256 because its inputs *are*
+//! client-controlled and its equality decides a replay.
 
 use gts::ResolvedType;
+use toolkit_macros::domain_model;
 
 use crate::domain::admission::fingerprint::canonical_text;
 
 /// FNV-1a 64-bit — deterministic, non-cryptographic fingerprint.
 ///
-/// Algorithm is a public specification (Fowler–Noll–Vo) with fixed constants,
-/// guaranteeing identical output across all Rust versions and platforms. That
-/// stability is a storage requirement here, not a nicety: these digests are
-/// persisted and compared against digests written by an earlier process.
+/// Fixed public constants (Fowler–Noll–Vo) give identical output across all Rust
+/// versions and platforms. That stability is a storage requirement here: these
+/// digests are persisted and compared against digests written by an earlier
+/// process.
 fn fnv1a_64(fields: &[&[u8]]) -> Vec<u8> {
     const BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01B3;
@@ -64,11 +56,9 @@ fn fnv1a_64(fields: &[&[u8]]) -> Vec<u8> {
         }
     };
     // Length-prefixed per field, so no two splits of adjacent fields collide. The
-    // prefix is a `u64` and not a `usize`: `usize::to_be_bytes` is 4 bytes on a
-    // 32-bit target and 8 on a 64-bit one, which would make the digest a property of
-    // the platform and stop every persisted `content_hash` from matching after a
-    // rebuild — the opposite of what this function's docstring promises. The
-    // saturation cannot happen: no field here is 16 exabytes long.
+    // prefix is a `u64`, not a `usize`, whose `to_be_bytes` is 4 bytes on a 32-bit
+    // target and 8 on a 64-bit one — that would make persisted digests a property
+    // of the platform. The saturation cannot happen: no field here is 16 exabytes.
     for field in fields {
         absorb(&u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
         absorb(field);
@@ -77,6 +67,7 @@ fn fnv1a_64(fields: &[&[u8]]) -> Vec<u8> {
 }
 
 /// The three artifacts D3 materializes, plus their digest.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterializedArtifacts {
     pub resolved_schema: String,

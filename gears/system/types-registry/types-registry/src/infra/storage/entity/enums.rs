@@ -12,24 +12,22 @@
 //! `database.sql` fixes three rules about the numbering, and all three are one
 //! concern:
 //!
-//! * numbering is **append-only** after the first release, because renumbering
-//!   is a data migration — a new value takes the next free number and a retired
-//!   number is never reused;
-//! * numbering is **per column and deliberately not aligned** between columns.
-//!   `3` is `completed` in `operation.status` and `succeeded` in
-//!   `operation_item.status`; where two columns agree that is coincidence, not a
-//!   contract, and it MUST NOT be turned into one;
-//! * CHECK constraints **enumerate** the allowed values rather than accept a
-//!   range, so every variant here has a counterpart in the DDL.
+//! * numbering is **append-only** after the first release, because renumbering is a
+//!   data migration — a new value takes the next free number, a retired number is
+//!   never reused;
+//! * numbering is **per column and deliberately not aligned** between columns. `3`
+//!   is `completed` in `operation.status` and `succeeded` in
+//!   `operation_item.status`; where two columns agree that is coincidence, and it
+//!   MUST NOT be turned into a contract;
+//! * CHECK constraints **enumerate** the allowed values, so every variant here has
+//!   a counterpart in the DDL.
 //!
-//! Keeping the numbering in one place is what makes the round-trip test — which
-//! asserts the exact integers from `database.sql` — a single readable guard
-//! instead of six scattered ones.
+//! One place for the numbering makes the round-trip test — which asserts the exact
+//! integers from `database.sql` — a single guard instead of six scattered ones.
 //!
-//! [`OwnershipScope`] and [`OperationKind`] are each shared by two columns, and
-//! that sharing is deliberate in both cases: `entity.ownership_scope` is a copy
-//! of `version_family.ownership_scope` verified under the family lock, and
-//! `operation_item.kind` is a copy of `operation.kind` tied to it by
+//! [`OwnershipScope`] and [`OperationKind`] are each shared by two columns
+//! deliberately: `entity.ownership_scope` copies `version_family.ownership_scope`
+//! under the family lock, and `operation_item.kind` copies `operation.kind` under
 //! `fk_tr_operation_item_operation`. One type per *vocabulary*, not per column.
 
 use sea_orm::entity::prelude::*;

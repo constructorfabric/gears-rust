@@ -4,69 +4,60 @@
 //! # Why the canonical bytes are built here and not taken from `serde_json`
 //!
 //! `serde_json::Value`'s map is a `BTreeMap` only while the `preserve_order`
-//! feature is off. Features unify across a workspace, so any crate anywhere in
-//! the build enabling it would turn that map into an `IndexMap` — at which point
-//! `to_string()` preserves the *input* order and the fingerprint of one document
-//! would depend on how the caller happened to write it. Two submissions of the
-//! same schema would then collide with `409` for no reason. Sorting explicitly
-//! costs one rebuild per candidate and removes the dependency on a feature flag
-//! this crate does not control.
+//! feature is off, and features unify across a workspace — any crate enabling it
+//! would turn that map into an `IndexMap`, making the fingerprint depend on how the
+//! caller happened to order the document and turning a re-submission into a
+//! spurious `409`. Sorting explicitly costs one rebuild per candidate and removes
+//! the dependency on a flag this crate does not control. (`gts-rust` has no
+//! canonical-JSON function to defer to; it canonicalizes the *identifier*, via
+//! `GtsId::try_new`.)
 //!
-//! `gts-rust` has no canonical-JSON function to defer to, so
-//! `constraint-gts-implementation` is not engaged: what is canonicalized through
-//! `gts-rust` is the *identifier* (`GtsId::try_new`, which trims and normalizes),
-//! and what is canonicalized here is the byte encoding.
-//!
-//! **Numbers are not canonicalized.** `1` and `1.0` are distinct here, because
-//! `serde_json` preserves the literal form and RFC 8785 number canonicalization
-//! has no implementation in this workspace. The consequence is bounded and in the
-//! safe direction: a caller who reformats a number gets a fresh fingerprint —
-//! a `409` on a reused key, never a false replay.
+//! **Numbers are not canonicalized.** `1` and `1.0` are distinct, because
+//! `serde_json` preserves the literal form and RFC 8785 number canonicalization has
+//! no implementation in this workspace. The consequence is in the safe direction: a
+//! reformatted number yields a fresh fingerprint — a `409` on a reused key, never a
+//! false replay.
 //!
 //! # Every field is length-prefixed
 //!
 //! A digest over concatenated fields cannot distinguish `("ab", "c")` from
 //! `("a", "bc")`, so a candidate identifier ending in a digit could otherwise
-//! collide with a different split of identifier and body. Each field is written
-//! as its byte length followed by its bytes.
+//! collide with a different split of identifier and body.
 //!
 //! # Why SHA-256, and why `aws-lc-rs` rather than `sha2`
 //!
-//! Both digests here cover **client-controlled input** and their equality decides
-//! a replay, so both need collision resistance against a chosen input:
+//! Both digests here cover **client-controlled input** and their equality decides a
+//! replay, so both need collision resistance against a chosen input:
 //!
-//! * `request_fingerprint` covers the submitted body. Equality means "same
-//!   request, return the stored operation"; inequality means `409`. A caller able
-//!   to construct a second body colliding with the first would be handed the first
-//!   request's operation instead of the refusal — a record it never named, on a
-//!   hash match alone.
+//! * `request_fingerprint` covers the submitted body — equality returns the stored
+//!   operation, inequality means `409`. A caller able to collide with another body
+//!   would be handed an operation it never named, on a hash match alone.
 //! * `idempotency_scope_hash` is half of `UNIQUE (idempotency_scope_hash,
 //!   idempotency_key)`. It digests constants in P0 (see `P0_PRINCIPAL_ID` below),
-//!   but once P1 puts a real tenant in it, a forgeable digest lets one tenant
+//!   but once P1 puts a real tenant in it a forgeable digest lets one tenant
 //!   collide into another's `Idempotency-Key` namespace.
 //!
-//! That rules out the inline FNV-1a used by [`crate::domain::artifacts`] — not on
-//! collision *probability*, which is ~2⁻⁶⁴ per comparison either way, but because
-//! FNV-1a's round is invertible (`h ← (h ^ b) · PRIME` with an odd `PRIME`), so a
-//! target digest can be solved for rather than searched. This layout would hand an
-//! attacker the freedom to do it: only the 1-byte `force` field follows the 8
-//! arbitrary bytes of `expected_resource_version`.
+//! That rules out the inline FNV-1a of [`crate::domain::artifacts`] — not on
+//! collision *probability*, ~2⁻⁶⁴ per comparison either way, but because FNV-1a's
+//! round is invertible (`h ← (h ^ b) · PRIME`, odd `PRIME`), so a target digest can
+//! be solved for rather than searched. This layout hands an attacker the freedom to
+//! do it: only the 1-byte `force` field follows the 8 arbitrary bytes of
+//! `expected_resource_version`.
 //!
-//! The hasher is `aws-lc-rs` — the FIPS-validated implementation the platform
-//! already installs as its crypto provider at bootstrap — and **not** the `sha2`
-//! crate, which DE0708 bans outside an allow-list (`SECURITY.md §9`). So this
-//! keeps the property without spending an allow-list entry, and the gear pulls no
-//! non-FIPS hasher into the graph. Same choice, same reasoning, as
-//! `bss/ledger`'s `payload_hash`.
+//! The hasher is `aws-lc-rs` — the FIPS-validated provider the platform already
+//! installs at bootstrap — and not `sha2`, which DE0708 bans outside an allow-list
+//! (`SECURITY.md §9`), as in `bss/ledger`'s `payload_hash`.
 
 use aws_lc_rs::digest::{Context, SHA256};
 use serde_json::{Map, Value};
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use super::Precondition;
 use crate::domain::enums::{OperationKind, OwnershipScope, Plane};
 
 /// SHA-256 digest of the idempotency namespace.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ScopeHash([u8; 32]);
 
@@ -83,6 +74,7 @@ impl ScopeHash {
 }
 
 /// SHA-256 digest binding an idempotency key to one canonical request.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RequestFingerprint([u8; 32]);
 
@@ -141,6 +133,7 @@ fn canonicalize(value: &Value) -> Value {
 }
 
 /// One candidate's contribution to the fingerprint.
+#[domain_model]
 #[derive(Clone, Copy, Debug)]
 pub struct FingerprintCandidate<'a> {
     pub gts_id: &'a str,
@@ -151,6 +144,7 @@ pub struct FingerprintCandidate<'a> {
 }
 
 /// Everything the fingerprint covers.
+#[domain_model]
 #[derive(Clone, Copy, Debug)]
 pub struct FingerprintInput<'a> {
     pub kind: OperationKind,

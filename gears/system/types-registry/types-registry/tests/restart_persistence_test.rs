@@ -1,15 +1,13 @@
 //! Persistence across closing and reopening the database connection pool.
 //!
-//! These tests deliberately do not claim to launch a new process or execute
-//! `TypesRegistryGear::init`: the database is a real file, and the
-//! `RegistryService`, `DBProvider`, pool and connections are dropped between
-//! phases. Phase two reopens the file and re-runs the test migration path before
-//! reading. Full process restart and startup seeding remain T30's e2e obligation.
+//! No new process and no `TypesRegistryGear::init`: the database is a real file, and
+//! the `RegistryService`, `DBProvider`, pool and connections are dropped between
+//! phases; phase two reopens the file and re-runs the test migration path. Full
+//! process restart and startup seeding remain T30's e2e obligation.
 //!
-//! The comparison is on whole `Model` values rather than a hand-picked column
-//! list. It covers all eight tables written by one Type Schema followed by one
-//! Instance, including the operation audit trail, and every query has a stable
-//! primary-key order.
+//! The comparison is on whole `Model` values rather than a hand-picked column list,
+//! over all eight tables written by one Type Schema followed by one Instance
+//! (including the operation audit trail), each query in primary-key order.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -37,7 +35,7 @@ use types_registry::infra::storage::entity::{
 };
 
 mod common;
-use common::{allow_all, stores, test_db_file};
+use common::{TestDir, allow_all, stores, test_db_file};
 
 const BOOT: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const CF_TYPE: &str = gts_id!("cf.core.example.type.v1~");
@@ -177,9 +175,8 @@ fn submission(key: &str, gts_id: &str, content: Value) -> SubmitRequest {
 
 #[tokio::test]
 async fn a_schema_and_instance_survive_database_reopen() {
-    let dir = std::env::temp_dir().join(format!("tr-reopen-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join("registry.db");
+    let dir = TestDir::new("tr-reopen");
+    let path = dir.path().join("registry.db");
 
     // ---------------------------------------------------------------- boot one
     let authored_schema = schema(CF_TYPE);
@@ -275,11 +272,10 @@ async fn a_schema_and_instance_survive_database_reopen() {
     assert_eq!(schema_by_id.gts_id, CF_TYPE);
     assert_eq!(schema_by_id.gts_uuid, schema_uuid);
     assert_eq!(schema_by_id.resource_version, 1);
-    assert_eq!(schema_by_id.revision_no, Some(1));
     assert_eq!(schema_by_uuid.gts_uuid, schema_by_id.gts_uuid);
     assert_eq!(schema_by_uuid.gts_id, schema_by_id.gts_id);
 
-    assert_eq!(schema_by_id.authored.as_ref(), Some(&authored_schema));
+    assert_eq!(schema_by_id.content.as_ref(), Some(&authored_schema));
     let stored_raw: Value =
         serde_json::from_str(&after.schema_revisions[0].raw_schema).expect("raw_schema is JSON");
     assert_eq!(stored_raw, authored_schema);
@@ -303,8 +299,7 @@ async fn a_schema_and_instance_survive_database_reopen() {
 
     assert_eq!(instance_by_id.gts_id, CF_INSTANCE);
     assert_eq!(instance_by_id.resource_version, 1);
-    assert_eq!(instance_by_id.revision_no, Some(1));
-    assert_eq!(instance_by_id.authored.as_ref(), Some(&authored_instance));
+    assert_eq!(instance_by_id.content.as_ref(), Some(&authored_instance));
     assert!(instance_by_id.resolved_schema.is_none());
     assert!(instance_by_id.effective_traits.is_none());
     assert!(instance_by_id.effective_traits_schema.is_none());
@@ -336,7 +331,6 @@ async fn a_schema_and_instance_survive_database_reopen() {
 
     drop(svc);
     drop(db);
-    std::fs::remove_dir_all(&dir).expect("remove temp dir");
 }
 
 /// Before T21, a process that dies between acceptance and inline admission leaves
@@ -346,9 +340,8 @@ async fn a_schema_and_instance_survive_database_reopen() {
 /// `replayed`.
 #[tokio::test]
 async fn a_nonterminal_replay_resumes_inline_admission_before_t21() {
-    let dir = std::env::temp_dir().join(format!("tr-reopen-resume-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join("registry.db");
+    let dir = TestDir::new("tr-reopen-resume");
+    let path = dir.path().join("registry.db");
 
     let authored = schema(CF_TYPE);
     let accepted_id = {
@@ -412,5 +405,4 @@ async fn a_nonterminal_replay_resumes_inline_admission_before_t21() {
 
     drop(svc);
     drop(db);
-    std::fs::remove_dir_all(&dir).expect("remove temp dir");
 }

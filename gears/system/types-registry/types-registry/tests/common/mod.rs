@@ -5,6 +5,7 @@
 //! `dead_code` is allowed because each test binary includes this module whole and
 //! uses only the helpers it needs.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gts::GtsConfig;
@@ -23,6 +24,37 @@ pub fn create_service() -> Arc<TypesRegistryService> {
         repo,
         TypesRegistryConfig::default(),
     ))
+}
+
+/// Per-test temporary directory removed during unwinding as well as on success.
+///
+/// Declaring the guard before a database provider makes Rust drop the provider
+/// first, so `SQLite` has released the file by the time this cleanup runs.
+pub struct TestDir {
+    path: PathBuf,
+}
+
+impl TestDir {
+    pub fn new(prefix: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).expect("create test temp dir");
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.path) {
+            eprintln!(
+                "failed to clean up test directory {}: {error}",
+                self.path.display()
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -58,7 +90,10 @@ pub async fn provider_for(dsn: &str, max_conns: u32) -> Arc<DBProvider<DbError>>
         min_conns: Some(1),
         ..Default::default()
     };
-    let db = connect_db(dsn, opts).await.expect("connect sqlite");
+    let dsn_scheme = dsn.split(':').next().unwrap_or("database");
+    let db = connect_db(dsn, opts)
+        .await
+        .unwrap_or_else(|e| panic!("connect {dsn_scheme} test database: {e}"));
     run_migrations_for_testing(&db, migrations())
         .await
         .expect("run migrations");
@@ -90,12 +125,11 @@ pub fn allow_all() -> AccessScope {
 // Managed-state fixtures
 // ---------------------------------------------------------------------------
 //
-// `type_schema` and `type_schema_revision` have no repository writer: those
-// writes belong to the admission worker (T8), which is their first caller. Until
-// then the tests that need admitted rows — the transient store (T5) and the
-// backend suites — write them through their `ActiveModel`s, and share the
-// boilerplate here rather than each carrying its own copy of the
-// operation → item → revision → current-pointer chain.
+// `type_schema` and `type_schema_revision` have no repository writer: those writes
+// belong to the admission worker (T8), their first caller. Until then the tests that
+// need admitted rows — the transient store (T5) and the backend suites — write them
+// through their `ActiveModel`s and share the operation → item → revision →
+// current-pointer boilerplate here.
 
 use sea_orm::ActiveValue::Set;
 use time::OffsetDateTime;

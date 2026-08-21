@@ -221,9 +221,19 @@ fn byte_sizes_accept_the_documented_and_the_plain_forms() {
 /// refuse every document at admission.
 #[test]
 fn a_malformed_byte_size_fails_to_parse() {
-    for bad in ["", "KB", "1TB", "1.5MB", "-1"] {
+    for bad in ["", "KB", "1.5MB", "-1"] {
         let got: Result<ByteSize, _> = serde_json::from_value(json!(bad));
         assert!(got.is_err(), "'{bad}' must not parse");
+    }
+}
+
+/// Well-formed byte-count syntax with an unsupported unit is rejected rather
+/// than silently interpreted as bytes or rounded to the nearest known unit.
+#[test]
+fn an_unsupported_byte_size_unit_fails_to_parse() {
+    for bad in ["1TB", "1XB"] {
+        let got: Result<ByteSize, _> = serde_json::from_value(json!(bad));
+        assert!(got.is_err(), "'{bad}' must reject its unsupported unit");
     }
 }
 

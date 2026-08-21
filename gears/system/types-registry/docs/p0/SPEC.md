@@ -102,7 +102,7 @@ correctness core, not scope.
 
 ## 4. Two DESIGN prerequisites this closes with numbers
 
-DESIGN §4 lists nine implementation prerequisites. P0 closes two of them and must
+DESIGN §4 lists eight implementation prerequisites. P0 closes two of them and must
 record how.
 
 **Unbounded activation write set.** DESIGN: *"choose and document either the permitted
@@ -128,14 +128,16 @@ the worklist carries no depth. `database.sql` already sanctions the early stop:
 *"The traversal reaches the subject anyway, recomputes it, finds an identical digest,
 and stops there."*
 
-Still open and inherited: the `toolkit-db/preview-outbox` sign-off and worker liveness
-bounds. The ADR-0015 quarantine preflight is **satisfied by construction** — see §17, O4.
+The `toolkit-db/preview-outbox` sign-off is closed: outbox support is unconditional in
+`toolkit-db` 0.12.0. Still open and inherited: worker liveness bounds. The ADR-0015
+quarantine preflight is **satisfied by construction** — see §17, O4.
 
 ---
 
 ## 5. Tech stack
 
-Rust edition 2024, toolchain ≥ 1.92.0. No new third-party dependency is introduced.
+Rust edition 2024, toolchain ≥ 1.95.0. One new third-party dependency: `lru`, for the
+store-build cache. Everything else comes from the workspace.
 
 | Concern | Choice |
 |---|---|
@@ -147,7 +149,10 @@ Rust edition 2024, toolchain ≥ 1.92.0. No new third-party dependency is introd
 | Shared state | none held between admissions — reads go to the database, the `gts-rust` store is transient per admission unit (§8.2, D2) |
 
 New dependencies for `cf-gears-types-registry`: `toolkit-db`, `sea-orm`,
-`sea-orm-migration`, `chrono`, `sha2`, and `toolkit` feature `preview-outbox`.
+`sea-orm-migration`, `time`, `aws-lc-rs` (the FIPS-validated SHA-256 the platform
+installs at bootstrap, in place of the DE0708-banned `sha2`), and `lru`. The `toolkit`
+outbox needs no feature: it stopped being a preview in toolkit-db 0.12.0 and is now
+unconditional.
 
 Gear capabilities change from `[system, rest]` to **`[system, db, rest, stateful]`**
 (`stateful` for the outbox worker lifecycle). Precedent: `credstore` runs
@@ -163,18 +168,16 @@ make ci                  # full gate: fmt, clippy, test, deny, dylint, lychee
 
 cargo test -p cf-gears-types-registry
 cargo test -p cf-gears-types-registry-sdk
-make test-db             # all three backends via testcontainers
-make test-sqlite         # single backend, fast
-make test-pg
-make test-mysql
+make test-types-registry-db  # this gear's PostgreSQL + MySQL container suites
 
 make dylint              # architecture lints — DE01xx/DE02xx/DE08xx apply here
 make e2e-local           # REST surface end to end
 ```
 
-Definition of done for any slice: `make ci` green **and** `make test-db` green on all
-three backends. SQLite-only is not sufficient — `constraint-multi-backend` is a
-correctness requirement, and the lock and CAS paths differ per backend.
+Definition of done for any slice: `make ci` green, the plain gear tests green on SQLite,
+and `make test-types-registry-db` green on PostgreSQL and MySQL. SQLite-only is not
+sufficient — `constraint-multi-backend` is a correctness requirement, and the lock and CAS
+paths differ per backend.
 
 ---
 
@@ -516,17 +519,19 @@ platform never offers it to an in-process gear:
   (`toolkit-http-middleware/src/auth.rs:220`). "Platform-plane only" is not expressible
   declaratively; a handler would have to assert it itself.
 
-Given that, P0 keeps these routes on the business listener with the authentication they have
-today. The alternative — marking them `.anonymous()` to signal "not tenant traffic" — would
-be a **security regression**, not a step toward the platform plane: there is no platform
-identity to put in its place, so it would let anything that reaches the gateway register a
-global type. This is the same shape as the PDP deviation: authenticated, not authorized,
-with the gap named rather than implied (§12, C6). Recorded as ceiling **C8**.
+Given that, P0 does **not expose mutation routes through api-gateway**. `OperationBuilder`
+defaults `exposed` to `false`, and registration and deletion deliberately retain that default
+until a platform listener can authenticate a platform principal before dispatch. They stay
+`.authenticated()` for internal calls; marking them `.anonymous()` without a platform identity
+to put in its place would be a security regression. Non-mutating routes keep their existing
+authentication-only posture. This is the same shape as the PDP deviation for reads:
+authenticated, not authorized, with the gap named rather than implied (§12, C6). Recorded as
+ceiling **C8**.
 
-Also worth stating because the advice exists elsewhere and does not transfer: guidance to
-serve platform routes `.anonymous()` and **not** `.exposed()` is written for a gear's own OoP
-listener. `exposed` defaults to `false`, meaning internal-only, so copying that for an
-in-process gear would make the routes unreachable for the e2e suites that must call them.
+The future v2-to-v1 path promotion changes paths only. It must not add `.exposed()` to a
+mutation route. Publishing registration or deletion is gated on the platform listener plus a
+platform-principal/PDP decision; until both exist, those operations are reachable only through
+internal inter-gear communication and direct test routers.
 
 **Platform identity in the client is what forces gRPC — expect the move, do not treat it as a
 contingency.** A REST contract method whose first parameter is `&PlatformSecurityContext` is
@@ -697,7 +702,7 @@ because other documents cite the numbers.
 | C5 | No operation-retention sweep: terminal operations accumulate | The §3.2 sweep, once volume justifies it |
 | C6 | **No PDP.** Reads and writes are authenticated but not authorized, deviating from `06`'s *"every sensitive DB access MUST be covered by a PDP decision"*. Entities are `#[secure(unrestricted)]`, so a tenant-scoped query fails closed rather than leaking | The deferred identity-to-permission binding; then `tenant_col` + `PolicyEnforcer` (§12) |
 | C7 | **The validator has no tenant or projection dimensions.** P0's validator digests `resource_version`, `resolution_fingerprint` and a fixed default-projection marker (§8.5); the SDK cache key likewise carries visibility context and projection as constants. Correct while every read is platform-plane and no `$select` exists, and wrong the moment either arrives | The wire form is a **versioned** JSON object, so P1 adds the chain versions and the real projection digest under a new version and refuses to honour a P0 token |
-| C8 | **Platform-plane operations are served on the business listener.** Every P0 operation is platform-plane (`plane = 1`), but the plane is expressed by the contract and the data, not enforced by the transport: an in-process gear has no inbound platform-identity validator, api-gateway has no platform listener, and `OperationBuilder` cannot mark a route platform-only (§8.4). Existing authentication is kept, because `.anonymous()` without a platform identity would be a regression | A platform listener with `X-ToolKit-Internal-Token` / `PlatformIdentity`, plus a declarative platform-plane route marker. Both are toolkit/api-gateway work outside this gear, and ADR-0006/0008 already ask for the listener |
+| C8 | **Platform-plane mutations are internal-only.** Every P0 operation is platform-plane (`plane = 1`), but an in-process gear has no inbound platform-identity validator, api-gateway has no platform listener, and `OperationBuilder` cannot mark a route platform-only (§8.4). Registration and deletion therefore keep `exposed = false`; internal and non-mutating calls retain authentication, because `.anonymous()` without a platform identity would be a regression | A platform listener with `X-ToolKit-Internal-Token` / `PlatformIdentity`, a declarative platform-plane route marker, and a platform-principal/PDP decision before mutation dispatch. Only then may mutation routes be exposed. This is toolkit/api-gateway work outside this gear, and ADR-0006/0008 already ask for the listener |
 
 Each ceiling gets a `ponytail:`-style source comment naming the bound and the upgrade
 path at the point where it bites.
@@ -1164,7 +1169,7 @@ Conventions from `12_unit_testing.md`, which override anything implied elsewhere
   synchronously instead of enqueuing and waiting on the outbox. Outbox *wiring* is
   exercised once, in E2E. Any test that polls an operation is wrong by construction.
 - Each test builds its own **SQLite `:memory:`** database and fresh service instances; no
-  shared state, parallel-safe. `make test-db` on PostgreSQL and MySQL covers the
+  shared state, parallel-safe. `make test-types-registry-db` on PostgreSQL and MySQL covers the
   backend-specific lock, CAS and range-bound paths.
 - Pure logic is `#[test]`, not `#[tokio::test]`.
 - **Verify state with direct entity queries**, never only through a service read — a
@@ -1175,8 +1180,8 @@ Conventions from `12_unit_testing.md`, which override anything implied elsewhere
   `dependency_reverse_impact_terminates_on_cycle`.
 - Error variants asserted with `assert!(matches!(...), "…got: {err:?}")`.
 
-Target 90%+ coverage. `make test-db` on all three backends is part of done, not a
-follow-up.
+Target 90%+ coverage. The plain SQLite gear tests plus
+`make test-types-registry-db` on PostgreSQL and MySQL are part of done, not a follow-up.
 
 **Unit** — acceptance check ordering, fingerprint computation, family key derivation
 (`vM~` / `vM.n~` → one key), shape and contiguity rules, dialect spelling set,
@@ -1281,7 +1286,8 @@ references.
 - Validate at the admission boundary before touching storage.
 - Enforce idempotency uniqueness and `resource_version` CAS in the database, never in
   process memory.
-- Run `make ci` and `make test-db` before calling a slice done.
+- Run `make ci`, the plain SQLite gear tests, and `make test-types-registry-db` for
+  PostgreSQL/MySQL before calling a slice done.
 - Sign commits (`git commit -s`), Conventional Commits format.
 - Name every deliberate simplification at the point where it bites, with its bound and
   upgrade path.
@@ -1338,7 +1344,8 @@ is the executable task list. The number is kept because other documents cite it.
 
 1. A gear's Type Schemas and Instances survive a process restart with authored content
    and all three effective artifacts byte-identical.
-2. `make ci` and `make test-db` green on SQLite, PostgreSQL and MySQL.
+2. `make ci` and the plain gear tests green on SQLite;
+   `make test-types-registry-db` green on PostgreSQL and MySQL.
 3. Registration returns `202` + operation; polling reaches a terminal state with one
    outcome per candidate GTS identifier.
 4. Replaying an `Idempotency-Key` with the same fingerprint writes nothing and returns

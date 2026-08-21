@@ -16,9 +16,9 @@
 //!
 //! `owning_gear` is caller-declared attribution and **MUST NOT authorize**: in a
 //! single-process deployment every gear shares the process workload identity, so
-//! the platform cannot tell which gear inside it is registering. It answers "who
-//! do I ask about this contract", which is why `ck_tr_entity_owner` makes it NOT
-//! NULL for a global entity, whose whole owner side is otherwise null.
+//! the platform cannot tell which gear is registering. It answers "who do I ask
+//! about this contract", which is why `ck_tr_entity_owner` makes it NOT NULL for a
+//! global entity, whose owner side is otherwise all null.
 
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
@@ -28,19 +28,17 @@ use uuid::Uuid;
 use super::enums::{EntityKind, LifecycleStatus, OwnershipScope};
 
 // ponytail: ceiling C6 — no PDP. P0 reads and writes are authenticated but not
-// authorized, which deviates from `06_authn_authz_secure_orm.md`'s "every sensitive
-// DB access MUST be covered by a PDP decision". `unrestricted` is chosen here
-// rather than `tenant_col = "owner_tenant_id"` because P0 never populates tenant
-// scope: every row carries `ownership_scope = 1` and a NULL owner, so a
-// tenant-scoped predicate would match nothing and `unrestricted` states that
-// intent instead of faking a dimension. It fails closed either way — a
-// tenant-scoped query against a tenant-scoped entity with an empty scope yields
-// `WHERE 1=0`.
+// authorized, deviating from `06_authn_authz_secure_orm.md`'s "every sensitive DB
+// access MUST be covered by a PDP decision". `unrestricted` rather than
+// `tenant_col = "owner_tenant_id"` because P0 never populates tenant scope — every
+// row carries `ownership_scope = 1` and a NULL owner, so a tenant-scoped predicate
+// would match nothing and `unrestricted` states that intent instead of faking a
+// dimension.
 //
-// Upgrade path, and the reason the column exists already: switch this attribute
-// to `#[secure(tenant_col = "owner_tenant_id", ...)]` and add the
-// `PolicyEnforcer` calls once the identity-to-permission binding lands (SPEC §9
-// C6, §12). The DDL needs no migration for that step.
+// Upgrade path (and why the column exists already): switch to
+// `#[secure(tenant_col = "owner_tenant_id", ...)]` and add the `PolicyEnforcer`
+// calls once the identity-to-permission binding lands (SPEC §9 C6, §12). No DDL
+// migration is needed for that step.
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "types_registry__entity")]
 #[secure(unrestricted)]

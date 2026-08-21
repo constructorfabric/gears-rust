@@ -1,34 +1,26 @@
 //! The repository primitives (T4) on `PostgreSQL` and `MySQL`.
 //!
-//! `repo_test.rs` covers `SQLite` unconditionally. Two of the primitives it
-//! exercises there rest on properties `SQLite` cannot demonstrate, which is why
-//! this file exists rather than being a duplicate suite:
+//! `repo_test.rs` covers `SQLite` unconditionally. This file is not a duplicate
+//! suite — it holds the four properties `SQLite` cannot demonstrate:
 //!
 //! * **`create_or_get` reads the loser's unique violation as the serialization
-//!   point.** `is_unique_violation()` classifies a driver-specific error code —
-//!   `23505` on `PostgreSQL`, `1062` on `MySQL`, `SQLITE_CONSTRAINT_UNIQUE` on
-//!   `SQLite`. A misclassification on one backend turns an ordinary race into a
-//!   failed admission, and only that backend's evidence would catch it.
+//!   point.** `is_unique_violation()` classifies a driver-specific error code
+//!   (`23505` / `1062` / `SQLITE_CONSTRAINT_UNIQUE`), and a misclassification on one
+//!   backend turns an ordinary race into a failed admission.
 //! * **The current-document read binds a disjunction of exact
-//!   `(entity_id, revision_no)` pairs**, and the authored document lives in a
-//!   backend-specific large-text column — `text` on `PostgreSQL`, `LONGTEXT` on
-//!   `MySQL`. Both the multi-column `IN`-equivalent and a document larger than
-//!   any `varchar` are things `SQLite`, which is typeless and has no parameter
-//!   shape to get wrong, cannot vouch for.
+//!   `(entity_id, revision_no)` pairs** into a backend-specific large-text column
+//!   (`text` / `LONGTEXT`). `SQLite` is typeless and has no parameter shape to get
+//!   wrong, so it can vouch for neither.
 //! * **A multi-statement read needs snapshot isolation, not merely a transaction.**
-//!   `PostgreSQL` defaults to `READ COMMITTED`, where every statement takes a fresh
-//!   snapshot, so two reads inside one such transaction can still straddle a
-//!   concurrent commit. `ports::snapshot_read()` asks for `RepeatableRead` +
-//!   `ReadOnly` exactly to close that, and `SQLite` — which maps every level onto
-//!   `Serializable` — cannot tell the two apart, so only these backends can show
-//!   that the request has an effect.
-//! * **The keyset cursor's total order is the column's collation.** The
-//!   migration declares `COLLATE "C"` on `PostgreSQL` and `ascii_bin` on `MySQL`
-//!   precisely so `ORDER BY gts_id` and `gts_id > :after` are byte order. On a
-//!   locale collation, punctuation sorts by locale rules instead, and the
-//!   cursor's order would stop matching the order the caller pages in —
-//!   `constraint-multi-backend`. `SQLite` compares `TEXT` bytewise with no
-//!   collation to get wrong, so it cannot fail this test.
+//!   `PostgreSQL` defaults to `READ COMMITTED`, where two reads in one transaction
+//!   can straddle a concurrent commit; `ports::snapshot_read()` asks for
+//!   `RepeatableRead` + `ReadOnly` to close that. `SQLite` maps every level onto
+//!   `Serializable` and cannot tell the two apart.
+//! * **The keyset cursor's total order is the column's collation.** `COLLATE "C"` /
+//!   `ascii_bin` is what makes `ORDER BY gts_id` and `gts_id > :after` byte order;
+//!   under a locale collation the cursor's order would stop matching the order the
+//!   caller pages in (`constraint-multi-backend`). `SQLite` compares `TEXT` bytewise
+//!   with no collation to get wrong.
 //!
 //! Gated behind `--features integration` because it needs a Docker daemon:
 //!
@@ -398,17 +390,15 @@ async fn current_documents_reads_the_current_revision_only(
 /// A read under [`snapshot_read`] does not observe a commit that lands mid-read,
 /// and the same pair of reads on a pooled connection does.
 ///
-/// This is the property the service read paths depend on: `entity()` reads the
-/// entity row, then its current-state artifacts, then its authored document, and a
-/// revision committed between any two of those would otherwise compose a response
-/// out of two different states. The control half matters as much as the assertion —
-/// without it the test would pass against a `READ COMMITTED` transaction, which is
-/// what `PostgreSQL` gives by default and what this configuration exists to avoid.
+/// The property the service read paths depend on: `entity()` reads the entity row,
+/// then its current-state artifacts, then its authored document, and a revision
+/// committed between any two would compose a response out of two states. The control
+/// half matters as much as the assertion — without it the test would pass against
+/// the `READ COMMITTED` transaction `PostgreSQL` gives by default.
 ///
-/// Mutation-checked: replacing `snapshot_read()` with `TxConfig::default()` fails
-/// this on `PostgreSQL` with `(1, 2)` — two reads, two versions — and still passes
-/// on `MySQL`, whose InnoDB default is already `REPEATABLE READ`. So the isolation
-/// request is load-bearing on exactly the backend that needs it.
+/// Mutation-checked: `TxConfig::default()` in place of `snapshot_read()` fails this
+/// on `PostgreSQL` with `(1, 2)` and still passes on `MySQL`, whose InnoDB default is
+/// already `REPEATABLE READ`.
 async fn snapshot_read_does_not_see_a_mid_read_commit(
     db: &Provider,
     family_id: i64,
@@ -507,13 +497,12 @@ async fn snapshot_read_does_not_see_a_mid_read_commit(
 /// shape production ever uses: `create_or_get` is called from the admission commit
 /// transaction, never from a pooled connection.
 ///
-/// This is the case [`family_race_yields_one_row`] cannot cover and the one that was
-/// broken: a *raised* unique violation aborts the transaction on `PostgreSQL`, so the
-/// re-read that recovers from it failed with *"current transaction is aborted,
-/// commands ignored until end of transaction block"* — while the pooled-connection
-/// version of the test passed. Absorbing the conflict (`ON CONFLICT DO NOTHING`)
-/// leaves the transaction usable, and `commit_write` keeps `MySQL` from answering the
-/// re-read out of a pre-race snapshot.
+/// The case [`family_race_yields_one_row`] cannot cover: a *raised* unique violation
+/// aborts the transaction on `PostgreSQL` — *"current transaction is aborted"* — so
+/// the recovering re-read fails, while the pooled-connection version passes.
+/// Absorbing the conflict (`ON CONFLICT DO NOTHING`) leaves the transaction usable,
+/// and `commit_write` keeps `MySQL` from answering the re-read out of a pre-race
+/// snapshot.
 async fn family_race_inside_a_transaction_yields_one_row(db: &Provider, backend: &str) -> i64 {
     let mut handles = Vec::new();
     for _ in 0..8 {
@@ -667,9 +656,14 @@ async fn repository_primitives_behave_on_postgres() {
         .get_host_port_ipv4(5432)
         .await
         .expect("postgres port");
-    wait_for_tcp("127.0.0.1", port, Duration::from_mins(1)).await;
+    let host = container
+        .get_host()
+        .await
+        .expect("postgres container host")
+        .to_string();
+    wait_for_tcp(host.trim_matches(['[', ']']), port, Duration::from_mins(1)).await;
 
-    let db = provider_for(&format!("postgres://user:pass@127.0.0.1:{port}/app"), 8).await;
+    let db = provider_for(&format!("postgres://user:pass@{host}:{port}/app"), 8).await;
     assert_repo_primitives_behave(&db, "postgres").await;
 }
 
@@ -686,8 +680,13 @@ async fn repository_primitives_behave_on_mysql() {
         .get_host_port_ipv4(3306)
         .await
         .expect("mysql port");
-    wait_for_tcp("127.0.0.1", port, Duration::from_mins(2)).await;
+    let host = container
+        .get_host()
+        .await
+        .expect("mysql container host")
+        .to_string();
+    wait_for_tcp(host.trim_matches(['[', ']']), port, Duration::from_mins(2)).await;
 
-    let db = provider_for(&format!("mysql://root@127.0.0.1:{port}/test"), 8).await;
+    let db = provider_for(&format!("mysql://root@{host}:{port}/test"), 8).await;
     assert_repo_primitives_behave(&db, "mysql").await;
 }

@@ -35,7 +35,7 @@ use types_registry::infra::storage::entity::{entity, operation};
 use types_registry::infra::storage::repo::OperationRepo;
 
 mod common;
-use common::{allow_all, stores, test_db, test_db_file};
+use common::{TestDir, allow_all, stores, test_db, test_db_file};
 
 const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const CF_TYPE: &str = gts_id!("cf.core.example.type.v1~");
@@ -91,6 +91,26 @@ fn request(key: &str, content: Value) -> SubmitRequest {
             expected_resource_version: None,
             force: false,
         }],
+    }
+}
+
+fn batch_request(key: &str, count: usize) -> SubmitRequest {
+    let candidates = (1..=count)
+        .map(|major| {
+            let gts_id = format!("gts.cf.core.example.type.v{major}~");
+            Candidate {
+                content: Some(schema(&gts_id)),
+                gts_id,
+                expected_resource_version: None,
+                force: false,
+            }
+        })
+        .collect();
+    SubmitRequest {
+        idempotency_key: key.to_owned(),
+        kind: domain_enums::OperationKind::Registration,
+        dry_run: false,
+        candidates,
     }
 }
 
@@ -159,6 +179,52 @@ async fn an_accepted_request_writes_one_operation_its_items_and_one_dispatch() {
     );
 
     // The dispatch happened once, inside the same transaction.
+    assert_eq!(recorder.calls(), vec![accepted.operation_id]);
+}
+
+/// The configured maximum batch crosses the 70-row SQLite-safe insert chunk.
+/// Persisting all 100 items proves acceptance splits the multi-row INSERT rather
+/// than binding all 1,400 operation-item values in one statement.
+#[tokio::test]
+async fn maximum_batch_is_inserted_across_sqlite_bind_chunks() {
+    let db = test_db().await;
+    let provider = provider(&db);
+    let policy = RegistrationPolicy::default();
+    let config = TypesRegistryConfig::default();
+    let recorder = Arc::new(RecordingDispatch::default());
+    let dispatch: Arc<dyn OperationDispatch> = recorder.clone();
+    let request = batch_request("max-batch", config.limits.batch_candidates);
+    let expected_ids: Vec<&str> = request
+        .candidates
+        .iter()
+        .map(|candidate| candidate.gts_id.as_str())
+        .collect();
+
+    let accepted = accept(
+        &stores(),
+        &provider,
+        &allow_all(),
+        &context(&policy, &config),
+        &dispatch,
+        &request,
+        NOW,
+    )
+    .await
+    .expect("the configured maximum batch must be accepted");
+
+    let conn = provider.conn().expect("conn");
+    let items = OperationRepo::find_items(&conn, &allow_all(), accepted.operation_id)
+        .await
+        .expect("read operation items");
+    assert_eq!(items.len(), config.limits.batch_candidates);
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.gts_id.as_str())
+            .collect::<Vec<_>>(),
+        expected_ids,
+        "chunking must preserve submission order and every candidate"
+    );
     assert_eq!(recorder.calls(), vec![accepted.operation_id]);
 }
 
@@ -459,9 +525,8 @@ async fn a_refused_dry_run_does_not_reserve_the_idempotency_key() {
 /// after verifying the fingerprint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_acceptance_on_one_key_yields_one_operation() {
-    let dir = std::env::temp_dir().join(format!("tr-accept-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join("registry.db");
+    let dir = TestDir::new("tr-accept");
+    let path = dir.path().join("registry.db");
     let db = test_db_file(&path).await;
 
     let mut handles = Vec::new();
@@ -519,9 +584,6 @@ async fn concurrent_acceptance_on_one_key_yields_one_operation() {
         .await
         .expect("read operations");
     assert_eq!(all.len(), 1, "exactly one operation row");
-
-    drop(db);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -537,9 +599,8 @@ async fn concurrent_acceptance_on_one_key_yields_one_operation() {
 async fn acceptance_reads_no_entity_state() {
     use sea_orm::{ConnectionTrait, Database, Statement};
 
-    let dir = std::env::temp_dir().join(format!("tr-noentity-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join("registry.db");
+    let dir = TestDir::new("tr-noentity");
+    let path = dir.path().join("registry.db");
     let db = test_db_file(&path).await;
 
     let raw = Database::connect(format!("sqlite://{}?mode=rwc", path.display()))
@@ -576,6 +637,4 @@ async fn acceptance_reads_no_entity_state() {
     .expect("acceptance must not touch entity state");
 
     drop(raw);
-    drop(db);
-    std::fs::remove_dir_all(&dir).ok();
 }

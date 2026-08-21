@@ -85,34 +85,26 @@ impl From<DomainError> for CanonicalError {
 //
 // Every refusal below becomes an RFC-9457 problem through the canonical-error
 // ladder — never a raw status tuple. One arm per `AcceptanceError` variant, so a
-// new refusal reason cannot reach the wire as an opaque 500 by omission: the
-// match is exhaustive and the compiler enforces it.
+// new refusal reason cannot reach the wire as an opaque 500 by omission.
 //
 // # The wire detail is written here, not taken from `Display`
 //
 // Each wire `detail` is composed from the variant's own fields rather than from its
-// `Display`, which is the pattern every other gear in this workspace follows
-// (file-storage, chat-engine, mini-chat, oagw, resource-group, nodes-registry) and
-// what DE1302 enforces.
+// `Display` — the pattern every other gear here follows, and what DE1302 enforces.
+// `CanonicalError` is a terminal RFC-9457 document with no `source()` slot, so
+// piping `Display` into it would fuse two messages with different audiences: the
+// `#[error(...)]` text is for operators reading logs and names internals
+// (`limits.batch_candidates`, `allow_compatibility_force`), while `detail` is a
+// public API string. Fused, a reworded log line silently changes the wire contract.
+// Infrastructure failures likewise log the cause and answer with a generic detail,
+// because a rendered `DbErr` can carry a table name, a constraint name or SQL.
 //
-// **One arm renders, on purpose.** `PolicyRefused` calls `refusal.to_string()`,
-// because `PolicyRefusal` is not an error being converted — it is a value whose
-// whole content is the region and the parameter an operator has to edit, and the
+// **One arm renders, on purpose.** `PolicyRefused` calls `refusal.to_string()`:
+// `PolicyRefusal` is not an error being converted but a value whose whole content
+// is the region and the parameter an operator has to edit, and the
 // `failed_precondition` constructor locks the wire `detail`, so that content
-// survives only in the violation's description. The reasoning is at that arm. What
-// the rule below forbids is rendering an `AcceptanceError` or a `WorkerError`; a
-// policy refusal carries no internals to leak.
-//
-// It is not a formality. `CanonicalError` is a terminal RFC-9457 document with no
-// `source()` slot, so piping `Display` into it would fuse two messages with
-// different audiences: the `#[error(...)]` text exists for operators reading logs
-// and names internals (`limits.batch_candidates`, `allow_compatibility_force`),
-// while `detail` is a public API string. Fused, a reworded log line silently
-// changes the wire contract, and internal vocabulary leaks to callers.
-//
-// Infrastructure failures therefore log the cause and answer with a generic
-// detail. A `DbErr` rendered onto the wire can carry a table name, a constraint
-// name or a fragment of SQL, and none of it is actionable by the caller.
+// survives only in the violation's description. It carries no internals to leak.
+// The reasoning is repeated at that arm.
 
 /// What the caller is told when the failure is ours.
 const OPAQUE_INTERNAL: &str = "An internal error occurred. Please retry later.";

@@ -1,36 +1,33 @@
 //! The domain's enumeration vocabularies.
 //!
-//! These are the types the domain reasons with. They carry **no** storage
-//! representation: no `smallint` mapping, no `sea_orm` derive, nothing that ties a
-//! variant to a column. Their persisted counterparts live in
-//! `infra::storage::entity::enums`, which owns the integers `database.sql` fixes
+//! These carry **no** storage representation: no `smallint` mapping, no `sea_orm`
+//! derive, nothing tying a variant to a column. Their persisted counterparts live
+//! in `infra::storage::entity::enums`, which owns the integers `database.sql` fixes
 //! and converts in both directions.
 //!
 //! # Why the same variants exist twice
 //!
-//! Because the two sides answer different questions and change for different
-//! reasons. The storage enums are constrained by an append-only numbering, by
-//! CHECK constraints that enumerate values, and by the rule that numbering is
+//! The storage enums are constrained by an append-only numbering, by CHECK
+//! constraints that enumerate values, and by the rule that numbering is
 //! deliberately *not* aligned between columns — none of which is a domain concern.
 //! The domain enums are constrained only by what the business rules distinguish.
+//! The duplication costs two edits per new variant; what keeps it honest is that
+//! the conversions in `infra::storage::entity::enums` are exhaustive matches, so a
+//! new variant fails to compile until the other side and the DDL agree. A single
+//! shared type let a variant reach the database with no CHECK to admit it.
 //!
-//! The duplication is not free: it is two places to edit when a vocabulary grows.
-//! What keeps them honest is that the conversions in
-//! `infra::storage::entity::enums` are exhaustive matches, so adding a variant on
-//! either side fails to compile until the other side and the DDL agree. That is a
-//! stronger guarantee than a single shared type gave us, because the single shared
-//! type let a new variant reach the database with no CHECK to admit it.
-//!
-//! No `Serialize` / `Deserialize` / `ToSchema` here either. The wire vocabulary is
-//! the SDK's and REST's business (`api/rest/dto.rs`), and deriving serde on a
-//! domain enum is how the storage numbering leaked onto the wire in the first
-//! place.
+//! No `Serialize` / `Deserialize` / `ToSchema` here either: the wire vocabulary is
+//! REST's business (`api/rest/dto.rs`), and deriving serde on a domain enum is how
+//! the storage numbering leaked onto the wire in the first place.
+
+use toolkit_macros::domain_model;
 
 /// `version_family.ownership_scope`, `entity.ownership_scope` — global or tenant
 /// ownership (ADR-0009).
 ///
 /// P0 admits `Global` only; `Tenant` exists because the distinction is already
 /// part of the model P1 tenancy fills in.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OwnershipScope {
     Global,
@@ -42,6 +39,7 @@ pub enum OwnershipScope {
 /// Follows from the identifier's trailing `~`; it is carried explicitly because
 /// several rules branch on it and re-deriving it at each branch would let the two
 /// readings drift.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EntityKind {
     TypeSchema,
@@ -52,6 +50,7 @@ pub enum EntityKind {
 ///
 /// P0 has no managed `deprecated` state. `Deleted` entities remain readable so
 /// issued Registry References stay reverse-resolvable until purge.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LifecycleStatus {
     Active,
@@ -63,6 +62,7 @@ pub enum LifecycleStatus {
 /// Dry run is **not** a kind: it is orthogonal, carried alongside, and part of the
 /// request fingerprint — so one `Idempotency-Key` cannot replay a dry run as a
 /// commit.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OperationKind {
     Registration,
@@ -73,6 +73,7 @@ pub enum OperationKind {
 ///
 /// Every P0 operation is `Platform`. The plane is expressed by the contract and
 /// the data, not enforced by the transport (ceiling C8).
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Plane {
     Platform,
@@ -85,6 +86,7 @@ pub enum Plane {
 /// items and are deliberately not aggregated here. There is no cancellation or
 /// expiry state: redelivery retries idempotently, and after exhaustion existing
 /// terminal outcomes stay intact while unfinished items fail with a reason.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OperationStatus {
     Pending,
@@ -103,6 +105,7 @@ pub enum OperationStatus {
 /// `blocked_by_dependency` reason instead. Dry-run success is `Succeeded` rather
 /// than a separate "would succeed", because the operation already exposes the mode
 /// and restating it per item would be a second vocabulary.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OperationItemStatus {
     Pending,
@@ -118,6 +121,7 @@ pub enum OperationItemStatus {
 /// schema-resolution dependency, which is why the strict reference extractor in
 /// `gts-rust` excludes it from resolution. Its edge protects the entity the value
 /// or the constraint names, not constraint satisfiability.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DependencyKind {
     SchemaRef,

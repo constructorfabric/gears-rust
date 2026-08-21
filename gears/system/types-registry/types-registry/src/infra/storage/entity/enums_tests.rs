@@ -2,14 +2,13 @@
 //! writes beside each column.
 //!
 //! These numbers are a storage contract: `database.sql` makes the numbering
-//! append-only after the first release, because renumbering is a data migration.
-//! A variant reordered or inserted in the middle would silently reinterpret
-//! every existing row, and nothing else in the build would notice — a
-//! `DeriveActiveEnum` with `num_value` compiles whatever numbers it is given.
+//! append-only after the first release, because renumbering is a data migration. A
+//! variant reordered or inserted in the middle would silently reinterpret every
+//! existing row, and nothing else in the build would notice — `DeriveActiveEnum`
+//! compiles whatever `num_value` it is given.
 //!
-//! Every case is written out literally rather than derived from the variant
-//! order, because deriving it from the order would restate the bug it is meant
-//! to catch.
+//! Every case is written out literally rather than derived from the variant order,
+//! which would restate the bug it is meant to catch.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
