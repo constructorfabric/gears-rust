@@ -10,6 +10,7 @@ use crate::domain::service::Service;
 use crate::infra::storage::sea_orm_repo::{
     SeaOrmCommentRepository, SeaOrmCommitRepository, SeaOrmIssueRepository,
     SeaOrmPullRequestRepository, SeaOrmRepoRepository, SeaOrmReviewCommentRepository,
+    SeaOrmReviewRepository,
 };
 
 pub type ConcreteService = Service<
@@ -19,6 +20,7 @@ pub type ConcreteService = Service<
     SeaOrmCommitRepository,
     SeaOrmCommentRepository,
     SeaOrmReviewCommentRepository,
+    SeaOrmReviewRepository,
 >;
 
 const API_TAG: &str = "GitHub Mirror";
@@ -173,6 +175,12 @@ pub fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
+    router = register_comment_routes(router, openapi);
+
+    router.layer(Extension(service))
+}
+
+fn register_comment_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     router =
         OperationBuilder::get("/github-mirror/v1/repos/{owner}/{name}/issues/{number}/comments")
             .operation_id("github_mirror.list_comments")
@@ -227,5 +235,31 @@ pub fn register_routes(
             .error_500(openapi)
             .register(router, openapi);
 
-    router.layer(Extension(service))
+    router = OperationBuilder::get("/github-mirror/v1/repos/{owner}/{name}/pulls/{number}/reviews")
+        .operation_id("github_mirror.list_reviews")
+        .summary("List mirrored reviews of a pull request")
+        .description(
+            "Returns pull-request reviews (approve/request-changes/comment verdicts) held in              the local mirror for the tenant, oldest first",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("owner", "Repository owner login")
+        .path_param("name", "Repository name")
+        .path_param("number", "Pull request number")
+        .query_param("limit", false, "Maximum number of reviews to return")
+        .handler(handlers::list_reviews)
+        .json_response_with_schema::<toolkit_odata::Page<dto::ReviewDto>>(
+            openapi,
+            StatusCode::OK,
+            "Paginated list of mirrored reviews",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router
 }

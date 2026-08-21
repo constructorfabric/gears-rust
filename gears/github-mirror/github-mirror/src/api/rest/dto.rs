@@ -1,4 +1,4 @@
-use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository, ReviewComment};
+use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository, Review, ReviewComment};
 
 use crate::domain::service::{MirrorStatus, SyncSummary};
 
@@ -166,6 +166,7 @@ pub struct SyncSummaryDto {
     pub commits_synced: u64,
     pub comments_synced: u64,
     pub review_comments_synced: u64,
+    pub reviews_synced: u64,
 }
 
 impl From<SyncSummary> for SyncSummaryDto {
@@ -177,6 +178,7 @@ impl From<SyncSummary> for SyncSummaryDto {
             commits_synced: s.commits_synced,
             comments_synced: s.comments_synced,
             review_comments_synced: s.review_comments_synced,
+            reviews_synced: s.reviews_synced,
         }
     }
 }
@@ -243,6 +245,37 @@ impl From<ReviewComment> for ReviewCommentDto {
             created_at: c.created_at,
             updated_at: c.updated_at,
             html_url: c.html_url,
+        }
+    }
+}
+
+/// A mirrored GitHub PR review as served by the read API.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ReviewDto {
+    pub id: i64,
+    pub repo_id: i64,
+    pub pull_number: i64,
+    pub author_login: Option<String>,
+    pub state: String,
+    pub body: Option<String>,
+    pub commit_id: Option<String>,
+    pub submitted_at: Option<String>,
+    pub html_url: Option<String>,
+}
+
+impl From<Review> for ReviewDto {
+    fn from(r: Review) -> Self {
+        Self {
+            id: r.id,
+            repo_id: r.repo_id,
+            pull_number: r.pull_number,
+            author_login: r.author_login,
+            state: r.state,
+            body: r.body,
+            commit_id: r.commit_id,
+            submitted_at: r.submitted_at,
+            html_url: r.html_url,
         }
     }
 }

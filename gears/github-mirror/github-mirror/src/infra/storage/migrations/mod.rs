@@ -6,6 +6,7 @@ pub mod initial_001;
 pub mod issues_002;
 pub mod pull_requests_003;
 pub mod review_comments_006;
+pub mod reviews_007;
 
 pub struct Migrator;
 
@@ -19,6 +20,7 @@ impl MigratorTrait for Migrator {
             Box::new(commits_004::Migration),
             Box::new(comments_005::Migration),
             Box::new(review_comments_006::Migration),
+            Box::new(reviews_007::Migration),
         ]
     }
 }

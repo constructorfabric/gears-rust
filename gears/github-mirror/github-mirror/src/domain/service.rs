@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
-use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository, ReviewComment};
+use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository, Review, ReviewComment};
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page, PageInfo};
 use toolkit_security::{SecurityContext, pep_properties};
@@ -12,7 +12,7 @@ use super::ports::github::GithubPort;
 use super::repo::{
     CommentRecord, CommentRepository, CommitRecord, CommitRepository, IssueRecord, IssueRepository,
     PullRequestRecord, PullRequestRepository, RepoRepository, RepositoryRecord,
-    ReviewCommentRecord, ReviewCommentRepository,
+    ReviewCommentRecord, ReviewCommentRepository, ReviewRecord, ReviewRepository,
 };
 
 pub const GEAR_NAME: &str = "github-mirror";
@@ -51,6 +51,11 @@ pub(crate) const REVIEW_COMMENT_RESOURCE: ResourceType = ResourceType::from_stat
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+pub(crate) const REVIEW_RESOURCE: ResourceType = ResourceType::from_static(
+    "github_mirror.review",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
+
 pub(crate) const SYNC_RESOURCE: ResourceType =
     ResourceType::from_static("github_mirror.sync", &[pep_properties::OWNER_TENANT_ID]);
 
@@ -84,6 +89,7 @@ pub struct SyncSummary {
     pub commits_synced: u64,
     pub comments_synced: u64,
     pub review_comments_synced: u64,
+    pub reviews_synced: u64,
 }
 
 #[domain_model]
@@ -94,6 +100,7 @@ pub struct Service<
     C: CommitRepository,
     M: CommentRepository,
     V: ReviewCommentRepository,
+    W: ReviewRepository,
 > {
     db: Arc<DbProvider>,
     repo: Arc<R>,
@@ -102,6 +109,7 @@ pub struct Service<
     commits: Arc<C>,
     comments: Arc<M>,
     review_comments: Arc<V>,
+    reviews: Arc<W>,
     github: Arc<dyn GithubPort>,
     policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
@@ -114,7 +122,8 @@ impl<
     C: CommitRepository,
     M: CommentRepository,
     V: ReviewCommentRepository,
-> Service<R, I, P, C, M, V>
+    W: ReviewRepository,
+> Service<R, I, P, C, M, V, W>
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -125,6 +134,7 @@ impl<
         commits: Arc<C>,
         comments: Arc<M>,
         review_comments: Arc<V>,
+        reviews: Arc<W>,
         github: Arc<dyn GithubPort>,
         policy_enforcer: PolicyEnforcer,
         config: ServiceConfig,
@@ -137,6 +147,7 @@ impl<
             commits,
             comments,
             review_comments,
+            reviews,
             github,
             policy_enforcer,
             config,
@@ -670,6 +681,96 @@ impl<
             .await
     }
 
+    /// List mirrored reviews of one pull request, tenant-scoped, oldest
+    /// first (by review id).
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored for this
+    /// tenant; `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn list_reviews(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        pull_number: i64,
+        query: &ODataQuery,
+    ) -> Result<Page<Review>, DomainError> {
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &REVIEW_RESOURCE,
+                actions::LIST,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+        let items = self
+            .reviews
+            .list_by_pull(&conn, &scope, repository.id, pull_number, limit)
+            .await?;
+
+        Ok(Page::new(
+            items,
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit,
+            },
+        ))
+    }
+
+    /// Insert or update a mirrored review row for the caller's tenant.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored;
+    /// `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn upsert_review(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        record: ReviewRecord,
+    ) -> Result<Review, DomainError> {
+        let tenant_id = ctx.subject_tenant_id();
+
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &REVIEW_RESOURCE,
+                actions::UPSERT,
+                None,
+                &AccessRequest::new().resource_property(pep_properties::OWNER_TENANT_ID, tenant_id),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let record = ReviewRecord {
+            repo_id: repository.id,
+            ..record
+        };
+        self.reviews.upsert(&conn, &scope, tenant_id, record).await
+    }
+
     /// Fetch one repository from GitHub (first slice: repo + first page of
     /// issues, pull requests, and commits) and upsert it into the mirror.
     ///
@@ -746,6 +847,14 @@ impl<
             review_comments_synced += 1;
         }
 
+        let mut reviews_synced: u64 = 0;
+        for record in fetched.reviews {
+            self.reviews
+                .upsert(&conn, &scope, tenant_id, record)
+                .await?;
+            reviews_synced += 1;
+        }
+
         Ok(SyncSummary {
             repository: repository.full_name,
             issues_synced,
@@ -753,6 +862,7 @@ impl<
             commits_synced,
             comments_synced,
             review_comments_synced,
+            reviews_synced,
         })
     }
 }

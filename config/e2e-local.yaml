@@ -427,6 +427,13 @@ gears:
       file: "settings.db"
     config: {}
 
+  github-mirror:
+    database:
+      server: "sqlite_users"
+      file: "github_mirror.db"
+    config:
+      api_base_url: "https://api.github.com"
+
   file-parser:
     config:
       allowed_local_base_dir: /tmp

@@ -5,10 +5,13 @@ use crate::domain::error::DomainError;
 use crate::domain::ports::github::{FetchedRepository, GithubPort};
 use crate::domain::repo::{
     CommentRecord, CommitRecord, IssueRecord, PullRequestRecord, RepositoryRecord,
-    ReviewCommentRecord,
+    ReviewCommentRecord, ReviewRecord,
 };
 
 const FIRST_PAGE_SIZE: u32 = 50;
+/// GitHub serves reviews only per pull request, so sync-lite fetches them
+/// for the first few pulls of the page to keep the call count bounded.
+const REVIEW_SYNC_PULL_CAP: usize = 10;
 const USER_AGENT: &str = concat!("cf-gears-github-mirror/", env!("CARGO_PKG_VERSION"));
 
 /// Minimal GitHub REST client — increment 1 of gears-rust#4630.
@@ -171,6 +174,18 @@ struct GhReviewComment {
 }
 
 #[derive(Debug, Deserialize)]
+struct GhReview {
+    id: i64,
+    #[serde(default)]
+    user: Option<GhActor>,
+    state: String,
+    body: Option<String>,
+    commit_id: Option<String>,
+    submitted_at: Option<String>,
+    html_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GhCommit {
     sha: String,
     commit: GhCommitDetails,
@@ -269,6 +284,20 @@ fn review_comment_record(repo_id: i64, c: GhReviewComment) -> ReviewCommentRecor
     }
 }
 
+fn review_record(repo_id: i64, pull_number: i64, r: GhReview) -> ReviewRecord {
+    ReviewRecord {
+        id: r.id,
+        repo_id,
+        pull_number,
+        author_login: r.user.map(|u| u.login),
+        state: r.state,
+        body: r.body,
+        commit_id: r.commit_id,
+        submitted_at: r.submitted_at,
+        html_url: r.html_url,
+    }
+}
+
 fn commit_record(repo_id: i64, c: GhCommit) -> CommitRecord {
     CommitRecord {
         repo_id,
@@ -319,6 +348,20 @@ impl GithubPort for GithubClient {
             ))
             .await?;
 
+        let mut reviews: Vec<ReviewRecord> = Vec::new();
+        for pull in pulls.iter().take(REVIEW_SYNC_PULL_CAP) {
+            let page: Vec<GhReview> = self
+                .get_json(&format!(
+                    "/repos/{owner}/{name}/pulls/{}/reviews?per_page={FIRST_PAGE_SIZE}",
+                    pull.number
+                ))
+                .await?;
+            reviews.extend(
+                page.into_iter()
+                    .map(|r| review_record(repo_id, pull.number, r)),
+            );
+        }
+
         Ok(FetchedRepository {
             repository: repository_record(repo),
             issues: issues
@@ -341,6 +384,7 @@ impl GithubPort for GithubClient {
                 .into_iter()
                 .map(|c| review_comment_record(repo_id, c))
                 .collect(),
+            reviews,
         })
     }
 }

@@ -97,6 +97,20 @@ fn gh_review_comments_json() -> serde_json::Value {
     ])
 }
 
+fn gh_reviews_json() -> serde_json::Value {
+    json!([
+        {
+            "id": 31,
+            "user": { "login": "erin" },
+            "state": "APPROVED",
+            "body": "ship it",
+            "commit_id": "h1",
+            "submitted_at": "2026-08-20T00:00:00Z",
+            "html_url": "https://github.com/rust-lang/rust/pull/13#pullrequestreview-31"
+        }
+    ])
+}
+
 #[tokio::test]
 async fn fetch_repository_maps_github_payloads_into_records() {
     let server = MockServer::start_async().await;
@@ -136,6 +150,13 @@ async fn fetch_repository_maps_github_payloads_into_records() {
             when.method("GET")
                 .path("/repos/rust-lang/rust/pulls/comments");
             then.status(200).json_body(gh_review_comments_json());
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method("GET")
+                .path("/repos/rust-lang/rust/pulls/13/reviews");
+            then.status(200).json_body(gh_reviews_json());
         })
         .await;
 
@@ -183,6 +204,11 @@ async fn fetch_repository_maps_github_payloads_into_records() {
         fetched.review_comments[0].path.as_deref(),
         Some("src/lib.rs")
     );
+
+    assert_eq!(fetched.reviews.len(), 1);
+    assert_eq!(fetched.reviews[0].pull_number, 13);
+    assert_eq!(fetched.reviews[0].state, "APPROVED");
+    assert_eq!(fetched.reviews[0].author_login.as_deref(), Some("erin"));
 }
 
 #[tokio::test]

@@ -11,7 +11,7 @@ use crate::api::rest::routes::ConcreteService;
 
 use super::dto::{
     CommentDto, CommitDto, GithubMirrorHealthDto, IssueDto, PullRequestDto, RepositoryDto,
-    ReviewCommentDto, SyncSummaryDto,
+    ReviewCommentDto, ReviewDto, SyncSummaryDto,
 };
 
 pub async fn health(
@@ -91,4 +91,16 @@ pub async fn list_review_comments(
         .list_review_comments(&ctx, &owner, &name, number, &query)
         .await?;
     Ok(Json(page.map_items(ReviewCommentDto::from)))
+}
+
+pub async fn list_reviews(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    OData(query): OData,
+) -> ApiResult<JsonPage<ReviewDto>> {
+    let page: Page<_> = svc
+        .list_reviews(&ctx, &owner, &name, number, &query)
+        .await?;
+    Ok(Json(page.map_items(ReviewDto::from)))
 }

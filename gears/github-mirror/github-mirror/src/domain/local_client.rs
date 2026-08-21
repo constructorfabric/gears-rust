@@ -10,7 +10,7 @@ use toolkit_security::SecurityContext;
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
     CommentRepository, CommitRepository, IssueRepository, PullRequestRepository, RepoRepository,
-    ReviewCommentRepository,
+    ReviewCommentRepository, ReviewRepository,
 };
 use crate::domain::service::Service;
 
@@ -48,7 +48,7 @@ impl From<DomainError> for CanonicalError {
     }
 }
 
-type SharedService<R, I, P, C, M, V> = Arc<Service<R, I, P, C, M, V>>;
+type SharedService<R, I, P, C, M, V, W> = Arc<Service<R, I, P, C, M, V, W>>;
 
 #[domain_model]
 pub struct LocalClient<
@@ -58,8 +58,9 @@ pub struct LocalClient<
     C: CommitRepository + 'static,
     M: CommentRepository + 'static,
     V: ReviewCommentRepository + 'static,
+    W: ReviewRepository + 'static,
 > {
-    service: SharedService<R, I, P, C, M, V>,
+    service: SharedService<R, I, P, C, M, V, W>,
 }
 
 impl<
@@ -69,10 +70,11 @@ impl<
     C: CommitRepository + 'static,
     M: CommentRepository + 'static,
     V: ReviewCommentRepository + 'static,
-> LocalClient<R, I, P, C, M, V>
+    W: ReviewRepository + 'static,
+> LocalClient<R, I, P, C, M, V, W>
 {
     #[must_use]
-    pub fn new(service: SharedService<R, I, P, C, M, V>) -> Self {
+    pub fn new(service: SharedService<R, I, P, C, M, V, W>) -> Self {
         Self { service }
     }
 }
@@ -85,7 +87,8 @@ impl<
     C: CommitRepository + 'static,
     M: CommentRepository + 'static,
     V: ReviewCommentRepository + 'static,
-> GithubMirrorClientV1 for LocalClient<R, I, P, C, M, V>
+    W: ReviewRepository + 'static,
+> GithubMirrorClientV1 for LocalClient<R, I, P, C, M, V, W>
 {
     async fn status(&self, _ctx: &SecurityContext) -> Result<MirrorStatus, CanonicalError> {
         let status = self.service.status();
@@ -125,6 +128,7 @@ impl<
             commits_synced: summary.commits_synced,
             comments_synced: summary.comments_synced,
             review_comments_synced: summary.review_comments_synced,
+            reviews_synced: summary.reviews_synced,
         })
     }
 }

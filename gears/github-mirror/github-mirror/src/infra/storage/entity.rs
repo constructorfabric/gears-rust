@@ -219,3 +219,37 @@ pub mod review_comments {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod reviews {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    /// Mirrored GitHub PR review (the verdict object), tenant-scoped.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_reviews")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        /// GitHub review id.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: i64,
+        /// Owning repository's GitHub id.
+        pub repo_id: i64,
+        /// Owning pull-request number.
+        pub pull_number: i64,
+        pub author_login: Option<String>,
+        /// `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED`, or `PENDING`.
+        pub state: String,
+        pub body: Option<String>,
+        pub commit_id: Option<String>,
+        /// RFC3339 timestamp kept as text; absent for PENDING reviews.
+        pub submitted_at: Option<String>,
+        pub html_url: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
