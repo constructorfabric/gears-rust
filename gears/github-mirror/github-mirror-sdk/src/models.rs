@@ -108,6 +108,7 @@ pub struct SyncSummary {
     pub review_comments_synced: u64,
     pub reviews_synced: u64,
     pub labels_synced: u64,
+    pub milestones_synced: u64,
 }
 
 /// A mirrored GitHub issue/PR comment (read-slice shape).
@@ -186,4 +187,27 @@ pub struct Label {
     /// True for GitHub's default label set (bug, documentation, ...).
     pub is_default: bool,
     pub description: Option<String>,
+}
+
+/// A mirrored GitHub milestone (read-slice shape).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Milestone {
+    /// GitHub's numeric milestone id.
+    pub id: i64,
+    /// Owning repository's GitHub id.
+    pub repo_id: i64,
+    /// Milestone number within the repository.
+    pub number: i64,
+    pub title: String,
+    /// open or closed.
+    pub state: String,
+    pub description: Option<String>,
+    pub open_issues: i64,
+    pub closed_issues: i64,
+    pub due_on: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub html_url: Option<String>,
 }

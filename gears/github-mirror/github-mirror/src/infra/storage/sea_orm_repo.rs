@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use github_mirror_sdk::{
-    Comment, Commit, Issue, Label, PullRequest, Repository, Review, ReviewComment,
+    Comment, Commit, Issue, Label, Milestone, PullRequest, Repository, Review, ReviewComment,
 };
 use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, Order};
 use toolkit_db::secure::{
@@ -12,14 +12,16 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
     CommentRecord, CommentRepository, CommitRecord, CommitRepository, IssueRecord, IssueRepository,
-    LabelRecord, LabelRepository, PullRequestRecord, PullRequestRepository, RepoRepository,
-    RepositoryRecord, ReviewCommentRecord, ReviewCommentRepository, ReviewRecord, ReviewRepository,
+    LabelRecord, LabelRepository, MilestoneRecord, MilestoneRepository, PullRequestRecord,
+    PullRequestRepository, RepoRepository, RepositoryRecord, ReviewCommentRecord,
+    ReviewCommentRepository, ReviewRecord, ReviewRepository,
 };
 
 use super::entity::comments::{self, Entity as CommentEntity};
 use super::entity::commits::{self, Entity as CommitEntity};
 use super::entity::issues::{self, Entity as IssueEntity};
 use super::entity::labels::{self, Entity as LabelEntity};
+use super::entity::milestones::{self, Entity as MilestoneEntity};
 use super::entity::pull_requests::{self, Entity as PullRequestEntity};
 use super::entity::repositories::{self, Entity as RepoEntity};
 use super::entity::review_comments::{self, Entity as ReviewCommentEntity};
@@ -867,6 +869,116 @@ impl LabelRepository for SeaOrmLabelRepository {
             .scope_with(scope)
             .filter(sea_orm::Condition::all().add(labels::Column::RepoId.eq(repo_id)))
             .order_by(labels::Column::Name, Order::Asc)
+            .limit(limit)
+            .all(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+
+pub struct SeaOrmMilestoneRepository;
+
+impl SeaOrmMilestoneRepository {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SeaOrmMilestoneRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn milestone_active_model(tenant_id: Uuid, r: &MilestoneRecord) -> milestones::ActiveModel {
+    milestones::ActiveModel {
+        tenant_id: ActiveValue::Set(tenant_id),
+        id: ActiveValue::Set(r.id),
+        repo_id: ActiveValue::Set(r.repo_id),
+        number: ActiveValue::Set(r.number),
+        title: ActiveValue::Set(r.title.clone()),
+        state: ActiveValue::Set(r.state.clone()),
+        description: ActiveValue::Set(r.description.clone()),
+        open_issues: ActiveValue::Set(r.open_issues),
+        closed_issues: ActiveValue::Set(r.closed_issues),
+        due_on: ActiveValue::Set(r.due_on.clone()),
+        created_at: ActiveValue::Set(r.created_at.clone()),
+        updated_at: ActiveValue::Set(r.updated_at.clone()),
+        closed_at: ActiveValue::Set(r.closed_at.clone()),
+        html_url: ActiveValue::Set(r.html_url.clone()),
+    }
+}
+
+#[async_trait]
+impl MilestoneRepository for SeaOrmMilestoneRepository {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: MilestoneRecord,
+    ) -> Result<Milestone, DomainError> {
+        let on_conflict = SecureOnConflict::<MilestoneEntity>::columns([
+            milestones::Column::TenantId,
+            milestones::Column::Id,
+        ])
+        .update_columns([
+            milestones::Column::RepoId,
+            milestones::Column::Number,
+            milestones::Column::Title,
+            milestones::Column::State,
+            milestones::Column::Description,
+            milestones::Column::OpenIssues,
+            milestones::Column::ClosedIssues,
+            milestones::Column::DueOn,
+            milestones::Column::CreatedAt,
+            milestones::Column::UpdatedAt,
+            milestones::Column::ClosedAt,
+            milestones::Column::HtmlUrl,
+        ])
+        .map_err(map_scope_error)?;
+
+        MilestoneEntity::insert(milestone_active_model(tenant_id, &record))
+            .secure()
+            .scope_with_model(scope, &milestone_active_model(tenant_id, &record))
+            .map_err(map_scope_error)?
+            .on_conflict(on_conflict)
+            .exec(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(Milestone {
+            id: record.id,
+            repo_id: record.repo_id,
+            number: record.number,
+            title: record.title,
+            state: record.state,
+            description: record.description,
+            open_issues: record.open_issues,
+            closed_issues: record.closed_issues,
+            due_on: record.due_on,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            closed_at: record.closed_at,
+            html_url: record.html_url,
+        })
+    }
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Milestone>, DomainError> {
+        let rows = MilestoneEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(sea_orm::Condition::all().add(milestones::Column::RepoId.eq(repo_id)))
+            .order_by(milestones::Column::Number, Order::Asc)
             .limit(limit)
             .all(conn)
             .await

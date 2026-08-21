@@ -3,7 +3,7 @@ use std::sync::Arc;
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use github_mirror_sdk::{
-    Comment, Commit, Issue, Label, PullRequest, Repository, Review, ReviewComment,
+    Comment, Commit, Issue, Label, Milestone, PullRequest, Repository, Review, ReviewComment,
 };
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page, PageInfo};
@@ -13,8 +13,9 @@ use super::error::DomainError;
 use super::ports::github::GithubPort;
 use super::repo::{
     CommentRecord, CommentRepository, CommitRecord, CommitRepository, IssueRecord, IssueRepository,
-    LabelRecord, LabelRepository, PullRequestRecord, PullRequestRepository, RepoRepository,
-    RepositoryRecord, ReviewCommentRecord, ReviewCommentRepository, ReviewRecord, ReviewRepository,
+    LabelRecord, LabelRepository, MilestoneRecord, MilestoneRepository, PullRequestRecord,
+    PullRequestRepository, RepoRepository, RepositoryRecord, ReviewCommentRecord,
+    ReviewCommentRepository, ReviewRecord, ReviewRepository,
 };
 
 pub const GEAR_NAME: &str = "github-mirror";
@@ -63,6 +64,11 @@ pub(crate) const LABEL_RESOURCE: ResourceType = ResourceType::from_static(
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+pub(crate) const MILESTONE_RESOURCE: ResourceType = ResourceType::from_static(
+    "github_mirror.milestone",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
+
 pub(crate) const SYNC_RESOURCE: ResourceType =
     ResourceType::from_static("github_mirror.sync", &[pep_properties::OWNER_TENANT_ID]);
 
@@ -98,6 +104,7 @@ pub struct SyncSummary {
     pub review_comments_synced: u64,
     pub reviews_synced: u64,
     pub labels_synced: u64,
+    pub milestones_synced: u64,
 }
 
 #[domain_model]
@@ -110,6 +117,7 @@ pub struct Service<
     V: ReviewCommentRepository,
     W: ReviewRepository,
     L: LabelRepository,
+    N: MilestoneRepository,
 > {
     db: Arc<DbProvider>,
     repo: Arc<R>,
@@ -120,6 +128,7 @@ pub struct Service<
     review_comments: Arc<V>,
     reviews: Arc<W>,
     labels: Arc<L>,
+    milestones: Arc<N>,
     github: Arc<dyn GithubPort>,
     policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
@@ -134,7 +143,8 @@ impl<
     V: ReviewCommentRepository,
     W: ReviewRepository,
     L: LabelRepository,
-> Service<R, I, P, C, M, V, W, L>
+    N: MilestoneRepository,
+> Service<R, I, P, C, M, V, W, L, N>
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -147,6 +157,7 @@ impl<
         review_comments: Arc<V>,
         reviews: Arc<W>,
         labels: Arc<L>,
+        milestones: Arc<N>,
         github: Arc<dyn GithubPort>,
         policy_enforcer: PolicyEnforcer,
         config: ServiceConfig,
@@ -161,6 +172,7 @@ impl<
             review_comments,
             reviews,
             labels,
+            milestones,
             github,
             policy_enforcer,
             config,
@@ -873,6 +885,97 @@ impl<
         self.labels.upsert(&conn, &scope, tenant_id, record).await
     }
 
+    /// List mirrored milestones of one repository (`owner/name`),
+    /// tenant-scoped, by milestone number.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored for this
+    /// tenant; `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn list_milestones(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        query: &ODataQuery,
+    ) -> Result<Page<Milestone>, DomainError> {
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &MILESTONE_RESOURCE,
+                actions::LIST,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+        let items = self
+            .milestones
+            .list_by_repo(&conn, &scope, repository.id, limit)
+            .await?;
+
+        Ok(Page::new(
+            items,
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit,
+            },
+        ))
+    }
+
+    /// Insert or update a mirrored milestone row for the caller's tenant.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored;
+    /// `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn upsert_milestone(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        record: MilestoneRecord,
+    ) -> Result<Milestone, DomainError> {
+        let tenant_id = ctx.subject_tenant_id();
+
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &MILESTONE_RESOURCE,
+                actions::UPSERT,
+                None,
+                &AccessRequest::new().resource_property(pep_properties::OWNER_TENANT_ID, tenant_id),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let record = MilestoneRecord {
+            repo_id: repository.id,
+            ..record
+        };
+        self.milestones
+            .upsert(&conn, &scope, tenant_id, record)
+            .await
+    }
+
     /// Fetch one repository from GitHub (first slice: repo + first page of
     /// issues, pull requests, and commits) and upsert it into the mirror.
     ///
@@ -963,6 +1066,14 @@ impl<
             labels_synced += 1;
         }
 
+        let mut milestones_synced: u64 = 0;
+        for record in fetched.milestones {
+            self.milestones
+                .upsert(&conn, &scope, tenant_id, record)
+                .await?;
+            milestones_synced += 1;
+        }
+
         Ok(SyncSummary {
             repository: repository.full_name,
             issues_synced,
@@ -972,6 +1083,7 @@ impl<
             review_comments_synced,
             reviews_synced,
             labels_synced,
+            milestones_synced,
         })
     }
 }

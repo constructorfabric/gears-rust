@@ -283,3 +283,41 @@ pub mod labels {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod milestones {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    /// Mirrored GitHub milestone, tenant-scoped.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_milestones")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        /// GitHub milestone id.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: i64,
+        /// Owning repository's GitHub id.
+        pub repo_id: i64,
+        /// Milestone number within the repository.
+        pub number: i64,
+        pub title: String,
+        /// open or closed.
+        pub state: String,
+        pub description: Option<String>,
+        pub open_issues: i64,
+        pub closed_issues: i64,
+        /// RFC3339 timestamps kept as text (engine-agnostic), as in the reference.
+        pub due_on: Option<String>,
+        pub created_at: String,
+        pub updated_at: String,
+        pub closed_at: Option<String>,
+        pub html_url: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

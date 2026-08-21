@@ -1,5 +1,5 @@
 use github_mirror_sdk::{
-    Comment, Commit, Issue, Label, PullRequest, Repository, Review, ReviewComment,
+    Comment, Commit, Issue, Label, Milestone, PullRequest, Repository, Review, ReviewComment,
 };
 
 use crate::domain::service::{MirrorStatus, SyncSummary};
@@ -170,6 +170,7 @@ pub struct SyncSummaryDto {
     pub review_comments_synced: u64,
     pub reviews_synced: u64,
     pub labels_synced: u64,
+    pub milestones_synced: u64,
 }
 
 impl From<SyncSummary> for SyncSummaryDto {
@@ -183,6 +184,7 @@ impl From<SyncSummary> for SyncSummaryDto {
             review_comments_synced: s.review_comments_synced,
             reviews_synced: s.reviews_synced,
             labels_synced: s.labels_synced,
+            milestones_synced: s.milestones_synced,
         }
     }
 }
@@ -305,6 +307,45 @@ impl From<Label> for LabelDto {
             color: l.color,
             is_default: l.is_default,
             description: l.description,
+        }
+    }
+}
+
+/// A mirrored GitHub milestone as served by the read API.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct MilestoneDto {
+    pub id: i64,
+    pub repo_id: i64,
+    pub number: i64,
+    pub title: String,
+    pub state: String,
+    pub description: Option<String>,
+    pub open_issues: i64,
+    pub closed_issues: i64,
+    pub due_on: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub html_url: Option<String>,
+}
+
+impl From<Milestone> for MilestoneDto {
+    fn from(m: Milestone) -> Self {
+        Self {
+            id: m.id,
+            repo_id: m.repo_id,
+            number: m.number,
+            title: m.title,
+            state: m.state,
+            description: m.description,
+            open_issues: m.open_issues,
+            closed_issues: m.closed_issues,
+            due_on: m.due_on,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+            closed_at: m.closed_at,
+            html_url: m.html_url,
         }
     }
 }

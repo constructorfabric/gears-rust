@@ -4941,6 +4941,79 @@
         ],
         "type": "object"
       },
+      "MilestoneDto": {
+        "description": "A mirrored GitHub milestone as served by the read API.",
+        "properties": {
+          "closed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closed_issues": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "due_on": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "html_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "number": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "open_issues": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "repo_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "state": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "repo_id",
+          "number",
+          "title",
+          "state",
+          "open_issues",
+          "closed_issues",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "MimeSizeOverrideDto": {
         "description": "Per-mime-type size limit override in a policy request/response.",
         "properties": {
@@ -5932,6 +6005,24 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/MembershipDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_MilestoneDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MilestoneDto"
             },
             "type": "array"
           },
@@ -9924,6 +10015,11 @@
             "minimum": 0,
             "type": "integer"
           },
+          "milestones_synced": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "pull_requests_synced": {
             "format": "int64",
             "minimum": 0,
@@ -9951,7 +10047,8 @@
           "comments_synced",
           "review_comments_synced",
           "reviews_synced",
-          "labels_synced"
+          "labels_synced",
+          "milestones_synced"
         ],
         "type": "object"
       },
@@ -26390,6 +26487,112 @@
           }
         ],
         "summary": "List mirrored labels of a repository",
+        "tags": [
+          "GitHub Mirror"
+        ]
+      }
+    },
+    "/github-mirror/v1/repos/{owner}/{name}/milestones": {
+      "get": {
+        "description": "Returns milestones held in the local mirror for the tenant, by number",
+        "operationId": "github_mirror.list_milestones",
+        "parameters": [
+          {
+            "description": "Repository owner login",
+            "in": "path",
+            "name": "owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository name",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum number of milestones to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_MilestoneDto"
+                }
+              }
+            },
+            "description": "Paginated list of mirrored milestones"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List mirrored milestones of a repository",
         "tags": [
           "GitHub Mirror"
         ]

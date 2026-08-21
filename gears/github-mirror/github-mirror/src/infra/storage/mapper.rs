@@ -1,9 +1,10 @@
 use github_mirror_sdk::{
-    Comment, Commit, Issue, Label, PullRequest, Repository, Review, ReviewComment,
+    Comment, Commit, Issue, Label, Milestone, PullRequest, Repository, Review, ReviewComment,
 };
 
 use super::entity::{
-    comments, commits, issues, labels, pull_requests, repositories, review_comments, reviews,
+    comments, commits, issues, labels, milestones, pull_requests, repositories, review_comments,
+    reviews,
 };
 
 impl From<repositories::Model> for Repository {
@@ -135,6 +136,26 @@ impl From<labels::Model> for Label {
             color: m.color,
             is_default: m.is_default,
             description: m.description,
+        }
+    }
+}
+
+impl From<milestones::Model> for Milestone {
+    fn from(m: milestones::Model) -> Self {
+        Self {
+            id: m.id,
+            repo_id: m.repo_id,
+            number: m.number,
+            title: m.title,
+            state: m.state,
+            description: m.description,
+            open_issues: m.open_issues,
+            closed_issues: m.closed_issues,
+            due_on: m.due_on,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+            closed_at: m.closed_at,
+            html_url: m.html_url,
         }
     }
 }

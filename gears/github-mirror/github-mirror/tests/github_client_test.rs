@@ -123,6 +123,25 @@ fn gh_labels_json() -> serde_json::Value {
     ])
 }
 
+fn gh_milestones_json() -> serde_json::Value {
+    json!([
+        {
+            "id": 51,
+            "number": 1,
+            "title": "v1.0",
+            "state": "open",
+            "description": "first stable",
+            "open_issues": 3,
+            "closed_issues": 7,
+            "due_on": "2026-09-30T00:00:00Z",
+            "created_at": "2026-08-20T00:00:00Z",
+            "updated_at": "2026-08-20T00:00:00Z",
+            "closed_at": null,
+            "html_url": "https://github.com/rust-lang/rust/milestone/1"
+        }
+    ])
+}
+
 #[tokio::test]
 async fn fetch_repository_maps_github_payloads_into_records() {
     let server = MockServer::start_async().await;
@@ -175,6 +194,12 @@ async fn fetch_repository_maps_github_payloads_into_records() {
         .mock_async(|when, then| {
             when.method("GET").path("/repos/rust-lang/rust/labels");
             then.status(200).json_body(gh_labels_json());
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method("GET").path("/repos/rust-lang/rust/milestones");
+            then.status(200).json_body(gh_milestones_json());
         })
         .await;
 
@@ -235,6 +260,12 @@ async fn fetch_repository_maps_github_payloads_into_records() {
         fetched.labels[0].description.as_deref(),
         Some("Something is not working")
     );
+
+    assert_eq!(fetched.milestones.len(), 1);
+    assert_eq!(fetched.milestones[0].number, 1);
+    assert_eq!(fetched.milestones[0].title, "v1.0");
+    assert_eq!(fetched.milestones[0].open_issues, 3);
+    assert_eq!(fetched.milestones[0].closed_issues, 7);
 }
 
 #[tokio::test]

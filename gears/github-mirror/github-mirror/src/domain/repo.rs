@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use github_mirror_sdk::{
-    Comment, Commit, Issue, Label, PullRequest, Repository, Review, ReviewComment,
+    Comment, Commit, Issue, Label, Milestone, PullRequest, Repository, Review, ReviewComment,
 };
 use toolkit_db::secure::DBRunner;
 use toolkit_macros::domain_model;
@@ -297,4 +297,42 @@ pub trait LabelRepository: Send + Sync {
         repo_id: i64,
         limit: u64,
     ) -> Result<Vec<Label>, DomainError>;
+}
+
+/// Write-side record for a mirrored milestone.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MilestoneRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub number: i64,
+    pub title: String,
+    pub state: String,
+    pub description: Option<String>,
+    pub open_issues: i64,
+    pub closed_issues: i64,
+    pub due_on: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub html_url: Option<String>,
+}
+
+#[async_trait]
+pub trait MilestoneRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: MilestoneRecord,
+    ) -> Result<Milestone, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Milestone>, DomainError>;
 }

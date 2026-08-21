@@ -4,8 +4,8 @@ use serde::Deserialize;
 use crate::domain::error::DomainError;
 use crate::domain::ports::github::{FetchedRepository, GithubPort};
 use crate::domain::repo::{
-    CommentRecord, CommitRecord, IssueRecord, LabelRecord, PullRequestRecord, RepositoryRecord,
-    ReviewCommentRecord, ReviewRecord,
+    CommentRecord, CommitRecord, IssueRecord, LabelRecord, MilestoneRecord, PullRequestRecord,
+    RepositoryRecord, ReviewCommentRecord, ReviewRecord,
 };
 
 const FIRST_PAGE_SIZE: u32 = 50;
@@ -184,6 +184,22 @@ struct GhLabel {
 }
 
 #[derive(Debug, Deserialize)]
+struct GhMilestone {
+    id: i64,
+    number: i64,
+    title: String,
+    state: String,
+    description: Option<String>,
+    open_issues: i64,
+    closed_issues: i64,
+    due_on: Option<String>,
+    created_at: String,
+    updated_at: String,
+    closed_at: Option<String>,
+    html_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GhReview {
     id: i64,
     #[serde(default)]
@@ -305,6 +321,24 @@ fn label_record(repo_id: i64, l: GhLabel) -> LabelRecord {
     }
 }
 
+fn milestone_record(repo_id: i64, m: GhMilestone) -> MilestoneRecord {
+    MilestoneRecord {
+        id: m.id,
+        repo_id,
+        number: m.number,
+        title: m.title,
+        state: m.state,
+        description: m.description,
+        open_issues: m.open_issues,
+        closed_issues: m.closed_issues,
+        due_on: m.due_on,
+        created_at: m.created_at,
+        updated_at: m.updated_at,
+        closed_at: m.closed_at,
+        html_url: m.html_url,
+    }
+}
+
 fn review_record(repo_id: i64, pull_number: i64, r: GhReview) -> ReviewRecord {
     ReviewRecord {
         id: r.id,
@@ -375,6 +409,12 @@ impl GithubPort for GithubClient {
             ))
             .await?;
 
+        let milestones: Vec<GhMilestone> = self
+            .get_json(&format!(
+                "/repos/{owner}/{name}/milestones?state=all&per_page={FIRST_PAGE_SIZE}"
+            ))
+            .await?;
+
         let mut reviews: Vec<ReviewRecord> = Vec::new();
         for pull in pulls.iter().take(REVIEW_SYNC_PULL_CAP) {
             let page: Vec<GhReview> = self
@@ -415,6 +455,10 @@ impl GithubPort for GithubClient {
             labels: labels
                 .into_iter()
                 .map(|l| label_record(repo_id, l))
+                .collect(),
+            milestones: milestones
+                .into_iter()
+                .map(|m| milestone_record(repo_id, m))
                 .collect(),
         })
     }

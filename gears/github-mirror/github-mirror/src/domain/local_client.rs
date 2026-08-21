@@ -9,8 +9,8 @@ use toolkit_security::SecurityContext;
 
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
-    CommentRepository, CommitRepository, IssueRepository, LabelRepository, PullRequestRepository,
-    RepoRepository, ReviewCommentRepository, ReviewRepository,
+    CommentRepository, CommitRepository, IssueRepository, LabelRepository, MilestoneRepository,
+    PullRequestRepository, RepoRepository, ReviewCommentRepository, ReviewRepository,
 };
 use crate::domain::service::Service;
 
@@ -48,7 +48,7 @@ impl From<DomainError> for CanonicalError {
     }
 }
 
-type SharedService<R, I, P, C, M, V, W, L> = Arc<Service<R, I, P, C, M, V, W, L>>;
+type SharedService<R, I, P, C, M, V, W, L, N> = Arc<Service<R, I, P, C, M, V, W, L, N>>;
 
 #[domain_model]
 pub struct LocalClient<
@@ -60,8 +60,9 @@ pub struct LocalClient<
     V: ReviewCommentRepository + 'static,
     W: ReviewRepository + 'static,
     L: LabelRepository + 'static,
+    N: MilestoneRepository + 'static,
 > {
-    service: SharedService<R, I, P, C, M, V, W, L>,
+    service: SharedService<R, I, P, C, M, V, W, L, N>,
 }
 
 impl<
@@ -73,10 +74,11 @@ impl<
     V: ReviewCommentRepository + 'static,
     W: ReviewRepository + 'static,
     L: LabelRepository + 'static,
-> LocalClient<R, I, P, C, M, V, W, L>
+    N: MilestoneRepository + 'static,
+> LocalClient<R, I, P, C, M, V, W, L, N>
 {
     #[must_use]
-    pub fn new(service: SharedService<R, I, P, C, M, V, W, L>) -> Self {
+    pub fn new(service: SharedService<R, I, P, C, M, V, W, L, N>) -> Self {
         Self { service }
     }
 }
@@ -91,7 +93,8 @@ impl<
     V: ReviewCommentRepository + 'static,
     W: ReviewRepository + 'static,
     L: LabelRepository + 'static,
-> GithubMirrorClientV1 for LocalClient<R, I, P, C, M, V, W, L>
+    N: MilestoneRepository + 'static,
+> GithubMirrorClientV1 for LocalClient<R, I, P, C, M, V, W, L, N>
 {
     async fn status(&self, _ctx: &SecurityContext) -> Result<MirrorStatus, CanonicalError> {
         let status = self.service.status();
@@ -133,6 +136,7 @@ impl<
             review_comments_synced: summary.review_comments_synced,
             reviews_synced: summary.reviews_synced,
             labels_synced: summary.labels_synced,
+            milestones_synced: summary.milestones_synced,
         })
     }
 }
