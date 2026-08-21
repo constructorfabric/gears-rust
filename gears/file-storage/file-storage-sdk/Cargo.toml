@@ -1,11 +1,14 @@
 [package]
 name = "cf-gears-file-storage-sdk"
 version = "0.1.0"
-publish = false
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "SDK for file-storage gear: API trait, types, and error definitions"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "file-storage"]
+categories = ["api-bindings"]
 
 [lib]
 name = "file_storage_sdk"

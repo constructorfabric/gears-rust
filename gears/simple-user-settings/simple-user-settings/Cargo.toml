@@ -1,7 +1,6 @@
 [package]
 name = "cf-gears-simple-user-settings"
 version = "0.1.0"
-publish = false
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -21,7 +20,7 @@ workspace = true
 simple-user-settings-sdk = { package = "cf-gears-simple-user-settings-sdk", version = "0.1.0", path = "../simple-user-settings-sdk" }
 
 # AuthZ resolver for authorization (PEP flow)
-authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", path = "../../../gears/system/authz-resolver/authz-resolver-sdk" }
+authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.20", path = "../../../gears/system/authz-resolver/authz-resolver-sdk" }
 authz-resolver = { workspace = true }
 
 anyhow = { workspace = true }
