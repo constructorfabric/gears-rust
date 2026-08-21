@@ -13,7 +13,7 @@
 
 use sea_orm::sea_query::{Alias, IntoIden, PostgresQueryBuilder, QuotedBuilder};
 
-use crate::PgqError;
+use crate::error::PgqError;
 
 fn write_ident(out: &mut String, name: &str) {
     let mut buffer = String::new();

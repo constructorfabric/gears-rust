@@ -24,7 +24,8 @@ use sea_orm::sea_query::{
 };
 use sea_orm::{Condition, Value};
 
-use crate::{Direction, Element, GraphTable, PgqError, ProjectedColumn};
+use crate::ast::{Direction, Element, GraphTable, ProjectedColumn};
+use crate::error::PgqError;
 
 /// The construct's name. Rendered raw rather than as an identifier, because it
 /// is a keyword: quoting it would make the statement a syntax error.
@@ -163,4 +164,27 @@ pub fn table_ref(table: &GraphTable, alias: &str) -> Result<TableRef, PgqError> 
     // placeholder rather than with the value's text.
     let call = Func::cust(Alias::new(GRAPH_TABLE)).arg(Expr::cust_with_values(sql, values));
     Ok(TableRef::FunctionCall(call, Alias::new(alias).into_iden()))
+}
+
+impl GraphTable {
+    /// Render as a `FROM` item aliased `alias`.
+    ///
+    /// # Errors
+    /// Returns [`PgqError`] for a construct that cannot name anything: no
+    /// projected columns, an empty identifier, or a variable used twice.
+    pub fn into_table_ref(self, alias: &str) -> Result<TableRef, PgqError> {
+        table_ref(&self, alias)
+    }
+
+    /// Render the construct's SQL and bound values, without executing it.
+    ///
+    /// Exposed for tests: assertions belong on rendered SQL, because a predicate
+    /// that never reaches the database would satisfy a `Debug`-form assertion
+    /// and still leak.
+    ///
+    /// # Errors
+    /// As [`Self::into_table_ref`].
+    pub fn render_for_test(&self) -> Result<(String, Vec<Value>), PgqError> {
+        body(self)
+    }
 }
