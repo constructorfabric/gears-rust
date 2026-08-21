@@ -3,7 +3,7 @@ use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
-    CommentRecord, CommitRecord, IssueRecord, PullRequestRecord, RepositoryRecord,
+    CommentRecord, CommitRecord, IssueRecord, LabelRecord, PullRequestRecord, RepositoryRecord,
     ReviewCommentRecord, ReviewRecord,
 };
 
@@ -18,6 +18,7 @@ pub struct FetchedRepository {
     pub comments: Vec<CommentRecord>,
     pub review_comments: Vec<ReviewCommentRecord>,
     pub reviews: Vec<ReviewRecord>,
+    pub labels: Vec<LabelRecord>,
 }
 
 /// Outbound port to GitHub's REST API (implemented in `infra/github`).

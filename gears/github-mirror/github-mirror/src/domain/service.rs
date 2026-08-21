@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
-use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository, Review, ReviewComment};
+use github_mirror_sdk::{
+    Comment, Commit, Issue, Label, PullRequest, Repository, Review, ReviewComment,
+};
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page, PageInfo};
 use toolkit_security::{SecurityContext, pep_properties};
@@ -11,8 +13,8 @@ use super::error::DomainError;
 use super::ports::github::GithubPort;
 use super::repo::{
     CommentRecord, CommentRepository, CommitRecord, CommitRepository, IssueRecord, IssueRepository,
-    PullRequestRecord, PullRequestRepository, RepoRepository, RepositoryRecord,
-    ReviewCommentRecord, ReviewCommentRepository, ReviewRecord, ReviewRepository,
+    LabelRecord, LabelRepository, PullRequestRecord, PullRequestRepository, RepoRepository,
+    RepositoryRecord, ReviewCommentRecord, ReviewCommentRepository, ReviewRecord, ReviewRepository,
 };
 
 pub const GEAR_NAME: &str = "github-mirror";
@@ -56,6 +58,11 @@ pub(crate) const REVIEW_RESOURCE: ResourceType = ResourceType::from_static(
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+pub(crate) const LABEL_RESOURCE: ResourceType = ResourceType::from_static(
+    "github_mirror.label",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
+
 pub(crate) const SYNC_RESOURCE: ResourceType =
     ResourceType::from_static("github_mirror.sync", &[pep_properties::OWNER_TENANT_ID]);
 
@@ -90,6 +97,7 @@ pub struct SyncSummary {
     pub comments_synced: u64,
     pub review_comments_synced: u64,
     pub reviews_synced: u64,
+    pub labels_synced: u64,
 }
 
 #[domain_model]
@@ -101,6 +109,7 @@ pub struct Service<
     M: CommentRepository,
     V: ReviewCommentRepository,
     W: ReviewRepository,
+    L: LabelRepository,
 > {
     db: Arc<DbProvider>,
     repo: Arc<R>,
@@ -110,6 +119,7 @@ pub struct Service<
     comments: Arc<M>,
     review_comments: Arc<V>,
     reviews: Arc<W>,
+    labels: Arc<L>,
     github: Arc<dyn GithubPort>,
     policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
@@ -123,7 +133,8 @@ impl<
     M: CommentRepository,
     V: ReviewCommentRepository,
     W: ReviewRepository,
-> Service<R, I, P, C, M, V, W>
+    L: LabelRepository,
+> Service<R, I, P, C, M, V, W, L>
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -135,6 +146,7 @@ impl<
         comments: Arc<M>,
         review_comments: Arc<V>,
         reviews: Arc<W>,
+        labels: Arc<L>,
         github: Arc<dyn GithubPort>,
         policy_enforcer: PolicyEnforcer,
         config: ServiceConfig,
@@ -148,6 +160,7 @@ impl<
             comments,
             review_comments,
             reviews,
+            labels,
             github,
             policy_enforcer,
             config,
@@ -771,6 +784,95 @@ impl<
         self.reviews.upsert(&conn, &scope, tenant_id, record).await
     }
 
+    /// List mirrored labels of one repository (`owner/name`), tenant-scoped,
+    /// by name.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored for this
+    /// tenant; `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn list_labels(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        query: &ODataQuery,
+    ) -> Result<Page<Label>, DomainError> {
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &LABEL_RESOURCE,
+                actions::LIST,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+        let items = self
+            .labels
+            .list_by_repo(&conn, &scope, repository.id, limit)
+            .await?;
+
+        Ok(Page::new(
+            items,
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit,
+            },
+        ))
+    }
+
+    /// Insert or update a mirrored label row for the caller's tenant.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored;
+    /// `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn upsert_label(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        record: LabelRecord,
+    ) -> Result<Label, DomainError> {
+        let tenant_id = ctx.subject_tenant_id();
+
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &LABEL_RESOURCE,
+                actions::UPSERT,
+                None,
+                &AccessRequest::new().resource_property(pep_properties::OWNER_TENANT_ID, tenant_id),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let record = LabelRecord {
+            repo_id: repository.id,
+            ..record
+        };
+        self.labels.upsert(&conn, &scope, tenant_id, record).await
+    }
+
     /// Fetch one repository from GitHub (first slice: repo + first page of
     /// issues, pull requests, and commits) and upsert it into the mirror.
     ///
@@ -855,6 +957,12 @@ impl<
             reviews_synced += 1;
         }
 
+        let mut labels_synced: u64 = 0;
+        for record in fetched.labels {
+            self.labels.upsert(&conn, &scope, tenant_id, record).await?;
+            labels_synced += 1;
+        }
+
         Ok(SyncSummary {
             repository: repository.full_name,
             issues_synced,
@@ -863,6 +971,7 @@ impl<
             comments_synced,
             review_comments_synced,
             reviews_synced,
+            labels_synced,
         })
     }
 }

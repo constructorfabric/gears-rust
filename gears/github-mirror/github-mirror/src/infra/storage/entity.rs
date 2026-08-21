@@ -253,3 +253,33 @@ pub mod reviews {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod labels {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    /// Mirrored GitHub issue/PR label, tenant-scoped.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_labels")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        /// GitHub label id.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: i64,
+        /// Owning repository's GitHub id.
+        pub repo_id: i64,
+        pub name: String,
+        /// Hex color without the leading `#`.
+        pub color: String,
+        /// True for GitHub's default label set.
+        pub is_default: bool,
+        pub description: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

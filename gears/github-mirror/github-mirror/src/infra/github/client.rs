@@ -4,7 +4,7 @@ use serde::Deserialize;
 use crate::domain::error::DomainError;
 use crate::domain::ports::github::{FetchedRepository, GithubPort};
 use crate::domain::repo::{
-    CommentRecord, CommitRecord, IssueRecord, PullRequestRecord, RepositoryRecord,
+    CommentRecord, CommitRecord, IssueRecord, LabelRecord, PullRequestRecord, RepositoryRecord,
     ReviewCommentRecord, ReviewRecord,
 };
 
@@ -174,6 +174,16 @@ struct GhReviewComment {
 }
 
 #[derive(Debug, Deserialize)]
+struct GhLabel {
+    id: i64,
+    name: String,
+    color: String,
+    #[serde(default, rename = "default")]
+    is_default: bool,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GhReview {
     id: i64,
     #[serde(default)]
@@ -284,6 +294,17 @@ fn review_comment_record(repo_id: i64, c: GhReviewComment) -> ReviewCommentRecor
     }
 }
 
+fn label_record(repo_id: i64, l: GhLabel) -> LabelRecord {
+    LabelRecord {
+        id: l.id,
+        repo_id,
+        name: l.name,
+        color: l.color,
+        is_default: l.is_default,
+        description: l.description,
+    }
+}
+
 fn review_record(repo_id: i64, pull_number: i64, r: GhReview) -> ReviewRecord {
     ReviewRecord {
         id: r.id,
@@ -348,6 +369,12 @@ impl GithubPort for GithubClient {
             ))
             .await?;
 
+        let labels: Vec<GhLabel> = self
+            .get_json(&format!(
+                "/repos/{owner}/{name}/labels?per_page={FIRST_PAGE_SIZE}"
+            ))
+            .await?;
+
         let mut reviews: Vec<ReviewRecord> = Vec::new();
         for pull in pulls.iter().take(REVIEW_SYNC_PULL_CAP) {
             let page: Vec<GhReview> = self
@@ -385,6 +412,10 @@ impl GithubPort for GithubClient {
                 .map(|c| review_comment_record(repo_id, c))
                 .collect(),
             reviews,
+            labels: labels
+                .into_iter()
+                .map(|l| label_record(repo_id, l))
+                .collect(),
         })
     }
 }

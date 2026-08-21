@@ -4,6 +4,7 @@ pub mod comments_005;
 pub mod commits_004;
 pub mod initial_001;
 pub mod issues_002;
+pub mod labels_008;
 pub mod pull_requests_003;
 pub mod review_comments_006;
 pub mod reviews_007;
@@ -21,6 +22,7 @@ impl MigratorTrait for Migrator {
             Box::new(comments_005::Migration),
             Box::new(review_comments_006::Migration),
             Box::new(reviews_007::Migration),
+            Box::new(labels_008::Migration),
         ]
     }
 }

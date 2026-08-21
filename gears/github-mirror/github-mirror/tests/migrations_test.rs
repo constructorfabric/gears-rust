@@ -21,6 +21,7 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_comments",
         "gm_review_comments",
         "gm_reviews",
+        "gm_labels",
     ] {
         assert!(
             manager.has_table(table).await.unwrap(),
@@ -40,6 +41,7 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_comments",
         "gm_review_comments",
         "gm_reviews",
+        "gm_labels",
     ] {
         assert!(
             !manager.has_table(table).await.unwrap(),

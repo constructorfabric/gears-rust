@@ -10,7 +10,7 @@ use axum::http::{Request, StatusCode};
 use github_mirror::api::rest::routes::{ConcreteService, register_routes};
 use github_mirror::domain::ports::github::FetchedRepository;
 use github_mirror::domain::repo::{
-    CommentRecord, CommitRecord, IssueRecord, PullRequestRecord, RepositoryRecord,
+    CommentRecord, CommitRecord, IssueRecord, LabelRecord, PullRequestRecord, RepositoryRecord,
     ReviewCommentRecord, ReviewRecord,
 };
 use toolkit::api::OpenApiRegistryImpl;
@@ -122,6 +122,14 @@ fn fetched() -> FetchedRepository {
             submitted_at: Some("2026-08-20T00:00:00Z".to_owned()),
             html_url: None,
         }],
+        labels: vec![LabelRecord {
+            id: 41,
+            repo_id: 42,
+            name: "bug".to_owned(),
+            color: "d73a4a".to_owned(),
+            is_default: true,
+            description: Some("Something is not working".to_owned()),
+        }],
     }
 }
 
@@ -150,7 +158,7 @@ async fn get(router: Router, uri: &str) -> axum::http::Response<Body> {
 }
 
 #[tokio::test]
-async fn sync_fills_all_seven_tables_and_reads_serve_them() {
+async fn sync_fills_all_eight_tables_and_reads_serve_them() {
     let ctx = common::caller_in(Uuid::new_v4());
     let db = common::inmem_db().await;
     let service = common::service_with_github(
@@ -176,6 +184,7 @@ async fn sync_fills_all_seven_tables_and_reads_serve_them() {
     assert_eq!(summary["comments_synced"], 1);
     assert_eq!(summary["review_comments_synced"], 1);
     assert_eq!(summary["reviews_synced"], 1);
+    assert_eq!(summary["labels_synced"], 1);
 
     let repos = body_json(get(router.clone(), "/github-mirror/v1/repos").await).await;
     assert_eq!(repos["items"][0]["full_name"], "rust-lang/rust");
@@ -237,7 +246,7 @@ async fn sync_fills_all_seven_tables_and_reads_serve_them() {
 
     let reviews = body_json(
         get(
-            router2,
+            router2.clone(),
             "/github-mirror/v1/repos/rust-lang/rust/pulls/12/reviews",
         )
         .await,
@@ -246,6 +255,12 @@ async fn sync_fills_all_seven_tables_and_reads_serve_them() {
     assert_eq!(reviews["items"].as_array().expect("items").len(), 1);
     assert_eq!(reviews["items"][0]["author_login"], "erin");
     assert_eq!(reviews["items"][0]["state"], "APPROVED");
+
+    let labels =
+        body_json(get(router2, "/github-mirror/v1/repos/rust-lang/rust/labels").await).await;
+    assert_eq!(labels["items"].as_array().expect("items").len(), 1);
+    assert_eq!(labels["items"][0]["name"], "bug");
+    assert_eq!(labels["items"][0]["is_default"], true);
 }
 
 #[tokio::test]

@@ -9,8 +9,8 @@ use toolkit_security::SecurityContext;
 
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
-    CommentRepository, CommitRepository, IssueRepository, PullRequestRepository, RepoRepository,
-    ReviewCommentRepository, ReviewRepository,
+    CommentRepository, CommitRepository, IssueRepository, LabelRepository, PullRequestRepository,
+    RepoRepository, ReviewCommentRepository, ReviewRepository,
 };
 use crate::domain::service::Service;
 
@@ -48,7 +48,7 @@ impl From<DomainError> for CanonicalError {
     }
 }
 
-type SharedService<R, I, P, C, M, V, W> = Arc<Service<R, I, P, C, M, V, W>>;
+type SharedService<R, I, P, C, M, V, W, L> = Arc<Service<R, I, P, C, M, V, W, L>>;
 
 #[domain_model]
 pub struct LocalClient<
@@ -59,8 +59,9 @@ pub struct LocalClient<
     M: CommentRepository + 'static,
     V: ReviewCommentRepository + 'static,
     W: ReviewRepository + 'static,
+    L: LabelRepository + 'static,
 > {
-    service: SharedService<R, I, P, C, M, V, W>,
+    service: SharedService<R, I, P, C, M, V, W, L>,
 }
 
 impl<
@@ -71,10 +72,11 @@ impl<
     M: CommentRepository + 'static,
     V: ReviewCommentRepository + 'static,
     W: ReviewRepository + 'static,
-> LocalClient<R, I, P, C, M, V, W>
+    L: LabelRepository + 'static,
+> LocalClient<R, I, P, C, M, V, W, L>
 {
     #[must_use]
-    pub fn new(service: SharedService<R, I, P, C, M, V, W>) -> Self {
+    pub fn new(service: SharedService<R, I, P, C, M, V, W, L>) -> Self {
         Self { service }
     }
 }
@@ -88,7 +90,8 @@ impl<
     M: CommentRepository + 'static,
     V: ReviewCommentRepository + 'static,
     W: ReviewRepository + 'static,
-> GithubMirrorClientV1 for LocalClient<R, I, P, C, M, V, W>
+    L: LabelRepository + 'static,
+> GithubMirrorClientV1 for LocalClient<R, I, P, C, M, V, W, L>
 {
     async fn status(&self, _ctx: &SecurityContext) -> Result<MirrorStatus, CanonicalError> {
         let status = self.service.status();
@@ -129,6 +132,7 @@ impl<
             comments_synced: summary.comments_synced,
             review_comments_synced: summary.review_comments_synced,
             reviews_synced: summary.reviews_synced,
+            labels_synced: summary.labels_synced,
         })
     }
 }

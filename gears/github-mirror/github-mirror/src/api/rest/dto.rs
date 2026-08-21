@@ -1,4 +1,6 @@
-use github_mirror_sdk::{Comment, Commit, Issue, PullRequest, Repository, Review, ReviewComment};
+use github_mirror_sdk::{
+    Comment, Commit, Issue, Label, PullRequest, Repository, Review, ReviewComment,
+};
 
 use crate::domain::service::{MirrorStatus, SyncSummary};
 
@@ -167,6 +169,7 @@ pub struct SyncSummaryDto {
     pub comments_synced: u64,
     pub review_comments_synced: u64,
     pub reviews_synced: u64,
+    pub labels_synced: u64,
 }
 
 impl From<SyncSummary> for SyncSummaryDto {
@@ -179,6 +182,7 @@ impl From<SyncSummary> for SyncSummaryDto {
             comments_synced: s.comments_synced,
             review_comments_synced: s.review_comments_synced,
             reviews_synced: s.reviews_synced,
+            labels_synced: s.labels_synced,
         }
     }
 }
@@ -276,6 +280,31 @@ impl From<Review> for ReviewDto {
             commit_id: r.commit_id,
             submitted_at: r.submitted_at,
             html_url: r.html_url,
+        }
+    }
+}
+
+/// A mirrored GitHub label as served by the read API.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct LabelDto {
+    pub id: i64,
+    pub repo_id: i64,
+    pub name: String,
+    pub color: String,
+    pub is_default: bool,
+    pub description: Option<String>,
+}
+
+impl From<Label> for LabelDto {
+    fn from(l: Label) -> Self {
+        Self {
+            id: l.id,
+            repo_id: l.repo_id,
+            name: l.name,
+            color: l.color,
+            is_default: l.is_default,
+            description: l.description,
         }
     }
 }

@@ -107,6 +107,7 @@ pub struct SyncSummary {
     pub comments_synced: u64,
     pub review_comments_synced: u64,
     pub reviews_synced: u64,
+    pub labels_synced: u64,
 }
 
 /// A mirrored GitHub issue/PR comment (read-slice shape).
@@ -169,4 +170,20 @@ pub struct Review {
     /// Absent while the review is still PENDING.
     pub submitted_at: Option<String>,
     pub html_url: Option<String>,
+}
+
+/// A mirrored GitHub issue/PR label (read-slice shape).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Label {
+    /// GitHub's numeric label id.
+    pub id: i64,
+    /// Owning repository's GitHub id.
+    pub repo_id: i64,
+    pub name: String,
+    /// Hex color without the leading `#`.
+    pub color: String,
+    /// True for GitHub's default label set (bug, documentation, ...).
+    pub is_default: bool,
+    pub description: Option<String>,
 }

@@ -13,7 +13,7 @@ use github_mirror::domain::ports::github::{FetchedRepository, GithubPort};
 use github_mirror::domain::service::{Service, ServiceConfig};
 use github_mirror::infra::storage::migrations::Migrator;
 use github_mirror::infra::storage::sea_orm_repo::{
-    SeaOrmCommentRepository, SeaOrmCommitRepository, SeaOrmIssueRepository,
+    SeaOrmCommentRepository, SeaOrmCommitRepository, SeaOrmIssueRepository, SeaOrmLabelRepository,
     SeaOrmPullRequestRepository, SeaOrmRepoRepository, SeaOrmReviewCommentRepository,
     SeaOrmReviewRepository,
 };
@@ -31,6 +31,7 @@ pub type ConcreteService = Service<
     SeaOrmCommentRepository,
     SeaOrmReviewCommentRepository,
     SeaOrmReviewRepository,
+    SeaOrmLabelRepository,
 >;
 
 /// PDP fake: allows everything, constrained to the caller's tenant.
@@ -126,6 +127,7 @@ pub fn service_with_github(
         Arc::new(SeaOrmCommentRepository::new()),
         Arc::new(SeaOrmReviewCommentRepository::new()),
         Arc::new(SeaOrmReviewRepository::new()),
+        Arc::new(SeaOrmLabelRepository::new()),
         github,
         enforcer(),
         ServiceConfig {

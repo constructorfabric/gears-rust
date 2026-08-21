@@ -111,6 +111,18 @@ fn gh_reviews_json() -> serde_json::Value {
     ])
 }
 
+fn gh_labels_json() -> serde_json::Value {
+    json!([
+        {
+            "id": 41,
+            "name": "bug",
+            "color": "d73a4a",
+            "default": true,
+            "description": "Something is not working"
+        }
+    ])
+}
+
 #[tokio::test]
 async fn fetch_repository_maps_github_payloads_into_records() {
     let server = MockServer::start_async().await;
@@ -157,6 +169,12 @@ async fn fetch_repository_maps_github_payloads_into_records() {
             when.method("GET")
                 .path("/repos/rust-lang/rust/pulls/13/reviews");
             then.status(200).json_body(gh_reviews_json());
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method("GET").path("/repos/rust-lang/rust/labels");
+            then.status(200).json_body(gh_labels_json());
         })
         .await;
 
@@ -209,6 +227,14 @@ async fn fetch_repository_maps_github_payloads_into_records() {
     assert_eq!(fetched.reviews[0].pull_number, 13);
     assert_eq!(fetched.reviews[0].state, "APPROVED");
     assert_eq!(fetched.reviews[0].author_login.as_deref(), Some("erin"));
+
+    assert_eq!(fetched.labels.len(), 1);
+    assert_eq!(fetched.labels[0].name, "bug");
+    assert!(fetched.labels[0].is_default);
+    assert_eq!(
+        fetched.labels[0].description.as_deref(),
+        Some("Something is not working")
+    );
 }
 
 #[tokio::test]

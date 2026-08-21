@@ -10,8 +10,8 @@ use axum::extract::Path;
 use crate::api::rest::routes::ConcreteService;
 
 use super::dto::{
-    CommentDto, CommitDto, GithubMirrorHealthDto, IssueDto, PullRequestDto, RepositoryDto,
-    ReviewCommentDto, ReviewDto, SyncSummaryDto,
+    CommentDto, CommitDto, GithubMirrorHealthDto, IssueDto, LabelDto, PullRequestDto,
+    RepositoryDto, ReviewCommentDto, ReviewDto, SyncSummaryDto,
 };
 
 pub async fn health(
@@ -103,4 +103,14 @@ pub async fn list_reviews(
         .list_reviews(&ctx, &owner, &name, number, &query)
         .await?;
     Ok(Json(page.map_items(ReviewDto::from)))
+}
+
+pub async fn list_labels(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path((owner, name)): Path<(String, String)>,
+    OData(query): OData,
+) -> ApiResult<JsonPage<LabelDto>> {
+    let page: Page<_> = svc.list_labels(&ctx, &owner, &name, &query).await?;
+    Ok(Json(page.map_items(LabelDto::from)))
 }

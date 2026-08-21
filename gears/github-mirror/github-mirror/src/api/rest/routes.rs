@@ -8,7 +8,7 @@ use toolkit::api::{OpenApiRegistry, OperationBuilder};
 use crate::api::rest::{dto, handlers};
 use crate::domain::service::Service;
 use crate::infra::storage::sea_orm_repo::{
-    SeaOrmCommentRepository, SeaOrmCommitRepository, SeaOrmIssueRepository,
+    SeaOrmCommentRepository, SeaOrmCommitRepository, SeaOrmIssueRepository, SeaOrmLabelRepository,
     SeaOrmPullRequestRepository, SeaOrmRepoRepository, SeaOrmReviewCommentRepository,
     SeaOrmReviewRepository,
 };
@@ -21,6 +21,7 @@ pub type ConcreteService = Service<
     SeaOrmCommentRepository,
     SeaOrmReviewCommentRepository,
     SeaOrmReviewRepository,
+    SeaOrmLabelRepository,
 >;
 
 const API_TAG: &str = "GitHub Mirror";
@@ -167,6 +168,29 @@ pub fn register_routes(
             openapi,
             StatusCode::OK,
             "Repository synced into the mirror",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/github-mirror/v1/repos/{owner}/{name}/labels")
+        .operation_id("github_mirror.list_labels")
+        .summary("List mirrored labels of a repository")
+        .description("Returns labels held in the local mirror for the tenant, by name")
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("owner", "Repository owner login")
+        .path_param("name", "Repository name")
+        .query_param("limit", false, "Maximum number of labels to return")
+        .handler(handlers::list_labels)
+        .json_response_with_schema::<toolkit_odata::Page<dto::LabelDto>>(
+            openapi,
+            StatusCode::OK,
+            "Paginated list of mirrored labels",
         )
         .error_400(openapi)
         .error_401(openapi)
