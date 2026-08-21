@@ -1,0 +1,28 @@
+[package]
+name = "cf-gears-github-mirror-sdk"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "SDK for github-mirror gear: API trait, types, and error definitions"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["web-programming"]
+
+[lib]
+name = "github_mirror_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+
+toolkit = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+toolkit-security = { workspace = true }

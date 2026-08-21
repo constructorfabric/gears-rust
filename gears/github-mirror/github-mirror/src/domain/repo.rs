@@ -1,0 +1,476 @@
+use async_trait::async_trait;
+use github_mirror_sdk::{
+    Branch, Comment, Commit, Contributor, Issue, Label, Milestone, PullRequest, Release,
+    Repository, Review, ReviewComment, WorkflowRun,
+};
+use toolkit_db::secure::DBRunner;
+use toolkit_macros::domain_model;
+use toolkit_security::AccessScope;
+use uuid::Uuid;
+
+use super::error::DomainError;
+
+/// Write-side record for a mirrored repository (what sync knows about it).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryRecord {
+    pub id: i64,
+    pub owner: String,
+    pub name: String,
+    pub full_name: String,
+    pub default_branch: String,
+    pub private: bool,
+    pub pushed_at: Option<String>,
+    pub stars: i64,
+    pub forks: i64,
+    pub description: Option<String>,
+}
+
+#[async_trait]
+pub trait RepoRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: RepositoryRecord,
+    ) -> Result<Repository, DomainError>;
+
+    async fn list<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        limit: u64,
+    ) -> Result<Vec<Repository>, DomainError>;
+
+    async fn find_by_full_name<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        full_name: &str,
+    ) -> Result<Option<Repository>, DomainError>;
+}
+
+/// Write-side record for a mirrored issue (pull requests included).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub number: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    pub is_pull_request: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub html_url: Option<String>,
+}
+
+#[async_trait]
+pub trait IssueRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: IssueRecord,
+    ) -> Result<Issue, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Issue>, DomainError>;
+}
+
+/// Write-side record for a mirrored pull request.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub number: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    pub draft: bool,
+    pub merged: bool,
+    pub head_sha: Option<String>,
+    pub base_sha: Option<String>,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub merged_at: Option<String>,
+}
+
+#[async_trait]
+pub trait PullRequestRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: PullRequestRecord,
+    ) -> Result<PullRequest, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<PullRequest>, DomainError>;
+}
+
+/// Write-side record for a mirrored commit.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRecord {
+    pub repo_id: i64,
+    pub sha: String,
+    pub message: String,
+    pub author_login: Option<String>,
+    pub committer_login: Option<String>,
+    pub authored_at: Option<String>,
+    pub committed_at: Option<String>,
+    pub additions: i64,
+    pub deletions: i64,
+}
+
+#[async_trait]
+pub trait CommitRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: CommitRecord,
+    ) -> Result<Commit, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Commit>, DomainError>;
+}
+
+/// Write-side record for a mirrored issue/PR comment.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub issue_number: i64,
+    pub author_login: Option<String>,
+    pub body: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: Option<String>,
+}
+
+#[async_trait]
+pub trait CommentRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: CommentRecord,
+    ) -> Result<Comment, DomainError>;
+
+    async fn list_by_issue<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        issue_number: i64,
+        limit: u64,
+    ) -> Result<Vec<Comment>, DomainError>;
+}
+
+/// Write-side record for a mirrored PR review comment.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCommentRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub pull_number: i64,
+    pub author_login: Option<String>,
+    pub body: Option<String>,
+    pub path: Option<String>,
+    pub diff_hunk: Option<String>,
+    pub in_reply_to_id: Option<i64>,
+    pub commit_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: Option<String>,
+}
+
+#[async_trait]
+pub trait ReviewCommentRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: ReviewCommentRecord,
+    ) -> Result<ReviewComment, DomainError>;
+
+    async fn list_by_pull<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        pull_number: i64,
+        limit: u64,
+    ) -> Result<Vec<ReviewComment>, DomainError>;
+}
+
+/// Write-side record for a mirrored PR review.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub pull_number: i64,
+    pub author_login: Option<String>,
+    pub state: String,
+    pub body: Option<String>,
+    pub commit_id: Option<String>,
+    pub submitted_at: Option<String>,
+    pub html_url: Option<String>,
+}
+
+#[async_trait]
+pub trait ReviewRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: ReviewRecord,
+    ) -> Result<Review, DomainError>;
+
+    async fn list_by_pull<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        pull_number: i64,
+        limit: u64,
+    ) -> Result<Vec<Review>, DomainError>;
+}
+
+/// Write-side record for a mirrored label.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub name: String,
+    pub color: String,
+    pub is_default: bool,
+    pub description: Option<String>,
+}
+
+#[async_trait]
+pub trait LabelRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: LabelRecord,
+    ) -> Result<Label, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Label>, DomainError>;
+}
+
+/// Write-side record for a mirrored milestone.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MilestoneRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub number: i64,
+    pub title: String,
+    pub state: String,
+    pub description: Option<String>,
+    pub open_issues: i64,
+    pub closed_issues: i64,
+    pub due_on: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub html_url: Option<String>,
+}
+
+#[async_trait]
+pub trait MilestoneRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: MilestoneRecord,
+    ) -> Result<Milestone, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Milestone>, DomainError>;
+}
+
+/// Write-side record for a mirrored release.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub tag_name: String,
+    pub name: Option<String>,
+    pub draft: bool,
+    pub prerelease: bool,
+    pub body: Option<String>,
+    pub author_login: Option<String>,
+    pub created_at: String,
+    pub published_at: Option<String>,
+    pub html_url: Option<String>,
+}
+
+#[async_trait]
+pub trait ReleaseRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: ReleaseRecord,
+    ) -> Result<Release, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Release>, DomainError>;
+}
+
+/// Write-side record for a mirrored branch head.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchRecord {
+    pub repo_id: i64,
+    pub name: String,
+    pub commit_sha: String,
+    pub protected: bool,
+}
+
+#[async_trait]
+pub trait BranchRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: BranchRecord,
+    ) -> Result<Branch, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Branch>, DomainError>;
+}
+
+/// Write-side record for a mirrored contributor.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContributorRecord {
+    pub repo_id: i64,
+    pub user_id: i64,
+    pub login: String,
+    pub contributions: i64,
+    pub user_type: String,
+    pub avatar_url: Option<String>,
+    pub html_url: Option<String>,
+}
+
+#[async_trait]
+pub trait ContributorRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: ContributorRecord,
+    ) -> Result<Contributor, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Contributor>, DomainError>;
+}
+
+/// Write-side record for a mirrored workflow run.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub workflow_id: i64,
+    pub run_number: i64,
+    pub run_attempt: i64,
+    pub name: Option<String>,
+    pub event: String,
+    pub status: Option<String>,
+    pub conclusion: Option<String>,
+    pub head_branch: Option<String>,
+    pub head_sha: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub html_url: Option<String>,
+    pub actor_login: Option<String>,
+}
+
+#[async_trait]
+pub trait WorkflowRunRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: WorkflowRunRecord,
+    ) -> Result<WorkflowRun, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<WorkflowRun>, DomainError>;
+}

@@ -1,10 +1,9 @@
-# Updated: 2026-04-16 by Constructor Tech
 # CF/Gears Example Server Configuration
 #
 # Database Architecture Overview:
 # ===============================
 #
-# CF/Gears example server uses a centralized DbManager that:
+# CF/Gears Example Server uses a centralized DbManager that:
 # 1. Loads global database server templates from `database.servers`
 # 2. For each gear, merges server template with gear-specific overrides
 # 3. Creates isolated database connections per gear
@@ -75,7 +74,7 @@ logging:
     file: "logs/sql.log"
     file_level: debug
   api-gateway:
-    console_level: debug
+    console_level: info
     file: "logs/api.log"
     file_level: debug
     max_age_days: 28
@@ -86,27 +85,20 @@ logging:
 # Per-gear configurations using new structure
 gears:
   api-gateway:
-    # No database needed for api-gateway
     config:
-      bind_addr: "127.0.0.1:8087"
+      bind_addr: "0.0.0.0:8087"
       enable_docs: true
       cors_enabled: false
-      prefix_path: "/cf"
+
       # OpenAPI Documentation Configuration
       openapi:
         title: "CF/Gears Example Server API"
         version: "0.1.0"
         description: "CF/Gears Example Server API Documentation"
-      defaults:
-        body_limit_bytes: 64000000
-        rate_limit:
-          rps: 1000
-          burst: 200
-          in_flight: 64
 
-      # Authentication: disabled for local development (uses default root SecurityContext).
-      # Set to false to enable bearer-token auth via authn-resolver pipeline below.
+      # Authentication Configuration
       auth_disabled: true
+      require_auth_by_default: true
 
   gear-orchestrator:
     config: {}
@@ -115,139 +107,7 @@ gears:
   grpc-hub:
     config:
       # Use ephemeral port; OoP gears receive the actual bound address from master host
-      listen_addr: "uds:///tmp/cf-gears-grpc"
-
-  # AuthN pipeline - used when auth_disabled: false.
-  # AuthZ pipeline - used always (with default root SecurityContext when auth is disabled).
-  # Requires --features static-authn,static-authz for the static plugins.
-  authn-resolver:
-    config:
-      vendor: "constructorfabric"
-
-  authz-resolver:
-    config:
-      vendor: "constructorfabric"
-
-  static-authn-plugin:
-    config:
-      vendor: "constructorfabric"
-      priority: 100
-      mode: accept_all
-      s2s_credentials:
-        - client_id: "mini-chat"
-          client_secret: "mini-chat-dev-secret"
-
-  static-authz-plugin:
-    config:
-      vendor: "constructorfabric"
-      priority: 100
-
-  account-management:
-    database:
-      server: "sqlite_users"
-      file: "account_management.db"
-    config:
-      bootstrap:
-        # Matches static-tr-plugin's `e2e-root` so AM's tenants table
-        # ends up holding the same root id the platform middleware
-        # already knows about, letting E2E callers POST child tenants
-        # under it without a separate seeding step.
-        root_id: "00000000-df51-5b42-9538-d2b56b7ee953"
-        root_name: "e2e-root"
-        root_tenant_type: "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
-        idp_wait_timeout: "5m"
-        idp_retry_backoff_initial: "2s"
-        idp_retry_backoff_max: "30s"
-        strict: false
-      idp:
-        # Fail-closed on missing IdP client: `static-idp-plugin` is
-        # enabled in this E2E config so the user-management surface
-        # (`/tenants/{id}/users`) MUST resolve to a live plugin, not
-        # the silent `NoopIdpProvider` fallback that returns 501. AM's
-        # `deps = [...]` does not name `static-idp-plugin` directly (AM
-        # is plugin-impl-agnostic), so without `idp.required=true` the
-        # ToolKit topo-sort could initialise AM before the plugin and
-        # leave it serving 501s for the lifetime of the process. With
-        # `required=true` AM aborts startup loud and fast if it can't
-        # see the plugin — the operator then knows to investigate
-        # rather than silently shipping a half-wired stack.
-        required: true
-
-  chat-engine:
-    database:
-      server: "sqlite_users"
-      file: "chat_engine.db"
-    config: {}
-
-  mini-chat:
-    # Gear-specific database configuration
-    database:
-      server: "sqlite_users"
-      file: "mini_chat.db"
-    config:
-      # S2S credentials for obtaining SecurityContext
-      # that will be used for communication with other gears.
-      client_credentials:
-        client_id: "mini-chat"
-        client_secret: "mini-chat-dev-secret"
-      # Provider registry. Key = provider_id (matches ModelCatalogEntry.provider_id).
-      # `upstream_alias` is optional — defaults to `host` when omitted.
-      providers:
-        openai:
-          kind: openai_responses
-          storage_kind: openai
-          host: "api.openai.com"
-          auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
-          auth_config:
-            header: "Authorization"
-            prefix: "Bearer "
-            secret_ref: "openai-key"
-
-      # ── Azure OpenAI example (uncomment and set your endpoint) ──────────
-      #   azure_openai:
-      #     kind: openai_responses
-      #     host: "<your-resource>.openai.azure.com"       # Azure endpoint
-      #     # upstream_alias: "custom-alias"               # optional, defaults to host
-      #     api_path: "/openai/v1/responses"
-      #     auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
-      #     auth_config:
-      #       header: "api-key"
-      #       prefix: ""
-      #       secret_ref: "azure-openai-key"
-      #
-      # ── Per-tenant Azure example (each tenant has its own endpoint) ─────
-      #   azure_openai_tenant_a:
-      #     kind: openai_responses
-      #     host: "tenant-a.openai.azure.com"
-      #     api_path: "/openai/v1/responses"
-      #     auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
-      #     auth_config:
-      #       header: "api-key"
-      #       prefix: ""
-      #       secret_ref: "azure-openai-key-tenant-a"
-      #   azure_openai_tenant_b:
-      #     kind: openai_responses
-      #     host: "tenant-b.openai.azure.com"
-      #     api_path: "/openai/v1/responses"
-      #     auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
-      #     auth_config:
-      #       header: "api-key"
-      #       prefix: ""
-      #       secret_ref: "azure-openai-key-tenant-b"
-
-  resource-group:
-    database:
-      server: "sqlite_users"
-      file: "resource_group.db"
-    config: {}
-
-  simple-user-settings:
-    # Gear-specific database configuration
-    database:
-      server: "sqlite_users"
-      file: "settings.db"
-    config:
-      max_field_length: 100
+      listen_addr: "127.0.0.1:0"
 
   users-info:
     # Gear-specific database configuration
@@ -280,8 +140,6 @@ gears:
     config:
       default_page_size: 5
       max_page_size: 100
-      audit_base_url: "http://localhost:9090"
-      notifications_base_url: "http://localhost:9091"
 
   tenant-resolver:
     config:
@@ -292,57 +150,41 @@ gears:
       priority: 20
       # Tenant tree configuration (example: company with 2 divisions, each with departments)
       tenants:
-        # Root tenant — structural anchor, also used by auth-disabled mode
-        # (must match DEFAULT_TENANT_ID in toolkit-security). The tenant tree
-        # has exactly one root.
-        - id: "00000000-df51-5b42-9538-d2b56b7ee953"
-          name: "default"
+        # Root tenant (company level)
+        - id: "00000000-0000-0000-0000-000000000001"
+          name: "company-root"
           parent_id: null
           status: active
 
-        # Business sub-root (company level) under the structural root
-        - id: "00000000-0000-0000-0000-000000000001"
-          name: "company-root"
-          parent_id: "00000000-df51-5b42-9538-d2b56b7ee953"
-          status: active
-
         # Division 1: Engineering
-        - id: "00000000-0000-0000-0000-000000000002"
+        - id: "00000000-0000-0000-0000-000000000010"
           name: "engineering"
           parent_id: "00000000-0000-0000-0000-000000000001"
           status: active
 
         # Division 2: Sales
-        - id: "00000000-0000-0000-0000-000000000005"
+        - id: "00000000-0000-0000-0000-000000000011"
           name: "sales"
           parent_id: "00000000-0000-0000-0000-000000000001"
           status: active
 
+        # Department under Engineering: Backend
+        - id: "00000000-0000-0000-0000-000000000100"
+          name: "backend"
+          parent_id: "00000000-0000-0000-0000-000000000010"
+          status: active
+
         # Department under Engineering: Frontend (soft-deleted)
-        - id: "00000000-0000-0000-0000-000000000003"
+        - id: "00000000-0000-0000-0000-000000000101"
           name: "frontend"
-          parent_id: "00000000-0000-0000-0000-000000000002"
+          parent_id: "00000000-0000-0000-0000-000000000010"
           status: deleted
 
-        # Department under Engineering: Backend
-        - id: "00000000-0000-0000-0000-000000000004"
-          name: "backend"
-          parent_id: "00000000-0000-0000-0000-000000000002"
-          status: active
-
         # Department under Sales: Enterprise
-        - id: "00000000-0000-0000-0000-000000000006"
+        - id: "00000000-0000-0000-0000-000000000110"
           name: "enterprise"
-          parent_id: "00000000-0000-0000-0000-000000000005"
+          parent_id: "00000000-0000-0000-0000-000000000011"
           status: active
-
-  github-mirror:
-    database:
-      server: "sqlite_users"
-      file: "github_mirror.db"
-    config:
-      api_base_url: "https://api.github.com"
-
 
   credstore:
     database:
@@ -357,29 +199,39 @@ gears:
     config:
       secrets:
         - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          owner_id: "00000000-df51-5b42-9538-d2b56b7ee953"
           key: "openai-key"
           value: "sk-test-e2e-fake-key"
-        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
-          key: "azure-openai-key"
-          value: "REPLACE_WITH_AZURE_KEY"
-
-  file-storage:
-    # SQLite backend — no Postgres required for local / quickstart runs.
-    database:
-      server: "sqlite_users"
-      file: "file_storage.db"
-    config:
-      sidecar_base_url: "http://localhost:8099"
-      storage_root: "./.file-storage-data"
-      signing_key_seed: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      # Quickstart exercises the production default: sweep the orphan/expired
-      # backlog in the background.
-      enable_background_sweep: true
 
   # File parser gear configuration (no database needed)
   file-parser:
     config:
-      allowed_local_base_dir: /tmp
+      allowed_local_base_dir: "/tmp"
+
+  simple-user-settings:
+    database:
+      server: "sqlite_users"
+      file: "simple_user_settings.db"
+    config: {}
+
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
+    config: {}
+
+  static-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+
+  github-mirror:
+    database:
+      server: "sqlite_users"
+      file: "github_mirror.db"
+    config:
+      api_base_url: "https://api.github.com"
 
 # OpenTelemetry configuration (resource identity, tracing, metrics)
 opentelemetry:
@@ -433,7 +285,6 @@ opentelemetry:
   # Metrics configuration
   metrics:
     enabled: false
-    # cardinality_limit: 2000  # Max distinct attribute combinations per instrument (SDK default if omitted)
 
 # Example configurations for different database scenarios:
 #

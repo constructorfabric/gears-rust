@@ -90,6 +90,8 @@ members = [
     "gears/file-parser/file-parser",
     "gears/file-storage/file-storage-sdk",
     "gears/file-storage/file-storage",
+    "gears/github-mirror/github-mirror-sdk",
+    "gears/github-mirror/github-mirror",
     "gears/system/account-management/account-management",
     "gears/system/account-management/account-management-sdk",
     "gears/system/account-management/plugins/static-idp-plugin",
