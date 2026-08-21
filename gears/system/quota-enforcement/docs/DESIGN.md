@@ -78,8 +78,10 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-quota-enforcement-fr-quota-resolution-policy`            | `PolicyService` with scope precedence (per-metric > global); seeded `global` Policy at bootstrap.                                                                                                                                                                                                                                                                                                                                                                              |
 | `cpt-cf-quota-enforcement-fr-quota-resolution-policy-versioning` | Two-table layout (`quota_resolution_policy` + `quota_resolution_policy_version`); explicit `latest_version` pointer updated atomically with new version row insert (single tx).                                                                                                                                                                                                                                                                                                |
 | `cpt-cf-quota-enforcement-fr-quota-lifecycle`                    | `QuotaManagementService` over `create_quota` / `update_quota` / `deactivate_quota` / `read_quotas`; deactivation cascades to active leases via `DeactivateOutcome { resolved_leases }`. Use cases: `cpt-cf-quota-enforcement-usecase-create-quota` (create / validate path), `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade` (deactivate path).                                                                                                                        |
-| `cpt-cf-quota-enforcement-fr-subject-resolution`                 | `EvaluationOrchestrator` iterates over the static set of `SubjectTypeResolver` trait impls (one per seeded subject type — `tenant`, `user`) to compute the applicable-subjects set from `SecurityContext`; each resolver corresponds 1:1 to a GTS instance suffix under `gts://gts.cf.qe.subject.type.v1~`.                                                                                                                                                                    |
-| `cpt-cf-quota-enforcement-fr-subject-type-registry`              | P1: two seeded GTS instances (`gts://gts.cf.qe.subject.type.v1~cf.qe.subject.{tenant,user}.v1~`) loaded into platform `types-registry` at QE bootstrap via `TypesRegistryClient`; resolution rules realised as compile-time `SubjectTypeResolver` impls in the QE binary. No QE-internal "registry" struct in P1; the trait surface is the contractual boundary preserved across P2's operator-facing registration API.                                                        |
+| `cpt-cf-quota-enforcement-fr-projection-contracts`               | Abstract QE subject/resource bases plus owner-derived projections and separate Quota-attribute contracts live in `types-registry`; the owner projection is the subject-type half of the counter key; no QE table or registration endpoint.                                                                                                                                                                                                                               |
+| `cpt-cf-quota-enforcement-fr-contract-validation`                | Gateway validates request projections at every write/preview ingress; `QuotaManagementService` validates Quota attributes on create/update; `PolicyService` snapshots schemas and performs static pair checking; `EvaluationOrchestrator` has no registry dependency.                                                                                                                                                                                                  |
+| `cpt-cf-quota-enforcement-fr-subject-resolution`                 | `EvaluationOrchestrator` iterates compiled `SubjectProjectionResolver` implementations for the declared owner, deriving non-nil ids from `SecurityContext` and yielding every applicable owner scope.                                                                                                                                                                                                                                                                    |
+| `cpt-cf-quota-enforcement-fr-subject-type-registry`              | Registry-resident concrete owner projections replace platform-wide seeded instances; bootstrap verifies projection↔resolver correspondence and admitted metrics. No QE-internal registry table or operator-facing registration API.                                                                                                                                                                                                                                        |
 | `cpt-cf-quota-enforcement-fr-pluggable-storage`                  | `QuotaEnforcementStoragePluginV1` trait + closed `StorageError` enum + I1–I13 invariants block (§3.3).                                                                                                                                                                                                                                                                                                                                                                         |
 | `cpt-cf-quota-enforcement-fr-notification-plugin`                | In-process plugin trait + outbox same-tx invariant (I11) for durable emit; notification dispatcher drains outbox at-least-once.                                                                                                                                                                                                                                                                                                                                                |
 | `cpt-cf-quota-enforcement-fr-idempotency`                        | Single-tx upsert on `(tenant, subject, operation_type, idem_key)` inside every mutating storage primitive (I1, I2).                                                                                                                                                                                                                                                                                                                                                            |
@@ -88,7 +90,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-quota-enforcement-fr-period-rollover`                    | Lazy period-row creation on first evaluate in new period (I3 exception); `period-rollover` event emitted via outbox.                                                                                                                                                                                                                                                                                                                                                           |
 | `cpt-cf-quota-enforcement-fr-quota-snapshot-read`                | Realised by the unified `POST /v1/quota-enforcement/snapshot` endpoint with `subjects.len() == 1` in the request body; cursor-paginated; read-only with the sole exception of lazy period-row materialization.                                                                                                                                                                                                                                                                 |
 | `cpt-cf-quota-enforcement-fr-bulk-quota-snapshot-read`           | Same `POST /v1/quota-enforcement/snapshot` endpoint with `subjects.len() >= 1`; cursor-paginated (default 100 entries / page); single and bulk are degenerate cases of one request shape.                                                                                                                                                                                                                                                                                      |
-| `cpt-cf-quota-enforcement-fr-end-user-quota-snapshot-read`       | Same `POST /v1/quota-enforcement/snapshot` endpoint, invoked by Quota Manager with the forwarded end-user `SecurityContext`; PDP narrows the applicable-subjects set to `(user, tenant)` derived from that context; identical per-Quota state shape and response payload as the operator-side call.                                                                                                                                                                            |
+| `cpt-cf-quota-enforcement-fr-end-user-quota-snapshot-read`       | Same `POST /v1/quota-enforcement/snapshot` endpoint, invoked by Quota Manager with the forwarded end-user `SecurityContext`; PDP narrows the applicable-subjects set to the owner's user/tenant projections derived from that context; identical per-Quota state shape and response payload as the operator-side call.                                                                                                                                                            |
 | `cpt-cf-quota-enforcement-fr-quota-type-allocation`              | Distinct counter shape `quota_allocation_counters(quota_id, in_flight_amount, version)`; debit/lease-acquire increment, credit/lease-commit/release decrement; no period field accepted on creation.                                                                                                                                                                                                                                                                           |
 | `cpt-cf-quota-enforcement-fr-quota-type-consumption`             | Distinct counter shape `quota_consumption_counters(quota_id, period_id, …)`; debit/lease-commit increase consumed, credit/lease-release/rollback decrease — all attributed to acquisition period (I5).                                                                                                                                                                                                                                                                         |
 | `cpt-cf-quota-enforcement-fr-period-semantics`                   | UTC calendar alignment realised at `quota_consumption_counters` row creation; `(period_start, period_end)` half-open interval persisted on the counter row; `period_id` is the rollover anchor.                                                                                                                                                                                                                                                                                |
@@ -96,8 +98,8 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-quota-enforcement-fr-hard-quota-reject`                  | `most-restrictive-wins` Engine returns `Decision::Denied { violated_quota_ids, reason }` when no applicable Quota is satisfiable (every bounded Quota in every tier has `remaining < amount` and no applicable unbounded Quota exists); `EvaluationOrchestrator` aborts mutation, no counter touched. See PRD §5.9 for binding-Quota selection and the cascade/Denial rules.                                                                                                   |
 | `cpt-cf-quota-enforcement-fr-quota-type-rate-rejection`          | `quota_type` reserves the `rate` GTS instance (`gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1`) but rejects Quota create/update referencing it with the canonical `Unimplemented` error; `rate_spec` JSON field migration deferred to P3 (zero-cost reservation in P1 per PRD §5.3).                                                                                                                                                                                             |
 | `cpt-cf-quota-enforcement-fr-metric-identity-validation`         | `QuotaManagementService` validates `metric_name` against `types-registry` at Quota create/update via `TypesRegistryClient` (ClientHub-mediated SDK trait); in-process LRU cache; fail-closed on registry unavailability; unknown metric → actionable creation-time error.                                                                                                                                                                                                      |
-| `cpt-cf-quota-enforcement-fr-quota-metadata`                     | Optional JSON object on `Quota` (≤ 4 KB byte cap enforced at create/update); surfaced to active Engine via `EvaluationContext.applicable_quotas[*].metadata` (ADR-0003).                                                                                                                                                                                                                                                                                                       |
-| `cpt-cf-quota-enforcement-fr-attribute-based-quota-selection`    | Engine consumes `EvaluationContext.request.metadata` and `applicable_quotas[*].metadata`; Policy expressions filter applicable Quotas (e.g., `quota.metadata.region == request.metadata.region`). Worked example: PRD use case `cpt-cf-quota-enforcement-usecase-region-gated-via-metadata`.                                                                                                                                                                                   |
+| `cpt-cf-quota-enforcement-fr-quota-metadata`                     | Separate owner-published Quota-attribute contract; ≤ 4 KB and schema conformance enforced at create/update, then stored and snapshotted at the locked read without hot-path revalidation (ADR-0003/0007).                                                                                                                                                                                                                                                                       |
+| `cpt-cf-quota-enforcement-fr-attribute-based-quota-selection`    | Engine consumes validated request and Quota attributes; `PolicyService` statically validates property references and pair compatibility while the Engine retains semantic interpretation.                                                                                                                                                                                                                                                                                  |
 | `cpt-cf-quota-enforcement-fr-quota-cascade`                      | Two P1 cascade capabilities: (a) **default subject-scope cascade** in the built-in `most-restrictive-wins` Engine — single-entry Debit Plan via subject-scope tier walk (user-scope > tenant-scope in P1); (b) **customizable multi-entry cascade** via `cel` Policies that produce arbitrary sparse or split Debit Plans (cross-tier split, intra-tier cascade, proportional distributions). Worked example: PRD use case `cpt-cf-quota-enforcement-usecase-cascade-via-cel`. |
 | `cpt-cf-quota-enforcement-fr-telemetry`                          | Components emit counters, histograms, gauges, and spans inline via the `tracing` crate (and OpenTelemetry export when `toolkit`'s `otel` feature is enabled); bounded label cardinality (`cpt-cf-quota-enforcement-constraint-bounded-cardinality`) is a coding-discipline invariant, not a wrapper. Gear-specific metrics enumerated per PRD §5.16.                                                                                                                          |
 
@@ -107,11 +109,11 @@ This table maps non-functional requirements from PRD §6 to specific design resp
 
 | NFR ID                                                    | NFR Summary                              | Allocated To                               | Design Response                                                                                                                                                                                                                                                     | Verification Approach                                                                                          |
 | --------------------------------------------------------- | ---------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `cpt-cf-quota-enforcement-nfr-evaluation-latency`         | p95 ≤ 100 ms admission                   | Gateway + Storage Plugin + Engine          | Storage-plugin hot-path indexing on `(subject_type, subject_id, metric)`; single-tx counter mutation; per-Policy Engine timeout 5 ms (`cpt-cf-quota-enforcement-fr-quota-resolution-policy`); deterministic acquisition ordering with row-lock contract (ADR-0002). | Load test with synthetic mixed debit/lease traffic; histogram `lease_acquisition_wait_seconds` ≤ p95 ≤ 100 ms. |
+| `cpt-cf-quota-enforcement-nfr-evaluation-latency`         | p95 ≤ 100 ms admission                   | Gateway + Storage Plugin + Engine          | Storage-plugin hot-path indexing on `(projection_type, subject_id, metric)`; no registry access; single-tx counter mutation; per-Policy Engine timeout 5 ms; deterministic acquisition ordering (ADR-0002). | Load test with synthetic mixed debit/lease traffic; histogram `lease_acquisition_wait_seconds` ≤ p95 ≤ 100 ms. |
 | `cpt-cf-quota-enforcement-nfr-throughput`                 | ≥ 10 K ops/s                             | Stateless gateway, storage plugin tuning   | Horizontal scale (multi-replica gateway behind LB); storage-plugin connection pooling; bulk-read applicable Quotas; sharded counters as a P2 hook. Plugin-side tuning is plugin-internal.                                                                           | Load test sustained 10K ops/s with no SLO breach.                                                              |
-| `cpt-cf-quota-enforcement-nfr-subject-scale`              | ≥ 100 M subjects                         | Storage plugin schema + indexes            | Plugin-side hot-path indexing on `(subject_type, subject_id, metric)`; partitioning strategy plugin-internal; cap of 4 KB on `metadata` keeps row width bounded.                                                                                                    | Synthetic dataset benchmark; query-plan inspection at 100 M subjects.                                          |
+| `cpt-cf-quota-enforcement-nfr-subject-scale`              | ≥ 100 M subjects                         | Storage plugin schema + indexes            | Plugin-side hot-path indexing on `(projection_type, subject_id, metric)`; partitioning strategy plugin-internal; cap of 4 KB on `metadata` keeps row width bounded.                                                                                                 | Synthetic dataset benchmark; query-plan inspection at 100 M subjects.                                          |
 | `cpt-cf-quota-enforcement-nfr-quota-density`              | ≥ 10 Quotas/subject; ≥ 1 B Quotas total  | Storage plugin schema                      | Single `Quota` entity; per-period counter rows; plugin-side hot-path indexing keyed on active Quotas.                                                                                                                                                               | Capacity model in §4 + bench.                                                                                  |
-| `cpt-cf-quota-enforcement-nfr-availability`               | 99.95 %                                  | Stateless gateway, K8s                     | Multi-replica gateway with rolling updates; sweeper / dispatcher singletons via `CoordinationPluginV1` lock with TTL-renew and follower-mode fallback on lock loss.                                                                                                 | SRE error-budget burn-down; chaos-test gateway pod kills.                                                      |
+| `cpt-cf-quota-enforcement-nfr-availability`               | 99.95 %                                  | Stateless gateway, K8s                     | Multi-replica gateway with rolling updates; sweeper / dispatcher singletons use `CoordinationPluginV1` locks. | SRE error-budget burn-down and chaos-test gateway pod kills.                                                   |
 | `cpt-cf-quota-enforcement-nfr-authentication`             | Authenticated requests only              | api-gateway / ToolKit pipeline              | Unauthenticated requests are rejected by the platform `api-gateway` before they reach a QE handler.                                                                                                                                                                 | Integration test: anonymous request → 401.                                                                     |
 | `cpt-cf-quota-enforcement-nfr-authorization`              | PDP-gated, fail-closed                   | Gateway + EvaluationOrchestrator           | Two-phase PDP integration — admission decision before transaction (Gateway, with LRU cache + fail-closed), constraint filters propagated into in-transaction storage reads (EvaluationOrchestrator); PDP unavailability → fail-closed deny.                         | Chaos: PDP down → all writes denied.                                                                           |
 | `cpt-cf-quota-enforcement-nfr-tenant-isolation-integrity` | No cross-tenant leakage                  | Gateway + Storage Plugin                   | Defense-in-depth: gateway PDP filter + storage plugin tenant-id binding on every query.                                                                                                                                                                             | Adversarial integration test: caller forges tenant-id in payload → server-derived identity wins.               |
@@ -129,6 +131,7 @@ This table maps non-functional requirements from PRD §6 to specific design resp
 | `cpt-cf-quota-enforcement-adr-metadata-snapshot-timing` | EvaluationContext metadata snapshot taken at applicable-Quotas resolution. Resolves the Quota Metadata mutation-visibility decision — deterministic + replay-safe + simpler than evaluation-start snapshot.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `cpt-cf-quota-enforcement-adr-settlement-window-emit`   | Emit nothing during settlement window; closing-period state surfaced via `period-rollover` payload alone. Eliminates need for new event variants for cross-period commits/releases.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `cpt-cf-quota-enforcement-adr-evaluation-engine`        | Engines are pluggable via `QuotaResolutionEngineV1` — capability-based contract (DESIGN §3.3 + PRD §5.9), no specific engine technology mandated by QE-core. P1 reference impls (non-normative): `most-restrictive-wins` (hardcoded) and `cel` (sandboxed CEL via `cel-interpreter` crate). Operators may ship additional engines (Starlark / Lua / Wasm / custom DSL); trust boundary enforces Debit-Plan invariants regardless of engine choice.                                                                                                                                                                                                                                                         |
+| `cpt-cf-quota-enforcement-adr-projection-contracts`     | Metric owners publish registered subject/resource projections and separate Quota-attribute contracts; Gateway and write services enforce them, owner identity preserves shared counters, subject id remains server-derived, and registry resolution stays off the evaluation hot path.                                                                                                                                                                                                                                                                                                                                                                                         |
 
 ### 1.3 Architecture Layers
 
@@ -167,11 +170,22 @@ graph TB
 | Gateway (`quota-enforcement` crate) | REST handler layer mounted into the platform `api-gateway` gear via ToolKit `RestApiCapability::register_rest`; QE does not run its own HTTP server. Owns DTO validation; phase-1 PDP integration (admission + LRU cache + fail-closed); tenant-isolation filter; delegates to `QuotaManagementService` / `QuotaEnforcementService`.                                                                                                                                          | Axum handlers + ToolKit `OperationBuilder` (typed-operation registration auto-generates the OpenAPI fragment via `utoipa`); tracing. |
 | Plugins (separate crates)           | `quota-enforcement-storage-plugin` (transactional persistence via `toolkit-db` per `cpt-cf-quota-enforcement-adr-storage-backend`); `quota-enforcement-coordination-plugin` (leader election / distributed locks, per `cpt-cf-quota-enforcement-adr-coordination-plugin`); `quota-enforcement-engine-most-restrictive`, `quota-enforcement-engine-cel` (built-ins, in-process linkage); `quota-enforcement-notification-plugin` trait (sink implementations operator-supplied). | Rust crates; static linkage at build time per `cpt-cf-quota-enforcement-constraint-in-process-engine-registration`.                 |
 | Background tasks                    | `LeaseSweeper` (physical reclamation tier of `cpt-cf-quota-enforcement-fr-lease-timeout`); `RetentionSweeper` (idempotency / operation log retention); `NotificationDispatcher` (drains outbox to registered sinks).                                                                                                                                                                                                                                                           | Same binary as gateway when bundled, or separate binary in split deployments; singleton coordination via `CoordinationPluginV1`.    |
-| External                            | Persistent backend reached via the storage plugin (P1 backend choice in `cpt-cf-quota-enforcement-adr-storage-backend`); `authz-resolver` (PDP); `types-registry` (metric registration + GTS schema catalogue, including subject type schemas); platform observability stack — `tracing` plus OpenTelemetry export via `toolkit`'s `otel` feature.                                                                                                                              | Existing platform components.                                                                                                       |
+| External                            | Persistent backend reached via the storage plugin (P1 backend choice in `cpt-cf-quota-enforcement-adr-storage-backend`); `authz-resolver` (PDP); `types-registry` (metric registration plus owner projection and Quota-attribute contracts); platform observability stack — `tracing` plus OpenTelemetry export via `toolkit`'s `otel` feature.                                                                                                                                   | Existing platform components.                                                                                                       |
 
 ## 2. Principles & Constraints
 
 ### 2.1 Design Principles
+
+#### Declarative owner projection contracts
+
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-principle-declarative-projection-contracts`
+
+Every evaluation declares a concrete, registered GTS projection owned by the Gear that owns the metric. That projection
+is the subject-type half of Quota identity and is shared by all callers; request and Quota attributes are validated at
+their authoring boundaries before Engine evaluation. Caller-specific projection taxonomies are forbidden because they
+fragment shared counters. Registry resolution is confined to bootstrap and Quota/Policy writes.
+
+**ADRs**: `cpt-cf-quota-enforcement-adr-projection-contracts`.
 
 #### Server-derived identity
 
@@ -271,17 +285,14 @@ integrity.
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-constraint-types-registry-delegation`
 
-QE does not maintain its own metric catalogue. Metric names, kind classification (counter / gauge), and enforcement-mode
-classification (`QuotaGated` / `Direct`) live in the platform `types-registry`. QE validates `metric_name` references
-against `types-registry` at Quota create/update; metric naming/syntax is governed entirely by the registry. Metric
-instances follow the GTS URI form under base `gts.cf.qe.metric.type.v1~` — e.g.,
-`gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1`. The Subject Type Registry is realized through the same
-canonical mechanism — subject type entries are GTS instances under `gts://gts.cf.qe.subject.type.v1~`; P1 seeds two
-instances: `gts.cf.qe.subject.type.v1~cf.qe.subject.tenant.v1` and `gts.cf.qe.subject.type.v1~cf.qe.subject.user.v1`.
+`types-registry` is the authoritative metric and contract catalogue. QE persists no duplicate catalogue; it validates
+registry data and builds local snapshots at bootstrap and Quota/Policy writes. The evaluation path does not call the
+registry.
+Illustrative metric identifiers remain under `gts.cf.qe.metric.type.v1~` pending the cross-gear naming decision; naming
+under the metric-owning Gear is a candidate, not a decision in this design.
 
-> **Notation.** Throughout this document, seeded subject types and metric instances are referenced by their short
-> instance names (`tenant`, `user`, `ai-tokens-input`, etc.) for readability. API requests, storage rows, and outbox
-> events use the full GTS URI form.
+> **Notation.** Scope names (`tenant`, `user`) and metric names are shortened in prose. API requests and storage use full
+> GTS type ids, including the trailing `~` for projections.
 
 **ADRs**: none.
 
@@ -301,10 +312,12 @@ one-active-at-a-time discipline.
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-constraint-bounded-cardinality`
 
-Telemetry labels are restricted to bounded enums — `metric_name` from `types-registry`, `engine_id` from the registered
-Engine set, `operation` from `{debit, credit, rollback, reserve, commit, release, batch_debit}`, `invariant` from the
-closed Debit-Plan-invariant set, `reason` from the closed denial-reason enum. High-cardinality identifiers (`tenant_id`,
-`subject_id`, `quota_id`, `policy_id`, `idempotency_key`, `lease_token`) MUST NOT appear as labels. This prevents
+Telemetry labels are restricted to deployment-bounded enums — `engine_id` from the registered Engine set, `operation`
+from `{debit, credit, rollback, reserve, commit, release, batch_debit, preview}`, `surface` from a closed validation-
+surface enum, `invariant` from the
+closed Debit-Plan-invariant set, `reason` from closed reason enums. High/unbounded-cardinality identifiers (`tenant_id`,
+`subject_id`, `quota_id`, `policy_id`, `idempotency_key`, `lease_token`, `metric`, projection type, caller attribution)
+MUST NOT appear as labels. This prevents
 per-tenant time-series explosion at 100 M-subject scale per `cpt-cf-quota-enforcement-nfr-subject-scale`.
 
 **ADRs**: none.
@@ -337,13 +350,13 @@ itself only mutates counters according to declarative Quota records and pluggabl
 **Technology**: Native Rust structs in `quota-enforcement-sdk` crate (per `cpt-cf-quota-enforcement-constraint-toolkit`).
 Plugins are registered in-process at gear bootstrap via ClientHub. Domain data shape is Rust-native.
 
-**Location**: [`quota-enforcement-sdk/src/`](../quota-enforcement-sdk/src/) crate.
+**Planned location**: `quota-enforcement-sdk/src/` (the crate has not been scaffolded yet).
 
 **Core Entities**:
 
 | Entity                         | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Persistence                                                          |
 | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `Quota`                        | Declarative cap assigned to a single subject for a single metric. Carries `quota_id` (server-assigned **UUIDv7** per `cpt-cf-quota-enforcement-adr-acquisition-ordering`), `tenant_id`, subject reference, metric, type, period spec (consumption only), enforcement mode, cap, notification thresholds, validity window, source, status, metadata, version. First-class stored entity — no separate template/binding concept.                                                                                                                                 | `quotas` table                                                       |
+| `Quota`                        | Declarative cap assigned to a single subject for a single metric. Carries `quota_id` (server-assigned **UUIDv7** per `cpt-cf-quota-enforcement-adr-acquisition-ordering`), `tenant_id`, subject reference, metric, type, period spec (consumption only), enforcement mode, cap, notification thresholds, validity window, source, status, metadata, accepted Quota-attribute contract type/version, and record version. First-class stored entity — no separate template/binding concept.                                                                                              | `quotas` table                                                       |
 | `Counter` (allocation)         | Per-Quota in-flight counter for allocation Quotas. Mutated on debit / lease acquire (increment) and credit / lease commit/release (decrement).                                                                                                                                                                                                                                                                                                                                                                                                                 | `quota_allocation_counters` table                                    |
 | `Counter` (consumption)        | Per-(Quota, period) consumed counter. New row materialised lazily on first evaluate in a new period (single I3 exception). Carries `highest_crossed_threshold_pct`.                                                                                                                                                                                                                                                                                                                                                                                            | `quota_consumption_counters` table                                   |
 | `Lease`                        | Two-phase capacity hold (PRD `cpt-cf-quota-enforcement-fr-lease-acquire`). Carries token (UUID), tenant, subject, idempotency key, acquisition timestamp, expiry timestamp, state, `acquisition_period_id`. State machine: `Active` → `Committed` / `Released` / `AutoReleased` / `ResolvedByDeactivation` (closed enum, terminal states).                                                                                                                                                                                                                     | `leases` table                                                       |
@@ -351,16 +364,20 @@ Plugins are registered in-process at gear bootstrap via ClientHub. Domain data s
 | `LeaseCapacityCounter`         | Per-`(tenant, metric)` count of currently active leases. Mutated atomically with lease state transitions. Enforces the per-`(tenant, metric)` active-lease cap (PRD `cpt-cf-quota-enforcement-fr-lease-timeout`, default 1000).                                                                                                                                                                                                                                                                                                                                | `lease_capacity_counters` table                                      |
 | `QuotaResolutionPolicy`        | Operator-managed binding of an Engine + config to a scope (P1: `global` or per-metric). Stable identifier; `latest_version` pointer updated atomically with new version row insert.                                                                                                                                                                                                                                                                                                                                                                            | `quota_resolution_policy` table                                      |
 | `QuotaResolutionPolicyVersion` | Immutable per-version record. Carries `policy_id`, `policy_version`, `engine_id`, `engine_config` (JSON), `timeout_ms`, `version_state` (`active` / `superseded` / `rolled_back` (terminal) / `deleted` (terminal — set on the previously-active version when the entire `policy_id` is soft-deleted via `delete_policy` per PRD §5.9)), `comment` (optional operator note), audit fields.                                                                                                                                                                     | `quota_resolution_policy_version` table                              |
-| `IdempotencyRecord`            | Replay-safety record keyed by `(tenant_id, subject_type, subject_id, operation_type, idem_key)`. The `(subject_type, subject_id)` slot is the operation's resolved applicable-subjects set for `debit`/`reserve`/`commit`/`release`/`batch_debit` envelope, and the owning Quota's `(subject_type, subject_id)` (read under the mutation row-lock) for `credit`/`rollback` per `cpt-cf-quota-enforcement-fr-idempotency`. Carries canonical `payload_hash` (SHA-256 of sorted JSON), `decision_blob` (JSON-typed; schema-versioned with full Decision), `expires_at`. | `idempotency_records` table                                          |
+| `IdempotencyRecord`            | Replay-safety record keyed by `(tenant_id, projection_type, subject_id, operation_type, idem_key)`. The projection/subject slot is the resolved applicable-subjects set for evaluation operations and the owning Quota's persisted identity for direct Quota mutations. Carries canonical `payload_hash`, schema-versioned `decision_blob`, and `expires_at`.                                                                                                                                            | `idempotency_records` table                                          |
 | `OperationLog`                 | Operation ledger of every successful mutating operation (P1 scope; audit-grade attribution awaits platform audit infra per PRD §4.2 / §6.2, see §4.3). Carries operation kind, actor SecurityContext, target Quota IDs, request fingerprint, Decision outcome, timestamp. Partitioned by date for retention and cold-tier migration.                                                                                                                                                                                                                           | `operation_log` table                                                |
 | `NotificationOutboxEvent`      | Same-tx event row enqueued by mutating storage primitives. Carries `event_id`, `event_kind`, `tenant_id`, target reference, payload, emission timestamp. Drained by `NotificationDispatcher` and dispatched at-least-once.                                                                                                                                                                                                                                                                                                                                     | `notification_outbox` table (toolkit-db Outbox queue)                 |
-| `SubjectTypeEntry`             | Subject-type registration metadata. Identity = chained GTS instance URI under base `gts://gts.cf.qe.subject.type.v1~`; payload = `{description: String}`. P1 instances `tenant` and `user` are embedded as compile-time constants in the QE binary; resolution logic is implemented as `SubjectTypeResolver` trait impls.                                                                                                                                                                                                                                       | `types-registry` (GTS schema catalogue) — no QE-side DB table in P1. |
+| `SubjectScope`                 | QE-owned GTS discriminator type `gts.cf.core.qe.subject_scope.v1~`. P1 registers `gts.cf.core.qe.subject_scope.v1~cf.core.qe.user.v1` and `gts.cf.core.qe.subject_scope.v1~cf.core.qe.tenant.v1` as its well-known instances.                                                                                                                                                                                                                                                                                                                                        | `types-registry`; no QE-side DB table. |
+| `SubjectProjectionContract`    | Registered concrete GTS type derived from abstract `gts.cf.core.qe.subj.v1~`; identity is a `GtsTypeId` with trailing `~`. Refines required `metadata`, declares admitted metrics, and declares its subject scope as a required `scope: GtsInstanceId` trait narrowed to `gts.cf.core.qe.subject_scope.v1~*`, never a name segment. It is the type half of Quota subject identity. Resolution uses a matching `SubjectProjectionResolver`; QE seeds no platform-wide subject instances.                                                                                             | `types-registry`; no QE-side DB table. |
+| `ResourceProjectionContract`   | Registered concrete GTS type derived from abstract `gts.cf.core.qe.res.v1~`; carries optional resource identity plus schematized request properties. It does not enter the P1 counter key.                                                                                                                                                                                                                                                                                                                                                                                        | `types-registry`; no QE-side DB table. |
+| `QuotaAttributeContract`       | Separate owner-published GTS contract derived from `gts.cf.core.qe.quota_attrs.v1~`; validates operator-authored `Quota.metadata` on create/update and may intentionally differ from request projection shape.                                                                                                                                                                                                                                                                                                                                                                   | `types-registry`; schema/version snapshot referenced by Quota/Policy state, no QE catalogue table. |
 
 **In-memory entities** (passed across in-process calls; never persisted as the source of truth):
 
 | Entity              | Description                                                                                                                                                                                                                                                                  |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `EvaluationContext` | Engine input: resolved subjects, applicable Quota snapshots (with metadata), current usage, request (metric/amount/metadata), active Policy reference, time. Materialised at the locked-read step (`cpt-cf-quota-enforcement-adr-metadata-snapshot-timing`).                 |
+| `EvaluationContext` | Engine input: resolved owner projections, server-derived subject ids, optional resource projection, applicable Quota snapshots (with validated metadata), current usage, request (metric/amount/required metadata), snapshotted active Policy contracts, and time. The self-declared `caller_type` is deliberately excluded. Materialised at the locked-read step (`cpt-cf-quota-enforcement-adr-metadata-snapshot-timing`). |
+| `ProjectionContractCatalog` | Immutable process-local snapshot of every configured concrete subject/resource projection and admitted-metric relation, including an authoritative reverse index from each metric to its complete configured subject-projection set. Built once at bootstrap and immutable for the process lifetime; breaking-version activation is not supported in P1. Used by Gateway evaluation-request validation and server-side projection selection without a registry call. |
 | `Decision`          | Engine output: closed `result` enum (`Allowed` / `Denied { violated_quota_ids, reason }`), `debit_plan: HashMap<QuotaId, QuotaDebitPlan>`, `diagnostics: HashMap<String, JsonValue>`. Engine failures do not produce a Decision — they surface as `CanonicalError` per §3.3. |
 | `QuotaDebitPlan`    | Per-Quota mutation directive in a `Decision`: `amount` (≥ 0). Extension-ready (P3 may add `clamped` marker). Validated against the closed Debit-Plan invariant set at the QE-core boundary.                                                                                  |
 | `BatchItem`         | One element of an envelope batch (`apply_batch_debit`): `(SecurityContext, request_payload, optional_per_item_idem_key)`.                                                                                                                                                    |
@@ -383,7 +400,7 @@ erDiagram
 **Type-stability invariants** (`cpt-cf-quota-enforcement-constraint-toolkit`):
 
 - All enums (`QuotaType`, `EnforcementMode`, `QuotaSource`, `LeaseState`, `DecisionResult`, `NotificationEventKind`,
-  `PolicyVersionState`) are closed at SDK boundary.
+`PolicyVersionState`) are closed at SDK boundary.
 - Input deserialization uses `serde(deny_unknown_fields)`; output deserialization tolerates forward-compat additions for
   SDK consumers.
 - `IdempotencyRecord.decision_blob` is JSON-typed and schema-versioned (top-level `__version`); additive shape changes
@@ -407,9 +424,11 @@ graph TB
         ER[EngineRegistry]
         LM[LeaseManager]
         IC[IdempotencyCache]
-        SR[SubjectTypeResolver impls<br/>static set: tenant, user]
+        PCC[ProjectionContractCatalog<br/>immutable local snapshots]
+        SR[SubjectProjectionResolver impls<br/>owner-scoped static set]
         GW --> QMS
         GW --> QES
+        GW --> PCC
         QES --> EO
         EO --> ER
         EO --> PS
@@ -445,8 +464,10 @@ graph TB
     RS -->|lock| CP
     ND -->|lock| CP
     GW -->|PDP| AuthzResolver[(authz-resolver)]
-    QMS -->|metric validate| TR[(types-registry)]
-    GWBoot[QE bootstrap] -. seed subject-type GTS .-> TR
+    QMS -->|metric + contract resolve/cache| TR[(types-registry)]
+    PS -->|Policy contract snapshots| TR
+    GWBoot[QE bootstrap] -. bases + consistency validation .-> TR
+    GWBoot -->|atomic contract snapshot| PCC
     CP --> CoordBackend[(Coordination backend)]
 ```
 
@@ -459,11 +480,19 @@ graph TB
 REST handler layer of the `quota-enforcement` crate; mounted into the platform `api-gateway` gear via ToolKit. QE does
 not run its own HTTP server — the platform `api-gateway` gear owns the Axum router and the aggregated OpenAPI
 document. This is the only QE-side entry point for every external caller (Quota Consumer, Quota Manager, Quota Reader,
-Monitoring System); SDK clients flow through the same operation surface for end-to-end uniformity.
+Monitoring System); SDK clients flow through the same operation surface for end-to-end uniformity. Any authorized
+caller uses the metric owner's projection and calls QE directly; the owner does not proxy those operations.
 
 ##### Responsibility scope
 
-REST handlers (Axum), request DTO validation, typed-operation registration into the platform `api-gateway`
+REST handlers (Axum), request DTO validation, and fail-closed subject/resource projection validation at ingress of
+every evaluation write/preview operation (including batch items), before Engine dispatch. Validation requires a concrete
+registered `GtsTypeId`, required `metadata`, admitted metric, typed caller attribution, and a non-nil server-derived
+subject id. Gateway structurally validates `caller_type` but excludes it from `EvaluationContext` and all Policy/Engine
+input.
+Subject/resource shape and admitted-metric checks use the process-local `ProjectionContractCatalog`; Gateway never
+calls `types-registry` from a request path. A catalog refresh replaces the complete validated snapshot atomically.
+Also owns typed-operation registration into the platform `api-gateway`
 (auto-generates the OpenAPI fragment via `utoipa`), tenant-isolation filter (defense-in-depth), correlation of trace
 context. Phase-1 PDP integration (admission decision before transaction): wraps
 `authz-resolver-sdk::PolicyEnforcer` (obtained from ClientHub) with an in-process LRU cache of PDP decisions keyed
@@ -473,7 +502,7 @@ consumption inside the evaluation transaction. Stateless across replicas (the LR
 
 ##### Responsibility boundaries
 
-Does not contain business logic (`cpt-cf-quota-enforcement-constraint-no-business-logic`). Does not call Engine or
+Does not interpret projection property meaning (`cpt-cf-quota-enforcement-constraint-no-business-logic`). Does not call Engine or
 Storage directly — delegates to `QuotaManagementService` / `QuotaEnforcementService`, passing the translated
 `&[Constraint]` slice for in-transaction filter composition (phase-2 propagation is owned by `EvaluationOrchestrator`).
 Does not own any persistent state. Does not implement the PDP itself — the actual policy decision lives in the external
@@ -505,6 +534,12 @@ classification `QuotaGated`/`Direct` are reported by the registry and consumed d
 `types-registry` unavailability and «flag-but-don't-auto-deactivate» on later metric removal — both per
 `cpt-cf-quota-enforcement-fr-metric-identity-validation`. Transactional `create_quota` / `update_quota` /
 `deactivate_quota` / `read_quotas` calls on Storage plugin; event emission for `quota-changed`.
+
+The same `TypesRegistryClient` and bounded LRU resolve the metric owner's subject projection and separate Quota-
+attribute contract. `quota.metadata` is validated at create/update before persistence, outside the storage transaction.
+The accepted contract id/version is snapshotted; stored metadata is not revalidated during evaluation. Creation checks
+both the registry contract and membership in the configured `ProjectionContractCatalog`; P1 rejects replacement
+projections outside that catalogue.
 
 ##### Responsibility boundaries
 
@@ -558,8 +593,9 @@ is validated against the closed Debit-Plan invariant set before mutation.
 Pipeline ordering, transaction lifecycle, EvaluationContext materialisation timing
 (`cpt-cf-quota-enforcement-adr-metadata-snapshot-timing`), invariant enforcement, telemetry emission for invariant
 violations. Subject resolution (`cpt-cf-quota-enforcement-fr-subject-resolution`) is realised here by iterating the
-static set of `SubjectTypeResolver` trait impls — one per seeded subject type — over the request `SecurityContext` to
-build the applicable-subjects set; resolvers that cannot derive a subject for the given context are skipped (PRD §5.1).
+complete resolver set selected server-side for the request metric from `ProjectionContractCatalog`. The caller-declared
+projection is validated as a member but cannot narrow that set. Each resolver runs over `SecurityContext` to build every
+applicable owner scope. Anonymous/nil identity is rejected; optional scopes lacking a field are skipped (PRD §5.1).
 Phase-2 PDP integration: receives the `&[Constraint]` slice from `Gateway` (already translated from the PDP response)
 and forwards it into Storage-plugin reads/writes for in-transaction filter composition
 (`cpt-cf-quota-enforcement-nfr-tenant-isolation-integrity` defense-in-depth). EO does not call the PDP itself and does
@@ -570,6 +606,8 @@ not interpret constraint semantics — that is the storage plugin's responsibili
 Does not own arbitration logic (delegated to Engines). Does not own counter mutation mechanics (delegated to Storage
 plugin). Does not pre-eval on idempotency replay — replay returns the stored `decision_blob` verbatim (satisfies the
 idempotency-replay rule of `cpt-cf-quota-enforcement-fr-idempotency` by never re-invoking the Engine on replay).
+It has no `TypesRegistryClient`, performs no schema resolution, and does not revalidate stored Quota metadata. Registry
+latency or availability therefore cannot enter the evaluation transaction.
 
 Synchronization between concurrent EO instances (every gateway replica runs an EO) is delegated entirely to the storage
 plugin's serialization of concurrent row mutations — the deterministic acquisition ordering of
@@ -579,7 +617,7 @@ singletons and do not consume `CoordinationPluginV1`; that contract is reserved 
 ##### Related components (by ID)
 
 - `cpt-cf-quota-enforcement-component-engine-registry`, `-policy-service`, `-storage-plugin`, `-idempotency-cache`,
-  `-notification-dispatcher`. `SubjectTypeResolver` is a trait surface (impls live in the gateway crate), not a
+  `-notification-dispatcher`. `SubjectProjectionResolver` is a trait surface (impls live in the gateway crate), not a
   component with its own ID.
 
 #### PolicyService
@@ -596,7 +634,12 @@ Policy at evaluation time (`global` ← per-metric).
 ##### Responsibility scope
 
 CRUD on `quota_resolution_policy` and `quota_resolution_policy_version` tables via Storage plugin; in-process LRU cache
-of latest active versions; `engine_config` validation (delegated to the named Engine's `validate_config`).
+of latest active versions; contract resolution/snapshotting via `TypesRegistryClient`; `engine_config` validation
+delegated to the named Engine's `validate_config` with request/Quota schemas. The `cel` validator statically checks
+property and projection references plus pair compatibility, returning line/column diagnostics; because `caller_type`
+is absent from `EvaluationContext`, any attempted reference is rejected as an unknown field. In P1 it also rejects a
+Policy create/update that references a projection outside the active `ProjectionContractCatalog` with
+`ProjectionNotResolvable`.
 
 ##### Responsibility boundaries
 
@@ -730,7 +773,7 @@ outbox. Optionally deletes lease rows after a grace period.
 Single-leader execution via `CoordinationPluginV1::try_lock(LockScope::LeaseSweeper, ttl)` with heartbeat-renew on
 TTL/3; on lock loss the sweeper drops to follower mode and re-acquires through jittered backoff. Batch size
 operator-configurable (P1 reference default: 1000 expired leases per cycle). Surface `lease_unreclaimed_expired` gauge
-(cardinality discipline: only `metric` label).
+  without metric labels (per the bounded-cardinality constraint).
 
 ##### Responsibility boundaries
 
@@ -886,6 +929,22 @@ QE exposes three contractual surfaces:
 P2 endpoints (`bulk_create_quotas`, `bulk_update_quotas`, `bulk_deactivate_quotas`) are deferred per
 `cpt-cf-quota-enforcement-fr-bulk-quota-crud` (PRD §5.2, P2).
 
+There is no projection-alias, Quota/counter-migration, or breaking-version activation endpoint in P1.
+
+**Evaluation request contract fields.** Every write/preview request (and each batch item) carries:
+
+| Field | Rust type | Rule |
+|-------|-----------|------|
+| `subject_projection_type` | `GtsTypeId` | Required concrete type derived from `gts.cf.core.qe.subj.v1~`; the server resolves and injects the subject id from `SecurityContext`. |
+| `subject_metadata` | `Map<String, JsonValue>` | Required on the wire, including `{}` when empty; validated against the subject projection. |
+| `resource_projection_type` | `Option<GtsTypeId>` | Optional concrete type derived from `gts.cf.core.qe.res.v1~`; when present, resource metadata is required. |
+| `resource_id` | `Option<String>` | Descriptive resource identity; not part of the P1 counter key. |
+| `resource_metadata` | `Option<Map<String, JsonValue>>` | Validated against the resource projection. |
+| `caller_type` | `GtsTypeId` | Required self-declared calling-Gear metadata for logs and diagnostics only. Excluded from `EvaluationContext`; it cannot influence authorization, Policy branching, apportionment, Quota selection, Debit Plans, or counter/allocation buckets. |
+
+No consumption request DTO carries `subject_id` or `tenant_id`. Management DTOs retain explicit target identity under
+PDP scope. `metadata` is never silently defaulted.
+
 **Error Model.**
 
 QE conforms to the platform error contract: Canonical error model implemented by
@@ -928,7 +987,9 @@ Identifiers under the `gts.cf.qe.resource.*` namespace:
 
 | `DomainError` variant family                                                                                                                                                                                                                                                                            | `CanonicalError`     | HTTP | Reason / context                                                                                                                                   |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | ---- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Field validation: `UnknownSubjectType`, `CapMustBeNonNegative`, `BulkTooLarge`, `InvalidAmount`, `TtlOutOfBounds`                                                                                                                                                                                       | `InvalidArgument`    | 400  | matching `UPPER_SNAKE` token (field violation)                                                                                                     |
+| Field validation: `CapMustBeNonNegative`, `BulkTooLarge`, `InvalidAmount`, `TtlOutOfBounds`                                                                                                                                                                                                             | `InvalidArgument`    | 400  | matching `UPPER_SNAKE` token (field violation)                                                                                                     |
+| Contract input validation: `ProjectionNotRegistered`, `ProjectionAbstract`, `ProjectionSchemaMismatch`, `ProjectionMetadataMissing`, `MetricNotAdmitted`, `CallerAttributionInvalid`, `AnonymousSubject`                                                                                              | `InvalidArgument`    | 400  | stable field-level reason; returned before Engine dispatch, never as `Decision::Denied`                                                            |
+| Contract lifecycle preconditions: `ProjectionNotResolvable`, `ContractSnapshotUnavailable`, `QuotaAttributeContractMismatch`, `PolicyContractPairIncompatible`                                                                                                                                       | `FailedPrecondition` | 400  | stable precondition reason; Quota/Policy write rejected before persistence                                                                         |
 | Semantic precondition: `ThresholdsRequireBoundedCap`, `CapBelowConsumed`, `LeaseNotActive`, `OverCommitNotAuthorized`, `PeriodClosed`, `MetricNotQuotaGated`, `MetricNotRegistered`, `QuotaDeactivated`, `UnknownEngine`, `CannotDeleteSeededGlobalPolicy`, `UnknownPolicyVersion`, `VersionRolledBack` | `FailedPrecondition` | 400  | matching `UPPER_SNAKE` token (precondition violation)                                                                                              |
 | `PdpDenied`                                                                                                                                                                                                                                                                                             | `PermissionDenied`   | 403  | —                                                                                                                                                  |
 | `NotFound { kind, id }`                                                                                                                                                                                                                                                                                 | `NotFound`           | 404  | `kind` selects `type`; `id` populates `resource_name`                                                                                              |
@@ -962,9 +1023,9 @@ field.
 
 - **Technology**: Rust traits in `quota-enforcement-sdk` crate; async; tokio.
 
-- **Location**: [`quota-enforcement-sdk/src/client.rs`](../quota-enforcement-sdk/src/client.rs).
+- **Planned location**: `quota-enforcement-sdk/src/client.rs` (the crate has not been scaffolded yet).
 
-Two traits split by actor role; every method is async, takes a `SecurityContext` reference as the first argument after
+Three traits split by actor role; every method is async, takes a `SecurityContext` reference as the first argument after
 `&self`, and returns `Result<_, QuotaEnforcementError>`.
 
 **`QuotaEnforcementClientV1`** — Quota Consumer surface:
@@ -989,13 +1050,20 @@ Two traits split by actor role; every method is async, takes a `SecurityContext`
 | `deactivate_quota(id)`                      | `DeactivateOutcome`             | `cpt-cf-quota-enforcement-fr-quota-lifecycle` (cascade resolved leases)                                                                           |
 | `read_quotas(filter, page)`                 | `PageResult<Quota>`             | `cpt-cf-quota-enforcement-fr-quota-lifecycle`                                                                                                     |
 | `credit(req: CreditRequest)`                | `Decision`                      | `cpt-cf-quota-enforcement-fr-credit`                                                                                                              |
+
+**`QuotaOperatorClientV1`** — Platform Operator surface. Quota Resolution Policy management is
+operator-only per `cpt-cf-quota-enforcement-fr-authorization`; PRD §2.3 denies it to Quota Manager, so
+these methods are deliberately **not** on `QuotaManagerClientV1`:
+
+| Method                                      | Returns                         | Realises                                                                                                                                          |
+| ------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `create_policy(p: PolicyDraft)`             | `PolicyVersion`                 | `cpt-cf-quota-enforcement-fr-quota-resolution-policy-versioning`                                                                                  |
 | `update_policy(scope, if_match_version, p)` | `PolicyVersion`                 | same — creates new immutable version; `if_match_version` enforces lost-update protection (PRD §5.9), rejected with `VERSION_CONFLICT` on mismatch |
 | `rollback_policy(scope, target)`            | `PolicyVersion`                 | same — rollback to prior version                                                                                                                  |
 | `delete_policy(scope)`                      | `()`                            | same — soft-delete, narrow-scope only                                                                                                             |
 | `list_policy_versions(scope, page)`         | `PageResult<PolicyVersionMeta>` | same                                                                                                                                              |
 
-Both traits are implemented by `quota-enforcement-sdk-rest-client` (HTTP transport) and by
+All three traits are implemented by `quota-enforcement-sdk-rest-client` (HTTP transport) and by
 `quota-enforcement-sdk-in-process` (direct in-process call when QE is bundled in the caller's binary). Cross-gear
 callers MUST use the SDK and MUST NOT depend on the QE gateway's internal types
 (`cpt-cf-quota-enforcement-constraint-toolkit`).
@@ -1016,12 +1084,12 @@ the mutation (I11). Every method returns `Result<_, StorageError>`.
 
 | Group                                  | Methods                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Lifecycle**                          | `bootstrap(defaults: BootstrapBundle)` (idempotent: schema-version check, default Policy seed, subject-type GTS instances, default config-table rows, static built-in Engine registration).                                                                                                                                                                                                                                                      |
+| **Lifecycle**                          | `bootstrap(defaults: BootstrapBundle)` (idempotent: schema-version check, default Policy seed, owner-projection/resolver consistency checks, default config-table rows, static built-in Engine registration).                                                                                                                                                                                                                                  |
 | **Quota CRUD**                         | `create_quota(q: Quota)` → `QuotaId`; `update_quota(quota_id, patch: QuotaPatch, events)`; `deactivate_quota(quota_id, events)` → `DeactivateOutcome { resolved_leases }` (atomic cascade resolves active leases per `cpt-cf-quota-enforcement-fr-quota-lifecycle`); `read_quotas(filter: QuotaFilter, page: Page)` → `PageResult<Quota>`.                                                                                                       |
 | **Counter mutation (transactional)**   | `apply_debit_plan(applicable, plan: DebitPlan, idem_key, events)` (apply Debit Plan atomically across N Quotas, persist idempotency, enqueue events, write op-log entry — all in a single backend transaction); `apply_batch_debit(envelope_idem_key, items, events)` (envelope batch per `cpt-cf-quota-enforcement-fr-batch-debit`); `apply_credit(quota_id, amount, idem_key, events)`; `apply_rollback(original_idem_key, idem_key, events)`. |
 | **Lease (two-phase)**                  | `acquire_lease(applicable, plan, ttl, idem_key)` → `LeaseToken` (atomic: lease + per-Quota holds, increment active-lease counter — I7, capture acquisition_period_id — I5); `commit_lease(token, actual_amount, idem_key, events)` (rejects `OverCommitNotAuthorized` if `actual > reserved`); `release_lease(token, idem_key, events)`.                                                                                                         |
 | **Snapshot read**                      | `read_quota_snapshot(applicable, metric)` → `Vec<QuotaSnapshot>` (lazy period-row materialisation is the single I3 exception); `bulk_read_quota_snapshot(pairs, page)` → `PageResult<QuotaSnapshot>` (`cpt-cf-quota-enforcement-fr-bulk-quota-snapshot-read`).                                                                                                                                                                                   |
-| **Policy CRUD (immutable versioning)** | `create_policy / update_policy / rollback_policy / delete_policy` (all events-emitting); `read_policy(scope)` returns latest active version; `read_policy_version(policy_id, version)`; `list_policy_versions(scope, page)`.                                                                                                                                                                                                                     |
+| **Policy CRUD (immutable versioning)** | `create_policy / update_policy / rollback_policy / delete_policy` (all events-emitting); `read_policy(scope)` returns latest active version; `read_policy_version(policy_id, version)`; `list_policy_versions(scope, page)`.                                                                                                                    |
 | **Idempotency**                        | `lookup_idempotency(idem_key)` → `Option<IdempotencyRecord>` (gateway entry-point check; persist is implicit-in-`apply_*`).                                                                                                                                                                                                                                                                                                                      |
 | **Sweeper / reclamation**              | `reclaim_expired_leases(batch_size, before)` → `Vec<ExpiredLease>` (physical reclamation tier of `cpt-cf-quota-enforcement-fr-lease-timeout`); `reclaim_expired_idempotency`; `reclaim_operation_log`.                                                                                                                                                                                                                                           |
 | **Outbox dispatch**                    | `pull_outbox_events(batch_size)` → `Vec<OutboxEvent>` (notification dispatcher consumer); `mark_event_delivered(event_id)`; `mark_event_failed(event_id, reason)`.                                                                                                                                                                                                                                                                               |
@@ -1029,8 +1097,8 @@ the mutation (I11). Every method returns `Result<_, StorageError>`.
 **`StorageError`** — closed enum returned by every plugin method. Variants grouped by concern: lease state
 (`LeaseNotActive`, `LeaseInflightLimitExceeded`, `LeaseContentionTimeout`, `OverCommitNotAuthorized`); idempotency /
 versioning (`IdempotencyPayloadMismatch`, `VersionConflict`, `UnknownPolicyVersion`, `VersionRolledBack`); Quota
-lifecycle (`CapBelowConsumed`, `QuotaNotFound`, `QuotaDeactivated`, `PeriodClosed`); metric / type registry
-(`MetricNotRegistered`, `MetricNotQuotaGated`, `SubjectTypeNotRegistered`); post-PDP defense-in-depth
+lifecycle (`CapBelowConsumed`, `QuotaNotFound`, `QuotaDeactivated`, `PeriodClosed`); metric / contract registry
+(`MetricNotRegistered`, `MetricNotQuotaGated`, `ProjectionNotRegistered`); post-PDP defense-in-depth
 (`SubjectOutOfScope`); operational (`Unavailable`, `SchemaVersionMismatch` per I12, `Internal(String)`).
 
 `From<StorageError> for DomainError` is a 1:1 lift for most variants (`LeaseNotActive`, `IdempotencyPayloadMismatch`,
@@ -1234,7 +1302,7 @@ through SDK clients, plugin traits, or `ClientHub` (`cpt-cf-quota-enforcement-co
 | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `toolkit-db`                                          | `SecureConn` (DB access), Outbox queue                                                                                                                                         | Storage-plugin connectivity per `cpt-cf-quota-enforcement-constraint-toolkit`; outbox queue for notification-event durability (I11). Backend-specific realisations are plugin-internal.               |
 | `quota-enforcement-coordination-plugin` (impl crate) | `CoordinationPluginV1` trait via ClientHub                                                                                                                                     | Sweeper / dispatcher singleton coordination per `cpt-cf-quota-enforcement-contract-coordination-plugin`. Coordination backend is pluggable independently of the storage backend.                     |
-| `types-registry`                                     | `types-registry-sdk` GTS schema lookup; metric-name validation                                                                                                                 | Metric-name validation at Quota create/update (`cpt-cf-quota-enforcement-fr-metric-identity-validation`); GTS schema catalogue host for `gts.cf.qe.subject.type.v1~` Subject Type Registry instances. |
+| `types-registry`                                     | `types-registry-sdk` GTS schema/type lookup                                                                                                                                    | Metric validation; host for QE abstract bases, scope discriminators, owner projections/admitted-metric traits, and Quota-attribute contracts. Called at bootstrap and Quota/Policy writes, never by `EvaluationOrchestrator`. |
 | `authz-resolver`                                     | `authz-resolver-sdk::PolicyEnforcer`                                                                                                                                           | PDP integration — admission decisions with constraint filters; admission decision before tx, constraint filters consumed inside tx. Realises `cpt-cf-quota-enforcement-fr-authorization`.            |
 | `tracing` + `toolkit` `otel` feature                  | `tracing` macros (info/warn/error, instrument) and metric / span emission re-exported from `toolkit` core when the `otel` feature is enabled (OTLP exporter, span propagation). | Metric and trace emission per `cpt-cf-quota-enforcement-fr-telemetry`. No QE-side adapter wrapper; components emit directly from their hot paths.                                                    |
 | `ClientHub`                                          | RPC primitives                                                                                                                                                                 | Cross-gear SDK transport (when QE is consumed via REST from another gear's binary, the SDK layers on top of the platform RPC).                                                                   |
@@ -1285,7 +1353,7 @@ preferring it over alternatives — lives in `cpt-cf-quota-enforcement-adr-stora
 | Bounded-latency row mutation under contention with deterministic acquisition ordering             | Multi-Quota acquisition with predictable wait under contention. Realization options include pessimistic row locks, optimistic CAS with retry, or hybrid schemes — concrete choice is plugin-internal.     | I7, I8, I9, `cpt-cf-quota-enforcement-adr-acquisition-ordering`, `cpt-cf-quota-enforcement-nfr-evaluation-latency` |
 | Durable commit with RPO = 0                                                                       | Every committed operation persisted before acknowledgement. Realization options include synchronous replication, consensus quorum apply, or multi-AZ durability ack — concrete choice is plugin-internal. | `cpt-cf-quota-enforcement-nfr-fault-tolerance`                                                                     |
 | Filterable metadata predicates                                                                    | Engine policies evaluate predicates over `quota.metadata` and `request.metadata`. Realization options (JSON columns, document fields, columnar indexes, …) are plugin-internal.                           | `cpt-cf-quota-enforcement-fr-attribute-based-quota-selection`, `cpt-cf-quota-enforcement-fr-quota-metadata`        |
-| Hot-path access by `(subject_type, subject_id, metric)` and `(quota_id, period_id)`               | p95 ≤ 100 ms admission at ≥ 100 M subjects. Concrete index / sharding / denormalization strategy is plugin-internal.                                                                                      | `cpt-cf-quota-enforcement-nfr-evaluation-latency`, `cpt-cf-quota-enforcement-nfr-subject-scale`                    |
+| Hot-path access by `(projection_type, subject_id, metric)` and `(quota_id, period_id)`            | p95 ≤ 100 ms admission at ≥ 100 M subjects. Concrete index / sharding / denormalization strategy is plugin-internal.                                                                                      | `cpt-cf-quota-enforcement-nfr-evaluation-latency`, `cpt-cf-quota-enforcement-nfr-subject-scale`                    |
 | Efficient narrowing to active-status rows                                                         | Hot-path scan limited to active Quotas at ≥ 1 B Quotas total. Realization options include partial indexes, denormalization, or equivalent.                                                                | `cpt-cf-quota-enforcement-nfr-quota-density`                                                                       |
 | Schema-versioned migrations validated at `bootstrap()`                                            | Fail-fast on schema / contract drift                                                                                                                                                                      | I12                                                                                                                |
 
@@ -1302,7 +1370,7 @@ renegotiating the corresponding invariant or NFR, and that renegotiation is out 
 | Aspect              | P1 Configuration                                                                                                                                                                                             |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Metrics emission    | `tracing` macros at instrumentation sites; export pipeline (OTLP / Prometheus exporter) configured by the platform binary via `toolkit`'s `otel` feature.                                                     |
-| Cardinality         | Bounded label sets per `cpt-cf-quota-enforcement-constraint-bounded-cardinality`. High-cardinality identifiers (`tenant_id`, `quota_id`, `idempotency_key`, `lease_token`) MUST NOT appear as metric labels. |
+| Cardinality         | Bounded label sets per `cpt-cf-quota-enforcement-constraint-bounded-cardinality`. IDs, metrics, projection types, and caller attribution MUST NOT appear as metric labels. |
 | Tracing             | OpenTelemetry; spans nested under `qe.gateway.handle_request` root.                                                                                                                                          |
 | Operator dashboards | Out of DESIGN scope; maintained in the infrastructure repository.                                                                                                                                            |
 
@@ -1346,6 +1414,7 @@ sequenceDiagram
     Caller ->> GW: POST /operations/debit (DebitRequest)
     GW ->> PDP: enforce(debit)
     PDP -->> GW: Permitted + constraints
+    GW ->> GW: validate projection instances + admitted metric<br/>derive non-nil subject id from SecurityContext
     GW ->> EO: evaluate(ctx, debit_req, constraints)
     EO ->> SP: lookup_idempotency(ctx, idem_key)
     alt replay
@@ -1718,6 +1787,7 @@ sequenceDiagram
     participant ER as EngineRegistry
 
     Caller ->> GW: POST /operations/preview (PreviewRequest, no idem_key)
+    GW ->> GW: validate projection instances + admitted metric<br/>derive non-nil subject id from SecurityContext
     GW ->> EO: preview(ctx, req)
     EO ->> SP: read_quota_snapshot (read-only — read consistency only)
     SP -->> EO: Vec<QuotaSnapshot>
@@ -1751,10 +1821,10 @@ The end-user self-service flow is the same `POST /v1/quota-enforcement/snapshot`
 
 1. **Applicable-subjects filter is fixed.** When the call is made under an end-user `SecurityContext` (as opposed to an
    operator/QM service-account context), PDP narrows the applicable-subjects set to exactly
-   `{(tenant, ctx.tenant_id), (user, ctx.user_id)}`; any caller-supplied `subjects` filter that broadens this scope is
+   `{(owner-tenant-projection, ctx.tenant_id), (owner-user-projection, ctx.user_id)}`; any caller-supplied `subjects` filter that broadens this scope is
    rejected. This is the precondition for tenant-isolation integrity in the Quota Manager mediation pattern (PRD §5.10
-   normative): every Quota applicable to that `(user, tenant)` pair is returned, and **only** Quotas applicable to that
-   pair.
+   normative): every Quota applicable to that owner user/tenant projection set is returned, and **only** Quotas
+   applicable to that set.
 1. **No Policy attribution in the response.** Unlike `evaluate_preview`, the response shape carries no `policy_id` /
    `policy_version` / Engine diagnostics. End-user surfaces consume per-Quota state (`cap`, `consumed`, `remaining`,
    period boundary, validity window, metadata) without exposing arbitration internals.
@@ -1785,11 +1855,12 @@ sequenceDiagram
     Op ->> GW: POST /quotas (QuotaDraft)
     GW ->> QMS: create(ctx, draft)
     QMS ->> QMS: validate (cap ≥ 0, thresholds-require-bounded-cap, type/period combinatorics, source enum)
-    QMS ->> TR: lookup metric_name (in-process LRU cache inside QMS)
+    QMS ->> TR: resolve metric + owner projection + Quota-attribute contract (QMS LRU)
     alt unknown metric
         TR -->> QMS: Err(MetricNotRegistered)
         QMS -->> Op: 400 METRIC_NOT_REGISTERED (DomainError::MetricNotRegistered)
     else metric is registered (QuotaGated or Direct)
+        QMS ->> QMS: validate registered concrete subject projection<br/>require configured-catalogue membership<br/>validate derivation + metric admission + quota.metadata<br/>snapshot accepted contract id/version
         QMS ->> SP: BEGIN tx + create_quota(ctx, quota)
         Note over SP: 1. INSERT into `quotas` (server-assigned UUIDv7 quota_id, status='active')<br/>2. INSERT corresponding counter row(s) — `quota_allocation_counters` for allocation type, lazy `quota_consumption_counters` row created on first evaluate for consumption<br/>3. Enqueue quota-changed (change_kind='created') in outbox<br/>4. Append operation_log entry<br/>5. COMMIT
         SP -->> QMS: QuotaId
@@ -1959,12 +2030,15 @@ sequenceDiagram
     participant Op as Platform Operator
     participant GW as Gateway
     participant PS as PolicyService
+    participant TR as types-registry
     participant ER as EngineRegistry
     participant SP as StoragePlugin
 
     Op ->> GW: PATCH /policies/{id} (PolicyDraft + if_match_version)
     GW ->> PS: update_policy(ctx, scope, if_match_version, draft)
-    PS ->> ER: validate_config(draft.engine_id, draft.engine_config)
+    PS ->> TR: resolve + snapshot referenced request/Quota contracts
+    TR -->> PS: schemas + versions
+    PS ->> ER: validate_config(config, schemas, pair compatibility)
     ER -->> PS: Box<dyn ValidatedConfig>
     PS ->> SP: BEGIN tx + update_policy(scope, if_match_version, draft, events)
     alt if_match_version != current latest_version
@@ -2023,7 +2097,7 @@ plugin chooses physical layout.
 | `lease_capacity_counters`         | Per-(tenant, metric) active-lease counter                                                                                                                                                             | Co-terminus with QE deployment                                                                                                                             |
 | `quota_resolution_policy`         | Policy entity + `latest_version` pointer                                                                                                                                                              | Indefinite (seeded `global` cannot be deleted)                                                                                                             |
 | `quota_resolution_policy_version` | Immutable version rows (`active` / `superseded` / `rolled_back` / `deleted` per PRD §5.9 four-state enum)                                                                                             | Operator-configured retention (default 90 days for `superseded` / `rolled_back` / `deleted` terminals); seeded `global` Policy versions kept indefinitely. |
-| `idempotency_records`             | Replay-safety records keyed by `(tenant_id, subject_type, subject_id, operation_type, idem_key)` per `cpt-cf-quota-enforcement-fr-idempotency`                                                               | Operator-configurable per-`(tenant, metric)` (default 24 h); reclaimed by `RetentionSweeper`                                                               |
+| `idempotency_records`             | Replay-safety records keyed by `(tenant_id, projection_type, subject_id, operation_type, idem_key)` per `cpt-cf-quota-enforcement-fr-idempotency`                                                            | Operator-configurable per-`(tenant, metric)` (default 24 h); reclaimed by `RetentionSweeper`                                                               |
 | `operation_log`                   | Operation ledger (P1; audit-grade attribution deferred to P2)                                                                                                                                         | Operator-configurable (default 30 days); partitioned by date for `DROP PARTITION` retention                                                                |
 | `notification_outbox`             | Same-tx event queue (toolkit-db Outbox)                                                                                                                                                                | Co-terminus with successful delivery; dead-letter rows retained per operator config                                                                        |
 | `contention_timeout_config`       | Per-metric contention timeout configuration                                                                                                                                                           | Indefinite                                                                                                                                                 |
@@ -2049,10 +2123,22 @@ plugin chooses physical layout.
 1. Verifying schema is at the trait's major version (returns `SchemaVersionMismatch` otherwise).
 1. Seeding the `global` Quota Resolution Policy with the `most-restrictive-wins` Engine if it does not exist (cannot be
    deleted thereafter per `cpt-cf-quota-enforcement-fr-quota-resolution-policy`).
-1. Loading the embedded subject type GTS instances (`tenant`, `user`) into types-registry — via `TypesRegistryClient`
-   (platform `types-registry-sdk`, ClientHub-mediated) — if not already present, and asserting the bidirectional
-   correspondence between the Rust `SubjectTypeResolver` impls compiled into the QE binary and the GTS instances under
-   `gts://gts.cf.qe.subject.type.v1~` (every resolver matches an instance and vice-versa); a mismatch fails bootstrap.
+1. Registering the abstract QE bases `gts.cf.core.qe.subj.v1~`, `gts.cf.core.qe.res.v1~`, and
+   `gts.cf.core.qe.quota_attrs.v1~`, plus `gts.cf.core.qe.subject_scope.v1~` and its P1 well-known instances
+   `gts.cf.core.qe.subject_scope.v1~cf.core.qe.user.v1` and
+   `gts.cf.core.qe.subject_scope.v1~cf.core.qe.tenant.v1`, through `TypesRegistryClient` if missing. Concrete owner
+   projections are published by their owners; QE seeds no platform-wide subject instances.
+1. Resolving every configured subject/resource projection into a candidate `ProjectionContractCatalog`.
+1. Asserting the bidirectional correspondence between every configured concrete owner projection and the compiled Rust
+   `SubjectProjectionResolver` set; checking derivation from the QE base, admitted metric references, concrete (non-
+   abstract) status, derivation of every admitted metric reference from the metric base (a narrowed `x-gts-ref` is a
+   prefix match only, so neither registration nor derivation is covered by it), uniqueness of every admitted
+   `(metric, scope)` pair across the configured projection set, and rejection of anonymous/nil identities. QE reads
+   each projection's registry-validated effective `scope` trait and compares its `GtsInstanceId` directly. Any
+   missing/duplicate resolver, invalid reference, or `(metric, scope)` pair claimed by two configured projections fails
+   bootstrap. Bootstrap also fails when the configured catalogue is incompatible with any active Quota or Policy.
+   Registered projections outside the configured catalogue remain discoverable, but P1 rejects Quota and Policy writes
+   that reference them. The immutable catalogue is published to Gateway only after all checks pass.
 1. Seeding default rows for `contention_timeout_config(metric=NULL, timeout_ms=0)`,
    `lease_capacity_config(tenant_id=NULL, metric=NULL, max_active_leases=1000)`, and
    `idempotency_retention_config(tenant=NULL, metric=NULL, retention_seconds=86400)` when missing.
@@ -2083,8 +2169,9 @@ graph LR
 - **Single region.** Multi-region is out of P1 scope; the platform's standard region-pair active-passive pattern applies
   and `cpt-cf-quota-enforcement-nfr-fault-tolerance` (RPO=0) is delivered by the storage plugin's durable-commit
   guarantee (concrete realization is plugin-internal).
-- **Stateless gateway.** Multi-replica behind a platform load balancer; rolling-update safe. Realises
-  `cpt-cf-quota-enforcement-nfr-availability` (99.95 %).
+- **Stateless gateway.** Multi-replica behind a platform load balancer. Ordinary updates that keep the same projection
+  catalogue are rolling-update safe. Breaking projection-version activation is not supported in P1; bootstrap rejects
+  a configured catalogue that is incompatible with any active Quota or Policy.
 - **Sweeper coordination.** `LeaseSweeper`, `RetentionSweeper`, and `NotificationDispatcher` each acquire a distinct
   TTL-bounded lock via `CoordinationPluginV1::try_lock(LockScope::*, ttl)` at startup. The replica that wins the lock
   runs the background loop; others remain in follower mode and serve only request traffic. Holders renew at TTL/3; on
@@ -2108,11 +2195,11 @@ The complete QE-specific metric catalogue exposed alongside the framework baseli
 
 | Metric                                     | Type      | Labels                   | Notes                                                                                                                                                                                                                       |
 | ------------------------------------------ | --------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `denial_total`                             | Counter   | `metric`, `reason`       | Closed `reason` enum (`cpt-cf-quota-enforcement-constraint-bounded-cardinality`)                                                                                                                                            |
-| `lease_contention_rejected_total`          | Counter   | `metric`                 | Increments on `LEASE_CONTENTION_TIMEOUT` (I8)                                                                                                                                                                               |
-| `lease_acquisition_wait_seconds`           | Histogram | `metric`                 | Wait time during lease acquisition (successful or rejected); buckets sized for the SLO of `cpt-cf-quota-enforcement-nfr-evaluation-latency` (p95 ≤ 100 ms) — exact bucket configuration is operator-tunable per deployment. |
-| `lease_inflight_limit_exceeded_total`      | Counter   | `metric`                 | Per-(tenant, metric) cap (I7)                                                                                                                                                                                               |
-| `lease_unreclaimed_expired`                | Gauge     | `metric`                 | Sweeper visibility                                                                                                                                                                                                          |
+| `denial_total`                             | Counter   | `reason`                 | Closed `reason` enum (`cpt-cf-quota-enforcement-constraint-bounded-cardinality`)                                                                                                                                            |
+| `lease_contention_rejected_total`          | Counter   | —                        | Increments on `LEASE_CONTENTION_TIMEOUT` (I8)                                                                                                                                                                               |
+| `lease_acquisition_wait_seconds`           | Histogram | —                        | Wait time during lease acquisition (successful or rejected); buckets sized for the SLO of `cpt-cf-quota-enforcement-nfr-evaluation-latency` (p95 ≤ 100 ms).                                                               |
+| `lease_inflight_limit_exceeded_total`      | Counter   | —                        | Per-(tenant, metric) cap (I7), aggregated without a metric label                                                                                                                                                             |
+| `lease_unreclaimed_expired`                | Gauge     | —                        | Sweeper visibility; per-metric detail belongs in traces/admin diagnostics                                                                                                                                                    |
 | `engine_bootstrap_failures_total`          | Counter   | `engine_id`              | Gear-bootstrap fail-fast                                                                                                                                                                                                  |
 | `engine_evaluation_seconds`                | Histogram | `engine_id`              | Engine `evaluate()` latency; bucket sizing aligns with the per-Policy timeout (default 5 ms) — exact bucket configuration is operator-tunable.                                                                              |
 | `debit_plan_invariant_violations_total`    | Counter   | `engine_id`, `invariant` | `invariant` ∈ closed set of 4 (PRD §5.16)                                                                                                                                                                                   |
@@ -2124,10 +2211,16 @@ The complete QE-specific metric catalogue exposed alongside the framework baseli
 | `outbox_dead_letters_total`                | Counter   | `queue`                  | Sustained delivery-failure surface                                                                                                                                                                                          |
 | `policy_version_transitions_total`         | Counter   | `transition_kind`        | `{create, update, rollback, delete}`                                                                                                                                                                                        |
 | `policy_version_conflict_rejections_total` | Counter   | —                        | Policy versioning concurrency rejections                                                                                                                                                                                    |
+| `contract_validation_failures_total`       | Counter   | `surface`, `reason`      | `surface` ∈ `{request_subject, request_resource, caller_attribution, quota_attributes, policy_pair, bootstrap}`; `reason` is a closed validation-reason enum                                                                 |
+| `admitted_metric_violations_total`         | Counter   | `surface`                | Projection/metric incompatibility at request, Quota/Policy write, or bootstrap; no metric label                                                                                                                              |
 
 Label cardinality is bounded at compile time (`cpt-cf-quota-enforcement-constraint-bounded-cardinality`);
-high-cardinality identifiers (`tenant_id`, `subject_id`, `quota_id`, `policy_id`, `idempotency_key`, `lease_token`)
+high/unbounded-cardinality identifiers (`tenant_id`, `subject_id`, `quota_id`, `policy_id`, `idempotency_key`,
+`lease_token`, `metric`, projection type, caller attribution)
 appear only on traces and structured log fields, never on metric labels.
+
+Caller attribution is intentionally not a metric dimension: although typed, the registry does not bound the number of
+service projection types across deployments. It is available on sampled traces and structured diagnostics instead.
 
 **Tracing.** OpenTelemetry traces propagate from the `qe.gateway.handle_request` root. Stage spans:
 `subject_resolution`, `applicable_quotas_fetch`, `policy_lookup`, `engine_evaluate`, `invariant_check`,
@@ -2145,7 +2238,7 @@ Quotas):
 
 | Data class                        | Estimate                              | Notes                                                                                                                   |
 | --------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `quotas`                          | ≈ 250 GB at 1 B rows × ~250 B         | Hot index on `(subject_type, subject_id, metric)` partial-where-active sized to fit the storage-plugin in-memory cache. |
+| `quotas`                          | ≈ 250 GB at 1 B rows × ~250 B         | Hot index on `(projection_type, subject_id, metric)` partial-where-active sized to fit the storage-plugin in-memory cache. |
 | `quota_consumption_counters`      | ≈ 1.5 GB / month / metric at peak     | 13-month retention via partition drop.                                                                                  |
 | `leases` (active + ledger window) | ≤ 1 GB                                | Ledger entries kept within operation-log retention.                                                                     |
 | `idempotency_records`             | ≈ 432 GB at 24 h × 10 K ops/s × 500 B | **Significant** — operator may split to a dedicated storage tier.                                                       |
@@ -2174,9 +2267,11 @@ additively without breaking existing callers.
 | Topic                                                                            | Phase | Hook in P1 design                                                                                                                                                                                                                                                                                                                                                                 |
 |----------------------------------------------------------------------------------|-------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Sharded counters                                                                 | P2    | Counter tables additive `shard_id` column; acquisition ordering grows to `(quota_id, shard_id)`; queries aggregate via `SUM`.                                                                                                                                                                                                                                                     |
-| Bulk Quota CRUD endpoints                                                        | P2    | REST surface adds `/v1/quota-enforcement/quotas/bulk-*`; Storage plugin already exposes transactional batch primitives via `apply_batch_debit` precedent.                                                                                                                                                                                                                         |
-| Operator-facing Subject Type registration API                                    | P2    | GTS schema for `gts.cf.qe.subject.type.v1~` is published in P1; P2 grows the schema additively (resolver palette or schema-embedded rule) and persists instances in DB instead of embedded JSON.                                                                                                                                                                                  |
-| Resource-group traversal subject types (`cost-center` etc.)                      | P3    | Adds a new variant to the resolution-rule discriminator or a new resolver template; existing P1/P2 instances stay valid.                                                                                                                                                                                                                                                          |
+| Runtime projection-catalog refresh                                               | P2    | `ProjectionContractCatalog` is already built and published atomically at bootstrap; a refresh path replaces the same value under the same atomicity guarantee. It does not by itself enable breaking-version activation.                                                                                                                                                |
+| Breaking projection-version activation                                           | P2    | Requires an authoritative admission transition plus version-independent idempotency correlation before catalogue, Quota, and Policy versions can change safely.                                                                                                                                                                                                     |
+| Bulk Quota CRUD endpoints                                                        | P2    | REST surface adds `/v1/quota-enforcement/quotas/bulk-*`; Storage plugin already exposes transactional batch primitives via `apply_batch_debit` precedent. Quota Manager depends on this surface for projection-version replacement at scale; QE still gains no Quota/counter migration verb.                                                                                      |
+| Additional owner projection scopes                                               | P2    | Owners publish more derived projection types; a compiled resolver is added only after the authenticated identity field exists. QE gains no registration API.                                                                                                                                                                                                                       |
+| Resource-group-backed projection resolution (`cost-center` etc.)                 | P3    | Adds a `SubjectProjectionResolver` implementation without changing identity or Engine contracts; requires a separate latency/security design.                                                                                                                                                                                                                                     |
 | Rate Quota type (`rate`)                                                         | P3    | `quota_type` reserves the `rate` GTS instance (`gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1`); runtime currently rejects Quota creation referencing it with the canonical `Unimplemented` error per `cpt-cf-quota-enforcement-fr-quota-type-rate-rejection`. Schema migration adds optional `rate_spec` JSON field at activation time per PRD §5.3 (zero-cost reservation in P1). |
 | Cap-clamp admission (`hard-with-clamp`)                                          | P3    | `EnforcementMode` is the closed enum of `cpt-cf-quota-enforcement-fr-enforcement-mode` and admits additive variants in P3; `Decision::AllowedWithClamp` is an additive arm.                                                                                                                                                                                                       |
 | EventBus integration replacing in-process notification dispatch                  | P2    | `QuotaNotificationSinkV1` trait remains; an `EventBus`-backed sink implementation plugs in alongside operator-supplied sinks (PRD §13 EventBus OQ).                                                                                                                                                                                                                               |
@@ -2184,7 +2279,7 @@ additively without breaking existing callers.
 | Active period-rollover scheduler (silent-Quota coverage)                         | P2    | P1 lazy detection has the known limitation that Quotas with no operations after a period boundary do not emit `period-rollover` until the next op. P2 adds a scheduled scan keyed off `period_end`.                                                                                                                                                                               |
 | Cold-tier migration of `operation_log` and `idempotency_records`                 | P2    | Both have partition-by-date layouts in the storage plugin; cold-tier migration is a standard data-platform extension point.                                                                                                                                                                                                                                                       |
 | Composable Policy patterns / Shadow evaluation / CEL-based notification policies | P2    | All sit on top of the existing Engine and Notification plugin contracts; each is a new Engine or new Policy semantic, not a contract change.                                                                                                                                                                                                                                      |
-| Quota Metadata GTS schema validation (per-tenant / per-metric)                   | P3    | Hooks in `cpt-cf-quota-enforcement-fr-quota-metadata`; depends on platform-wide GTS availability.                                                                                                                                                                                                                                                                                 |
+| Per-resource counter axis                                                        | Open  | Resource projections already provide the contract. If a concrete high-cardinality consumer emerges, add resource to the counter/applicable-set key so counters materialize per resource; do not simulate this with properties.                                                                                                                                                    |
 | Engine deprecation lifecycle                                                     | P2    | Kept open; relevant when additional Engine plugins (Wasm / Starlark / Lua) land in the deployment binary. P1 fail-fast on bootstrap-time registration failures (`cpt-cf-quota-enforcement-fr-quota-resolution-engine`) covers built-in Engine outages but not intentional removals — the latter await the P2 deprecation roadmap.                                                 |
 | Audit-grade retention + audit infrastructure                                     | P2    | Operation-log retention covers the ledger; audit-grade attribution awaits the platform audit infra.                                                                                                                                                                                                                                                                               |
 
@@ -2209,6 +2304,7 @@ additively without breaking existing callers.
   [0003 Metadata snapshot timing](./ADR/0003-cpt-cf-quota-enforcement-adr-metadata-snapshot-timing.md),
   [0004 Settlement window emit](./ADR/0004-cpt-cf-quota-enforcement-adr-settlement-window-emit.md),
   [0005 Pluggable evaluation engine](./ADR/0005-cpt-cf-quota-enforcement-adr-evaluation-engine.md),
-  [0006 Coordination plugin](./ADR/0006-cpt-cf-quota-enforcement-adr-coordination-plugin.md)
+  [0006 Coordination plugin](./ADR/0006-cpt-cf-quota-enforcement-adr-coordination-plugin.md),
+  [0007 Declarative projection contracts](./ADR/0007-cpt-cf-quota-enforcement-adr-projection-contracts.md)
 - **Storage plugin DESIGN**: authored separately by the plugin owner once the plugin crate is created
 - **Features**: `features/` (per-feature implementation guides — to be authored as P1 development progresses)
