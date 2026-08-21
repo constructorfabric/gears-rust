@@ -107,6 +107,10 @@ patterns = ["gears/mini-chat/*"]
 reason = "Ignore module 'approval-service' (PRD/DESIGN are placeholders). Remove this ignore after PRD/DESIGN conform to template."
 patterns = ["gears/approval-service/*"]
 
+[[ignore]]
+reason = "Ignore module 'location-manager' (PRD authored; DESIGN not yet authored). Remove this ignore after DESIGN conforms to template."
+patterns = ["gears/location-manager/*"]
+
 [[systems]]
 name = "cf-gears"
 slug = "cf"
