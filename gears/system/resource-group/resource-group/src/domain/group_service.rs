@@ -611,7 +611,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // Record closure-row metrics outside the retry closure so retries
         // do not double-count (CodeRabbit).
         if let Ok((_, closure_rows)) = &result {
-            self.metrics.closure_rows_written(Operation::Move, *closure_rows);
+            self.metrics
+                .closure_rows_written(Operation::Move, *closure_rows);
         }
         result.map(|(group, _)| group)
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-13
@@ -680,14 +681,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 let scope = scope.clone();
                 let group_repo = group_repo.clone();
                 Box::pin(async move {
-                    Self::delete_group_inner(&*group_repo, tx, &scope, group_id, force)
-                        .await
+                    Self::delete_group_inner(&*group_repo, tx, &scope, group_id, force).await
                 })
             })
             .await;
         // Record subtree-node metric outside the retry closure (CodeRabbit).
         if let Ok(Some(subtree_count)) = &result {
-            self.metrics.subtree_nodes(Operation::ForceDelete, *subtree_count);
+            self.metrics
+                .subtree_nodes(Operation::ForceDelete, *subtree_count);
         }
         self.record_op(
             if force {
@@ -1508,7 +1509,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             group_repo.delete_all_closure_rows(tx, group_id).await?;
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6a
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6b
-            group_repo.delete_by_id(tx, group_id).await.map(|_| None)
+            group_repo.delete_by_id(tx, group_id).await.map(|()| None)
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6b
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6
         }

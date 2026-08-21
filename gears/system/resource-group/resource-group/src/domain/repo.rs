@@ -415,14 +415,20 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
         resource_id: &str,
     ) -> Result<Vec<Uuid>, DomainError>;
 
-    /// Try to insert the guard row for a resource membership.
+    /// Try to claim the guard row for a resource membership.
     ///
-    /// `INSERT ... ON CONFLICT DO NOTHING` on PK `(gts_type_id, resource_id)`
-    /// serializes the first membership of a resource. Returns the `tenant_id`
-    /// that was either just inserted or already present.
+    /// Reads the existing guard row for PK `(gts_type_id, resource_id)`
+    /// first; if none exists, inserts one and falls back to re-reading it on
+    /// a unique-violation race. Serializes the first membership of a
+    /// resource. Returns the `tenant_id` that was either just inserted or
+    /// already present.
     ///
     /// The caller must then compare the returned tenant against the group's
-    /// own tenant and reject the `add_membership` if they differ.
+    /// own tenant and reject the `add_membership` if they differ. To keep
+    /// the claim from outliving the memberships it guards, run this in the
+    /// same transaction as the membership insert it gates, and release the
+    /// guard via [`Self::delete_membership_guard`] once
+    /// [`Self::count_memberships`] reports none remain for the pair.
     async fn ensure_membership_guard<C: DBRunner>(
         &self,
         db: &C,
@@ -430,4 +436,20 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
         resource_id: &str,
         tenant_id: Uuid,
     ) -> Result<Uuid, DomainError>;
+
+    /// Count memberships still referencing `(gts_type_id, resource_id)`.
+    async fn count_memberships<C: DBRunner>(
+        &self,
+        db: &C,
+        gts_type_id: i16,
+        resource_id: &str,
+    ) -> Result<u64, DomainError>;
+
+    /// Delete the membership-tenant guard row for `(gts_type_id, resource_id)`.
+    async fn delete_membership_guard<C: DBRunner>(
+        &self,
+        db: &C,
+        gts_type_id: i16,
+        resource_id: &str,
+    ) -> Result<(), DomainError>;
 }

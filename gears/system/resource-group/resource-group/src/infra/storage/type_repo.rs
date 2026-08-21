@@ -539,7 +539,8 @@ impl TypeRepositoryTrait for TypeRepository {
                 // Same conflict either way.
                 if e.is_foreign_key_violation() {
                     DomainError::conflict_active_references(format!(
-                        "Cannot delete type: group(s) of this type exist (type_id {type_id})"
+                        "Cannot delete type: group(s) or membership(s) of this type exist \
+                         (type_id {type_id})"
                     ))
                 } else {
                     DomainError::database(e.to_string())
@@ -745,6 +746,10 @@ impl TypeRepositoryTrait for TypeRepository {
         child_type_id: i16,
         membership_codes: &[String],
     ) -> Result<Vec<(String, uuid::Uuid, String)>, DomainError> {
+        use crate::infra::storage::entity::resource_group_membership::{
+            self as membership_entity, Entity as MembershipEntity,
+        };
+
         if membership_codes.is_empty() {
             return Ok(Vec::new());
         }
@@ -773,34 +778,21 @@ impl TypeRepositoryTrait for TypeRepository {
             .collect();
         let type_ids: Vec<i16> = membership_types.iter().map(|t| t.id).collect();
 
-        // Find groups of `child_type_id` that have memberships in any of
-        // the removed membership types. Unscoped — an integrity sweep must
-        // always see the real data regardless of the caller's scope.
-        use crate::infra::storage::entity::resource_group_membership::{
-            self as membership_entity, Entity as MembershipEntity,
-        };
+        // Which groups of `child_type_id` have a membership in one of the
+        // removed types -- decided by the database via a subquery, not by
+        // loading every group of that type into the process first (that
+        // was the anti-pattern `find_groups_violating_removed_parents`
+        // above was rewritten to avoid). What comes back grows with the
+        // number of violating memberships, not with the number of groups
+        // of the child type. Unscoped — an integrity sweep must always see
+        // the real data regardless of the caller's scope.
+        let groups_of_child_type = Query::select()
+            .column(rg_entity::Column::Id)
+            .from(ResourceGroupEntity)
+            .and_where(Expr::col(rg_entity::Column::GtsTypeId).eq(child_type_id))
+            .to_owned();
 
-        // Subquery: group ids of the child type that have a membership
-        // of a removed type.
-        let groups_with_membership: Vec<rg_entity::Model> = ResourceGroupEntity::find()
-            .filter(rg_entity::Column::GtsTypeId.eq(child_type_id))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        if groups_with_membership.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let group_ids: Vec<uuid::Uuid> = groups_with_membership.iter().map(|g| g.id).collect();
-        let name_by_id: std::collections::HashMap<uuid::Uuid, String> = groups_with_membership
-            .iter()
-            .map(|g| (g.id, g.name.clone()))
-            .collect();
-
-        let mut violations: Vec<(String, uuid::Uuid, String)> = Vec::new();
+        let mut violating: Vec<(i16, uuid::Uuid)> = Vec::new();
         for chunk in type_ids.chunks(
             toolkit_db::secure::max_bind_params_for(db)
                 .saturating_sub(1)
@@ -808,22 +800,51 @@ impl TypeRepositoryTrait for TypeRepository {
         ) {
             let members: Vec<membership_entity::Model> = MembershipEntity::find()
                 .filter(membership_entity::Column::GtsTypeId.is_in(chunk.to_vec()))
-                .filter(membership_entity::Column::GroupId.is_in(group_ids.clone()))
+                .filter(
+                    membership_entity::Column::GroupId.in_subquery(groups_of_child_type.clone()),
+                )
                 .secure()
                 .scope_with(&scope)
                 .all(db)
                 .await
                 .map_err(|e| DomainError::database(e.to_string()))?;
 
-            for m in &members {
-                if let Some(code) = id_to_code.get(&m.gts_type_id) {
-                    let name = name_by_id.get(&m.group_id).cloned().unwrap_or_default();
-                    violations.push((code.clone(), m.group_id, name));
-                }
-            }
+            violating.extend(members.into_iter().map(|m| (m.gts_type_id, m.group_id)));
         }
 
-        Ok(violations)
+        if violating.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Resolve names only for the groups that actually violate, the same
+        // way the sibling method above bounds its own group lookup by the
+        // answer rather than by the type's popularity.
+        let mut violating_group_ids: Vec<uuid::Uuid> =
+            violating.iter().map(|(_, id)| *id).collect();
+        violating_group_ids.sort_unstable();
+        violating_group_ids.dedup();
+
+        let mut name_by_id: std::collections::HashMap<uuid::Uuid, String> =
+            std::collections::HashMap::new();
+        for id_chunk in violating_group_ids.chunks(toolkit_db::secure::max_bind_params_for(db)) {
+            let groups: Vec<rg_entity::Model> = ResourceGroupEntity::find()
+                .filter(rg_entity::Column::Id.is_in(id_chunk.to_vec()))
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            name_by_id.extend(groups.into_iter().map(|g| (g.id, g.name)));
+        }
+
+        Ok(violating
+            .into_iter()
+            .filter_map(|(type_id, group_id)| {
+                let code = id_to_code.get(&type_id)?.clone();
+                let name = name_by_id.get(&group_id).cloned().unwrap_or_default();
+                Some((code, group_id, name))
+            })
+            .collect())
     }
 
     /// List GTS types with `OData` filtering and cursor-based pagination.

@@ -8,8 +8,6 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use common::{create_root_type, make_ctx, make_group_service, make_membership_service, test_db};
 use toolkit_odata::ODataQuery;
 use uuid::Uuid;

@@ -2243,11 +2243,12 @@ async fn rest_route_smoke_all_endpoints_registered() {
 // (`domain_to_problem_cycle_detected_is_400`), but neither one drives the
 // actual HTTP path. These two tests close that gap.
 //
-// They now drive `POST /resource-group/v1/groups/{id}/move` rather than
-// `PUT /resource-group/v1/groups/{id}`: re-parenting was split out of the
-// update payload, so a `parent_id` in a PUT body is a rejected unknown field
-// (see `rest_update_group_rejects_parent_id_field`) and can no longer reach
-// cycle detection at all.
+// There is no separate move endpoint: re-parenting stays part of the
+// `UpdateGroupDto` payload (`parent_id`, required, `null` for root -- see
+// its doc comment in `api/rest/dto.rs`), and `update_group_inner` delegates
+// to the same move logic when `parent_id` changes (src/domain/group_service.rs,
+// "Delegate to move logic"). So `PUT /resource-group/v1/groups/{id}` with a
+// changed `parent_id` is how these tests reach cycle detection.
 
 /// moving a group under its own descendant returns 400 with a
 /// `hierarchy` precondition violation.

@@ -9,7 +9,6 @@
 
 mod common;
 
-use std::sync::Arc;
 use toolkit_gts::GTS_ID_PREFIX;
 
 use serde_json::json;
@@ -17,7 +16,6 @@ use uuid::Uuid;
 
 use resource_group::domain::error::DomainError;
 use resource_group::domain::repo::TypeRepositoryTrait;
-use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::entity::{
     gts_type::{self, Entity as GtsTypeEntity},
     gts_type_allowed_membership::{self, Entity as AllowedMembershipEntity},

@@ -521,7 +521,7 @@ async fn explicit_id_with_same_tenant_still_succeeds() {
             tenant_id,
         )
         .await
-            .expect("id + same-tenant target must still succeed");
+        .expect("id + same-tenant target must still succeed");
 
     assert_eq!(group.id, id);
 }

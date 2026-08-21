@@ -254,6 +254,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
 
         let sc = system_scope();
 
+        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-1
         // Optimistic: try to read first; if none exists, insert.
         let existing = GuardEntity::find()
             .filter(guard_entity::Column::GtsTypeId.eq(gts_type_id))
@@ -267,7 +268,9 @@ impl MembershipRepositoryTrait for MembershipRepository {
         if let Some(guard) = existing {
             return Ok(guard.tenant_id);
         }
+        // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-1
 
+        // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-2
         // No guard row yet — try to claim this resource.
         let model = guard_entity::ActiveModel {
             gts_type_id: Set(gts_type_id),
@@ -276,27 +279,78 @@ impl MembershipRepositoryTrait for MembershipRepository {
             created_at: Set(time::OffsetDateTime::now_utc()),
         };
 
-        let result = toolkit_db::secure::secure_insert::<GuardEntity>(model, &sc, db).await;
-        if result.is_ok() {
-            return Ok(tenant_id);
+        match toolkit_db::secure::secure_insert::<GuardEntity>(model, &sc, db).await {
+            Ok(_) => Ok(tenant_id),
+            // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-2
+            // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-3
+            Err(err) if err.is_unique_violation() => {
+                // Lost the race. Read the established tenant.
+                GuardEntity::find()
+                    .filter(guard_entity::Column::GtsTypeId.eq(gts_type_id))
+                    .filter(guard_entity::Column::ResourceId.eq(resource_id))
+                    .secure()
+                    .scope_with(&sc)
+                    .one(db)
+                    .await
+                    .map_err(|e| DomainError::database(e.to_string()))?
+                    .ok_or_else(|| {
+                        DomainError::database(
+                            "Guard row disappeared after UNIQUE violation".to_owned(),
+                        )
+                    })
+                    .map(|winner| winner.tenant_id)
+            }
+            // @cpt-end:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-3
+            Err(err) => Err(DomainError::database(err.to_string())),
         }
-        let err = result.unwrap_err();
-        if err.is_unique_violation() {
-            // Lost the race. Read the established tenant.
-            let winner = GuardEntity::find()
-                .filter(guard_entity::Column::GtsTypeId.eq(gts_type_id))
-                .filter(guard_entity::Column::ResourceId.eq(resource_id))
-                .secure()
-                .scope_with(&sc)
-                .one(db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?
-                .ok_or_else(|| {
-                    DomainError::database("Guard row disappeared after UNIQUE violation".to_owned())
-                })?;
-            Ok(winner.tenant_id)
-        } else {
-            Err(DomainError::database(err.to_string()))
-        }
+    }
+
+    /// Count memberships still referencing `(gts_type_id, resource_id)`.
+    ///
+    /// Used to decide whether the membership-tenant guard row can be
+    /// released after a removal. Unscoped, for the same reason
+    /// [`Self::get_existing_membership_tenant_ids`] is: the guard's
+    /// lifecycle must track the real data, not a partial view of it.
+    async fn count_memberships<C: DBRunner>(
+        &self,
+        db: &C,
+        gts_type_id: i16,
+        resource_id: &str,
+    ) -> Result<u64, DomainError> {
+        let scope = system_scope();
+        MembershipEntity::find()
+            .filter(membership_entity::Column::GtsTypeId.eq(gts_type_id))
+            .filter(membership_entity::Column::ResourceId.eq(resource_id))
+            .secure()
+            .scope_with(&scope)
+            .count(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))
+    }
+
+    /// Delete the membership-tenant guard row for `(gts_type_id, resource_id)`.
+    ///
+    /// Called once the last membership referencing the pair is gone, so the
+    /// tenant claim does not outlive every membership it was guarding.
+    async fn delete_membership_guard<C: DBRunner>(
+        &self,
+        db: &C,
+        gts_type_id: i16,
+        resource_id: &str,
+    ) -> Result<(), DomainError> {
+        use crate::infra::storage::entity::resource_membership_tenant::{
+            self as guard_entity, Entity as GuardEntity,
+        };
+
+        let scope = system_scope();
+        GuardEntity::delete_many()
+            .filter(guard_entity::Column::GtsTypeId.eq(gts_type_id))
+            .filter(guard_entity::Column::ResourceId.eq(resource_id))
+            .secure()
+            .scope_with(&scope)
+            .exec(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+        Ok(())
     }
 }

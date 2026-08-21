@@ -11,7 +11,6 @@
 
 mod common;
 
-use std::sync::Arc;
 use toolkit_gts::GTS_ID_PREFIX;
 
 use common::{make_ctx, make_group_service, make_membership_service, test_db};
@@ -20,7 +19,6 @@ use uuid::Uuid;
 use resource_group::domain::seeding::{
     GroupSeedDef, MembershipSeedDef, seed_groups, seed_memberships, seed_types,
 };
-use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::entity::gts_type::{
     Column as TypeColumn, Entity as TypeEntity,
 };
@@ -28,7 +26,6 @@ use resource_group::infra::storage::entity::resource_group::Entity as GroupEntit
 use resource_group::infra::storage::entity::resource_group_membership::{
     Column as MbrColumn, Entity as MbrEntity,
 };
-use resource_group::infra::storage::type_repo::TypeRepository;
 use resource_group_sdk::CreateTypeRequest;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use toolkit_db::secure::SecureEntityExt;

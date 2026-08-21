@@ -27,7 +27,6 @@ use toolkit_odata::ODataQuery;
 use toolkit_security::pep_properties;
 
 use resource_group::domain::group_service::{GroupService, QueryProfile};
-use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::membership_repo::MembershipRepository;
 use resource_group::infra::storage::type_repo::TypeRepository;

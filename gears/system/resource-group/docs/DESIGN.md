@@ -1591,7 +1591,9 @@ Fixtures (following `oagw` e2e pattern): session-scoped `rg_base_url` (from env 
 
 Hierarchy mutations run with bounded retry, at an isolation level chosen per operation rather than fixed:
 
-- `SERIALIZABLE` where a write depends on a predicate over rows it does not itself lock: `create`, `move`, a parent-changing `update`, and a **force** delete — all of which rewrite closure rows across a subtree.
+- `SERIALIZABLE` where a write depends on a predicate over rows it does not itself lock:
+  - `create` — the depth/width limit check reads the parent's depth and its sibling count, and the insert that follows locks neither, so two concurrent creates under the same parent can each read a count that passes the check and both commit past the limit.
+  - `move`, a parent-changing `update`, and a **force** delete — these rewrite closure rows across a subtree, exposed to the same phantom-read window between the cycle check and the closure/entity mutation.
 - The backend default where there is no such predicate: a name/metadata-only `update`, which changes one row by primary key, and a **non-force** delete, which takes a row lock (`SELECT ... FOR UPDATE`) on its target so the children and membership checks it decides from stay true until it commits.
 
 The second group does not *require* `SERIALIZABLE` — it does not stop being correct under it. What changes is where contention shows up: on PostgreSQL's default (`READ COMMITTED`) those operations wait on a row lock rather than aborting with `40001`, so retries there are for deadlocks, not for serialization failures. A deployment that raises the default to `SERIALIZABLE`, and SQLite, which is serializable regardless, keep the abort-and-retry behaviour; retry is in place either way. Concurrency tests verify correctness under parallel access.

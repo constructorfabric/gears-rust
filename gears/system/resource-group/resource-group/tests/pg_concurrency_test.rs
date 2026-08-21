@@ -39,7 +39,7 @@ use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::migrations::Migrator;
 use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::models::{CreateGroupRequest, CreateTypeRequest};
+use resource_group_sdk::models::{CreateGroupRequest, CreateTypeRequest, UpdateTypeRequest};
 use sea_orm_migration::MigratorTrait;
 use testcontainers::{ContainerRequest, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres;
@@ -71,9 +71,10 @@ async fn pg_fixture() -> Option<PgFixture> {
     let container = match request.start().await {
         Ok(c) => c,
         Err(e) => {
-            if require_docker() {
-                panic!("Docker required (RG_PG_REQUIRE_DOCKER=1) but container failed: {e}");
-            }
+            assert!(
+                !require_docker(),
+                "Docker required (RG_PG_REQUIRE_DOCKER=1) but container failed: {e}"
+            );
             eprintln!("pg_concurrency_test: skipping (Docker unavailable: {e})");
             return None;
         }
@@ -158,6 +159,23 @@ async fn concurrent_move_a_to_b_and_b_to_a() {
         })
         .await
         .expect("create type");
+
+    // A and B below are both of this type and need to become each other's
+    // parent, so the type must allow itself as a parent. It cannot list
+    // itself at creation (the row does not exist yet for `resolve_ids` to
+    // find), so this is a follow-up update against the now-existing row.
+    let rt = type_svc
+        .update_type_unscoped(
+            &rt.code,
+            UpdateTypeRequest {
+                can_be_root: rt.can_be_root,
+                allowed_parent_types: vec![rt.code.clone()],
+                allowed_membership_types: rt.allowed_membership_types.clone(),
+                metadata_schema: None,
+            },
+        )
+        .await
+        .expect("allow type to parent itself");
 
     let root = group_svc
         .create_group(
@@ -255,6 +273,23 @@ async fn concurrent_create_child_and_move_parent() {
         })
         .await
         .expect("create type");
+
+    // `parent` and `child` below nest under groups of this same type, so the
+    // type must allow itself as a parent. It cannot list itself at creation
+    // (the row does not exist yet for `resolve_ids` to find), so this is a
+    // follow-up update against the now-existing row.
+    let rt = type_svc
+        .update_type_unscoped(
+            &rt.code,
+            UpdateTypeRequest {
+                can_be_root: rt.can_be_root,
+                allowed_parent_types: vec![rt.code.clone()],
+                allowed_membership_types: rt.allowed_membership_types.clone(),
+                metadata_schema: None,
+            },
+        )
+        .await
+        .expect("allow type to parent itself");
 
     let root = group_svc
         .create_group(
@@ -424,20 +459,20 @@ async fn concurrent_non_force_delete_and_create_child() {
     );
 
     match (&del_res, &create_res) {
-        (Ok(_), Ok(_)) => {
+        (Ok(()), Ok(_)) => {
             panic!("both non-force delete and create succeeded -- FK invariant broken!")
         }
         (Err(e1), Err(e2)) => {
             let m = format!("{e1}{e2}");
             assert!(
-                m.contains("conflict") || m.contains("not_found") || m.contains("precondition"),
+                m.contains("conflict") || m.contains("not found") || m.contains("precondition"),
                 "expected conflict/not_found, got: {e1} / {e2}"
             );
         }
-        (Ok(_), Err(e)) | (Err(e), Ok(_)) => {
+        (Ok(()), Err(e)) | (Err(e), Ok(_)) => {
             let m = format!("{e}");
             assert!(
-                m.contains("conflict") || m.contains("not_found") || m.contains("precondition"),
+                m.contains("conflict") || m.contains("not found") || m.contains("precondition"),
                 "expected conflict/not_found/precondition, got: {e}"
             );
         }
@@ -485,20 +520,20 @@ async fn concurrent_delete_type_and_create_group() {
     );
 
     match (&del_res, &create_res) {
-        (Ok(_), Ok(_)) => {
+        (Ok(()), Ok(_)) => {
             panic!("both delete_type and create_group succeeded -- type in use but removed!")
         }
         (Err(e1), Err(e2)) => {
             let m = format!("{e1}{e2}");
             assert!(
-                m.contains("conflict") || m.contains("references") || m.contains("not_found"),
+                m.contains("conflict") || m.contains("references") || m.contains("not found"),
                 "expected conflict/references, got: {e1} / {e2}"
             );
         }
-        (Ok(_), Err(e)) | (Err(e), Ok(_)) => {
+        (Ok(()), Err(e)) | (Err(e), Ok(_)) => {
             let m = format!("{e}");
             assert!(
-                m.contains("conflict") || m.contains("references") || m.contains("not_found"),
+                m.contains("conflict") || m.contains("references") || m.contains("not found"),
                 "expected conflict/references/not_found, got: {e}"
             );
         }

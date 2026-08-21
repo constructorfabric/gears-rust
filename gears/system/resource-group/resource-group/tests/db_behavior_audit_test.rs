@@ -519,9 +519,10 @@ async fn trace_list_memberships() {
 /// that table is a key part or `created_at`, all four known to the caller
 /// (RG-08).
 ///
-/// And the writes run on a bare connection. That is RG-01, still present here:
-/// the transaction boundary belongs to the isolation branch, so this asserts
-/// the defect rather than its absence, and fails the day it is fixed.
+/// Fixed 2026-08-21 (RG-01): the guard claim and the membership insert now
+/// share one transaction (`ensure_membership_guard` + `insert` inside
+/// `add_membership_inner`'s `transaction_with_retry`), so a failed insert
+/// rolls the claim back instead of leaving it behind. This asserts the fix.
 #[tokio::test]
 async fn trace_add_membership() {
     let (db, rec) = common::test_db_with_recorder().await;
@@ -567,11 +568,9 @@ async fn trace_add_membership() {
     );
 
     assert!(
-        !rec.writes_outside_tx().is_empty(),
-        "RG-01 is pinned as present in this branch: add_membership writes on a \
-         bare connection. If this now fails, the transaction boundary landed -- \
-         flip this to `is_empty()` and update the RG-01 row in \
-         docs/db-behavior-audit.md in the same commit:\n{}",
+        rec.writes_outside_tx().is_empty(),
+        "RG-01 regression: add_membership's guard claim and membership insert \
+         should share one transaction; got a write outside it:\n{}",
         rec.dump()
     );
 }
@@ -1314,6 +1313,15 @@ async fn trace_delete_type() {
     assert!(
         rec.writes_outside_tx().is_empty(),
         "delete_type must run its writes inside a transaction (RG-02):\n{}",
+        rec.dump()
+    );
+    // `writes_outside_tx` only flags writes: a regression that moved the id
+    // resolution or the reference count ahead of `BEGIN` would still pass
+    // that check as long as the delete itself stayed transactional, and
+    // that ordering is exactly the check-then-delete race RG-02 was about.
+    assert!(
+        rec.events().iter().all(|event| event.in_tx),
+        "delete_type must run its reads and writes inside one transaction (RG-02):\n{}",
         rec.dump()
     );
 }
