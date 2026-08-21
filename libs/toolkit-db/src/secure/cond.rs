@@ -1,4 +1,4 @@
-use sea_orm::sea_query::{Alias, Query};
+use sea_orm::sea_query::{Alias, Query, SelectStatement, SimpleExpr};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, sea_query::Expr};
 
 use crate::secure::{AccessScope, ScopableEntity};
@@ -50,6 +50,72 @@ fn uuid_scope_values_to_sea_values(values: &[ScopeValue]) -> Option<Vec<sea_orm:
 /// Build a deny-all condition (`WHERE false`).
 fn deny_all() -> Condition {
     Condition::all().add(Expr::value(false))
+}
+
+/// Select the direct or closure-expanded group IDs used by a typed membership query.
+enum GroupSelection {
+    /// Match membership rows against explicit group UUIDs.
+    Direct(Vec<sea_orm::Value>),
+    /// Match membership rows against group IDs returned by a closure query.
+    Subtree(Box<SelectStatement>),
+}
+
+/// Resolve an external member-handle GTS schema ID to RG-local `gts_type.id` values.
+fn membership_type_subquery(membership_resource_type: &str) -> SelectStatement {
+    let member_type = Alias::new("member_type");
+    Query::select()
+        .column((member_type.clone(), Alias::new(rg_tables::GTS_TYPE_ID)))
+        .from_as(Alias::new(rg_tables::GTS_TYPE_TABLE), member_type.clone())
+        .and_where(
+            Expr::col((member_type, Alias::new(rg_tables::GTS_TYPE_SCHEMA_ID)))
+                .eq(membership_resource_type),
+        )
+        .to_owned()
+}
+
+/// Build the common typed RG membership condition for direct and subtree predicates.
+///
+/// RG stores external resource IDs as opaque text, so the entity property is
+/// cast to text. Casting membership IDs to UUID would make valid non-UUID member
+/// types raise a `PostgreSQL` conversion error. An absent member-handle type fails
+/// closed because otherwise identical external IDs from different types could
+/// be conflated.
+fn typed_membership_condition(
+    entity_property: SimpleExpr,
+    membership_resource_type: &str,
+    group_selection: GroupSelection,
+) -> Option<SimpleExpr> {
+    if membership_resource_type.is_empty() {
+        return None;
+    }
+
+    let membership = Alias::new("membership");
+    let group_id = Expr::col((
+        membership.clone(),
+        Alias::new(rg_tables::MEMBERSHIP_GROUP_ID),
+    ));
+    let group_predicate = match group_selection {
+        GroupSelection::Direct(group_ids) => group_id.is_in(group_ids),
+        GroupSelection::Subtree(closure_subquery) => group_id.in_subquery(*closure_subquery),
+    };
+    let mut membership_subquery = Query::select()
+        .column((
+            membership.clone(),
+            Alias::new(rg_tables::MEMBERSHIP_RESOURCE_ID),
+        ))
+        .from_as(Alias::new(rg_tables::MEMBERSHIP_TABLE), membership.clone())
+        .and_where(group_predicate)
+        .to_owned();
+    membership_subquery.and_where(
+        Expr::col((membership, Alias::new(rg_tables::MEMBERSHIP_GTS_TYPE_ID)))
+            .in_subquery(membership_type_subquery(membership_resource_type)),
+    );
+
+    Some(
+        entity_property
+            .cast_as(Alias::new("text"))
+            .in_subquery(membership_subquery),
+    )
 }
 
 /// Builds a `SeaORM` `Condition` from an `AccessScope` using property resolution.
@@ -155,81 +221,27 @@ where
                 and_cond = and_cond.add(col.is_in(sea_values));
             }
             ScopeFilter::InGroup(gf) => {
-                // Legacy untyped filters cannot safely distinguish identical
-                // external IDs belonging to different RG member-handle types.
-                if gf.membership_resource_type().is_empty() {
-                    and_cond = and_cond.add(Expr::value(false));
-                    continue;
-                }
-
-                // CAST(col AS text) IN (
-                //   SELECT membership.resource_id
-                //   FROM resource_group_membership AS membership
-                //   WHERE membership.group_id IN (...)
-                //     AND membership.gts_type_id IN (
-                //       SELECT member_type.id FROM gts_type AS member_type
-                //       WHERE member_type.schema_id = <membership resource type>
-                //     )
-                // )
-                //
-                // RG stores external resource IDs as opaque TEXT. Cast the
-                // entity side to text: casting membership.resource_id to UUID
-                // would throw for valid non-UUID member types before the type
-                // qualifier can exclude them.
-                let membership = Alias::new("membership");
-                let member_type = Alias::new("member_type");
                 let Some(group_values) = uuid_scope_values_to_sea_values(gf.group_ids()) else {
                     and_cond = and_cond.add(Expr::value(false));
                     continue;
                 };
-                let type_subquery = Query::select()
-                    .column((member_type.clone(), Alias::new(rg_tables::GTS_TYPE_ID)))
-                    .from_as(Alias::new(rg_tables::GTS_TYPE_TABLE), member_type.clone())
-                    .and_where(
-                        Expr::col((member_type, Alias::new(rg_tables::GTS_TYPE_SCHEMA_ID)))
-                            .eq(gf.membership_resource_type()),
-                    )
-                    .to_owned();
-                let subquery = Query::select()
-                    .column((
-                        membership.clone(),
-                        Alias::new(rg_tables::MEMBERSHIP_RESOURCE_ID),
-                    ))
-                    .from_as(Alias::new(rg_tables::MEMBERSHIP_TABLE), membership.clone())
-                    .and_where(
-                        Expr::col((
-                            membership.clone(),
-                            Alias::new(rg_tables::MEMBERSHIP_GROUP_ID),
-                        ))
-                        .is_in(group_values),
-                    )
-                    .and_where(
-                        Expr::col((membership, Alias::new(rg_tables::MEMBERSHIP_GTS_TYPE_ID)))
-                            .in_subquery(type_subquery),
-                    )
-                    .to_owned();
-                and_cond = and_cond.add(
-                    col.into_expr()
-                        .cast_as(Alias::new("text"))
-                        .in_subquery(subquery),
-                );
-            }
-            ScopeFilter::InGroupSubtree(sf) => {
-                if sf.membership_resource_type().is_empty() {
+                let Some(condition) = typed_membership_condition(
+                    col.into_expr(),
+                    gf.membership_resource_type(),
+                    GroupSelection::Direct(group_values),
+                ) else {
                     and_cond = and_cond.add(Expr::value(false));
                     continue;
-                }
-
-                // Same typed TEXT-membership comparison as InGroup, with the
-                // direct group set supplied by the closure-table subtree.
-                let closure = Alias::new("group_closure");
-                let membership = Alias::new("membership");
-                let member_type = Alias::new("member_type");
+                };
+                and_cond = and_cond.add(condition);
+            }
+            ScopeFilter::InGroupSubtree(sf) => {
                 let Some(ancestor_values) = uuid_scope_values_to_sea_values(sf.ancestor_ids())
                 else {
                     and_cond = and_cond.add(Expr::value(false));
                     continue;
                 };
+                let closure = Alias::new("group_closure");
                 let closure_subquery = Query::select()
                     .column((
                         closure.clone(),
@@ -241,37 +253,15 @@ where
                             .is_in(ancestor_values),
                     )
                     .to_owned();
-                let type_subquery = Query::select()
-                    .column((member_type.clone(), Alias::new(rg_tables::GTS_TYPE_ID)))
-                    .from_as(Alias::new(rg_tables::GTS_TYPE_TABLE), member_type.clone())
-                    .and_where(
-                        Expr::col((member_type, Alias::new(rg_tables::GTS_TYPE_SCHEMA_ID)))
-                            .eq(sf.membership_resource_type()),
-                    )
-                    .to_owned();
-                let membership_subquery = Query::select()
-                    .column((
-                        membership.clone(),
-                        Alias::new(rg_tables::MEMBERSHIP_RESOURCE_ID),
-                    ))
-                    .from_as(Alias::new(rg_tables::MEMBERSHIP_TABLE), membership.clone())
-                    .and_where(
-                        Expr::col((
-                            membership.clone(),
-                            Alias::new(rg_tables::MEMBERSHIP_GROUP_ID),
-                        ))
-                        .in_subquery(closure_subquery),
-                    )
-                    .and_where(
-                        Expr::col((membership, Alias::new(rg_tables::MEMBERSHIP_GTS_TYPE_ID)))
-                            .in_subquery(type_subquery),
-                    )
-                    .to_owned();
-                and_cond = and_cond.add(
-                    col.into_expr()
-                        .cast_as(Alias::new("text"))
-                        .in_subquery(membership_subquery),
-                );
+                let Some(condition) = typed_membership_condition(
+                    col.into_expr(),
+                    sf.membership_resource_type(),
+                    GroupSelection::Subtree(Box::new(closure_subquery)),
+                ) else {
+                    and_cond = and_cond.add(Expr::value(false));
+                    continue;
+                };
+                and_cond = and_cond.add(condition);
             }
             ScopeFilter::InTenantSubtree(sf) => {
                 // Respect-barriers (default), no descendant_status filter:

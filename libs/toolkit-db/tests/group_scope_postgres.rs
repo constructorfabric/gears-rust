@@ -458,15 +458,20 @@ async fn in_group_subtree_matches_descendants_but_not_unrelated_groups() -> Resu
     let ancestor_id = Uuid::new_v4();
     let descendant_id = Uuid::new_v4();
     let unrelated_id = Uuid::new_v4();
+    let direct_resource = Uuid::new_v4();
     let descendant_resource = Uuid::new_v4();
     let wrong_type_resource = Uuid::new_v4();
     let unrelated_resource = Uuid::new_v4();
 
     seed_type(&conn, 1, RESOURCE_MEMBER_TYPE).await?;
     seed_type(&conn, 2, OTHER_MEMBER_TYPE).await?;
+    seed_resource(&conn, direct_resource, tenant_id, "direct").await?;
     seed_resource(&conn, descendant_resource, tenant_id, "descendant").await?;
     seed_resource(&conn, wrong_type_resource, tenant_id, "wrong-type").await?;
     seed_resource(&conn, unrelated_resource, tenant_id, "unrelated").await?;
+    // The closure self-row makes direct members of the selected ancestor part
+    // of its subtree, just as it does in the canonical RG closure table.
+    seed_membership(&conn, ancestor_id, 1, direct_resource.to_string()).await?;
     seed_membership(&conn, descendant_id, 1, descendant_resource.to_string()).await?;
     // Duplicate external IDs across types are valid, while a row belonging
     // only to the wrong type must never grant access.
@@ -475,15 +480,17 @@ async fn in_group_subtree_matches_descendants_but_not_unrelated_groups() -> Resu
     // A selected-type opaque ID proves the query never casts membership IDs.
     seed_membership(&conn, descendant_id, 1, "opaque-descendant-id").await?;
     seed_membership(&conn, unrelated_id, 1, unrelated_resource.to_string()).await?;
-    secure_insert::<closure::Entity>(
-        closure::ActiveModel {
-            ancestor_id: Set(ancestor_id),
-            descendant_id: Set(descendant_id),
-        },
-        &AccessScope::allow_all(),
-        &conn,
-    )
-    .await?;
+    for descendant_id in [ancestor_id, descendant_id] {
+        secure_insert::<closure::Entity>(
+            closure::ActiveModel {
+                ancestor_id: Set(ancestor_id),
+                descendant_id: Set(descendant_id),
+            },
+            &AccessScope::allow_all(),
+            &conn,
+        )
+        .await?;
+    }
 
     let scope = AccessScope::single(ScopeConstraint::new(vec![
         ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
@@ -499,8 +506,12 @@ async fn in_group_subtree_matches_descendants_but_not_unrelated_groups() -> Resu
         .all(&conn)
         .await?;
 
-    assert_eq!(rows.len(), 1, "only members of the selected subtree match");
-    assert_eq!(rows[0].id, descendant_resource);
-    assert_eq!(rows[0].name, "descendant");
+    let mut names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["descendant", "direct"],
+        "the subtree must include direct and descendant members while excluding unrelated groups and member types"
+    );
     Ok(())
 }
