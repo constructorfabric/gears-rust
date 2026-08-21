@@ -173,7 +173,34 @@ the name without a value gets the pin rather than an image with no tag.
 The PostgreSQL 19 helpers (`postgres_graph`, `graph_lane_required`) exist for the
 SQL/PGQ work in `docs/arch/secure-orm/ADR/0002` and are unused until that lands.
 
-### 4.4 CI
+### 4.4 Asserting database errors
+
+A test that expects the database to refuse an operation **must assert which
+error it got**, not merely that it failed. `assert!(result.is_err())` passes
+whether the store answered the domain error it documents or an opaque
+`Internal`, so it cannot see a classifier that stopped recognising the
+condition.
+
+```rust
+// Wrong — green whether the delete was refused for the documented reason or
+// blew up for an unrelated one.
+assert!(store.delete(id).await.is_err());
+
+// Right — names the variant, so a misclassification fails the test.
+match store.delete(id).await.expect_err("delete referenced must fail") {
+    Error::UsageTypeReferenced { .. } => {}
+    other => panic!("expected UsageTypeReferenced, got {other:?}"),
+}
+```
+
+This is what a unit test on the classifier cannot do for you. Feeding it a
+SQLSTATE literal (`classify("23503")`) checks the mapping against the value the
+author typed, not against the value the server sends — so it stays green when a
+database upgrade changes the code. PostgreSQL 18 did exactly that: it reports an
+`ON DELETE RESTRICT` refusal as `23001` rather than `23503`, and the
+variant-asserting integration test is what caught it. See #4645.
+
+### 4.5 CI
 
 The `integration` job in `ci.yml` runs SQLite, Postgres, and MySQL integration tests
 plus macro UI tests on every PR (Ubuntu only).
