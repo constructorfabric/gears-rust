@@ -100,6 +100,7 @@ async fn sync_repository_via_sdk_trait_fills_the_mirror() {
         reviews: vec![],
         labels: vec![],
         milestones: vec![],
+        releases: vec![],
     };
     let service = common::service_with_github(
         db,

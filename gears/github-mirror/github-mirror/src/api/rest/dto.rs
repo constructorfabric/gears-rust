@@ -1,5 +1,6 @@
 use github_mirror_sdk::{
-    Comment, Commit, Issue, Label, Milestone, PullRequest, Repository, Review, ReviewComment,
+    Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
+    ReviewComment,
 };
 
 use crate::domain::service::{MirrorStatus, SyncSummary};
@@ -171,6 +172,7 @@ pub struct SyncSummaryDto {
     pub reviews_synced: u64,
     pub labels_synced: u64,
     pub milestones_synced: u64,
+    pub releases_synced: u64,
 }
 
 impl From<SyncSummary> for SyncSummaryDto {
@@ -185,6 +187,7 @@ impl From<SyncSummary> for SyncSummaryDto {
             reviews_synced: s.reviews_synced,
             labels_synced: s.labels_synced,
             milestones_synced: s.milestones_synced,
+            releases_synced: s.releases_synced,
         }
     }
 }
@@ -346,6 +349,41 @@ impl From<Milestone> for MilestoneDto {
             updated_at: m.updated_at,
             closed_at: m.closed_at,
             html_url: m.html_url,
+        }
+    }
+}
+
+/// A mirrored GitHub release as served by the read API.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ReleaseDto {
+    pub id: i64,
+    pub repo_id: i64,
+    pub tag_name: String,
+    pub name: Option<String>,
+    pub draft: bool,
+    pub prerelease: bool,
+    pub body: Option<String>,
+    pub author_login: Option<String>,
+    pub created_at: String,
+    pub published_at: Option<String>,
+    pub html_url: Option<String>,
+}
+
+impl From<Release> for ReleaseDto {
+    fn from(r: Release) -> Self {
+        Self {
+            id: r.id,
+            repo_id: r.repo_id,
+            tag_name: r.tag_name,
+            name: r.name,
+            draft: r.draft,
+            prerelease: r.prerelease,
+            body: r.body,
+            author_login: r.author_login,
+            created_at: r.created_at,
+            published_at: r.published_at,
+            html_url: r.html_url,
         }
     }
 }

@@ -109,6 +109,7 @@ pub struct SyncSummary {
     pub reviews_synced: u64,
     pub labels_synced: u64,
     pub milestones_synced: u64,
+    pub releases_synced: u64,
 }
 
 /// A mirrored GitHub issue/PR comment (read-slice shape).
@@ -209,5 +210,25 @@ pub struct Milestone {
     pub created_at: String,
     pub updated_at: String,
     pub closed_at: Option<String>,
+    pub html_url: Option<String>,
+}
+
+/// A mirrored GitHub release (read-slice shape).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    /// GitHub's numeric release id.
+    pub id: i64,
+    /// Owning repository's GitHub id.
+    pub repo_id: i64,
+    pub tag_name: String,
+    pub name: Option<String>,
+    pub draft: bool,
+    pub prerelease: bool,
+    pub body: Option<String>,
+    pub author_login: Option<String>,
+    pub created_at: String,
+    /// Absent for drafts.
+    pub published_at: Option<String>,
     pub html_url: Option<String>,
 }

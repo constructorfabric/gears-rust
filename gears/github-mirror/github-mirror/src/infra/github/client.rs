@@ -5,7 +5,7 @@ use crate::domain::error::DomainError;
 use crate::domain::ports::github::{FetchedRepository, GithubPort};
 use crate::domain::repo::{
     CommentRecord, CommitRecord, IssueRecord, LabelRecord, MilestoneRecord, PullRequestRecord,
-    RepositoryRecord, ReviewCommentRecord, ReviewRecord,
+    ReleaseRecord, RepositoryRecord, ReviewCommentRecord, ReviewRecord,
 };
 
 const FIRST_PAGE_SIZE: u32 = 50;
@@ -200,6 +200,21 @@ struct GhMilestone {
 }
 
 #[derive(Debug, Deserialize)]
+struct GhRelease {
+    id: i64,
+    tag_name: String,
+    name: Option<String>,
+    draft: bool,
+    prerelease: bool,
+    body: Option<String>,
+    #[serde(default)]
+    author: Option<GhActor>,
+    created_at: String,
+    published_at: Option<String>,
+    html_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GhReview {
     id: i64,
     #[serde(default)]
@@ -339,6 +354,22 @@ fn milestone_record(repo_id: i64, m: GhMilestone) -> MilestoneRecord {
     }
 }
 
+fn release_record(repo_id: i64, r: GhRelease) -> ReleaseRecord {
+    ReleaseRecord {
+        id: r.id,
+        repo_id,
+        tag_name: r.tag_name,
+        name: r.name,
+        draft: r.draft,
+        prerelease: r.prerelease,
+        body: r.body,
+        author_login: r.author.map(|a| a.login),
+        created_at: r.created_at,
+        published_at: r.published_at,
+        html_url: r.html_url,
+    }
+}
+
 fn review_record(repo_id: i64, pull_number: i64, r: GhReview) -> ReviewRecord {
     ReviewRecord {
         id: r.id,
@@ -415,6 +446,12 @@ impl GithubPort for GithubClient {
             ))
             .await?;
 
+        let releases: Vec<GhRelease> = self
+            .get_json(&format!(
+                "/repos/{owner}/{name}/releases?per_page={FIRST_PAGE_SIZE}"
+            ))
+            .await?;
+
         let mut reviews: Vec<ReviewRecord> = Vec::new();
         for pull in pulls.iter().take(REVIEW_SYNC_PULL_CAP) {
             let page: Vec<GhReview> = self
@@ -459,6 +496,10 @@ impl GithubPort for GithubClient {
             milestones: milestones
                 .into_iter()
                 .map(|m| milestone_record(repo_id, m))
+                .collect(),
+            releases: releases
+                .into_iter()
+                .map(|r| release_record(repo_id, r))
                 .collect(),
         })
     }

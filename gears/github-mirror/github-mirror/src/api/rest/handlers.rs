@@ -11,7 +11,7 @@ use crate::api::rest::routes::ConcreteService;
 
 use super::dto::{
     CommentDto, CommitDto, GithubMirrorHealthDto, IssueDto, LabelDto, MilestoneDto, PullRequestDto,
-    RepositoryDto, ReviewCommentDto, ReviewDto, SyncSummaryDto,
+    ReleaseDto, RepositoryDto, ReviewCommentDto, ReviewDto, SyncSummaryDto,
 };
 
 pub async fn health(
@@ -123,4 +123,14 @@ pub async fn list_milestones(
 ) -> ApiResult<JsonPage<MilestoneDto>> {
     let page: Page<_> = svc.list_milestones(&ctx, &owner, &name, &query).await?;
     Ok(Json(page.map_items(MilestoneDto::from)))
+}
+
+pub async fn list_releases(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path((owner, name)): Path<(String, String)>,
+    OData(query): OData,
+) -> ApiResult<JsonPage<ReleaseDto>> {
+    let page: Page<_> = svc.list_releases(&ctx, &owner, &name, &query).await?;
+    Ok(Json(page.map_items(ReleaseDto::from)))
 }

@@ -6126,6 +6126,24 @@
         ],
         "type": "object"
       },
+      "Page_ReleaseDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ReleaseDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "Page_RepositoryDto": {
         "properties": {
           "items": {
@@ -8567,6 +8585,70 @@
         ],
         "type": "object"
       },
+      "ReleaseDto": {
+        "description": "A mirrored GitHub release as served by the read API.",
+        "properties": {
+          "author_login": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "draft": {
+            "type": "boolean"
+          },
+          "html_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prerelease": {
+            "type": "boolean"
+          },
+          "published_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repo_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "tag_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "repo_id",
+          "tag_name",
+          "draft",
+          "prerelease",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "RepositoryDto": {
         "description": "A mirrored GitHub repository as served by the read API.",
         "properties": {
@@ -10025,6 +10107,11 @@
             "minimum": 0,
             "type": "integer"
           },
+          "releases_synced": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "repository": {
             "type": "string"
           },
@@ -10048,7 +10135,8 @@
           "review_comments_synced",
           "reviews_synced",
           "labels_synced",
-          "milestones_synced"
+          "milestones_synced",
+          "releases_synced"
         ],
         "type": "object"
       },
@@ -26929,6 +27017,112 @@
           }
         ],
         "summary": "List mirrored reviews of a pull request",
+        "tags": [
+          "GitHub Mirror"
+        ]
+      }
+    },
+    "/github-mirror/v1/repos/{owner}/{name}/releases": {
+      "get": {
+        "description": "Returns releases held in the local mirror for the tenant, newest first",
+        "operationId": "github_mirror.list_releases",
+        "parameters": [
+          {
+            "description": "Repository owner login",
+            "in": "path",
+            "name": "owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository name",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum number of releases to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ReleaseDto"
+                }
+              }
+            },
+            "description": "Paginated list of mirrored releases"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List mirrored releases of a repository",
         "tags": [
           "GitHub Mirror"
         ]

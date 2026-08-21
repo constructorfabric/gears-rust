@@ -14,8 +14,8 @@ use github_mirror::domain::service::{Service, ServiceConfig};
 use github_mirror::infra::storage::migrations::Migrator;
 use github_mirror::infra::storage::sea_orm_repo::{
     SeaOrmCommentRepository, SeaOrmCommitRepository, SeaOrmIssueRepository, SeaOrmLabelRepository,
-    SeaOrmMilestoneRepository, SeaOrmPullRequestRepository, SeaOrmRepoRepository,
-    SeaOrmReviewCommentRepository, SeaOrmReviewRepository,
+    SeaOrmMilestoneRepository, SeaOrmPullRequestRepository, SeaOrmReleaseRepository,
+    SeaOrmRepoRepository, SeaOrmReviewCommentRepository, SeaOrmReviewRepository,
 };
 use toolkit::{ClientHub, ConfigProvider, GearCtx};
 use toolkit_db::migration_runner::run_migrations_for_testing;
@@ -33,6 +33,7 @@ pub type ConcreteService = Service<
     SeaOrmReviewRepository,
     SeaOrmLabelRepository,
     SeaOrmMilestoneRepository,
+    SeaOrmReleaseRepository,
 >;
 
 /// PDP fake: allows everything, constrained to the caller's tenant.
@@ -130,6 +131,7 @@ pub fn service_with_github(
         Arc::new(SeaOrmReviewRepository::new()),
         Arc::new(SeaOrmLabelRepository::new()),
         Arc::new(SeaOrmMilestoneRepository::new()),
+        Arc::new(SeaOrmReleaseRepository::new()),
         github,
         enforcer(),
         ServiceConfig {

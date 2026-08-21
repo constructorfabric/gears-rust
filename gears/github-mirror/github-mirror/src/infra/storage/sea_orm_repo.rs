@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use github_mirror_sdk::{
-    Comment, Commit, Issue, Label, Milestone, PullRequest, Repository, Review, ReviewComment,
+    Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
+    ReviewComment,
 };
 use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, Order};
 use toolkit_db::secure::{
@@ -13,8 +14,8 @@ use crate::domain::error::DomainError;
 use crate::domain::repo::{
     CommentRecord, CommentRepository, CommitRecord, CommitRepository, IssueRecord, IssueRepository,
     LabelRecord, LabelRepository, MilestoneRecord, MilestoneRepository, PullRequestRecord,
-    PullRequestRepository, RepoRepository, RepositoryRecord, ReviewCommentRecord,
-    ReviewCommentRepository, ReviewRecord, ReviewRepository,
+    PullRequestRepository, ReleaseRecord, ReleaseRepository, RepoRepository, RepositoryRecord,
+    ReviewCommentRecord, ReviewCommentRepository, ReviewRecord, ReviewRepository,
 };
 
 use super::entity::comments::{self, Entity as CommentEntity};
@@ -23,6 +24,7 @@ use super::entity::issues::{self, Entity as IssueEntity};
 use super::entity::labels::{self, Entity as LabelEntity};
 use super::entity::milestones::{self, Entity as MilestoneEntity};
 use super::entity::pull_requests::{self, Entity as PullRequestEntity};
+use super::entity::releases::{self, Entity as ReleaseEntity};
 use super::entity::repositories::{self, Entity as RepoEntity};
 use super::entity::review_comments::{self, Entity as ReviewCommentEntity};
 use super::entity::reviews::{self, Entity as ReviewEntity};
@@ -979,6 +981,110 @@ impl MilestoneRepository for SeaOrmMilestoneRepository {
             .scope_with(scope)
             .filter(sea_orm::Condition::all().add(milestones::Column::RepoId.eq(repo_id)))
             .order_by(milestones::Column::Number, Order::Asc)
+            .limit(limit)
+            .all(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+
+pub struct SeaOrmReleaseRepository;
+
+impl SeaOrmReleaseRepository {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SeaOrmReleaseRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn release_active_model(tenant_id: Uuid, r: &ReleaseRecord) -> releases::ActiveModel {
+    releases::ActiveModel {
+        tenant_id: ActiveValue::Set(tenant_id),
+        id: ActiveValue::Set(r.id),
+        repo_id: ActiveValue::Set(r.repo_id),
+        tag_name: ActiveValue::Set(r.tag_name.clone()),
+        name: ActiveValue::Set(r.name.clone()),
+        draft: ActiveValue::Set(r.draft),
+        prerelease: ActiveValue::Set(r.prerelease),
+        body: ActiveValue::Set(r.body.clone()),
+        author_login: ActiveValue::Set(r.author_login.clone()),
+        created_at: ActiveValue::Set(r.created_at.clone()),
+        published_at: ActiveValue::Set(r.published_at.clone()),
+        html_url: ActiveValue::Set(r.html_url.clone()),
+    }
+}
+
+#[async_trait]
+impl ReleaseRepository for SeaOrmReleaseRepository {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: ReleaseRecord,
+    ) -> Result<Release, DomainError> {
+        let on_conflict = SecureOnConflict::<ReleaseEntity>::columns([
+            releases::Column::TenantId,
+            releases::Column::Id,
+        ])
+        .update_columns([
+            releases::Column::RepoId,
+            releases::Column::TagName,
+            releases::Column::Name,
+            releases::Column::Draft,
+            releases::Column::Prerelease,
+            releases::Column::Body,
+            releases::Column::AuthorLogin,
+            releases::Column::CreatedAt,
+            releases::Column::PublishedAt,
+            releases::Column::HtmlUrl,
+        ])
+        .map_err(map_scope_error)?;
+
+        ReleaseEntity::insert(release_active_model(tenant_id, &record))
+            .secure()
+            .scope_with_model(scope, &release_active_model(tenant_id, &record))
+            .map_err(map_scope_error)?
+            .on_conflict(on_conflict)
+            .exec(conn)
+            .await
+            .map_err(map_scope_error)?;
+
+        Ok(Release {
+            id: record.id,
+            repo_id: record.repo_id,
+            tag_name: record.tag_name,
+            name: record.name,
+            draft: record.draft,
+            prerelease: record.prerelease,
+            body: record.body,
+            author_login: record.author_login,
+            created_at: record.created_at,
+            published_at: record.published_at,
+            html_url: record.html_url,
+        })
+    }
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Release>, DomainError> {
+        let rows = ReleaseEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(sea_orm::Condition::all().add(releases::Column::RepoId.eq(repo_id)))
+            .order_by(releases::Column::CreatedAt, Order::Desc)
             .limit(limit)
             .all(conn)
             .await

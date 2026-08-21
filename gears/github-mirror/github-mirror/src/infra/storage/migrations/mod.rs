@@ -7,6 +7,7 @@ pub mod issues_002;
 pub mod labels_008;
 pub mod milestones_009;
 pub mod pull_requests_003;
+pub mod releases_010;
 pub mod review_comments_006;
 pub mod reviews_007;
 
@@ -25,6 +26,7 @@ impl MigratorTrait for Migrator {
             Box::new(reviews_007::Migration),
             Box::new(labels_008::Migration),
             Box::new(milestones_009::Migration),
+            Box::new(releases_010::Migration),
         ]
     }
 }

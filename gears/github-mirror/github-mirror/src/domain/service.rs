@@ -3,7 +3,8 @@ use std::sync::Arc;
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use github_mirror_sdk::{
-    Comment, Commit, Issue, Label, Milestone, PullRequest, Repository, Review, ReviewComment,
+    Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
+    ReviewComment,
 };
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page, PageInfo};
@@ -14,8 +15,8 @@ use super::ports::github::GithubPort;
 use super::repo::{
     CommentRecord, CommentRepository, CommitRecord, CommitRepository, IssueRecord, IssueRepository,
     LabelRecord, LabelRepository, MilestoneRecord, MilestoneRepository, PullRequestRecord,
-    PullRequestRepository, RepoRepository, RepositoryRecord, ReviewCommentRecord,
-    ReviewCommentRepository, ReviewRecord, ReviewRepository,
+    PullRequestRepository, ReleaseRecord, ReleaseRepository, RepoRepository, RepositoryRecord,
+    ReviewCommentRecord, ReviewCommentRepository, ReviewRecord, ReviewRepository,
 };
 
 pub const GEAR_NAME: &str = "github-mirror";
@@ -69,6 +70,11 @@ pub(crate) const MILESTONE_RESOURCE: ResourceType = ResourceType::from_static(
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+pub(crate) const RELEASE_RESOURCE: ResourceType = ResourceType::from_static(
+    "github_mirror.release",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
+
 pub(crate) const SYNC_RESOURCE: ResourceType =
     ResourceType::from_static("github_mirror.sync", &[pep_properties::OWNER_TENANT_ID]);
 
@@ -105,6 +111,7 @@ pub struct SyncSummary {
     pub reviews_synced: u64,
     pub labels_synced: u64,
     pub milestones_synced: u64,
+    pub releases_synced: u64,
 }
 
 #[domain_model]
@@ -118,6 +125,7 @@ pub struct Service<
     W: ReviewRepository,
     L: LabelRepository,
     N: MilestoneRepository,
+    E: ReleaseRepository,
 > {
     db: Arc<DbProvider>,
     repo: Arc<R>,
@@ -129,6 +137,7 @@ pub struct Service<
     reviews: Arc<W>,
     labels: Arc<L>,
     milestones: Arc<N>,
+    releases: Arc<E>,
     github: Arc<dyn GithubPort>,
     policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
@@ -144,7 +153,8 @@ impl<
     W: ReviewRepository,
     L: LabelRepository,
     N: MilestoneRepository,
-> Service<R, I, P, C, M, V, W, L, N>
+    E: ReleaseRepository,
+> Service<R, I, P, C, M, V, W, L, N, E>
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -158,6 +168,7 @@ impl<
         reviews: Arc<W>,
         labels: Arc<L>,
         milestones: Arc<N>,
+        releases: Arc<E>,
         github: Arc<dyn GithubPort>,
         policy_enforcer: PolicyEnforcer,
         config: ServiceConfig,
@@ -173,6 +184,7 @@ impl<
             reviews,
             labels,
             milestones,
+            releases,
             github,
             policy_enforcer,
             config,
@@ -976,6 +988,95 @@ impl<
             .await
     }
 
+    /// List mirrored releases of one repository (`owner/name`),
+    /// tenant-scoped, newest first.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored for this
+    /// tenant; `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn list_releases(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        query: &ODataQuery,
+    ) -> Result<Page<Release>, DomainError> {
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &RELEASE_RESOURCE,
+                actions::LIST,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+        let items = self
+            .releases
+            .list_by_repo(&conn, &scope, repository.id, limit)
+            .await?;
+
+        Ok(Page::new(
+            items,
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit,
+            },
+        ))
+    }
+
+    /// Insert or update a mirrored release row for the caller's tenant.
+    ///
+    /// # Errors
+    /// `DomainError::NotFound` when the repository is not mirrored;
+    /// `Forbidden`/`Database`/`Internal` as usual.
+    pub async fn upsert_release(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        record: ReleaseRecord,
+    ) -> Result<Release, DomainError> {
+        let tenant_id = ctx.subject_tenant_id();
+
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &RELEASE_RESOURCE,
+                actions::UPSERT,
+                None,
+                &AccessRequest::new().resource_property(pep_properties::OWNER_TENANT_ID, tenant_id),
+            )
+            .await?;
+
+        let conn = self.db.conn()?;
+        let full_name = format!("{owner}/{name}");
+        let repository = self
+            .repo
+            .find_by_full_name(&conn, &scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let record = ReleaseRecord {
+            repo_id: repository.id,
+            ..record
+        };
+        self.releases.upsert(&conn, &scope, tenant_id, record).await
+    }
+
     /// Fetch one repository from GitHub (first slice: repo + first page of
     /// issues, pull requests, and commits) and upsert it into the mirror.
     ///
@@ -986,7 +1087,9 @@ impl<
     /// # Errors
     /// `DomainError::NotFound` when GitHub does not know the repository,
     /// `Forbidden` on PDP denial, `Internal` on GitHub/storage failures.
-    #[allow(clippy::cast_possible_truncation)]
+    // One linear upsert loop per mirrored table; splitting them into
+    // helpers would only hide the sequence.
+    #[allow(clippy::cast_possible_truncation, clippy::cognitive_complexity)]
     pub async fn sync_repository(
         &self,
         ctx: &SecurityContext,
@@ -1074,6 +1177,14 @@ impl<
             milestones_synced += 1;
         }
 
+        let mut releases_synced: u64 = 0;
+        for record in fetched.releases {
+            self.releases
+                .upsert(&conn, &scope, tenant_id, record)
+                .await?;
+            releases_synced += 1;
+        }
+
         Ok(SyncSummary {
             repository: repository.full_name,
             issues_synced,
@@ -1084,6 +1195,7 @@ impl<
             reviews_synced,
             labels_synced,
             milestones_synced,
+            releases_synced,
         })
     }
 }

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use github_mirror_sdk::{
-    Comment, Commit, Issue, Label, Milestone, PullRequest, Repository, Review, ReviewComment,
+    Comment, Commit, Issue, Label, Milestone, PullRequest, Release, Repository, Review,
+    ReviewComment,
 };
 use toolkit_db::secure::DBRunner;
 use toolkit_macros::domain_model;
@@ -335,4 +336,40 @@ pub trait MilestoneRepository: Send + Sync {
         repo_id: i64,
         limit: u64,
     ) -> Result<Vec<Milestone>, DomainError>;
+}
+
+/// Write-side record for a mirrored release.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub tag_name: String,
+    pub name: Option<String>,
+    pub draft: bool,
+    pub prerelease: bool,
+    pub body: Option<String>,
+    pub author_login: Option<String>,
+    pub created_at: String,
+    pub published_at: Option<String>,
+    pub html_url: Option<String>,
+}
+
+#[async_trait]
+pub trait ReleaseRepository: Send + Sync {
+    async fn upsert<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: ReleaseRecord,
+    ) -> Result<Release, DomainError>;
+
+    async fn list_by_repo<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        repo_id: i64,
+        limit: u64,
+    ) -> Result<Vec<Release>, DomainError>;
 }
