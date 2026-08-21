@@ -281,6 +281,25 @@ async fn access_scope_rejects_unadvertised_native_group_predicate() {
 }
 
 #[tokio::test]
+async fn access_scope_rejects_group_predicate_after_suppressing_untyped_capability() {
+    let error = enforcer(GroupScopeMock)
+        .with_capabilities(vec![Capability::GroupMembership])
+        .access_scope(&test_ctx(), &TEST_RESOURCE, "list", None)
+        .await
+        .expect_err("an untyped resource must not accept an unsolicited group predicate");
+
+    let EnforcerError::CompileFailed(ConstraintCompileError::AllConstraintsFailed { reason }) =
+        error
+    else {
+        panic!("expected fail-closed compilation error, got: {error:?}");
+    };
+    assert!(
+        reason.contains("unadvertised capabilities: group_membership"),
+        "the resource mapping must suppress the configured capability before evaluation: {reason}"
+    );
+}
+
+#[tokio::test]
 async fn access_scope_pdp_resolves_tenant_from_subject() {
     let e = enforcer(AllowAllMock);
     let ctx = test_ctx();
