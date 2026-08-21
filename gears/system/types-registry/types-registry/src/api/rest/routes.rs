@@ -52,12 +52,19 @@ pub fn register_routes(
     // the transport**. An in-process gear has no inbound platform-identity
     // validator, api-gateway has no platform listener, and `OperationBuilder`
     // cannot mark a route platform-only. So these routes keep the authentication
-    // they have and stay `.exposed()`; `.anonymous()` is deliberately **not**
-    // used, because without a platform identity to replace the current gate it
-    // would be a regression rather than a step toward one. The upgrade path is a
-    // platform listener with `X-ToolKit-Internal-Token` / `PlatformIdentity` plus
-    // a declarative route marker — both toolkit/api-gateway work outside this
-    // gear (SPEC §9 C8, §8.4).
+    // they have; `.anonymous()` is deliberately **not** used, because without a
+    // platform identity to replace the current gate it would be a regression
+    // rather than a step toward one. The upgrade path is a platform listener
+    // with `X-ToolKit-Internal-Token` / `PlatformIdentity` plus a declarative
+    // route marker — both toolkit/api-gateway work outside this gear
+    // (SPEC §9 C8, §8.4).
+    //
+    // The v2 routes below are **internal-only** (no `.exposed()`): the gateway
+    // does not publish them, because v2 is an interim surface until T24a
+    // promotes it onto `V1`. They still register in the `OpenAPI` document —
+    // `exposed` gates gateway visibility, not spec inclusion — so the contract
+    // check sees them. T24a restores `.exposed()` together with the `V2` → `V1`
+    // constant change.
 
     // -----------------------------------------------------------------------
     // v1 — the pre-database contract, unchanged from `main`
@@ -139,6 +146,8 @@ pub fn register_routes(
     // -----------------------------------------------------------------------
     //
     // Interim: T24a promotes these onto v1 once the in-memory path is deleted.
+    // Internal-only until then — no `.exposed()`, so the gateway does not
+    // publish the interim surface (see the ceiling-C8 note above).
 
     // POST /types-registry/v2/entities — submit a registration (D10)
     //
@@ -175,7 +184,6 @@ pub fn register_routes(
         })
         .tag(API_TAG)
         .authenticated()
-        .exposed()
         .require_license_features::<License>([])
         .json_request::<SubmitEntitiesRequest>(openapi, "Entities to admit")
         .handler(handlers::submit_entities)
@@ -195,6 +203,9 @@ pub fn register_routes(
             "The Idempotency-Key is bound to a different request",
         )
         .standard_errors(openapi)
+        // `require_registry` answers 503 where no database is bound
+        // (`no-db.yaml`, `--mock`): declared, not merely enforced.
+        .error_503(openapi)
         .register(router, openapi);
 
     // GET /types-registry/v2/operations/{operation_id} — poll an operation
@@ -207,7 +218,6 @@ pub fn register_routes(
         )
         .tag(API_TAG)
         .authenticated()
-        .exposed()
         .require_license_features::<License>([])
         .path_param(
             "operation_id",
@@ -217,6 +227,7 @@ pub fn register_routes(
         .json_response_with_schema::<OperationDto>(openapi, StatusCode::OK, "The operation")
         .problem_response(openapi, StatusCode::NOT_FOUND, "No such operation")
         .standard_errors(openapi)
+        .error_503(openapi)
         .register(router, openapi);
 
     // GET /types-registry/v2/entities/{entity_key} — exact read from the database
@@ -231,7 +242,6 @@ pub fn register_routes(
         )
         .tag(API_TAG)
         .authenticated()
-        .exposed()
         .require_license_features::<License>([])
         .path_param(
             "entity_key",
@@ -242,6 +252,7 @@ pub fn register_routes(
         .json_response_with_schema::<EntityDto>(openapi, StatusCode::OK, "The requested entity")
         .problem_response(openapi, StatusCode::NOT_FOUND, "Entity not found")
         .standard_errors(openapi)
+        .error_503(openapi)
         .register(router, openapi);
 
     router.layer(Extension(service)).layer(Extension(registry))
