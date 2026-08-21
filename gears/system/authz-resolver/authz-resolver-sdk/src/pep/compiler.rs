@@ -34,10 +34,10 @@
 //! converted element-wise (via `TenantStatus::as_smallint`) and bound to
 //! the SQL `descendant_status` column; an empty list disables the filter.
 
-use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, ScopeValue};
+use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, ScopeValue, pep_properties};
 
 use crate::constraints::{Constraint, Predicate};
-use crate::models::{BarrierMode, EvaluationResponse};
+use crate::models::{BarrierMode, Capability, EvaluationResponse};
 
 /// Error during constraint compilation.
 #[derive(Debug, thiserror::Error)]
@@ -66,9 +66,14 @@ pub enum ConstraintCompileError {
 /// Each PDP constraint compiles to a `ScopeConstraint` (AND of filters).
 /// Multiple constraints become `AccessScope::from_constraints` (OR-ed).
 ///
-/// The compiler is property-agnostic: it validates predicates against the
-/// provided `supported_properties` list and converts them structurally.
-/// Unknown properties fail that constraint (fail-closed).
+/// The compiler validates predicates against the provided
+/// `supported_properties` list and converts them structurally. Unknown
+/// properties fail that constraint (fail-closed). Native group predicates are
+/// additionally restricted to `id` and must share an AND constraint with an
+/// `owner_tenant_id` predicate. Native group
+/// predicates also fail closed through this entry point because their RG
+/// member-handle type is absent; use
+/// [`compile_to_access_scope_with_group_membership_type`] for those predicates.
 /// If ALL constraints fail compilation, returns `AllConstraintsFailed`.
 ///
 /// # Errors
@@ -79,6 +84,73 @@ pub fn compile_to_access_scope(
     response: &EvaluationResponse,
     require_constraints: bool,
     supported_properties: &[&str],
+) -> Result<AccessScope, ConstraintCompileError> {
+    compile_to_access_scope_with_group_membership_type(
+        response,
+        require_constraints,
+        supported_properties,
+        None,
+    )
+}
+
+/// Compile constraints with the RG member-handle type required by native group
+/// predicates.
+///
+/// Kept separate from [`compile_to_access_scope`] so existing low-level callers
+/// remain source-compatible. A native `InGroup`/`InGroupSubtree` predicate sent
+/// through the untyped entry point fails closed instead of querying membership
+/// rows across unrelated resource types.
+///
+/// # Errors
+///
+/// Returns the same errors as [`compile_to_access_scope`]. Native group
+/// predicates additionally fail compilation when `group_membership_type` is
+/// absent or empty, when UUID hierarchy keys are malformed, when the predicate
+/// targets a property other than `id`, or when the same constraint lacks an
+/// `owner_tenant_id` predicate.
+pub fn compile_to_access_scope_with_group_membership_type(
+    response: &EvaluationResponse,
+    require_constraints: bool,
+    supported_properties: &[&str],
+    group_membership_type: Option<&str>,
+) -> Result<AccessScope, ConstraintCompileError> {
+    compile_to_access_scope_impl(
+        response,
+        require_constraints,
+        supported_properties,
+        group_membership_type,
+        None,
+    )
+}
+
+/// Compile constraints while enforcing the exact capabilities advertised in
+/// the evaluation request.
+///
+/// The high-level enforcer uses this path to reject unsolicited native group
+/// predicates from a PDP. Low-level callers that explicitly provide a group
+/// membership type remain responsible for negotiating their own capabilities.
+pub(crate) fn compile_to_access_scope_with_negotiated_capabilities(
+    response: &EvaluationResponse,
+    require_constraints: bool,
+    supported_properties: &[&str],
+    group_membership_type: Option<&str>,
+    negotiated_capabilities: &[Capability],
+) -> Result<AccessScope, ConstraintCompileError> {
+    compile_to_access_scope_impl(
+        response,
+        require_constraints,
+        supported_properties,
+        group_membership_type,
+        Some(negotiated_capabilities),
+    )
+}
+
+fn compile_to_access_scope_impl(
+    response: &EvaluationResponse,
+    require_constraints: bool,
+    supported_properties: &[&str],
+    group_membership_type: Option<&str>,
+    negotiated_capabilities: Option<&[Capability]>,
 ) -> Result<AccessScope, ConstraintCompileError> {
     // Step 1: Handle empty constraints based on require_constraints flag.
     if response.context.constraints.is_empty() {
@@ -93,7 +165,12 @@ pub fn compile_to_access_scope(
     let mut fail_reasons: Vec<String> = Vec::new();
 
     for constraint in &response.context.constraints {
-        match compile_constraint(constraint, supported_properties) {
+        match compile_constraint(
+            constraint,
+            supported_properties,
+            group_membership_type,
+            negotiated_capabilities,
+        ) {
             Ok(sc) => constraints.push(sc),
             Err(reason) => {
                 tracing::warn!(
@@ -127,21 +204,43 @@ pub fn compile_to_access_scope(
 fn compile_constraint(
     constraint: &Constraint,
     supported_properties: &[&str],
+    group_membership_type: Option<&str>,
+    negotiated_capabilities: Option<&[Capability]>,
 ) -> Result<ScopeConstraint, String> {
+    let has_group_predicate = constraint.predicates.iter().any(|predicate| {
+        matches!(
+            predicate,
+            Predicate::InGroup(_) | Predicate::InGroupSubtree(_)
+        )
+    });
+    if has_group_predicate && !has_tenant_scope_predicate(constraint) {
+        return Err(
+            "native group predicates require an owner_tenant_id predicate in the same constraint (fail-closed)"
+                .to_owned(),
+        );
+    }
+
     let mut filters = Vec::new();
 
     for predicate in &constraint.predicates {
         let (property, filter) = match predicate {
             Predicate::Eq(eq) => {
-                let value = json_to_scope_value(&eq.value)?;
+                let value = if eq.property == pep_properties::OWNER_TENANT_ID {
+                    json_to_uuid_scope_value(&eq.value, pep_properties::OWNER_TENANT_ID)?
+                } else {
+                    json_to_scope_value(&eq.value)?
+                };
                 (eq.property.as_str(), ScopeFilter::eq(&eq.property, value))
             }
             Predicate::In(p) => {
-                let values: Vec<ScopeValue> = p
-                    .values
-                    .iter()
-                    .map(json_to_scope_value)
-                    .collect::<Result<_, _>>()?;
+                let values: Vec<ScopeValue> = if p.property == pep_properties::OWNER_TENANT_ID {
+                    json_values_to_uuid_scope_values(&p.values, pep_properties::OWNER_TENANT_ID)?
+                } else {
+                    p.values
+                        .iter()
+                        .map(json_to_scope_value)
+                        .collect::<Result<_, _>>()?
+                };
                 if values.is_empty() {
                     return Err(format!(
                         "In predicate on '{}' has empty value list (fail-closed)",
@@ -151,46 +250,64 @@ fn compile_constraint(
                 (p.property.as_str(), ScopeFilter::r#in(&p.property, values))
             }
             Predicate::InGroup(p) => {
-                let group_ids: Vec<ScopeValue> = p
-                    .group_ids
-                    .iter()
-                    .map(json_to_scope_value)
-                    .collect::<Result<_, _>>()?;
+                require_resource_id_group_property("InGroup", &p.property)?;
+                require_negotiated_capabilities(
+                    negotiated_capabilities,
+                    &[Capability::GroupMembership],
+                    "InGroup",
+                )?;
+                let group_ids = json_values_to_uuid_scope_values(&p.group_ids, "group_ids")?;
                 if group_ids.is_empty() {
                     return Err(format!(
                         "InGroup predicate on '{}' has empty group_ids (fail-closed)",
                         p.property
                     ));
                 }
+                let membership_type =
+                    required_group_membership_type(group_membership_type, "InGroup", &p.property)?;
                 (
                     p.property.as_str(),
-                    ScopeFilter::in_group(&p.property, group_ids),
+                    ScopeFilter::in_group_typed(&p.property, membership_type, group_ids),
                 )
             }
             Predicate::InGroupSubtree(p) => {
-                let ancestor_ids: Vec<ScopeValue> = p
-                    .ancestor_ids
-                    .iter()
-                    .map(json_to_scope_value)
-                    .collect::<Result<_, _>>()?;
+                require_resource_id_group_property("InGroupSubtree", &p.property)?;
+                require_negotiated_capabilities(
+                    negotiated_capabilities,
+                    &[Capability::GroupMembership, Capability::GroupHierarchy],
+                    "InGroupSubtree",
+                )?;
+                let ancestor_ids =
+                    json_values_to_uuid_scope_values(&p.ancestor_ids, "ancestor_ids")?;
                 if ancestor_ids.is_empty() {
                     return Err(format!(
                         "InGroupSubtree predicate on '{}' has empty ancestor_ids (fail-closed)",
                         p.property
                     ));
                 }
+                let membership_type = required_group_membership_type(
+                    group_membership_type,
+                    "InGroupSubtree",
+                    &p.property,
+                )?;
                 (
                     p.property.as_str(),
-                    ScopeFilter::in_group_subtree(&p.property, ancestor_ids),
+                    ScopeFilter::in_group_subtree_typed(&p.property, membership_type, ancestor_ids),
                 )
             }
             Predicate::InTenantSubtree(p) => {
-                let root_tenant_id = json_to_uuid_scope_value(&p.root_tenant_id).map_err(|e| {
-                    format!(
-                        "InTenantSubtree predicate on '{}' has invalid root_tenant_id: {e}",
-                        p.property
-                    )
-                })?;
+                require_negotiated_capabilities(
+                    negotiated_capabilities,
+                    &[Capability::TenantHierarchy],
+                    "InTenantSubtree",
+                )?;
+                let root_tenant_id = json_to_uuid_scope_value(&p.root_tenant_id, "root_tenant_id")
+                    .map_err(|e| {
+                        format!(
+                            "InTenantSubtree predicate on '{}' has invalid root_tenant_id: {e}",
+                            p.property
+                        )
+                    })?;
                 // Map authz-sdk barrier mode onto toolkit-security's bool flag.
                 // `Respect` (default) clamps the closure subquery with
                 // `AND barrier = 0`; `Ignore` is reserved for cross-barrier
@@ -229,24 +346,109 @@ fn compile_constraint(
     Ok(ScopeConstraint::new(filters))
 }
 
+/// Whether a group-bearing constraint also carries the mandatory tenant scope
+/// in the same AND envelope.
+fn has_tenant_scope_predicate(constraint: &Constraint) -> bool {
+    constraint
+        .predicates
+        .iter()
+        .any(|predicate| match predicate {
+            Predicate::Eq(predicate) => predicate.property == pep_properties::OWNER_TENANT_ID,
+            Predicate::In(predicate) => predicate.property == pep_properties::OWNER_TENANT_ID,
+            Predicate::InTenantSubtree(predicate) => {
+                predicate.property == pep_properties::OWNER_TENANT_ID
+            }
+            Predicate::InGroup(_) | Predicate::InGroupSubtree(_) => false,
+        })
+}
+
+/// Native group membership currently describes the resource itself. Applying
+/// one resource type mapping to another property (for example `owner_id`) can
+/// select unrelated membership rows when identifiers collide.
+fn require_resource_id_group_property(predicate: &str, property: &str) -> Result<(), String> {
+    if property == pep_properties::RESOURCE_ID {
+        Ok(())
+    } else {
+        Err(format!(
+            "{predicate} predicate must target '{}' until per-property membership types are supported, got '{property}' (fail-closed)",
+            pep_properties::RESOURCE_ID,
+        ))
+    }
+}
+
+/// Require every native SQL capability needed by a predicate when the
+/// high-level enforcer supplies the negotiated request capabilities.
+fn require_negotiated_capabilities(
+    negotiated_capabilities: Option<&[Capability]>,
+    required: &[Capability],
+    predicate: &str,
+) -> Result<(), String> {
+    let Some(negotiated_capabilities) = negotiated_capabilities else {
+        return Ok(());
+    };
+    let missing: Vec<&'static str> = required
+        .iter()
+        .filter(|capability| !negotiated_capabilities.contains(capability))
+        .map(|capability| match capability {
+            Capability::TenantHierarchy => "tenant_hierarchy",
+            Capability::GroupMembership => "group_membership",
+            Capability::GroupHierarchy => "group_hierarchy",
+        })
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{predicate} predicate requires unadvertised capabilities: {} (fail-closed)",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// Return the configured RG member-handle type or a fail-closed compilation
+/// reason suitable for the enclosing constraint.
+fn required_group_membership_type<'a>(
+    group_membership_type: Option<&'a str>,
+    predicate: &str,
+    property: &str,
+) -> Result<&'a str, String> {
+    group_membership_type.filter(|value| !value.is_empty()).ok_or_else(|| {
+        format!(
+            "{predicate} predicate on '{property}' requires a configured RG membership resource type (fail-closed)"
+        )
+    })
+}
+
+/// Convert a UUID-valued JSON list to scope values without permitting scalar
+/// types that would fail against `PostgreSQL`'s UUID hierarchy columns.
+fn json_values_to_uuid_scope_values(
+    values: &[serde_json::Value],
+    field: &str,
+) -> Result<Vec<ScopeValue>, String> {
+    values
+        .iter()
+        .map(|value| json_to_uuid_scope_value(value, field))
+        .collect()
+}
+
 /// Convert a `serde_json::Value` to a UUID `ScopeValue`.
 ///
 /// Only valid UUID strings are accepted; anything else (non-UUID string,
-/// number, bool, null, array, object) is rejected. Used for `root_tenant_id`
-/// in `InTenantSubtree` where the column type is always UUID.
-fn json_to_uuid_scope_value(v: &serde_json::Value) -> Result<ScopeValue, String> {
+/// number, bool, null, array, object) is rejected for UUID-backed hierarchy
+/// columns.
+fn json_to_uuid_scope_value(v: &serde_json::Value, field: &str) -> Result<ScopeValue, String> {
     match v {
         serde_json::Value::String(s) => uuid::Uuid::parse_str(s)
             .map(ScopeValue::Uuid)
-            .map_err(|_| format!("root_tenant_id must be a UUID string, got: {s:?} (fail-closed)")),
-        serde_json::Value::Number(_) => {
-            Err("root_tenant_id must be a UUID string, got number (fail-closed)".to_owned())
-        }
-        serde_json::Value::Bool(_) => {
-            Err("root_tenant_id must be a UUID string, got bool (fail-closed)".to_owned())
-        }
+            .map_err(|_| format!("{field} must contain UUID strings, got: {s:?} (fail-closed)")),
+        serde_json::Value::Number(_) => Err(format!(
+            "{field} must contain UUID strings, got number (fail-closed)"
+        )),
+        serde_json::Value::Bool(_) => Err(format!(
+            "{field} must contain UUID strings, got bool (fail-closed)"
+        )),
         other => Err(format!(
-            "root_tenant_id must be a UUID string, got: {other} (fail-closed)"
+            "{field} must contain UUID strings, got: {other} (fail-closed)"
         )),
     }
 }

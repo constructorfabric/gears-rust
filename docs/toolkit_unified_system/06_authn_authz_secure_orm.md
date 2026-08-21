@@ -139,29 +139,49 @@ Each resource type declares which properties the PEP can compile from PDP constr
 use authz_resolver_sdk::pep::ResourceType;
 use toolkit_security::pep_properties;
 
-pub const USER: ResourceType = ResourceType {
-    name: "my_gear.user",
-    supported_properties: &[
+pub const USER: ResourceType = ResourceType::from_static(
+    "my_gear.user",
+    &[
         pep_properties::OWNER_TENANT_ID,  // tenant scoping
-        pep_properties::RESOURCE_ID,       // resource-level access
+        pep_properties::RESOURCE_ID,      // resource-level access
     ],
-};
+);
 
-pub const DOCUMENT: ResourceType = ResourceType {
-    name: "my_gear.document",
-    supported_properties: &[
+pub const DOCUMENT: ResourceType = ResourceType::from_static(
+    "my_gear.document",
+    &[
         pep_properties::OWNER_TENANT_ID,
         pep_properties::RESOURCE_ID,
         pep_properties::OWNER_ID,  // ownership-based access
-        "category_id",             // custom domain property
+        "category_id",            // custom domain property
     ],
-};
+);
 ```
 
 Well-known properties from `toolkit_security::pep_properties`:
 - `OWNER_TENANT_ID` — tenant that owns the resource
 - `RESOURCE_ID` — the resource's primary key
 - `OWNER_ID` — the user who owns the resource
+
+A resource that can execute native `InGroup`/`InGroupSubtree` predicates must
+also declare the RG member-handle type used in
+`resource_group_membership.gts_type_id`:
+
+```rust
+pub const USER: ResourceType = ResourceType::from_static(
+    "my_gear.user",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+)
+.with_group_membership_type("gts.cf.core.rg.type.v1~example.core.mygear.user.v1~");
+```
+
+This value is not inferred from the AuthZ resource name: gears may use different
+GTS paths for policy matching and RG membership storage. `PolicyEnforcer`
+suppresses `GroupMembership` and `GroupHierarchy` capabilities for resource
+descriptors without this mapping, causing the PDP to use its degraded explicit
+`In` path. The querying database must also contain or project
+`resource_group_membership`, `resource_group_closure`, and RG's `gts_type`
+registry before the enforcer is configured with those capabilities.
 
 ### Defining actions
 
