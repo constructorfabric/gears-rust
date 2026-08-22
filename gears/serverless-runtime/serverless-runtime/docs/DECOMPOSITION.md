@@ -1,6 +1,6 @@
 <!--
 Created:  2026-05-14 by Constructor Tech
-Updated:  2026-05-20 by Constructor Tech
+Updated:  2026-08-11 by Constructor Tech
 -->
 # Decomposition: Serverless Runtime
 
@@ -27,15 +27,18 @@ Updated:  2026-05-20 by Constructor Tech
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-status-overall`
 ## 1. Overview
 
-The Serverless Runtime is decomposed into three crates that map directly to the host/SDK/plugin boundary established by [ADR-0005](../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md) (Thin Host Gear, Fat Runtime Plugins):
+The Serverless Runtime is decomposed into four crates that map directly to the host/SDK/plugin boundary established by [ADR-0005](../../docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md) (Thin Host Gear, Fat Runtime Plugins), the contract crate having since been split by audience:
 
-- `serverless-runtime/serverless-sdk/` — **SDK contract crate**. Defines the cross-host-plugin trait surface, the authoring traits, shared domain types, the error taxonomy, and the adapter conformance harness. Trait names, type definitions, and crate-naming nuances live in `serverless-sdk/docs/PRD.md` + `DESIGN.md`.
+- `serverless-runtime/serverless-sdk/` — **Consumer contract crate** (`serverless-runtime-sdk`). Defines the client trait other gears use to invoke callables and observe runs, the value types it exchanges, and its error taxonomy. Carries nothing plugin-facing. Details live in [`serverless-sdk/docs/PRD.md`](../../serverless-sdk/docs/PRD.md), [`DESIGN.md`](../../serverless-sdk/docs/DESIGN.md), and [`DECOMPOSITION.md`](../../serverless-sdk/docs/DECOMPOSITION.md).
+- `serverless-runtime/serverless-plugin-sdk/` — **Plugin contract crate** (`serverless-runtime-plugin-sdk`). Will define the plugin trait, the notification-only plugin → host event port, the authoring traits, and the adapter conformance harness. Not yet designed: the directory currently holds only `BACKUP-pre-split-sdk-docs/`, a backup of the pre-split SDK documents kept for reference and excluded from validation.
 - `serverless-runtime/` — **Host implementation crate** (this DECOMPOSITION). Owns Function Registry, Tenant Policy Manager, REST + JSON-RPC + MCP transports (per [ADR-0002](../../docs/ADR/0002-cpt-cf-serverless-runtime-adr-jsonrpc-mcp-protocol-surfaces-v1.md)), Plugin Dispatcher + invocation index, audit aggregation, and RFC-9457 error mapping. The host MUST NOT depend on any plugin crate at compile time.
 - `plugins/serverless-runtime-temporal-plugin/` — **First runtime plugin**, owning the fat plugin tier per ADR-0005. Uses Temporal as the durable execution backend ([ADR-0004](../../docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md)) and the CNCF Serverless Workflow Spec as DSL ([ADR-0003](../../docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md)). Future plugins (Lambda, Azure Durable, Starlark) will sit alongside as siblings under `plugins/`.
 
-This DECOMPOSITION covers **only the host implementation crate** (`serverless-runtime/`). The SDK contract crate (`serverless-runtime-sdk/`) and the Temporal plugin crate (`plugins/serverless-runtime-temporal-plugin/`) are tracked as separate work items and will get their own DECOMPOSITION documents inside their respective crate directories once their docs trees are populated. SDK PRD + DESIGN landed in `constructorfabric/gears-rust` (merge `9140c337`, 2026-05-12) and now live at `gears/serverless-runtime/serverless-sdk/docs/`; the SDK crate's own DECOMPOSITION has not yet been written.
+This DECOMPOSITION covers **only the host implementation crate** (`serverless-runtime/`). The consumer SDK is tracked separately in its own [`DECOMPOSITION.md`](../../serverless-sdk/docs/DECOMPOSITION.md); its FEATURE artifacts are intentionally deferred until that decomposition is accepted. The plugin-facing SDK and Temporal plugin remain separate future work items and will get their own DECOMPOSITION documents when their docs trees are populated. The plugin-facing SDK has no current documents — `gears/serverless-runtime/serverless-plugin-sdk/BACKUP-pre-split-sdk-docs/` holds only a backup of the pre-split SDK documents, kept for reference and excluded from validation.
 
 The 8 host features below are **ordered by core-first** (§2.1–2.4) followed by **additional layers** (§2.5–2.8: alternative transports, governance, observability). A separate **MVP / Deferred** dimension cross-cuts this ordering:
+
+> **Feature documents.** Only F-01 has one ([`features/gear-scaffold.md`](features/gear-scaffold.md)). F-02 – F-08 are referenced below as "F-0n FEATURE.md" for the tactical detail they will carry, but those documents are not written yet, so the headings below are deliberately unlinked rather than pointing at files that do not exist. Add the link when the document lands.
 
 - **MVP** = §2.1–2.3 (F-01 + F-02 + F-03 with registration endpoints only). The minimum to land the host crate in `main` and prove ToolKit integration. Invocation/schedule/trigger endpoints exist in F-03 but return `503` until F-04 lands.
 - **Deferred** = §2.4–2.8. All deferred features are p1 by business priority but do not block MVP. Per-feature unlock criteria + tactical detail live in each feature's `FEATURE.md`; the high-level dependency graph is in §3.
@@ -54,7 +57,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
 - **Out of scope**:
   - Any feature-specific code (REST endpoints, persistence, plugin dispatch, etc. — all later features)
-  - SDK crate scaffolding (covered by the SDK crate's own future DECOMPOSITION)
+  - SDK crate scaffolding (covered by the SDK crate's own [`DECOMPOSITION.md`](../../serverless-sdk/docs/DECOMPOSITION.md))
 
 - **Requirements Covered**:
 
@@ -83,13 +86,13 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
 - **Data**: n/a (no persistence)
 
-### 2.2 [Function Registry](features/function-registry.md) - HIGH
+### 2.2 Function Registry - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-function-registry`
 
 - **Purpose**: Owns callable-definition lifecycle — CRUD, versioning, lifecycle state, host-side schema validation, and version resolution. Single source of truth for function/workflow definition persistence; consults tenant-policy at the dispatch boundary.
 
-- **Depends On**: `cpt-cf-serverless-runtime-feature-gear-scaffold`. Cross-crate dependency on the SDK domain type model (defined in `gears/serverless-runtime/serverless-sdk/`).
+- **Depends On**: `cpt-cf-serverless-runtime-feature-gear-scaffold` and the host-owned function/workflow model in [`DESIGN_RUST_TYPES.md`](../../docs/DESIGN_RUST_TYPES.md). The consumer SDK carries invocation types only.
 
 - **Scope**: Persistent function/workflow definition store with CRUD, versioning, lifecycle state, and host-side schema validation. Delegates adapter-specific validation to plugins. Concrete entity schema, state-machine transitions, validation hooks, and version-resolution rules live in F-02 FEATURE.md.
 
@@ -115,7 +118,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
   - None
 
-- **Domain Model Entities**: SDK function/workflow definition types and supporting projections (concrete list in F-02 FEATURE.md and `serverless-sdk/docs/`).
+- **Domain Model Entities**: host-owned function/workflow definition types and supporting projections (concrete list in F-02 FEATURE.md and [`DESIGN_RUST_TYPES.md`](../../docs/DESIGN_RUST_TYPES.md)).
 
 - **Design Components**:
 
@@ -129,7 +132,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
 - **Data**: Function-definition persistence (concrete table/migration in F-02 FEATURE.md).
 
-### 2.3 [REST Surface](features/rest-surface.md) - HIGH
+### 2.3 REST Surface - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-rest-surface`
 
@@ -159,7 +162,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
   - None
 
-- **Domain Model Entities**: SDK domain types (function, invocation, schedule, trigger, tenant policy) and their filter/patch projections; concrete inventory in F-03 FEATURE.md.
+- **Domain Model Entities**: host-owned domain types (function, invocation index, schedule, trigger, tenant policy) and their filter/patch projections; concrete inventory in F-03 FEATURE.md. Only the invocation value types are also published to consumers, via `serverless-runtime-sdk`.
 
 - **Design Components**:
 
@@ -172,19 +175,20 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
   - `cpt-cf-serverless-runtime-seq-invocation-flow`
 - **Data**: n/a (delegated to F-02 / F-07 / F-04)
 
-### 2.4 [Plugin Dispatcher + Invocation Index](features/plugin-dispatcher.md) - HIGH
+### 2.4 Plugin Dispatcher + Invocation Index - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-plugin-dispatcher`
 
 - **Purpose**: **Deferred (post-MVP)** — built when the SDK trait surface is concretely-typed AND at least one plugin crate has been scaffolded. Plugin dispatch + host-side invocation index: routes invocation/schedule/trigger requests to the appropriate plugin (resolved by GTS adapter type) and maintains a queryable index of invocations populated by plugin-emitted events. Aggregate queries answered by the index; deep fetches delegate to the plugin.
 
-- **Depends On**: `cpt-cf-serverless-runtime-feature-gear-scaffold`, `cpt-cf-serverless-runtime-feature-function-registry`. Cross-crate dependency on the SDK trait surface (defined in `gears/serverless-runtime/serverless-sdk/`).
+- **Depends On**: `cpt-cf-serverless-runtime-feature-gear-scaffold`, `cpt-cf-serverless-runtime-feature-function-registry`. Cross-crate dependency on the plugin trait surface (defined in `gears/serverless-runtime/serverless-plugin-sdk/`).
 
-- **Scope**: Dispatcher (resolve plugin by GTS adapter type), invocation-index persistence, event-port handler for plugin emissions, aggregate query helpers, delegation hooks for deep fetches. Concrete dispatcher implementation, index entity schema, event-handler wiring, and SDK-trait integration shape live in F-04 FEATURE.md.
+- **Scope**: Dispatcher (resolve plugin by GTS adapter type), invocation-index persistence, event-port handler for plugin emissions, aggregate query helpers, delegation hooks for deep fetches. **Implements `ServerlessRuntimeClientV1` and registers it in `ClientHub`** — every operation on that trait is dispatch (invoke, control, replay) or an index read (get, query), so it cannot be implemented before this feature and has no earlier owner. Includes the integration test that starts a callable through the published contract alone, which SDK PRD §1.3 uses to verify its first goal. Concrete dispatcher implementation, index entity schema, event-handler wiring, and SDK-trait integration shape live in F-04 FEATURE.md.
 
 - **Out of scope**:
   - Plugin crate implementation (future plugin DECOMPOSITION)
-  - SDK trait definitions (SDK crate)
+  - Declaring the SDK traits themselves — the contract crates own their declarations; this feature
+    supplies the host-side implementation of the consumer one
 
 - **Requirements Covered**:
 
@@ -215,7 +219,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
 - **Data**: Invocation-index persistence (concrete table/migration in F-04 FEATURE.md).
 
-### 2.5 [JSON-RPC Transport](features/jsonrpc-transport.md) - HIGH
+### 2.5 JSON-RPC Transport - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-jsonrpc-transport`
 
@@ -254,7 +258,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
   - `cpt-cf-serverless-runtime-seq-jsonrpc-invocation`
 - **Data**: n/a (transport-only)
 
-### 2.6 [MCP Server](features/mcp-server.md) - HIGH
+### 2.6 MCP Server - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-mcp-server`
 
@@ -295,13 +299,13 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
   - `cpt-cf-serverless-runtime-seq-mcp-sampling`
 - **Data**: n/a (session state held in-memory + invocation_index)
 
-### 2.7 [Tenant Policy Management](features/tenant-policy.md) - HIGH
+### 2.7 Tenant Policy Management - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-tenant-policy`
 
 - **Purpose**: **Deferred (post-MVP governance layer)** — built when core host flow (F-01..F-04) is functional. Owns tenant runtime policy (quotas, retention, allowed adapters, default limits, idempotency defaults). Enforced at the plugin-dispatch boundary before any plugin call.
 
-- **Depends On**: `cpt-cf-serverless-runtime-feature-gear-scaffold`. Cross-crate dependency on the SDK domain type model (defined in `gears/serverless-runtime/serverless-sdk/`).
+- **Depends On**: `cpt-cf-serverless-runtime-feature-gear-scaffold` and `cpt-cf-serverless-runtime-feature-plugin-dispatcher`. F-07 owns the tenant-policy model and inserts its enforcement before plugin dispatch; neither contract SDK owns these types.
 
 - **Scope**: Tenant-policy persistence + CRUD, pre-dispatch enforcement middleware (adapter allowlist, quota check, default-limit injection). Concrete entity schema, enforcement-middleware hooks, and quota-tracking strategy live in F-07 FEATURE.md.
 
@@ -325,7 +329,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
   - None
 
-- **Domain Model Entities**: SDK tenant-policy family (quotas, retention, defaults, idempotency, usage; concrete list in F-07 FEATURE.md).
+- **Domain Model Entities**: host-owned tenant-policy family (quotas, retention, defaults, idempotency, usage), defined in [`DESIGN_RUST_TYPES.md`](../../docs/DESIGN_RUST_TYPES.md) and detailed in F-07 FEATURE.md.
 
 - **Design Components**:
 
@@ -339,13 +343,13 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
 - **Data**: Tenant-policy persistence (concrete table/migration in F-07 FEATURE.md).
 
-### 2.8 [Audit Aggregation + RFC-9457 Error Mapping](features/audit-error-mapping.md) - HIGH
+### 2.8 Audit Aggregation + RFC-9457 Error Mapping - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-audit-error-mapping`
 
 - **Purpose**: **Deferred (post-MVP observability layer)** — built after core host flow (F-01..F-04); before then errors return in transport-default form and audit events log only locally. Aggregates plugin-emitted audit + lifecycle events and forwards to the platform audit engine. Maps host/SDK errors to RFC-9457 Problem documents uniformly across all transports.
 
-- **Depends On**: `cpt-cf-serverless-runtime-feature-plugin-dispatcher`. Cross-crate dependency on the SDK error model and trace instrumentation (defined in `gears/serverless-runtime/serverless-sdk/`).
+- **Depends On**: `cpt-cf-serverless-runtime-feature-plugin-dispatcher`. Cross-crate dependency on the plugin error model and trace instrumentation (defined in `gears/serverless-runtime/serverless-plugin-sdk/`).
 
 - **Scope**: Audit-event aggregator subscribed to the dispatcher's event port; RFC-9457 Problem-mapping middleware for all transports; basic sensitive-field masking. Exact event schemas, masking rules, and middleware wiring live in F-08 FEATURE.md.
 
@@ -424,18 +428,19 @@ F-08 cpt-cf-serverless-runtime-feature-audit-error-mapping
 
 **Dependency Rationale**:
 
-- `cpt-cf-serverless-runtime-feature-function-registry` requires `cpt-cf-serverless-runtime-feature-gear-scaffold` (the host crate must exist) plus a cross-crate dependency on the SDK domain type model (defined in `gears/serverless-runtime/serverless-sdk/`) so the registry can persist `FunctionDefinition`.
+- `cpt-cf-serverless-runtime-feature-function-registry` requires `cpt-cf-serverless-runtime-feature-gear-scaffold` (the host crate must exist) plus the host-owned domain type model in [`DESIGN_RUST_TYPES.md`](../../docs/DESIGN_RUST_TYPES.md) so the registry can persist `FunctionDefinition`.
 - `cpt-cf-serverless-runtime-feature-rest-surface` requires `function-registry` (CRUD target) for the registration endpoints — that subset is the MVP scope. The invocation/schedule/trigger REST endpoints are documented as part of F-03 but return `503 Service Unavailable` until `plugin-dispatcher` (F-04) lands. F-03 does NOT hard-require F-04; the wiring point for dispatcher integration is reserved in F-03 but stubbed at MVP.
-- **F-04 plugin-dispatcher** is the gating Deferred-but-core feature. Unblocks once two cross-crate prerequisites are met: SDK trait signatures are concretely-typed AND at least one plugin crate is scaffolded + registered. Until then, REST endpoints depending on dispatch return `503`.
+- **F-04 plugin-dispatcher** is the gating Deferred-but-core feature. Unblocks once two cross-crate prerequisites are met: plugin-SDK trait signatures are concretely-typed AND at least one plugin crate is scaffolded + registered. Until then, REST endpoints depending on dispatch return `503`.
 - **F-05 jsonrpc-transport** and **F-06 mcp-server** are alternative transports for LLM agents over the same Invocation Engine contract that REST uses. Additive — without them the host still serves REST-only. F-06 is a specialization of F-05; F-05 is normally built first or in parallel.
 - **F-07 tenant-policy** is a governance layer consulted at the plugin-dispatch boundary. It augments F-03/F-04 with a pre-dispatch enforcement middleware. Distinct from basic tenant scoping (which is handled by F-02's standard tenant-isolated SeaORM access).
 - **F-08 audit-error-mapping** is an observability layer aggregating audit events from the dispatcher's event port (F-04) and applying RFC-9457 problem-mapping uniformly across transports. Until it lands, audit events log locally and errors return in transport-default form (acceptable for development; required for production launch).
 
 **Foundation feature**: `cpt-cf-serverless-runtime-feature-gear-scaffold` (F-01). No upstream deps; start here.
 
-**Cross-crate dependencies** (out of scope of this DECOMPOSITION; will be tracked in the SDK and Temporal-plugin DECOMPOSITIONs when those crates' docs trees are populated):
+**Cross-crate dependencies** (out of scope of this DECOMPOSITION; consumer-SDK allocation is tracked in its own DECOMPOSITION, while the plugin SDK and Temporal plugin will be tracked when their docs trees are populated):
 
-- SDK contract crate (`serverless-runtime-sdk`, docs at `gears/serverless-runtime/serverless-sdk/`): the cross-host-plugin trait surface, shared domain types, error taxonomy, and conformance test suite. Concrete inventory lives in `serverless-sdk/docs/PRD.md` + `DESIGN.md`.
+- Consumer contract crate (`serverless-runtime-sdk`): the consumer client trait, invocation value types, and error taxonomy. Its allocation and concrete inventory live in [`serverless-sdk/docs/DECOMPOSITION.md`](../../serverless-sdk/docs/DECOMPOSITION.md), [`PRD.md`](../../serverless-sdk/docs/PRD.md), and [`DESIGN.md`](../../serverless-sdk/docs/DESIGN.md).
+- Plugin contract crate (`serverless-runtime-plugin-sdk`): the plugin trait surface, the plugin → host event port, shared domain types, and the conformance test suite. Not yet designed; no current documents exist for it.
 - Temporal plugin crate (`plugins/serverless-runtime-temporal-plugin`, future): concrete `RuntimeAdapter` implementation with Temporal-native primitives so the dispatcher can resolve a real backend.
 
 **Parallelizable**:

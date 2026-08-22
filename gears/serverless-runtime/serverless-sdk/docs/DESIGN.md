@@ -1,6 +1,6 @@
 <!--
-Created: 2026-03-30 by Constructor Tech
-Updated: 2026-03-30 by Constructor Tech
+Created: 2026-07-30 by Constructor Tech
+Updated: 2026-08-11 by Constructor Tech
 -->
 
 # Technical Design — CF/Gears Serverless Runtime SDK
@@ -22,16 +22,9 @@ Updated: 2026-03-30 by Constructor Tech
   - [3.4 Internal Dependencies](#34-internal-dependencies)
   - [3.5 External Dependencies](#35-external-dependencies)
   - [3.6 Interactions & Sequences](#36-interactions--sequences)
-  - [3.7 Testability Architecture](#37-testability-architecture)
-  - [Database schemas & tables](#database-schemas--tables)
-  - [3.8 Capacity, Cost, and Deployment Exclusions](#38-capacity-cost-and-deployment-exclusions)
-- [4. Additional Context](#4-additional-context)
-  - [Relationship to the Serverless Runtime Design](#relationship-to-the-serverless-runtime-design)
-  - [Comparison with Similar Solutions](#comparison-with-similar-solutions)
-  - [Known Technical Debt](#known-technical-debt)
-  - [Crate Naming Convention](#crate-naming-convention)
-- [5. Non-Applicable Domains](#5-non-applicable-domains)
-- [6. Traceability](#6-traceability)
+  - [3.7 Database schemas & tables](#37-database-schemas--tables)
+- [4. Additional context](#4-additional-context)
+- [5. Traceability](#5-traceability)
 
 <!-- /toc -->
 
@@ -39,905 +32,445 @@ Updated: 2026-03-30 by Constructor Tech
 =============================================================================
 TECHNICAL DESIGN DOCUMENT
 =============================================================================
-PURPOSE: Define HOW the system is built — architecture, components, APIs,
-data models, and technical decisions that realize the requirements.
-
-DESIGN IS PRIMARY: DESIGN defines the "what" (architecture and behavior).
-ADRs record the "why" (rationale and trade-offs) for selected design
-decisions; ADRs are not a parallel spec, they are traceability artifacts.
-
-SCOPE:
-  ✓ Architecture overview and vision
-  ✓ Design principles and constraints
-  ✓ Component model and interactions
-  ✓ API contracts and interfaces
-  ✓ Data models
+PURPOSE: Define HOW the system is built — architecture, components, contracts.
 
 NOT IN THIS DOCUMENT (see other templates):
-  ✗ Requirements → PRD.md
-  ✗ Detailed rationale for decisions → ADR/
-  ✗ Step-by-step implementation flows → features/
+  ✗ Business requirements, FR/NFR statements → PRD.md
+  ✗ Why a specific technical approach was chosen → ADR/
+  ✗ Detailed implementation flows, algorithms → features/
 
 STANDARDS ALIGNMENT:
   - IEEE 1016-2009 (Software Design Description)
   - IEEE 42010 (Architecture Description)
-  - ISO/IEC 15288 / 12207 (Architecture & Design Definition processes)
-
-DESIGN LANGUAGE:
-  - Be specific and clear; no fluff, bloat, or emoji
-  - Reference PRD requirements using `cpt-cf-serverless-runtime-sdk-fr-{slug}` IDs
+  - ISO/IEC 15288 / 12207 (Architecture & Design Definition)
 =============================================================================
 -->
 
-- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-design-root`
+> **Status: draft.** Sections that do not apply to a library with no I/O, no persistence and no
+> deployment footprint of its own say so explicitly rather than being omitted.
+>
+> The contract described here **is not final**. Seven unresolved questions in the
+> `serverless-runtime` gear's own documentation reach into it — G-01, G-02 and G-05 to G-09 in
+> [`NEXT_ADR_SCOPE.md`](../../docs/NEXT_ADR_SCOPE.md) §3. Each either leaves a stated requirement
+> partially unmet or leaves an operation's semantics undecided, so the surface below can still
+> change in ways that break callers. See §4 for what each one blocks.
+
 ## 1. Architecture Overview
 
 ### 1.1 Architectural Vision
 
-`serverless-runtime-sdk` is the engine-agnostic contract crate of the serverless-runtime gear. It exposes traits and value types used by the host and by runtime plugins. It has no runtime state, no I/O, and no engine-specific dependencies.
+`serverless-runtime-sdk` is a contract crate: types and one trait, no behaviour. It exists so
+that a gear needing to run automation depends on a compile-time contract rather than on the
+`serverless-runtime` gear itself, and so that the same gear is unaffected when execution
+backends change.
 
-The invocation flow through this crate's types:
-
-```mermaid
-flowchart LR
-    host([host])
-    plugin([runtime plugin])
-    user([user handler])
-
-    host -- "call via RuntimeAdapter" --> plugin
-    plugin -- "call via FunctionHandler / WorkflowHandler" --> user
-    plugin -. "index events via ServerlessRuntimeClient" .-> host
-```
-
-**Traits — who implements, who calls:**
-
-| Trait | Implemented by | Called by |
-|---|---|---|
-| `RuntimeAdapter` | runtime plugin | host |
-| `ServerlessRuntimeClient` | host | plugin (to emit index-update events) |
-| `FunctionHandler<I, O>` / `WorkflowHandler<I, O>` | runtime plugin (wraps the function author's authoring asset) | plugin |
-
-> **Note on "who implements `FunctionHandler`".** The `impl FunctionHandler<I, O> for …` lives inside the runtime plugin — the plugin provides a Rust type that wraps a **function author's authoring asset** (a Starlark script, a Rust activity fn, a compiled WASM gear, a deployed Lambda function, …). Inside `call`, the plugin executes that asset. Function authors never implement SDK traits directly; they author in the plugin's own authoring model and the plugin bridges that into a `FunctionHandler`. A plugin could choose to expose `FunctionHandler` as its own authoring model for power users, but that's a minority case.
-
-**Shared domain** (used across all three parties): `InvocationRecord`, `CompensationContext`, `RuntimeErrorCategory`, `RuntimeErrorPayload`, `RetryPolicy`, `TimelineEventType`.
-
-**Handler-author projections** (ergonomic views of the shared domain that appear in the `FunctionHandler::call` signature): `Context` (from `InvocationRecord`), `CompensationInput` (from `CompensationContext`), `ServerlessSdkError` (maps to `RuntimeErrorCategory`).
-
-**Other gears**: `environment` (`Environment` trait + `CredStoreEnvironment` impl for synchronous config/secret access), `trace` (plugin-only helper that emits `TimelineEventType` events around handler calls).
-
-The `async-trait` crate is used for `RuntimeAdapter`, `FunctionHandler`, and `WorkflowHandler`, making them ergonomic to implement and ensuring the returned `Future` is `+ Send` without callers annotating anything.
-
-For the gear-wide decomposition (how host, plugins, and this SDK fit together) see [`gears/serverless-runtime/docs/DESIGN.md`](../../docs/DESIGN.md).
+Everything the crate contains is reachable from one trait, `ServerlessRuntimeClientV1`. The
+crate performs no I/O, holds no state, spawns no tasks, and has no initialisation. At runtime
+the `serverless-runtime` gear registers its implementation and consumers resolve it by trait
+type through `ClientHub`; this crate contributes no code to that path.
 
 ### 1.2 Architecture Drivers
 
 #### Functional Drivers
 
-| Requirement | Design Response |
-|-------------|-----------------|
-| `cpt-cf-serverless-runtime-sdk-fr-handler-trait` | `FunctionHandler<I, O>` generic async trait in `handler.rs` |
-| `cpt-cf-serverless-runtime-sdk-fr-handler-send-sync` | `Handler: Send + Sync + 'static` bound on the trait definition |
-| `cpt-cf-serverless-runtime-sdk-fr-workflow-handler-trait` | `WorkflowHandler<I, O>: FunctionHandler<I, O>` supertrait in `workflow.rs` |
-| `cpt-cf-serverless-runtime-sdk-fr-compensation-input` | `CompensationInput` struct in `workflow.rs`, `#[non_exhaustive]` |
-| `cpt-cf-serverless-runtime-sdk-fr-context` | `Context` struct in `context.rs` with 9 fields from `InvocationRecord` |
-| `cpt-cf-serverless-runtime-sdk-fr-deadline-helpers` | `is_deadline_exceeded()` and `remaining_time()` on `Context` |
-| `cpt-cf-serverless-runtime-sdk-fr-environment-trait` | Sync `Environment` trait with `CredStoreEnvironment` impl in `environment.rs` |
-| `cpt-cf-serverless-runtime-sdk-fr-error-model` | `#[non_exhaustive]` `ServerlessSdkError` with `thiserror` in `error.rs` |
-| `cpt-cf-serverless-runtime-sdk-fr-trace-gear` | `trace.rs` with `call_instrumented` and `compensate_instrumented` |
-| `cpt-cf-serverless-runtime-sdk-fr-no-consumer-tracing` | `tracing` calls contained entirely within `trace.rs` |
+| PRD Requirement | Design Response |
+|---|---|
+| `cpt-cf-serverless-runtime-sdk-fr-invoke` | One `dyn`-dispatched trait resolved through `ClientHub`; no transport types in the crate. `InvokeRequest` carries an opaque `callable_id`, so functions and workflows take one path with no caller-side branch |
+| `cpt-cf-serverless-runtime-sdk-fr-sync-result` | `InvocationOutcome` carries the result payload alongside the summary, populated on the waiting path |
+| `cpt-cf-serverless-runtime-sdk-fr-dry-run` | `InvokeRequest.dry_run` plus the `dry_run` flag on the outcome, so a synthetic result is never mistaken for a recorded run |
+| `cpt-cf-serverless-runtime-sdk-fr-idempotency` | `InvokeRequest.idempotency_key` plus the `cached` flag on the outcome (partial — see §4) |
+| `cpt-cf-serverless-runtime-sdk-fr-read-run`, `…-fr-query-runs` | Both return `InvocationSummary`, the gear's index row, so no read can imply a plugin round-trip |
+| `cpt-cf-serverless-runtime-sdk-fr-run-states` | `InvocationStatus` adopted verbatim from the gear's schema (partial — see §4) |
+| `cpt-cf-serverless-runtime-sdk-fr-control`, `…-fr-replay` | `ControlAction` for in-place interventions; `replay_invocation` separate because it mints a new identifier |
+| `cpt-cf-serverless-runtime-sdk-fr-refusal-reasons`, `…-fr-refusal-parity` | A dedicated error enum whose variants map one-to-one onto the gear's RFC 9457 problem types (§3.3) |
+| `cpt-cf-serverless-runtime-sdk-fr-failure-vs-refusal` | `Err` reserved for refusals; a callable that ran and failed returns `Ok` (§2.1) |
+| `cpt-cf-serverless-runtime-sdk-fr-test-double` | Substitute implementation behind the `test-util` feature (§4) |
 
 #### NFR Allocation
 
-| NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
-|--------|-------------|--------------|-----------------|----------------------|
-| `cpt-cf-serverless-runtime-sdk-nfr-no-engine-deps` | No engine-specific deps | All gears | Dep list restricted to `serde`, `serde_json`, `thiserror`, `async-trait`, `tracing` | `cargo deny` in CI |
-| `cpt-cf-serverless-runtime-sdk-nfr-no-unsafe` | Zero `unsafe` blocks | All gears | Workspace `unsafe_code = "forbid"` lint; no pointer manipulation | Lint enforced at compile time |
-| `cpt-cf-serverless-runtime-sdk-nfr-low-overhead` | No blocking I/O or extra heap allocs on hot path | `trace.rs`, `handler.rs` | `call_instrumented` introduces one `Box<dyn Future>` (async-trait) and one `tracing` span; no additional heap allocations on the hot path | Code review on PRs touching `trace.rs` or `handler.rs` |
-| `cpt-cf-serverless-runtime-sdk-nfr-api-docs` | Zero missing-doc warnings; `#![deny(missing_docs)]` | All public items | All public types, traits, and functions documented with purpose, usage, and invariants | `cargo doc --no-deps` in CI |
-| `cpt-cf-serverless-runtime-sdk-nfr-authoring-ergonomics` | Plain `async fn` syntax; no lifetime annotations on handler impls | `handler.rs`, `workflow.rs` | `async-trait` expands `async fn` to `Pin<Box<dyn Future + Send>>` internally, keeping the `impl` surface annotation-free | SDK examples and integration tests compile with `async fn` syntax; CI fails on any explicit `impl Future` or lifetime annotation on method signatures |
+| PRD NFR | Realised by |
+|---|---|
+| `cpt-cf-serverless-runtime-sdk-nfr-engine-neutrality` | Dependency set restricted to platform crates and a small set of ubiquitous data crates; no engine, backend or cloud SDK (§2.2, §3.4) |
+| `cpt-cf-serverless-runtime-sdk-nfr-read-locality` | Reads return only the gear's index row, so the surface offers nothing a plugin round-trip would be needed for (§3.1) |
+| `cpt-cf-serverless-runtime-sdk-nfr-no-unsafe` | Workspace lint `unsafe_code = "forbid"` (§2.2) |
+| `cpt-cf-serverless-runtime-sdk-nfr-api-docs` | Documentation lint enforced in CI on the public surface |
 
-#### Key Design Decisions
+#### Key ADRs
 
-| Decision | Summary |
-|----------|---------|
-| `async-trait` over native `async fn` in traits | Rust supports `async fn` in trait definitions natively (RPITIT — Return Position `impl Trait` In Traits), but the returned future does not carry a `Send` bound by default. Multi-threaded async runtimes require `Send` futures. The `async-trait` crate adds the `Send` bound automatically via `Pin<Box<dyn Future + Send>>`. Use `async-trait` until native `async fn` in traits supports `Send`-bounded futures ergonomically on stable Rust. |
-| Synchronous `Environment` | Pre-fetch config/secrets from the platform credstore before invocation; handlers access them synchronously via the `Environment` trait |
-| Structured `CompensationInput` | Dedicated struct with named fields, not a generic handler input parameter |
-| Concrete `Context` struct | Not a trait or generic parameter — keeps construction simple and mapping explicit |
-| `#[non_exhaustive]` error enum | `ServerlessSdkError` is an enum (not a trait object) for exhaustive `RuntimeErrorCategory` mapping |
-| `WorkflowHandler` supertrait | `WorkflowHandler<I,O>: FunctionHandler<I,O>` — every workflow is a function |
+| ADR | Decision |
+|---|---|
+| host `cpt-cf-serverless-runtime-adr-thin-host` | The gear indexes runs; backends own full detail. Fixes reads to the index row and keeps execution mechanics out of this crate. |
+| host `cpt-cf-serverless-runtime-adr-callable-type-hierarchy` | Functions and workflows are sibling types, and the SDK field is named `callable_id` rather than `function_id`. |
 
 ### 1.3 Architecture Layers
 
-The serverless-runtime gear has a thin host and fat runtime plugins. This SDK is the single contract crate that sits between them: the host invokes plugins through the `RuntimeAdapter` trait, and plugins invoke user code through the handler traits.
+The crate has no layers. It is a single flat contract module set, deliberately: introducing a
+domain or infrastructure layer inside a crate with no behaviour would add indirection with
+nothing behind it.
 
-```
-╔══════════════════════════════════════════════════════════════╗
-║  Host (serverless-runtime crate)                             ║
-║  Registry · Tenant Policy · REST · GTS validation · audit    ║
-║  plugin dispatch · lightweight invocation index              ║
-║  depends on: serverless-runtime-sdk (RuntimeAdapter,         ║
-║              InvocationRecord, RuntimeErrorCategory, …)      ║
-╚═══════════════════════╤══════════════════════════════════════╝
-                        │ dispatches through dyn RuntimeAdapter
-╔═══════════════════════▼══════════════════════════════════════╗
-║  Runtime Plugin (serverless-runtime/plugins/<backend>-plugin) ║
-║  Implements RuntimeAdapter (invocation, control, schedule,    ║
-║  event-trigger) using backend-native primitives.              ║
-║  Implements/invokes FunctionHandler<I, O> / WorkflowHandler.  ║
-║  Applies RetryPolicy using engine-native mechanisms.          ║
-║  (Temporal · Starlark · cloud FaaS — plugins out of scope)    ║
-╚═══════════════════════╤══════════════════════════════════════╝
-                        │ depends on
-╔═══════════════════════▼══════════════════════════════════════╗
-║  serverless-runtime-sdk  (this crate)                         ║
-║                                                               ║
-║  Shared domain                                                ║
-║  ┌────────────────────────────────────────────────────────┐   ║
-║  │  InvocationRecord · CompensationContext                │   ║
-║  │  RuntimeErrorCategory · RuntimeErrorPayload            │   ║
-║  │  RetryPolicy · TimelineEventType                       │   ║
-║  └────────────────────────────────────────────────────────┘   ║
-║                                                               ║
-║  Traits                                                       ║
-║  ┌────────────────────────────────────────────────────────┐   ║
-║  │  RuntimeAdapter          (plugin impls, host calls)    │   ║
-║  │  ServerlessRuntimeClient (host impls, plugin calls)    │   ║
-║  │  FunctionHandler /                                     │   ║
-║  │  WorkflowHandler         (plugin impls wrapping user   │   ║
-║  │                           authoring asset, plugin      │   ║
-║  │                           calls)                       │   ║
-║  └────────────────────────────────────────────────────────┘   ║
-║                                                               ║
-║  Handler-author surface (user-facing gears)                 ║
-║  ┌──────────┐ ┌───────────┐ ┌───────┐ ┌──────────┐           ║
-║  │ handler  │ │ workflow  │ │ error │ │ context  │           ║
-║  └──────────┘ └───────────┘ └───────┘ └──────────┘           ║
-║  ┌─────────────────┐ ┌───────────────────────────┐            ║
-║  │  environment    │ │  trace  (plugin-only)      │           ║
-║  └─────────────────┘ └───────────────────────────┘            ║
-╚═══════════════════════════════════════════════════════════════╝
-```
+| Concern | Location |
+|---|---|
+| The consumer trait | `src/api.rs` |
+| Value types the trait exchanges | `src/models.rs` |
+| The error type | `src/error.rs` |
+| Test double | `src/test_util.rs` (behind the `test-util` feature) |
 
-| Layer | Responsibility | Technology |
-|-------|---------------|------------|
-| Host | Registry, tenant policy, REST façade, GTS validation, audit, plugin dispatch, lightweight invocation index (host-indexed, plugin-detailed split per `cpt-cf-serverless-runtime-adr-thin-host`) | Rust, ToolKit, SecureORM |
-| Runtime Plugin | Implements `RuntimeAdapter` for one backend; owns invocation, scheduling, event-trigger, retry, compensation using backend-native primitives; invokes user handlers through `FunctionHandler` / `WorkflowHandler` | Rust + `async-trait`, backend SDK |
-| SDK (this crate) | Shared domain types; `RuntimeAdapter` (plugins implement, host calls); `ServerlessRuntimeClient` (host implements, plugins call); `FunctionHandler`/`WorkflowHandler` (plugin implements wrapping user authoring asset, plugin calls); handler-author projections (`Context`, `CompensationInput`, `ServerlessSdkError`); plugin-only `trace` instrumentation | Rust stable, `serde`, `thiserror`, `async-trait`, `tracing`, `cf-credstore-sdk` |
-
----
+This is the canonical SDK layout described in
+[Gear Layout and SDK Pattern](../../../../docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md),
+without the plugin-facing module — that surface belongs to a separate plugin-facing SDK, which
+is not yet designed.
 
 ## 2. Principles & Constraints
 
 ### 2.1 Design Principles
 
-#### Implementation-Agnostic Authoring Contract
+#### A refused call and a failed callable are different outcomes
 
-- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-principle-impl-agnostic`
+- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-principle-refusal-vs-failure`
 
-No engine-specific type appears in the public API of this crate. `Context`, `Environment`,
-`CompensationInput`, and `ServerlessSdkError` are entirely defined in terms of stable
-platform concepts (GTS IDs as `String`, `serde_json::Value` for opaque payloads) without
-depending on any adapter. This directly enforces
-`cpt-cf-serverless-runtime-principle-impl-agnostic` at the SDK layer.
+`Err` means no result was delivered: the Serverless Runtime either declined the work, or started
+it and could not finish it synchronously. A callable that ran and then failed returns `Ok`,
+carrying a summary whose status is `Failed`. A synchronous caller must be able to distinguish "the
+runtime would not start this" from "your automation threw", and collapsing both into `Err`
+destroys that distinction precisely where it matters most.
 
-`Environment` is synchronous because handlers should not perform async I/O for config/secret
-resolution. The SDK pre-fetches values from the platform credstore (`CredStoreClientV1`)
-before invocation and exposes them through the synchronous `Environment` trait.
+The second `Err` case is `SyncSuspension`, and it is why the principle is about delivering a
+result rather than about refusal alone: the run was accepted and started, then reached a
+suspension point that a synchronous call cannot wait through. It carries the invocation id
+because the run survives — suspended, resumable, cancellable — so the caller can continue with it
+asynchronously. The gear's HTTP surface reports the same condition as a 409, so both paths agree.
 
-#### GTS Identity by Reference
+#### The crate never interprets platform identifiers
 
-- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-principle-gts-by-reference`
+- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-principle-opaque-ids`
 
-GTS type IDs (`function_id`, `error_type_id`, GTS chain strings) are carried as opaque
-`String` values throughout the crate. The SDK never interprets, parses, or validates GTS
-chains. This prevents coupling to GTS library versions and keeps the crate portable.
+Type identifiers are carried as opaque strings and never parsed, split or validated here.
+Parsing is owned by the type system and applied by the gear; a second parser in this crate would
+be a second thing to keep correct.
 
-#### Minimal Trusted Surface
+#### Minimal surface
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-principle-minimal-surface`
 
-The crate exposes exactly the types and traits required for handler authoring and adapter
-driving. No utility types, convenience wrappers, or domain-specific helpers are added
-unless they directly serve a stated requirement. Every public item must be justifiable
-by a PRD requirement ID.
+The trait carries only what a consuming gear has been shown to need. Administrative operations
+stay on the HTTP surface. Methods are added when a real caller needs them, not in anticipation.
 
 ### 2.2 Constraints
 
-#### No Engine Dependencies — Ever
+#### No execution-technology dependencies
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-constraint-no-engine-deps`
 
-The `[dependencies]` section of `Cargo.toml` must never include engine-specific crates.
-This constraint is permanent: adding an engine dependency invalidates the adapter
-portability guarantee and breaks the implementation-agnostic principle.
+No dependency on any execution engine, backend or cloud provider — no Temporal client, no
+Starlark, no cloud SDK. Permitted are the platform's own crates and the workspace's ubiquitous
+data and error crates, enumerated in §3.4. Stated as a prohibition rather than an allow-list, so
+adopting a further platform crate needs no amendment; what binds is that nothing tying the crate
+to one execution technology may enter.
 
-#### SDK Trust Boundary — All Inputs Are Trusted
+#### No unsafe code
 
-- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-constraint-trust-boundary`
+- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-constraint-no-unsafe`
 
-The SDK accepts all inputs it receives as trusted. Specifically:
+Enforced by the workspace lint `unsafe_code = "forbid"` (root `Cargo.toml`).
 
-- `Context` fields (`tenant_id`, `invocation_id`, `correlation_id`, etc.) are populated
-  by the adapter from the runtime's `InvocationRecord`; the SDK does not validate them.
-- `input: I` is a value the adapter has already deserialised from the runtime's `params`
-  JSON; the SDK does not validate the deserialized value's business invariants.
-- `env: &dyn Environment` is a pre-populated snapshot provided by the adapter; the SDK
-  does not verify secret resolution or access control.
+#### Dependency direction
 
-Input validation (schema conformance, injection prevention, privilege constraints) is the
-responsibility of the Serverless Runtime API layer and adapter before the handler is called.
-Handler implementations are responsible for validating *business* invariants on `input: I`
-within their `call` implementation and returning `ServerlessSdkError::InvalidInput` if
-those invariants are violated.
+- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-constraint-dep-direction`
 
-#### Stable Rust — No Nightly Features
-
-- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-constraint-stable-rust`
-
-The crate must compile on the workspace minimum Rust version without any nightly features,
-attributes, or unstable library APIs. Design decisions that require nightly (e.g., RPITIT
-with `Send` bounds before stabilisation) must be replaced with stable alternatives.
-
----
+No dependency on the `serverless-runtime` gear crate, on any runtime plugin crate, or on the
+plugin-facing SDK. Arrows point only towards this crate.
 
 ## 3. Technical Architecture
 
 ### 3.1 Domain Model
 
-**Technology**: Rust structs and traits
-**Location**: [`serverless-runtime-sdk/src/`](../src/)
+**Technology**: Rust structs and enums; no `serde` derive requirement beyond what consumers
+need for their own boundaries.
 
-#### InvocationRecord → Context Field Mapping
+**Core Entities**
 
-`Context` is the SDK's read-only projection of the runtime's `InvocationRecord`.
-The SDK constructs `Context` from the record before calling the handler via
-`Context::from_invocation_record()` — a deterministic mapping.
+- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-entity-invocation`
 
-| `Context` field | Source in Runtime | Type |
-|-----------------|-------------------|------|
-| `invocation_id` | `InvocationRecord.invocation_id` | `String` |
-| `function_id` | `InvocationRecord.function_id` | `String` (GTS ID) |
-| `function_version` | `InvocationRecord.function_version` | `String` — semantic version of the function deployment (`^\d+\.\d+\.\d+$`); distinct from the GTS chain version in `function_id` |
-| `tenant_id` | `InvocationRecord.tenant_id` | `String` |
-| `attempt_number` | Adapter-tracked retry count | `u32` (1-indexed) |
-| `correlation_id` | `InvocationObservability.correlation_id` | `String` |
-| `trace_id` | `InvocationObservability.trace_id` | `Option<String>` |
-| `span_id` | `InvocationObservability.span_id` | `Option<String>` |
-| `deadline` | Computed from `FunctionLimits.timeout_seconds` at invocation start | `Option<std::time::Instant>` |
+| Entity | Description |
+|---|---|
+| `InvokeRequest` | What to run and how: `callable_id`, `mode`, `params`, `dry_run`, `idempotency_key`. |
+| `InvocationMode` | `Sync` or `Async`. Adopted from the gear's model unchanged. |
+| `InvocationSummary` | One row of the gear's invocation index — see below. |
+| `InvocationErrorSummary` | Stable failure type and failure category stored in the gear's index. |
+| `InvocationErrorCategory` | What kind of failure it was — `Transient`, `Permanent`, `ResourceLimit`, `Timeout`, `Canceled`. Named for the failure, not for an action: the plugin has already retried to its policy by the time a run reaches `Failed`. |
+| `InvocationOutcome` | What starting or replaying a run returns — see below. |
+| `InvocationStatus` | The nine run states, adopted verbatim from the gear's `gts.cf.core.sless.status.v1~` schema: `Queued`, `Running`, `Suspended`, `Succeeded`, `Failed`, `Canceled`, `Compensating`, `Compensated`, `DeadLettered`. |
+| `ControlAction` | `Cancel`, `Suspend`, `Resume`, `Retry` — the in-place interventions. |
+| `InvocationId` | Identity assigned by the gear. |
 
-**Fields omitted from Context** (runtime concerns, not handler concerns):
-`status`, `mode`, `params` (typed via `I`), `result`, `error`, `timestamps`,
-`metrics`.
+**`InvocationSummary`** carries the gear's index row with the SDK's field naming (host
+`cpt-cf-serverless-runtime-adr-thin-host`), not a trimmed `InvocationRecord`: invocation id,
+callable id, the backend that ran it, tenant, owner, status, timestamps (created, started,
+suspended, finished), and an error summary populated only in failure states. Every value the
+index holds is present; only the callable's field is renamed, from the registry's `function_id`
+to `callable_id`, because it accepts workflows too. The full record —
+inputs, results, observability, step history — exists only with the executing backend and is
+not reachable through this crate.
 
-#### CompensationContext → CompensationInput Field Mapping
+The plugin port carries the same safe fields in its own crate-local type; the host maps them into
+`InvocationErrorSummary`, so neither SDK depends on the other. That mapping is also where the
+vocabulary changes: the plugin classifies a failure for its own retry policy (`Retryable` and so
+on), while the consumer sees what kind of failure it was (`Transient`, `Permanent`, …). A run
+reaches `Failed` only once the plugin has retried to policy and given up, so a word naming a
+retry would describe something already spent. Backend messages and arbitrary details remain
+plugin-local and are available through observability APIs.
 
-`CompensationInput` is the SDK's projection of the runtime's `CompensationContext`
-(`gts.cf.core.sless.compensation_context.v1~`). The adapter deserialises the
-runtime's JSON envelope and populates this struct.
+**`InvocationOutcome`** wraps the summary and adds what a caller cannot otherwise learn:
 
-| `CompensationInput` field | Source in Runtime's `CompensationContext` | Type |
-|--------------------------|-------------------------------------------|------|
-| `trigger` | `trigger` (`"failure"` / `"cancellation"`) | `CompensationTrigger` enum |
-| `original_workflow_invocation_id` | `original_workflow_invocation_id` | `String` |
-| `failed_step_id` | `failed_step_id` | `String` |
-| `failed_step_error` | `failed_step_error` | `Option<FailedStepError>` |
-| `workflow_state_snapshot` | `workflow_state_snapshot` | `serde_json::Value` |
-| `timestamp` | `timestamp` | `String` (ISO 8601) |
-| `function_id` | `invocation_metadata.function_id` | `String` (GTS ID) |
-| `original_input` | `invocation_metadata.original_input` | `serde_json::Value` |
-| `tenant_id` | `invocation_metadata.tenant_id` | `String` |
-| `correlation_id` | `invocation_metadata.correlation_id` | `Option<String>` |
-| `started_at` | `invocation_metadata.started_at` | `Option<String>` (ISO 8601) |
+| Field | Meaning |
+|---|---|
+| `result` | The callable's output. Present for a synchronous run that succeeded; absent otherwise. |
+| `cached` | The result was served from the response cache without re-executing. Requires an idempotency key plus a callable declaring itself idempotent with a non-zero cache age; only successful results are ever cached. |
+| `dry_run` | The request was validated but nothing ran. The summary is synthetic and was not persisted, so it cannot be read back by id afterwards. |
 
-`FailedStepError` is a typed projection of the runtime's `failed_step_error` object:
-`error_type: String`, `message: String`, `error_metadata: Option<serde_json::Value>`.
+`cached` and `dry_run` are mutually exclusive: a dry run neither reads nor writes the cache, and
+does not evaluate the idempotency key at all.
 
-Field names match the runtime's `CompensationContext` schema exactly. `correlation_id`
-and `started_at` are `Option` because the runtime schema marks them as optional within
-`invocation_metadata`.
+**Payload handling.** `params` and `result` are `serde_json::Value` and are treated as opaque: no
+code here reads into them, transforms them, retains a copy, or writes them anywhere. Validation is
+the gear's, against the callable's declared schema.
 
-#### ServerlessSdkError → RuntimeErrorCategory Mapping
+That extends to `Debug`. Types carrying a payload implement it by hand and render the payload as a
+placeholder rather than deriving it, because a derived `Debug` is how payloads leak in practice —
+some consumer eventually logs a whole request while diagnosing something unrelated, and it is
+precisely then that nobody is thinking about what the payload contains. The rest of each type's
+fields print normally, so the redaction costs no diagnostic value that matters.
 
-Adapters use this mapping to produce the correct `RuntimeErrorPayload` from a
-`ServerlessSdkError` returned by a handler.
+Opacity is not confidentiality. Both payloads are visible to the gear and to the executing
+backend, and the backend records them as part of the run's history, where anyone permitted to
+inspect that run can read them afterwards. The runtime has no secret-reference type, no
+sensitive-field annotation, and no masking rules for execution history, so there is nothing this
+crate can offer a caller that needs to pass a credential — see §4 and PRD §13.
 
-| `ServerlessSdkError` | `RuntimeErrorCategory` | GTS Error Type Hint |
-|----------------------|------------------------|---------------------|
-| `UserError(msg)` | `NonRetryable` | `gts.cf.core.sless.err.v1~cf.core.sless.err.validation.v1~` |
-| `InvalidInput(msg)` | `NonRetryable` | `gts.cf.core.sless.err.v1~cf.core.sless.err.validation.v1~` |
-| `Timeout` | `Timeout` | `gts.cf.core.sless.err.v1~cf.core.sless.err.runtime_timeout.v1~` |
-| `NotSupported(msg)` | `NonRetryable` | adapter-defined |
-| `Internal(msg)` | `Retryable` | adapter-defined |
-
-**Variant semantics for adapter authors** — both `UserError` and `InvalidInput` are `NonRetryable`; the distinction is:
-- `InvalidInput` — the request violates a structural or type constraint that the handler checked (e.g., a required field is absent, a value is out of allowed range). Return this *before* any side effects.
-- `UserError` — the request is structurally valid but rejected by business logic (e.g., insufficient funds, duplicate resource, forbidden action for the caller's state). Return this after business rules are evaluated.
-
-**Adapter-only categories** (never produced by handler code):
-
-| `RuntimeErrorCategory` | Origin | Notes |
-|------------------------|--------|-------|
-| `ResourceLimit` | Adapter | Tenant quota or resource limit exceeded; adapter signals before or during invocation |
-| `Canceled` | Runtime | External cancellation; runtime applies this status, not the handler |
-
-#### API Stability: `#[non_exhaustive]` Surface Summary
-
-All public types in this crate that may gain fields or variants in future semver-compatible
-releases are declared `#[non_exhaustive]`. The table below is the authoritative reference
-for which types carry this attribute and what it means for each consumer role.
-
-| Type | `#[non_exhaustive]` | Impact on adapter authors | Construction / match pattern |
-|------|---------------------|--------------------------|------------------------------|
-| `ServerlessSdkError` | Yes (enum) | `match` must include a `_` catch-all arm | `match` must include a `_` catch-all arm; no compile-time signal exists for new variants — adapter maintainers must consult DESIGN.md §3.1 when updating the SDK dependency |
-| `CompensationInput` | Yes (struct) | Field access by name is stable; struct literal construction outside the crate is forbidden | Adapter constructs `CompensationInput` via `CompensationInput::new(trigger, original_workflow_invocation_id, failed_step_id, failed_step_error, workflow_state_snapshot, timestamp, function_id, original_input, tenant_id, correlation_id, started_at)` — a `pub fn new(...)` constructor defined in the crate |
-| `FailedStepError` | Yes (struct) | Field access by name is stable; struct literal construction outside the crate is forbidden | Constructed via `FailedStepError::new(error_type, message, error_metadata)` |
-| `CompensationTrigger` | Yes (enum) | `match` must include a `_` catch-all arm | `match` must include a `_` catch-all arm |
-| `Context` | No | All 9 fields are stable; struct literal construction is used in tests | Constructed via `Context::from_invocation_record()`; test code uses struct literal syntax. Any field addition is a compile break at the mapping site — intentional, to force the `InvocationRecord → Context` mapping to stay in sync. |
-
-**Note on `Context`**: `Context` is not `#[non_exhaustive]` because
-`Context::from_invocation_record()` and test code use struct literal form.
-Adding or removing a field is a compile-breaking change at the mapping site,
-ensuring it stays in sync with `InvocationRecord`.
+**Lifetime.** An `InvocationSummary` exists only while the gear retains the run, which the tenant's
+retention policy governs. Past that point a query returns nothing and `get_invocation` reports the
+run as unknown; a run that aged out is indistinguishable from one that never existed. This crate
+neither defines nor extends the retention period, and holds no cache that would outlive it.
 
 ### 3.2 Component Model
 
-```mermaid
-graph TD
-    subgraph sdk["serverless-runtime-sdk (this crate)"]
-        lib["lib.rs (re-exports)"]
+One component. A contract crate has no internal structure worth modelling, and a component
+diagram of a single node communicates nothing.
 
-        subgraph domain_grp["Shared domain"]
-            dom["domain.rs\nInvocationRecord\nCompensationContext\nRuntimeErrorCategory\nRuntimeErrorPayload\nRetryPolicy\nTimelineEventType"]
-        end
+#### Consumer contract
 
-        subgraph traits_grp["Traits"]
-            adp["adapter.rs\nRuntimeAdapter\n(plugin impls, host calls)"]
-            rcl["runtime_client.rs\nServerlessRuntimeClient\n(host impls, plugin calls)"]
-            hdl["handler.rs\nFunctionHandler<I,O>\n(plugin impls wrapping user asset,\nplugin calls)"]
-            wfl["workflow.rs\nWorkflowHandler<I,O>\nCompensationInput\nCompensationTrigger\n(plugin impls wrapping user asset,\nplugin calls)"]
-        end
-
-        subgraph handler_author["Handler-author surface"]
-            ctx["context.rs\nContext"]
-            env["environment.rs\nEnvironment trait\nCredStoreEnvironment"]
-            err["error.rs\nServerlessSdkError"]
-            trc["trace.rs\ncall_instrumented\ncompensate_instrumented\n(plugin-only helper)"]
-        end
-    end
-
-    lib --> adp
-    lib --> rcl
-    lib --> dom
-    lib --> ctx
-    lib --> env
-    lib --> err
-    lib --> hdl
-    lib --> wfl
-    lib --> trc
-
-    adp --> dom
-    rcl --> dom
-    ctx --> dom
-    err --> dom
-    hdl --> ctx
-    hdl --> env
-    hdl --> err
-    wfl --> ctx
-    wfl --> env
-    wfl --> err
-    wfl --> hdl
-    trc --> ctx
-    trc --> env
-    trc --> err
-    trc --> hdl
-    trc --> wfl
-```
-
-**Dependency direction**: handler-author gears (`context`, `error`, `workflow`) depend on the shared domain where a projection exists (e.g., `Context` projects from `InvocationRecord`; `ServerlessSdkError` maps to `RuntimeErrorCategory`). `RuntimeAdapter` and `ServerlessRuntimeClient` do not depend on handler traits — the host can consume this crate through `RuntimeAdapter` + domain types alone without pulling in `FunctionHandler` definitions it never uses (though in practice `lib.rs` re-exports everything).
-
-#### context.rs — Context
-
-- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-component-context`
+- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-component-api`
 
 ##### Why this component exists
 
-Handlers need a stable, read-only view of their own invocation identity and execution
-constraints. `Context` provides exactly this without exposing the full `InvocationRecord`
-or any runtime internals.
+To give consuming gears a compile-time contract for running automation, so that no consumer
+depends on the `serverless-runtime` gear directly and none is coupled to an execution backend.
 
 ##### Responsibility scope
 
-Owns: `Context` struct (9 fields), `is_deadline_exceeded()`, `remaining_time()` helpers.
-Derives: `Debug`, `Clone`. `deadline: Option<std::time::Instant>` is `Copy`, so `Context`
-is cheaply cloneable for test construction. `is_deadline_exceeded()` and `remaining_time()`
-are marked `#[must_use]` — ignoring the return value is a logic error.
+Declares `ServerlessRuntimeClientV1`, the value types its methods exchange, the error type they
+raise, and a test double behind the `test-util` feature.
 
 ##### Responsibility boundaries
 
-Does not own: any mutable invocation state, status transitions, retry tracking, raw `params`
-(those come as typed `I` through the handler). Does not parse GTS chains.
-
----
-
-#### environment.rs — Environment
-
-- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-component-environment`
-
-##### Why this component exists
-
-Handlers need access to deployment configuration and secrets without coupling to
-async resolution inside handler logic. `Environment` is the minimal abstraction
-that satisfies this need synchronously.
-
-##### Responsibility scope
-
-Owns: `Environment` trait with `get_config` and `get_secret`, plus `CredStoreEnvironment`
-— the standard implementation backed by `CredStoreClientV1` that plugins instantiate
-before each invocation. Custom implementations remain possible for testing or non-standard
-secret sources.
-
-##### Responsibility boundaries
-
-Does not own: credstore plugin discovery or credential management (platform concern),
-secret caching beyond the per-invocation snapshot. `Environment` is a read-only
-snapshot, not a live proxy.
-
-**Design decision**: synchronous interface; SDK pre-fetches from credstore before invocation.
-
----
-
-#### error.rs — ServerlessSdkError
-
-- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-component-error`
-
-##### Why this component exists
-
-Handlers need to express failure semantics (business logic errors, invalid input, timeout,
-unsupported operations, internal failures) in a way that unambiguously maps to
-`RuntimeErrorCategory` without depending on runtime types.
-
-##### Responsibility scope
-
-Owns: `ServerlessSdkError` enum with 5 `#[non_exhaustive]` variants, each with documented
-`RuntimeErrorCategory` mapping. Derives: `Debug`. Implements `Display + std::error::Error`
-via `thiserror`. Does **not** derive `Clone` or `PartialEq` — error values are consumed at
-the adapter boundary and not compared or cloned in SDK code.
-
-##### Responsibility boundaries
-
-Does not own: `RuntimeErrorPayload` construction (adapter concern), error type GTS ID
-assignment (adapter concern), retry logic (runtime concern).
-
----
-
-#### handler.rs — Handler
-
-- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-component-handler`
-
-##### Why this component exists
-
-`FunctionHandler<I, O>` is the base callable contract. Every serverless function — stateless or
-durable — is a `FunctionHandler`. This is the SDK expression of
-`cpt-cf-serverless-runtime-principle-unified-function` and the GTS `function.v1~` base type.
-
-##### Responsibility scope
-
-Owns: `FunctionHandler<I, O>` async trait with `call` method. Declares `I: DeserializeOwned + Send + 'static`
-and `O: Serialize + Send + 'static` bounds. Requires `Self: Send + Sync + 'static`.
-
-The canonical adapter storage pattern is `Arc<dyn FunctionHandler<I, O> + Send + Sync>`: shared
-ownership across concurrent invocations on a multi-threaded async runtime. `Box<dyn FunctionHandler<I, O>>`
-is valid for single-owner dispatch but insufficient for shared registry storage.
-
-##### Responsibility boundaries
-
-Does not own: span emission (trace gear concern). Input deserialisation from raw JSON
-and output serialisation are performed by the plugin before/after calling the handler
-through `trace::call_instrumented`.
-
-**Design decision**: `async-trait` for stable `Send`-bound futures.
-
----
-
-#### workflow.rs — WorkflowHandler + CompensationInput
-
-- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-component-workflow`
-
-##### Why this component exists
-
-Durable workflows require compensation capability (saga pattern, BR-133). `WorkflowHandler`
-extends `FunctionHandler` with `compensate`, and `CompensationInput` provides the structured context
-that compensation handlers receive — expressing the function-level compensation layer without
-coupling to executor-specific step-level APIs.
-
-##### Responsibility scope
-
-Owns: `WorkflowHandler<I, O>` trait (extends `FunctionHandler<I, O>`) with `compensate` method.
-Owns `CompensationInput` struct (11 fields, all `#[non_exhaustive]`), `FailedStepError` struct,
-and `CompensationTrigger`
-enum (`Failure`, `Cancellation`, `#[non_exhaustive]`).
-
-##### Responsibility boundaries
-
-Does not own: step-level compensation (plugin concern — each plugin uses its backend's
-native compensation primitive: Temporal saga patterns, SQS DLQ + compensation queue,
-Azure Durable compensation activities, etc.), checkpoint creation (plugin concern —
-plugins write checkpoints using backend-native mechanisms; the SDK only reads checkpoint
-state during compensation via `CompensationInput.workflow_state_snapshot`), state
-machine transitions (`compensating` → `compensated` / `dead_lettered` — host concern,
-observed via the lightweight invocation index). Deserialisation of `CompensationInput`
-from the runtime's `CompensationContext` JSON is performed by the plugin before
-calling `trace::compensate_instrumented`.
-
-**Related**: `cpt-cf-serverless-runtime-sdk-component-handler`
-
-**Design decision**: structured type with named fields, not a generic handler input.
-
----
-
-#### trace.rs — Instrumentation Utilities
-
-- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-component-trace`
-
-##### Why this component exists
-
-The Serverless Runtime emits `InvocationTimelineEvent` records for every invocation.
-These must be driven from a consistent, centrally-defined location without SDK consumers
-adding any observability code. `trace.rs` is the sole location where `tracing` events
-are emitted, and it is intended for adapter use only.
-
-##### Responsibility scope
-
-Owns: `call_instrumented<H, I, O>` and `compensate_instrumented<H, I, O>` free functions.
-Each creates a named `tracing::info_span`, records optional `trace_id`/`span_id` fields
-lazily, and emits `started`/`succeeded`/`failed` or `compensation_*` lifecycle events
-that map to `TimelineEventType` variants.
-
-##### Responsibility boundaries
-
-Does not own: `tracing` subscriber setup (application/adapter concern), span export to
-OpenTelemetry (adapter/platform concern), structured log routing, metrics.
-
-##### Access control
-
-`trace.rs` is `pub` but is designated **adapter-only** by convention and documentation.
-No Rust visibility modifier prevents adapter authors from calling `call_instrumented` or
-`compensate_instrumented` directly; however, doing so would duplicate spans and emit
-incorrect lifecycle events (a second `started` event for an already-running invocation).
-
-The enforcement strategy is documentation and code review, not compiler enforcement.
-A future option is to gate `trace.rs` behind a `adapter` Cargo feature flag
-(disabled by default for function-author-facing builds); this is tracked as a
-known limitation and should be evaluated if SDK misuse is observed in practice.
-
-##### Span fields emitted
-
-| Field | Source | Notes |
-|-------|--------|-------|
-| `invocation_id` | `ctx.invocation_id` | Always present |
-| `function_id` | `ctx.function_id` | Always present |
-| `function_version` | `ctx.function_version` | `call_instrumented` only |
-| `tenant_id` | `ctx.tenant_id` | Always present |
-| `attempt_number` | `ctx.attempt_number` | Always present |
-| `correlation_id` | `ctx.correlation_id` | Always present |
-| `trace_id` | `ctx.trace_id` | Recorded lazily; absent if `None` |
-| `span_id` | `ctx.span_id` | Recorded lazily; absent if `None` |
-| `original_workflow_invocation_id` | `input.original_workflow_invocation_id` | `compensate_instrumented` only |
-| `compensation_trigger` | `input.trigger` | `compensate_instrumented` only |
-| `failed_step_id` | `input.failed_step_id` | `compensate_instrumented` only |
+Implements nothing. Validates nothing. Performs no I/O. Does not declare the plugin contract,
+the channel backends use to report progress, or anything else plugin-facing — those live in the
+plugin-facing SDK.
 
 ### 3.3 API Contracts
 
-#### FunctionHandler<I, O> Trait Contract
+- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-interface-client-v1`
 
-- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-interface-handler-trait`
+- **Technology**: Rust trait, `async-trait`, `dyn`-dispatched via `ClientHub`
+- **Stability**: unstable until 1.0 (PRD §3.1)
+- **Location**: `src/api.rs`
 
-- **Type**: Rust async trait (`#[async_trait]`)
-- **Technology**: `async-trait` 0.1
-- **Stability**: unstable (0.x)
+**Operations**
 
-```
-FunctionHandler<I, O>
-  where I: DeserializeOwned + Send + 'static
-        O: Serialize + Send + 'static
-  Self: Send + Sync + 'static
-  ─────────────────────────────────────────
-  async fn call(
-      &self,
-      ctx: &Context,
-      env: &dyn Environment,
-      input: I,
-  ) -> Result<O, ServerlessSdkError>
-```
+Every method takes `&SecurityContext` as its first argument, per platform convention.
 
-**Invariants**:
-- `ctx` is immutable for the duration of `call`.
-- `env` is populated before `call`; no async fetching inside. `get_config` and `get_secret`
-  return `Option<&str>` that borrows from `&self` — every `Environment` implementation must
-  own the string data (e.g., a `HashMap<String, String>`) and cannot lazily resolve values.
-- Returning `Ok(O)` maps to `InvocationStatus::Succeeded`.
-- Returning `Err(_)` maps to `InvocationStatus::Failed` (with retry if `Internal`).
+| Operation | Input | Returns |
+|---|---|---|
+| `invoke` | `InvokeRequest` | `InvocationOutcome` |
+| `get_invocation` | `&InvocationId` | `InvocationSummary` |
+| `list_invocations` | `&ODataQuery` | `Page<InvocationSummary>` |
+| `control_invocation` | `&InvocationId`, `ControlAction` | `()` |
+| `replay_invocation` | `&InvocationId` | `InvocationOutcome` |
 
-#### WorkflowHandler<I, O> Trait Contract
+`replay_invocation` is a distinct operation rather than a `ControlAction` because it produces a
+new invocation id, which a caller has no other way to obtain; the four control actions all act
+on the invocation they are given, so returning nothing is sufficient.
 
-- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-interface-workflow-trait`
+`Ok(())` from `control_invocation` means **accepted, not applied**. The gear routes the action to
+the plugin that owns the run, and two things sit between acceptance and an observable change:
+backends generally treat cancellation as cooperative, so a run winds down rather than stopping at
+once, and reads here are served from the gear's index, which the plugin updates by notification.
+A caller that needs to know the action took effect re-reads the run.
 
-- **Type**: Rust async trait (`#[async_trait]`), supertrait of `FunctionHandler<I, O>`
-- **Stability**: unstable (0.x)
+`list_invocations` takes `&ODataQuery` and returns `Page<T>` from `toolkit-odata`, the platform's
+standard filtering, sorting and cursor-paging model
+([OData, Pagination, Select, Filter](../../../../docs/toolkit_unified_system/07_odata_pagination_select_filter.md)).
+A tenant's invocation history grows without bound, so an unpaged list is not a viable surface;
+adopting the platform model rather than a local one also means the in-process query semantics are
+the same ones the gear's HTTP surface already exposes.
 
-```
-WorkflowHandler<I, O>: FunctionHandler<I, O>
-  ─────────────────────────────────────────
-  async fn compensate(
-      &self,
-      ctx: &Context,
-      env: &dyn Environment,
-      input: CompensationInput,
-  ) -> Result<(), ServerlessSdkError>
-```
+**Error contract**
 
-**Invariants**:
-- `compensate` may be called more than once for the same `original_workflow_invocation_id`;
-  implementations must be idempotent.
-- Returning `Err(_)` transitions the original invocation to `dead_lettered`.
+- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-interface-error`
+
+One enum, `ServerlessRuntimeError`. Each variant corresponds to exactly one problem type and
+HTTP status on the gear's REST surface, so in-process and over-HTTP behaviour agree. Gear error
+types below are relative to `gts.cf.core.sless.err.v1~cf.core.sless.err.…`.
+
+| Variant | Gear error type | HTTP | Source |
+|---|---|---|---|
+| `NotFound` | `not_found.v1~` | 404 | host DESIGN §Dry-Run validations |
+| `NotActive` | `not_active.v1~` | 409 | callable is draft, disabled or archived |
+| `InvalidInput` | `validation.v1~` | 422 | inputs fail the callable's schema |
+| `QuotaExceeded` | `quota_exceeded.v1~` | 429 | tenant concurrency exhausted |
+| `SyncSuspension { invocation_id }` | `sync_suspension.v1~` | 409 | a synchronous run reached a suspension point; the run stays suspended and the id reaches it |
+| `AccessDenied` | — † | 403 | caller not permitted |
+| `UnsupportedMode` | — † | 409 | the callable does not offer the requested invocation mode |
+| `UnsupportedControl` | — † | 409 | action does not apply — the run's state, or the callable's kind |
+| `NoPluginAvailable` | — † | 503 | no backend registered for the callable |
+| `ServiceUnavailable { retry_after }` | — † | 503 | backend registered but not accepting work |
+| `Internal` | — | 500 | unclassified |
+
+† Not enumerated by the gear's design. Tracked as gap G-01 in
+[`NEXT_ADR_SCOPE.md`](../../docs/NEXT_ADR_SCOPE.md) §3. Until it is closed, agreement between
+the in-process and HTTP paths is asserted for the five mapped variants only.
+
+`UnsupportedMode` refuses a request before anything runs, because the callable does not offer the
+mode asked for. It is not `SyncSuspension`, which concerns a run that already started and then
+reached a suspension point. The restriction is symmetric — `supported_invocations` can exclude
+either mode — so this is not specifically about synchronous calls.
+
+Per `cpt-cf-serverless-runtime-sdk-principle-refusal-vs-failure`, a callable that ran and failed
+is not represented here: it returns `Ok` with `status: Failed`.
 
 ### 3.4 Internal Dependencies
 
-| Dependency | Interface Used | Purpose |
-|------------|----------------|---------|
-| `serde` | `DeserializeOwned`, `Serialize` derives | `FunctionHandler` I/O type bounds |
-| `serde_json` | `serde_json::Value` | Opaque JSON fields in `CompensationInput` |
-| `thiserror` | `#[derive(thiserror::Error)]` | `ServerlessSdkError` `Display + Error` impl |
-| `async-trait` | `#[async_trait]` | Stable async fn in `FunctionHandler` and `WorkflowHandler` |
-| `tracing` | `info_span!`, `info!`, `error!`, `Instrument` | Timeline event emission in `trace.rs` only |
+The complete set. Every entry is an existing workspace dependency, and each is here because the
+contract cannot express something without it — not for convenience.
 
-**Dependency Rules**:
-- No circular dependencies (this is a leaf library).
-- No cross-gear type imports except through `lib.rs` re-exports.
-- `trace.rs` may import from all other gears but no other gear imports from `trace.rs`.
+| Dependency | Provides | Why not avoidable |
+|---|---|---|
+| `toolkit-security` | `SecurityContext` | Caller identity must cross the boundary as the platform's own type; a local copy would not interoperate. |
+| `toolkit-odata` | `ODataQuery`, `Page<T>` | The platform's filtering, sorting and cursor-paging model. A tenant's invocation history is unbounded, so listing requires paging. |
+| `async-trait` | `async fn` in a `dyn`-dispatched trait | Required while the trait is object-safe and `dyn`-dispatched. |
+| `serde_json` | The `params` and `result` payloads | A callable's inputs and outputs are arbitrary JSON, validated by the gear against the callable's schema. The SDK carries them opaquely and cannot narrow the type. |
+| `time` | Timestamps on `InvocationSummary` | Matches the gear's own `OffsetDateTime` timestamps; converting to a local representation would lose the platform's offset handling. |
+| `serde` | Derives on the value types | Consumers serialise these types at their own boundaries (their REST responses, their stored state). Requiring each to write conversions would defeat the purpose of a shared contract. |
+| `thiserror` | The error type's `std::error::Error` implementation | Consumers propagate this error through their own error types, which requires a `source` chain and a `Display` implementation. |
+
+None of these ties the crate to an execution technology, so
+`cpt-cf-serverless-runtime-sdk-nfr-engine-neutrality` holds. There is no dependency on the
+`serverless-runtime` gear, on any runtime plugin, or on the plugin-facing SDK.
+
+That last exclusion has a consequence worth stating. Two types appear on both this surface and the
+plugin-facing one — `InvocationId` and `InvocationStatus` — and since neither SDK may depend on the
+other, this crate declares its own. They are not copies kept in step by convention: `InvocationStatus`
+mirrors the GTS type `gts.cf.core.sless.status.v1~`, and that schema is the contract. This crate's
+mirror is verified against the schema, as the plugin SDK's must be — each answers to the schema
+rather than to the other.
 
 ### 3.5 External Dependencies
 
-This crate has no external system dependencies (no HTTP, no database, no message broker).
-All external integration happens through plugin crates that depend on this crate.
-
-**Scope note — in-process runtime helper crate.** In-process runtimes that lack native
-durable timers, event signals, or checkpointing (Starlark, a potential WASM backend)
-will consume a separate plugin-level helper crate that provides those primitives. That
-helper crate is **not** part of this SDK: it is a plugin-side dependency pulled in by
-the plugins that need it (and only by those plugins), scoping the complexity to where
-it is actually used instead of forcing every plugin to route through a runtime-neutral
-substrate. This SDK remains minimal and engine-agnostic; plugins with backend-native
-primitives (Temporal, cloud FaaS, Azure Durable) never touch the helper crate.
+None. The crate reaches no database, service, queue or external system. Everything it declares
+is resolved in-process.
 
 ### 3.6 Interactions & Sequences
 
-#### FunctionHandler Invocation Flow
+The crate contributes no runtime behaviour, so there is nothing to sequence inside it. The one
+interaction worth recording is how a consumer reaches the implementation, because it is the
+reason the crate exists: the dependency is on the contract, never on the gear.
 
-**ID**: `cpt-cf-serverless-runtime-sdk-seq-handler-call`
+#### Starting a callable from a consuming gear
 
-**Use cases**: `cpt-cf-serverless-runtime-sdk-usecase-impl-handler`
-
-The host dispatches to a plugin through `RuntimeAdapter::execute`; the plugin is responsible for deserialising `params`, constructing `Context`, populating `Environment`, invoking the user handler via `trace::call_instrumented`, and emitting the result back to the host. Each plugin implements this bridge using its backend's native primitives; this SDK provides only the traits and helpers the plugin uses.
-
-```mermaid
-sequenceDiagram
-    participant R as Serverless Runtime host
-    participant A as Plugin (impl RuntimeAdapter)
-    participant T as trace::call_instrumented (this SDK)
-    participant H as FunctionHandler<I,O> impl (user code)
-
-    R->>A: RuntimeAdapter::execute(InvocationRecord)
-    A->>A: deserialise params JSON → I
-    A->>A: Context::from_invocation_record(record)
-    A->>A: resolve Environment (e.g. CredStoreEnvironment)
-    A->>A: resolve handler instance
-    A->>T: call_instrumented(handler, &ctx, &env, input)
-    T->>T: create span "serverless.handler.call"
-    T->>T: emit timeline event "started"
-    T->>H: call(&ctx, &env, input)
-    H-->>T: Result<O, ServerlessSdkError>
-    T->>T: emit "succeeded" | "failed"
-    T-->>A: Result<O, ServerlessSdkError>
-    A->>A: serialise O → JSON or map Err → RuntimeErrorPayload
-    A->>R: ServerlessRuntimeClient index update (status, error summary)
-    A-->>R: InvocationResult
-```
-
-#### Compensation Flow
-
-**ID**: `cpt-cf-serverless-runtime-sdk-seq-compensate`
-
-**Use cases**: `cpt-cf-serverless-runtime-sdk-usecase-impl-compensation`
+- [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-seq-invoke`
 
 ```mermaid
 sequenceDiagram
-    participant R as Serverless Runtime host
-    participant A as Plugin (impl RuntimeAdapter)
-    participant T as trace::compensate_instrumented (this SDK)
-    participant W as WorkflowHandler<I,O> impl (user code)
+    participant C as Consuming gear
+    participant H as ClientHub
+    participant G as serverless-runtime gear
+    participant P as Runtime plugin
 
-    R->>A: RuntimeAdapter::execute(compensation InvocationRecord)
-    note over A: trigger="failure"|"cancellation"
-    A->>A: deserialise params JSON → CompensationInput
-    A->>A: construct Context, populate Environment
-    A->>A: resolve handler instance
-    A->>T: compensate_instrumented(handler, &ctx, &env, input)
-    T->>T: create span "serverless.handler.compensate"
-    T->>T: emit "compensation_started"
-    T->>W: compensate(&ctx, &env, input)
-    W->>W: idempotency guard on original_workflow_invocation_id
-    W->>W: perform rollback using workflow_state_snapshot
-    W-->>T: Result<(), ServerlessSdkError>
-    T->>T: emit "compensation_completed" | "compensation_failed"
-    T-->>A: Result<(), ServerlessSdkError>
-    A->>R: ServerlessRuntimeClient index update (compensated | dead_lettered)
+    G->>H: register implementation (during gear init)
+    C->>H: resolve ServerlessRuntimeClientV1
+    H-->>C: &dyn ServerlessRuntimeClientV1
+    C->>G: invoke(ctx, InvokeRequest)
+    Note over G: authorise, scope to tenant, validate<br/>inputs, apply quota, dedupe, audit
+    G->>P: dispatch to the callable's backend
+    P-->>G: accepted / result
+    G-->>C: InvocationOutcome
 ```
 
-**Note on uniform semantics**: because each plugin owns its own invocation bridge, this SDK does not centralise a `dispatch_invocation` helper. Uniform user-visible semantics are enforced through two layers in this SDK: (1) the typed contracts — trait shapes, `ServerlessSdkError` → `RuntimeErrorCategory` mapping, and the `trace::*_instrumented` event taxonomy; and (2) the **adapter conformance test suite** shipped with this SDK, which every plugin runs against its `RuntimeAdapter` implementation. The suite covers invocation status transitions, retry semantics, compensation triggering, suspension/resume visibility, and error taxonomy, per `cpt-cf-serverless-runtime-sdk-fr-conformance-suite` (see PRD §5.7) and `cpt-cf-serverless-runtime-adr-thin-host`.
+Note that this crate appears nowhere in the call path — it supplies the type `C` names and the
+type `G` implements, and nothing else. A refusal at the `Note over G` step returns
+`ServerlessRuntimeError` and never reaches the plugin.
 
-### 3.7 Testability Architecture
+### 3.7 Database schemas & tables
 
-The trait-based design ensures all components are independently testable without adapter
-infrastructure.
+None. The crate owns no persistence and defines no schema. Runs are recorded by the
+`serverless-runtime` gear in its invocation index, and full execution state belongs to the
+executing backend; both are outside this crate
+(host `cpt-cf-serverless-runtime-adr-thin-host`).
 
-**Mock boundaries:**
+## 4. Additional context
 
-| Boundary | Test Double | Notes |
-|----------|-------------|-------|
-| `Environment` trait | Any `HashMap<String, String>`-backed impl for unit tests; `CredStoreEnvironment` for integration tests | Unit tests need no credstore; integration tests use the standard impl |
-| `FunctionHandler<I, O>` | Direct invocation: `handler.call(&ctx, &env, input).await` | No adapter, no spawned tasks |
-| `WorkflowHandler<I, O>` | Direct invocation: `handler.compensate(&ctx, &env, input).await` | Test idempotency with identical `original_workflow_invocation_id` |
-| `Context` | Fully constructible in tests; set `deadline` to a past `Instant` to test expired-deadline paths | No runtime infrastructure |
-| `trace.rs` | Any `tracing::Subscriber` (e.g., `tracing-subscriber` with test collector) | No SDK-specific subscriber |
+**Test double.** The `test-util` feature exposes an implementation of the trait that a consuming
+gear can drive from its own unit tests without a Serverless Runtime present. It is gated behind a
+feature so that it is absent from production builds and costs nothing for consumers that do not
+enable it. `test-util` is the crate's only feature: with nothing plugin-facing left in the crate,
+there is no audience left to gate.
 
-**Test isolation approach:** Each gear (`context.rs`, `environment.rs`, `error.rs`,
-`handler.rs`, `workflow.rs`, `trace.rs`) is independently testable; no shared mutable
-state across invocations. All SDK types are `Send + Sync`, compatible with parallel test runners.
+**Naming.** `callable_id`, not `function_id` — mandated for the SDK models by host
+`cpt-cf-serverless-runtime-adr-callable-type-hierarchy` because the field accepts workflows too.
 
-**Testing strategy:**
+**Open, inherited from the gear.** Four questions in the `serverless-runtime` gear's own
+documentation reach into this contract. All are tracked in
+[`NEXT_ADR_SCOPE.md`](../../docs/NEXT_ADR_SCOPE.md) §3. This SDK forwards the gear's behaviour and
+does not invent answers, so each leaves something here provisional:
 
-| Level | Approach | Scope |
-|-------|----------|-------|
-| Unit | Per-gear tests with HashMap-backed `Environment` mock and minimal `Context` | Trait compilation, error variant mapping, deadline helper behavior |
-| Integration | Compile-only test: `impl FunctionHandler` + `impl WorkflowHandler` without any adapter crate | Verifies API contract compiles on stable 1.92.0 |
-| Performance | Code review: verify `call_instrumented` introduces no blocking I/O or extra heap allocations | Verifies `nfr-low-overhead` threshold (one `Box<dyn Future>` + one span) |
+| Gap | What it blocks here |
+|---|---|
+| G-01 | Five error variants — `AccessDenied`, `UnsupportedMode`, `UnsupportedControl`, `NoPluginAvailable`, `ServiceUnavailable` — have no gear error type to map onto, so refusal parity (§3.3) is proven for the other five only. |
+| G-02 | Whether `Retry` mints a new invocation id. If it does, it is not an in-place intervention: it leaves `ControlAction` and joins `replay_invocation`, changing the trait's shape. |
+| G-05 | A deduplicated request cannot be distinguished from a freshly started one. `InvocationOutcome.cached` covers the response-cache path only; the gear specifies no response shape for deduplication. Adding that distinction later means adding a field or replacing `cached` with an origin discriminator. The deduplication key's scope is also unspecified — the gear defines a key tuple for response caching but only a time window for deduplication — so what makes two requests "the same" is not something this crate can document. |
+| G-06 | Whether `Failed` and `Canceled` mean the run has finished. Seven of the nine states can be classified; these two are contradicted between the gear's state machine and its prose, so no terminal/success classification is published here yet. |
+| G-07 | Who assigns the invocation id, and whether duplicate suppression actually works. Dedup runs before the id exists, so two concurrent requests carrying the same key can both start a run — the case `fr-idempotency` exists to prevent. |
+| G-08 | Whether a run can be read immediately after starting it. Nothing orders the first status notification before `invoke` returns, so `usecase-start-async`'s postcondition is not guaranteed by the protocol. |
+| G-09 | Whether what a read returns is current. Status notifications carry no ordering or identity and are retried on timeout, so a run can appear to move backwards; a lost one leaves the record wrong permanently, with no resync path. Every read in this crate is served from that record. |
 
-### Database schemas & tables
+Until all four close, the surface in §3.3 is a draft and can still change in ways that break
+callers. `InvocationOutcome` and `ControlAction` are the two types most likely to move.
 
-**Not applicable.** This crate is a pure Rust library with no database, no persistence layer,
-and no schema definitions. There are no SQL or NoSQL schemas, no ORM entities, and no
-migration files owned by this gear. All data structures are in-memory Rust types
-defined in §3.1 (Domain Model).
+**Deliberate omissions.** Design concerns the project's review covers but this document does not
+address, each for a stated reason rather than by oversight:
 
-### 3.8 Capacity, Cost, and Deployment Exclusions
+| Concern | Why absent |
+|---|---|
+| Performance and scaling design | No runtime behaviour to tune. The crate adds nothing to a call path (§3.6); throughput and concurrency are bounded by the gear's tenant quotas. |
+| Caching design | Deliberately none. The gear owns response caching; a cache here would be a second source of truth for run state, and would outlive the retention window the gear enforces (§3.1). |
+| Resilience design — retry, timeout, circuit breaking, bulkheads | Would be meaningless: a call is an in-process function call, so there is no channel to fail. Retry of a *callable* is the backend's, and this crate deliberately does not drive it (PRD §4.2). |
+| Concurrency and state management | The crate holds no state, spawns no task and owns no lock. Thread-safety is expressed by the trait's `Send + Sync` bound and nothing more. |
+| Persistence, schema and migration design | Owns no persistence (§3.7). |
+| Deployment topology, configuration and rollout | Compiled into its consumers; there is no deployable unit, no configuration surface and no independent release to roll out beyond crate versioning (§3.3). |
+| Observability design — logging, metrics, tracing | Emits none, by design: as a contract compiled into every consumer, anything it emitted would appear in whichever gear's telemetry the caller owns. Correlation and trace propagation are carried in `SecurityContext` and handled by the gear. |
+| Authentication and authorization design | Neither is decided here. The crate transports an established identity; the gear authorises each request and this crate reports the refusal (§3.3). |
+| GTS design | Introduces no GTS identifier, schema, well-known instance, trait or registry entry. Type identifiers are carried as opaque strings (§2.1) and every schema they name belongs to the gear. `guidelines/GTS.md` therefore does not apply. |
+| Multi-tenancy design | Tenant scoping is applied by the gear. The crate carries the tenant in `SecurityContext` and surfaces it on `InvocationSummary`; it makes no isolation decision. |
+| Internationalisation, accessibility, user interface | No human interface (PRD §6.2). |
 
-The following capacity and cost planning domains are not applicable to this design and are
-explicitly excluded:
+## 5. Traceability
 
-| Domain | Disposition | Reasoning |
-|--------|-------------|-----------|
-| Capacity planning | N/A | Pure library crate; no runtime process, no user-facing endpoints, no data storage. Capacity is entirely determined by the consuming adapter and its runtime. |
-| Cost estimation / budgeting | N/A | Pure library crate; no infrastructure provisioned, no compute resources allocated by this crate. Cost is an adapter/platform concern. |
-| Deployment topology | N/A | Library crate with no deployment artifact; distributed as a Cargo crate, consumed at compile time. |
-
----
-
-## 4. Additional Context
-
-### Relationship to the Serverless Runtime Design
-
-This crate is the single shared SDK of the serverless-runtime gear. It owns both:
-
-- **Shared domain types** (`InvocationRecord`, `CompensationContext`, `RuntimeErrorCategory`,
-  `RuntimeErrorPayload`, `RetryPolicy`, `TimelineEventType`): these types live in this SDK
-  crate so host and plugins share a single compile-time definition without the host
-  depending on any plugin crate. `RetryPolicy` is platform-defined (max attempts, backoff,
-  non-retryable error classification) and exported from this crate so every plugin honours
-  it consistently; plugins *apply* it using their backend's engine-native retry mechanism.
-  See the gear-level [DESIGN.md](../../docs/DESIGN.md) for how these types are consumed
-  by the host (registry, lightweight invocation index, etc.).
-- **Projections used by handler code**:
-  - `Context` is a projection of `InvocationRecord`.
-  - `CompensationInput` is a projection of `CompensationContext`
-    (`gts.cf.core.sless.compensation_context.v1~`).
-  - `ServerlessSdkError` variants map to `RuntimeErrorCategory` values (see §3.1).
-  - `trace.rs` timeline events correspond to `TimelineEventType` values.
-
-Dependency direction:
-
-```
-host crate (serverless-runtime) ──► this SDK
-plugin crate (<backend>-plugin)  ──► this SDK
-                                       ▲
-user handler crate (optional) ─────────┘ (via FunctionHandler / WorkflowHandler traits)
-```
-
-Each plugin is responsible for constructing the deterministic field mappings between
-its backend-native record types and the shared domain types exported by this SDK.
-This crate provides the *target* types and the trait surface; it does not provide a
-central dispatch helper — each plugin bridges its backend's invocation primitive to
-`FunctionHandler::call` using `trace::call_instrumented` as the single uniform
-instrumentation point.
-
-### Comparison with Similar Solutions
-
-| Solution | Handler model | Context model | Error model | Compensation |
-|----------|---------------|---------------|-------------|--------------|
-| **This crate** | `async trait FunctionHandler<I, O>` + `WorkflowHandler<I, O>: FunctionHandler<I, O>` | Concrete `Context` struct (platform-owned fields) | `#[non_exhaustive]` enum → `RuntimeErrorCategory` | `WorkflowHandler::compensate` (structured `CompensationInput`) |
-| AWS Lambda Rust Runtime | `fn handler(event: E, ctx: Context) -> Result<R, E>` free-function or `tower::Service` | Concrete `lambda_runtime::Context` struct | `Box<dyn Error>` — opaque, no retry category | None — compensation is application-level |
-| Temporal Rust SDK | `#[workflow]` proc-macro on async fn; activities as `#[activity]` async fn | `workflow::Context` injected via proc-macro | `ApplicationError` with explicit `non_retryable` flag | Step-level rollback via custom activity sequencing; no first-class saga trait |
-| Cloudflare Workers (Rust via wasm) | `#[event(fetch)]` on async fn; `Request`/`Response` types | `Env` struct for bindings | `worker::Error` enum | None |
-| Apache OpenWhisk Rust | Free function `fn main(args: Value) -> Value`; no trait | No context; caller metadata in args JSON | Return value discrimination (error key in JSON) | None |
-
-**Key differentiators of this crate:**
-
-- **Typed `RuntimeErrorCategory` mapping**: Unlike Lambda's opaque `Box<dyn Error>` or
-  OpenWhisk's JSON key convention, `ServerlessSdkError` variants map deterministically to
-  retry categories — the platform can make correct retry decisions without runtime inspection.
-- **First-class compensation trait**: Unlike Temporal's SDK (which handles saga rollback
-  via activity sequencing in the workflow body) or Lambda (no compensation concept),
-  `WorkflowHandler::compensate` is a first-class, compiler-enforced obligation on every
-  durable workflow.
-- **No proc-macros, no code generation**: Unlike Temporal's `#[workflow]` / `#[activity]`
-  macros, this crate uses plain traits and `#[async_trait]`. Adapter developers implement
-  traits directly; no hidden code generation.
-- **Adapter-agnostic by construction**: Unlike Lambda's SDK (AWS-specific) or Workers
-  (Cloudflare-specific), this crate has no runtime-specific dependency; the same
-  `FunctionHandler` implementation can run on any adapter without modification.
-
-### Known Technical Debt
-
-| Item | Nature | Migration Path |
-|------|--------|----------------|
-| `async-trait` dependency | One heap allocation (`Box<dyn Future>`) per `call`/`compensate` invocation; extra `#[async_trait]` annotation required on every `impl` block | Remove when native `async fn` in traits (RPITIT — Return Position `impl Trait` In Traits) supports `Send`-bounded futures ergonomically on stable Rust. Migration is backward-compatible at the trait level. |
-
-### Crate Naming Convention
-
-| Artifact | Value |
-|----------|-------|
-| Directory | `gears/serverless-runtime/serverless-sdk/` (a rename to `serverless-runtime-sdk/` for consistency with the crate/package name is deferred) |
-| Package name | `serverless-runtime-sdk` |
-| Lib name | `serverless_runtime_sdk` |
-| Import | `use serverless_runtime_sdk::...` |
-
----
-
-## 5. Non-Applicable Domains
-
-The following checklist domains are not applicable to this DESIGN. Absence of content
-in these areas is deliberate, not an omission.
-
-| Domain | Checklist Item | Disposition | Reasoning |
-|--------|---------------|-------------|-----------|
-| SEC — Authentication | SEC-DESIGN-001 | N/A | No user sessions, no HTTP endpoints, no credential management at the SDK layer. |
-| SEC — Authorization | SEC-DESIGN-002 | N/A | No permission model; all actors are trusted internal platform developers. |
-| SEC — Data Protection | SEC-DESIGN-003 | N/A | SDK passes data as opaque blobs (`I`, `O`, `serde_json::Value`); no PII stored or transmitted. |
-| SEC — Security Boundaries | SEC-DESIGN-004 | N/A | Pure library; no network boundary, no process boundary, no trust zone separation required. |
-| SEC — Threat Modeling | SEC-DESIGN-005 | N/A | Pure library with no attack surface; no network exposure, no credential management, no data storage. |
-| SEC — Audit Logging | SEC-DESIGN-006 | Addressed via §3.2 `component-trace` | Invocation lifecycle tracing events are emitted by `trace.rs`; security audit beyond invocation events is adapter/runtime concern. |
-| DATA — Data Stores | DATA-DESIGN-001 | N/A | No data stores; all state is in-memory per invocation. See `Database schemas & tables` in §3. |
-| DATA — Data Integrity | DATA-DESIGN-002 | N/A | No persistent data; no referential integrity requirements. Values are passed through as opaque blobs. |
-| DATA — Data Governance | DATA-DESIGN-003 | N/A | No data ownership, stewardship, or retention; data classification is the adapter/runtime concern. |
-| OPS — Deployment Topology | OPS-DESIGN-001 | N/A | Library crate with no deployment artifact. See §3.8. |
-| OPS — IaC | OPS-DESIGN-003 | N/A | No infrastructure provisioned by this crate; no Terraform, K8s, Docker, or CI/CD resources owned here. |
-| OPS — SLO Targets | OPS-DESIGN-004 | N/A | Library crate; no uptime SLO. Per-invocation overhead is bounded by `nfr-low-overhead` (§1.2), not an SLO. |
-| COMPL — Regulatory Requirements | COMPL-DESIGN-001 | N/A | Internal Rust library; no GDPR, HIPAA, PCI DSS, or other regulatory obligations. |
-| COMPL — Privacy by Design | COMPL-DESIGN-002 | N/A | Internal developer tooling; no end-user data collection, no PII flows. |
-| UX — User-Facing Architecture | UX-DESIGN-001 | N/A | No end-user UI; developer SDK only. Developer ergonomics addressed via trait design and `nfr-api-docs`. |
-| PERF — Performance Architecture | PERF-DESIGN-001–004 | N/A | Pure library with no runtime process, database, or network I/O. Per-invocation overhead bounded by `nfr-low-overhead` (§1.2 NFR Allocation); caching, scalability, and resource pooling are adapter/runtime concerns. |
-| REL — Error Handling | REL-DESIGN-002 | Addressed via §3.1, §3.3 | Error classification (`ServerlessSdkError` → `RuntimeErrorCategory` mapping) and dead-letter routing documented in §3.1 error mapping table and §3.3 trait contract invariants. |
-| REL — Data Consistency / Saga | REL-DESIGN-003 | Addressed via §3.2, §3.3 | Compensating transaction pattern documented in `component-workflow`; idempotency invariant stated in `WorkflowHandler` contract (§3.3). |
-| REL — Fault Tolerance, Recovery, Resilience | REL-DESIGN-001, 004, 005 | N/A | Pure library; no infrastructure to make fault-tolerant or recover. Retry policies, failover, and circuit breakers are runtime/adapter concerns. |
-| INT — Integration Architecture | INT-DESIGN-001, 003, 004 | N/A | No external system integrations, event buses, or API gateway. Adapter contract integration documented in §3.3 and §3.5. |
-| INT — External System Integration | INT-DESIGN-002 | Addressed via §3.5 | This crate has no external system dependencies; all external integration happens through adapter crates (§3.5). |
-
----
-
-## 6. Traceability
-
-- **PRD**: [PRD.md](./PRD.md)
-- **Source**: [serverless-runtime-sdk/src/](../src/)
-- **Serverless Runtime DESIGN**: [gears/serverless-runtime/docs/DESIGN.md](../../docs/DESIGN.md)
-- **Serverless Runtime Rust Types**: [gears/serverless-runtime/docs/DESIGN_RUST_TYPES.md](../../docs/DESIGN_RUST_TYPES.md)
+- **Requirements**: [PRD.md](./PRD.md)
+- **ADRs**: none of this crate's own yet; host ADRs are referenced inline above
+- **Decomposition**: [DECOMPOSITION.md](./DECOMPOSITION.md)
+- **Feature artifacts**: intentionally deferred until the decomposition is accepted
+- **Gear design**: [`../../docs/DESIGN.md`](../../docs/DESIGN.md),
+  [`../../docs/DESIGN_RUST_TYPES.md`](../../docs/DESIGN_RUST_TYPES.md)
+- **Plugin contract**: owned by a separate plugin-facing SDK, not yet designed. Intentionally
+  not linked from here: nothing about its shape is settled, so a reference would imply a contract
+  that does not exist.
