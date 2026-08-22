@@ -15,7 +15,6 @@ use bss_ledger::infra::posting::period::{FiscalPeriodGuard, PeriodError};
 use bss_ledger::infra::storage::migrations::Migrator;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
@@ -27,7 +26,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn pin_open_admits_open_rejects_closed_and_missing() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

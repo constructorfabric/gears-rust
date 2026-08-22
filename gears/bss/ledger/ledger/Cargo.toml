@@ -121,6 +121,7 @@ types-registry-sdk = { workspace = true, features = ["test-util"] }
 # `testcontainers` crate is not a direct dep. Raw SQL in tests goes through
 # sea-orm `Statement`, not `sqlx` directly.
 testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }
 # `tower::ServiceExt` provides `.oneshot(...)` for the REST router tests.
 tower = { workspace = true }
 # TODO(broker): `jsonschema` validated event payloads against their vendored

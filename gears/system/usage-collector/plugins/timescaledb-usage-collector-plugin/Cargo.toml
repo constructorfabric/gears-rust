@@ -73,6 +73,7 @@ inventory = { workspace = true }
 tokio = { workspace = true }
 # Unconditional: [dev-dependencies] can't be optional; usage is #![cfg(feature="postgres")]-gated.
 testcontainers = { workspace = true }
+test-containers = { workspace = true }
 # In-memory metric reader for the metrics-recording unit tests; the `testing`
 # feature gates `InMemoryMetricExporter`.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

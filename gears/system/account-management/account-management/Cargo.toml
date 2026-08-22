@@ -118,3 +118,4 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # not require Docker.
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }

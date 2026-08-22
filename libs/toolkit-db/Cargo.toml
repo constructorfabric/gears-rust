@@ -135,6 +135,7 @@ toolkit-utils = { workspace = true, features = ["serde"] }
 serde-saphyr = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 anyhow = { workspace = true }
 temp-env = { workspace = true }

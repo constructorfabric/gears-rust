@@ -168,9 +168,11 @@ Before this turn, `leader_conformance` was missing entirely — only the cache a
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
+// Image tags are pinned workspace-wide in `libs/test-containers`; never call
+// `Postgres::default()` here (see /docs/TESTING.md §4.4).
+
 pub async fn start_postgres() -> (ContainerAsync<Postgres>, PostgresClusterConfig) {
-    let container = Postgres::default()
-        .with_db_name("cluster_test")
+    let container = test_containers::postgres_named("cluster_test")
         .start()
         .await
         .expect("Postgres container starts");
@@ -190,8 +192,7 @@ pub async fn start_postgres() -> (ContainerAsync<Postgres>, PostgresClusterConfi
 /// Same container, but returns `PostgresLockConfig` (§3.5 DESIGN.md) for tests
 /// exercising the standalone lock-only provider path.
 pub async fn start_postgres_lock_only() -> (ContainerAsync<Postgres>, PostgresLockConfig) {
-    let container = Postgres::default()
-        .with_db_name("cluster_test")
+    let container = test_containers::postgres_named("cluster_test")
         .start()
         .await
         .expect("Postgres container starts");

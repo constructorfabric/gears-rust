@@ -32,7 +32,6 @@ use bss_ledger::infra::authz::cross_tenant::{CrossTenantGateway, TargetScope};
 use bss_ledger::infra::storage::migrations::Migrator;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -68,7 +67,7 @@ async fn setup(container_url: &str) -> (DatabaseConnection, DBProvider<DbError>)
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn routine_resolve_writes_no_record_returns_home_scope() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -114,7 +113,7 @@ async fn routine_resolve_writes_no_record_returns_home_scope() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_tenant_resolve_writes_record_returns_target_scope() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -198,7 +197,7 @@ async fn cross_tenant_resolve_writes_record_returns_target_scope() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_tenant_resolve_without_reason_is_rejected_no_record() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -245,7 +244,7 @@ async fn cross_tenant_resolve_without_reason_is_rejected_no_record() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_tenant_resolve_without_role_is_denied_no_record() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;
@@ -292,7 +291,7 @@ async fn cross_tenant_resolve_without_role_is_denied_no_record() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn audit_retrieval_and_tamper_status_reads() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider) = setup(&url).await;

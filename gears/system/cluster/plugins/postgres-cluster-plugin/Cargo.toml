@@ -100,6 +100,7 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 
 [dev-dependencies]
+test-containers = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # `pg_spec_006` reads the `cluster_postgres_lock_active_names` gauge back through
 # an in-process OTel reader (`InMemoryMetricExporter`, gated by the `testing`

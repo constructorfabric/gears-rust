@@ -53,3 +53,4 @@ tokio = { workspace = true, features = [
   "sync",
 ] }
 testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }

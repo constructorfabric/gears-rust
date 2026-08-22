@@ -72,7 +72,7 @@ use resource_group::infra::storage::type_repo::TypeRepository;
 use resource_group_sdk::{CreateTypeRequest, UpdateTypeRequest};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use sea_orm_migration::MigratorTrait;
-use testcontainers::{ContainerRequest, ImageExt, runners::AsyncRunner};
+use testcontainers::{ImageExt, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres;
 use toolkit_db::secure::{SecureEntityExt, secure_insert};
 use toolkit_db::{
@@ -107,11 +107,9 @@ fn require_docker() -> bool {
 /// graceful skip. Skipping is right locally, but wrong in CI, where a broken
 /// daemon would otherwise pass vacuously -- `RG_PG_REQUIRE_DOCKER=1` panics.
 async fn pg_fixture() -> Option<PgFixture> {
-    // testcontainers-modules' Postgres image defaults to "11-alpine", which
-    // predates gen_random_uuid() becoming a built-in (PG13+) -- RG's
-    // migrations use it, so pin a modern tag.
-    let request = ContainerRequest::from(Postgres::default())
-        .with_tag("16-alpine")
+    // No local tag override: the workspace floor is now PG 18, well past the
+    // PG13 that made gen_random_uuid() built-in (RG's migrations use it).
+    let request = test_containers::postgres()
         .with_env_var("POSTGRES_PASSWORD", "pass")
         .with_env_var("POSTGRES_USER", "user")
         .with_env_var("POSTGRES_DB", "app");

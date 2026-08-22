@@ -126,6 +126,37 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # Static gate, no toolchain needed: database image tags are pinned in
+      # libs/test-containers (docs/TESTING.md 4.4). A fixture calling the
+      # upstream default constructors, or naming an image inline, re-introduces
+      # the transitive pin through Cargo.lock that issue #4616 removed.
+      #
+      # This is a grep, not a Rust parser, so it cannot catch every way to
+      # write the same call — e.g. renaming the import and calling the local
+      # name instead. The second check below closes that one gap: nothing in
+      # this workspace has a legitimate reason to rename `Postgres`/`Mysql`
+      # on import, so the rename itself is treated as the violation.
+      - name: No unpinned database container images
+        run: |
+          if hits=$(grep -rnE \
+              'Postgres[[:space:]]*::[[:space:]]*default[[:space:]]*\([[:space:]]*\)|Mysql[[:space:]]*::[[:space:]]*default[[:space:]]*\([[:space:]]*\)|GenericImage[[:space:]]*::[[:space:]]*new[[:space:]]*\([[:space:]]*"(mariadb|timescale/timescaledb)"' \
+              --include='*.rs' . \
+              | grep -v '/target/' \
+              | grep -v 'libs/test-containers/'); then
+            echo "::error::Database images must come from libs/test-containers (see docs/TESTING.md 4.4)."
+            echo "$hits"
+            exit 1
+          fi
+          if hits=$(grep -rnE \
+              'Postgres[[:space:]]+as[[:space:]]+[A-Za-z_][A-Za-z0-9_]*|Mysql[[:space:]]+as[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' \
+              --include='*.rs' . \
+              | grep -v '/target/' \
+              | grep -v 'libs/test-containers/'); then
+            echo "::error::Do not rename Postgres/Mysql on import -- it defeats the grep guard above (see docs/TESTING.md 4.4)."
+            echo "$hits"
+            exit 1
+          fi
+
       - name: Install protoc
         uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:

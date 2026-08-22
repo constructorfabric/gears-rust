@@ -69,13 +69,15 @@ def skip_without_docker() -> None:
 class TimescaleDbSidecar:
     """A throwaway TimescaleDB container with a dynamically mapped host port.
 
-    Keep IMAGE in sync with the Rust plugin integration tests:
-    gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/tests/common/mod.rs
-    A skew between the two means the plugin's migrations are validated against
-    a different PostgreSQL major than E2E runs.
+    Keep IMAGE in sync with TIMESCALEDB_IMAGE / TIMESCALEDB_TAG in
+    libs/test-containers/src/lib.rs, which is where the Rust side pins every
+    database image. A skew means the plugin's migrations are validated against
+    a different PostgreSQL major than E2E runs; the Rust test
+    `e2e_sidecar_pins_the_same_timescaledb_image` fails the build if this
+    literal drifts from the constants.
     """
 
-    IMAGE = "timescale/timescaledb:2.17.2-pg16"
+    IMAGE = "timescale/timescaledb:2.29.2-pg18"
     LABEL = "cf-gears-e2e=usage-collector"
 
     DB_USER = "uc"

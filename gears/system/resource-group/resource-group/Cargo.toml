@@ -95,6 +95,7 @@ toolkit-db = { workspace = true, features = ["sqlite", "pg", "test-support"] }
 # Cargo.toml), used here as test-only dev-dependencies.
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }
 tower = { workspace = true }
 http-body-util = { workspace = true }
 # Enable the SDK `test-util` feature so integration-test fakes can build the

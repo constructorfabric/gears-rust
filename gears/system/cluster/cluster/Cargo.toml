@@ -53,6 +53,7 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 
 [dev-dependencies]
+test-containers = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 serde-saphyr = { workspace = true }
 uuid = { workspace = true }
