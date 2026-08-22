@@ -54,7 +54,6 @@ use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
 use chrono::{Datelike, NaiveDate, Utc};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -100,7 +99,7 @@ fn account(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_currency_revaluation_then_next_period_reversal() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -407,7 +406,7 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn revaluation_with_no_period_end_rate_is_fx_rate_unavailable() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

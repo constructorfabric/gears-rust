@@ -48,7 +48,6 @@ use bss_ledger::infra::pii::ErasureService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit::api::OpenApiRegistryImpl;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -147,7 +146,7 @@ async fn body_string(response: axum::http::Response<Body>) -> String {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_tenant_tamper_status_denied_returns_403() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let provider = provider_for(&url).await;
@@ -191,7 +190,7 @@ async fn cross_tenant_tamper_status_denied_returns_403() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_tenant_erasure_without_reason_returns_400() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let provider = provider_for(&url).await;
@@ -245,7 +244,7 @@ async fn cross_tenant_erasure_without_reason_returns_400() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_tenant_erasure_unauthorized_returns_403() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let provider = provider_for(&url).await;

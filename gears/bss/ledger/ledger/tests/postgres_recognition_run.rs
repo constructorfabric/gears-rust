@@ -58,7 +58,6 @@ use bss_ledger_sdk::{AccountClass, RecognitionRunOutcome, Side};
 use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -359,7 +358,7 @@ async fn segment_status(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn run_releases_atomically_and_is_not_double_credited() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -452,7 +451,7 @@ async fn run_releases_atomically_and_is_not_double_credited() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn over_recognition_blocked_at_per_schedule_check_with_sibling_positive() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -538,7 +537,7 @@ async fn over_recognition_blocked_at_per_schedule_check_with_sibling_positive() 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn reversal_decrements_and_segment_stays_done() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -639,7 +638,7 @@ async fn reversal_decrements_and_segment_stays_done() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn racing_runs_credit_each_segment_exactly_once() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -710,7 +709,7 @@ async fn queued_successor_drains_behind_its_predecessor_in_one_pass() {
     // segment_no, is released first in the same ascending pass). Pins that a
     // QUEUED segment is not stuck — it is picked up and drained behind its
     // predecessor, never ahead of it.
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -807,7 +806,7 @@ async fn queued_successor_re_parks_when_predecessor_excluded_from_window() {
     // successor but NOT its still-un-DONE predecessor (a narrower run target),
     // the successor is re-parked QUEUED (the §4.6 gate holds) — never released
     // ahead of its predecessor — and a LATER, wider run drains it.
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -903,7 +902,7 @@ fn recognized_item_no_link(amount: i64, periods: u32, first_period: &str) -> Inv
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn get_schedule_returns_header_and_segments_and_none_when_absent() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -973,7 +972,7 @@ async fn get_schedule_returns_header_and_segments_and_none_when_absent() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn deferred_post_without_invoice_link_is_rejected() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -1082,7 +1081,7 @@ async fn try_insert_active_schedule(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn drained_schedule_completes_and_frees_the_one_live_slot() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;

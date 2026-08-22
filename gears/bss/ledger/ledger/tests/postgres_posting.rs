@@ -34,7 +34,6 @@ use sea_orm::{
     ActiveValue::Set, ConnectionTrait, Database, DatabaseConnection, EntityTrait, Statement,
 };
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::{AccessScope, SecureInsertExt, SecureOnConflict};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -237,7 +236,7 @@ fn line(f: &Fixture, account: Uuid, class: AccountClass, side: Side, amount: i64
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn post_balanced_replay_period_and_negative() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -394,7 +393,7 @@ async fn post_balanced_replay_period_and_negative() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_same_key_posts_once() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -465,7 +464,7 @@ async fn concurrent_same_key_posts_once() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn secure_orm_isolates_cross_tenant_entry_reads() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -517,7 +516,7 @@ async fn secure_orm_isolates_cross_tenant_entry_reads() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn reverses_fields_persist_on_a_reversal_post() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -611,7 +610,7 @@ async fn reverses_fields_persist_on_a_reversal_post() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_overdraw_of_guarded_account_stays_non_negative() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -668,7 +667,7 @@ async fn concurrent_overdraw_of_guarded_account_stays_non_negative() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn concurrent_close_never_certifies_a_period_a_post_landed_in() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -818,7 +817,7 @@ impl PostSidecar for RejectingSidecar {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn post_sidecar_commits_with_entry_and_rolls_back_on_err() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -911,7 +910,7 @@ fn cross_currency_entry(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_currency_post_populates_functional_balance() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -987,7 +986,7 @@ async fn cross_currency_post_populates_functional_balance() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn post_with_request_hash_rejects_same_key_different_payload() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -1053,7 +1052,7 @@ async fn post_with_request_hash_rejects_same_key_different_payload() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn post_with_request_hash_same_hash_replays() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -1101,7 +1100,7 @@ async fn post_with_request_hash_same_hash_replays() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn single_currency_post_leaves_functional_null() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -1134,7 +1133,7 @@ async fn single_currency_post_leaves_functional_null() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn tenant_posting_lock_blocks_posting() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
@@ -1193,7 +1192,7 @@ async fn tenant_posting_lock_blocks_posting() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn clock_skew_beyond_24h_is_quarantined() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

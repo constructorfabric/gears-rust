@@ -1669,7 +1669,7 @@ pub mod pg {
 
     use anyhow::Result;
     use sea_orm::ConnectionTrait;
-    use testcontainers::{ContainerRequest, ImageExt, runners::AsyncRunner};
+    use testcontainers::{ImageExt, runners::AsyncRunner};
     use testcontainers_modules::postgres::Postgres;
     use toolkit_db::migration_runner::run_migrations_for_testing;
     use toolkit_db::{ConnectOpts, connect_db};
@@ -1702,8 +1702,8 @@ pub mod pg {
     /// — a missing Docker daemon shows up as a clear container-start
     /// failure rather than a silent skip.
     pub async fn bring_up_postgres() -> Result<PgHarness> {
-        let postgres_image = Postgres::default();
-        let request = ContainerRequest::from(postgres_image)
+        // Image tag comes from cf-gears-test-containers; see libs/test-containers.
+        let request = cf_gears_test_containers::postgres()
             .with_env_var("POSTGRES_PASSWORD", "pass")
             .with_env_var("POSTGRES_USER", "user")
             .with_env_var("POSTGRES_DB", "app");

@@ -28,7 +28,6 @@
 
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, connect_db};
@@ -64,7 +63,7 @@ fn url_with_search_path(port: u16, search_path: &str) -> String {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn migrations_idempotent_under_public_first_search_path() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
 
     let db = connect_db(
@@ -136,7 +135,7 @@ async fn migrations_idempotent_under_public_first_search_path() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers); documents the C1 crash"]
 async fn bss_first_search_path_crash_loops_on_second_boot() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
 
     let db = connect_db(
@@ -169,7 +168,7 @@ async fn bss_first_search_path_crash_loops_on_second_boot() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn payment_tables_created_on_up_and_dropped_on_down() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let db = Database::connect(&url).await.unwrap();
@@ -225,7 +224,7 @@ async fn payment_tables_created_on_up_and_dropped_on_down() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn pending_event_queue_created_on_up_and_dropped_on_down() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let db = Database::connect(&url).await.unwrap();

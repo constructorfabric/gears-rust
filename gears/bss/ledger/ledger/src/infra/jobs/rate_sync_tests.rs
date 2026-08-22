@@ -20,7 +20,6 @@ use bss_ledger_sdk::{CurrencyPair, UnconfiguredRateProviderV1};
 use chrono::Utc;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::{ConnectOpts, connect_db};
 
@@ -188,7 +187,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn fans_rates_out_to_every_provisioned_tenant() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

@@ -49,11 +49,7 @@ pub fn bring_up_sqlite() -> DbUnderTest {
 /// Returns an error if the container fails to start or become ready.
 #[cfg(feature = "pg")]
 pub async fn bring_up_postgres() -> Result<DbUnderTest> {
-    use testcontainers::ContainerRequest;
-    use testcontainers_modules::postgres::Postgres;
-
-    let postgres_image = Postgres::default();
-    let container_request = ContainerRequest::from(postgres_image)
+    let container_request = cf_gears_test_containers::postgres()
         .with_env_var("POSTGRES_PASSWORD", "pass")
         .with_env_var("POSTGRES_USER", "user")
         .with_env_var("POSTGRES_DB", "app");
@@ -74,10 +70,7 @@ pub async fn bring_up_postgres() -> Result<DbUnderTest> {
 /// Returns an error if the container fails to start or the port cannot be obtained.
 #[cfg(feature = "mysql")]
 pub async fn bring_up_mysql() -> Result<DbUnderTest> {
-    use testcontainers::ContainerRequest;
-    use testcontainers_modules::mysql::Mysql;
-    let mysql_image = Mysql::default();
-    let container_request = ContainerRequest::from(mysql_image)
+    let container_request = cf_gears_test_containers::mysql()
         .with_env_var("MYSQL_ROOT_PASSWORD", "root")
         .with_env_var("MYSQL_USER", "user")
         .with_env_var("MYSQL_PASSWORD", "pass")

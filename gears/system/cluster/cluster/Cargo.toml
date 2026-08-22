@@ -53,6 +53,13 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Database image pins: see libs/test-containers. A dev-dependency rather than an
+# optional regular one — that crate is `publish = false`, and a path dependency
+# with no version in `[dependencies]` fails the packaging check because
+# `cargo publish` strips the path. Dev-dependencies are dropped on publish, and
+# are available to tests regardless of the `integration` feature, which gates
+# only whether the test code itself compiles.
+cf-gears-test-containers = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 serde-saphyr = { workspace = true }
 uuid = { workspace = true }

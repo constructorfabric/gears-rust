@@ -23,7 +23,6 @@ use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::ODataQuery;
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -47,7 +46,7 @@ fn account_row(tenant: Uuid) -> AccountRow {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn cross_tenant_reference_reads_are_sql_scoped_to_empty() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 

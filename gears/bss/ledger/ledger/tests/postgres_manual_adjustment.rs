@@ -44,7 +44,6 @@ use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{AccountClass, Side};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -246,7 +245,7 @@ fn req(
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn rounding_correction_posts_then_replays_idempotently() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -319,7 +318,7 @@ async fn rounding_correction_posts_then_replays_idempotently() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn class_outside_allow_list_is_not_allowed() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;
@@ -362,7 +361,7 @@ async fn class_outside_allow_list_is_not_allowed() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn contra_revenue_write_off_is_not_allowed_and_does_not_post() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let (raw, provider, s) = setup(&url).await;

@@ -47,7 +47,6 @@ use toolkit_security::AccessScope;
 
 use coord::{AckError, LeaseManager};
 
-use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const KEY: &str = "fence-job";
@@ -114,7 +113,7 @@ async fn force_expire(db: &Db) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker (testcontainers)"]
 async fn fence_rejects_a_lease_stolen_after_the_ack_snapshot() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = cf_gears_test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let db = setup(&url).await;

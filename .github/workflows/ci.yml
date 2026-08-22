@@ -684,6 +684,31 @@ jobs:
           disable_search: true
           fail_ci_if_error: ${{ github.event_name != 'pull_request' }}
 
+  db-image-pins:
+    name: Database image pins
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # Database versions live in libs/test-containers and nowhere else. A
+      # fixture that constructs an image directly is pinned only transitively
+      # through Cargo.lock, so a dependency bump would change the database under
+      # it silently -- which is the situation that crate was created to end.
+      - name: No direct database image constructors outside libs/test-containers
+        run: |
+          hits=$(grep -rn --include='*.rs' \
+            -e 'Postgres::default()' -e 'Mysql::default()' . \
+            | grep -v 'libs/test-containers' \
+            | grep -v '/target/' || true)
+          if [ -n "$hits" ]; then
+            echo "Construct database images through cf-gears-test-containers:"
+            echo "$hits"
+            exit 1
+          fi
+
   lint:
     name: Architecture Lints (cargo gears lint)
     runs-on: ubuntu-latest

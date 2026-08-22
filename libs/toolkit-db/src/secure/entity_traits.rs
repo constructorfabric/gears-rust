@@ -152,4 +152,37 @@ pub trait ScopableEntity: EntityTrait {
     /// Manual implementors must provide all property arms explicitly.
     #[must_use]
     fn resolve_property(property: &str) -> Option<Self::Column>;
+
+    /// Every column a scope predicate can address on this entity.
+    ///
+    /// [`resolve_property`](Self::resolve_property) answers "which column does
+    /// this property mean" but cannot be enumerated, so nothing could ask the
+    /// opposite question: *which* columns are scope columns at all. Two things
+    /// need that answer.
+    ///
+    /// A property-graph declaration must expose every scope column as a graph
+    /// property, because a column absent from a `PROPERTIES` list is invisible
+    /// to `MATCH` — not an error, just silently unfilterable, which for a scope
+    /// column means the pattern cannot be scoped
+    /// (`docs/arch/secure-orm/ADR/0002`, Policy 3). And a graph element must be
+    /// rejected up front when it resolves no scope column at all, rather than
+    /// compiling to a deny-all traversal that looks like missing data
+    /// (Policy 2).
+    ///
+    /// The default covers the four dimension columns, so every existing
+    /// hand-written implementation keeps working. `#[derive(Scopable)]`
+    /// overrides it to include `pep_prop(...)` columns as well, which it knows
+    /// and this default cannot.
+    #[must_use]
+    fn scope_columns() -> Vec<Self::Column> {
+        [
+            Self::tenant_col(),
+            Self::resource_col(),
+            Self::owner_col(),
+            Self::type_col(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
 }
