@@ -14,12 +14,6 @@ metadata.docs.rs.all-features = true
 [lib]
 name = "gear_orchestrator"
 
-[features]
-default = []
-# Enable the Kubernetes TokenReview validator for `internal_auth: { provider:
-# kube }` on the DirectoryService gRPC RPCs (Profile 3 platform host).
-k8s-auth = ["dep:toolkit-k8s-auth"]
-
 [lints]
 workspace = true
 
@@ -27,10 +21,6 @@ workspace = true
 cf-gears-system-sdks = { workspace = true, features = ["directory_grpc"] }
 toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
-toolkit-security = { workspace = true }
-toolkit-transport-grpc = { workspace = true }
-toolkit-k8s-auth = { workspace = true, optional = true }
-secrecy = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
 http = { workspace = true }
@@ -48,3 +38,6 @@ tower = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 api_gateway = { path = "../api-gateway", package = "cf-gears-api-gateway" }
 serde_json = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-transport-grpc = { workspace = true }
+secrecy = { workspace = true }

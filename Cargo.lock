@@ -2322,7 +2322,6 @@ dependencies = [
  "cf-gears-api-gateway",
  "cf-gears-system-sdks",
  "cf-gears-toolkit",
- "cf-gears-toolkit-k8s-auth",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-transport-grpc",
@@ -2347,6 +2346,8 @@ dependencies = [
  "async-trait",
  "cf-gears-system-sdks",
  "cf-gears-toolkit",
+ "cf-gears-toolkit-k8s-auth",
+ "cf-gears-toolkit-security",
  "cf-gears-toolkit-transport-grpc",
  "http",
  "inventory",
@@ -3456,6 +3457,7 @@ dependencies = [
  "cf-gears-toolkit-security",
  "k8s-openapi",
  "kube",
+ "parking_lot",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3583,6 +3585,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tonic",
+ "tower",
  "tracing",
 ]
 

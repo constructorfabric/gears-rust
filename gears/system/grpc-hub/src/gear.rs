@@ -27,11 +27,23 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{service::RoutesBuilder, transport::Server};
 
+use toolkit_security::{DynInternalAuthenticator, InternalAuthConfig};
+use toolkit_transport_grpc::{InternalAuthEnforcement, InternalAuthGrpcLayer};
+
 #[cfg(windows)]
 use toolkit_transport_grpc::create_named_pipe_incoming;
 
 const DEFAULT_LISTEN_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 50051));
+
+/// Default seconds a positive platform-plane validation result is cached.
+/// Mirrors `toolkit_k8s_auth::DEFAULT_TOKEN_REVIEW_CACHE_TTL`, kept local so the
+/// config surface does not depend on the optional `k8s-auth` feature.
+const DEFAULT_INTERNAL_AUTH_CACHE_TTL_SECS: u64 = 30;
+/// Upper bound on the internal-auth cache TTL. Caps how long a revoked or
+/// expired token can keep validating from cache, so a misconfiguration cannot
+/// widen the revocation window unboundedly.
+const MAX_INTERNAL_AUTH_CACHE_TTL_SECS: u64 = 300;
 
 /// Configuration for the gRPC Hub gear.
 ///
@@ -56,6 +68,38 @@ pub struct GrpcHubConfig {
     /// The address is parsed and validated during gear `init`; an
     /// unparsable port segment (e.g. `host:abc`) causes `init` to fail.
     pub advertise_addr: Option<String>,
+
+    /// Platform-plane (internal) authentication for **all** inbound gRPC RPCs
+    /// served by this hub. When set, an [`InternalAuthGrpcLayer`] validates the
+    /// `x-toolkit-internal-token` on every non-exempt RPC
+    /// (`cpt-cf-adr-platform-plane-auth`); when absent, enforcement is disabled
+    /// (Profile 1 / in-process only).
+    ///
+    /// Mirrors the REST `oop_http.internal_auth` surface: a single flat
+    /// `InternalAuthConfig` provider, with the gRPC-only enforcement / exempt /
+    /// cache knobs as sibling fields below.
+    pub internal_auth: Option<InternalAuthConfig>,
+
+    /// How an **absent** internal credential is treated when `internal_auth` is
+    /// set. Defaults to [`InternalAuthEnforcement::Required`]. Has no effect
+    /// when `internal_auth` is `None`. (gRPC-only: the REST middleware is always
+    /// permissive.)
+    pub internal_auth_enforcement: InternalAuthEnforcement,
+
+    /// Optional override of the gRPC method-path prefixes exempt from
+    /// enforcement. When `None`, the transport default
+    /// (`toolkit_transport_grpc::DEFAULT_EXEMPT_PREFIXES` — health + reflection)
+    /// applies. An empty vector enforces on every method.
+    pub internal_auth_exempt_methods: Option<Vec<String>>,
+
+    /// Seconds a **successful** platform-plane validation is cached, collapsing a
+    /// burst of calls carrying the same token into a single validation-backend
+    /// round-trip. Only positive results are cached, and only providers that make
+    /// a remote call benefit — in practice `kube` (the shared-secret provider is
+    /// a local comparison and is never wrapped). `0` disables caching (every call
+    /// re-validates). Bounded at boot by [`MAX_INTERNAL_AUTH_CACHE_TTL_SECS`] to
+    /// keep the token-revocation window tight.
+    pub internal_auth_cache_ttl_secs: u64,
 }
 
 impl Default for GrpcHubConfig {
@@ -63,6 +107,10 @@ impl Default for GrpcHubConfig {
         Self {
             listen_addr: DEFAULT_LISTEN_ADDR.to_string(),
             advertise_addr: None,
+            internal_auth: None,
+            internal_auth_enforcement: InternalAuthEnforcement::default(),
+            internal_auth_exempt_methods: None,
+            internal_auth_cache_ttl_secs: DEFAULT_INTERNAL_AUTH_CACHE_TTL_SECS,
         }
     }
 }
@@ -94,6 +142,81 @@ fn parse_advertise_addr(advertise_addr: &str) -> anyhow::Result<(String, Option<
     }
 }
 
+/// Build the inbound platform-plane validator from configuration.
+///
+/// The dependency-light shared-secret provider is built directly. The
+/// Kubernetes `TokenReview` provider requires the `k8s-auth` feature and, when
+/// `cache_ttl_secs > 0`, is wrapped in a
+/// [`CachingInternalAuthenticator`](toolkit_k8s_auth::CachingInternalAuthenticator)
+/// so a burst of calls carrying the same projected token collapses to a single
+/// API-server round-trip; `0` uses the uncached validator. Without the feature,
+/// configuring `provider: kube` is a hard error rather than a silent enforcement
+/// downgrade.
+#[cfg_attr(
+    not(feature = "k8s-auth"),
+    allow(clippy::unused_async, unused_variables)
+)]
+async fn build_internal_authenticator(
+    cfg: Option<&InternalAuthConfig>,
+    cache_ttl_secs: u64,
+) -> anyhow::Result<Option<DynInternalAuthenticator>> {
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+
+    // Shared-secret (and any future dependency-light provider) builds here.
+    if let Some(auth) = cfg.build_authenticator() {
+        return Ok(Some(auth));
+    }
+
+    #[cfg(feature = "k8s-auth")]
+    {
+        if cfg.is_kube() {
+            let audiences = cfg.kube_audiences().unwrap_or_default().to_vec();
+            let validator = toolkit_k8s_auth::K8sTokenReviewAuthenticator::try_default(audiences)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to init Kubernetes TokenReview authenticator: {e}")
+                })?;
+            // `0` disables caching; any positive TTL wraps the validator in the
+            // short-lived positive cache.
+            let auth = if cache_ttl_secs == 0 {
+                DynInternalAuthenticator::new(validator)
+            } else {
+                DynInternalAuthenticator::new(toolkit_k8s_auth::CachingInternalAuthenticator::new(
+                    validator,
+                    std::time::Duration::from_secs(cache_ttl_secs),
+                ))
+            };
+            return Ok(Some(auth));
+        }
+    }
+    #[cfg(not(feature = "k8s-auth"))]
+    {
+        if cfg.is_kube() {
+            anyhow::bail!("grpc-hub internal_auth provider=kube requires the `k8s-auth` feature");
+        }
+    }
+
+    anyhow::bail!(
+        "internal_auth is configured but no authenticator could be built for the selected provider"
+    )
+}
+
+/// Assemble the [`InternalAuthGrpcLayer`] from a built `authenticator` and the
+/// configured enforcement mode / exempt-method override.
+fn assemble_auth_layer(
+    authenticator: Option<DynInternalAuthenticator>,
+    enforcement: InternalAuthEnforcement,
+    exempt_methods: Option<Vec<String>>,
+) -> InternalAuthGrpcLayer {
+    let mut layer = InternalAuthGrpcLayer::new(authenticator).with_enforcement(enforcement);
+    if let Some(prefixes) = exempt_methods {
+        layer = layer.with_exempt_prefixes(prefixes);
+    }
+    layer
+}
+
 /// The gRPC Hub gear.
 /// This gear is responsible for hosting the gRPC server and managing the gRPC services.
 #[toolkit::gear(
@@ -108,6 +231,9 @@ pub struct GrpcHub {
     pub(crate) client_hub: OnceLock<Arc<ClientHub>>,
     pub(crate) instance_id: OnceLock<String>,
     pub(crate) bound_endpoint: RwLock<Option<String>>,
+    /// Platform-plane middleware applied to every served gRPC RPC; a
+    /// pass-through layer when `internal_auth` is unset.
+    pub(crate) auth_layer: OnceLock<InternalAuthGrpcLayer>,
 }
 
 impl Default for GrpcHub {
@@ -119,6 +245,7 @@ impl Default for GrpcHub {
             client_hub: OnceLock::new(),
             instance_id: OnceLock::new(),
             bound_endpoint: RwLock::new(None),
+            auth_layer: OnceLock::new(),
         }
     }
 }
@@ -158,6 +285,17 @@ impl GrpcHub {
     /// Set the bound endpoint after the server has started listening.
     fn set_bound_endpoint(&self, endpoint: String) {
         *self.bound_endpoint.write() = Some(endpoint);
+    }
+
+    /// The platform-plane middleware to install on the server, defaulting to a
+    /// pass-through layer when none was configured.
+    fn effective_auth_layer(&self) -> InternalAuthGrpcLayer {
+        self.auth_layer.get().cloned().unwrap_or_else(|| {
+            tracing::warn!(
+                "gRPC hub auth_layer is unset; platform-plane authentication will pass through"
+            );
+            InternalAuthGrpcLayer::new(None)
+        })
     }
 
     /// Pick the endpoint to register with Directory for a TCP listener.
@@ -427,6 +565,7 @@ impl GrpcHub {
 
         let incoming = TcpListenerStream::new(listener);
         Server::builder()
+            .layer(self.effective_auth_layer())
             .add_routes(routes)
             .serve_with_incoming_shutdown(incoming, async move {
                 cancel.cancelled().await;
@@ -466,6 +605,7 @@ impl GrpcHub {
 
         let incoming = UnixListenerStream::new(uds);
         Server::builder()
+            .layer(self.effective_auth_layer())
             .add_routes(routes)
             .serve_with_incoming_shutdown(incoming, async move {
                 cancel.cancelled().await;
@@ -493,6 +633,7 @@ impl GrpcHub {
 
         let incoming = create_named_pipe_incoming(pipe_name, cancel.clone());
         Server::builder()
+            .layer(self.effective_auth_layer())
             .add_routes(routes)
             .serve_with_incoming_shutdown(incoming, async move {
                 cancel.cancelled().await;
@@ -600,6 +741,38 @@ impl Gear for GrpcHub {
         // Parse listen_addr into appropriate transport type
         self.apply_listen_config(&cfg.listen_addr)?;
 
+        // Fail loud at init on an out-of-bound cache TTL rather than silently
+        // running with a dangerously wide token-revocation window.
+        if cfg.internal_auth_cache_ttl_secs > MAX_INTERNAL_AUTH_CACHE_TTL_SECS {
+            anyhow::bail!(
+                "grpc-hub internal_auth_cache_ttl_secs ({}) exceeds the maximum of {}s",
+                cfg.internal_auth_cache_ttl_secs,
+                MAX_INTERNAL_AUTH_CACHE_TTL_SECS
+            );
+        }
+
+        // Build the inbound platform-plane middleware; an unset `internal_auth`
+        // yields a pass-through layer (Profile 1 / in-process).
+        let authenticator = build_internal_authenticator(
+            cfg.internal_auth.as_ref(),
+            cfg.internal_auth_cache_ttl_secs,
+        )
+        .await?;
+        if authenticator.is_some() {
+            tracing::info!(
+                enforcement = ?cfg.internal_auth_enforcement,
+                "inbound gRPC platform-plane enforcement enabled"
+            );
+        }
+        let auth_layer = assemble_auth_layer(
+            authenticator,
+            cfg.internal_auth_enforcement,
+            cfg.internal_auth_exempt_methods.clone(),
+        );
+        self.auth_layer
+            .set(auth_layer)
+            .map_err(|_| anyhow::anyhow!("auth_layer already set (init called twice?)"))?;
+
         if let Some(advertise_addr) = cfg.advertise_addr {
             let parsed = parse_advertise_addr(&advertise_addr)?;
 
@@ -699,6 +872,49 @@ mod tests {
                 routes.add_service(ServiceBImpl);
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn build_internal_authenticator_passes_through_when_unconfigured() {
+        let auth = build_internal_authenticator(None, 30).await.unwrap();
+        assert!(auth.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_internal_authenticator_builds_shared_secret() {
+        let cfg = InternalAuthConfig::SharedSecret {
+            secret: "test-secret".to_owned(),
+            peer_name: "test-peer".to_owned(),
+        };
+        let auth = build_internal_authenticator(Some(&cfg), 30).await.unwrap();
+        assert!(auth.is_some());
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "k8s-auth"))]
+    async fn build_internal_authenticator_rejects_kube_without_feature() {
+        let cfg = InternalAuthConfig::Kube {
+            audiences: vec!["toolkit-internal".to_owned()],
+            token_path: None,
+        };
+        let err = build_internal_authenticator(Some(&cfg), 30)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("k8s-auth"),
+            "error should mention missing k8s-auth feature: {err}"
+        );
+    }
+
+    #[test]
+    fn effective_auth_layer_defaults_to_pass_through_when_unset() {
+        let hub = GrpcHub::default();
+        let layer = hub.effective_auth_layer();
+        let rendered = format!("{layer:?}");
+        assert!(
+            rendered.contains("enforced: false"),
+            "expected pass-through layer, got {rendered}"
+        );
     }
 
     #[test]
@@ -845,6 +1061,18 @@ mod tests {
         assert!(
             installer_store.is_empty(),
             "installers should be consumed after serve completes"
+        );
+    }
+
+    #[test]
+    fn omitted_cache_ttl_inherits_struct_default() {
+        let cfg: GrpcHubConfig = serde_json::from_value(serde_json::json!({
+            "internal_auth": { "provider": "shared_secret", "secret": "x" }
+        }))
+        .expect("partial config should deserialize via container default");
+        assert_eq!(
+            cfg.internal_auth_cache_ttl_secs, DEFAULT_INTERNAL_AUTH_CACHE_TTL_SECS,
+            "omitted TTL must inherit the struct Default, not u64::default()"
         );
     }
 
