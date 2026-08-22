@@ -9,6 +9,78 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.10.19](https://github.com/constructorfabric/gears-rust/compare/cf-gears-mini-chat-sdk-v0.10.18...cf-gears-mini-chat-sdk-v0.10.19) - 2026-08-22
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit
+
+## [0.1.3](https://github.com/constructorfabric/gears-rust/compare/bss-rate-provider-v0.1.2...bss-rate-provider-v0.1.3) - 2026-08-22
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-toolkit, cf-gears-types-registry, bss-rate-provider-sdk, bss-rate-provider-sdk, cf-gears-types-registry-sdk, cf-gears-types-registry-sdk, bss-ledger-sdk, bss-ledger-sdk
+
+## [0.1.3](https://github.com/constructorfabric/gears-rust/compare/bss-ledger-sdk-v0.1.2...bss-ledger-sdk-v0.1.3) - 2026-08-22
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-canonical-errors, cf-gears-toolkit-odata
+
+## [0.2.29](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authn-resolver-v0.2.28...cf-gears-authn-resolver-v0.2.29) - 2026-08-22
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-canonical-errors, cf-gears-toolkit, cf-gears-types-registry, cf-gears-types-registry-sdk, cf-gears-authn-resolver-sdk
+
+## [0.3.29](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authn-resolver-sdk-v0.3.28...cf-gears-authn-resolver-sdk-v0.3.29) - 2026-08-22
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit
+
+## [0.5.9](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oagw-sdk-v0.5.8...cf-gears-oagw-sdk-v0.5.9) - 2026-08-22
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-canonical-errors
+
+## [0.1.33](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tenant-resolver-v0.1.32...cf-gears-tenant-resolver-v0.1.33) - 2026-08-22
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-canonical-errors, cf-gears-toolkit, cf-gears-types-registry, cf-gears-tenant-resolver-sdk, cf-gears-types-registry-sdk
+
+## [0.2.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-resource-group-sdk-v0.2.6...cf-gears-resource-group-sdk-v0.2.7) - 2026-08-22
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-canonical-errors, cf-gears-toolkit-odata
+
+## [0.1.37](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authz-resolver-v0.1.36...cf-gears-authz-resolver-v0.1.37) - 2026-08-22
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-canonical-errors, cf-gears-toolkit, cf-gears-types-registry, cf-gears-authz-resolver-sdk, cf-gears-types-registry-sdk
+
+## [0.3.6](https://github.com/constructorfabric/gears-rust/compare/cf-gears-types-registry-sdk-v0.3.5...cf-gears-types-registry-sdk-v0.3.6) - 2026-08-22
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-canonical-errors
+
+## [0.3.21](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authz-resolver-sdk-v0.3.20...cf-gears-authz-resolver-sdk-v0.3.21) - 2026-08-22
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-tenant-resolver-sdk
+
+## [0.3.21](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tenant-resolver-sdk-v0.3.20...cf-gears-tenant-resolver-sdk-v0.3.21) - 2026-08-22
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit
+
 ## [0.2.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-event-broker-v0.2.0...cf-gears-event-broker-v0.2.1) - 2026-08-17
 
 ### Fixed
