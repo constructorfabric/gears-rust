@@ -17,3 +17,6 @@ workspace = true
 [dependencies]
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+
+[dev-dependencies]
+temp-env = { workspace = true }

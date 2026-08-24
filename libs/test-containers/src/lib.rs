@@ -193,12 +193,45 @@ mod tests {
         assert_ne!(MYSQL_TAG, Mysql::default().tag());
     }
 
-    /// An exported-but-empty variable must not produce `postgres:`.
+    /// An exported-but-empty variable must not produce `postgres:`. Set for
+    /// real (empty, then whitespace-only) rather than merely absent, so the
+    /// `Ok(v)` guard is what the test exercises — an absent variable never
+    /// reaches it.
     #[test]
     fn an_empty_override_falls_back_to_the_pin() {
-        assert_eq!(
-            tag_from_env("GEARS_TEST_ABSENT_VAR_XYZ", "fallback"),
-            "fallback"
-        );
+        temp_env::with_var("GEARS_TEST_EMPTY_VAR_XYZ", Some(""), || {
+            assert_eq!(
+                tag_from_env("GEARS_TEST_EMPTY_VAR_XYZ", "fallback"),
+                "fallback"
+            );
+        });
+        temp_env::with_var("GEARS_TEST_EMPTY_VAR_XYZ", Some("   "), || {
+            assert_eq!(
+                tag_from_env("GEARS_TEST_EMPTY_VAR_XYZ", "fallback"),
+                "fallback"
+            );
+        });
+    }
+
+    /// And the unset case still falls back, via the `Err` arm.
+    #[test]
+    fn an_absent_override_falls_back_to_the_pin() {
+        temp_env::with_var_unset("GEARS_TEST_ABSENT_VAR_XYZ", || {
+            assert_eq!(
+                tag_from_env("GEARS_TEST_ABSENT_VAR_XYZ", "fallback"),
+                "fallback"
+            );
+        });
+    }
+
+    /// A set, non-empty variable wins over the pin.
+    #[test]
+    fn a_real_override_replaces_the_pin() {
+        temp_env::with_var("GEARS_TEST_SET_VAR_XYZ", Some("20-alpine"), || {
+            assert_eq!(
+                tag_from_env("GEARS_TEST_SET_VAR_XYZ", "fallback"),
+                "20-alpine"
+            );
+        });
     }
 }
