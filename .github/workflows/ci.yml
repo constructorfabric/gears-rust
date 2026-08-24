@@ -355,6 +355,13 @@ jobs:
       - name: Test toolkit-db (pg integration)
         run: make test-pg
 
+      - name: Test toolkit-db (pgq unit + PG19 integration)
+        # Compiles and runs everything behind the `pgq` feature — the secure
+        # graph builder, its unit suites and the trybuild guards — and the
+        # PostgreSQL 19 integration suite, which skips itself while the pre-GA
+        # PG19 image is unavailable (see libs/test-containers).
+        run: make test-pgq
+
       - name: Test toolkit-db (mysql integration)
         run: make test-mysql
 

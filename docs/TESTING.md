@@ -123,6 +123,7 @@ behind the `integration` Cargo feature so that `cargo test --workspace` (without
 |---------|----------|---------|
 | `cf-gears-toolkit-db` | `sqlite,integration` | SQLite (in-process) |
 | `cf-gears-toolkit-db` | `pg,integration` | PostgreSQL (requires running instance) |
+| `cf-gears-toolkit-db` | `pgq,integration` | PostgreSQL 19 SQL/PGQ (testcontainers; skips while the pre-GA image is unavailable) |
 | `cf-gears-toolkit-db` | `mysql,integration` | MySQL (requires running instance) |
 | `users-info` | `integration` | PostgreSQL |
 
@@ -131,8 +132,9 @@ behind the `integration` Cargo feature so that `cargo test --workspace` (without
 ```bash
 make test-sqlite           # quick, no external services needed
 make test-pg               # requires Postgres
+make test-pgq              # SQL/PGQ: PostgreSQL 19 via testcontainers (Docker)
 make test-mysql            # requires MySQL
-make test-db               # all three
+make test-db               # all of the above
 make test-users-info-pg    # users-info Postgres integration
 ```
 
@@ -151,11 +153,14 @@ repository silently.
 let request = cf_gears_test_containers::postgres()
     .with_env_var("POSTGRES_PASSWORD", "pass");
 
-// when the image itself needs configuring (with_db_name, with_user, ...)
-let request = cf_gears_test_containers::postgres_from(
-    Postgres::default().with_db_name("my_test"),
-);
+// when the database needs a name of its own
+let request = cf_gears_test_containers::postgres_with_db("my_test");
 ```
+
+There is deliberately no "configure the image yourself" hook: the point of the
+crate is that no fixture outside it names an image constructor. If a fixture
+needs image-level configuration the crate does not offer, add a helper to
+`libs/test-containers` instead.
 
 Tags can be overridden per run, so CI can drive a version matrix without code
 changes:
@@ -170,8 +175,8 @@ changes:
 An exported-but-empty variable is treated as unset, so a CI job that declares
 the name without a value gets the pin rather than an image with no tag.
 
-The PostgreSQL 19 helpers (`postgres_graph`, `graph_lane_required`) exist for the
-SQL/PGQ work in `docs/arch/secure-orm/ADR/0002` and are unused until that lands.
+The PostgreSQL 19 helpers (`postgres_graph`, `graph_lane_required`) serve the
+SQL/PGQ suite from `docs/arch/secure-orm/ADR/0002` (`make test-pgq`).
 
 ### 4.4 Asserting database errors
 

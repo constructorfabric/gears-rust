@@ -465,7 +465,7 @@ dev: dev-fmt dev-clippy dev-test
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-cluster-pg test-rg-pg test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-cluster-pg test-rg-pg test-fips
 
 # Run all tests
 test: install-tools
@@ -487,12 +487,20 @@ test-sqlite: install-tools
 test-pg: install-tools
 	cargo nextest run -p cf-gears-toolkit-db --features pg,integration
 
+## Run SQL/PGQ tests: the unit suites gated behind the `pgq` feature plus the
+## PostgreSQL 19 integration suite (Docker required; the suite spins up its own
+## postgres container via testcontainers, and skips itself while the pre-GA
+## PG19 image is unavailable — set GEARS_TEST_PG_GRAPH_REQUIRED=1 to turn that
+## skip into a failure once the lane is expected to be green).
+test-pgq: install-tools
+	cargo nextest run -p cf-gears-toolkit-db --features pgq,integration
+
 ## Run MySQL integration tests
 test-mysql: install-tools
 	cargo nextest run -p cf-gears-toolkit-db --features mysql,integration
 
 # Run all database integration tests
-test-db: test-sqlite test-pg test-mysql
+test-db: test-sqlite test-pg test-pgq test-mysql
 
 ## Run users-info gear integration tests
 test-users-info-pg: install-tools
