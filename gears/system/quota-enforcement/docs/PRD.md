@@ -600,6 +600,10 @@ completeness:
 - **Audit logging** (consumption events and definition changes) — deferred to P2 when the platform audit infrastructure
   is available.
 - **Subject hierarchy via resource-group** — P3 only; P1 supports `tenant` and `user` directly without traversal.
+- **Breaking projection-version activation** — out of P1 per `cpt-cf-quota-enforcement-fr-quota-lifecycle`: the
+  current projection version stays active, replacement contracts may be registered but are rejected by Quota and
+  Policy writes with `PROJECTION_NOT_RESOLVABLE`, and P1 provides no projection alias or Quota/counter migration
+  operation.
 - **Grace policies for hard caps** (e.g., +N% for T minutes during a campaign or incident before resuming the strict
   cap) — deferred to P2.
 - **Rate quota implementation** (token bucket / sliding window) — declared as a future quota type; P1 implements only
@@ -3312,6 +3316,14 @@ on behalf of a tenant administrator)
   contract enumerated in `cpt-cf-quota-enforcement-fr-quota-type-rate-declared` lists
   `(rate, burst_capacity, smoothing_window)` as the field shape but defers the bucket-vs-window choice to
   implementation. — owner: Platform Engineering — target resolution: rate-quota implementation phase.
+- **Subscription-term and anniversary-aligned periods**: P1 periods are calendar-aligned UTC (`day`, `week`, `month`,
+  `year`) plus non-recurring `one_time` per `cpt-cf-quota-enforcement-fr-period-semantics`. App licensing integrations
+  (e.g., the platform licensing/quota integration guide for the Proctor app) need caps that reset on an agreement's
+  anniversary or span a subscription term; today the only faithful representation is `one_time` plus a validity window,
+  and an arbitrary anniversary reset is not representable. Candidate resolutions: a new period GTS instance carrying an
+  anchor timestamp, or a Quota Manager-side rollover/re-materialization mechanism that recreates the Quota per term.
+  Decision criterion: a committed app-fulfillment consumer plus the cross-gear rollover ownership question. — owner:
+  Platform Engineering / Quota Manager — target resolution: first app-fulfillment integration.
 - **Period-end carry-over of unused capacity**: P1 has no rollover-of-unused semantics — every period boundary resets
   `consumed` to 0 and forfeits leftover capacity, matching the licensing service P1 PRD; neither models carry. If
   concrete product demand for "unused tokens roll over to next period" emerges, ownership belongs to the
