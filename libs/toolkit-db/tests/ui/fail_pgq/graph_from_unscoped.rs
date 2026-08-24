@@ -48,6 +48,9 @@ mod test_entity {
         fn resolve_property(_property: &str) -> Option<Column> {
             Some(Column::TenantId)
         }
+        fn scope_columns() -> Vec<Column> {
+            vec![Column::TenantId, Column::Id]
+        }
     }
 }
 

@@ -18,6 +18,33 @@ pub enum ScopeError {
     /// Operation denied - entity not accessible in current security scope.
     #[error("access denied: {0}")]
     Denied(&'static str),
+
+    /// A graph pattern element on which no constraint of the live scope
+    /// resolves. Compiling it would produce a deny-all traversal that reads as
+    /// missing data, so it is refused by name instead
+    /// (`docs/arch/secure-orm/ADR/0002`, Policy 2).
+    #[error(
+        "invalid scope: no constraint of the scope resolves on graph element \
+         `{element}` (property `{property}` does not resolve on its entity)"
+    )]
+    UnresolvedScopeProperty {
+        /// The pattern variable of the refused element.
+        element: &'static str,
+        /// A property the scope addresses that the element's entity cannot map.
+        property: String,
+    },
+
+    /// The SQL/PGQ syntax layer refused to render. Carried as its own variant
+    /// so the distinct refusals (no projected columns, a duplicate pattern
+    /// variable, an empty identifier) stay distinguishable to the caller.
+    ///
+    /// Present unconditionally, although only the `pgq`-gated builder
+    /// constructs it: a feature-gated variant would change this enum's shape
+    /// under feature unification, breaking every downstream exhaustive `match`
+    /// the moment any crate in the build enables `pgq` (including
+    /// `--all-features` CI lanes).
+    #[error("graph syntax error: {0}")]
+    Pgq(#[from] toolkit_sea_orm_pgq::PgqError),
 }
 
 impl ScopeError {

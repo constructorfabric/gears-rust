@@ -90,6 +90,14 @@ pub(super) fn map_scope_err(err: ScopeError) -> DomainError {
             diagnostic: format!("unexpected access denied in credstore repo: {msg}"),
             cause: None,
         },
+        // Graph-query refusals; credstore issues no graph queries, so reaching
+        // either is a programmer error, like `Invalid`.
+        err @ (ScopeError::UnresolvedScopeProperty { .. } | ScopeError::Pgq(_)) => {
+            DomainError::Internal {
+                diagnostic: format!("scope invalid: {err}"),
+                cause: None,
+            }
+        }
     }
 }
 

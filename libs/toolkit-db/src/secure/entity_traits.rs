@@ -34,6 +34,10 @@ use sea_orm::EntityTrait;
 ///             _ => None,
 ///         }
 ///     }
+///     fn scope_columns() -> Vec<Self::Column> {
+///         // Exactly the columns resolve_property can return.
+///         vec![user::Column::TenantId, user::Column::Id]
+///     }
 /// }
 /// ```
 ///
@@ -153,12 +157,12 @@ pub trait ScopableEntity: EntityTrait {
     #[must_use]
     fn resolve_property(property: &str) -> Option<Self::Column>;
 
-    /// Every column a scope predicate can address on this entity.
+    /// Every column a scope predicate can address on this entity — exactly the
+    /// set [`resolve_property`](Self::resolve_property) can return.
     ///
-    /// [`resolve_property`](Self::resolve_property) answers "which column does
-    /// this property mean" but cannot be enumerated, so nothing could ask the
-    /// opposite question: *which* columns are scope columns at all. Two things
-    /// need that answer.
+    /// `resolve_property` answers "which column does this property mean" but
+    /// cannot be enumerated, so nothing could ask the opposite question:
+    /// *which* columns are scope columns at all. Two things need that answer.
     ///
     /// A property-graph declaration must expose every scope column as a graph
     /// property, because a column absent from a `PROPERTIES` list is invisible
@@ -169,20 +173,19 @@ pub trait ScopableEntity: EntityTrait {
     /// compiling to a deny-all traversal that looks like missing data
     /// (Policy 2).
     ///
-    /// The default covers the four dimension columns, so every existing
-    /// hand-written implementation keeps working. `#[derive(Scopable)]`
-    /// overrides it to include `pep_prop(...)` columns as well, which it knows
-    /// and this default cannot.
+    /// Required rather than defaulted, because a default cannot be right: it
+    /// would either omit the extra properties a hand-written
+    /// `resolve_property` maps (their columns then miss the `PROPERTIES` list
+    /// and the pattern silently cannot filter on them), or enumerate a column
+    /// like [`type_col`](Self::type_col) that no property resolves to (the
+    /// entity then passes the Policy 2 gates while resolving nothing — the
+    /// silent deny-all those gates exist to refuse). Manual implementors
+    /// enumerate the same set their `resolve_property` can return;
+    /// `#[derive(Scopable)]` generates both from one configuration so they
+    /// cannot disagree.
+    ///
+    /// Note `type_col` is **not** a scope column: `resolve_property` has no
+    /// well-known property name for it, so no scope constraint can address it.
     #[must_use]
-    fn scope_columns() -> Vec<Self::Column> {
-        [
-            Self::tenant_col(),
-            Self::resource_col(),
-            Self::owner_col(),
-            Self::type_col(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
-    }
+    fn scope_columns() -> Vec<Self::Column>;
 }

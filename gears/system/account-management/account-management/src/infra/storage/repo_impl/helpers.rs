@@ -91,6 +91,14 @@ pub fn map_scope_to_tx(err: ScopeError) -> TxError {
             diagnostic: format!("unexpected access denied in AM repo: {msg}"),
             cause: None,
         }),
+        // Graph-query refusals; the AM repo issues no graph queries, so
+        // reaching either is a programmer error, like `Invalid`.
+        err @ (ScopeError::UnresolvedScopeProperty { .. } | ScopeError::Pgq(_)) => {
+            TxError::Domain(DomainError::Internal {
+                diagnostic: format!("scope invalid: {err}"),
+                cause: None,
+            })
+        }
     }
 }
 

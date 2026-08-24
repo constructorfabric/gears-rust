@@ -15,11 +15,14 @@ use toolkit_security::access_scope::{
 /// alike; a second, PGQ-specific compiler would double the number of places
 /// tenant isolation could be wrong (`docs/arch/secure-orm/ADR/0002`).
 // The graph-addressed half of this module is the API `docs/arch/secure-orm/ADR/0002`
-// pins, and `secure::pgq` is what will consume it. Until that lands nothing in a
-// non-test build names it, which is what these allows say — the shape is fixed
-// here on purpose, separately from the builder that uses it.
+// pins; `secure::pgq` is its consumer. That module is behind the `pgq` feature,
+// so on a build without it the graph-only items really are unused — which is
+// exactly what the `cfg_attr` allows below say, and nothing more. (These items
+// are `pub` rather than `pub(crate)` only because `cond` is a private module,
+// where the two are equivalent and `clippy::redundant_pub_crate` prefers the
+// shorter one; nothing here is re-exported.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "pgq"), allow(dead_code))]
 pub enum ColumnAddress {
     /// `"resources"."tenant_id"` — the entity's own table. Always renderable.
     Table,
@@ -62,7 +65,7 @@ pub enum SiblingSupport {
 /// which `PostgreSQL` treats as an implicit lateral, so the correlation resolves
 /// without `LATERAL` (which the parser refuses before `GRAPH_TABLE`).
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "pgq"), allow(dead_code))]
 pub struct SiblingSource {
     /// Alias the predicate refers to. Derived from the filter's position in the
     /// scope, so the same scope compiled for two pattern elements yields the
@@ -71,33 +74,39 @@ pub struct SiblingSource {
     pub alias: String,
     /// The relation itself.
     pub query: SelectStatement,
-    /// Column of `alias` the predicate compares against.
+    /// Column of `alias` the predicate compares against. Read by the SQL
+    /// assertions in this module's tests; the execution path bakes it into the
+    /// predicate at compile time and never reads it back.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub column: &'static str,
 }
 
 /// A compiled scope predicate together with anything it references.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct ScopePredicate {
     condition: Condition,
     siblings: Vec<SiblingSource>,
 }
 
-#[allow(dead_code)]
 impl ScopePredicate {
-    /// The predicate.
+    /// The predicate. Read by this module's tests; the builders consume the
+    /// predicate through [`Self::into_parts`] instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn condition(&self) -> &Condition {
         &self.condition
     }
 
-    /// Relations the predicate correlates against, if any.
+    /// Relations the predicate correlates against, if any. Test-only, as
+    /// [`Self::condition`].
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn siblings(&self) -> &[SiblingSource] {
         &self.siblings
     }
 
     /// Split into the predicate and its correlated relations.
+    #[cfg_attr(not(feature = "pgq"), allow(dead_code))]
     #[must_use]
     pub fn into_parts(self) -> (Condition, Vec<SiblingSource>) {
         (self.condition, self.siblings)
@@ -156,9 +165,26 @@ where
 {
     // Table addressing renders every arm, so the `Result` cannot be `Err` here
     // and the sibling list is always empty. Kept as one code path so the select
-    // path cannot drift from the graph path.
-    build_scope_predicate::<E>(scope, ColumnAddress::Table)
-        .map_or_else(|_| deny_all(), |p| p.condition)
+    // path cannot drift from the graph path. Should a future arm break that
+    // assumption, the fallback is still fail-closed — but it must not be
+    // silent: a platform-wide `WHERE false` with nothing recording why is the
+    // exact failure mode this module's documentation calls unacceptable.
+    match build_scope_predicate::<E>(scope, ColumnAddress::Table) {
+        Ok(predicate) => predicate.condition,
+        Err(error) => {
+            debug_assert!(
+                false,
+                "table addressing must render every ScopeFilter arm: {error}"
+            );
+            tracing::error!(
+                %error,
+                entity = %E::default().table_name(),
+                "scope compilation failed under table addressing; \
+                 falling back to a deny-all predicate"
+            );
+            deny_all()
+        }
+    }
 }
 
 /// Build a scope predicate with a chosen column addressing.
@@ -196,6 +222,7 @@ where
 
     let mut compiled: Vec<Condition> = Vec::new();
     let mut siblings: Vec<SiblingSource> = Vec::new();
+    let mut constraints_with_siblings = 0_usize;
 
     for (index, constraint) in scope.constraints().iter().enumerate() {
         // A constraint whose property does not resolve is dropped, as it always
@@ -213,8 +240,24 @@ where
             build_constraint_condition::<E>(constraint, address, index, &mut constraint_siblings)?
         {
             compiled.push(cond);
+            if !constraint_siblings.is_empty() {
+                constraints_with_siblings += 1;
+            }
             siblings.append(&mut constraint_siblings);
         }
+    }
+
+    // OR-ed constraints whose siblings come from *different* constraints cannot
+    // be served by comma joins: the relations are placed unconditionally, so an
+    // empty alternative zeroes the whole result and two non-empty ones multiply
+    // each match by the other relation's cardinality. Refused loudly rather
+    // than compiled wrong (`docs/arch/secure-orm/ADR/0002`).
+    if constraints_with_siblings > 1 {
+        return Err(ScopeError::Invalid(
+            "more than one OR-ed scope constraint needs a correlated FROM item; \
+             comma-joined siblings from different alternatives would zero or \
+             multiply the result; narrow the scope or query per alternative",
+        ));
     }
 
     let condition = match compiled.len() {
@@ -270,8 +313,13 @@ struct SetMembership {
     column: &'static str,
     /// Refusal to raise when the arm cannot be rendered where it was asked for.
     reject_msg: &'static str,
-    /// Alias for the correlated form.
-    alias: String,
+    /// Position of the filter in the scope, from which the correlated form
+    /// derives its alias. Carried as indices rather than as the built string:
+    /// this struct travels down the select path of every scoped query, where
+    /// the alias is never read, and building it there would put an allocation
+    /// on every filter of every query in the platform.
+    constraint_index: usize,
+    filter_index: usize,
     /// Whether the relation can contain duplicate keys.
     needs_distinct: bool,
 }
@@ -305,10 +353,16 @@ fn attach_set_membership(
             if arm.needs_distinct {
                 query.distinct();
             }
-            let correlated = Expr::col((Alias::new(arm.alias.as_str()), Alias::new(arm.column)));
+            // Derived from the filter's position in the scope, so the same
+            // scope compiled for two pattern elements produces the same alias —
+            // the two references then share one `FROM` item instead of
+            // duplicating the relation, which is what keeps a correlated join
+            // from multiplying rows.
+            let alias = format!("__cf_scope_{}_{}", arm.constraint_index, arm.filter_index);
+            let correlated = Expr::col((Alias::new(alias.as_str()), Alias::new(arm.column)));
             let cond = and_cond.add(column.eq(correlated));
             siblings.push(SiblingSource {
-                alias: arm.alias,
+                alias,
                 query,
                 column: arm.column,
             });
@@ -344,11 +398,6 @@ where
             return Ok(None);
         };
         let column = addressed::<E>(col, address);
-        // Derived from the filter's position in the scope, so the same scope
-        // compiled for two pattern elements produces the same alias — the two
-        // references then share one `FROM` item instead of duplicating the
-        // relation, which is what keeps a correlated join from multiplying rows.
-        let alias = format!("__cf_scope_{constraint_index}_{filter_index}");
 
         match filter {
             ScopeFilter::Eq(eq) => {
@@ -379,7 +428,8 @@ where
                         column: rg_tables::MEMBERSHIP_RESOURCE_ID,
                         reject_msg: "scope filter InGroup needs a correlated FROM item, \
                                      which this query cannot host",
-                        alias,
+                        constraint_index,
+                        filter_index,
                         // A resource authorized through two groups has two membership rows.
                         needs_distinct: true,
                     },
@@ -418,7 +468,8 @@ where
                         column: rg_tables::MEMBERSHIP_RESOURCE_ID,
                         reject_msg: "scope filter InGroupSubtree needs a correlated FROM item, \
                                      which this query cannot host",
-                        alias,
+                        constraint_index,
+                        filter_index,
                         // Same reason: one resource can be a member of several groups in the subtree.
                         needs_distinct: true,
                     },
@@ -477,7 +528,8 @@ where
                         column: tenant_tables::CLOSURE_DESCENDANT_ID,
                         reject_msg: "scope filter InTenantSubtree needs a correlated FROM item, \
                                      which this query cannot host",
-                        alias,
+                        constraint_index,
+                        filter_index,
                         // The closure PK is (ancestor_id, descendant_id), so descendants of one ancestor are unique already.
                         needs_distinct: false,
                     },
@@ -565,6 +617,10 @@ mod tests {
             (
                 AccessScope::for_tenant(NIL),
                 r#"SELECT 1 FROM "t" WHERE "custom_prop_test"."tenant_id" IN ('00000000-0000-0000-0000-000000000000')"#,
+            ),
+            (
+                one(ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, NIL)),
+                r#"SELECT 1 FROM "t" WHERE "custom_prop_test"."tenant_id" = '00000000-0000-0000-0000-000000000000'"#,
             ),
             (
                 group_scope(),
@@ -714,6 +770,39 @@ mod tests {
         );
     }
 
+    /// Siblings from two *OR-ed* constraints cannot both be comma-joined: the
+    /// relations are placed unconditionally, so an empty alternative zeroes the
+    /// whole result and two non-empty ones multiply each match by the other's
+    /// cardinality. Such a scope is refused for graph addressing — and still
+    /// compiles for table addressing, where the subqueries inline.
+    #[test]
+    fn siblings_from_two_or_ed_constraints_are_refused() {
+        use custom_prop_entity::Entity as E;
+        let scope = AccessScope::from_constraints(vec![
+            ScopeConstraint::new(vec![ScopeFilter::in_group(
+                pep_properties::RESOURCE_ID,
+                vec![ScopeValue::Uuid(uuid::Uuid::from_u128(7))],
+            )]),
+            ScopeConstraint::new(vec![ScopeFilter::in_tenant_subtree(
+                pep_properties::OWNER_TENANT_ID,
+                ScopeValue::Uuid(NIL),
+                true,
+                vec![],
+            )]),
+        ]);
+
+        let err = build_scope_predicate::<E>(&scope, graph(SiblingSupport::Allowed))
+            .expect_err("siblings from two alternatives must be refused");
+        assert!(
+            matches!(err, ScopeError::Invalid(msg) if msg.contains("more than one OR-ed")),
+            "unexpected error: {err}"
+        );
+        assert!(
+            build_scope_predicate::<E>(&scope, ColumnAddress::Table).is_ok(),
+            "the select path inlines both subqueries and stays servable"
+        );
+    }
+
     /// The same scope compiled for two pattern elements must name the same
     /// sibling, so the two references share one `FROM` item. Two aliases would
     /// place the relation twice and multiply rows.
@@ -855,6 +944,9 @@ mod tests {
                     "department_id" => Some(Column::DepartmentId),
                     _ => None,
                 }
+            }
+            fn scope_columns() -> Vec<Column> {
+                vec![Column::TenantId, Column::Id, Column::DepartmentId]
             }
         }
     }

@@ -161,13 +161,18 @@ fn generate_col_impl(
     }
 }
 
-/// Generate the `resolve_property` match arms from dimension columns and `pep_prop` entries.
 /// Enumerate every column a scope predicate can address.
 ///
 /// Built from the same configuration as `resolve_property`, so the two cannot
 /// disagree about what counts as a scope column — which matters because a
 /// property-graph declaration derives its `PROPERTIES` list from this, and a
 /// scope column left out of that list is silently unfilterable.
+///
+/// `type_col` is deliberately absent: `resolve_property` emits no arm for it
+/// (there is no well-known property name), so no scope constraint can address
+/// it — listing it here would let an entity whose only dimension is `type_col`
+/// pass the Policy 2 gates while resolving nothing, which is the silent
+/// deny-all those gates exist to refuse.
 fn generate_scope_columns(config: &SecureConfig, span: Span) -> TokenStream {
     let mut columns = Vec::new();
 
@@ -175,7 +180,6 @@ fn generate_scope_columns(config: &SecureConfig, span: Span) -> TokenStream {
         config.tenant_col.as_ref().map(|(name, _)| name),
         config.resource_col.as_ref().map(|(name, _)| name),
         config.owner_col.as_ref().map(|(name, _)| name),
-        config.type_col.as_ref().map(|(name, _)| name),
     ]
     .into_iter()
     .flatten()
@@ -198,6 +202,7 @@ fn generate_scope_columns(config: &SecureConfig, span: Span) -> TokenStream {
     }
 }
 
+/// Generate the `resolve_property` match arms from dimension columns and `pep_prop` entries.
 fn generate_resolve_property(config: &SecureConfig, span: Span) -> TokenStream {
     let mut arms = Vec::new();
 

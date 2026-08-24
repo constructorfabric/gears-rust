@@ -170,5 +170,10 @@ fn map_scope_err(err: toolkit_db::secure::ScopeError) -> DomainError {
         ScopeError::Denied(msg) => DomainError::internal(format!(
             "unexpected access denied in AM integrity-check loader: {msg}"
         )),
+        // Graph-query refusals; the loader issues no graph queries, so
+        // reaching either is a programmer error, like `Invalid`.
+        err @ (ScopeError::UnresolvedScopeProperty { .. } | ScopeError::Pgq(_)) => {
+            DomainError::internal(format!("scope invalid: {err}"))
+        }
     }
 }

@@ -27,17 +27,19 @@
 //! [`VertexOf`] and [`EdgeOf`] are what make `label ↔ entity` compiler-checked
 //! rather than a convention held in two files. A builder that accepts
 //! `J: VertexOf<G>` cannot be handed an entity that is not part of `G`, and
-//! cannot be handed an edge where a vertex belongs.
+//! cannot be handed an edge where a vertex belongs. The query builder
+//! additionally checks the pattern against [`PropertyGraph::declaration`] at
+//! build time, so an entity that implements the marker trait but was never
+//! registered in the declaration fails here, with a message, rather than at the
+//! server.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use sea_orm::sea_query::{Alias, IntoIden, SelectStatement, TableRef};
+use sea_orm::sea_query::{Alias, IntoIden, Query, SelectStatement, TableRef};
 use sea_orm::{Condition, EntityTrait, FromQueryResult, QueryTrait, StatementBuilder};
-use toolkit_sea_orm_pgq::{
-    EdgeTable, ElementKey, EndpointRef, PropertyGraph as GraphDdl, VertexTable,
-};
+use toolkit_sea_orm_pgq::{EdgeTable, EndpointRef, PropertyGraph as GraphDdl, VertexTable};
 
 use crate::secure::cond::{ColumnAddress, SiblingSupport, build_scope_predicate};
 use crate::secure::select::{Scoped, SecureSelect};
@@ -108,7 +110,9 @@ impl GraphDeclaration {
     ///
     /// # Errors
     /// Returns [`ScopeError::Invalid`] when `J` resolves no scope column
-    /// (Policy 2) or when its label is already taken (Policy 1).
+    /// (Policy 2) or when its label is already taken (Policy 1), and
+    /// [`ScopeError::Pgq`] when the element cannot be rendered (e.g. an empty
+    /// key).
     pub fn vertex<G, J>(mut self, key: &[&str]) -> Result<Self, ScopeError>
     where
         G: PropertyGraph,
@@ -122,7 +126,8 @@ impl GraphDeclaration {
     /// Register `J` as an edge between two vertex tables.
     ///
     /// # Errors
-    /// As [`Self::vertex`], plus an endpoint that names no columns.
+    /// As [`Self::vertex`], plus an endpoint that names no columns or whose
+    /// key and referenced columns differ in arity.
     pub fn edge<G, J>(
         mut self,
         key: &[&str],
@@ -134,11 +139,11 @@ impl GraphDeclaration {
         J: EdgeOf<G>,
     {
         let element = self.element::<J>(J::LABEL, key)?;
-        self.edges.push(EdgeTable {
+        self.edges.push(EdgeTable::new(
             element,
-            source: into_endpoint(source)?,
-            destination: into_endpoint(destination)?,
-        });
+            into_endpoint(source)?,
+            into_endpoint(destination)?,
+        ));
         Ok(self)
     }
 
@@ -147,12 +152,6 @@ impl GraphDeclaration {
     where
         J: ScopableEntity + EntityTrait,
     {
-        if key.is_empty() {
-            return Err(ScopeError::Invalid(
-                "a property-graph element needs a key; without one no edge can reference it",
-            ));
-        }
-
         // Policy 2, checked here rather than after compiling a condition: an
         // entity that resolves no scope column compiles to exactly the same
         // predicate under a real scope as a legitimate deny-all does, so by the
@@ -184,20 +183,20 @@ impl GraphDeclaration {
             }
         }
 
-        Ok(VertexTable {
-            table: J::default().table_name().to_owned(),
-            key: ElementKey(key.iter().map(|c| (*c).to_owned()).collect()),
-            label: label.to_owned(),
+        Ok(VertexTable::new(
+            J::default().table_name(),
+            key.iter().map(|c| (*c).to_owned()).collect(),
+            label,
             properties,
-        })
+        )?)
     }
 
     /// Render the `CREATE PROPERTY GRAPH` statement.
     ///
     /// # Errors
-    /// Returns [`ScopeError::Invalid`] when the declaration cannot be rendered.
+    /// Returns [`ScopeError::Pgq`] when the declaration cannot be rendered.
     pub fn create_statement(&self) -> Result<String, ScopeError> {
-        self.ddl().create_statement().map_err(syntax_error)
+        Ok(self.ddl().create_statement()?)
     }
 
     /// Render the matching `DROP PROPERTY GRAPH IF EXISTS`.
@@ -205,15 +204,11 @@ impl GraphDeclaration {
     /// # Errors
     /// As [`Self::create_statement`].
     pub fn drop_statement(&self) -> Result<String, ScopeError> {
-        self.ddl().drop_statement().map_err(syntax_error)
+        Ok(self.ddl().drop_statement()?)
     }
 
     fn ddl(&self) -> GraphDdl {
-        GraphDdl {
-            name: self.name.clone(),
-            vertices: self.vertices.clone(),
-            edges: self.edges.clone(),
-        }
+        GraphDdl::new(self.name.clone(), self.vertices.clone(), self.edges.clone())
     }
 
     /// Labels declared so far, for tests and diagnostics.
@@ -226,38 +221,18 @@ impl GraphDeclaration {
     pub fn properties_of(&self, label: &str) -> Option<&[String]> {
         self.vertices
             .iter()
-            .chain(self.edges.iter().map(|e| &e.element))
-            .find(|element| element.label == label)
-            .map(|element| element.properties.as_slice())
+            .chain(self.edges.iter().map(EdgeTable::element))
+            .find(|element| element.label() == label)
+            .map(VertexTable::properties)
     }
 }
 
 fn into_endpoint(endpoint: Endpoint) -> Result<EndpointRef, ScopeError> {
-    if endpoint.key.is_empty() || endpoint.references.is_empty() {
-        return Err(ScopeError::Invalid(
-            "an edge endpoint needs both its own columns and the columns it references",
-        ));
-    }
-    if endpoint.key.len() != endpoint.references.len() {
-        return Err(ScopeError::Invalid(
-            "an edge endpoint must reference as many columns as it carries",
-        ));
-    }
-    Ok(EndpointRef {
-        key: ElementKey(endpoint.key),
-        table: endpoint.table,
-        references: ElementKey(endpoint.references),
-    })
-}
-
-/// A syntax-layer refusal, carried into this crate's error type.
-///
-/// The message is dropped rather than formatted in: `ScopeError::Invalid` holds
-/// a `&'static str`, and the syntax layer's refusals are all about a declaration
-/// this module already validated, so reaching one means a bug here rather than a
-/// caller mistake.
-fn syntax_error(_: toolkit_sea_orm_pgq::PgqError) -> ScopeError {
-    ScopeError::Invalid("the property-graph declaration could not be rendered")
+    Ok(EndpointRef::new(
+        endpoint.key,
+        endpoint.table,
+        endpoint.references,
+    )?)
 }
 
 // ───────────────────────── the secure graph query ─────────────────────────
@@ -267,14 +242,24 @@ fn syntax_error(_: toolkit_sea_orm_pgq::PgqError) -> ScopeError {
 /// Reachable only from a scoped select, mirroring `with_ctes`: the scope the
 /// elements inherit is the one the outer query already carries, so a
 /// differently-scoped element cannot be constructed.
+///
+/// Everything the caller registers is recorded and assembled in `build()`,
+/// because one decision can only be taken once the whole pattern is known:
+/// whether the anchor query stays in the `FROM` at all (see
+/// [`SecureSelect::with_graph`]).
 pub struct SecureGraphSelect<E: EntityTrait, G: PropertyGraph> {
-    /// Outer query, scope `WHERE` already embedded by `scope_with`. Its table is
-    /// the anchor a pattern may correlate against.
-    outer: SelectStatement,
+    /// The scoped entity query `with_graph` was called on, scope `WHERE`
+    /// already embedded. Placed in the `FROM` only when the pattern carries a
+    /// caller predicate that can correlate against it; otherwise dropped, so an
+    /// uncorrelated anchor cannot multiply rows.
+    anchor: SelectStatement,
     /// Seeds every element predicate. This is what makes same-scope structural.
     scope: Arc<AccessScope>,
     pattern: Option<PathState>,
     columns: Vec<toolkit_sea_orm_pgq::ProjectedColumn>,
+    filters: Vec<Condition>,
+    limit: Option<u64>,
+    distinct: bool,
     /// Relations the element predicates correlate against, deduplicated by
     /// alias so one relation referenced by several elements is placed once.
     siblings: Vec<SiblingPlacement>,
@@ -295,16 +280,66 @@ struct SiblingPlacement {
     query: SelectStatement,
 }
 
+/// One pattern element under construction.
+///
+/// The caller's predicates and the scope condition are kept apart until the
+/// element is finalized, so the rendered body always reads caller predicate
+/// first, scope after — scope is applied *on top of* whatever the caller wrote,
+/// and `Element::and_where` only ever narrows, so a predicate cannot filter the
+/// scope back off.
+struct PendingElement {
+    variable: &'static str,
+    label: &'static str,
+    caller: Vec<Condition>,
+    scope: Condition,
+}
+
+impl PendingElement {
+    fn finalize(self) -> toolkit_sea_orm_pgq::Element {
+        let mut element = toolkit_sea_orm_pgq::Element::new(self.variable, self.label);
+        for condition in self.caller {
+            element = element.and_where(condition);
+        }
+        element.and_where(self.scope)
+    }
+}
+
 /// Pattern under construction, with the pending edge a hop needs.
 #[derive(Default)]
 struct PathState {
-    head: Option<toolkit_sea_orm_pgq::Element>,
+    head: Option<PendingElement>,
     hops: Vec<(
-        toolkit_sea_orm_pgq::Element,
+        PendingElement,
         toolkit_sea_orm_pgq::Direction,
-        toolkit_sea_orm_pgq::Element,
+        PendingElement,
     )>,
-    pending_edge: Option<(toolkit_sea_orm_pgq::Element, toolkit_sea_orm_pgq::Direction)>,
+    pending_edge: Option<(PendingElement, toolkit_sea_orm_pgq::Direction)>,
+    /// Whether any element carries a caller predicate. A caller predicate is
+    /// the only construct that can correlate the pattern against the anchor,
+    /// so without one the anchor is dropped from the `FROM`.
+    has_caller_predicate: bool,
+}
+
+impl PathState {
+    /// The element a `where_` call attaches to: the most recently added one.
+    fn last_element_mut(&mut self) -> Option<&mut PendingElement> {
+        if let Some((edge, _)) = self.pending_edge.as_mut() {
+            return Some(edge);
+        }
+        if let Some((_, _, target)) = self.hops.last_mut() {
+            return Some(target);
+        }
+        self.head.as_mut()
+    }
+
+    /// Every element, head first, in written order.
+    fn elements(&self) -> impl Iterator<Item = &PendingElement> {
+        self.head.iter().chain(
+            self.hops
+                .iter()
+                .flat_map(|(edge, _, target)| [edge, target]),
+        )
+    }
 }
 
 impl<E> SecureSelect<E, Scoped>
@@ -314,17 +349,26 @@ where
     /// Begin a graph query over `G`.
     ///
     /// Every pattern element registered on the result is scoped with **this**
-    /// query's `AccessScope`. The outer query stays in the `FROM` as the anchor,
-    /// which is what lets a pattern correlate against an already-scoped entity
-    /// query — the "start from these rows and walk out one hop" shape.
+    /// query's `AccessScope`.
+    ///
+    /// The query itself becomes the *anchor*: it stays in the `FROM` — already
+    /// scoped — when the pattern correlates against it through an element
+    /// predicate ([`PathBuilder::where_`]), which is the "start from these
+    /// rows and walk out one hop" shape. A pattern with no element predicate
+    /// has no way to reference the anchor, so the anchor is dropped from the
+    /// `FROM` rather than left as an uncorrelated cross join that multiplies
+    /// every match by the anchor's row count.
     #[must_use]
     pub fn with_graph<G: PropertyGraph>(self) -> SecureGraphSelect<E, G> {
         let scope = self.scope_arc();
         SecureGraphSelect {
-            outer: QueryTrait::into_query(self.into_inner()),
+            anchor: QueryTrait::into_query(self.into_inner()),
             scope,
             pattern: None,
             columns: Vec::new(),
+            filters: Vec::new(),
+            limit: None,
+            distinct: false,
             siblings: Vec::new(),
             error: None,
             graph_alias: "cf_graph",
@@ -411,6 +455,34 @@ impl<G: PropertyGraph> PathBuilder<G> {
         self
     }
 
+    /// Narrow the element added last with the caller's own predicate.
+    ///
+    /// The predicate is written inside the element's body, **before** the scope
+    /// condition — scope is applied on top of it and cannot be filtered back
+    /// off. Columns are addressed by the element's variable
+    /// (`Expr::col(("a", "id"))`), and a predicate that compares against the
+    /// anchor entity's own columns is what correlates the pattern with the
+    /// anchor query — the "start from these rows, walk out one hop" shape.
+    #[must_use]
+    pub fn where_(mut self, condition: Condition) -> Self {
+        if condition.is_empty() {
+            self.fail(ScopeError::Invalid(
+                "an empty element predicate constrains nothing; \
+                 drop the where_() call or add a filter to the condition",
+            ));
+            return self;
+        }
+        if let Some(element) = self.state.last_element_mut() {
+            element.caller.push(condition);
+            self.state.has_caller_predicate = true;
+        } else {
+            self.fail(ScopeError::Invalid(
+                "where_() narrows the last added element; add a vertex or an edge first",
+            ));
+        }
+        self
+    }
+
     fn edge<J>(&mut self, variable: &'static str, direction: toolkit_sea_orm_pgq::Direction)
     where
         J: EdgeOf<G>,
@@ -438,12 +510,15 @@ impl<G: PropertyGraph> PathBuilder<G> {
     ///
     /// Policy 2 first: an entity that resolves no scope column is refused here,
     /// because after a condition exists it is indistinguishable from a
-    /// legitimate deny-all.
+    /// legitimate deny-all. The same policy is then checked against the *live*
+    /// scope: an entity may well declare scope columns and still resolve none
+    /// of the properties this particular scope addresses, which would compile
+    /// to the very same silent deny-all.
     fn scoped_element<J>(
         &mut self,
         variable: &'static str,
         label: &'static str,
-    ) -> Result<toolkit_sea_orm_pgq::Element, ScopeError>
+    ) -> Result<PendingElement, ScopeError>
     where
         J: ScopableEntity + EntityTrait,
         J::Column: sea_orm::ColumnTrait + Copy,
@@ -454,6 +529,7 @@ impl<G: PropertyGraph> PathBuilder<G> {
                  an element that resolves none would traverse as a silent deny-all",
             ));
         }
+        self.require_scope_resolves::<J>(variable)?;
 
         let predicate = build_scope_predicate::<J>(
             &self.scope,
@@ -463,6 +539,19 @@ impl<G: PropertyGraph> PathBuilder<G> {
             },
         )?;
         let (condition, siblings) = predicate.into_parts();
+
+        // A scope that is neither unconstrained nor deny-all must leave a real
+        // predicate on the element. An empty condition here would be dropped by
+        // `Element::and_where`, and the element would traverse every tenant's
+        // rows under a scope that never said allow-all — so "no predicate" is
+        // reachable only from an explicitly unconstrained scope.
+        if condition.is_empty() && !self.scope.is_unconstrained() {
+            return Err(ScopeError::Invalid(
+                "the scope compiled to an empty predicate for a graph element; \
+                 only an explicitly unconstrained scope may leave an element \
+                 without a predicate",
+            ));
+        }
 
         for sibling in siblings {
             // Deduplicated by alias: the same scope compiled for two elements
@@ -476,7 +565,48 @@ impl<G: PropertyGraph> PathBuilder<G> {
             }
         }
 
-        Ok(toolkit_sea_orm_pgq::Element::new(variable, label).and_where(condition))
+        Ok(PendingElement {
+            variable,
+            label,
+            caller: Vec::new(),
+            scope: condition,
+        })
+    }
+
+    /// Refuse an element on which no constraint of the live scope resolves.
+    ///
+    /// `build_scope_predicate` drops a constraint whose property does not
+    /// resolve — the fail-closed rule for OR-ed alternatives — and falls to
+    /// deny-all when *every* constraint dropped. On the graph path that
+    /// deny-all is indistinguishable from missing data, so it is refused here
+    /// by name instead (Policy 2, the same reasoning as the declaration-time
+    /// gate, applied to the scope actually in force).
+    fn require_scope_resolves<J>(&self, variable: &'static str) -> Result<(), ScopeError>
+    where
+        J: ScopableEntity + EntityTrait,
+    {
+        if self.scope.is_unconstrained() || self.scope.is_deny_all() {
+            return Ok(());
+        }
+        let mut first_unresolved: Option<&str> = None;
+        for constraint in self.scope.constraints() {
+            match constraint
+                .filters()
+                .iter()
+                .find(|filter| J::resolve_property(filter.property()).is_none())
+            {
+                // Every filter of this constraint resolves: the scope is
+                // servable on this element.
+                None => return Ok(()),
+                Some(filter) => {
+                    first_unresolved.get_or_insert(filter.property());
+                }
+            }
+        }
+        Err(ScopeError::UnresolvedScopeProperty {
+            element: variable,
+            property: first_unresolved.unwrap_or_default().to_owned(),
+        })
     }
 
     fn fail(&mut self, error: ScopeError) {
@@ -495,9 +625,18 @@ where
     ///
     /// Scope is attached to every element as it is added, so a predicate the
     /// closure adds afterwards narrows the element rather than replacing what
-    /// the library put there.
+    /// the library put there. Callable once: a second pattern would silently
+    /// replace the first while keeping the relations it placed, so it is
+    /// refused instead.
     #[must_use]
     pub fn match_path(mut self, f: impl FnOnce(PathBuilder<G>) -> PathBuilder<G>) -> Self {
+        if self.pattern.is_some() {
+            self.fail(ScopeError::Invalid(
+                "match_path() was called twice; a graph query has one pattern",
+            ));
+            return self;
+        }
+
         let builder = f(PathBuilder {
             scope: Arc::clone(&self.scope),
             state: PathState::default(),
@@ -526,12 +665,7 @@ where
         self
     }
 
-    /// Project a graph property into the result, and select it in the outer
-    /// query.
-    ///
-    /// Selecting it here as well is deliberate: a `COLUMNS` entry nothing selects
-    /// transfers nothing, and a caller that has just named the properties it
-    /// wants should not have to name them twice.
+    /// Project a graph property into the result.
     #[must_use]
     pub fn column(
         mut self,
@@ -542,36 +676,27 @@ where
         self.columns.push(toolkit_sea_orm_pgq::ProjectedColumn::new(
             variable, property, alias,
         ));
-        // First projected column replaces the anchor's `SELECT *`: a graph query
-        // asked for graph columns.
-        if self.columns.len() == 1 {
-            self.outer.clear_selects();
-        }
-        self.outer.expr_as(
-            sea_orm::sea_query::Expr::col((Alias::new(self.graph_alias), Alias::new(alias))),
-            Alias::new(alias),
-        );
         self
     }
 
     /// Narrow the outer query, on top of the scope the elements already carry.
     #[must_use]
     pub fn filter(mut self, filter: Condition) -> Self {
-        self.outer.cond_where(filter);
+        self.filters.push(filter);
         self
     }
 
     /// Cap the number of rows.
     #[must_use]
     pub fn limit(mut self, limit: u64) -> Self {
-        self.outer.limit(limit);
+        self.limit = Some(limit);
         self
     }
 
     /// Deduplicate the outer result.
     #[must_use]
     pub fn distinct(mut self) -> Self {
-        self.outer.distinct();
+        self.distinct = true;
         self
     }
 
@@ -581,9 +706,55 @@ where
         }
     }
 
-    /// Assemble the statement: the anchor, the correlated siblings, and the
-    /// pattern, in one `FROM`.
-    fn build(mut self) -> Result<SelectStatement, ScopeError> {
+    /// Check the pattern against the graph's declaration (Policy 3).
+    ///
+    /// `VertexOf`/`EdgeOf` tie an entity to the graph *type*, but nothing ties
+    /// an `impl` to the declaration — an entity could be patterned into a graph
+    /// it was never registered in, and the mistake would surface as a server
+    /// error naming no Rust construct. Checked here instead: every label must
+    /// be declared, and every projected property must be in the element's
+    /// `PROPERTIES` list, where a missing entry is otherwise *silently*
+    /// unfilterable.
+    fn check_declaration(
+        state: &PathState,
+        columns: &[toolkit_sea_orm_pgq::ProjectedColumn],
+    ) -> Result<(), ScopeError> {
+        let declaration = G::declaration()?;
+
+        let mut label_of: BTreeMap<&str, &str> = BTreeMap::new();
+        for element in state.elements() {
+            if declaration.properties_of(element.label).is_none() {
+                return Err(ScopeError::Invalid(
+                    "the pattern addresses a label the graph declaration does not \
+                     declare; register the entity in the declaration",
+                ));
+            }
+            label_of.insert(element.variable, element.label);
+        }
+
+        for column in columns {
+            let Some(label) = label_of.get(column.variable()) else {
+                return Err(ScopeError::Invalid(
+                    "a projected column names a variable the pattern does not bind",
+                ));
+            };
+            let exposed = declaration
+                .properties_of(label)
+                .is_some_and(|properties| properties.iter().any(|p| p == column.property()));
+            if !exposed {
+                return Err(ScopeError::Invalid(
+                    "a projected property is not in the element's PROPERTIES list; \
+                     a column absent from that list is invisible to MATCH; expose \
+                     it through the element's key or scope columns",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Assemble the statement: the anchor (if the pattern correlates against
+    /// it), the correlated siblings, and the pattern, in one `FROM`.
+    fn build(self) -> Result<SelectStatement, ScopeError> {
         if let Some(error) = self.error {
             return Err(error);
         }
@@ -592,48 +763,88 @@ where
                 "a graph query needs a pattern; call match_path()",
             ));
         };
+
+        Self::check_declaration(&state, &self.columns)?;
+
+        // The anchor can only be referenced through a caller predicate, so
+        // without one it would be a pure row multiplier: `column()` selects
+        // graph columns only, and a comma-joined relation nothing references
+        // returns each match once per anchor row. The scope it carried is not
+        // lost — every element body embeds the same scope.
+        let mut outer = if state.has_caller_predicate {
+            self.anchor
+        } else {
+            Query::select()
+        };
+        // The graph query's result is the projected graph columns; whatever the
+        // anchor selected is replaced rather than appended to.
+        outer.clear_selects();
+
         let Some(head) = state.head else {
             return Err(ScopeError::Invalid(
                 "a graph query needs a head vertex; call vertex()",
             ));
         };
-
-        let mut pattern = toolkit_sea_orm_pgq::GraphPattern::new(head);
+        let mut pattern = toolkit_sea_orm_pgq::GraphPattern::new(head.finalize());
         for (edge, direction, target) in state.hops {
-            pattern = pattern.hop(edge, direction, target);
+            pattern = pattern.hop(edge.finalize(), direction, target.finalize());
         }
 
         let mut table = toolkit_sea_orm_pgq::GraphTable::new(G::GRAPH_NAME, pattern);
-        for column in self.columns {
-            table = table.column(column);
+        for column in &self.columns {
+            outer.expr_as(
+                sea_orm::sea_query::Expr::col((
+                    Alias::new(self.graph_alias),
+                    Alias::new(column.alias()),
+                )),
+                Alias::new(column.alias()),
+            );
+            table = table.column(column.clone());
         }
 
         // Siblings first, then the pattern: a comma join, which PostgreSQL
         // treats as an implicit lateral, so the pattern's correlated references
         // resolve. `LATERAL` itself is refused before `GRAPH_TABLE`.
         for sibling in self.siblings {
-            self.outer.from(TableRef::SubQuery(
+            outer.from(TableRef::SubQuery(
                 Box::new(sibling.query),
                 Alias::new(sibling.alias.as_str()).into_iden(),
             ));
         }
-        self.outer.from(
-            table
-                .into_table_ref(self.graph_alias)
-                .map_err(|_| ScopeError::Invalid("the graph pattern could not be rendered"))?,
-        );
+        outer.from(table.into_table_ref(self.graph_alias)?);
 
-        Ok(self.outer)
+        for filter in self.filters {
+            outer.cond_where(filter);
+        }
+        if let Some(limit) = self.limit {
+            outer.limit(limit);
+        }
+        if self.distinct {
+            outer.distinct();
+        }
+
+        Ok(outer)
     }
 
-    /// Render the statement without executing it.
+    /// Render the statement for `backend` without executing it.
+    ///
+    /// Exists because this crate has no mock database: it is the only way for a
+    /// test to assert on the emitted SQL. Crate-private — `sea_orm::Statement`
+    /// and `DbBackend` must not appear in this crate's public surface, exactly
+    /// as on the CTE path (see the `runner` module docs).
     ///
     /// # Errors
     /// Returns [`ScopeError::Invalid`] for a pattern that cannot be built.
-    pub fn build_statement(
+    #[cfg(test)]
+    pub(crate) fn build_statement(
         self,
         backend: sea_orm::DbBackend,
     ) -> Result<sea_orm::Statement, ScopeError> {
+        self.into_statement(backend)
+    }
+
+    /// Render the statement for execution.
+    fn into_statement(self, backend: sea_orm::DbBackend) -> Result<sea_orm::Statement, ScopeError> {
         let query = self.build()?;
         Ok(StatementBuilder::build(&query, &backend))
     }
@@ -648,7 +859,7 @@ where
         T: FromQueryResult + Send + Sync,
     {
         let exec = DBRunnerInternal::as_seaorm(runner);
-        let stmt = self.build_statement(exec.backend())?;
+        let stmt = self.into_statement(exec.backend())?;
         Ok(match exec {
             crate::secure::SeaOrmRunner::Conn(db) => T::find_by_statement(stmt).all(db).await?,
             crate::secure::SeaOrmRunner::Tx(tx) => T::find_by_statement(stmt).all(tx).await?,

@@ -48,6 +48,9 @@ mod node {
                 _ => None,
             }
         }
+        fn scope_columns() -> Vec<Column> {
+            vec![Column::TenantId, Column::Id]
+        }
     }
 }
 
@@ -91,6 +94,9 @@ mod edge {
                 p if p == pep_properties::RESOURCE_ID => Some(Column::Id),
                 _ => None,
             }
+        }
+        fn scope_columns() -> Vec<Column> {
+            vec![Column::TenantId, Column::Id]
         }
     }
 }
@@ -137,6 +143,9 @@ mod owned {
                 _ => None,
             }
         }
+        fn scope_columns() -> Vec<Column> {
+            vec![Column::TenantId, Column::Id, Column::OwnerId]
+        }
     }
 }
 
@@ -175,6 +184,9 @@ mod closure {
         }
         fn resolve_property(_property: &str) -> Option<Column> {
             None
+        }
+        fn scope_columns() -> Vec<Column> {
+            Vec::new()
         }
     }
 }
@@ -399,7 +411,10 @@ fn a_mismatched_endpoint_arity_is_refused() {
 
     let err = Mismatched::declaration().expect_err("arity must match");
     assert!(
-        matches!(err, ScopeError::Invalid(msg) if msg.contains("as many columns")),
+        matches!(
+            err,
+            ScopeError::Pgq(toolkit_sea_orm_pgq::PgqError::MismatchedEndpointArity { .. })
+        ),
         "unexpected error: {err}"
     );
 }
@@ -451,6 +466,7 @@ fn the_derive_enumerates_custom_pep_properties() {
 
 use crate::secure::SecureEntityExt as _;
 use sea_orm::EntityTrait as _;
+use sea_orm::sea_query::ExprTrait as _;
 use toolkit_security::AccessScope;
 
 /// Each element's own body, keyed by its variable.
@@ -559,16 +575,61 @@ fn every_graph_element_embeds_scope() {
     }
 }
 
-/// An outer `WHERE` is not a substitute: it trims the output while the traversal
-/// already saw every tenant's rows. So the element bodies must carry the
-/// predicate even though the outer query has one too.
+/// A pattern with no caller predicate has no way to reference the anchor, so
+/// the anchor is dropped from the `FROM` rather than left as an uncorrelated
+/// comma join — which would multiply every match by the anchor's row count.
+#[test]
+fn an_uncorrelated_anchor_is_dropped_from_the_from_clause() {
+    let sql = two_hop(&tenant_scope()).expect("builds");
+    assert!(
+        !sql.contains(r#""graph_node""#),
+        "an anchor nothing references must not be in the FROM: {sql}"
+    );
+    // Isolation is not lost with it: every element still carries the scope.
+    for (variable, body) in element_bodies(&sql) {
+        assert!(
+            body.contains(&format!(r#""{variable}"."tenant_id""#)),
+            "{body}"
+        );
+    }
+}
+
+/// The "start from these rows, walk out one hop" shape: a caller predicate
+/// correlating an element with the anchor keeps the anchor in the `FROM` —
+/// scoped by its own outer `WHERE` — and that outer `WHERE` is still not a
+/// substitute for element scope, which every body carries regardless.
 #[test]
 fn the_outer_where_does_not_stand_in_for_element_scope() {
-    let sql = two_hop(&tenant_scope()).expect("builds");
+    use sea_orm::sea_query::{Alias, Expr};
+
+    let sql = node::Entity::find()
+        .secure()
+        .scope_with(&tenant_scope())
+        .with_graph::<Kb>()
+        .match_path(|p| {
+            p.vertex::<node::Entity>("a")
+                .where_(
+                    sea_orm::Condition::all().add(
+                        Expr::col((Alias::new("a"), Alias::new("id")))
+                            .eq(Expr::col((Alias::new("graph_node"), Alias::new("id")))),
+                    ),
+                )
+                .edge_to::<edge::Entity>("e")
+                .to::<node::Entity>("b")
+        })
+        .column("b", "id", "neighbour")
+        .build_statement(sea_orm::DbBackend::Postgres)
+        .expect("builds")
+        .sql;
+
     let (pattern, outer) = sql.split_once(" AS \"cf_graph\"").expect("aliased");
     assert!(
+        pattern.contains(r#"FROM "graph_node""#),
+        "a correlated anchor stays in the FROM: {pattern}"
+    );
+    assert!(
         outer.contains(r#""graph_node"."tenant_id""#),
-        "the anchor should still be scoped: {outer}"
+        "the anchor must still be scoped: {outer}"
     );
     // And removing the outer clause from consideration leaves the pattern fully
     // scoped on its own.
@@ -581,15 +642,24 @@ fn the_outer_where_does_not_stand_in_for_element_scope() {
 }
 
 /// A caller predicate narrows an element; it cannot remove what the library put
-/// there. Both predicates must survive in the same body.
+/// there. Both must survive in the same element body, the caller's predicate
+/// first and the scope AND-ed after it — scope is applied on top, so a
+/// predicate cannot filter it back off.
 #[test]
 fn a_caller_predicate_cannot_remove_element_scope() {
+    use sea_orm::sea_query::{Alias, Expr};
+
+    // A predicate that would exclude every scoped row, were it able to win.
+    let excluding = sea_orm::Condition::all().add(
+        Expr::col((Alias::new("a"), Alias::new("tenant_id"))).eq(uuid::Uuid::from_u128(0xDEAD)),
+    );
     let sql = node::Entity::find()
         .secure()
         .scope_with(&tenant_scope())
         .with_graph::<Kb>()
         .match_path(|p| {
             p.vertex::<node::Entity>("a")
+                .where_(excluding)
                 .edge_to::<edge::Entity>("e")
                 .to::<node::Entity>("b")
         })
@@ -597,12 +667,23 @@ fn a_caller_predicate_cannot_remove_element_scope() {
         .build_statement(sea_orm::DbBackend::Postgres)
         .expect("builds")
         .sql;
+
     let bodies = element_bodies(&sql);
-    assert!(
-        bodies["a"].contains(r#""a"."tenant_id""#),
-        "{:?}",
-        bodies["a"]
+    let body = &bodies["a"];
+    let caller = body.find(" = ").expect("the caller predicate renders");
+    let occurrences = body.matches(r#""a"."tenant_id""#).count();
+    assert_eq!(
+        occurrences, 2,
+        "both the caller predicate and the scope must survive in one body: {body}"
     );
+    let scope = body
+        .rfind(r#""a"."tenant_id" IN"#)
+        .expect("the scope renders");
+    assert!(
+        caller < scope,
+        "the caller predicate must precede the scope, so scope is AND-ed on top: {body}"
+    );
+    assert!(body.contains(" AND "), "{body}");
 }
 
 /// Deny-all reaches every element rather than only the outer query.
@@ -780,5 +861,192 @@ fn elements_binding_different_values_get_different_placeholders() {
     assert!(
         rendered.contains("1111") && rendered.contains("2222"),
         "{rendered}"
+    );
+}
+
+/// The exact bound-value list, for a pattern whose elements bind *different*
+/// numbers of values. Under a symmetric pattern (every element compiling the
+/// same scope) a placeholder-numbering bug is invisible: the wrong index still
+/// lands on the right value. Here the edge carries one extra caller value, so
+/// any renumbering or dropped binding shifts the list and fails the equality.
+#[test]
+fn the_exact_value_list_is_bound_when_elements_differ() {
+    use sea_orm::sea_query::{Alias, Expr};
+
+    let tenant = uuid::Uuid::from_u128(0x5150);
+    let stmt = node::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::for_tenant(tenant))
+        .with_graph::<Kb>()
+        .match_path(|p| {
+            p.vertex::<node::Entity>("a")
+                .edge_to::<edge::Entity>("e")
+                .where_(
+                    sea_orm::Condition::all()
+                        .add(Expr::col((Alias::new("e"), Alias::new("id"))).eq(5_i64)),
+                )
+                .to::<node::Entity>("b")
+        })
+        .column("b", "id", "neighbour")
+        .build_statement(sea_orm::DbBackend::Postgres)
+        .expect("builds");
+
+    let values = stmt.values.expect("bound values");
+    assert_eq!(
+        values.0,
+        vec![
+            // element `a`: its scope.
+            sea_orm::Value::from(tenant),
+            // element `e`: the caller predicate first, then its scope.
+            sea_orm::Value::from(5_i64),
+            sea_orm::Value::from(tenant),
+            // element `b`: its scope.
+            sea_orm::Value::from(tenant),
+            // the anchor's outer WHERE — the caller predicate kept it in the
+            // FROM, and its scope binds after the pattern renders.
+            sea_orm::Value::from(tenant),
+        ],
+        "values must bind in pattern order, caller predicate before scope"
+    );
+    assert!(
+        stmt.sql.contains("$5") && !stmt.sql.contains("$6"),
+        "exactly five placeholders: {}",
+        stmt.sql
+    );
+}
+
+/// A scope made of one empty constraint is neither unconstrained nor deny-all,
+/// yet compiles to an empty predicate. Attaching nothing would leave the
+/// element traversing every tenant's rows, so it is refused: "no predicate" is
+/// reachable only from an explicitly unconstrained scope.
+#[test]
+fn an_empty_constraint_scope_is_refused_for_elements() {
+    let scope =
+        AccessScope::from_constraints(vec![toolkit_security::access_scope::ScopeConstraint::new(
+            vec![],
+        )]);
+    assert!(!scope.is_unconstrained() && !scope.is_deny_all());
+
+    let err = two_hop(&scope).expect_err("an empty predicate must be refused");
+    assert!(
+        matches!(err, ScopeError::Invalid(msg) if msg.contains("empty predicate")),
+        "unexpected error: {err}"
+    );
+}
+
+/// Policy 2 against the *live* scope: an entity may declare scope columns and
+/// still resolve none of the properties this scope addresses. Compiled, that
+/// would be a silent deny-all traversal; refused instead, naming the element
+/// and the property.
+#[test]
+fn a_scope_no_constraint_of_which_resolves_is_refused() {
+    let scope =
+        AccessScope::from_constraints(vec![toolkit_security::access_scope::ScopeConstraint::new(
+            vec![toolkit_security::access_scope::ScopeFilter::in_uuids(
+                "department_id",
+                vec![uuid::Uuid::from_u128(1)],
+            )],
+        )]);
+
+    let err = two_hop(&scope).expect_err("an unresolvable scope must be refused");
+    assert!(
+        matches!(
+            &err,
+            ScopeError::UnresolvedScopeProperty { element, property }
+                if *element == "a" && property == "department_id"
+        ),
+        "unexpected error: {err}"
+    );
+}
+
+/// Policy 3 on the query path: `VertexOf` ties an entity to the graph *type*,
+/// but only the declaration says what the graph object really contains. A
+/// label the declaration does not register fails at build time, with a
+/// message, rather than at the server.
+#[test]
+fn a_label_outside_the_declaration_is_refused() {
+    struct Sparse;
+    impl PropertyGraph for Sparse {
+        const GRAPH_NAME: &'static str = "sparse";
+        fn declaration() -> Result<GraphDeclaration, ScopeError> {
+            GraphDeclaration::new::<Self>().vertex::<Self, node::Entity>(&["tenant_id", "id"])
+        }
+    }
+    impl VertexOf<Sparse> for node::Entity {
+        const LABEL: &'static str = "node";
+    }
+    // Registered nowhere in the declaration, yet the marker impl compiles —
+    // exactly the drift the build-time check exists to catch.
+    impl VertexOf<Sparse> for edge::Entity {
+        const LABEL: &'static str = "ghost";
+    }
+
+    let err = node::Entity::find()
+        .secure()
+        .scope_with(&tenant_scope())
+        .with_graph::<Sparse>()
+        .match_path(|p| p.vertex::<edge::Entity>("g"))
+        .column("g", "id", "x")
+        .build_statement(sea_orm::DbBackend::Postgres)
+        .expect_err("an undeclared label must be refused");
+    assert!(
+        matches!(err, ScopeError::Invalid(msg) if msg.contains("does not declare")),
+        "unexpected error: {err}"
+    );
+}
+
+/// A projected property missing from the element's `PROPERTIES` list is
+/// *silently* unfilterable at the server, so the build refuses it by name.
+#[test]
+fn a_property_outside_the_declaration_is_refused() {
+    let err = node::Entity::find()
+        .secure()
+        .scope_with(&tenant_scope())
+        .with_graph::<Kb>()
+        .match_path(|p| {
+            p.vertex::<node::Entity>("a")
+                .edge_to::<edge::Entity>("e")
+                .to::<node::Entity>("b")
+        })
+        // `name` is a real column of the node table, deliberately not exposed.
+        .column("b", "name", "n")
+        .build_statement(sea_orm::DbBackend::Postgres)
+        .expect_err("an unexposed property must be refused");
+    assert!(
+        matches!(err, ScopeError::Invalid(msg) if msg.contains("PROPERTIES")),
+        "unexpected error: {err}"
+    );
+
+    let unbound = node::Entity::find()
+        .secure()
+        .scope_with(&tenant_scope())
+        .with_graph::<Kb>()
+        .match_path(|p| p.vertex::<node::Entity>("a"))
+        .column("z", "id", "x")
+        .build_statement(sea_orm::DbBackend::Postgres)
+        .expect_err("a variable the pattern does not bind must be refused");
+    assert!(
+        matches!(unbound, ScopeError::Invalid(msg) if msg.contains("does not bind")),
+        "unexpected error: {unbound}"
+    );
+}
+
+/// A second `match_path` would silently replace the first pattern while keeping
+/// the sibling relations it contributed — an uncorrelated `FROM` item nothing
+/// references. Refused instead.
+#[test]
+fn a_second_match_path_is_refused() {
+    let err = node::Entity::find()
+        .secure()
+        .scope_with(&tenant_scope())
+        .with_graph::<Kb>()
+        .match_path(|p| p.vertex::<node::Entity>("a"))
+        .match_path(|p| p.vertex::<node::Entity>("b"))
+        .column("a", "id", "x")
+        .build_statement(sea_orm::DbBackend::Postgres)
+        .expect_err("a second pattern must be refused");
+    assert!(
+        matches!(err, ScopeError::Invalid(msg) if msg.contains("twice")),
+        "unexpected error: {err}"
     );
 }
