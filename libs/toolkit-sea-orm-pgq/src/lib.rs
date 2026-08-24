@@ -32,9 +32,10 @@
 //! name therefore renders as exactly one quoted identifier.
 //!
 //! **Values are bound, never interpolated.** Element predicates arrive as
-//! `sea_query` [`Condition`]s and are written into one shared
-//! [`SqlWriterValues`], so placeholders are numbered continuously across the
-//! whole construct and the values travel as parameters.
+//! `sea_query` [`Condition`]s and are handed to the enclosing statement's
+//! builder as expressions, so placeholders are numbered continuously across
+//! the whole statement and the values travel as parameters. The `render`
+//! module documents why they must not be pre-rendered to text instead.
 //!
 //! # Directions are explicit
 //!
@@ -45,7 +46,6 @@
 //! directed patterns.
 //!
 //! [`QuotedBuilder::prepare_iden`]: sea_orm::sea_query::QuotedBuilder::prepare_iden
-//! [`SqlWriterValues`]: sea_orm::sea_query::SqlWriterValues
 //! [`Condition`]: sea_orm::Condition
 
 mod ast;
@@ -58,5 +58,5 @@ mod render;
 mod tests;
 
 pub use ast::{Direction, Element, GraphPattern, GraphTable, ProjectedColumn};
-pub use ddl::{EdgeTable, ElementKey, EndpointRef, PropertyGraph, VertexTable};
+pub use ddl::{EdgeTable, EndpointRef, PropertyGraph, VertexTable};
 pub use error::PgqError;

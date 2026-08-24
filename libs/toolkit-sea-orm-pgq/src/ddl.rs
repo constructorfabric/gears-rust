@@ -10,6 +10,12 @@
 //! `PROPERTIES` list is invisible to `MATCH`.** Not an error — just silently
 //! unfilterable, which for a scope column means the pattern cannot be scoped at
 //! all. That failure mode is why generation exists.
+//!
+//! Fields are `pub(crate)` behind validating constructors, for the same reason
+//! `ast` documents: these types are re-exported from the crate root, so `pub`
+//! fields would let a caller assemble a declaration around the invariants the
+//! constructors check — an endpoint whose key and referenced columns disagree
+//! in arity, for instance, renders as DDL `PostgreSQL` rejects.
 
 use sea_orm::sea_query::{Alias, IntoIden, PostgresQueryBuilder, QuotedBuilder};
 
@@ -43,57 +49,156 @@ fn require_named(value: &str, what: &'static str) -> Result<(), PgqError> {
 /// the tenant means an edge structurally cannot join a vertex of another tenant,
 /// before any scope predicate is applied.
 #[derive(Clone, Debug)]
-pub struct ElementKey(pub Vec<String>);
+pub struct ElementKey(pub(crate) Vec<String>);
 
 /// One vertex table and the label it is declared under.
 #[derive(Clone, Debug)]
 pub struct VertexTable {
     /// Table backing the element.
-    pub table: String,
+    pub(crate) table: String,
     /// Key columns.
-    pub key: ElementKey,
+    pub(crate) key: ElementKey,
     /// Label the pattern language addresses it by. One label per table: sharing
     /// a label across tables would give one label several security mappings.
-    pub label: String,
+    pub(crate) label: String,
     /// Columns exposed as properties. A scope column missing here cannot be
     /// filtered on inside a pattern.
-    pub properties: Vec<String>,
+    pub(crate) properties: Vec<String>,
+}
+
+impl VertexTable {
+    /// An element over `table`, addressed as `label`, keyed on `key` and
+    /// exposing `properties`.
+    ///
+    /// # Errors
+    /// Returns [`PgqError::EmptyElementKey`] for a key with no columns — such an
+    /// element could never be referenced by an endpoint — and
+    /// [`PgqError::EmptyProperties`] for an empty property list, which would
+    /// make the element unfilterable.
+    pub fn new(
+        table: impl Into<String>,
+        key: Vec<String>,
+        label: impl Into<String>,
+        properties: Vec<String>,
+    ) -> Result<Self, PgqError> {
+        if key.is_empty() {
+            return Err(PgqError::EmptyElementKey);
+        }
+        if properties.is_empty() {
+            return Err(PgqError::EmptyProperties);
+        }
+        Ok(Self {
+            table: table.into(),
+            key: ElementKey(key),
+            label: label.into(),
+            properties,
+        })
+    }
+
+    /// The label the pattern language addresses this element by.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// The columns exposed as properties.
+    #[must_use]
+    pub fn properties(&self) -> &[String] {
+        &self.properties
+    }
 }
 
 /// Which vertex an edge endpoint points at.
 #[derive(Clone, Debug)]
 pub struct EndpointRef {
     /// Columns on the edge table.
-    pub key: ElementKey,
+    pub(crate) key: ElementKey,
     /// Vertex table referenced.
-    pub table: String,
+    pub(crate) table: String,
     /// Columns on that vertex table.
-    pub references: ElementKey,
+    pub(crate) references: ElementKey,
+}
+
+impl EndpointRef {
+    /// An endpoint mapping `key` on the edge table to `references` on `table`.
+    ///
+    /// # Errors
+    /// Returns [`PgqError::EmptyEndpointKey`] when either column list is empty,
+    /// and [`PgqError::MismatchedEndpointArity`] when the two lists differ in
+    /// length — both would render DDL `PostgreSQL` rejects.
+    pub fn new(
+        key: Vec<String>,
+        table: impl Into<String>,
+        references: Vec<String>,
+    ) -> Result<Self, PgqError> {
+        if key.is_empty() || references.is_empty() {
+            return Err(PgqError::EmptyEndpointKey);
+        }
+        if key.len() != references.len() {
+            return Err(PgqError::MismatchedEndpointArity {
+                key: key.len(),
+                references: references.len(),
+            });
+        }
+        Ok(Self {
+            key: ElementKey(key),
+            table: table.into(),
+            references: ElementKey(references),
+        })
+    }
 }
 
 /// One edge table, its label and its two endpoints.
 #[derive(Clone, Debug)]
 pub struct EdgeTable {
     /// The element itself.
-    pub element: VertexTable,
+    pub(crate) element: VertexTable,
     /// Source endpoint.
-    pub source: EndpointRef,
+    pub(crate) source: EndpointRef,
     /// Destination endpoint.
-    pub destination: EndpointRef,
+    pub(crate) destination: EndpointRef,
+}
+
+impl EdgeTable {
+    /// An edge over `element`, pointing from `source` to `destination`.
+    #[must_use]
+    pub fn new(element: VertexTable, source: EndpointRef, destination: EndpointRef) -> Self {
+        Self {
+            element,
+            source,
+            destination,
+        }
+    }
+
+    /// The element common to vertices and edges: table, key, label, properties.
+    #[must_use]
+    pub fn element(&self) -> &VertexTable {
+        &self.element
+    }
 }
 
 /// A whole property-graph declaration.
 #[derive(Clone, Debug)]
 pub struct PropertyGraph {
     /// Name of the graph object.
-    pub name: String,
+    pub(crate) name: String,
     /// Vertex tables.
-    pub vertices: Vec<VertexTable>,
+    pub(crate) vertices: Vec<VertexTable>,
     /// Edge tables.
-    pub edges: Vec<EdgeTable>,
+    pub(crate) edges: Vec<EdgeTable>,
 }
 
 impl PropertyGraph {
+    /// A graph named `name` over the given element tables.
+    #[must_use]
+    pub fn new(name: impl Into<String>, vertices: Vec<VertexTable>, edges: Vec<EdgeTable>) -> Self {
+        Self {
+            name: name.into(),
+            vertices,
+            edges,
+        }
+    }
+
     /// Render `CREATE PROPERTY GRAPH`.
     ///
     /// # Errors
@@ -102,9 +207,7 @@ impl PropertyGraph {
     pub fn create_statement(&self) -> Result<String, PgqError> {
         require_named(&self.name, "a property graph name")?;
         if self.vertices.is_empty() {
-            return Err(PgqError::EmptyIdentifier {
-                what: "a property graph's vertex table list",
-            });
+            return Err(PgqError::NoVertexTables);
         }
 
         let mut sql = String::from("CREATE PROPERTY GRAPH ");
@@ -151,19 +254,13 @@ impl PropertyGraph {
 }
 
 /// `table KEY (columns)` — the part that opens any element.
+///
+/// The list-emptiness invariants are enforced by the constructors; what remains
+/// to check here are the identifiers themselves, which a constructor accepts as
+/// arbitrary strings.
 fn write_element_head(sql: &mut String, element: &VertexTable) -> Result<(), PgqError> {
     require_named(&element.table, "an element table name")?;
     require_named(&element.label, "an element label")?;
-    if element.key.0.is_empty() {
-        return Err(PgqError::EmptyIdentifier {
-            what: "an element key",
-        });
-    }
-    if element.properties.is_empty() {
-        return Err(PgqError::EmptyIdentifier {
-            what: "an element's property list",
-        });
-    }
 
     sql.push_str("    ");
     write_ident(sql, &element.table);
@@ -196,11 +293,6 @@ fn write_element(sql: &mut String, element: &VertexTable) -> Result<(), PgqError
 
 fn write_endpoint(sql: &mut String, endpoint: &EndpointRef) -> Result<(), PgqError> {
     require_named(&endpoint.table, "an endpoint table name")?;
-    if endpoint.key.0.is_empty() || endpoint.references.0.is_empty() {
-        return Err(PgqError::EmptyIdentifier {
-            what: "an endpoint key",
-        });
-    }
     write_ident_list(sql, &endpoint.key.0);
     sql.push_str(") REFERENCES ");
     write_ident(sql, &endpoint.table);

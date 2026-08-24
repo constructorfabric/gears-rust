@@ -8,9 +8,13 @@ use sea_orm::sea_query::{Alias, Expr, ExprTrait as _, PostgresQueryBuilder, Quer
 use sea_orm::{Condition, Value};
 
 use crate::{
-    Direction, EdgeTable, Element, ElementKey, EndpointRef, GraphPattern, GraphTable, PgqError,
+    Direction, EdgeTable, Element, EndpointRef, GraphPattern, GraphTable, PgqError,
     ProjectedColumn, PropertyGraph, VertexTable,
 };
+
+fn columns(names: &[&str]) -> Vec<String> {
+    names.iter().map(|n| (*n).to_owned()).collect()
+}
 
 fn simple() -> GraphTable {
     GraphTable::new(
@@ -141,6 +145,63 @@ fn placeholders_are_numbered_across_the_whole_pattern() {
         "{sql}"
     );
     assert_eq!(values.len(), 3);
+}
+
+/// The regression the fragment-based renderer exists to prevent: an edge
+/// element's predicate sits inside `[` `]`, which `sea_query`'s tokenizer
+/// treats as a quoted string. Rendered to text and round-tripped through
+/// `cust_with_values`, the edge's placeholder kept its inner numbering while
+/// the outer statement renumbered everything else, and the edge's value was
+/// dropped from the bound list — so the edge compared against a neighbouring
+/// element's value.
+///
+/// Asserted on the *final statement*, the execution path, with elements that
+/// bind different numbers of values: under a symmetric pattern the numbering
+/// mistake is invisible because every element binds the same list.
+#[test]
+fn edge_values_survive_into_the_final_statement() {
+    let table = GraphTable::new(
+        "kb",
+        GraphPattern::new(
+            Element::new("a", "node").and_where(
+                Condition::all()
+                    .add(Expr::col(Alias::new("x")).eq(1))
+                    .add(Expr::col(Alias::new("y")).eq(2)),
+            ),
+        )
+        .hop(
+            Element::new("e", "edge")
+                .and_where(Condition::all().add(Expr::col(Alias::new("z")).eq(3))),
+            Direction::Outgoing,
+            Element::new("b", "node").and_where(
+                Condition::all()
+                    .add(Expr::col(Alias::new("x")).eq(4))
+                    .add(Expr::col(Alias::new("y")).eq(5)),
+            ),
+        ),
+    )
+    .column(ProjectedColumn::new("b", "id", "n"));
+
+    let statement = Query::select()
+        .column(Alias::new("n"))
+        .from(table.into_table_ref("g").expect("renders"))
+        .to_owned();
+    let (sql, values) = statement.build(PostgresQueryBuilder);
+
+    // The edge's own placeholder, numbered continuously with its neighbours.
+    assert!(sql.contains(r#""z" = $3"#), "{sql}");
+    assert!(!sql.contains("$6"), "only five values exist: {sql}");
+    assert_eq!(
+        values.0,
+        vec![
+            Value::from(1),
+            Value::from(2),
+            Value::from(3),
+            Value::from(4),
+            Value::from(5),
+        ],
+        "every element's values must be bound, in pattern order"
+    );
 }
 
 /// Everything outside a quoted identifier, with the identifiers removed.
@@ -300,34 +361,38 @@ fn a_repeated_variable_is_refused() {
 // ─────────────────────────────── DDL ───────────────────────────────
 
 fn graph_ddl() -> PropertyGraph {
-    let node = VertexTable {
-        table: "graph_node".to_owned(),
-        key: ElementKey(vec!["tenant_id".to_owned(), "id".to_owned()]),
-        label: "node".to_owned(),
-        properties: vec!["tenant_id".to_owned(), "id".to_owned()],
-    };
-    PropertyGraph {
-        name: "kb".to_owned(),
-        vertices: vec![node],
-        edges: vec![EdgeTable {
-            element: VertexTable {
-                table: "graph_edge".to_owned(),
-                key: ElementKey(vec!["tenant_id".to_owned(), "id".to_owned()]),
-                label: "edge".to_owned(),
-                properties: vec!["tenant_id".to_owned(), "id".to_owned()],
-            },
-            source: EndpointRef {
-                key: ElementKey(vec!["tenant_id".to_owned(), "src".to_owned()]),
-                table: "graph_node".to_owned(),
-                references: ElementKey(vec!["tenant_id".to_owned(), "id".to_owned()]),
-            },
-            destination: EndpointRef {
-                key: ElementKey(vec!["tenant_id".to_owned(), "dst".to_owned()]),
-                table: "graph_node".to_owned(),
-                references: ElementKey(vec!["tenant_id".to_owned(), "id".to_owned()]),
-            },
-        }],
-    }
+    let node = VertexTable::new(
+        "graph_node",
+        columns(&["tenant_id", "id"]),
+        "node",
+        columns(&["tenant_id", "id"]),
+    )
+    .expect("a valid vertex");
+    PropertyGraph::new(
+        "kb",
+        vec![node],
+        vec![EdgeTable::new(
+            VertexTable::new(
+                "graph_edge",
+                columns(&["tenant_id", "id"]),
+                "edge",
+                columns(&["tenant_id", "id"]),
+            )
+            .expect("a valid edge element"),
+            EndpointRef::new(
+                columns(&["tenant_id", "src"]),
+                "graph_node",
+                columns(&["tenant_id", "id"]),
+            )
+            .expect("a valid source"),
+            EndpointRef::new(
+                columns(&["tenant_id", "dst"]),
+                "graph_node",
+                columns(&["tenant_id", "id"]),
+            )
+            .expect("a valid destination"),
+        )],
+    )
 }
 
 /// An edge's clauses must come in grammar order: `KEY`, then `SOURCE`, then
@@ -369,15 +434,46 @@ fn the_ddl_declares_composite_endpoint_keys() {
 }
 
 /// A graph with no exposed properties would be unfilterable, so it is refused
-/// rather than created — the failure it prevents is silent.
+/// rather than declared — the failure it prevents is silent.
 #[test]
 fn an_element_without_properties_is_refused() {
-    let mut graph = graph_ddl();
-    graph.vertices[0].properties.clear();
-    assert!(matches!(
+    assert_eq!(
+        VertexTable::new("graph_node", columns(&["id"]), "node", Vec::new()).unwrap_err(),
+        PgqError::EmptyProperties
+    );
+}
+
+/// An endpoint with mismatched arity renders DDL `PostgreSQL` rejects, so the
+/// constructor refuses it — in a different crate the caller could not be relied
+/// on to check.
+#[test]
+fn a_mismatched_endpoint_is_refused_at_construction() {
+    assert_eq!(
+        EndpointRef::new(
+            columns(&["tenant_id", "src"]),
+            "graph_node",
+            columns(&["id"])
+        )
+        .unwrap_err(),
+        PgqError::MismatchedEndpointArity {
+            key: 2,
+            references: 1
+        }
+    );
+    assert_eq!(
+        EndpointRef::new(Vec::new(), "graph_node", columns(&["id"])).unwrap_err(),
+        PgqError::EmptyEndpointKey
+    );
+}
+
+/// A graph with no vertex tables cannot resolve any endpoint.
+#[test]
+fn a_graph_without_vertices_is_refused() {
+    let graph = PropertyGraph::new("kb", Vec::new(), Vec::new());
+    assert_eq!(
         graph.create_statement().unwrap_err(),
-        PgqError::EmptyIdentifier { .. }
-    ));
+        PgqError::NoVertexTables
+    );
 }
 
 #[test]

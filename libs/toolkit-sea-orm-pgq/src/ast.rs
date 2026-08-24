@@ -169,6 +169,24 @@ impl ProjectedColumn {
             alias: alias.into(),
         }
     }
+
+    /// The pattern variable the property is read off.
+    #[must_use]
+    pub fn variable(&self) -> &str {
+        &self.variable
+    }
+
+    /// The projected property.
+    #[must_use]
+    pub fn property(&self) -> &str {
+        &self.property
+    }
+
+    /// The output column name.
+    #[must_use]
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
 }
 
 /// A whole `GRAPH_TABLE` construct.
