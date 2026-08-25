@@ -934,6 +934,57 @@ fn an_empty_constraint_scope_is_refused_for_elements() {
     );
 }
 
+/// OR-ed constraints reach every element as one disjunction, and the filters
+/// inside a constraint stay conjunctive. A caller authorized through two
+/// grants must see the union of both, and neither alternative may widen the
+/// other: the second constraint here narrows its tenant by resource id, so a
+/// disjunction that lost the `AND` would admit that whole tenant.
+///
+/// Asserted per element rather than per statement, because the outer `WHERE`
+/// carries the same scope — counting across the whole SQL would pass even with
+/// an element body left unscoped.
+#[test]
+fn or_ed_constraints_reach_every_element_as_a_disjunction() {
+    use toolkit_security::access_scope::{ScopeConstraint, ScopeFilter};
+
+    let scope = AccessScope::from_constraints(vec![
+        ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+            toolkit_security::access_scope::pep_properties::OWNER_TENANT_ID,
+            vec![uuid::Uuid::from_u128(0x5150)],
+        )]),
+        ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(
+                toolkit_security::access_scope::pep_properties::OWNER_TENANT_ID,
+                vec![uuid::Uuid::from_u128(0x6161)],
+            ),
+            ScopeFilter::eq(
+                toolkit_security::access_scope::pep_properties::RESOURCE_ID,
+                toolkit_security::ScopeValue::Int(7),
+            ),
+        ]),
+    ]);
+
+    let sql = two_hop(&scope).expect("two resolvable constraints must compile");
+    let bodies = element_bodies(&sql);
+    assert_eq!(bodies.len(), 3, "expected three elements, got: {sql}");
+
+    for (variable, body) in &bodies {
+        assert!(
+            body.contains(" OR "),
+            "element {variable} lost the disjunction: {body}"
+        );
+        assert_eq!(
+            body.matches("\"tenant_id\"").count(),
+            2,
+            "element {variable} must carry both alternatives\' tenant filter: {body}"
+        );
+        assert!(
+            body.contains(" AND "),
+            "element {variable} lost the conjunction inside the second constraint: {body}"
+        );
+    }
+}
+
 /// Policy 2 against the *live* scope: an entity may declare scope columns and
 /// still resolve none of the properties this scope addresses. Compiled, that
 /// would be a silent deny-all traversal; refused instead, naming the element
