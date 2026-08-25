@@ -44,6 +44,7 @@ use crate::domain::metadata_codec::{DecodeError, RealmBinding, version_observed_
 pub enum UserOp {
     ProvisionUser,
     DeprovisionUser,
+    UpdateUser,
     ListUsers,
 }
 
@@ -53,6 +54,7 @@ impl UserOp {
         match self {
             Self::ProvisionUser => "provision_user",
             Self::DeprovisionUser => "deprovision_user",
+            Self::UpdateUser => "update_user",
             Self::ListUsers => "list_users",
         }
     }
@@ -165,6 +167,7 @@ pub enum PluginOp {
     DeprovisionTenant,
     ProvisionUser,
     DeprovisionUser,
+    UpdateUser,
     ListUsers,
     SaCreate,
     SaRotateSecret,
@@ -181,6 +184,7 @@ impl PluginOp {
             Self::DeprovisionTenant => "deprovision_tenant",
             Self::ProvisionUser => "provision_user",
             Self::DeprovisionUser => "deprovision_user",
+            Self::UpdateUser => "update_user",
             Self::ListUsers => "list_users",
             Self::SaCreate => "sa_create",
             Self::SaRotateSecret => "sa_rotate_secret",
@@ -222,6 +226,8 @@ impl FailureVariant {
     pub const USER_OP_REJECTED: Self = Self("user_op_rejected");
     pub const USER_OP_UNAVAILABLE: Self = Self("user_op_unavailable");
     pub const USER_OP_UNSUPPORTED: Self = Self("user_op_unsupported");
+    pub const USER_OP_NOT_FOUND: Self = Self("user_op_not_found");
+    pub const USER_OP_FIELD_NOT_WRITABLE: Self = Self("user_op_field_not_writable");
     pub const SA_INVALID_INPUT: Self = Self("sa_invalid_input");
     pub const SA_NOT_FOUND: Self = Self("sa_not_found");
 

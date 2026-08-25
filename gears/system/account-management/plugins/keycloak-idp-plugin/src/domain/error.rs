@@ -214,6 +214,45 @@ pub enum PluginError {
     #[error("user op unsupported: {detail}")]
     UserOpUnsupported { detail: String },
 
+    /// The target user is absent from the bound realm, OR its stored
+    /// `tenant_id` attribute does not match the requesting tenant. The
+    /// two collapse deliberately: `update_user` must not let a caller
+    /// distinguish "exists in another tenant" from "does not exist", or
+    /// the endpoint becomes a cross-tenant existence oracle. Boundary
+    /// maps this to [`IdpUserOperationFailure::NotFound`] (HTTP 404).
+    ///
+    /// Unlike the deprovision path — which folds absence into
+    /// `Ok(())` for idempotency — an update against a missing user is a
+    /// genuine 404: there is no state in which the patch was applied.
+    #[error("user op not found: {detail}")]
+    UserOpNotFound { detail: String },
+
+    /// KC refused to write one or more attributes because they are
+    /// provider-managed and not overridable (read-only user-profile
+    /// attribute, or an attribute federated from a read-only mapper).
+    /// Boundary maps this to [`IdpUserOperationFailure::FieldNotWritable`]
+    /// so AM emits a 400 carrying one `field_violations[]` entry per
+    /// refused attribute, each with `reason=IDP_MANAGED_FIELD`.
+    ///
+    /// `fields` is a set, not a single attribute: a merge patch can touch
+    /// several attributes at once and a locked realm typically refuses more
+    /// than one of them, so callers collect the full refused set before
+    /// returning this variant rather than reporting one attribute per round
+    /// trip. It must be non-empty; an attribution-less refusal belongs on
+    /// [`Self::UserOpRejected`] instead.
+    ///
+    /// Distinct from [`Self::UserOpUnsupported`] (the provider implements no
+    /// update at all) and from [`Self::UserOpRejected`] (the value was bad,
+    /// not the field).
+    #[error(
+        "user op fields not writable ({}): {detail}",
+        fields.iter().map(|f| f.as_field_token()).collect::<Vec<_>>().join(", ")
+    )]
+    UserOpFieldNotWritable {
+        fields: Vec<account_management_sdk::IdpUserAttribute>,
+        detail: String,
+    },
+
     /// Service-account request rejected before any KC call
     /// (name/scope/quota/conflict). Permanent client error.
     /// Boundary maps this to service-account-sdk's `InvalidInput`.
@@ -253,6 +292,8 @@ pub fn failure_variant_label(e: &PluginError) -> &'static str {
         PluginError::UserOpPasswordPolicy { .. } => "user_op_password_policy",
         PluginError::UserOpUnavailable { .. } => "user_op_unavailable",
         PluginError::UserOpUnsupported { .. } => "user_op_unsupported",
+        PluginError::UserOpNotFound { .. } => "user_op_not_found",
+        PluginError::UserOpFieldNotWritable { .. } => "user_op_field_not_writable",
         PluginError::SaInvalidInput { .. } => "sa_invalid_input",
         PluginError::SaNotFound { .. } => "sa_not_found",
     }

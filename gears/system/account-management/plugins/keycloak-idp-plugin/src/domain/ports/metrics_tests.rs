@@ -22,6 +22,7 @@ fn sa_op_as_str_stable() {
 fn user_op_as_str_stable() {
     assert_eq!(UserOp::ProvisionUser.as_str(), "provision_user");
     assert_eq!(UserOp::DeprovisionUser.as_str(), "deprovision_user");
+    assert_eq!(UserOp::UpdateUser.as_str(), "update_user");
     assert_eq!(UserOp::ListUsers.as_str(), "list_users");
 }
 
@@ -35,6 +36,7 @@ fn token_tier_as_str_stable() {
 fn plugin_op_as_str_stable() {
     assert_eq!(PluginOp::ProvisionTenant.as_str(), "provision_tenant");
     assert_eq!(PluginOp::DeprovisionTenant.as_str(), "deprovision_tenant");
+    assert_eq!(PluginOp::UpdateUser.as_str(), "update_user");
     assert_eq!(PluginOp::ListUsers.as_str(), "list_users");
     assert_eq!(PluginOp::SaCreate.as_str(), "sa_create");
     assert_eq!(PluginOp::SaRotateSecret.as_str(), "sa_rotate_secret");
@@ -140,6 +142,19 @@ fn failure_variant_constants_match_failure_variant_label() {
             "user_op_unsupported",
         ),
         (
+            PluginError::UserOpNotFound {
+                detail: String::new(),
+            },
+            "user_op_not_found",
+        ),
+        (
+            PluginError::UserOpFieldNotWritable {
+                fields: vec![account_management_sdk::IdpUserAttribute::Email],
+                detail: String::new(),
+            },
+            "user_op_field_not_writable",
+        ),
+        (
             PluginError::SaInvalidInput {
                 detail: String::new(),
                 field: None,
@@ -202,6 +217,14 @@ fn failure_variant_constants_match_their_literal() {
     assert_eq!(
         FailureVariant::USER_OP_UNSUPPORTED.as_str(),
         "user_op_unsupported"
+    );
+    assert_eq!(
+        FailureVariant::USER_OP_NOT_FOUND.as_str(),
+        "user_op_not_found"
+    );
+    assert_eq!(
+        FailureVariant::USER_OP_FIELD_NOT_WRITABLE.as_str(),
+        "user_op_field_not_writable"
     );
     assert_eq!(
         FailureVariant::SA_INVALID_INPUT.as_str(),

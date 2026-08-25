@@ -24,8 +24,8 @@ use account_management_sdk::idp_service_account::{
     IdpServiceAccountCredentials, IdpServiceAccountFailure, IdpServiceAccountSummary,
 };
 use account_management_sdk::idp_user::{
-    IdpDeprovisionUserRequest, IdpListUsersRequest, IdpProvisionUserRequest, IdpUser,
-    IdpUserOperationFailure,
+    IdpDeprovisionUserRequest, IdpListUsersRequest, IdpProvisionUserRequest, IdpUpdateUserRequest,
+    IdpUser, IdpUserOperationFailure,
 };
 use async_trait::async_trait;
 use toolkit_odata::Page;
@@ -93,6 +93,17 @@ impl IdpPluginClient for KeycloakIdpPlugin {
     ) -> Result<(), IdpUserOperationFailure> {
         self.user_facade
             .deprovision_user_inner(ctx, req)
+            .await
+            .map_err(translate_user_op_failure)
+    }
+
+    async fn update_user(
+        &self,
+        ctx: &SecurityContext,
+        req: &IdpUpdateUserRequest,
+    ) -> Result<IdpUser, IdpUserOperationFailure> {
+        self.user_facade
+            .update_user_inner(ctx, req)
             .await
             .map_err(translate_user_op_failure)
     }
@@ -356,6 +367,15 @@ fn translate_user_op_failure(e: PluginError) -> IdpUserOperationFailure {
         }
         PluginError::UserOpUnsupported { detail } => {
             IdpUserOperationFailure::UnsupportedOperation { detail }
+        }
+        // Absent users and users bound to another tenant are deliberately
+        // indistinguishable so the update endpoint cannot become a
+        // cross-tenant existence oracle.
+        PluginError::UserOpNotFound { detail } => IdpUserOperationFailure::NotFound { detail },
+        // Provider-managed attributes become structured AM field violations,
+        // allowing callers to disable every locked input from one response.
+        PluginError::UserOpFieldNotWritable { fields, detail } => {
+            IdpUserOperationFailure::FieldNotWritable { fields, detail }
         }
         PluginError::KcRest { .. } => IdpUserOperationFailure::Unavailable {
             detail: e.to_string(),

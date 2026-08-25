@@ -47,7 +47,7 @@ The Keycloak IdP Plugin (crate `cf-gears-keycloak-idp-plugin`) is a provider plu
 
 The plugin runs as a Gear in the host process. Account Management remains the public control-plane boundary. The plugin exposes no public REST API and does not authenticate requests, issue tokens, validate tokens, or make authorization decisions. It administers Keycloak directly over HTTPS using OAuth2 `client_credentials` administrator clients, with secret custody split between environment-expanded configuration and the platform Credential Store.
 
-In this revision, user provisioning, deprovisioning, and querying are supported; **user profile update is not implemented** and returns `UnsupportedOperation` (p2).
+User provisioning, profile update, deprovisioning, and querying are supported. Updates use provider-native JSON Merge Patch semantics while preserving Keycloak as the user source of truth.
 
 ### 1.2 Background / Problem Statement
 
@@ -175,7 +175,7 @@ flowchart LR
 - Selectable Keycloak provider registration for Account Management (types-registry catalogue instance plus scoped ClientHub client).
 - Tenant binding to shared (default, inherited by child tenants), adopted (single-tenant, operator-owned), and created (plugin-owned, per-tenant) realms.
 - Tenant identity-boundary creation, binding, and cleanup, including created-realm lifecycle and Credential Store custody of created-realm admin secrets.
-- Tenant-scoped user creation, deletion, provider-session revocation, listing, filtering, and cursor pagination.
+- Tenant-scoped user creation, partial profile and password update, deletion, provider-session revocation, listing, filtering, and cursor pagination.
 - Two-tier administrator credential handling (bootstrap admin, per-realm admin) with rotation convergence via reactive re-authentication, without process restart.
 - Tenant-scoped service-account creation, secret rotation, revocation, listing, and purge-on-tenant-deprovision through the service-account half of `IdpPluginClient`.
 - Deterministic failure classification, retry safety, and stage-attributed ambiguous-outcome reconciliation signals.
@@ -183,7 +183,7 @@ flowchart LR
 
 ### 4.2 Out of Scope
 
-The user-update, realm-profile-verification, and provider-version-gate bullets below are out of v1 scope but retained as p2 requirements. All other bullets are product-level exclusions.
+The realm-profile-verification and provider-version-gate bullets below are out of v1 scope but retained as p2 requirements. All other bullets are product-level exclusions.
 
 - Starting, deploying, upgrading, backing up, or scaling Keycloak.
 - Running code inside Keycloak or packaging Keycloak server extensions.
@@ -191,7 +191,6 @@ The user-update, realm-profile-verification, and provider-version-gate bullets b
 - Validating incoming JWTs; the OIDC AuthN Resolver Plugin owns validation.
 - Making authorization decisions; RBAC and the Policy Engine own authorization.
 - Exposing public REST endpoints; Account Management and other owning gears expose public APIs.
-- User profile updates through `IdpPluginClient::update_user`; the current implementation returns `UnsupportedOperation` (p2).
 - Runtime verification of the operator-provisioned realm authentication profile; operator realm bootstrap owns the profile (verification is p2).
 - A runtime Keycloak version gate; release qualification owns the compatibility matrix (a runtime gate is p2).
 - Moving a user between tenants or changing a user's tenant binding through any operation.
@@ -341,18 +340,18 @@ The plugin **MUST** create a user inside the resolved tenant identity boundary: 
 
 #### Tenant-Scoped User Update
 
-- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-user-update`
+- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-user-update`
 
-User profile update is not implemented in this revision: `IdpPluginClient::update_user` returns `UnsupportedOperation`. When implemented, partial updates to `username`, `email`, `display_name`, `first_name`, `last_name`, and `password` **MUST** apply within the existing tenant binding, omitted fields **MUST** remain unchanged, nullable profile fields **MUST** support clearing, and the user identifier and tenant binding **MUST** remain immutable.
+The plugin **MUST** verify the target user's stored `tenant_id` before every update and **MUST** perform no write when the user is absent or belongs to another tenant. It **MUST** apply supplied changes to `username`, `email`, `first_name`, `last_name`, and `password`; omitted fields **MUST** remain unchanged, nullable profile fields **MUST** support clearing, and the user identifier and tenant binding **MUST** remain immutable. Because Keycloak has no independently writable display-name property, a supplied `display_name` **MUST** return `FieldNotWritable` rather than guessing how to split it or silently discarding it. The success result **MUST** be a fresh provider read so Keycloak normalization is reflected.
 
-- **Rationale**: A production provider eventually needs a complete administrative user lifecycle; until then callers receive a deterministic unsupported outcome rather than partial behavior.
+- **Rationale**: Tenant administrators need truthful partial updates without weakening tenant isolation or inventing a lossy mapping for provider-derived fields.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-tenant-admin`, `cpt-cf-keycloak-idp-plugin-actor-account-management`
 
 #### User Update Outcome Classification
 
-- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-user-update-outcomes`
+- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-user-update-outcomes`
 
-When user update is implemented, the plugin **MUST** distinguish an absent user, duplicate username or email, password-policy rejection, unsupported behavior, invalid input, and provider unavailability. A missing user **MUST NOT** be treated as a successful update.
+The plugin **MUST** distinguish an absent or foreign user (`NotFound`, deliberately indistinguishable), duplicate username or email, password-policy rejection, provider-managed fields, invalid input, unsupported behavior, and provider unavailability. A missing user **MUST NOT** be treated as a successful update. A timeout after a profile or password write is ambiguous and **MUST** surface as provider unavailability without claiming that attributes remained unchanged.
 
 - **Rationale**: Tenant administrators need actionable and stable outcomes for corrective action.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-tenant-admin`, `cpt-cf-keycloak-idp-plugin-actor-account-management`
@@ -515,7 +514,7 @@ The operator's v1 realm authentication profile **MUST** limit access-token lifet
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-audit-metrics`
 
-The plugin **MUST** return a classified, redacted outcome for every supported call and **MUST** emit structured audit events on the dedicated `keycloak_idp.events` tracing target for every mutating tenant and user lifecycle transition: `tenant.bound`, `realm.created`, `admin_user.bound`, `tenant.unbound`, `realm.removed`, `service_accounts.purged`, `user.provisioned`, and `user.deprovisioned`, each carrying the acting subject (id, classified type, raw type, tenant) and provider identifiers. `user.provisioned` additionally records the username as operational evidence; no event carries secrets, passwords, tokens, or raw provider bodies. These emitters are a development stand-in: Account Management and the platform audit owner **MUST** create and durably deliver the terminal audit outcome for each mutating plugin call before production enablement.
+The plugin **MUST** return a classified, redacted outcome for every supported call and **MUST** emit structured audit events on the dedicated `keycloak_idp_plugin.events` tracing target for every mutating tenant and user lifecycle transition: `tenant.bound`, `realm.created`, `admin_user.bound`, `tenant.unbound`, `realm.removed`, `service_accounts.purged`, `user.provisioned`, `user.updated`, and `user.deprovisioned`, each carrying the acting subject (id, classified type, raw type, tenant) and provider identifiers. `user.provisioned` additionally records the username as operational evidence; `user.updated` records only the changed field names. No event carries update values, secrets, passwords, tokens, or raw provider bodies. These emitters are a development stand-in: Account Management and the platform audit owner **MUST** create and durably deliver the terminal audit outcome for each mutating plugin call before production enablement.
 
 - **Rationale**: A single owner for each durable record prevents duplicate or missing audit events while preserving plugin-level diagnostic evidence.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`
@@ -539,7 +538,7 @@ Global reliability, security, and observability baselines come from the [Archite
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-nfr-tenant-isolation`
 
-The plugin **MUST** prevent an operation resolved for one tenant from reading or mutating identities bound to another tenant: listing is scoped to the tenant group, user deletion is guarded by the stored `tenant_id` attribute, and realm/service-account mutations are guarded by ownership markers.
+The plugin **MUST** prevent an operation resolved for one tenant from reading or mutating identities bound to another tenant: listing is scoped to the tenant group, user update and deletion are guarded by the stored `tenant_id` attribute, and realm/service-account mutations are guarded by ownership markers.
 
 - **Threshold**: Zero successful cross-tenant operations across the automated negative-isolation suite.
 - **Rationale**: Identity administration is a security boundary for every tenant.
@@ -559,7 +558,7 @@ The plugin **MUST** prevent administrator tokens, administrator secrets, user pa
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-nfr-lifecycle-latency`
 
-On the release qualification profile, shared-realm tenant provisioning **MUST** complete within 5 seconds at p95; created-realm provisioning within 10 seconds at p95. User creation, deprovisioning, and a full query page **MUST** each complete within 1 second at p95. The profile **MUST** use 20 concurrent operations, an operator-equivalent Keycloak 26.x node backed by PostgreSQL, at most 5 ms network round-trip time between the plugin and Keycloak, and up to 1,000 human identities, enabled or disabled, in one tenant group. The query run matrix (filter-selectivity mix and token-cache states) is defined in [DESIGN §4.2](./DESIGN.md#42-verification-architecture). Operational bounds enforced by the implementation and validated by the profile: per-request provider timeout, bounded retry policy, saga timeout, caller page size cap, and the membership-scan hard cap with loud truncation (values in [DESIGN §§2.2, 3.6](./DESIGN.md#22-constraints)).
+On the release qualification profile, shared-realm tenant provisioning **MUST** complete within 5 seconds at p95; created-realm provisioning within 10 seconds at p95. User creation, update, deprovisioning, and a full query page **MUST** each complete within 1 second at p95. The profile **MUST** use 20 concurrent operations, an operator-equivalent Keycloak 26.x node backed by PostgreSQL, at most 5 ms network round-trip time between the plugin and Keycloak, and up to 1,000 human identities, enabled or disabled, in one tenant group. The query run matrix (filter-selectivity mix and token-cache states) is defined in [DESIGN §4.2](./DESIGN.md#42-verification-architecture). Operational bounds enforced by the implementation and validated by the profile: per-request provider timeout, bounded retry policy, saga timeout, caller page size cap, and the membership-scan hard cap with loud truncation (values in [DESIGN §§2.2, 3.6](./DESIGN.md#22-constraints)).
 
 - **Threshold**: Shared provisioning p95 ≤ 5 s; created provisioning p95 ≤ 10 s; each named user operation p95 ≤ 1 s; 20 concurrent operations; scan cap 10,000 members per tenant group with observable truncation.
 - **Rationale**: A fixed population, topology, filter mix, and bound set make the linear-scan acceptance test reproducible.
@@ -643,7 +642,7 @@ When required dependencies meet their objectives, the plugin **MUST** support th
 
 - **Type**: Rust SDK trait (`IdpPluginClient`)
 - **Stability**: stable
-- **Description**: Provides tenant provisioning, tenant deprovisioning, user provisioning, user deprovisioning, and user query behavior to Account Management. `update_user` is not implemented and returns `UnsupportedOperation` (p2).
+- **Description**: Provides tenant provisioning, tenant deprovisioning, user provisioning, tenant-scoped partial user update, user deprovisioning, and user query behavior to Account Management.
 - **Breaking Change Policy**: Incompatible request, result, or failure changes require a versioned contract and coordinated Account Management migration.
 
 #### Service-Account Lifecycle Contract
@@ -769,11 +768,30 @@ When required dependencies meet their objectives, the plugin **MUST** support th
 
 #### Update a Tenant User
 
-- [ ] `p2` - **ID**: `cpt-cf-keycloak-idp-plugin-usecase-update-user`
+- [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-usecase-update-user`
 
 **Actor**: `cpt-cf-keycloak-idp-plugin-actor-tenant-admin`
 
-Not available in this revision: `update_user` returns `UnsupportedOperation`. When implemented, Account Management sends the tenant context, user identifier, and partial update; the plugin applies only the supplied mutable fields within the resolved tenant binding and returns the updated provider projection, distinguishing not-found, duplicate-attribute, and password-policy outcomes.
+**Preconditions**:
+- Account Management has authorized the caller and supplies an active tenant context, user identifier, and non-empty merge patch.
+- The tenant metadata resolves a Keycloak realm and realm administrator.
+
+**Main Flow**:
+1. The plugin rejects statically provider-managed fields before provider access.
+2. It reads the user with profile metadata, verifies `attributes.tenant_id`, and refuses every touched field Keycloak reports as read-only before writing.
+3. It applies only touched profile fields and uses the credential endpoint when a password is supplied.
+4. It re-reads and returns Keycloak's resulting user projection.
+5. It emits `user.updated` with changed field names only.
+
+**Postconditions**:
+- The user remains bound to the same tenant and keeps the same provider identifier.
+- Omitted fields are unchanged and no password or profile value is retained by the plugin.
+
+**Alternative Flows**:
+- **Absent or foreign user**: return indistinguishable `NotFound` and perform no mutation.
+- **Provider-managed field**: return `FieldNotWritable` naming every attributable field and perform no mutation when preflight can determine the lock.
+- **Rename collision or password-policy reject**: return the corresponding typed SDK outcome.
+- **Provider failure or timeout**: return `Unavailable`; after an attempted write the caller must not assume that provider state stayed unchanged.
 
 #### Create and Rotate a Service Account
 
@@ -883,7 +901,7 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 - [ ] Created-mode provisioning is replay-safe: a marked realm is adopted idempotently, a foreign realm is rejected cleanly, a lost create reconciles by re-probe, and the realm-admin secret lands in the Credential Store before success is reported.
 - [ ] Hard deprovisioning deletes the tenant group, tears down created realms and their secrets on last-tenant retirement, and never deletes shared/adopted realms or other tenants' resources. (The service-account purge barrier that precedes boundary removal is p2, gated with §5.4.)
 - [ ] User provisioning binds `tenant_id`/`user_type` attributes and group membership, compensates orphans on group-join failure, and classifies duplicates with field refinement; user deprovisioning enforces the tenant-attribute guard, revokes sessions best-effort, and treats 404/410 as success-equivalent.
-- [ ] `update_user` deterministically returns `UnsupportedOperation`.
+- [ ] User updates enforce the stored-tenant binding before writing; apply merge-patch set/clear/omit semantics; reject derived or provider-managed fields explicitly; classify not-found, duplicate, password-policy, and provider failures; and return a fresh Keycloak projection.
 - [ ] User queries return only tenant-group members, honor the supported filter surface (rejecting unsupported shapes with `UnsupportedOperation` before provider access), sort on the requested order over the orderable field set (Account-Management default `username ASC, id ASC`), page via `CursorV1` with order- and filter-hash validation and the rolling-deploy legacy fallback, and truncate loudly at the scan hard cap.
 - [ ] Cross-tenant negative tests produce zero successful reads or mutations across the tenant and user surfaces.
 - [ ] Failure injection proves ambiguous tenant provisioning is never reported as clean, each user failure maps to an `IdpUserOperationFailure` outcome, and every variant carries its stable metric label.
@@ -900,7 +918,6 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 - [ ] Hard deprovisioning purges the tenant's service accounts before boundary removal, and a purge failure aborts the saga with a retryable or terminal classification rather than a success-equivalent outcome.
 - [ ] Cross-tenant negative tests extend to the service-account surface with zero successful reads or mutations.
 - [ ] Failure injection maps each service-account failure to the `IdpServiceAccountFailure` set, with every variant carrying its stable metric label.
-- [ ] `update_user` implements the SDK contract (partial update semantics, immutable identity/tenant binding, duplicate/password-policy/not-found classification) and passes the provider contract suite.
 - [ ] A read-only realm authentication-profile verifier gates tenant binding on shared/adopted realms before promotion of profile verification.
 - [ ] A runtime provider-version gate fails affected operations deterministically on unsupported majors without preventing host startup.
 
@@ -935,7 +952,8 @@ Not available in this revision: `update_user` returns `UnsupportedOperation`. Wh
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| An external mutation completes after the caller loses the response. | Duplicate or orphaned identity resources or credentials. | Idempotent replay paths (realm ensure re-probe, group 409 reuse), stage-attributed ambiguous outcomes, no blind retry, reconciliation runbook. |
+| An external mutation completes after the caller loses the response. | Duplicate or orphaned identity resources or credentials, or an update whose final state is unknown. | Idempotent replay paths (realm ensure re-probe, group 409 reuse), stage-attributed tenant/service-account ambiguity, no blind retry, reconciliation runbook; user-update timeout returns `Unavailable` and never asserts fields were unchanged. |
+| A user-update request combines profile and password changes across separate Keycloak endpoints. | The profile write can succeed before the credential reset fails. | Preflight tenant ownership and every known field lock before either write; return the exact password/provider failure and document that a failed multi-step update may require a provider re-read before retry. |
 | Administrator credentials grant broader access than required. | Compromise can affect unrelated tenants or realms. | Two-tier admin model, exact least-privilege role grants on created realms, typed secret custody, rotation convergence, and secret non-disclosure tests. |
 | Provider metadata becomes unreadable after upgrade or rollback. | Existing tenants cannot be administered or retired safely. | Versioned fail-closed envelope, decode-failure metrics, and compatibility coverage for supported upgrade paths. |
 | The Credential Store write fails after created-realm Keycloak state exists. | Realm exists without retrievable admin credentials. | A dedicated ambiguity stage token for the post-provider secret-write window, the reconciliation runbook, and replay-safe provisioning that restores the stored secret. |
@@ -956,10 +974,9 @@ The following questions gate only p2 promotion:
 
 | # | Question | Impact | Owner | Target Date |
 |---|----------|--------|-------|-------------|
-| 1 | When is `update_user` promoted, and does it adopt JSON Merge Patch semantics end to end? | Determines profile-editing support through this provider. | Account Management Owner and Plugin Owner | Before user-update DESIGN |
-| 2 | Should realm authentication-profile verification become a plugin-side runtime gate, and what profile format does the operator publish for it? | Determines whether misconfigured realms fail binding deterministically. | Platform Architect and Plugin Owner | Before profile-verifier DESIGN |
-| 3 | Does a runtime Keycloak version gate replace release-time qualification as the compatibility guarantee? | Determines unsupported-version failure behavior. | Plugin Owner | Before compatibility-gate DESIGN |
-| 4 | Will a future authentication component enforce real-time token revocation? | Determines whether any future release can promise rejection before JWT expiry. | Security Architect and AuthN Owner | Before real-time revocation requirements are added |
+| 1 | Should realm authentication-profile verification become a plugin-side runtime gate, and what profile format does the operator publish for it? | Determines whether misconfigured realms fail binding deterministically. | Platform Architect and Plugin Owner | Before profile-verifier DESIGN |
+| 2 | Does a runtime Keycloak version gate replace release-time qualification as the compatibility guarantee? | Determines unsupported-version failure behavior. | Plugin Owner | Before compatibility-gate DESIGN |
+| 3 | Will a future authentication component enforce real-time token revocation? | Determines whether any future release can promise rejection before JWT expiry. | Security Architect and AuthN Owner | Before real-time revocation requirements are added |
 
 ## 14. Traceability
 

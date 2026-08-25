@@ -180,6 +180,34 @@ fn user_op_unsupported_detail_format() {
 }
 
 #[test]
+fn user_op_not_found_detail_format_and_label_are_stable() {
+    let e = PluginError::UserOpNotFound {
+        detail: "user absent from tenant scope".into(),
+    };
+    assert_eq!(
+        format!("{e}"),
+        "user op not found: user absent from tenant scope"
+    );
+    assert_eq!(failure_variant_label(&e), "user_op_not_found");
+}
+
+#[test]
+fn user_op_field_not_writable_detail_format_and_label_are_stable() {
+    let e = PluginError::UserOpFieldNotWritable {
+        fields: vec![
+            account_management_sdk::IdpUserAttribute::Email,
+            account_management_sdk::IdpUserAttribute::FirstName,
+        ],
+        detail: "provider-managed profile".into(),
+    };
+    assert_eq!(
+        format!("{e}"),
+        "user op fields not writable (email, first_name): provider-managed profile"
+    );
+    assert_eq!(failure_variant_label(&e), "user_op_field_not_writable");
+}
+
+#[test]
 fn redact_secrets_masks_client_secret_kv() {
     let body = r#"{"error":"invalid_request","client_secret":"sensitive-value-123"}"#;
     let out = crate::domain::error::redact_secrets(body);

@@ -236,6 +236,41 @@ pub fn emit_user_provisioned(
     );
 }
 
+/// `kind = "user.updated"` — fired on every `update_user` success.
+///
+/// `changed` lists the request properties the patch actually touched
+/// (`username`, `email`, `first_name`, `last_name`, `password`), never
+/// their values: the audit trail records *what* an actor changed on
+/// someone's identity without becoming a secondary store of profile
+/// data, and `password` in particular MUST never have its value reach a
+/// log sink.
+pub fn emit_user_updated(
+    actor: &SecurityContext,
+    tenant_id: Uuid,
+    realm_name: &str,
+    realm_binding: RealmBinding,
+    user_id: Uuid,
+    changed: &[&'static str],
+) {
+    let (actor_subject_id, actor_subject_type, actor_subject_type_raw, actor_tenant_id) =
+        common_fields(actor);
+    let realm_binding_str = realm_binding_str(realm_binding);
+    tracing::info!(
+        target: "keycloak_idp_plugin.events",
+        kind = "user.updated",
+        %actor_subject_id,
+        actor_subject_type,
+        actor_subject_type_raw,
+        %actor_tenant_id,
+        %tenant_id,
+        realm_name,
+        realm_binding = realm_binding_str,
+        %user_id,
+        changed = changed.join(","),
+        "user updated"
+    );
+}
+
 /// `kind = "user.deprovisioned"` — fired on every `deprovision_user`
 /// success (including the 404/410 idempotency branches; `already_absent`
 /// distinguishes them).

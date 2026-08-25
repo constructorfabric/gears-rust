@@ -328,6 +328,33 @@ fn translate_user_op_unsupported_is_unsupported() {
 }
 
 #[test]
+fn translate_user_op_not_found_is_not_found() {
+    let e = PluginError::UserOpNotFound {
+        detail: "user absent from tenant scope".into(),
+    };
+    let f = translate_user_op_failure(e);
+    assert!(matches!(f, IdpUserOperationFailure::NotFound { .. }));
+    assert_eq!(f.detail(), "user absent from tenant scope");
+}
+
+#[test]
+fn translate_user_op_field_not_writable_preserves_all_fields() {
+    let expected = vec![
+        account_management_sdk::IdpUserAttribute::Email,
+        account_management_sdk::IdpUserAttribute::FirstName,
+    ];
+    let e = PluginError::UserOpFieldNotWritable {
+        fields: expected.clone(),
+        detail: "provider-managed profile".into(),
+    };
+    let f = translate_user_op_failure(e);
+    assert!(matches!(
+        f,
+        IdpUserOperationFailure::FieldNotWritable { ref fields, .. } if fields == &expected
+    ));
+}
+
+#[test]
 fn translate_user_op_leaked_kc_rest_is_unavailable() {
     // Defensive: if a `KcRest` ever leaks past the user-side translator
     // in the facade, the boundary still maps it to Unavailable so AM

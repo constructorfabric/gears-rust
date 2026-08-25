@@ -1,12 +1,18 @@
-//! `UserFacade` — provision/deprovision/list users against Keycloak per DESIGN "Interactions & Sequences".
+//! `UserFacade` — provision/update/deprovision/list users against Keycloak per
+//! DESIGN "Interactions & Sequences".
 //!
-//! Implements `provision_user_inner`, `deprovision_user_inner`, and
-//! `list_users_inner` across all three [`RealmBinding`] modes (Shared /
-//! Adopted / Created). Metadata decode, secret-source selection (DESIGN "Domain Model"),
-//! and user-operation audit events are handled within this facade; the SDK
-//! boundary in `idp_impl.rs` translates [`PluginError`] into the typed
-//! `IdpUserOperationFailure` variants (`Rejected` / `Unavailable` /
-//! `UnsupportedOperation`).
+//! Implements `provision_user_inner`, `update_user_inner`,
+//! `deprovision_user_inner`, and `list_users_inner` across all three
+//! [`RealmBinding`] modes (Shared / Adopted / Created). Metadata decode,
+//! secret-source selection (DESIGN "Domain Model"), and user-operation audit
+//! events are handled within this facade; the SDK boundary in `idp_impl.rs`
+//! translates [`PluginError`] into the typed `IdpUserOperationFailure`
+//! variants.
+//!
+//! Both mutating paths that take a caller-supplied user ID verify the user's
+//! stored `tenant_id` attribute before writing. Users live in Keycloak rather
+//! than AM's database, so that provider-side ownership check is the protection
+//! against cross-tenant user mutation.
 //!
 //! [`TenantFacade`]: crate::domain::tenant_facade::TenantFacade
 
@@ -14,8 +20,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use account_management_sdk::idp_user::{
-    IdpDeprovisionUserRequest, IdpListUsersRequest, IdpProvisionUserRequest, IdpUser,
-    IdpUserFilterField,
+    IdpDeprovisionUserRequest, IdpListUsersRequest, IdpProvisionUserRequest, IdpUpdateUserRequest,
+    IdpUser, IdpUserAttribute, IdpUserFilterField, IdpUserPatch,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use credstore_sdk::SecretRef;
@@ -134,15 +140,174 @@ fn is_kc_password_policy_reject(body_text: &str) -> bool {
         || error.starts_with("invalidpassword")
 }
 
+/// Map a Keycloak `UserRepresentation` property name onto the SDK
+/// attribute token AM attributes field violations to.
+///
+/// `display_name` is absent by design: it is not a KC property at all
+/// (see [`UserFacade::user_rep_to_idp_user`] — AM's `display_name` is
+/// *derived* from `firstName`/`lastName`), so KC can never name it in a
+/// validation error. The un-writability of `display_name` is a static
+/// fact about this plugin's mapping, rejected before any KC call by
+/// [`UserFacade::preflight_unwritable_attribute`].
+fn kc_field_to_attribute(kc_field: &str) -> Option<IdpUserAttribute> {
+    match kc_field {
+        "username" => Some(IdpUserAttribute::Username),
+        "email" => Some(IdpUserAttribute::Email),
+        "firstName" => Some(IdpUserAttribute::FirstName),
+        "lastName" => Some(IdpUserAttribute::LastName),
+        _ => None,
+    }
+}
+
+/// Detect a KC read-only-attribute reject on user-update and localise it
+/// to every refused attribute the body names.
+///
+/// This is the SAFETY NET, not the primary mechanism: `update_user` decides
+/// writability up front from the structured
+/// `userProfileMetadata.attributes[].readOnly` flags
+/// ([`UserFacade::read_user_for_update`]), so a well-behaved patch never
+/// reaches here. This path catches what pre-flight cannot: a KC that does not
+/// serve profile metadata, a lock introduced between the read and the write,
+/// or a lock the metadata does not model.
+///
+/// # Signal precedence
+///
+/// 1. **`errorMessage` equals a known read-only message KEY.** KC returns a
+///    message key, not localized prose — verified against KC 26.5.3, where the
+///    body is byte-identical under `Accept-Language: de`:
+///    `{"field":"username","errorMessage":"error-user-attribute-read-only","params":["username"]}`.
+///    Exact comparison only, over keys observed in real response bodies — see
+///    the list's own notes on what is excluded and why. There is deliberately
+///    NO substring fallback: a phrase test over the message could only add
+///    false positives on unrelated 400s (`"cannot link read-only federated
+///    store"` is not a locked field). KC does define
+///    `updateReadOnlyAttributesRejectedMessage` for the legacy
+///    read-only-attributes rejection, so that path is not keyless as such — it
+///    is merely unproven on the admin API, and unreachable for the five profile
+///    fields AM patches.
+/// 2. **`field` from the body**, whether the body is that flat object or the
+///    `{"errors":[…]}` array some validation paths emit. KC names the refused
+///    property itself, so it is always preferred over inference, and EVERY
+///    named entry is collected -- a multi-field patch can draw one `errors[]`
+///    entry per locked attribute, and the caller needs the whole set in one
+///    round trip, not just the first.
+/// 3. **Single-touched-attribute inference**, only once (1) has already
+///    established this IS a read-only reject and no entry named a modelled
+///    field. Bounded by construction: it chooses *which* field, never
+///    *whether*, so it cannot manufacture a locked-field error out of an
+///    unrelated failure.
+///
+/// Returns an empty `Vec` for any 400 that is not a read-only reject, and for
+/// a read-only reject that cannot be attributed to a modelled request
+/// property — the caller then uses the generic rejection lane rather than
+/// blaming an arbitrary field.
+///
+/// Several unrelated Keycloak features land here, which is why detection is not
+/// tied to one config source:
+///
+/// * **Realm flag** — `editUsernameAllowed=false` locks `username`. This is
+///   Keycloak's DEFAULT and needs no federation, so on a stock platform it is
+///   the most likely trigger of this whole code path. Verified against the
+///   `platform` realm: renaming a login is refused there out of the box.
+/// * **Declarative user profile** (default since KC 24) — an attribute whose
+///   `permissions.edit` excludes the caller. Produces the per-field
+///   `errors[]` shape handled first below.
+/// * **Federated read-only attributes** — an LDAP/User-Storage provider in
+///   `editMode=READ_ONLY`, or an individual `user-attribute-ldap-mapper` with
+///   `read.only=true`. The external directory owns the value, so Keycloak
+///   refuses to write it.
+/// * **Keycloak's internal attribute guard** — over system attributes
+///   (`LDAP_ID`, `LDAP_ENTRY_DN`, `KERBEROS_PRINCIPAL`, `CREATED_TIMESTAMP`,
+///   …). AM patches none of these — [`IdpUserAttribute`] models only the five
+///   profile fields — so this cannot fire from here. Listed for completeness,
+///   NOT handled: it surfaces as a generic `UserOpRejected` 400 if a future
+///   field mapping ever reaches it, which is the correct conservative outcome
+///   for a request AM should never have sent.
+///
+/// AM does not need to distinguish them: from a caller's perspective all four
+/// mean "this provider will not let you write this field", which is exactly
+/// what `IDP_MANAGED_FIELD` says.
+fn classify_kc_read_only_reject(
+    body_text: &str,
+    touched: &[IdpUserAttribute],
+) -> Vec<IdpUserAttribute> {
+    /// The one message key KC is known to return for a read-only-attribute
+    /// refusal. Compared for equality, not searched for: it is a stable
+    /// identifier, byte-identical from KC 26.5.3 under `Accept-Language: de`.
+    ///
+    /// Observed verbatim:
+    /// `{"field":"username","errorMessage":"error-user-attribute-read-only","params":["username"]}`
+    ///
+    /// Should a second key ever need adding, it MUST come with an observed
+    /// admin-API body. Two earlier guesses did not: `error-user-read-only`
+    /// turned out not to exist in KC 26.5.3's bundles at all, and a substring
+    /// test over the message could only ever add false positives (an unrelated
+    /// 400 reading `"cannot link read-only federated store"` is not a locked
+    /// field). Real keys that remain excluded for want of evidence that the
+    /// admin API returns them as `errorMessage` rather than rendering them as
+    /// themed display text: `updateReadOnlyAttributesRejectedMessage` (the
+    /// legacy read-only-attributes rejection), `readOnlyUserMessage`,
+    /// `readOnlyUsernameMessage`, `readOnlyPasswordMessage`.
+    const READ_ONLY_MESSAGE_KEY: &str = "error-user-attribute-read-only";
+
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body_text) else {
+        return Vec::new();
+    };
+
+    // KC states the refusal either as a flat object or as an `errors[]` array,
+    // so treat the body as a list of candidate entries: the array's members
+    // when present (most specific), then the root object itself.
+    let nested: &[serde_json::Value] = v
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[], Vec::as_slice);
+
+    let mut read_only_signalled = false;
+    let mut fields = Vec::new();
+    for entry in nested.iter().chain(std::iter::once(&v)) {
+        if entry
+            .get("errorMessage")
+            .and_then(serde_json::Value::as_str)
+            != Some(READ_ONLY_MESSAGE_KEY)
+        {
+            continue;
+        }
+        read_only_signalled = true;
+        // KC named the property — collected rather than returned
+        // immediately, because a multi-field patch can draw one entry per
+        // locked attribute and the caller needs the whole set. A field AM
+        // does not model (a custom realm attribute) still signals a
+        // read-only reject even though it contributes nothing to `fields`.
+        if let Some(attribute) = entry
+            .get("field")
+            .and_then(serde_json::Value::as_str)
+            .and_then(kc_field_to_attribute)
+            && !fields.contains(&attribute)
+        {
+            fields.push(attribute);
+        }
+    }
+    // No entry named a modelled field. A single-attribute patch is still
+    // unambiguous: the refusal can only be about that one.
+    if fields.is_empty()
+        && read_only_signalled
+        && let [only] = touched
+    {
+        fields.push(*only);
+    }
+    fields
+}
+
 /// Subset of Keycloak's `UserRepresentation` the facade needs:
 ///
 /// * UUID discovery after `provision_user` — only `id` is required.
 /// * `list_users` group-members listing — `id` + profile fields the
 ///   facade projects into [`IdpUser`].
 ///
-/// `firstName` / `lastName` are concatenated into [`IdpUser::display_name`]
-/// per DESIGN "Interactions & Sequences" (KC `firstName + lastName` is the canonical KC profile
-/// shape; OIDC `name` claim is not surfaced by the admin REST endpoint).
+/// `firstName` / `lastName` are projected directly and concatenated into
+/// [`IdpUser::display_name`] per DESIGN "Interactions & Sequences" (KC
+/// `firstName + lastName` is the canonical KC profile shape; OIDC `name` claim
+/// is not surfaced by the admin REST endpoint).
 ///
 /// `createdTimestamp` is used by the `list_users` cursor sort key
 /// `(createdTimestamp ASC, id ASC)` per DESIGN "Interactions & Sequences".
@@ -1152,6 +1317,615 @@ impl UserFacade {
         Ok((metadata.realm_name, metadata.realm_binding))
     }
 
+    /// Apply AM's merge patch to a user in the tenant's bound realm and
+    /// return the post-update projection.
+    ///
+    /// Emits `user.updated` on success and records a failure metric
+    /// otherwise, mirroring [`Self::provision_user_inner`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::update_user_impl`].
+    pub async fn update_user_inner(
+        &self,
+        ctx: &SecurityContext,
+        req: &IdpUpdateUserRequest,
+    ) -> Result<IdpUser, PluginError> {
+        let started = Instant::now();
+        let result = self.update_user_impl(req).await;
+        let elapsed = started.elapsed().as_secs_f64();
+        self.user_metrics
+            .user_op_duration(UserOp::UpdateUser, elapsed);
+        match &result {
+            Ok((user, realm_name, realm_binding)) => {
+                audit::emit_user_updated(
+                    ctx,
+                    req.tenant_context.tenant_id,
+                    realm_name,
+                    *realm_binding,
+                    user.id,
+                    &Self::changed_labels(&req.patch),
+                );
+            }
+            Err(e) => {
+                self.record_user_op_failure(PluginOp::UpdateUser, e);
+            }
+        }
+        result.map(|(user, _, _)| user)
+    }
+
+    /// Inner implementation returning the [`IdpUser`] plus the bound realm
+    /// name / binding so the wrapper can label the audit event without
+    /// re-decoding the metadata.
+    ///
+    /// Ordering (each step gated on the previous):
+    ///
+    /// 1. Decode tenant metadata; resolve the realm-admin secret source.
+    /// 2. Pre-flight the statically-unwritable attributes
+    ///    ([`Self::preflight_unwritable_attribute`]) — refused before any
+    ///    KC call, so a `display_name` patch costs no round trip.
+    /// 3. **Binding check** — the user's stored `tenant_id` attribute MUST
+    ///    equal the requesting tenant. This is the only defence against
+    ///    cross-tenant user mutation: users live in KC, so the `AuthZ` SQL
+    ///    clamp that protects AM-DB writes never sees this path. Same
+    ///    guard as [`Self::deprovision_user_impl`] step 2.5, but a
+    ///    mismatch here returns [`PluginError::UserOpNotFound`] rather
+    ///    than folding into success — an update must not silently no-op.
+    /// 4. `PUT /users/{id}` with only the touched profile fields.
+    /// 5. `PUT /users/{id}/reset-password` when the patch carries one.
+    /// 6. Re-read the user and project it.
+    ///
+    /// Step 6 is a real GET rather than echoing the request: KC normalises
+    /// what it stores (lower-cases `username`, may trim or reformat
+    /// profile fields), so the only truthful 200 body is the one read back
+    /// from the provider.
+    ///
+    /// # Errors
+    ///
+    /// * [`PluginError::UserOpFieldNotWritable`] — an attribute is
+    ///   provider-managed (`display_name` always; any attribute KC
+    ///   reports read-only).
+    /// * [`PluginError::UserOpNotFound`] — user absent from the realm, or
+    ///   bound to a different tenant.
+    /// * [`PluginError::UserOpDuplicate`] — a `username` rename collided.
+    /// * [`PluginError::UserOpPasswordPolicy`] — KC rejected the password.
+    /// * [`PluginError::UserOpRejected`] — any other terminal 400/422.
+    /// * [`PluginError::UserOpUnavailable`] — 5xx / transport / timeout.
+    async fn update_user_impl(
+        &self,
+        req: &IdpUpdateUserRequest,
+    ) -> Result<(IdpUser, String, RealmBinding), PluginError> {
+        // ---- Step 1: metadata + secret source. ----
+        let metadata = self.decode_tenant_metadata(req.tenant_context.metadata.as_ref())?;
+        let secret_source = self.build_secret_source(&metadata)?;
+
+        // ---- Step 2: statically-unwritable attributes. ----
+        if let Some(attribute) = Self::preflight_unwritable_attribute(&req.patch) {
+            return Err(PluginError::UserOpFieldNotWritable {
+                fields: vec![attribute],
+                detail: format!(
+                    "{} is derived from the Keycloak firstName/lastName pair and is not a \
+                     writable provider attribute; patch first_name / last_name instead",
+                    attribute.as_field_token()
+                ),
+            });
+        }
+
+        // ---- Step 3: single pre-write read — binding + writability. ----
+        let expected_tid = req.tenant_context.tenant_id;
+        let (actual_tid, read_only) = self
+            .kc_factory
+            .with_reactive_401(
+                &metadata.realm_name,
+                &metadata.admin_client_id,
+                &secret_source,
+                |realm_admin| {
+                    let realm_name = metadata.realm_name.clone();
+                    async move {
+                        self.read_user_for_update(&realm_admin, &realm_name, req.user_id)
+                            .await
+                    }
+                },
+            )
+            .await
+            .map_err(user_translate_kc)?;
+        if actual_tid != Some(expected_tid) {
+            tracing::warn!(
+                target: "keycloak_idp_plugin.user_binding",
+                user_id = %req.user_id,
+                expected_tenant_id = %expected_tid,
+                actual_tenant_id = ?actual_tid,
+                realm_name = %metadata.realm_name,
+                "user update refused: stored tenant_id attribute does not match request; cross-tenant PATCH prevented"
+            );
+            // Deliberately indistinguishable from a genuine absence: a
+            // caller must not be able to probe for users in other
+            // tenants by comparing 403 against 404.
+            return Err(PluginError::UserOpNotFound {
+                detail: format!("user {} not found in this tenant scope", req.user_id),
+            });
+        }
+
+        // ---- Step 3b: refuse attributes KC reports as non-writable. ----
+        //
+        // Decided from the structured `readOnly` flags rather than from a
+        // rejected write, which buys three things: the refusal names the exact
+        // field even when the patch touched several, no write is attempted for
+        // a patch that cannot fully apply (so a multi-field patch cannot land
+        // half-applied), and the classification does not depend on KC's error
+        // wording. `classify_kc_read_only_reject` still guards the PUT for
+        // locks this read cannot see.
+        //
+        // Ordering is deliberate where both could apply: a locked `username` is
+        // reported even when the requested login would ALSO collide with an
+        // existing one. The two answers are not equally useful —
+        // `already_exists` invites a retry with a different login, which is
+        // false when no login would be accepted. Refusing on the unconditional
+        // fact beats reporting the incidental one, and it means uniqueness is
+        // never probed for a field the caller cannot write.
+        let touched = Self::touched_attributes(&req.patch);
+        let locked_touched: Vec<IdpUserAttribute> = touched
+            .iter()
+            .copied()
+            .filter(|a| read_only.contains(a))
+            .collect();
+        if !locked_touched.is_empty() {
+            return Err(PluginError::UserOpFieldNotWritable {
+                detail: format!(
+                    "kc reports {} as read-only for this realm",
+                    locked_touched
+                        .iter()
+                        .map(|a| a.as_field_token())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                fields: locked_touched,
+            });
+        }
+
+        // ---- Step 4: profile PUT (skipped for a password-only patch). ----
+        if !touched.is_empty() {
+            self.kc_factory
+                .with_reactive_401(
+                    &metadata.realm_name,
+                    &metadata.admin_client_id,
+                    &secret_source,
+                    |realm_admin| {
+                        let realm_name = metadata.realm_name.clone();
+                        let touched = touched.clone();
+                        async move {
+                            self.patch_user(&realm_admin, &realm_name, req, &touched)
+                                .await
+                        }
+                    },
+                )
+                .await
+                .map_err(user_translate_kc)?;
+        }
+
+        // ---- Step 5: credential reset. ----
+        if let Some(password) = req.patch.password.as_ref() {
+            self.kc_factory
+                .with_reactive_401(
+                    &metadata.realm_name,
+                    &metadata.admin_client_id,
+                    &secret_source,
+                    |realm_admin| {
+                        let realm_name = metadata.realm_name.clone();
+                        async move {
+                            self.reset_password(&realm_admin, &realm_name, req.user_id, password)
+                                .await
+                        }
+                    },
+                )
+                .await
+                .map_err(user_translate_kc)?;
+        }
+
+        // ---- Step 6: re-read and project. ----
+        let rep = self
+            .kc_factory
+            .with_reactive_401(
+                &metadata.realm_name,
+                &metadata.admin_client_id,
+                &secret_source,
+                |realm_admin| {
+                    let realm_name = metadata.realm_name.clone();
+                    async move {
+                        self.read_user_rep(&realm_admin, &realm_name, req.user_id)
+                            .await
+                    }
+                },
+            )
+            .await
+            .map_err(user_translate_kc)?;
+        Ok((
+            Self::user_rep_to_idp_user(rep),
+            metadata.realm_name,
+            metadata.realm_binding,
+        ))
+    }
+
+    /// Attributes in `patch` that this plugin cannot write at all,
+    /// independent of realm configuration.
+    ///
+    /// Only `display_name`: AM models it as a first-class field, but
+    /// Keycloak has no such property — the projection composes it from
+    /// `firstName`/`lastName` (see [`Self::user_rep_to_idp_user`]).
+    /// Accepting the write and silently dropping it would make a 200
+    /// response a lie, and splitting a single string back into given /
+    /// family names is guesswork, so the honest answer is a refusal
+    /// naming the field, which AM renders as a 400 carrying
+    /// `field=display_name, reason=IDP_MANAGED_FIELD`.
+    fn preflight_unwritable_attribute(patch: &IdpUserPatch) -> Option<IdpUserAttribute> {
+        patch
+            .display_name
+            .as_ref()
+            .map(|_| IdpUserAttribute::DisplayName)
+    }
+
+    /// Writable profile attributes the patch touches, in a stable order.
+    /// `Some(_)` counts as touched whether it sets or clears; `password`
+    /// is excluded because it is written through a separate endpoint and
+    /// is not a user-profile attribute.
+    fn touched_attributes(patch: &IdpUserPatch) -> Vec<IdpUserAttribute> {
+        let mut touched = Vec::new();
+        if patch.username.is_some() {
+            touched.push(IdpUserAttribute::Username);
+        }
+        if patch.email.is_some() {
+            touched.push(IdpUserAttribute::Email);
+        }
+        if patch.first_name.is_some() {
+            touched.push(IdpUserAttribute::FirstName);
+        }
+        if patch.last_name.is_some() {
+            touched.push(IdpUserAttribute::LastName);
+        }
+        touched
+    }
+
+    /// AM request-property names the patch touched, for the audit event.
+    /// Names only — never values (see [`audit::emit_user_updated`]).
+    fn changed_labels(patch: &IdpUserPatch) -> Vec<&'static str> {
+        let mut changed: Vec<&'static str> = Self::touched_attributes(patch)
+            .iter()
+            .map(|a| a.as_field_token())
+            .collect();
+        if patch.password.is_some() {
+            changed.push("password");
+        }
+        changed
+    }
+
+    /// `PUT /admin/realms/{realm}/users/{user_id}` — apply the touched
+    /// profile fields.
+    ///
+    /// Only touched fields are sent, which is what preserves AM's merge
+    /// semantics: KC leaves a property it does not receive unchanged. A
+    /// *clear* (`Some(None)`) is sent as an empty string, which is KC's
+    /// way of blanking a profile field — `null` is indistinguishable from
+    /// "absent" to KC and would silently no-op. Because step 6 re-reads
+    /// the user, a realm that refuses to blank a field surfaces the
+    /// still-populated value in the 200 body rather than a false claim of
+    /// success.
+    ///
+    /// `display_name` never reaches here — [`Self::preflight_unwritable_attribute`]
+    /// rejects it first.
+    async fn patch_user(
+        &self,
+        realm_admin: &KcAdminClient,
+        realm_name: &str,
+        req: &IdpUpdateUserRequest,
+        touched: &[IdpUserAttribute],
+    ) -> Result<(), PluginError> {
+        const PATH: &str = "/admin/realms/{realm}/users/{user_id}";
+        let url = format!(
+            "{}admin/realms/{}/users/{}",
+            self.kc_factory.base_url_str(),
+            encode_component(realm_name),
+            req.user_id,
+        );
+        let mut body = serde_json::Map::new();
+        // `username` is set-only: AM rejects an explicit `null` upstream
+        // (the login identifier is required), so `Some(v)` is always a
+        // rename to a concrete value.
+        if let Some(username) = req.patch.username.as_ref() {
+            body.insert(
+                "username".into(),
+                serde_json::Value::String(username.clone()),
+            );
+        }
+        // Tri-state → KC: `Some(Some(v))` sets, `Some(None)` blanks via
+        // the empty string, `None` omits the key entirely.
+        let mut insert_tristate = |key: &str, value: Option<&Option<String>>| {
+            if let Some(slot) = value {
+                body.insert(
+                    key.to_owned(),
+                    serde_json::Value::String(slot.clone().unwrap_or_default()),
+                );
+            }
+        };
+        insert_tristate("email", req.patch.email.as_ref());
+        insert_tristate("firstName", req.patch.first_name.as_ref());
+        insert_tristate("lastName", req.patch.last_name.as_ref());
+        let body = serde_json::Value::Object(body);
+        let (status, body_text) = realm_admin
+            .raw_request("PUT", &url, Some(&body), PATH)
+            .await
+            .map_err(user_translate_kc)?;
+        if (200..=299).contains(&status) {
+            return Ok(());
+        }
+        if status == 401 {
+            // Idempotent request → safe for the wrapper's exactly-once
+            // retry after re-minting the bearer.
+            return Err(PluginError::KcRest {
+                method: "PUT",
+                path_template: PATH.into(),
+                status: KcStatusKind::Http(401),
+                body_first_2kb: redact_secrets(&truncate_2kb(&body_text)),
+            });
+        }
+        let redacted = redact_secrets(&truncate_2kb(&body_text));
+        if status == 404 || status == 410 {
+            return Err(PluginError::UserOpNotFound {
+                detail: format!("user {} not found in this tenant scope", req.user_id),
+            });
+        }
+        if status == 409 {
+            // On this endpoint a 409 can only be a uniqueness collision
+            // from the rename; the body only refines which field.
+            return Err(PluginError::UserOpDuplicate {
+                field: classify_kc_conflict(&body_text),
+                detail: format!("user already exists: kc:PUT {PATH} -> 409: {redacted}"),
+            });
+        }
+        if status == 400 || status == 422 {
+            let read_only_fields = classify_kc_read_only_reject(&body_text, touched);
+            if !read_only_fields.is_empty() {
+                return Err(PluginError::UserOpFieldNotWritable {
+                    detail: format!(
+                        "kc reports {} read-only: kc:PUT {PATH} -> {status}: {redacted}",
+                        read_only_fields
+                            .iter()
+                            .map(|a| a.as_field_token())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    fields: read_only_fields,
+                });
+            }
+            if is_kc_password_policy_reject(&body_text) {
+                return Err(PluginError::UserOpPasswordPolicy {
+                    detail: format!(
+                        "password policy rejected: kc:PUT {PATH} -> {status}: {redacted}"
+                    ),
+                });
+            }
+            return Err(PluginError::UserOpRejected {
+                detail: format!("kc:PUT {PATH} -> {status}: {redacted}"),
+            });
+        }
+        Err(PluginError::UserOpUnavailable {
+            detail: format!("kc:PUT {PATH} -> {status}: {redacted}"),
+        })
+    }
+
+    /// `PUT /admin/realms/{realm}/users/{user_id}/reset-password` — set a
+    /// new credential.
+    ///
+    /// A separate call because KC accepts an embedded `credentials` array
+    /// only on user-create; on update the credential endpoint is the
+    /// supported path. `temporary: true` makes KC require a password
+    /// change at next login. The plaintext lives only on this request's
+    /// stack and the outbound HTTPS body — it is never logged (the
+    /// failure details below carry only KC's response, itself passed
+    /// through [`redact_secrets`]).
+    async fn reset_password(
+        &self,
+        realm_admin: &KcAdminClient,
+        realm_name: &str,
+        user_id: Uuid,
+        password: &account_management_sdk::NewUserPassword,
+    ) -> Result<(), PluginError> {
+        const PATH: &str = "/admin/realms/{realm}/users/{user_id}/reset-password";
+        let url = format!(
+            "{}admin/realms/{}/users/{}/reset-password",
+            self.kc_factory.base_url_str(),
+            encode_component(realm_name),
+            user_id,
+        );
+        let body = serde_json::json!({
+            "type": "password",
+            "value": password.value,
+            "temporary": password.temporary,
+        });
+        let (status, body_text) = realm_admin
+            .raw_request("PUT", &url, Some(&body), PATH)
+            .await
+            .map_err(user_translate_kc)?;
+        if (200..=299).contains(&status) {
+            return Ok(());
+        }
+        if status == 401 {
+            return Err(PluginError::KcRest {
+                method: "PUT",
+                path_template: PATH.into(),
+                status: KcStatusKind::Http(401),
+                body_first_2kb: redact_secrets(&truncate_2kb(&body_text)),
+            });
+        }
+        let redacted = redact_secrets(&truncate_2kb(&body_text));
+        if status == 404 || status == 410 {
+            return Err(PluginError::UserOpNotFound {
+                detail: format!("user {user_id} not found in this tenant scope"),
+            });
+        }
+        if status == 400 || status == 422 {
+            if is_kc_password_policy_reject(&body_text) {
+                return Err(PluginError::UserOpPasswordPolicy {
+                    detail: format!(
+                        "password policy rejected: kc:PUT {PATH} -> {status}: {redacted}"
+                    ),
+                });
+            }
+            return Err(PluginError::UserOpRejected {
+                detail: format!("kc:PUT {PATH} -> {status}: {redacted}"),
+            });
+        }
+        Err(PluginError::UserOpUnavailable {
+            detail: format!("kc:PUT {PATH} -> {status}: {redacted}"),
+        })
+    }
+
+    /// `GET /admin/realms/{realm}/users/{user_id}?userProfileMetadata=true`
+    /// → `(stored tenant_id, attributes KC reports as non-writable)`.
+    ///
+    /// The update path's single pre-write read. It answers both questions
+    /// `update_user` must settle before touching anything, in one round trip:
+    ///
+    /// * **Who owns this user** — `attributes.tenant_id[0]`, the cross-tenant
+    ///   binding check (same datum [`Self::read_user_owner_tenant`] reads for
+    ///   the deprovision path).
+    /// * **Which attributes are writable** —
+    ///   `userProfileMetadata.attributes[].readOnly`, a structured boolean per
+    ///   attribute. This is KC's own computed verdict, so it accounts uniformly
+    ///   for every locking mechanism (the `editUsernameAllowed` realm flag,
+    ///   declarative-user-profile `permissions.edit`, a federated read-only
+    ///   mapper) without this code having to know which one applied.
+    ///
+    /// Preferring this over parsing the refusal is what keeps
+    /// [`classify_kc_read_only_reject`] a fallback: a structured boolean cannot
+    /// drift with KC's wording, and it lets the refusal name the offending
+    /// field even when the patch touched several.
+    ///
+    /// `tenant_id` mirrors [`Self::read_user_owner_tenant`]'s tolerance: an
+    /// absent user, a missing attribute, or an unparseable value all yield
+    /// `None`, which the caller treats as "no usable binding" and refuses. An
+    /// absent `userProfileMetadata` (older KC, or the query param ignored)
+    /// yields an empty lock set — pre-flight then permits everything and the
+    /// post-hoc classifier remains the guard.
+    async fn read_user_for_update(
+        &self,
+        realm_admin: &KcAdminClient,
+        realm_name: &str,
+        user_id: Uuid,
+    ) -> Result<(Option<Uuid>, Vec<IdpUserAttribute>), PluginError> {
+        const PATH: &str = "/admin/realms/{realm}/users/{user_id}";
+        let url = format!(
+            "{}admin/realms/{}/users/{}?userProfileMetadata=true",
+            self.kc_factory.base_url_str(),
+            encode_component(realm_name),
+            user_id,
+        );
+        let (status, body_text) = realm_admin
+            .raw_request("GET", &url, None, PATH)
+            .await
+            .map_err(user_translate_kc)?;
+        if status == 404 || status == 410 {
+            return Ok((None, Vec::new()));
+        }
+        if status == 401 {
+            return Err(PluginError::KcRest {
+                method: "GET",
+                path_template: PATH.into(),
+                status: KcStatusKind::Http(401),
+                body_first_2kb: redact_secrets(&truncate_2kb(&body_text)),
+            });
+        }
+        if !(200..=299).contains(&status) {
+            return Err(PluginError::UserOpUnavailable {
+                detail: format!(
+                    "kc:GET {PATH}?userProfileMetadata=true -> {status}: {}",
+                    redact_secrets(&truncate_2kb(&body_text)),
+                ),
+            });
+        }
+        // Parsed loosely as `Value`: only two sub-trees are needed, and
+        // tolerating the rest keeps this resilient to KC representation growth.
+        let user: serde_json::Value =
+            serde_json::from_str(&body_text).map_err(|e| PluginError::UserOpUnavailable {
+                detail: format!("kc:GET {PATH}?userProfileMetadata=true json decode: {e}"),
+            })?;
+        let tenant_id = user
+            .get("attributes")
+            .and_then(|a| a.get("tenant_id"))
+            .and_then(|t| t.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+        let read_only = user
+            .get("userProfileMetadata")
+            .and_then(|m| m.get("attributes"))
+            .and_then(serde_json::Value::as_array)
+            .map(|attrs| {
+                attrs
+                    .iter()
+                    .filter(|a| {
+                        a.get("readOnly")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|a| a.get("name").and_then(serde_json::Value::as_str))
+                    .filter_map(kc_field_to_attribute)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((tenant_id, read_only))
+    }
+
+    /// `GET /admin/realms/{realm}/users/{user_id}` → parsed [`UserRep`].
+    ///
+    /// The post-update read for [`Self::update_user_impl`]. Distinct from
+    /// [`Self::read_user_owner_tenant`], which decodes only the
+    /// `attributes.tenant_id` binding and folds a 404 into `Ok(None)`;
+    /// here an absent user is a genuine
+    /// [`PluginError::UserOpNotFound`] — it can only mean the user was
+    /// deleted concurrently between the patch and the read.
+    async fn read_user_rep(
+        &self,
+        realm_admin: &KcAdminClient,
+        realm_name: &str,
+        user_id: Uuid,
+    ) -> Result<UserRep, PluginError> {
+        const PATH: &str = "/admin/realms/{realm}/users/{user_id}";
+        let url = format!(
+            "{}admin/realms/{}/users/{}",
+            self.kc_factory.base_url_str(),
+            encode_component(realm_name),
+            user_id,
+        );
+        let (status, body_text) = realm_admin
+            .raw_request("GET", &url, None, PATH)
+            .await
+            .map_err(user_translate_kc)?;
+        if status == 401 {
+            return Err(PluginError::KcRest {
+                method: "GET",
+                path_template: PATH.into(),
+                status: KcStatusKind::Http(401),
+                body_first_2kb: redact_secrets(&truncate_2kb(&body_text)),
+            });
+        }
+        if status == 404 || status == 410 {
+            return Err(PluginError::UserOpNotFound {
+                detail: format!("user {user_id} not found in this tenant scope"),
+            });
+        }
+        if !(200..=299).contains(&status) {
+            return Err(PluginError::UserOpUnavailable {
+                detail: format!(
+                    "kc:GET {PATH} -> {status}: {}",
+                    redact_secrets(&truncate_2kb(&body_text)),
+                ),
+            });
+        }
+        serde_json::from_str::<UserRep>(&body_text).map_err(|e| PluginError::UserOpUnavailable {
+            detail: format!("kc:GET {PATH} json decode: {e}"),
+        })
+    }
+
     /// List users from the tenant's bound realm (DESIGN "Interactions & Sequences").
     ///
     /// 1. Decode tenant metadata.
@@ -1636,14 +2410,31 @@ impl UserFacade {
         if let Some(email) = rep.email {
             user = user.with_email(email);
         }
-        let display_name = match (rep.first_name, rep.last_name) {
-            (Some(f), Some(l)) if !f.is_empty() && !l.is_empty() => Some(format!("{f} {l}")),
-            (Some(f), _) if !f.is_empty() => Some(f),
-            (_, Some(l)) if !l.is_empty() => Some(l),
-            _ => None,
+        // KC blanks a profile field by storing the empty string (that is
+        // also how `patch_user` clears one), so treat empty as absent
+        // throughout: a cleared field must read back as omitted, not `""`.
+        let first_name = rep.first_name.filter(|f| !f.is_empty());
+        let last_name = rep.last_name.filter(|l| !l.is_empty());
+        let display_name = match (first_name.as_deref(), last_name.as_deref()) {
+            (Some(f), Some(l)) => Some(format!("{f} {l}")),
+            (Some(f), None) => Some(f.to_owned()),
+            (None, Some(l)) => Some(l.to_owned()),
+            (None, None) => None,
         };
         if let Some(dn) = display_name {
             user = user.with_display_name(dn);
+        }
+        // Project the underlying pair as well, not just the composed
+        // `display_name`. The SDK models `first_name` / `last_name`
+        // separately and they are the only writable half of the pair, so
+        // a caller that patches `first_name` has to be able to read it
+        // back — otherwise a successful update appears to have dropped
+        // the field.
+        if let Some(f) = first_name {
+            user = user.with_first_name(f);
+        }
+        if let Some(l) = last_name {
+            user = user.with_last_name(l);
         }
         user
     }
