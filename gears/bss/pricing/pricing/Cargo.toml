@@ -147,6 +147,8 @@ serde_json = { workspace = true }
 # D-159 and D-135 describe — SQLite serializes writers, so it can neither
 # confirm nor refute a claim about two of them.
 testcontainers-modules = { workspace = true }
+# Database image pins: see libs/test-containers.
+cf-gears-test-containers = { workspace = true }
 toolkit = { workspace = true, features = ["db"] }
 # `tower::ServiceExt::oneshot` drives the REST router in `tests/rest_*.rs`
 # without binding a socket.

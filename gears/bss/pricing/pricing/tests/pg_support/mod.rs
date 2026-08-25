@@ -2,8 +2,8 @@
 //!
 //! # Why this exists rather than a container per test
 //!
-//! The Postgres suites of this phase were first written with
-//! `Postgres::default().start()` inside every test. That does not scale and it
+//! The Postgres suites of this phase were first written starting a fresh
+//! container inside every test. That does not scale and it
 //! does not merely cost time: Track P2 measured sporadic
 //! `PortNotExposed { port: Tcp(5432) }` panics in whichever tests happened to be
 //! starting at the same moment — the daemon reports a container up a beat before
@@ -160,10 +160,6 @@ use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, Db, connect_db};
 
-/// The image tag every Postgres suite pins, matching `postgres_migrations.rs`;
-/// see its note on why the image default is not used.
-pub const PG_TAG: &str = "16-alpine";
-
 /// The one container's name — fixed, so a later run finds it instead of
 /// starting another. See the module doc for why reuse rather than cleanup.
 pub const HARNESS_CONTAINER: &str = "bss-pricing-pg-harness";
@@ -292,8 +288,7 @@ async fn start_named() -> Option<ContainerAsync<Postgres>> {
         // Bound per iteration rather than carried across them: the sibling check
         // below returns without reading it, which makes a loop-scoped `last` a
         // dead assignment on that path (`-D unused-assignments`).
-        let last = match Postgres::default()
-            .with_tag(PG_TAG)
+        let last = match cf_gears_test_containers::postgres()
             .with_container_name(HARNESS_CONTAINER)
             .start()
             .await

@@ -68,8 +68,8 @@ use bss_pricing::infra::storage::migrations::Migrator;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::ContainerAsync;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, connect_db};
 
@@ -91,20 +91,14 @@ fn chain_len() -> usize {
     Migrator::migrations().len()
 }
 
-/// `testcontainers-modules` defaults to `postgres:11-alpine`, which reached end
-/// of life in 2023. Nothing in this repository pins the production server
-/// version, so "the backend it targets" is an assumption either way; running on
-/// a current major is the closer of the two guesses, and pinning it here means a
-/// bump is a diff rather than a dependency's default quietly moving.
-const PG_TAG: &str = "16-alpine";
-
 /// A running Postgres, its port, and the container guard.
 ///
 /// The guard is returned because dropping it stops the container: a caller that
 /// bound only the port would race its own database to the end of the test.
 async fn pg() -> (u16, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_tag(PG_TAG)
+    // The image tag comes from cf-gears-test-containers, the single source of
+    // truth for database container versions across the workspace.
+    let container = cf_gears_test_containers::postgres()
         .start()
         .await
         .expect("start postgres");

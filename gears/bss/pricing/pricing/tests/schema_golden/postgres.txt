@@ -373,6 +373,9 @@ COLUMN bss.pricing_snapshot_provenance source_revision bigint NULL DEFAULT -
 COLUMN bss.pricing_snapshot_provenance subscription_ref uuid NOT NULL DEFAULT -
 COLUMN bss.pricing_snapshot_provenance tenant_id uuid NOT NULL DEFAULT -
 COLUMN bss.pricing_snapshot_provenance trigger_kind text NOT NULL DEFAULT -
+CONSTRAINT bss.coord_leases coord_leases_attempts_not_null NOT NULL attempts
+CONSTRAINT bss.coord_leases coord_leases_key_not_null NOT NULL key
+CONSTRAINT bss.coord_leases coord_leases_locked_until_not_null NOT NULL locked_until
 CONSTRAINT bss.coord_leases coord_leases_pkey PRIMARY KEY (key)
 CONSTRAINT bss.pricing_approval chk_pricing_approval_approver CHECK (((state = ANY (ARRAY['submitted'::text, 'voided'::text])) OR (approver_principal IS NOT NULL)))
 CONSTRAINT bss.pricing_approval chk_pricing_approval_decided_at CHECK (((state = 'submitted'::text) = (decided_at IS NULL)))
@@ -380,70 +383,172 @@ CONSTRAINT bss.pricing_approval chk_pricing_approval_distinct_principals CHECK (
 CONSTRAINT bss.pricing_approval chk_pricing_approval_reason CHECK (((state <> 'rejected'::text) OR (reason IS NOT NULL)))
 CONSTRAINT bss.pricing_approval chk_pricing_approval_state CHECK ((state = ANY (ARRAY['submitted'::text, 'approved'::text, 'rejected'::text, 'voided'::text])))
 CONSTRAINT bss.pricing_approval chk_pricing_approval_subject_kind CHECK ((subject_kind = ANY (ARRAY['plan_revision'::text, 'price_unit'::text, 'window'::text, 'policy'::text, 'overlay'::text, 'bulk_operation'::text, 'membership'::text])))
+CONSTRAINT bss.pricing_approval pricing_approval_approval_id_not_null NOT NULL approval_id
+CONSTRAINT bss.pricing_approval pricing_approval_content_hash_not_null NOT NULL content_hash
+CONSTRAINT bss.pricing_approval pricing_approval_materiality_not_null NOT NULL materiality
 CONSTRAINT bss.pricing_approval pricing_approval_pkey PRIMARY KEY (approval_id)
+CONSTRAINT bss.pricing_approval pricing_approval_state_not_null NOT NULL state
+CONSTRAINT bss.pricing_approval pricing_approval_subject_kind_not_null NOT NULL subject_kind
+CONSTRAINT bss.pricing_approval pricing_approval_subject_ref_not_null NOT NULL subject_ref
+CONSTRAINT bss.pricing_approval pricing_approval_submitted_at_not_null NOT NULL submitted_at
+CONSTRAINT bss.pricing_approval pricing_approval_submitter_principal_not_null NOT NULL submitter_principal
+CONSTRAINT bss.pricing_approval pricing_approval_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_approval_key chk_pricing_approval_key_state CHECK ((state = ANY (ARRAY['submitted'::text, 'approved'::text, 'rejected'::text, 'voided'::text])))
+CONSTRAINT bss.pricing_approval_key pricing_approval_key_approval_id_not_null NOT NULL approval_id
 CONSTRAINT bss.pricing_approval_key pricing_approval_key_pkey PRIMARY KEY (approval_id, scope_key)
+CONSTRAINT bss.pricing_approval_key pricing_approval_key_scope_key_not_null NOT NULL scope_key
+CONSTRAINT bss.pricing_approval_key pricing_approval_key_state_not_null NOT NULL state
+CONSTRAINT bss.pricing_approval_key pricing_approval_key_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_approval_threshold chk_pricing_approval_threshold_absolute_non_negative CHECK (((absolute_minor IS NULL) OR (absolute_minor >= 0)))
 CONSTRAINT bss.pricing_approval_threshold chk_pricing_approval_threshold_basis CHECK (((absolute_minor IS NULL) <> (percent_bp IS NULL)))
 CONSTRAINT bss.pricing_approval_threshold chk_pricing_approval_threshold_currency CHECK ((length((currency)::text) = 3))
 CONSTRAINT bss.pricing_approval_threshold chk_pricing_approval_threshold_percent_positive CHECK (((percent_bp IS NULL) OR (percent_bp > 0)))
 CONSTRAINT bss.pricing_approval_threshold chk_pricing_approval_threshold_version CHECK ((version >= 0))
+CONSTRAINT bss.pricing_approval_threshold pricing_approval_threshold_created_at_not_null NOT NULL created_at
+CONSTRAINT bss.pricing_approval_threshold pricing_approval_threshold_created_by_not_null NOT NULL created_by
+CONSTRAINT bss.pricing_approval_threshold pricing_approval_threshold_currency_not_null NOT NULL currency
+CONSTRAINT bss.pricing_approval_threshold pricing_approval_threshold_effective_from_not_null NOT NULL effective_from
 CONSTRAINT bss.pricing_approval_threshold pricing_approval_threshold_pkey PRIMARY KEY (tenant_id, version, currency)
+CONSTRAINT bss.pricing_approval_threshold pricing_approval_threshold_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_approval_threshold pricing_approval_threshold_version_not_null NOT NULL version
 CONSTRAINT bss.pricing_approval_threshold_tombstone chk_pricing_approval_threshold_tombstone_version CHECK ((version >= 0))
+CONSTRAINT bss.pricing_approval_threshold_tombstone pricing_approval_threshold_tombstone_created_at_not_null NOT NULL created_at
+CONSTRAINT bss.pricing_approval_threshold_tombstone pricing_approval_threshold_tombstone_created_by_not_null NOT NULL created_by
+CONSTRAINT bss.pricing_approval_threshold_tombstone pricing_approval_threshold_tombstone_effective_from_not_null NOT NULL effective_from
 CONSTRAINT bss.pricing_approval_threshold_tombstone pricing_approval_threshold_tombstone_pkey PRIMARY KEY (tenant_id, version)
+CONSTRAINT bss.pricing_approval_threshold_tombstone pricing_approval_threshold_tombstone_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_approval_threshold_tombstone pricing_approval_threshold_tombstone_version_not_null NOT NULL version
 CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_action CHECK ((action = ANY (ARRAY['create'::text, 'update'::text, 'delete'::text, 'abandon'::text, 'publish'::text, 'submit'::text, 'approve'::text, 'reject'::text, 'withdraw'::text, 'deny'::text, 'retire'::text, 'migrate'::text])))
 CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_entry_kind CHECK ((entry_kind = ANY (ARRAY['mutation'::text, 'rollup'::text])))
 CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_rollup CHECK (((entry_kind = 'rollup'::text) = (segment_heads IS NOT NULL)))
 CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_seq CHECK ((seq >= 0))
 CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_subject_kind CHECK ((subject_kind = ANY (ARRAY['plan_revision'::text, 'price_unit'::text, 'window'::text, 'policy'::text, 'overlay'::text, 'bulk_operation'::text, 'membership'::text])))
+CONSTRAINT bss.pricing_audit_log pricing_audit_log_action_not_null NOT NULL action
+CONSTRAINT bss.pricing_audit_log pricing_audit_log_actor_principal_id_not_null NOT NULL actor_principal_id
+CONSTRAINT bss.pricing_audit_log pricing_audit_log_chain_id_not_null NOT NULL chain_id
+CONSTRAINT bss.pricing_audit_log pricing_audit_log_entry_kind_not_null NOT NULL entry_kind
 CONSTRAINT bss.pricing_audit_log pricing_audit_log_pkey PRIMARY KEY (tenant_id, chain_id, seq)
+CONSTRAINT bss.pricing_audit_log pricing_audit_log_recorded_at_not_null NOT NULL recorded_at
+CONSTRAINT bss.pricing_audit_log pricing_audit_log_row_hash_not_null NOT NULL row_hash
+CONSTRAINT bss.pricing_audit_log pricing_audit_log_seq_not_null NOT NULL seq
+CONSTRAINT bss.pricing_audit_log pricing_audit_log_subject_kind_not_null NOT NULL subject_kind
+CONSTRAINT bss.pricing_audit_log pricing_audit_log_subject_ref_not_null NOT NULL subject_ref
+CONSTRAINT bss.pricing_audit_log pricing_audit_log_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_brand_taxonomy chk_pricing_brand_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
 CONSTRAINT bss.pricing_brand_taxonomy chk_pricing_brand_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_brand_taxonomy pricing_brand_taxonomy_display_name_not_null NOT NULL display_name
 CONSTRAINT bss.pricing_brand_taxonomy pricing_brand_taxonomy_pkey PRIMARY KEY (tenant_id, value)
+CONSTRAINT bss.pricing_brand_taxonomy pricing_brand_taxonomy_state_not_null NOT NULL state
+CONSTRAINT bss.pricing_brand_taxonomy pricing_brand_taxonomy_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_brand_taxonomy pricing_brand_taxonomy_value_not_null NOT NULL value
 CONSTRAINT bss.pricing_bulk_operation chk_pricing_bulk_operation_completed_at CHECK (((completed_at IS NOT NULL) = (state = ANY (ARRAY['validation_failed'::text, 'completed'::text, 'completed_with_conflicts'::text, 'rejected'::text]))))
 CONSTRAINT bss.pricing_bulk_operation chk_pricing_bulk_operation_import_never_awaits CHECK ((NOT ((kind = 'import'::text) AND (state = 'awaiting_approval'::text))))
 CONSTRAINT bss.pricing_bulk_operation chk_pricing_bulk_operation_kind CHECK ((kind = ANY (ARRAY['import'::text, 'repricing'::text])))
 CONSTRAINT bss.pricing_bulk_operation chk_pricing_bulk_operation_state CHECK ((state = ANY (ARRAY['validating'::text, 'validation_failed'::text, 'awaiting_approval'::text, 'committing'::text, 'completed'::text, 'completed_with_conflicts'::text, 'rejected'::text])))
+CONSTRAINT bss.pricing_bulk_operation pricing_bulk_operation_client_key_not_null NOT NULL client_key
+CONSTRAINT bss.pricing_bulk_operation pricing_bulk_operation_kind_not_null NOT NULL kind
+CONSTRAINT bss.pricing_bulk_operation pricing_bulk_operation_operation_id_not_null NOT NULL operation_id
 CONSTRAINT bss.pricing_bulk_operation pricing_bulk_operation_pkey PRIMARY KEY (operation_id)
+CONSTRAINT bss.pricing_bulk_operation pricing_bulk_operation_report_not_null NOT NULL report
+CONSTRAINT bss.pricing_bulk_operation pricing_bulk_operation_request_hash_not_null NOT NULL request_hash
+CONSTRAINT bss.pricing_bulk_operation pricing_bulk_operation_state_not_null NOT NULL state
+CONSTRAINT bss.pricing_bulk_operation pricing_bulk_operation_submitted_at_not_null NOT NULL submitted_at
+CONSTRAINT bss.pricing_bulk_operation pricing_bulk_operation_submitted_by_not_null NOT NULL submitted_by
+CONSTRAINT bss.pricing_bulk_operation pricing_bulk_operation_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_bulk_row_lock fk_pricing_bulk_row_lock_operation FOREIGN KEY (bulk_operation_id) REFERENCES bss.pricing_bulk_operation(operation_id)
 CONSTRAINT bss.pricing_bulk_row_lock fk_pricing_bulk_row_lock_price FOREIGN KEY (price_id) REFERENCES bss.pricing_price(price_id)
+CONSTRAINT bss.pricing_bulk_row_lock pricing_bulk_row_lock_bulk_operation_id_not_null NOT NULL bulk_operation_id
+CONSTRAINT bss.pricing_bulk_row_lock pricing_bulk_row_lock_locked_at_not_null NOT NULL locked_at
 CONSTRAINT bss.pricing_bulk_row_lock pricing_bulk_row_lock_pkey PRIMARY KEY (tenant_id, price_id)
+CONSTRAINT bss.pricing_bulk_row_lock pricing_bulk_row_lock_price_id_not_null NOT NULL price_id
+CONSTRAINT bss.pricing_bulk_row_lock pricing_bulk_row_lock_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_bundle chk_pricing_bundle_invoice_itemization CHECK ((invoice_itemization = ANY (ARRAY['aggregate'::text, 'itemize'::text])))
 CONSTRAINT bss.pricing_bundle chk_pricing_bundle_price_basis CHECK ((price_basis = ANY (ARRAY['sum_of_parts'::text, 'own_price'::text])))
+CONSTRAINT bss.pricing_bundle pricing_bundle_bundle_id_not_null NOT NULL bundle_id
+CONSTRAINT bss.pricing_bundle pricing_bundle_invoice_itemization_not_null NOT NULL invoice_itemization
 CONSTRAINT bss.pricing_bundle pricing_bundle_pkey PRIMARY KEY (bundle_id)
+CONSTRAINT bss.pricing_bundle pricing_bundle_plan_id_not_null NOT NULL plan_id
+CONSTRAINT bss.pricing_bundle pricing_bundle_price_basis_not_null NOT NULL price_basis
+CONSTRAINT bss.pricing_bundle pricing_bundle_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_bundle_component chk_pricing_bundle_component_min_qty CHECK (((min_qty IS NULL) OR (min_qty >= 0)))
 CONSTRAINT bss.pricing_bundle_component chk_pricing_bundle_component_qty_range CHECK (((min_qty IS NULL) OR (max_qty IS NULL) OR (min_qty <= max_qty)))
 CONSTRAINT bss.pricing_bundle_component fk_pricing_bundle_component_bundle FOREIGN KEY (bundle_id) REFERENCES bss.pricing_bundle(bundle_id)
+CONSTRAINT bss.pricing_bundle_component pricing_bundle_component_bundle_id_not_null NOT NULL bundle_id
+CONSTRAINT bss.pricing_bundle_component pricing_bundle_component_component_plan_id_not_null NOT NULL component_plan_id
+CONSTRAINT bss.pricing_bundle_component pricing_bundle_component_included_sku_id_not_null NOT NULL included_sku_id
 CONSTRAINT bss.pricing_bundle_component pricing_bundle_component_pkey PRIMARY KEY (bundle_id, plan_revision, component_plan_id)
+CONSTRAINT bss.pricing_bundle_component pricing_bundle_component_plan_revision_not_null NOT NULL plan_revision
+CONSTRAINT bss.pricing_bundle_component pricing_bundle_component_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_bundle_revshare chk_pricing_bundle_revshare_effective_share_bp CHECK (((effective_share_bp IS NULL) OR ((effective_share_bp >= 0) AND (effective_share_bp <= 10000))))
 CONSTRAINT bss.pricing_bundle_revshare chk_pricing_bundle_revshare_party CHECK (((length(btrim(party, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0) AND (btrim(party, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32))) <> 'platform'::text)))
 CONSTRAINT bss.pricing_bundle_revshare chk_pricing_bundle_revshare_share_bp CHECK (((share_bp >= 0) AND (share_bp <= 10000)))
 CONSTRAINT bss.pricing_bundle_revshare fk_pricing_bundle_revshare_group FOREIGN KEY (bundle_id, plan_revision, vendor_sku_id) REFERENCES bss.pricing_bundle_revshare_group(bundle_id, plan_revision, vendor_sku_id)
+CONSTRAINT bss.pricing_bundle_revshare pricing_bundle_revshare_bundle_id_not_null NOT NULL bundle_id
+CONSTRAINT bss.pricing_bundle_revshare pricing_bundle_revshare_party_not_null NOT NULL party
 CONSTRAINT bss.pricing_bundle_revshare pricing_bundle_revshare_pkey PRIMARY KEY (bundle_id, plan_revision, vendor_sku_id, party)
+CONSTRAINT bss.pricing_bundle_revshare pricing_bundle_revshare_plan_revision_not_null NOT NULL plan_revision
+CONSTRAINT bss.pricing_bundle_revshare pricing_bundle_revshare_share_bp_not_null NOT NULL share_bp
+CONSTRAINT bss.pricing_bundle_revshare pricing_bundle_revshare_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_bundle_revshare pricing_bundle_revshare_vendor_sku_id_not_null NOT NULL vendor_sku_id
 CONSTRAINT bss.pricing_bundle_revshare_group chk_pricing_bundle_revshare_group_absorber CHECK (((residual_absorber_party = 'platform'::text) OR ((length(btrim(residual_absorber_party, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0) AND (btrim(residual_absorber_party, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32))) <> 'platform'::text))))
 CONSTRAINT bss.pricing_bundle_revshare_group chk_pricing_bundle_revshare_group_platform_cut_bp CHECK (((platform_cut_bp >= 0) AND (platform_cut_bp <= 10000)))
 CONSTRAINT bss.pricing_bundle_revshare_group fk_pricing_bundle_revshare_group_bundle FOREIGN KEY (bundle_id) REFERENCES bss.pricing_bundle(bundle_id)
+CONSTRAINT bss.pricing_bundle_revshare_group pricing_bundle_revshare_group_bundle_id_not_null NOT NULL bundle_id
 CONSTRAINT bss.pricing_bundle_revshare_group pricing_bundle_revshare_group_pkey PRIMARY KEY (bundle_id, plan_revision, vendor_sku_id)
+CONSTRAINT bss.pricing_bundle_revshare_group pricing_bundle_revshare_group_plan_revision_not_null NOT NULL plan_revision
+CONSTRAINT bss.pricing_bundle_revshare_group pricing_bundle_revshare_group_platform_cut_bp_not_null NOT NULL platform_cut_bp
+CONSTRAINT bss.pricing_bundle_revshare_group pricing_bundle_revshare_group_residual_absorber_party_not_null NOT NULL residual_absorber_party
+CONSTRAINT bss.pricing_bundle_revshare_group pricing_bundle_revshare_group_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_bundle_revshare_group pricing_bundle_revshare_group_vendor_sku_id_not_null NOT NULL vendor_sku_id
 CONSTRAINT bss.pricing_catalog_version_ref chk_pricing_catalog_version_ref_commit CHECK (((catalog_version IS NULL) = (committed_at IS NULL)))
 CONSTRAINT bss.pricing_catalog_version_ref chk_pricing_catalog_version_ref_subject_kind CHECK ((subject_kind = ANY (ARRAY['plan'::text, 'price_overlay'::text, 'overlay_index'::text, 'group_membership'::text])))
 CONSTRAINT bss.pricing_catalog_version_ref chk_pricing_catalog_version_ref_subject_lifecycle CHECK (((subject_lifecycle_state IS NULL) OR (subject_lifecycle_state = ANY (ARRAY['published'::text, 'retired'::text]))))
 CONSTRAINT bss.pricing_catalog_version_ref chk_pricing_catalog_version_ref_subject_revision CHECK (((subject_revision IS NULL) OR (subject_revision >= 0)))
 CONSTRAINT bss.pricing_catalog_version_ref chk_pricing_catalog_version_ref_version CHECK (((catalog_version IS NULL) OR (catalog_version >= 0)))
+CONSTRAINT bss.pricing_catalog_version_ref pricing_catalog_version_ref_pending_ref_not_null NOT NULL pending_ref
 CONSTRAINT bss.pricing_catalog_version_ref pricing_catalog_version_ref_pkey PRIMARY KEY (tenant_id, pending_ref, subject_kind, subject_ref)
+CONSTRAINT bss.pricing_catalog_version_ref pricing_catalog_version_ref_requested_at_not_null NOT NULL requested_at
+CONSTRAINT bss.pricing_catalog_version_ref pricing_catalog_version_ref_subject_kind_not_null NOT NULL subject_kind
+CONSTRAINT bss.pricing_catalog_version_ref pricing_catalog_version_ref_subject_ref_not_null NOT NULL subject_ref
+CONSTRAINT bss.pricing_catalog_version_ref pricing_catalog_version_ref_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_composite_meter chk_pricing_composite_meter_output_unit CHECK ((length(btrim(output_unit, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
 CONSTRAINT bss.pricing_composite_meter fk_pricing_composite_meter_revision FOREIGN KEY (plan_id, plan_revision) REFERENCES bss.pricing_plan(plan_id, revision)
+CONSTRAINT bss.pricing_composite_meter pricing_composite_meter_composite_id_not_null NOT NULL composite_id
+CONSTRAINT bss.pricing_composite_meter pricing_composite_meter_constituent_units_not_null NOT NULL constituent_units
+CONSTRAINT bss.pricing_composite_meter pricing_composite_meter_formula_not_null NOT NULL formula
+CONSTRAINT bss.pricing_composite_meter pricing_composite_meter_output_unit_not_null NOT NULL output_unit
 CONSTRAINT bss.pricing_composite_meter pricing_composite_meter_pkey PRIMARY KEY (tenant_id, plan_id, plan_revision, composite_id)
+CONSTRAINT bss.pricing_composite_meter pricing_composite_meter_plan_id_not_null NOT NULL plan_id
+CONSTRAINT bss.pricing_composite_meter pricing_composite_meter_plan_revision_not_null NOT NULL plan_revision
+CONSTRAINT bss.pricing_composite_meter pricing_composite_meter_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_customer_group_taxonomy chk_pricing_customer_group_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
 CONSTRAINT bss.pricing_customer_group_taxonomy chk_pricing_customer_group_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_customer_group_taxonomy pricing_customer_group_taxonomy_display_name_not_null NOT NULL display_name
 CONSTRAINT bss.pricing_customer_group_taxonomy pricing_customer_group_taxonomy_pkey PRIMARY KEY (tenant_id, value)
+CONSTRAINT bss.pricing_customer_group_taxonomy pricing_customer_group_taxonomy_state_not_null NOT NULL state
+CONSTRAINT bss.pricing_customer_group_taxonomy pricing_customer_group_taxonomy_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_customer_group_taxonomy pricing_customer_group_taxonomy_value_not_null NOT NULL value
 CONSTRAINT bss.pricing_group_membership chk_pricing_group_membership_group_value_present CHECK ((length(btrim(group_value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
 CONSTRAINT bss.pricing_group_membership chk_pricing_group_membership_interval CHECK (((effective_to IS NULL) OR (effective_to > effective_from)))
 CONSTRAINT bss.pricing_group_membership chk_pricing_group_membership_row_version CHECK ((row_version >= 0))
 CONSTRAINT bss.pricing_group_membership excl_pricing_group_membership_no_overlap EXCLUDE USING gist (tenant_id WITH =, payer_tenant_id WITH =, tstzrange(effective_from, effective_to, '[)'::text) WITH &&)
+CONSTRAINT bss.pricing_group_membership pricing_group_membership_created_at_utc_not_null NOT NULL created_at_utc
+CONSTRAINT bss.pricing_group_membership pricing_group_membership_created_by_not_null NOT NULL created_by
+CONSTRAINT bss.pricing_group_membership pricing_group_membership_effective_from_not_null NOT NULL effective_from
+CONSTRAINT bss.pricing_group_membership pricing_group_membership_group_value_not_null NOT NULL group_value
+CONSTRAINT bss.pricing_group_membership pricing_group_membership_membership_id_not_null NOT NULL membership_id
+CONSTRAINT bss.pricing_group_membership pricing_group_membership_payer_tenant_id_not_null NOT NULL payer_tenant_id
 CONSTRAINT bss.pricing_group_membership pricing_group_membership_pkey PRIMARY KEY (membership_id)
+CONSTRAINT bss.pricing_group_membership pricing_group_membership_row_version_not_null NOT NULL row_version
+CONSTRAINT bss.pricing_group_membership pricing_group_membership_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_idempotency_dedup chk_pricing_idempotency_dedup_answered CHECK (((response_status IS NULL) = (response_body IS NULL)))
 CONSTRAINT bss.pricing_idempotency_dedup chk_pricing_idempotency_dedup_status CHECK (((response_status IS NULL) OR ((response_status >= 100) AND (response_status <= 599))))
+CONSTRAINT bss.pricing_idempotency_dedup pricing_idempotency_dedup_client_key_not_null NOT NULL client_key
+CONSTRAINT bss.pricing_idempotency_dedup pricing_idempotency_dedup_created_at_utc_not_null NOT NULL created_at_utc
+CONSTRAINT bss.pricing_idempotency_dedup pricing_idempotency_dedup_operation_not_null NOT NULL operation
 CONSTRAINT bss.pricing_idempotency_dedup pricing_idempotency_dedup_pkey PRIMARY KEY (tenant_id, operation, client_key)
+CONSTRAINT bss.pricing_idempotency_dedup pricing_idempotency_dedup_request_hash_not_null NOT NULL request_hash
+CONSTRAINT bss.pricing_idempotency_dedup pricing_idempotency_dedup_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_migration chk_pricing_migration_announced_before_effective CHECK ((announced_at <= effective_at))
 CONSTRAINT bss.pricing_migration chk_pricing_migration_cancelled_at CHECK (((state = 'cancelled'::text) = (cancelled_at IS NOT NULL)))
 CONSTRAINT bss.pricing_migration chk_pricing_migration_cancelled_order CHECK (((cancelled_at IS NULL) OR (cancelled_at >= created_at)))
@@ -456,20 +561,58 @@ CONSTRAINT bss.pricing_migration chk_pricing_migration_source_revision CHECK ((s
 CONSTRAINT bss.pricing_migration chk_pricing_migration_started_order CHECK (((started_at IS NULL) OR (started_at >= created_at)))
 CONSTRAINT bss.pricing_migration chk_pricing_migration_started_required CHECK (((state <> ALL (ARRAY['in_progress'::text, 'completed'::text])) OR (started_at IS NOT NULL)))
 CONSTRAINT bss.pricing_migration chk_pricing_migration_state CHECK ((state = ANY (ARRAY['scheduled'::text, 'in_progress'::text, 'completed'::text, 'cancelled'::text])))
+CONSTRAINT bss.pricing_migration pricing_migration_announced_at_not_null NOT NULL announced_at
+CONSTRAINT bss.pricing_migration pricing_migration_created_at_not_null NOT NULL created_at
+CONSTRAINT bss.pricing_migration pricing_migration_created_by_not_null NOT NULL created_by
+CONSTRAINT bss.pricing_migration pricing_migration_delta_report_not_null NOT NULL delta_report
+CONSTRAINT bss.pricing_migration pricing_migration_effective_at_not_null NOT NULL effective_at
+CONSTRAINT bss.pricing_migration pricing_migration_migration_id_not_null NOT NULL migration_id
 CONSTRAINT bss.pricing_migration pricing_migration_pkey PRIMARY KEY (tenant_id, migration_id)
+CONSTRAINT bss.pricing_migration pricing_migration_scope_not_null NOT NULL scope
+CONSTRAINT bss.pricing_migration pricing_migration_source_plan_id_not_null NOT NULL source_plan_id
+CONSTRAINT bss.pricing_migration pricing_migration_source_revision_not_null NOT NULL source_revision
+CONSTRAINT bss.pricing_migration pricing_migration_state_not_null NOT NULL state
+CONSTRAINT bss.pricing_migration pricing_migration_target_plan_id_not_null NOT NULL target_plan_id
+CONSTRAINT bss.pricing_migration pricing_migration_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_operator_flag chk_pricing_operator_flag_name CHECK ((flag = ANY (ARRAY['tier_divergent'::text, 'grants_divergent'::text, 'tax_readiness_divergent'::text, 'meter_binding_divergent'::text])))
+CONSTRAINT bss.pricing_operator_flag pricing_operator_flag_detail_not_null NOT NULL detail
+CONSTRAINT bss.pricing_operator_flag pricing_operator_flag_flag_not_null NOT NULL flag
 CONSTRAINT bss.pricing_operator_flag pricing_operator_flag_pkey PRIMARY KEY (tenant_id, subject_ref, flag)
+CONSTRAINT bss.pricing_operator_flag pricing_operator_flag_set_at_not_null NOT NULL set_at
+CONSTRAINT bss.pricing_operator_flag pricing_operator_flag_set_by_not_null NOT NULL set_by
+CONSTRAINT bss.pricing_operator_flag pricing_operator_flag_subject_ref_not_null NOT NULL subject_ref
+CONSTRAINT bss.pricing_operator_flag pricing_operator_flag_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_org_tier_taxonomy chk_pricing_org_tier_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
 CONSTRAINT bss.pricing_org_tier_taxonomy chk_pricing_org_tier_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_org_tier_taxonomy pricing_org_tier_taxonomy_display_name_not_null NOT NULL display_name
 CONSTRAINT bss.pricing_org_tier_taxonomy pricing_org_tier_taxonomy_pkey PRIMARY KEY (tenant_id, value)
+CONSTRAINT bss.pricing_org_tier_taxonomy pricing_org_tier_taxonomy_state_not_null NOT NULL state
+CONSTRAINT bss.pricing_org_tier_taxonomy pricing_org_tier_taxonomy_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_org_tier_taxonomy pricing_org_tier_taxonomy_value_not_null NOT NULL value
 CONSTRAINT bss.pricing_outbox chk_pricing_outbox_event_name CHECK ((event_name = ANY (ARRAY['PlanCreated'::text, 'PlanUpdated'::text, 'PlanPublished'::text, 'PlanRetired'::text, 'PlanMigrationScheduled'::text, 'PlanPublishDegraded'::text, 'BundleUpdated'::text, 'PriceCreated'::text, 'PriceUpdated'::text, 'PriceWindowScheduled'::text, 'PriceWindowActivated'::text, 'PriceWindowExpired'::text, 'PriceWindowCancelled'::text, 'PriceOverlayPublished'::text])))
 CONSTRAINT bss.pricing_outbox chk_pricing_outbox_sequence CHECK ((seq >= 0))
+CONSTRAINT bss.pricing_outbox pricing_outbox_aggregate_id_not_null NOT NULL aggregate_id
+CONSTRAINT bss.pricing_outbox pricing_outbox_correlation_id_not_null NOT NULL correlation_id
+CONSTRAINT bss.pricing_outbox pricing_outbox_dedup_key_not_null NOT NULL dedup_key
+CONSTRAINT bss.pricing_outbox pricing_outbox_enqueued_at_not_null NOT NULL enqueued_at
+CONSTRAINT bss.pricing_outbox pricing_outbox_event_name_not_null NOT NULL event_name
+CONSTRAINT bss.pricing_outbox pricing_outbox_outbox_id_not_null NOT NULL outbox_id
+CONSTRAINT bss.pricing_outbox pricing_outbox_payload_not_null NOT NULL payload
 CONSTRAINT bss.pricing_outbox pricing_outbox_pkey PRIMARY KEY (outbox_id)
+CONSTRAINT bss.pricing_outbox pricing_outbox_seq_not_null NOT NULL seq
+CONSTRAINT bss.pricing_outbox pricing_outbox_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_partner_taxonomy chk_pricing_partner_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
 CONSTRAINT bss.pricing_partner_taxonomy chk_pricing_partner_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_partner_taxonomy pricing_partner_taxonomy_display_name_not_null NOT NULL display_name
 CONSTRAINT bss.pricing_partner_taxonomy pricing_partner_taxonomy_pkey PRIMARY KEY (tenant_id, value)
+CONSTRAINT bss.pricing_partner_taxonomy pricing_partner_taxonomy_state_not_null NOT NULL state
+CONSTRAINT bss.pricing_partner_taxonomy pricing_partner_taxonomy_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_partner_taxonomy pricing_partner_taxonomy_value_not_null NOT NULL value
 CONSTRAINT bss.pricing_pin_frontier chk_pricing_pin_frontier_version CHECK ((catalog_version >= 0))
+CONSTRAINT bss.pricing_pin_frontier pricing_pin_frontier_advanced_at_not_null NOT NULL advanced_at
+CONSTRAINT bss.pricing_pin_frontier pricing_pin_frontier_catalog_version_not_null NOT NULL catalog_version
 CONSTRAINT bss.pricing_pin_frontier pricing_pin_frontier_pkey PRIMARY KEY (tenant_id)
+CONSTRAINT bss.pricing_pin_frontier pricing_pin_frontier_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_plan chk_pricing_plan_availability CHECK (((available_from IS NULL) OR (available_to IS NULL) OR (available_to > available_from)))
 CONSTRAINT bss.pricing_plan chk_pricing_plan_billing_cycle CHECK (((billing_cycle IS NULL) OR (billing_cycle = ANY (ARRAY['one_time'::text, 'recurring'::text, 'usage'::text, 'hybrid'::text]))))
 CONSTRAINT bss.pricing_plan chk_pricing_plan_custom_interval_n CHECK (((custom_interval_n IS NULL) OR (custom_interval_n > 0)))
@@ -482,36 +625,72 @@ CONSTRAINT bss.pricing_plan chk_pricing_plan_purchase_min_qty CHECK (((purchase_
 CONSTRAINT bss.pricing_plan chk_pricing_plan_purchase_qty CHECK (((purchase_min_qty IS NULL) OR (purchase_max_qty IS NULL) OR (purchase_min_qty <= purchase_max_qty)))
 CONSTRAINT bss.pricing_plan chk_pricing_plan_revision CHECK ((revision >= 0))
 CONSTRAINT bss.pricing_plan chk_pricing_plan_row_version CHECK ((row_version >= 0))
+CONSTRAINT bss.pricing_plan pricing_plan_created_at_utc_not_null NOT NULL created_at_utc
+CONSTRAINT bss.pricing_plan pricing_plan_created_by_not_null NOT NULL created_by
+CONSTRAINT bss.pricing_plan pricing_plan_lifecycle_state_not_null NOT NULL lifecycle_state
 CONSTRAINT bss.pricing_plan pricing_plan_pkey PRIMARY KEY (plan_id, revision)
+CONSTRAINT bss.pricing_plan pricing_plan_plan_id_not_null NOT NULL plan_id
+CONSTRAINT bss.pricing_plan pricing_plan_plan_tier_override_not_null NOT NULL plan_tier_override
+CONSTRAINT bss.pricing_plan pricing_plan_revision_not_null NOT NULL revision
+CONSTRAINT bss.pricing_plan pricing_plan_row_version_not_null NOT NULL row_version
+CONSTRAINT bss.pricing_plan pricing_plan_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_plan_addon_rule chk_pricing_plan_addon_rule_max_qty CHECK (((max_qty IS NULL) OR (max_qty >= 0)))
 CONSTRAINT bss.pricing_plan_addon_rule chk_pricing_plan_addon_rule_min_qty CHECK (((min_qty IS NULL) OR (min_qty >= 0)))
 CONSTRAINT bss.pricing_plan_addon_rule chk_pricing_plan_addon_rule_qty_range CHECK (((min_qty IS NULL) OR (max_qty IS NULL) OR (min_qty <= max_qty)))
 CONSTRAINT bss.pricing_plan_addon_rule chk_pricing_plan_addon_rule_required_max_qty CHECK (((NOT required) OR ((max_qty IS NOT NULL) AND (max_qty >= 1))))
 CONSTRAINT bss.pricing_plan_addon_rule chk_pricing_plan_addon_rule_step_qty CHECK (((step_qty IS NULL) OR (step_qty > 0)))
 CONSTRAINT bss.pricing_plan_addon_rule fk_pricing_plan_addon_rule_revision FOREIGN KEY (plan_id, plan_revision) REFERENCES bss.pricing_plan(plan_id, revision)
+CONSTRAINT bss.pricing_plan_addon_rule pricing_plan_addon_rule_addon_sku_id_not_null NOT NULL addon_sku_id
+CONSTRAINT bss.pricing_plan_addon_rule pricing_plan_addon_rule_conflicts_with_addon_sku_id_not_null NOT NULL conflicts_with_addon_sku_id
+CONSTRAINT bss.pricing_plan_addon_rule pricing_plan_addon_rule_depends_on_addon_sku_id_not_null NOT NULL depends_on_addon_sku_id
 CONSTRAINT bss.pricing_plan_addon_rule pricing_plan_addon_rule_pkey PRIMARY KEY (plan_id, plan_revision, addon_sku_id)
+CONSTRAINT bss.pricing_plan_addon_rule pricing_plan_addon_rule_plan_id_not_null NOT NULL plan_id
+CONSTRAINT bss.pricing_plan_addon_rule pricing_plan_addon_rule_plan_revision_not_null NOT NULL plan_revision
+CONSTRAINT bss.pricing_plan_addon_rule pricing_plan_addon_rule_required_not_null NOT NULL required
+CONSTRAINT bss.pricing_plan_addon_rule pricing_plan_addon_rule_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_plan_descriptor_set fk_pricing_plan_descriptor_set_revision FOREIGN KEY (plan_id, plan_revision) REFERENCES bss.pricing_plan(plan_id, revision)
+CONSTRAINT bss.pricing_plan_descriptor_set pricing_plan_descriptor_set_additional_fields_not_null NOT NULL additional_fields
 CONSTRAINT bss.pricing_plan_descriptor_set pricing_plan_descriptor_set_pkey PRIMARY KEY (plan_id, plan_revision)
+CONSTRAINT bss.pricing_plan_descriptor_set pricing_plan_descriptor_set_plan_id_not_null NOT NULL plan_id
+CONSTRAINT bss.pricing_plan_descriptor_set pricing_plan_descriptor_set_plan_revision_not_null NOT NULL plan_revision
+CONSTRAINT bss.pricing_plan_descriptor_set pricing_plan_descriptor_set_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_plan_period_floor_cap chk_pricing_plan_period_floor_cap_cap_positive CHECK (((cap_minor IS NULL) OR (cap_minor > 0)))
 CONSTRAINT bss.pricing_plan_period_floor_cap chk_pricing_plan_period_floor_cap_currency CHECK ((length(currency) = 3))
 CONSTRAINT bss.pricing_plan_period_floor_cap chk_pricing_plan_period_floor_cap_floor_positive CHECK (((floor_minor IS NULL) OR (floor_minor > 0)))
 CONSTRAINT bss.pricing_plan_period_floor_cap chk_pricing_plan_period_floor_cap_ordered CHECK (((floor_minor IS NULL) OR (cap_minor IS NULL) OR (floor_minor <= cap_minor)))
 CONSTRAINT bss.pricing_plan_period_floor_cap chk_pricing_plan_period_floor_cap_present CHECK (((floor_minor IS NOT NULL) OR (cap_minor IS NOT NULL)))
 CONSTRAINT bss.pricing_plan_period_floor_cap fk_pricing_plan_period_floor_cap_revision FOREIGN KEY (plan_id, plan_revision) REFERENCES bss.pricing_plan(plan_id, revision)
+CONSTRAINT bss.pricing_plan_period_floor_cap pricing_plan_period_floor_cap_currency_not_null NOT NULL currency
 CONSTRAINT bss.pricing_plan_period_floor_cap pricing_plan_period_floor_cap_pkey PRIMARY KEY (plan_id, plan_revision, currency, region)
+CONSTRAINT bss.pricing_plan_period_floor_cap pricing_plan_period_floor_cap_plan_id_not_null NOT NULL plan_id
+CONSTRAINT bss.pricing_plan_period_floor_cap pricing_plan_period_floor_cap_plan_revision_not_null NOT NULL plan_revision
+CONSTRAINT bss.pricing_plan_period_floor_cap pricing_plan_period_floor_cap_region_not_null NOT NULL region
+CONSTRAINT bss.pricing_plan_period_floor_cap pricing_plan_period_floor_cap_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_plan_phase chk_pricing_plan_phase_display_trial_days CHECK (((display_trial_days IS NULL) OR (display_trial_days = phase_duration_days)))
 CONSTRAINT bss.pricing_plan_phase chk_pricing_plan_phase_duration_non_negative CHECK (((phase_duration_days IS NULL) OR (phase_duration_days >= 0)))
 CONSTRAINT bss.pricing_plan_phase chk_pricing_plan_phase_kind CHECK ((kind = ANY (ARRAY['trial'::text, 'intro'::text, 'evergreen'::text])))
 CONSTRAINT bss.pricing_plan_phase chk_pricing_plan_phase_trial_projection_non_negative CHECK (((display_trial_days IS NULL) OR (display_trial_days >= 0)))
 CONSTRAINT bss.pricing_plan_phase fk_pricing_plan_phase_revision FOREIGN KEY (plan_id, plan_revision) REFERENCES bss.pricing_plan(plan_id, revision)
+CONSTRAINT bss.pricing_plan_phase pricing_plan_phase_kind_not_null NOT NULL kind
+CONSTRAINT bss.pricing_plan_phase pricing_plan_phase_ordinal_not_null NOT NULL ordinal
+CONSTRAINT bss.pricing_plan_phase pricing_plan_phase_phase_id_not_null NOT NULL phase_id
 CONSTRAINT bss.pricing_plan_phase pricing_plan_phase_pkey PRIMARY KEY (tenant_id, plan_id, plan_revision, phase_id)
+CONSTRAINT bss.pricing_plan_phase pricing_plan_phase_plan_id_not_null NOT NULL plan_id
+CONSTRAINT bss.pricing_plan_phase pricing_plan_phase_plan_revision_not_null NOT NULL plan_revision
+CONSTRAINT bss.pricing_plan_phase pricing_plan_phase_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_policy_object chk_pricing_policy_object_interval_days_cap CHECK (((max_custom_interval_days IS NULL) OR (max_custom_interval_days > 0)))
 CONSTRAINT bss.pricing_policy_object chk_pricing_policy_object_interval_months_cap CHECK (((max_custom_interval_months IS NULL) OR (max_custom_interval_months > 0)))
 CONSTRAINT bss.pricing_policy_object chk_pricing_policy_object_notice_floor CHECK ((enforced_migration_notice_days >= 60))
 CONSTRAINT bss.pricing_policy_object chk_pricing_policy_object_price_row_cap CHECK (((max_price_rows_per_plan IS NULL) OR (max_price_rows_per_plan > 0)))
 CONSTRAINT bss.pricing_policy_object chk_pricing_policy_object_tax_display_policy CHECK ((tax_display_policy_mode = ANY (ARRAY['fail_closed'::text, 'warn'::text])))
 CONSTRAINT bss.pricing_policy_object chk_pricing_policy_object_tier_band_cap CHECK (((max_tier_bands_per_row IS NULL) OR (max_tier_bands_per_row > 0)))
+CONSTRAINT bss.pricing_policy_object pricing_policy_object_additional_required_descriptors_not_null NOT NULL additional_required_descriptors
+CONSTRAINT bss.pricing_policy_object pricing_policy_object_enforced_migration_notice_days_not_null NOT NULL enforced_migration_notice_days
 CONSTRAINT bss.pricing_policy_object pricing_policy_object_pkey PRIMARY KEY (tenant_id)
+CONSTRAINT bss.pricing_policy_object pricing_policy_object_tax_display_policy_mode_not_null NOT NULL tax_display_policy_mode
+CONSTRAINT bss.pricing_policy_object pricing_policy_object_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_policy_object pricing_policy_object_updated_at_utc_not_null NOT NULL updated_at_utc
+CONSTRAINT bss.pricing_policy_object pricing_policy_object_updated_by_not_null NOT NULL updated_by
 CONSTRAINT bss.pricing_price chk_pricing_price_aggregation_function CHECK (((aggregation_function IS NULL) OR (aggregation_function = ANY (ARRAY['sum'::text, 'peak'::text, 'time_weighted'::text]))))
 CONSTRAINT bss.pricing_price chk_pricing_price_aggregation_granularity CHECK (((aggregation_granularity IS NULL) OR (aggregation_granularity = ANY (ARRAY['hour'::text, 'day'::text]))))
 CONSTRAINT bss.pricing_price chk_pricing_price_amount_non_negative CHECK (((amount_minor IS NULL) OR (amount_minor >= 0)))
@@ -539,7 +718,23 @@ CONSTRAINT bss.pricing_price chk_pricing_price_row_version CHECK ((row_version >
 CONSTRAINT bss.pricing_price chk_pricing_price_tier_aggregation_window CHECK (((tier_aggregation_window IS NULL) OR (tier_aggregation_window = ANY (ARRAY['calendar_month'::text, 'invoice_period'::text, 'subscription_lifetime'::text, 'per_event'::text, 'per_hour'::text]))))
 CONSTRAINT bss.pricing_price chk_pricing_price_tier_qualification_window CHECK (((tier_qualification_window IS NULL) OR (tier_qualification_window = ANY (ARRAY['current'::text, 'trailing_period'::text]))))
 CONSTRAINT bss.pricing_price chk_pricing_price_unit_rate_nano CHECK (((unit_rate_nano IS NULL) OR (unit_rate_nano >= 0)))
+CONSTRAINT bss.pricing_price pricing_price_charge_kind_not_null NOT NULL charge_kind
+CONSTRAINT bss.pricing_price pricing_price_cohort_not_null NOT NULL cohort
+CONSTRAINT bss.pricing_price pricing_price_created_at_utc_not_null NOT NULL created_at_utc
+CONSTRAINT bss.pricing_price pricing_price_created_by_not_null NOT NULL created_by
+CONSTRAINT bss.pricing_price pricing_price_currency_not_null NOT NULL currency
+CONSTRAINT bss.pricing_price pricing_price_dimension_key_not_null NOT NULL dimension_key
+CONSTRAINT bss.pricing_price pricing_price_lifecycle_state_not_null NOT NULL lifecycle_state
+CONSTRAINT bss.pricing_price pricing_price_phase_not_null NOT NULL phase
 CONSTRAINT bss.pricing_price pricing_price_pkey PRIMARY KEY (price_id)
+CONSTRAINT bss.pricing_price pricing_price_plan_id_not_null NOT NULL plan_id
+CONSTRAINT bss.pricing_price pricing_price_price_eligibility_not_null NOT NULL price_eligibility
+CONSTRAINT bss.pricing_price pricing_price_price_id_not_null NOT NULL price_id
+CONSTRAINT bss.pricing_price pricing_price_price_overlay_not_null NOT NULL price_overlay
+CONSTRAINT bss.pricing_price pricing_price_region_not_null NOT NULL region
+CONSTRAINT bss.pricing_price pricing_price_row_version_not_null NOT NULL row_version
+CONSTRAINT bss.pricing_price pricing_price_tax_inclusive_not_null NOT NULL tax_inclusive
+CONSTRAINT bss.pricing_price pricing_price_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_disclosure CHECK ((disclosure = ANY (ARRAY['restricted'::text, 'public'::text])))
 CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_interval CHECK (((effective_from IS NULL) OR (effective_to IS NULL) OR (effective_to > effective_from)))
 CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_lifecycle_state CHECK ((lifecycle_state = ANY (ARRAY['draft'::text, 'published'::text, 'superseded'::text, 'abandoned'::text])))
@@ -548,7 +743,18 @@ CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_row_version CHECK
 CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_scope_class CHECK ((scope_class = ANY (ARRAY['partner'::text, 'org_tier'::text, 'brand'::text, 'region'::text, 'customer_group'::text, 'global'::text])))
 CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_scope_value CHECK (((scope_class = 'global'::text) = (length(scope_value) = 0)))
 CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_tax_basis CHECK ((tax_basis = ANY (ARRAY['inclusive'::text, 'exclusive'::text, 'delegated_tariffs'::text])))
+CONSTRAINT bss.pricing_price_overlay pricing_price_overlay_disclosure_not_null NOT NULL disclosure
+CONSTRAINT bss.pricing_price_overlay pricing_price_overlay_lifecycle_state_not_null NOT NULL lifecycle_state
 CONSTRAINT bss.pricing_price_overlay pricing_price_overlay_pkey PRIMARY KEY (price_overlay_id, revision)
+CONSTRAINT bss.pricing_price_overlay pricing_price_overlay_precedence_not_null NOT NULL precedence
+CONSTRAINT bss.pricing_price_overlay pricing_price_overlay_price_overlay_id_not_null NOT NULL price_overlay_id
+CONSTRAINT bss.pricing_price_overlay pricing_price_overlay_revision_not_null NOT NULL revision
+CONSTRAINT bss.pricing_price_overlay pricing_price_overlay_row_version_not_null NOT NULL row_version
+CONSTRAINT bss.pricing_price_overlay pricing_price_overlay_scope_class_not_null NOT NULL scope_class
+CONSTRAINT bss.pricing_price_overlay pricing_price_overlay_scope_value_not_null NOT NULL scope_value
+CONSTRAINT bss.pricing_price_overlay pricing_price_overlay_target_ref_not_null NOT NULL target_ref
+CONSTRAINT bss.pricing_price_overlay pricing_price_overlay_tax_basis_not_null NOT NULL tax_basis
+CONSTRAINT bss.pricing_price_overlay pricing_price_overlay_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_adjustment_kind CHECK ((adjustment_kind = ANY (ARRAY['markup'::text, 'discount'::text, 'fixed'::text])))
 CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_cohort_needs_plan CHECK (((cohort IS NULL) OR (plan_id IS NOT NULL)))
 CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_discount_ceiling CHECK (((adjustment_kind <> 'discount'::text) OR (adjustment_value IS NULL) OR (adjustment_value <= 10000)))
@@ -560,16 +766,32 @@ CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_plan_id
 CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_sku_needs_plan CHECK (((target_sku IS NULL) OR (plan_id IS NOT NULL)))
 CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_target_sku_present CHECK (((target_sku IS NULL) OR (length(btrim(target_sku, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0)))
 CONSTRAINT bss.pricing_price_overlay_line fk_pricing_price_overlay_line_overlay FOREIGN KEY (price_overlay_id, overlay_revision) REFERENCES bss.pricing_price_overlay(price_overlay_id, revision)
+CONSTRAINT bss.pricing_price_overlay_line pricing_price_overlay_line_adjustment_kind_not_null NOT NULL adjustment_kind
+CONSTRAINT bss.pricing_price_overlay_line pricing_price_overlay_line_line_id_not_null NOT NULL line_id
+CONSTRAINT bss.pricing_price_overlay_line pricing_price_overlay_line_magnitude_kind_not_null NOT NULL magnitude_kind
+CONSTRAINT bss.pricing_price_overlay_line pricing_price_overlay_line_overlay_revision_not_null NOT NULL overlay_revision
 CONSTRAINT bss.pricing_price_overlay_line pricing_price_overlay_line_pkey PRIMARY KEY (tenant_id, overlay_revision, line_id)
+CONSTRAINT bss.pricing_price_overlay_line pricing_price_overlay_line_price_overlay_id_not_null NOT NULL price_overlay_id
+CONSTRAINT bss.pricing_price_overlay_line pricing_price_overlay_line_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_price_overlay_line_amount chk_pricing_price_overlay_line_amount_currency CHECK ((length(currency) = 3))
 CONSTRAINT bss.pricing_price_overlay_line_amount chk_pricing_price_overlay_line_amount_value_minor CHECK ((value_minor >= 0))
 CONSTRAINT bss.pricing_price_overlay_line_amount fk_pricing_price_overlay_line_amount_line FOREIGN KEY (tenant_id, overlay_revision, line_id) REFERENCES bss.pricing_price_overlay_line(tenant_id, overlay_revision, line_id)
+CONSTRAINT bss.pricing_price_overlay_line_amount pricing_price_overlay_line_amount_currency_not_null NOT NULL currency
+CONSTRAINT bss.pricing_price_overlay_line_amount pricing_price_overlay_line_amount_line_id_not_null NOT NULL line_id
+CONSTRAINT bss.pricing_price_overlay_line_amount pricing_price_overlay_line_amount_overlay_revision_not_null NOT NULL overlay_revision
 CONSTRAINT bss.pricing_price_overlay_line_amount pricing_price_overlay_line_amount_pkey PRIMARY KEY (tenant_id, overlay_revision, line_id, currency)
+CONSTRAINT bss.pricing_price_overlay_line_amount pricing_price_overlay_line_amount_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_price_overlay_line_amount pricing_price_overlay_line_amount_value_minor_not_null NOT NULL value_minor
 CONSTRAINT bss.pricing_price_tier_band chk_pricing_price_tier_band_from_qty CHECK ((from_qty >= 0))
 CONSTRAINT bss.pricing_price_tier_band chk_pricing_price_tier_band_unit_price CHECK ((unit_price_nano >= 0))
 CONSTRAINT bss.pricing_price_tier_band chk_pricing_price_tier_band_width CHECK (((to_qty IS NULL) OR (to_qty > from_qty)))
 CONSTRAINT bss.pricing_price_tier_band fk_pricing_price_tier_band_price FOREIGN KEY (price_id) REFERENCES bss.pricing_price(price_id)
+CONSTRAINT bss.pricing_price_tier_band pricing_price_tier_band_band_id_not_null NOT NULL band_id
+CONSTRAINT bss.pricing_price_tier_band pricing_price_tier_band_from_qty_not_null NOT NULL from_qty
 CONSTRAINT bss.pricing_price_tier_band pricing_price_tier_band_pkey PRIMARY KEY (band_id)
+CONSTRAINT bss.pricing_price_tier_band pricing_price_tier_band_price_id_not_null NOT NULL price_id
+CONSTRAINT bss.pricing_price_tier_band pricing_price_tier_band_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_price_tier_band pricing_price_tier_band_unit_price_nano_not_null NOT NULL unit_price_nano
 CONSTRAINT bss.pricing_price_tier_band uq_pricing_price_tier_band_lower_bound UNIQUE (price_id, from_qty)
 CONSTRAINT bss.pricing_price_window chk_pricing_price_window_activated_at CHECK (((state = ANY (ARRAY['active'::text, 'expired'::text])) = (activated_at IS NOT NULL)))
 CONSTRAINT bss.pricing_price_window chk_pricing_price_window_activation_order CHECK (((activated_at IS NULL) OR (activated_at >= effective_from)))
@@ -583,14 +805,35 @@ CONSTRAINT bss.pricing_price_window chk_pricing_price_window_reason_code CHECK (
 CONSTRAINT bss.pricing_price_window chk_pricing_price_window_state CHECK ((state = ANY (ARRAY['scheduled'::text, 'active'::text, 'expired'::text, 'cancelled'::text])))
 CONSTRAINT bss.pricing_price_window excl_pricing_price_window_no_overlap EXCLUDE USING gist (tenant_id WITH =, price_id WITH =, tstzrange(effective_from, effective_to, '[)'::text) WITH &&) WHERE ((state = ANY (ARRAY['scheduled'::text, 'active'::text])))
 CONSTRAINT bss.pricing_price_window fk_pricing_price_window_price FOREIGN KEY (price_id) REFERENCES bss.pricing_price(price_id)
+CONSTRAINT bss.pricing_price_window pricing_price_window_created_at_not_null NOT NULL created_at
+CONSTRAINT bss.pricing_price_window pricing_price_window_created_by_not_null NOT NULL created_by
+CONSTRAINT bss.pricing_price_window pricing_price_window_effective_from_not_null NOT NULL effective_from
+CONSTRAINT bss.pricing_price_window pricing_price_window_mutation_seq_not_null NOT NULL mutation_seq
 CONSTRAINT bss.pricing_price_window pricing_price_window_pkey PRIMARY KEY (window_id)
+CONSTRAINT bss.pricing_price_window pricing_price_window_price_id_not_null NOT NULL price_id
+CONSTRAINT bss.pricing_price_window pricing_price_window_reason_code_not_null NOT NULL reason_code
+CONSTRAINT bss.pricing_price_window pricing_price_window_state_not_null NOT NULL state
+CONSTRAINT bss.pricing_price_window pricing_price_window_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_price_window pricing_price_window_window_id_not_null NOT NULL window_id
 CONSTRAINT bss.pricing_read_model chk_pricing_read_model_catalog_version CHECK ((catalog_version >= 0))
 CONSTRAINT bss.pricing_read_model chk_pricing_read_model_subject_kind CHECK ((subject_kind = ANY (ARRAY['plan'::text, 'price_overlay'::text, 'overlay_index'::text, 'group_membership'::text])))
 CONSTRAINT bss.pricing_read_model chk_pricing_read_model_warm_marker CHECK ((warm_completed = (warm_completed_at IS NOT NULL)))
+CONSTRAINT bss.pricing_read_model pricing_read_model_catalog_version_not_null NOT NULL catalog_version
+CONSTRAINT bss.pricing_read_model pricing_read_model_payload_not_null NOT NULL payload
 CONSTRAINT bss.pricing_read_model pricing_read_model_pkey PRIMARY KEY (tenant_id, catalog_version, subject_kind, subject_ref)
+CONSTRAINT bss.pricing_read_model pricing_read_model_projected_at_not_null NOT NULL projected_at
+CONSTRAINT bss.pricing_read_model pricing_read_model_subject_kind_not_null NOT NULL subject_kind
+CONSTRAINT bss.pricing_read_model pricing_read_model_subject_ref_not_null NOT NULL subject_ref
+CONSTRAINT bss.pricing_read_model pricing_read_model_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_read_model pricing_read_model_warm_completed_not_null NOT NULL warm_completed
 CONSTRAINT bss.pricing_region_taxonomy chk_pricing_region_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
 CONSTRAINT bss.pricing_region_taxonomy chk_pricing_region_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_region_taxonomy pricing_region_taxonomy_display_name_not_null NOT NULL display_name
 CONSTRAINT bss.pricing_region_taxonomy pricing_region_taxonomy_pkey PRIMARY KEY (tenant_id, value)
+CONSTRAINT bss.pricing_region_taxonomy pricing_region_taxonomy_state_not_null NOT NULL state
+CONSTRAINT bss.pricing_region_taxonomy pricing_region_taxonomy_tax_rate_present_not_null NOT NULL tax_rate_present
+CONSTRAINT bss.pricing_region_taxonomy pricing_region_taxonomy_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_region_taxonomy pricing_region_taxonomy_value_not_null NOT NULL value
 CONSTRAINT bss.pricing_repricing_journal chk_pricing_repricing_journal_applied CHECK ((((applied_price_id IS NOT NULL) = (state = 'applied'::text)) AND ((applied_at IS NOT NULL) = (state = 'applied'::text))))
 CONSTRAINT bss.pricing_repricing_journal chk_pricing_repricing_journal_failed CHECK (((state = 'failed'::text) = (failure_reason IS NOT NULL)))
 CONSTRAINT bss.pricing_repricing_journal chk_pricing_repricing_journal_state CHECK ((state = ANY (ARRAY['pending'::text, 'applied'::text, 'failed'::text])))
@@ -599,14 +842,32 @@ CONSTRAINT bss.pricing_repricing_journal fk_pricing_repricing_journal_applied_pr
 CONSTRAINT bss.pricing_repricing_journal fk_pricing_repricing_journal_price FOREIGN KEY (price_id) REFERENCES bss.pricing_price(price_id)
 CONSTRAINT bss.pricing_repricing_journal fk_pricing_repricing_journal_run FOREIGN KEY (run_id) REFERENCES bss.pricing_bulk_operation(operation_id)
 CONSTRAINT bss.pricing_repricing_journal pricing_repricing_journal_pkey PRIMARY KEY (run_id, price_id)
+CONSTRAINT bss.pricing_repricing_journal pricing_repricing_journal_price_id_not_null NOT NULL price_id
+CONSTRAINT bss.pricing_repricing_journal pricing_repricing_journal_run_id_not_null NOT NULL run_id
+CONSTRAINT bss.pricing_repricing_journal pricing_repricing_journal_state_not_null NOT NULL state
+CONSTRAINT bss.pricing_repricing_journal pricing_repricing_journal_tenant_id_not_null NOT NULL tenant_id
 CONSTRAINT bss.pricing_rounding_policy_taxonomy chk_pricing_rounding_policy_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
 CONSTRAINT bss.pricing_rounding_policy_taxonomy chk_pricing_rounding_policy_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_rounding_policy_taxonomy pricing_rounding_policy_taxonomy_display_name_not_null NOT NULL display_name
 CONSTRAINT bss.pricing_rounding_policy_taxonomy pricing_rounding_policy_taxonomy_pkey PRIMARY KEY (tenant_id, value)
+CONSTRAINT bss.pricing_rounding_policy_taxonomy pricing_rounding_policy_taxonomy_state_not_null NOT NULL state
+CONSTRAINT bss.pricing_rounding_policy_taxonomy pricing_rounding_policy_taxonomy_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_rounding_policy_taxonomy pricing_rounding_policy_taxonomy_value_not_null NOT NULL value
 CONSTRAINT bss.pricing_snapshot_provenance chk_pricing_snapshot_provenance_payload CHECK ((jsonb_typeof(payload) = 'object'::text))
 CONSTRAINT bss.pricing_snapshot_provenance chk_pricing_snapshot_provenance_resolved CHECK (((jsonb_typeof(resolved) = 'array'::text) AND (jsonb_array_length(resolved) > 0)))
 CONSTRAINT bss.pricing_snapshot_provenance chk_pricing_snapshot_provenance_revision CHECK (((source_revision IS NULL) OR (source_revision >= 0)))
 CONSTRAINT bss.pricing_snapshot_provenance chk_pricing_snapshot_provenance_trigger CHECK ((trigger_kind = ANY (ARRAY['migration'::text, 'first_rating'::text])))
+CONSTRAINT bss.pricing_snapshot_provenance pricing_snapshot_provenance_acting_principal_not_null NOT NULL acting_principal
+CONSTRAINT bss.pricing_snapshot_provenance pricing_snapshot_provenance_created_at_not_null NOT NULL created_at
+CONSTRAINT bss.pricing_snapshot_provenance pricing_snapshot_provenance_payload_not_null NOT NULL payload
 CONSTRAINT bss.pricing_snapshot_provenance pricing_snapshot_provenance_pkey PRIMARY KEY (provenance_id)
+CONSTRAINT bss.pricing_snapshot_provenance pricing_snapshot_provenance_provenance_id_not_null NOT NULL provenance_id
+CONSTRAINT bss.pricing_snapshot_provenance pricing_snapshot_provenance_resolved_not_null NOT NULL resolved
+CONSTRAINT bss.pricing_snapshot_provenance pricing_snapshot_provenance_snapshot_instant_not_null NOT NULL snapshot_instant
+CONSTRAINT bss.pricing_snapshot_provenance pricing_snapshot_provenance_source_plan_id_not_null NOT NULL source_plan_id
+CONSTRAINT bss.pricing_snapshot_provenance pricing_snapshot_provenance_subscription_ref_not_null NOT NULL subscription_ref
+CONSTRAINT bss.pricing_snapshot_provenance pricing_snapshot_provenance_tenant_id_not_null NOT NULL tenant_id
+CONSTRAINT bss.pricing_snapshot_provenance pricing_snapshot_provenance_trigger_kind_not_null NOT NULL trigger_kind
 INDEX bss coord_leases_pkey CREATE UNIQUE INDEX coord_leases_pkey ON bss.coord_leases USING btree (key)
 INDEX bss excl_pricing_group_membership_no_overlap CREATE INDEX excl_pricing_group_membership_no_overlap ON bss.pricing_group_membership USING gist (tenant_id, payer_tenant_id, tstzrange(effective_from, effective_to, '[)'::text))
 INDEX bss excl_pricing_price_window_no_overlap CREATE INDEX excl_pricing_price_window_no_overlap ON bss.pricing_price_window USING gist (tenant_id, price_id, tstzrange(effective_from, effective_to, '[)'::text)) WHERE (state = ANY (ARRAY['scheduled'::text, 'active'::text]))
