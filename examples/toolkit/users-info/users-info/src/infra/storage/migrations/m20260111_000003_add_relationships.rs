@@ -99,6 +99,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS uk_addresses_user ON addresses(user_id);
 CREATE INDEX IF NOT EXISTS idx_addresses_city ON addresses(city_id);
                 "
             }
+            other => {
+                return Err(DbErr::Custom(format!(
+                    "migration has no DDL for database backend {other:?}"
+                )));
+            }
         };
 
         conn.execute_unprepared(sql).await?;

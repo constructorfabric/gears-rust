@@ -3,7 +3,7 @@
 //! drives the full post sequence: a balanced post updates the truth tables
 //! and derived caches and stamps the dedup row; a re-post replays; a closed
 //! period and a negative-balance post are rejected with the right codes.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -47,7 +47,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 
 /// Scalar i64 read of a single-column, single-row SELECT (bss-qualified).
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.map(|r| r.try_get_by_index::<i64>(0).unwrap())
 }
 
@@ -101,7 +101,7 @@ async fn setup(
         .unwrap();
 
     // OPEN fiscal period (raw, bss-qualified).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{legal_entity}','{period_id}','UTC','OPEN')"
     )))
@@ -341,7 +341,7 @@ async fn post_balanced_replay_period_and_negative() {
     assert_eq!(line_count2, 2, "no duplicate journal lines on replay");
 
     // --- 3. Closed period ---
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_fiscal_period SET status='CLOSED' \
          WHERE tenant_id='{}' AND legal_entity_id='{}' AND period_id='{}'",
         f.tenant, f.legal_entity, f.period_id
@@ -359,7 +359,7 @@ async fn post_balanced_replay_period_and_negative() {
     );
 
     // Re-open for the next case.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_fiscal_period SET status='OPEN' \
          WHERE tenant_id='{}' AND legal_entity_id='{}' AND period_id='{}'",
         f.tenant, f.legal_entity, f.period_id
@@ -705,7 +705,7 @@ async fn concurrent_close_never_certifies_a_period_a_post_landed_in() {
     );
 
     let status = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT status FROM bss.ledger_fiscal_period \
              WHERE tenant_id='{}' AND period_id='{}'",
             f.tenant, f.period_id
@@ -1143,7 +1143,7 @@ async fn tenant_posting_lock_blocks_posting() {
     let ctx = SecurityContext::anonymous();
 
     // Set the kill switch for the tenant.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_tenant_posting_lock (tenant_id, locked, reason_code, set_at) \
          VALUES ('{}', true, 'TENANT_TERMINATED', now())",
         f.tenant
@@ -1174,7 +1174,7 @@ async fn tenant_posting_lock_blocks_posting() {
     assert_eq!(entries, 0, "a refused post writes nothing");
 
     // Clearing the lock lets the same tenant post again.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_tenant_posting_lock SET locked = false, cleared_at = now() \
          WHERE tenant_id = '{}'",
         f.tenant

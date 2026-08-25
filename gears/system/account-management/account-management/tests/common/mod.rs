@@ -163,9 +163,64 @@ impl AuthZResolverClient for PermitWithSubtreeResolver {
 /// [`Capability::TenantHierarchy`] advertised so the PDP returns the
 /// native `InTenantSubtree` predicate. Used by metadata + tenant
 /// service integration tests.
+///
+/// Permits **every** action. Tests that need to prove a specific action
+/// is required must use [`enforcer_allowing`] instead — with this
+/// enforcer a missing per-verb permission is indistinguishable from a
+/// granted one.
 #[must_use]
 pub fn mock_enforcer() -> PolicyEnforcer {
     let authz: Arc<dyn AuthZResolverClient> = Arc::new(PermitWithSubtreeResolver);
+    PolicyEnforcer::new(authz).with_capabilities(vec![Capability::TenantHierarchy])
+}
+
+/// Action-aware PDP fake: permits only the actions in `allowed`, denying
+/// everything else with `decision: false`.
+///
+/// [`PermitWithSubtreeResolver`] ignores `request.action` entirely, so a
+/// surface whose authorization vocabulary is per-verb (rather than a
+/// read/write/delete triad) has no way to show under it that each verb
+/// consults its own permission. On the allow path this emits the same
+/// two `InTenantSubtree` constraints, so a permitted call behaves
+/// exactly as it does under `mock_enforcer` and the only variable under
+/// test is the action check.
+struct ActionAwareResolver {
+    allowed: Vec<String>,
+}
+
+#[async_trait]
+impl AuthZResolverClient for ActionAwareResolver {
+    async fn evaluate(
+        &self,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        if !self.allowed.contains(&request.action.name) {
+            return Ok(EvaluationResponse {
+                decision: false,
+                context: EvaluationResponseContext {
+                    constraints: Vec::new(),
+                    deny_reason: Some(authz_resolver_sdk::models::DenyReason {
+                        error_code: "permission_denied".to_owned(),
+                        details: Some(format!(
+                            "action '{}' not granted (allowed: {:?})",
+                            request.action.name, self.allowed
+                        )),
+                    }),
+                },
+            });
+        }
+        PermitWithSubtreeResolver.evaluate(request).await
+    }
+}
+
+/// [`PolicyEnforcer`] that permits only `actions`, denying every other
+/// verb. Used to probe that each action in a per-verb vocabulary is
+/// independently required.
+#[must_use]
+pub fn enforcer_allowing(actions: &[&str]) -> PolicyEnforcer {
+    let authz: Arc<dyn AuthZResolverClient> = Arc::new(ActionAwareResolver {
+        allowed: actions.iter().map(|a| (*a).to_owned()).collect(),
+    });
     PolicyEnforcer::new(authz).with_capabilities(vec![Capability::TenantHierarchy])
 }
 
@@ -717,6 +772,7 @@ use account_management::domain::metadata::registry::{
 };
 use account_management::domain::metadata::repo::MetadataRepo;
 use account_management::domain::metadata::service::MetadataService;
+use account_management::domain::service_account::service::ServiceAccountService;
 use account_management::domain::tenant::TenantRepo;
 use account_management::domain::tenant::resource_checker::InertResourceOwnershipChecker;
 use account_management::domain::tenant::service::TenantService;
@@ -724,9 +780,12 @@ use account_management::domain::tenant_type::inert_tenant_type_checker;
 use account_management::domain::user::service::UserService;
 use account_management::infra::storage::repo_impl::{ConversionRepoImpl, MetadataRepoImpl};
 use account_management_sdk::{
-    IdpDeprovisionTenantRequest, IdpDeprovisionUserRequest, IdpListUsersRequest, IdpPluginClient,
-    IdpProvisionFailure, IdpProvisionResult, IdpProvisionTenantRequest, IdpProvisionUserRequest,
-    IdpUpdateUserRequest, IdpUser, IdpUserDuplicateField, IdpUserFilterField,
+    IdpDeprovisionTenantRequest, IdpDeprovisionUserRequest, IdpListServiceAccountsRequest,
+    IdpListUsersRequest, IdpPluginClient, IdpProvisionFailure, IdpProvisionResult,
+    IdpProvisionServiceAccountRequest, IdpProvisionTenantRequest, IdpProvisionUserRequest,
+    IdpRevokeServiceAccountRequest, IdpRotateServiceAccountSecretRequest,
+    IdpServiceAccountCredentials, IdpServiceAccountFailure, IdpServiceAccountSummary,
+    IdpUpdateUserRequest, IdpUser, IdpUserAttribute, IdpUserDuplicateField, IdpUserFilterField,
     IdpUserOperationFailure,
 };
 use axum::Router;
@@ -795,6 +854,30 @@ pub struct FakeIdpPlugin {
     users: parking_lot::Mutex<
         std::collections::HashMap<Uuid, std::collections::HashMap<Uuid, IdpUser>>,
     >,
+    /// Attributes this provider refuses to write, standing in for a
+    /// realm that federates them from a read-only LDAP mapper (or marks
+    /// them non-writable in its user-profile config). Empty by default
+    /// so every existing test sees a fully-writable provider; opt in via
+    /// [`Self::with_locked_attribute`]. A `HashSet` — the natural shape
+    /// for a provider's non-writable set, and what the `Hash` bound on
+    /// the public SDK enum exists for.
+    locked_attributes: std::collections::HashSet<IdpUserAttribute>,
+    /// In-memory service accounts per tenant, keyed by the
+    /// provider-assigned `client_id`. Stands in for the `IdP`'s client
+    /// registry; the fake enforces the same `(tenant_id, name)`
+    /// uniqueness obligation the SDK trait places on real adapters, so
+    /// the REST tests exercise the collision path honestly.
+    accounts: parking_lot::Mutex<std::collections::HashMap<Uuid, Vec<StoredAccount>>>,
+}
+
+/// One stored service account in [`FakeIdpPlugin`]. No secret is kept:
+/// the fake mints a fresh one per provision / rotate, exactly as a real
+/// provider does — there is no read-back path to model.
+#[derive(Clone)]
+pub struct StoredAccount {
+    pub client_id: String,
+    pub name: String,
+    pub scopes: Vec<String>,
 }
 
 impl FakeIdpPlugin {
@@ -802,7 +885,41 @@ impl FakeIdpPlugin {
     pub fn new() -> Self {
         Self {
             users: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            locked_attributes: std::collections::HashSet::new(),
+            accounts: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Mark `attribute` as IdP-managed: `update_user` then refuses any
+    /// patch touching it with
+    /// [`IdpUserOperationFailure::FieldNotWritable`].
+    #[must_use]
+    pub fn with_locked_attribute(mut self, attribute: IdpUserAttribute) -> Self {
+        self.locked_attributes.insert(attribute);
+        self
+    }
+
+    /// Every locked attribute the patch tries to write. Checked against
+    /// the *touched* fields (`Some(_)`, including an explicit clear) —
+    /// refusing a locked attribute does not depend on whether the caller
+    /// set or cleared it. Returns the full set (not the first hit) so a
+    /// patch touching several locked attributes is refused in one
+    /// round-trip, matching the `FieldNotWritable` contract.
+    fn locked_attributes_in(
+        &self,
+        patch: &account_management_sdk::IdpUserPatch,
+    ) -> Vec<IdpUserAttribute> {
+        [
+            (IdpUserAttribute::Username, patch.username.is_some()),
+            (IdpUserAttribute::Email, patch.email.is_some()),
+            (IdpUserAttribute::DisplayName, patch.display_name.is_some()),
+            (IdpUserAttribute::FirstName, patch.first_name.is_some()),
+            (IdpUserAttribute::LastName, patch.last_name.is_some()),
+        ]
+        .into_iter()
+        .filter(|(attribute, touched)| *touched && self.locked_attributes.contains(attribute))
+        .map(|(attribute, _)| attribute)
+        .collect()
     }
 
     fn build_user(tenant_id: Uuid, req: &IdpProvisionUserRequest) -> IdpUser {
@@ -897,6 +1014,24 @@ impl IdpPluginClient for FakeIdpPlugin {
                 detail: format!("user {} not found in tenant {tenant_id}", req.user_id),
             });
         }
+        // Refuse IdP-managed attributes before the uniqueness check: a
+        // locked field cannot be written whatever the new value is, so
+        // whether it would also collide is moot.
+        let locked = self.locked_attributes_in(&req.patch);
+        if !locked.is_empty() {
+            let detail = format!(
+                "attributes {} are read-only (federated from a read-only mapper)",
+                locked
+                    .iter()
+                    .map(|a| a.as_field_token())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return Err(IdpUserOperationFailure::FieldNotWritable {
+                fields: locked,
+                detail,
+            });
+        }
         // Username uniqueness on rename, checked against OTHER users.
         if let Some(new_username) = &req.patch.username
             && scope
@@ -982,12 +1117,159 @@ impl IdpPluginClient for FakeIdpPlugin {
             },
         ))
     }
+
+    // ---- Service accounts ------------------------------------------
+
+    async fn provision_service_account(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpProvisionServiceAccountRequest,
+    ) -> Result<IdpServiceAccountCredentials, IdpServiceAccountFailure> {
+        let tenant_id = req.tenant_context.tenant_id;
+        let mut guard = self.accounts.lock();
+        let scope = guard.entry(tenant_id).or_default();
+        // The uniqueness obligation the SDK trait places on adapters: a
+        // name already live in the tenant is rejected, and the existing
+        // account is neither resumed nor revealed. Enforced here so
+        // the REST-level collision test exercises a conforming provider.
+        if scope.iter().any(|p| p.name == req.name) {
+            return Err(IdpServiceAccountFailure::InvalidInput {
+                detail: format!("name `{}` is already live in this tenant", req.name),
+                field: Some("name".to_owned()),
+            });
+        }
+        // Follows the common `svc-<tenant_id>-<name>` convention purely
+        // so fixtures read naturally — nothing in AM parses client ids.
+        let client_id = format!("svc-{tenant_id}-{}", req.name);
+        scope.push(StoredAccount {
+            client_id: client_id.clone(),
+            name: req.name.clone(),
+            scopes: req.scopes.clone(),
+        });
+        Ok(fake_credentials(&client_id))
+    }
+
+    async fn rotate_service_account_secret(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpRotateServiceAccountSecretRequest,
+    ) -> Result<IdpServiceAccountCredentials, IdpServiceAccountFailure> {
+        let guard = self.accounts.lock();
+        // A client id that does not resolve *within this tenant* is
+        // `NotFound` — the scoped-address rule; the lookup is inside the
+        // tenant's own bucket, so one tenant can never rotate another's
+        // account even given its exact client id.
+        let exists = guard
+            .get(&req.tenant_context.tenant_id)
+            .is_some_and(|scope| scope.iter().any(|p| p.client_id == req.client_id));
+        if exists {
+            Ok(fake_credentials(&req.client_id))
+        } else {
+            Err(IdpServiceAccountFailure::NotFound {
+                detail: format!("client {} not found in tenant", req.client_id),
+            })
+        }
+    }
+
+    async fn revoke_service_account(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpRevokeServiceAccountRequest,
+    ) -> Result<(), IdpServiceAccountFailure> {
+        let mut guard = self.accounts.lock();
+        let removed = match guard.get_mut(&req.tenant_context.tenant_id) {
+            Some(scope) => {
+                let before = scope.len();
+                scope.retain(|p| p.client_id != req.client_id);
+                let removed = scope.len() != before;
+                let now_empty = scope.is_empty();
+                if now_empty {
+                    guard.remove(&req.tenant_context.tenant_id);
+                }
+                removed
+            }
+            None => false,
+        };
+        if removed {
+            Ok(())
+        } else {
+            // Idempotency by error-mapping: the adapter reports absence
+            // 1:1 and AM decides it means success.
+            Err(IdpServiceAccountFailure::NotFound {
+                detail: format!("client {} not found in tenant", req.client_id),
+            })
+        }
+    }
+
+    async fn list_service_accounts(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpListServiceAccountsRequest,
+    ) -> Result<Vec<IdpServiceAccountSummary>, IdpServiceAccountFailure> {
+        let guard = self.accounts.lock();
+        Ok(guard
+            .get(&req.tenant_context.tenant_id)
+            .map(|scope| {
+                scope
+                    .iter()
+                    .map(|p| {
+                        IdpServiceAccountSummary::new(
+                            p.client_id.clone(),
+                            p.name.clone(),
+                            true,
+                            p.scopes.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+}
+
+/// The `client_secret` every fake provision / rotate mints. Fixed so
+/// tests can assert the credential survives the pass-through (while the
+/// adapter's error text must not).
+pub const FAKE_CLIENT_SECRET: &str = "fake-client-secret";
+
+/// Mint credentials for `client_id`. A real provider returns a fresh
+/// secret per call; the fake returns a constant so assertions can name
+/// it, and derives `subject_id` from the client id so it is stable
+/// across runs.
+fn fake_credentials(client_id: &str) -> IdpServiceAccountCredentials {
+    IdpServiceAccountCredentials::new(
+        client_id.to_owned(),
+        secrecy::SecretString::from(FAKE_CLIENT_SECRET.to_owned()),
+        "https://idp.test/realms/test/protocol/openid-connect/token".to_owned(),
+        Uuid::new_v5(&Uuid::NAMESPACE_DNS, client_id.as_bytes()),
+    )
 }
 
 /// Shared `Arc<dyn IdpPluginClient>` handle for the test router.
 #[must_use]
 pub fn fake_idp() -> Arc<dyn IdpPluginClient> {
     Arc::new(FakeIdpPlugin::new())
+}
+
+/// [`fake_idp`] with `attribute` marked IdP-managed, so any patch
+/// touching it is refused with
+/// [`IdpUserOperationFailure::FieldNotWritable`].
+#[must_use]
+pub fn fake_idp_with_locked_attribute(attribute: IdpUserAttribute) -> Arc<dyn IdpPluginClient> {
+    Arc::new(FakeIdpPlugin::new().with_locked_attribute(attribute))
+}
+
+/// [`fake_idp`] with several attributes marked IdP-managed, standing in
+/// for a realm that federates a whole block of profile attributes from a
+/// read-only mapper. A patch touching more than one of them is refused
+/// once, naming every offender.
+#[must_use]
+pub fn fake_idp_with_locked_attributes(
+    attributes: impl IntoIterator<Item = IdpUserAttribute>,
+) -> Arc<dyn IdpPluginClient> {
+    let plugin = attributes
+        .into_iter()
+        .fold(FakeIdpPlugin::new(), FakeIdpPlugin::with_locked_attribute);
+    Arc::new(plugin)
 }
 
 // ── Inert collaborators (resource checker, types registry) ───────────
@@ -1104,6 +1386,7 @@ pub struct TestServices {
     pub tenant_service: Arc<TenantService<TenantRepoImpl>>,
     pub metadata_service: Arc<MetadataService>,
     pub user_service: Arc<UserService>,
+    pub service_account_service: Arc<ServiceAccountService>,
     pub conversion_service: Arc<ConversionService>,
 }
 
@@ -1142,6 +1425,29 @@ pub fn build_services_full(
     metadata_registry: Arc<dyn MetadataSchemaRegistry>,
     types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
 ) -> TestServices {
+    build_services_full_with_sa_enforcer(
+        harness,
+        idp,
+        metadata_registry,
+        types_registry,
+        mock_enforcer(),
+    )
+}
+
+/// [`build_services_full`] with the service-account service's
+/// [`PolicyEnforcer`] supplied by the caller, so a test can restrict the
+/// granted action set (see [`enforcer_allowing`]) while every other
+/// service keeps the permissive [`mock_enforcer`]. Keeping the other
+/// services permissive means a denial observed on the service-account
+/// surface can only have come from its own PEP gate.
+#[must_use]
+pub fn build_services_full_with_sa_enforcer(
+    harness: &Harness,
+    idp: Arc<dyn IdpPluginClient>,
+    metadata_registry: Arc<dyn MetadataSchemaRegistry>,
+    types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+    sa_enforcer: PolicyEnforcer,
+) -> TestServices {
     use account_management::config::AccountManagementConfig;
 
     let cfg = AccountManagementConfig::default();
@@ -1163,6 +1469,13 @@ pub fn build_services_full(
         Arc::clone(&idp),
         Arc::clone(&types_registry),
         mock_enforcer(),
+    ));
+
+    let service_account_service = Arc::new(ServiceAccountService::new(
+        Arc::clone(&harness.repo) as Arc<dyn TenantRepo>,
+        Arc::clone(&idp),
+        Arc::clone(&types_registry),
+        sa_enforcer,
     ));
 
     let metadata_repo: Arc<dyn MetadataRepo> =
@@ -1189,6 +1502,7 @@ pub fn build_services_full(
         tenant_service,
         metadata_service,
         user_service,
+        service_account_service,
         conversion_service,
     }
 }
@@ -1204,6 +1518,7 @@ pub fn build_test_router(services: &TestServices) -> Router {
         Arc::clone(&services.tenant_service),
         Arc::clone(&services.metadata_service),
         Arc::clone(&services.user_service),
+        Arc::clone(&services.service_account_service),
         Arc::clone(&services.conversion_service),
     )
 }

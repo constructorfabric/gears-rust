@@ -54,7 +54,6 @@ pub struct OtelClusterMetrics {
     lock_ops: Counter<u64>,
     lock_op_duration: Histogram<f64>,
     leader_transitions: Counter<u64>,
-    discovery_ops: Counter<u64>,
     watch_resets: Counter<u64>,
     provider_errors: Counter<u64>,
 }
@@ -89,10 +88,6 @@ impl OtelClusterMetrics {
             leader_transitions: meter
                 .u64_counter(counter_name(names::LEADER_TRANSITIONS_TOTAL))
                 .with_description("Cluster leadership transitions")
-                .build(),
-            discovery_ops: meter
-                .u64_counter(counter_name(names::DISCOVERY_OPS_TOTAL))
-                .with_description("Total cluster service-discovery operations")
                 .build(),
             watch_resets: meter
                 .u64_counter(counter_name(names::WATCH_RESETS_TOTAL))
@@ -167,17 +162,6 @@ impl ClusterMetrics for OtelClusterMetrics {
             &[
                 self.provider_label(),
                 KeyValue::new(fields::label::TRANSITION, transition.to_owned()),
-            ],
-        );
-    }
-
-    fn discovery_op(&self, op: &str, result: &str) {
-        self.discovery_ops.add(
-            1,
-            &[
-                self.provider_label(),
-                KeyValue::new(fields::label::OP, op.to_owned()),
-                KeyValue::new(fields::label::RESULT, result.to_owned()),
             ],
         );
     }

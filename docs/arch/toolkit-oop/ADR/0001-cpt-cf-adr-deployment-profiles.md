@@ -54,6 +54,21 @@ Each gear runs as an independent Kubernetes pod. Service discovery uses K8s DNS
 (`{gear}.{namespace}.svc.cluster.local`) and optionally DirectoryService. An external gateway (Kong/Tyk/Envoy) handles
 public API ingress. SA tokens provide platform-plane identity; mTLS+SPIFFE (cert-manager) is the next phase.
 
+> **Amended by [ADR-0009 (Instance-Addressable Discovery)](0009-cpt-cf-adr-instance-addressable-discovery.md).**
+> Two refinements to the profile shapes above:
+> - **Profile 3:** a gear that runs in differentiated **roles** maps to *multiple* role-qualified directory
+>   names — i.e. *multiple* pod sets / Services, not "one gear = one pod + one Service". A **sharded** gear
+>   (interchangeable instances of *one* contract) instead stays under a **single** name; shards are
+>   distinguished by directory labels (`resolve_by_labels`), not by extra role-qualified names.
+>   Basic **name** resolution via k8s DNS is unchanged and DirectoryService remains **not required** for it;
+>   **instance / shard targeting** additionally requires each targeted instance to advertise a
+>   **per-instance-addressable** endpoint (not a shared Service VIP). The workload kind that provides it
+>   (`StatefulSet` + headless Service, a self-registering `Deployment`, …) is the gear developer's choice.
+> - **Profile 1 (Embedded) test-matrix hole:** the multi-instance shard model and role-split gears are **not
+>   expressible** in a single process, so `event-broker`'s cluster/role-split mode and any shard-model gear can
+>   only be integration-verified in Profile 2/3 (the adopting gear owns that coverage). This is a coverage gap in
+>   this ADR's "small, fully-covered matrix" justification, recorded here per ADR-0009 §5.
+
 ### Consequences
 
 * The platform tests exactly three topologies — not arbitrary combinations.

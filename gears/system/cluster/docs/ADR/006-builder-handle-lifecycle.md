@@ -30,7 +30,7 @@ date: 2026-04-27
 
 ## Context and Problem Statement
 
-The cluster wiring crate (`cf-cluster`, follow-up change) is the layer that reads operator YAML, instantiates per-backend plugins, and registers each plugin's `Arc<dyn _Backend>` in ClientHub under the corresponding profile scope. Plugins (Postgres, K8s, Redis, NATS, etcd, standalone) own background tasks: TTL reapers for SDK-default lock backends, renewal loops for leader-election backends, watch fan-out for cache backends, heartbeat tasks for service-discovery registrations.
+The cluster wiring crate (`cf-cluster`, follow-up change) is the layer that reads operator YAML, instantiates per-backend plugins, and registers each plugin's `Arc<dyn _Backend>` in ClientHub under the corresponding profile scope. Plugins (Postgres, K8s, Redis, NATS, etcd, standalone) own background tasks: TTL reapers for SDK-default lock backends, renewal loops for leader-election backends, watch fan-out for cache backends.
 
 Two intertwined questions arise:
 
@@ -147,11 +147,11 @@ Plugins are NOT separate `RunnableCapability` implementors. Plugin authors imple
 
 1. **Deregister all backends from ClientHub.** After this step, any subsequent `*V1::resolver(...).resolve()` on the parent profile fails with `ClusterError::ProfileNotBound`. Consumers in flight may still hold `Arc`-cloned facades from earlier resolutions.
 2. **Stop nested plugin handles in reverse-start order.** Each plugin handle's `stop()` cancels its `CancellationToken`, joins its background tasks (TTL reapers, renewal loops, watch fan-out), and returns. Plugin handles are independent — a stuck plugin does not block the others (they run with bounded `tokio::select!` against the parent host's `cancel` signal at the outer layer).
-3. **Deliver terminal watch events** to active watches in the order specified by ADR-003: `LeaderWatchEvent::Status(Lost)` then `LeaderWatchEvent::Closed(Shutdown)` for active leaders; `CacheWatchEvent::Closed(Shutdown)` for cache watches; `ServiceWatchEvent::Closed(Shutdown)` for service-discovery watches.
+3. **Deliver terminal watch events** to active watches in the order specified by ADR-003: `LeaderWatchEvent::Status(Lost)` then `LeaderWatchEvent::Closed(Shutdown)` for active leaders; and `CacheWatchEvent::Closed(Shutdown)` for cache watches.
 
 Step 1 happens before steps 2-3 to ensure no new resolutions race against a partially shut down plugin set. Steps 2 and 3 are interleaved per plugin: the plugin's `stop()` is what delivers terminal watch events, then joins the background task that owned the watch.
 
-Post-shutdown best-effort `Ok` semantics: `LockGuard::release(self)` / `ServiceHandle::deregister(self)` / `LeaderWatch::resign(self)` MAY return `Ok(())` after their plugin handle has observed shutdown — the resource is conceptually released, the bookkeeping is moot. Outside the shutdown window, real errors (foreign-holder release attempts, connection-lost mid-release, `LockExpired`) propagate normally. This narrowed best-effort `Ok` prevents shutdown noise from masquerading as consumer bugs.
+Post-shutdown best-effort `Ok` semantics: `LockGuard::release(self)` / `LeaderWatch::resign(self)` MAY return `Ok(())` after their plugin handle has observed shutdown — the resource is conceptually released, the bookkeeping is moot. Outside the shutdown window, real errors (foreign-holder release attempts, connection-lost mid-release, `LockExpired`) propagate normally. This narrowed best-effort `Ok` prevents shutdown noise from masquerading as consumer bugs.
 
 ### Consequences
 
@@ -166,7 +166,7 @@ Post-shutdown best-effort `Ok` semantics: `LockGuard::release(self)` / `ServiceH
 
 ### Confirmation
 
-- A unit test instantiates the wiring crate against an in-memory plugin (standalone), calls `build_and_start()`, resolves all four primitives, calls `handle.stop()`, and verifies subsequent resolutions return `ProfileNotBound`.
+- A unit test instantiates the wiring crate against an in-memory plugin (standalone), calls `build_and_start()`, resolves all three primitives, calls `handle.stop()`, and verifies subsequent resolutions return `ProfileNotBound`.
 - An integration test exercises the shutdown sequence: spawn an active `LeaderWatch`, call `handle.stop()`, assert the watch observes `Status(Lost)` followed by `Closed(Shutdown)` in that order.
 - A drop-test verifies that if the parent gear is dropped without calling `handle.stop()` (a programming error), background tasks are NOT silently leaked — `Drop` on `ClusterHandle` is panic-safe (`std::thread::panicking()` guard) and emits a debug-build panic / release-build warn-log to surface the bug:
     ```rust

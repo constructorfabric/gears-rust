@@ -168,8 +168,8 @@ pub async fn handle_get_usage_record(
 /// for exactly that purpose — and the service rejects an absent or
 /// one-sided window with `400 InvalidArgument`
 /// (`MISSING_TIME_WINDOW`) before any plugin dispatch. `$filter` /
-/// `$orderby` / `$top` / `cursor` flow through the standard [`OData`]
-/// extractor.
+/// `$orderby` / `$top` (alias `limit`) / `cursor` flow through the
+/// standard [`OData`] extractor.
 ///
 /// Gateway-side guards applied before the service is invoked:
 ///
@@ -306,10 +306,10 @@ fn prepare_aggregate_request(
     Ok((gts_id, metadata_filter, query, aggregation))
 }
 
-/// `$`-prefixed `OData` parameters accepted on the aggregate path. `$top`,
-/// `cursor`, and `$select` are intentionally excluded — aggregation is
-/// not paginated and its projection is fixed (operator + group-by
-/// dimensions ship in the body).
+/// `$`-prefixed `OData` parameters accepted on the aggregate path. `$top`
+/// (alias `limit`) and `cursor` are intentionally excluded — aggregation
+/// is not paginated. `$select` is excluded on both paths, for the reason
+/// given on [`OUR_ODATA_PARAMS`].
 const AGGREGATE_ODATA_PARAMS: &[&str] = &["$filter"];
 
 /// Reject any query parameter on the aggregate path that is not in the
@@ -359,8 +359,8 @@ fn prepare_list_request(
 /// Maximum number of records the gateway will request from the plugin
 /// in a single page per
 /// `cpt-cf-usage-collector-dod-usage-query-constraint-nfr-thresholds`.
-/// A caller-supplied `limit` above this ceiling is rejected with 400
-/// `InvalidArgument` (never silently clamped) so the plugin cannot be
+/// A caller-supplied `$top` / `limit` above this ceiling is rejected with
+/// 400 `InvalidArgument` (never silently clamped) so the plugin cannot be
 /// coaxed into unbounded reads.
 pub const MAX_PAGE_SIZE: u64 = 1000;
 
@@ -377,10 +377,22 @@ pub const MAX_METADATA_FILTER_VALUES: usize = 32;
 
 /// `$`-prefixed `OData` parameters (parsed by the toolkit `OData`
 /// extractor) and the non-`OData` scalars the toolkit also accepts.
-/// Both `$top` (canonical `OData`) and `limit` (toolkit alias) are
-/// admitted — the toolkit extractor folds them onto the same
-/// `ODataQuery.limit` slot.
-const OUR_ODATA_PARAMS: &[&str] = &["$filter", "$orderby", "$select", "$top", "limit", "cursor"];
+///
+/// Both `$top` (canonical `OData`, OASIS `OData` 4.01 Part 2 §5.1.6) and
+/// `limit` (toolkit alias) are admitted: [`toolkit::api::odata::ODataParams`]
+/// declares `limit` with `#[serde(alias = "$top")]`, so the extractor folds
+/// both spellings onto the same `ODataQuery.limit` slot. Sending both in one
+/// request is ambiguous and the extractor rejects it as a duplicate field
+/// before this allowlist runs.
+///
+/// `$select` is absent on purpose. The toolkit extractor parses it into
+/// `ODataQuery.select`, but this gear never applies the projection — the
+/// handler returns whole [`UsageRecordDto`]s and the plugin selects a
+/// fixed column list — so admitting it would take a caller's field list,
+/// discard it, and return every field under a `200` that reads as the
+/// requested projection. Rejecting names the parameter instead of
+/// leaving the caller to diff the response against what they asked for.
+const OUR_ODATA_PARAMS: &[&str] = &["$filter", "$orderby", "$top", "limit", "cursor"];
 
 /// Typed query parameters carrying SDK values that are NOT part of the
 /// `OData` surface.
@@ -400,7 +412,7 @@ const METADATA_PREFIX: &str = "metadata.";
 const CANONICAL_TIEBREAKER_FIELDS: &[&str] = &["created_at", "id"];
 
 /// Apply gateway-side guards on the parsed [`ODataQuery`]:
-/// 1. reject `limit > MAX_PAGE_SIZE` as `InvalidArgument` (no silent
+/// 1. reject `$top > MAX_PAGE_SIZE` as `InvalidArgument` (no silent
 ///    clamp; a caller asking for more rows than the page-size cap MUST
 ///    be told so they can paginate explicitly);
 /// 2. normalize `$orderby` so the effective order always ends in the
@@ -420,17 +432,23 @@ fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalErro
     // 1. $top cap. Reject above the cap so the caller observes the
     //    boundary rather than silently receiving a truncated page that
     //    looks complete.
+    //
+    //    The violation names `$top` — the canonical spelling — because the
+    //    parsed `ODataQuery` does not record which of the two accepted
+    //    spellings arrived on the wire, and the detail names the alias so
+    //    a `limit` caller still recognises their own parameter. Same
+    //    convention as `toolkit_odata`'s own `InvalidLimit` mapping.
     match query.limit {
         Some(l) if l > MAX_PAGE_SIZE => {
             return Err(UsageRecordResource::invalid_argument()
                 .with_field_violation(
                     "$top",
-                    format!("$top must be <= {MAX_PAGE_SIZE}, got {l}"),
+                    format!("page size ($top, alias limit) must be <= {MAX_PAGE_SIZE}, got {l}"),
                     "VALIDATION",
                 )
                 .create());
         }
-        // Within the cap: keep the caller's $top unchanged.
+        // Within the cap: keep the caller's page size unchanged.
         Some(_) => {}
         None => query.limit = Some(MAX_PAGE_SIZE),
     }

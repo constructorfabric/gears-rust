@@ -45,7 +45,7 @@ use account_management_sdk::{field, precondition, quota, reason};
 use toolkit_canonical_errors::{CanonicalError, resource_error};
 use tracing::warn;
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, UnsupportedResource};
 use crate::domain::metrics::{AM_CROSS_TENANT_DENIAL, MetricKind, emit_metric};
 
 // ---------------------------------------------------------------------------
@@ -69,6 +69,61 @@ pub(crate) struct TenantMetadataResource;
 
 #[resource_error(gts_id!("cf.core.am.conversion_request.v1~"))]
 pub(crate) struct ConversionRequestResource;
+
+// Machine identities carry their own resource type rather than riding
+// `UserResource`: a grant over users must not imply the power to mint
+// machine credentials, and the envelope's `resource_type` is what a
+// client keys that distinction off. Pinned against the SDK constant by
+// `sdk_error_mapping_tests`.
+#[resource_error(gts_id!("cf.core.am.service_account.v1~"))]
+pub(crate) struct ServiceAccountResource;
+
+/// Curated public `field_violations[].description` for one
+/// [`DomainError::IdpFieldNotWritable`] attribute. Derived from the typed
+/// attribute so the wording lives in exactly one place no matter how many
+/// attributes a single refusal carries, and no vendor text is echoed.
+fn idp_managed_field_description(attribute: account_management_sdk::IdpUserAttribute) -> String {
+    format!(
+        "the {} is managed by the identity provider and cannot be changed through this API",
+        attribute.as_human_phrase()
+    )
+}
+
+fn unsupported_operation_error(detail: &str, resource: UnsupportedResource) -> CanonicalError {
+    const UNSUPPORTED_DETAIL: &str = "operation not supported by the IdP provider";
+
+    // The service-account boundary has already discarded adapter text and
+    // substituted its fixed AM-owned message. Preserve that single source of
+    // truth on the wire and do not compute a provider-detail digest over our
+    // own constant. Tenant/user failures still carry provider text and retain
+    // the existing digest-only diagnostic path.
+    if resource == UnsupportedResource::ServiceAccount {
+        warn!(
+            target: "am.domain",
+            resource = ?resource,
+            "UnsupportedOperation surfaced with fixed service-account detail"
+        );
+    } else {
+        let (digest, len) = crate::domain::idp::redact_provider_detail(detail);
+        warn!(
+            target: "am.domain",
+            detail_digest = digest,
+            detail_len_chars = len,
+            resource = ?resource,
+            "UnsupportedOperation surfaced; provider detail redacted for log/envelope safety"
+        );
+    }
+
+    // The `resource_type` must name the surface the caller actually addressed.
+    match resource {
+        UnsupportedResource::Tenant => TenantResource::unimplemented(UNSUPPORTED_DETAIL).create(),
+        UnsupportedResource::User => UserResource::unimplemented(UNSUPPORTED_DETAIL).create(),
+        UnsupportedResource::ServiceAccount => {
+            ServiceAccountResource::unimplemented(crate::domain::idp::SA_UNSUPPORTED_MESSAGE)
+                .create()
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // DomainError → CanonicalError (the single AIP-193 ladder).
@@ -145,6 +200,22 @@ impl From<DomainError> for CanonicalError {
             // `password` / `PASSWORD_POLICY` tokens on the `user`
             // resource, so clients attribute the 400 to the password
             // input instead of the generic `request` / `VALIDATION`.
+            // Provider-sourced service-account rejection. `detail` is
+            // one of the fixed messages in `domain::idp`; the violation
+            // is attributed to `request` because the adapter's own field
+            // attribution is untrusted text and was discarded at the
+            // domain boundary. Reuses the `IDP_INVALID_INPUT` reason
+            // token — it IS an IdP-sourced input rejection — so clients
+            // learn one vocabulary for both surfaces.
+            DomainError::ServiceAccountInvalidInput { detail } => {
+                ServiceAccountResource::invalid_argument()
+                    .with_field_violation(
+                        field::REQUEST_FIELD,
+                        detail,
+                        account_management_sdk::field::IDP_INVALID_INPUT,
+                    )
+                    .create()
+            }
             DomainError::IdpPasswordPolicy { detail } => UserResource::invalid_argument()
                 .with_field_violation(
                     account_management_sdk::field::PASSWORD_FIELD,
@@ -152,6 +223,48 @@ impl From<DomainError> for CanonicalError {
                     account_management_sdk::field::PASSWORD_POLICY,
                 )
                 .create(),
+            // IdP-managed attribute reject: each `field` token is the
+            // exact `UserUpdateRequest` property name, so a client keys
+            // form-field attribution off it and disables those inputs.
+            // One violation per refused attribute — a merge patch can
+            // touch several locked attributes at once and the client
+            // learns the whole refused set from this one response.
+            // The public description is derived from the typed attribute
+            // here (single source of wording — the variant carries no
+            // caller- or vendor-supplied string to echo). Duplicates a
+            // provider may repeat collapse to one violation each.
+            DomainError::IdpFieldNotWritable { fields } => {
+                let mut seen = std::collections::HashSet::new();
+                let mut refused = fields.into_iter().filter(|a| seen.insert(*a));
+                match refused.next() {
+                    Some(first) => {
+                        let mut builder = UserResource::invalid_argument().with_field_violation(
+                            first.as_field_token(),
+                            idp_managed_field_description(first),
+                            account_management_sdk::field::IDP_MANAGED_FIELD,
+                        );
+                        for attribute in refused {
+                            builder = builder.with_field_violation(
+                                attribute.as_field_token(),
+                                idp_managed_field_description(attribute),
+                                account_management_sdk::field::IDP_MANAGED_FIELD,
+                            );
+                        }
+                        builder.create()
+                    }
+                    // Contract violation — the variant documents a
+                    // non-empty set. A 400 whose `field_violations[]` is
+                    // empty attributes the refusal to nothing, so degrade
+                    // to the generic `request` / `VALIDATION` pair.
+                    None => UserResource::invalid_argument()
+                        .with_field_violation(
+                            field::REQUEST_FIELD,
+                            "the identity provider refused the update",
+                            field::VALIDATION,
+                        )
+                        .create(),
+                }
+            }
 
             // ---- NotFound (HTTP 404) — one resource per variant ----
             DomainError::NotFound { detail, resource } => TenantResource::not_found(detail)
@@ -160,6 +273,11 @@ impl From<DomainError> for CanonicalError {
             DomainError::UserNotFound { detail, resource } => UserResource::not_found(detail)
                 .with_resource(resource)
                 .create(),
+            DomainError::ServiceAccountNotFound { detail, resource } => {
+                ServiceAccountResource::not_found(detail)
+                    .with_resource(resource)
+                    .create()
+            }
             DomainError::ConversionRequestNotFound { detail, resource } => {
                 ConversionRequestResource::not_found(detail)
                     .with_resource(resource)
@@ -190,6 +308,18 @@ impl From<DomainError> for CanonicalError {
             DomainError::Aborted { reason: _, detail } => TenantResource::aborted(detail)
                 .with_reason(reason::aborted::SERIALIZATION_CONFLICT)
                 .create(),
+            // 409, not 503: an ambiguous provision may have half-applied
+            // upstream, so "retry the same request" — what a 503 signals
+            // — would come back as a 400 ("name already live"). The
+            // `AMBIGUOUS_OUTCOME` reason plus the curated detail steer
+            // the caller into reconciliation instead. Every `detail`
+            // arriving here is AM-owned fixed text (see `domain::idp`),
+            // so interpolating it cannot relay adapter input.
+            DomainError::ServiceAccountAmbiguous { detail } => ServiceAccountResource::aborted(
+                format!("upstream outcome uncertain, state may have been retained: {detail}"),
+            )
+            .with_reason(reason::aborted::AMBIGUOUS_OUTCOME)
+            .create(),
 
             // ---- AlreadyExists (HTTP 409) ----
             DomainError::AlreadyExists { detail } => TenantResource::already_exists(detail)
@@ -359,16 +489,8 @@ impl From<DomainError> for CanonicalError {
             }
 
             // ---- Unimplemented (HTTP 501) ----
-            DomainError::UnsupportedOperation { detail } => {
-                let (digest, len) = crate::domain::idp::redact_provider_detail(&detail);
-                warn!(
-                    target: "am.domain",
-                    detail_digest = digest,
-                    detail_len_chars = len,
-                    "UnsupportedOperation surfaced; provider detail redacted for log/envelope safety"
-                );
-                TenantResource::unimplemented("operation not supported by the IdP provider")
-                    .create()
+            DomainError::UnsupportedOperation { detail, resource } => {
+                unsupported_operation_error(&detail, resource)
             }
 
             // ---- Internal (HTTP 500) ----

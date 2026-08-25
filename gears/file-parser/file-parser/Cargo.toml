@@ -1,0 +1,88 @@
+[package]
+name = "cf-gears-file-parser"
+version = "0.1.39"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "File Parser module"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["parsing"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "file_parser"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Content-based file type detection using the Magika ONNX model. Off by
+# default: pulls in ort (ONNX Runtime) + ndarray and ~3 MB of embedded model
+# weights, and needs libonnxruntime at runtime (dlopen via `ORT_DYLIB_PATH`).
+# Enable when callers cannot be trusted to send correct filenames or
+# Content-Type headers.
+magika = ["dep:magika", "dep:ort", "dep:tokio-util"]
+
+[dependencies]
+# Local dependencies
+file-parser-sdk = { package = "cf-gears-file-parser-sdk", version = "0.2.0", path = "../file-parser-sdk" }
+
+# Core dependencies
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+inventory = { workspace = true }
+
+# Serde and JSON schema
+serde = { workspace = true }
+utoipa = { workspace = true, features = ["time"] }
+
+# HTTP and REST
+axum = { workspace = true, features = ["macros", "multipart"] }
+http = { workspace = true }
+
+# Time handling
+time = { workspace = true }
+
+# UUID support
+uuid = { workspace = true }
+
+
+# Error handling
+thiserror = { workspace = true }
+
+# Bytes handling
+bytes = { workspace = true }
+
+# Futures and async streaming
+futures-util = { workspace = true }
+
+# Base64 encoding (used by stub parser)
+base64 = { workspace = true }
+
+# Temp file handling
+tempfile = { workspace = true }
+
+# Document parsing libraries
+kreuzberg = { workspace = true }
+
+# Content-based file type detection (optional, behind the `magika` feature)
+magika = { workspace = true, optional = true }
+ort = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+
+# MIME type parsing
+mime = { workspace = true }
+
+docx-rust = { workspace = true }
+
+# Local dependencies
+toolkit = { workspace = true }
+toolkit-canonical-errors = { workspace = true, features = ["axum"] }
+toolkit-security = { workspace = true }
+toolkit-macros = { workspace = true }

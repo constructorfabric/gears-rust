@@ -31,9 +31,7 @@ use toolkit::client_hub::ClientHub;
 
 use crate::error::ClusterError;
 use crate::profile::profile_scope;
-use crate::{
-    ClusterCacheBackend, DistributedLockBackend, LeaderElectionBackend, ServiceDiscoveryBackend,
-};
+use crate::{ClusterCacheBackend, DistributedLockBackend, LeaderElectionBackend};
 
 /// Registers a cache backend for `profile` so consumers resolving the cache
 /// primitive for that profile receive it.
@@ -127,39 +125,6 @@ pub fn deregister_lock_backend(hub: &ClientHub, profile: &str) -> Result<bool, C
     let scope = profile_scope(profile)?;
     Ok(hub
         .remove_scoped::<dyn DistributedLockBackend>(&scope)
-        .is_some())
-}
-
-/// Registers a service-discovery backend for `profile`.
-///
-/// # Errors
-/// Returns [`ClusterError::InvalidName`] if `profile` violates the cluster
-/// name rule; the hub is left unchanged in that case.
-pub fn register_service_discovery_backend(
-    hub: &ClientHub,
-    profile: &str,
-    backend: Arc<dyn ServiceDiscoveryBackend>,
-) -> Result<(), ClusterError> {
-    let scope = profile_scope(profile)?;
-    hub.register_scoped::<dyn ServiceDiscoveryBackend>(scope, backend);
-    Ok(())
-}
-
-/// Removes the service-discovery backend registered for `profile`.
-///
-/// Returns `Ok(true)` if a backend was present and removed, `Ok(false)`
-/// otherwise.
-///
-/// # Errors
-/// Returns [`ClusterError::InvalidName`] if `profile` violates the cluster
-/// name rule.
-pub fn deregister_service_discovery_backend(
-    hub: &ClientHub,
-    profile: &str,
-) -> Result<bool, ClusterError> {
-    let scope = profile_scope(profile)?;
-    Ok(hub
-        .remove_scoped::<dyn ServiceDiscoveryBackend>(&scope)
         .is_some())
 }
 

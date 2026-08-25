@@ -30,7 +30,11 @@ async fn pg_concurrent_post_migration_setup_is_serialized() {
     for _ in 0..8u32 {
         let pool = h.pool.clone();
         tasks.push(tokio::spawn(async move {
-            apply_post_migration_setup(&pool, 31_536_000).await
+            // The window is irrelevant here (this test asserts serialization, and
+            // inserts no rows) — but each re-apply registers a *live* policy, so
+            // use the no-drop window rather than the production one to leave the
+            // container in a state where a later-added row cannot vanish.
+            apply_post_migration_setup(&pool, common::NO_DROP_RETENTION_SECS).await
         }));
     }
     for t in tasks {
@@ -62,7 +66,7 @@ async fn pg_concurrent_post_migration_setup_is_serialized() {
 /// pooled connection must still report the configured value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_init_lock_does_not_leak_statement_timeout() {
-    let h = common::bring_up_with(17, 2, 2)
+    let h = common::bring_up_with(17, 2, 2, common::NO_DROP_RETENTION_SECS)
         .await
         .expect("timescaledb container (Docker required)");
 
@@ -96,7 +100,10 @@ async fn pg_init_lock_does_not_leak_statement_timeout() {
 /// hypertable + window and that the outbound `gts_id` FK does not block it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_registered_retention_policy_drops_aged_data() {
-    let h = common::bring_up()
+    // The one harness that needs the production 365-day window: the subject here
+    // IS retention. `bring_up_real_retention` also unschedules the job so the
+    // explicit `CALL run_job` below is the only thing that can drop a chunk.
+    let h = common::bring_up_real_retention()
         .await
         .expect("timescaledb container (Docker required)");
     let catalog = common::catalog_store(&h.pool);
@@ -161,5 +168,72 @@ async fn pg_registered_retention_policy_drops_aged_data() {
     assert_eq!(
         after_fresh, 1,
         "fresh record (inside window) survives retention"
+    );
+}
+
+/// Guard on the harness itself, and the exact inverse of the test above: the
+/// default [`common::bring_up`] must never register a retention policy that can
+/// reach the deliberately-backdated fixtures the query/ingest suites assert on.
+///
+/// `apply_post_migration_setup` registers a live `policy_retention` job whose
+/// background schedule the image fires ~3s after registration — mid-test. With
+/// the production 365-day default, `fixture_usage_record`'s 2023-11-14 instant is
+/// years past the cutoff and its whole 7-day chunk is drop-eligible the moment it
+/// is created, so a stalled test body loses rows it already inserted (observed in
+/// CI as an aggregation bucket short by one record).
+///
+/// Firing the policy explicitly asserts the property directly instead of waiting
+/// on the scheduler, so this test is fast and deterministic rather than a race
+/// that usually happens not to fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_default_harness_retention_cannot_drop_backdated_fixtures() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let catalog = common::catalog_store(&h.pool);
+    catalog
+        .create(common::fixture_usage_type(VCPU_GTS, "counter", &[]))
+        .await
+        .expect("register usage type (satisfies the gts_id FK)");
+    let store = common::record_store(&h.pool);
+    let tenant = Uuid::from_u128(0xBAD_11E);
+
+    // A stock fixture, at the stock backdated `created_at`, via the real ingest path.
+    let rec = common::fixture_usage_record(
+        VCPU_GTS,
+        tenant,
+        "backdated",
+        rust_decimal::Decimal::ONE,
+        0xB01,
+    );
+    let rec_id = rec.id;
+    let created_at = rec.created_at;
+    store.create(rec).await.expect("create backdated record");
+
+    // Fire the harness's own registered policy — whatever window it was given.
+    let job_id: i32 = sqlx::query_scalar(
+        "SELECT job_id FROM timescaledb_information.jobs \
+         WHERE proc_name = 'policy_retention' AND hypertable_name = 'usage_records'",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .expect("the retention policy must be registered against usage_records");
+    sqlx::query("CALL run_job($1)")
+        .bind(job_id)
+        .execute(&h.pool)
+        .await
+        .expect("running the retention policy must not error");
+
+    let survived: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE id = $1")
+        .bind(rec_id)
+        .fetch_one(&h.pool)
+        .await
+        .expect("count after");
+    assert_eq!(
+        survived, 1,
+        "the default harness registered a retention policy that can delete a stock \
+         fixture row (created_at = {created_at}); every test inserting fixtures is \
+         then racing the background scheduler. bring_up() must pass a window no \
+         fixture can fall outside of — see common::NO_DROP_RETENTION_SECS"
     );
 }

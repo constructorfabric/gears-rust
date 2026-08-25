@@ -60,7 +60,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -138,7 +138,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -435,7 +435,7 @@ async fn duplicate_build_lands_on_existing_active_schedule() {
     assert!(!first.replayed);
     assert_eq!(schedule_count(&raw, &s, "INV-DUP").await, 1, "one schedule");
     let first_schedule_id: Option<String> = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT schedule_id FROM bss.ledger_recognition_schedule \
              WHERE tenant_id='{}' AND source_invoice_id='INV-DUP'",
             s.tenant
@@ -462,7 +462,7 @@ async fn duplicate_build_lands_on_existing_active_schedule() {
         "still exactly ONE schedule (no second schedule_id)"
     );
     let after_schedule_id: Option<String> = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT schedule_id FROM bss.ledger_recognition_schedule \
              WHERE tenant_id='{}' AND source_invoice_id='INV-DUP'",
             s.tenant

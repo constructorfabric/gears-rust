@@ -15,13 +15,14 @@
 //! [`gts_instance!`]: toolkit_gts::gts_instance
 
 use account_management_sdk::{
-    CONVERSION_REQUEST_RESOURCE_TYPE, TENANT_METADATA_RESOURCE_TYPE, TENANT_RESOURCE_TYPE,
-    USER_RESOURCE_TYPE,
+    CONVERSION_REQUEST_RESOURCE_TYPE, SERVICE_ACCOUNT_RESOURCE_TYPE, TENANT_METADATA_RESOURCE_TYPE,
+    TENANT_RESOURCE_TYPE, USER_RESOURCE_TYPE,
 };
 use toolkit_gts::{AuthzPermissionV1, gts_instance};
 
 use crate::domain::conversion::service::pep::actions as conversion_actions;
 use crate::domain::metadata::service::pep::actions as metadata_actions;
+use crate::domain::service_account::service::pep::actions as service_account_actions;
 use crate::domain::tenant::service::pep::actions as tenant_actions;
 use crate::domain::user::service::pep::actions as user_actions;
 
@@ -180,10 +181,68 @@ gts_instance! {
         display_name: "Delete user".to_owned(),
     }
 }
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.user_update.v1"),
+        resource_type: USER_RESOURCE_TYPE.to_owned(),
+        action: user_actions::UPDATE.to_owned(),
+        display_name: "Update user".to_owned(),
+    }
+}
+
+// ---- service_account (gts.cf.core.am.service_account.v1~) --------------
+// @cpt-begin:cpt-cf-account-management-dod-service-accounts-independent-permissions:p1:inst-dod-sa-independent-permissions-catalog
+//
+// Per-verb rather than a read/write/delete triad, and a separate
+// resource type from `user` on purpose: minting a machine credential is
+// not something a "manage users" grant should imply, and re-keying an
+// existing account (`rotate_secret`) is grantable without the power to
+// create new ones.
+
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_create.v1"),
+        resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_owned(),
+        action: service_account_actions::CREATE.to_owned(),
+        display_name: "Create service account".to_owned(),
+    }
+}
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_list.v1"),
+        resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_owned(),
+        action: service_account_actions::LIST.to_owned(),
+        display_name: "List service accounts".to_owned(),
+    }
+}
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_rotate_secret.v1"),
+        resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_owned(),
+        action: service_account_actions::ROTATE_SECRET.to_owned(),
+        display_name: "Rotate service-account secret".to_owned(),
+    }
+}
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_revoke.v1"),
+        resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_owned(),
+        action: service_account_actions::REVOKE.to_owned(),
+        display_name: "Revoke service account".to_owned(),
+    }
+}
+// @cpt-end:cpt-cf-account-management-dod-service-accounts-independent-permissions:p1:inst-dod-sa-independent-permissions-catalog
 
 #[cfg(test)]
 mod tests {
     use toolkit_gts::{InventoryInstance, gts_id};
+
+    use super::{
+        CONVERSION_REQUEST_RESOURCE_TYPE, SERVICE_ACCOUNT_RESOURCE_TYPE,
+        TENANT_METADATA_RESOURCE_TYPE, TENANT_RESOURCE_TYPE, USER_RESOURCE_TYPE,
+        conversion_actions, metadata_actions, service_account_actions, tenant_actions,
+        user_actions,
+    };
 
     const PERMISSION_TYPE_ID: &str = gts_id!("cf.toolkit.authz.permission.v1~");
     /// AM's instance-id namespace segment, appended after
@@ -212,6 +271,11 @@ mod tests {
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.user_create.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.user_list.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.user_delete.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.user_update.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_create.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_list.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_rotate_secret.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.service_account_revoke.v1"),
     ];
 
     fn am_permission_instances() -> Vec<&'static InventoryInstance> {
@@ -243,6 +307,74 @@ mod tests {
                 entry.instance_id
             );
         }
+    }
+
+    /// Every `(resource_type, action)` pair an AM PEP gate can enforce,
+    /// assembled from the per-service action vocabularies rather than
+    /// restated by hand — the vocabularies are the same constants the
+    /// `PolicyEnforcer` call sites pass.
+    fn enforced_permission_pairs() -> std::collections::BTreeSet<(&'static str, &'static str)> {
+        let vocabularies: [(&'static str, &'static [&'static str]); 5] = [
+            (TENANT_RESOURCE_TYPE, tenant_actions::ALL),
+            (TENANT_METADATA_RESOURCE_TYPE, metadata_actions::ALL),
+            (CONVERSION_REQUEST_RESOURCE_TYPE, conversion_actions::ALL),
+            (USER_RESOURCE_TYPE, user_actions::ALL),
+            (SERVICE_ACCOUNT_RESOURCE_TYPE, service_account_actions::ALL),
+        ];
+        vocabularies
+            .into_iter()
+            .flat_map(|(resource_type, actions)| {
+                actions.iter().map(move |action| (resource_type, *action))
+            })
+            .collect()
+    }
+
+    /// Reads the `(resource_type, action)` pair back out of each registered
+    /// instance's serialized payload.
+    fn declared_permission_pairs() -> std::collections::BTreeSet<(String, String)> {
+        am_permission_instances()
+            .iter()
+            .map(|entry| {
+                let payload = (entry.payload_fn)();
+                let field = |name: &str| {
+                    payload
+                        .get(name)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_else(|| {
+                            panic!("instance {} lacks a string `{name}`", entry.instance_id)
+                        })
+                        .to_owned()
+                };
+                (field("resource_type"), field("action"))
+            })
+            .collect()
+    }
+
+    /// Catalog-vs-enforcement drift guard.
+    ///
+    /// [`EXPECTED_PERMISSION_IDS`] pins instance *ids*, which only catches a
+    /// renamed or dropped instance; it cannot notice a service that starts
+    /// enforcing a brand-new action nobody declared as grantable. Comparing
+    /// the semantic `(resource_type, action)` pairs closes that gap in both
+    /// directions: an enforced-but-undeclared action leaves the permission
+    /// ungrantable to least-privilege roles, and a declared-but-unenforced
+    /// one advertises a grant that gates nothing.
+    #[test]
+    fn am_permission_catalog_matches_enforced_action_vocabulary() {
+        let declared = declared_permission_pairs();
+        let enforced: std::collections::BTreeSet<(String, String)> = enforced_permission_pairs()
+            .into_iter()
+            .map(|(resource_type, action)| (resource_type.to_owned(), action.to_owned()))
+            .collect();
+
+        let undeclared: Vec<_> = enforced.difference(&declared).collect();
+        let unenforced: Vec<_> = declared.difference(&enforced).collect();
+        assert!(
+            undeclared.is_empty() && unenforced.is_empty(),
+            "AM permission catalog drifted from the enforced action vocabulary; \
+             enforced but not declared as an AuthzPermissionV1: {undeclared:?}; \
+             declared but not in any pep::actions::ALL: {unenforced:?}"
+        );
     }
 
     #[test]

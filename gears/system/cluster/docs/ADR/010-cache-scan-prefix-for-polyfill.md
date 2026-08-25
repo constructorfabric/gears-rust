@@ -28,12 +28,12 @@ date: 2026-06-10
 
 DESIGN §3.12 specifies `PollingPrefixWatch::spawn(cache, prefix, interval) -> CacheWatch`, which "periodically lists keys under the prefix, diffs against the previous list, and emits `Changed`/`Deleted` … Cost: N `get` calls per interval." Synthesizing a prefix watch by polling therefore requires the polyfill to **enumerate** the keys currently under a prefix.
 
-The cache contract frozen by the cache-primitive feature (`ClusterCacheBackend`, DECOMPOSITION §2.2) exposes only `get` / `put` / `delete` / `contains` / `put_if_absent` / `compare_and_swap` / `watch` / `watch_prefix`. None of these enumerates a keyspace: `watch_prefix` is the very capability the polyfill stands in for (and is unavailable on the backends that need the polyfill), and the cache-based service-discovery default avoids enumeration entirely by building its membership view from a **native** `watch_prefix` stream. As written, `PollingPrefixWatch` cannot be implemented against `Arc<dyn ClusterCacheBackend>` — there is no way to discover which keys exist under the prefix.
+The cache contract frozen by the cache-primitive feature (`ClusterCacheBackend`, DECOMPOSITION §2.2) exposes only `get` / `put` / `delete` / `contains` / `put_if_absent` / `compare_and_swap` / `watch` / `watch_prefix`. None of these enumerates a keyspace: `watch_prefix` is the very capability the polyfill stands in for (and is unavailable on the backends that need the polyfill), As written, `PollingPrefixWatch` cannot be implemented against `Arc<dyn ClusterCacheBackend>` — there is no way to discover which keys exist under the prefix.
 
 ## Decision Drivers
 
 - **The polyfill must work against the public trait object**, with no backend-specific downcast.
-- **The cache contract is consumed by the four primitives and the SDK defaults**; any change must be additive so existing backends keep compiling.
+- **The cache contract is consumed by the three primitives and the SDK defaults**; any change must be additive so existing backends keep compiling.
 - **Honest capability signalling** — a backend that cannot enumerate must say so, surfaced as the standard `Unsupported` error, not a panic or a silent empty result.
 - **Match DESIGN §3.12's documented cost** (`N + 1` round-trips: one enumeration plus one `get` per key to read versions for change detection).
 

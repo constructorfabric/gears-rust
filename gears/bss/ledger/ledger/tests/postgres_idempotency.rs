@@ -3,7 +3,7 @@
 //! of the same key returns `Replay` with a populated `result_entry_id`; a
 //! `claim` with a different payload hash still returns the stored row (the
 //! caller maps the hash mismatch to `IDEMPOTENCY_PAYLOAD_CONFLICT`). Ignored
-//! by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -76,7 +76,7 @@ async fn claim_then_finalize_then_replay() {
     // Seed a journal entry so finalize references a real id (one txn so the
     // deferred balance trigger sees both lines at COMMIT).
     let seed = raw.begin().await.unwrap();
-    seed.execute(pg(format!(
+    seed.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_entry
             (entry_id, tenant_id, legal_entity_id, period_id, entry_currency,
              source_doc_type, source_business_id, posted_at_utc, effective_at,
@@ -89,7 +89,7 @@ async fn claim_then_finalize_then_replay() {
     .unwrap();
     for (side, class) in [("DR", "AR"), ("CR", "CASH_CLEARING")] {
         let line = Uuid::now_v7();
-        seed.execute(pg(format!(
+        seed.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_journal_line
                 (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id,
                  account_class, side, amount_minor, currency, currency_scale, mapping_status)

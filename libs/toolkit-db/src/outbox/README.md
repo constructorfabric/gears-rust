@@ -405,10 +405,12 @@ else is infrastructure noise that will resolve itself.
 
 ### Worker Overhead
 
-Infrastructure overhead (scheduling, notifiers, semaphores) with no-op actions:
+Infrastructure overhead (scheduling, notifiers, semaphores) with no-op actions.
+A backend feature is still required: the bench declares
+`required-features = ["_any-backend"]`, which `sqlite`/`pg`/`mysql` activate.
 
 ```bash
-cargo bench -p cf-gears-toolkit-db --features preview-outbox --bench worker_overhead
+cargo bench -p cf-gears-toolkit-db --features sqlite --bench worker_overhead
 ```
 
 ### Outbox Throughput
@@ -418,13 +420,13 @@ Requires a database feature flag:
 
 ```bash
 # SQLite (local, no external DB needed)
-cargo bench -p cf-gears-toolkit-db --features preview-outbox,sqlite --bench outbox_throughput
+cargo bench -p cf-gears-toolkit-db --features sqlite --bench outbox_throughput
 
 # PostgreSQL
-cargo bench -p cf-gears-toolkit-db --features preview-outbox,pg --bench outbox_throughput -- postgres
+cargo bench -p cf-gears-toolkit-db --features pg --bench outbox_throughput -- postgres
 
 # MySQL
-cargo bench -p cf-gears-toolkit-db --features preview-outbox,mysql --bench outbox_throughput -- mysql
+cargo bench -p cf-gears-toolkit-db --features mysql --bench outbox_throughput -- mysql
 ```
 
 ### Makefile Targets
@@ -442,6 +444,6 @@ make bench-db-longhaul     # All engines, long-haul
 
 ```bash
 systemd-run --user --scope -p MemoryMax=4G -p CPUQuota=200% \
-  cargo bench -p cf-gears-toolkit-db --features preview-outbox --bench worker_overhead \
+  cargo bench -p cf-gears-toolkit-db --features sqlite --bench worker_overhead \
   -- --warm-up-time 1 --measurement-time 3 --sample-size 10
 ```

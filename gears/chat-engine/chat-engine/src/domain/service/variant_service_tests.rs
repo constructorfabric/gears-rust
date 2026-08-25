@@ -297,3 +297,214 @@ fn enabled_capability_names_handles_missing_and_malformed_inputs() {
     s.enabled_capabilities = Some(json!("not an array"));
     assert!(enabled_capability_names(&s).is_empty());
 }
+
+// ===========================================================================
+// Authorization + happy-path suite: real Sea-ORM repos over in-memory SQLite
+// with a mock PDP, so the VariantService PEP flow (authorize_session_op) and
+// the read path run end-to-end.
+// ===========================================================================
+
+use crate::domain::ports::NewUserMessage;
+use crate::domain::service::test_support::{
+    build_variant_service, ctx_for_subject, enforcer_allow, enforcer_deny, inmem_db, message_repo,
+    seed_session,
+};
+use chat_engine_sdk::models::{MessagePartInput, MessagePartType};
+
+fn text_part(text: &str) -> MessagePartInput {
+    MessagePartInput {
+        part_type: MessagePartType::Text,
+        content: json!({ "text": text }),
+        file_citations: vec![],
+        link_citations: vec![],
+        references: vec![],
+    }
+}
+
+async fn seed_message_pair(
+    db: &std::sync::Arc<crate::infra::db::repo::ChatEngineDb>,
+    session_id: Uuid,
+    tenant: Uuid,
+    user: Uuid,
+) -> crate::domain::ports::InsertedPair {
+    message_repo(db)
+        .insert_user_and_assistant_stub(NewUserMessage {
+            session_id,
+            tenant_id: Some(tenant.to_string()),
+            user_id: Some(user.to_string()),
+            parent_message_id: None,
+            parts: vec![text_part("hi")],
+            file_ids: None,
+            metadata: None,
+        })
+        .await
+        .expect("seed message pair")
+}
+
+#[tokio::test]
+async fn list_variants_pdp_denied_returns_forbidden() {
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+
+    let svc = build_variant_service(&db, enforcer_deny());
+    let err = svc
+        .list_variants(&ctx_for_subject(user, tenant), sid, Uuid::new_v4())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChatEngineError::Forbidden { .. }));
+}
+
+#[tokio::test]
+async fn set_active_variant_pdp_denied_returns_forbidden() {
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+
+    let svc = build_variant_service(&db, enforcer_deny());
+    let err = svc
+        .set_active_variant(&ctx_for_subject(user, tenant), sid, Uuid::new_v4())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChatEngineError::Forbidden { .. }));
+}
+
+#[tokio::test]
+async fn set_active_variant_by_index_pdp_denied_returns_forbidden() {
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+
+    let svc = build_variant_service(&db, enforcer_deny());
+    let err = svc
+        .set_active_variant_by_index(&ctx_for_subject(user, tenant), sid, Uuid::new_v4(), 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChatEngineError::Forbidden { .. }));
+}
+
+#[tokio::test]
+async fn list_variants_owner_returns_sibling_set() {
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+    let pair = seed_message_pair(&db, sid, tenant, user).await;
+
+    let svc = build_variant_service(&db, enforcer_allow());
+    let listing = svc
+        .list_variants(
+            &ctx_for_subject(user, tenant),
+            sid,
+            pair.assistant_message_id,
+        )
+        .await
+        .expect("owner list_variants ok");
+    assert!(
+        !listing.variants.is_empty(),
+        "the assistant stub is its own single variant"
+    );
+}
+
+#[tokio::test]
+async fn list_variants_unknown_message_is_not_found() {
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+
+    let svc = build_variant_service(&db, enforcer_allow());
+    let err = svc
+        .list_variants(&ctx_for_subject(user, tenant), sid, Uuid::new_v4())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChatEngineError::NotFound { .. }));
+}
+
+#[tokio::test]
+async fn set_active_variant_owner_activates_message() {
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+    let pair = seed_message_pair(&db, sid, tenant, user).await;
+
+    let svc = build_variant_service(&db, enforcer_allow());
+    let entry = svc
+        .set_active_variant(
+            &ctx_for_subject(user, tenant),
+            sid,
+            pair.assistant_message_id,
+        )
+        .await
+        .expect("owner set_active_variant ok");
+    assert_eq!(entry.message.message_id, pair.assistant_message_id);
+    assert!(entry.info.is_active);
+}
+
+#[tokio::test]
+async fn set_active_variant_by_index_owner_activates_sibling() {
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+    let pair = seed_message_pair(&db, sid, tenant, user).await;
+
+    let svc = build_variant_service(&db, enforcer_allow());
+    // The assistant stub is the sole sibling under the user message at index 0.
+    let entry = svc
+        .set_active_variant_by_index(
+            &ctx_for_subject(user, tenant),
+            sid,
+            pair.assistant_message_id,
+            0,
+        )
+        .await
+        .expect("owner set_active_variant_by_index ok");
+    assert_eq!(entry.info.variant_index, 0);
+}
+
+#[tokio::test]
+async fn set_active_variant_by_index_wrong_tenant_returns_not_found() {
+    // Point-op scope-miss -> 404 (anti-enumeration, ADR-0021). The session is
+    // owned by tenant_a/user_a; a foreign subject gets a PDP allow constrained
+    // to its OWN owner pair, so `authorize_session_op` re-reads under that scope
+    // and resolves 0 rows. This is only correct because the point-op applies the
+    // compiled scope to the row instead of consuming the unrestricted prefetch —
+    // a regression would leak the cross-tenant session as an activatable target.
+    let db = inmem_db().await;
+    let (tenant_a, user_a, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant_a, user_a).await;
+    let pair = seed_message_pair(&db, sid, tenant_a, user_a).await;
+
+    let svc = build_variant_service(&db, enforcer_allow());
+    let err = svc
+        .set_active_variant_by_index(
+            &ctx_for_subject(Uuid::new_v4(), Uuid::new_v4()),
+            sid,
+            pair.assistant_message_id,
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::NotFound { .. }),
+        "Expected NotFound for cross-tenant variant activation, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn set_active_variant_by_index_unknown_index_is_not_found() {
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+    let pair = seed_message_pair(&db, sid, tenant, user).await;
+
+    let svc = build_variant_service(&db, enforcer_allow());
+    let err = svc
+        .set_active_variant_by_index(
+            &ctx_for_subject(user, tenant),
+            sid,
+            pair.assistant_message_id,
+            99,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChatEngineError::NotFound { .. }));
+}

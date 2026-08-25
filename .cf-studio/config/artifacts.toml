@@ -19,6 +19,10 @@ reason = "Ignore 'coord' shared utility library (distributed-lease primitive; in
 patterns = ["gears/bss/libs/coord/*"]
 
 [[ignore]]
+reason = "Ignore 'fixtures' joint golden conformance corpus (cf-gears-bss-fixtures + its conformance harness; test-support infrastructure crates consumed by the BSS gears, not an SDLC-documented product module — no PRD/DESIGN required, README-documented). Same class as 'coord' above."
+patterns = ["gears/bss/fixtures/*"]
+
+[[ignore]]
 reason = "Ignore authn-resolver root module node while allowing nested plugin docs scopes."
 patterns = ["gears/system/authn-resolver"]
 
@@ -59,6 +63,26 @@ patterns = [
 reason = "Ignore legacy (pre-CFS) ADR files in oagw/docs root — converted copies live under docs/ADR/."
 patterns = ["gears/system/oagw/docs/adr-*.md"]
 
+
+[[ignore]]
+reason = "Ignore usage-collector DESIGN, DECOMPOSITION, features and ADRs — they still describe the superseded model (counter/gauge usage kinds, event deactivation, signed compensation) and reference concepts the PRD no longer defines, pending the rewrite to aggregation folds and invalidation tracked in PRD section 13. PRD.md still validated via autodetect."
+patterns = [
+  "gears/system/usage-collector/docs/DESIGN.md",
+  "gears/system/usage-collector/docs/DECOMPOSITION.md",
+  "gears/system/usage-collector/docs/features/*",
+  "gears/system/usage-collector/docs/ADR/*",
+  "gears/system/usage-collector/usage-collector/src/*",
+  "gears/system/usage-collector/usage-collector/tests/*",
+  "gears/system/usage-collector/usage-collector-sdk/src/*",
+]
+
+[[ignore]]
+reason = "Ignore the TimescaleDB usage-collector storage plugin — its specs and code still describe the superseded model and reference usage-collector concepts the PRD no longer defines (fr-usage-compensation, fr-event-deactivation, fr-usage-type-registration, fr-usage-type-deletion, fr-usage-type-existence-and-semantics), pending the plugin's own update to aggregation folds and invalidation once the rewrite tracked in PRD section 13 lands. Docs and code are ignored together: ignoring the specs alone would orphan the plugin's code traceability markers."
+patterns = [
+  "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/docs/*",
+  "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/*",
+  "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/tests/*",
+]
 
 [[ignore]]
 reason = "Ignore module 'tenant-resolver' (not SDLC-documented yet: missing required PRD/DESIGN)."
@@ -111,6 +135,14 @@ patterns = ["gears/mini-chat/*"]
 reason = "Ignore module 'approval-service' (PRD/DESIGN are placeholders). Remove this ignore after PRD/DESIGN conform to template."
 patterns = ["gears/approval-service/*"]
 
+[[ignore]]
+reason = "Ignore module 'contracts' (PRD is a placeholder: sections 7-12 are TBD, including the Non-Functional Requirements the template requires at least one id under, and no DESIGN exists yet). Remove this ignore after PRD/DESIGN conform to template."
+patterns = ["gears/bss/contracts/*"]
+
+[[ignore]]
+reason = "BSS multi-slice design sets (gears/bss/*/docs/design/*.md — pricing 12, rating 16, subscriptions 9 slices): DELIBERATELY outside cfs autodetect/traceability. cfs hardcodes the artifact-kind set, so a DESIGN_SLICE kind cannot be registered via the kit manifest (attempted + reverted 2026-07-28); a brace-glob on the DESIGN pattern breaks DESIGN.md matching. The slice docs follow the DESIGN template, declare cpt-cf-bss-* ids, and are review-audited (2026-07-22/28 waves) instead of cfs-validated. Revisit when cfs supports custom kinds — tracked in pricing DECISIONS.md (2026-07-28 review, finding 15)."
+patterns = ["gears/bss/*/docs/design/*"]
+
 [[systems]]
 name = "cf-gears"
 slug = "cf"
@@ -127,8 +159,14 @@ pattern = "PRD.md"
 traceability = "FULL"
 required = true
 
+# Glob (not a literal name) so a gear may ship companion design documents
+# alongside DESIGN.md — DESIGN-<aspect>.md, for an aspect large enough to
+# carve out of the main design and own its own artifact. Each match is
+# validated as a full DESIGN artifact against the kit constraints.
+# Files that are NOT standalone SDLC artifacts must be listed in [[ignore]]
+# above; ignore takes precedence over this pattern.
 [systems.autodetect.artifacts.DESIGN]
-pattern = "DESIGN.md"
+pattern = "DESIGN*.md"
 traceability = "FULL"
 required = false
 
@@ -339,6 +377,43 @@ system_root = "{project_root}/gears/system/account-management/docs/tr-plugin"
 artifacts_root = "{system_root}"
 
 [systems.autodetect.children.artifacts]
+[systems.autodetect.children.artifacts.PRD]
+pattern = "PRD.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.DESIGN]
+pattern = "DESIGN.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.ADR]
+pattern = "ADR/*.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.DECOMPOSITION]
+pattern = "DECOMPOSITION.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.artifacts.FEATURE]
+pattern = "features/*.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.children.validation]
+require_kind_registered_in_kit = true
+require_md_extension = true
+fail_on_unmatched_markdown = true
+
+# Nested sub-plugin scope: Keycloak IdP plugin carries its own PRD/DESIGN/DECOMPOSITION
+# under gears/system/account-management/plugins/keycloak-idp-plugin/docs.
+[[systems.autodetect.children]]
+kit = "gears"
+system_root = "{project_root}/gears/system/account-management/plugins/keycloak-idp-plugin/docs"
+artifacts_root = "{system_root}"
+
 [systems.autodetect.children.artifacts.PRD]
 pattern = "PRD.md"
 traceability = "DOCS-ONLY"

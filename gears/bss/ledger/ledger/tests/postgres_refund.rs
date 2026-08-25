@@ -73,7 +73,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -141,7 +141,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -299,7 +299,7 @@ async fn refund_clearing_state(
     psp: &str,
     phase: &str,
 ) -> Option<String> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT clearing_state FROM bss.ledger_refund \
          WHERE tenant_id='{}' AND psp_refund_id='{psp}' AND phase='{phase}'",
         s.tenant
@@ -321,7 +321,7 @@ async fn seed_allocation_refund(
     invoice_id: &str,
     allocated: i64,
 ) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_payment_allocation_refund \
          (tenant_id, payment_id, invoice_id, allocated_minor, refunded_minor, version) \
          VALUES ('{}','{payment_id}','{invoice_id}',{allocated},0,0)",
@@ -336,7 +336,7 @@ async fn seed_allocation_refund(
 /// the spendable-headroom CHECK have a non-trivial allocated base). Mirrors what
 /// `add_allocated` does, without wiring the whole allocation flow.
 async fn bump_allocated(raw: &DatabaseConnection, s: &Seller, payment_id: &str, amount: i64) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_payment_settlement \
          SET allocated_minor = allocated_minor + {amount}, version = version + 1 \
          WHERE tenant_id='{}' AND payment_id='{payment_id}'",
@@ -1447,7 +1447,7 @@ async fn clawback_queue_rows(raw: &DatabaseConnection, s: &Seller, status: &str)
 /// Force a REFUND_CLAWBACK queue row to look aged: backdate `queued_at` well past
 /// the 7-day aging horizon AND clear `apply_after` so it is immediately claimable.
 async fn age_clawback_row(raw: &DatabaseConnection, s: &Seller) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_pending_event_queue \
          SET queued_at = now() - interval '30 days', apply_after = NULL \
          WHERE tenant_id='{}' AND flow='REFUND_CLAWBACK'",
@@ -1535,7 +1535,7 @@ async fn clawback_after_outbound_decrements_net_refunded() {
     );
     // The claw-back refund row carries the relates_to link.
     let relates: Option<String> = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT relates_to_refund_id FROM bss.ledger_refund \
              WHERE tenant_id='{}' AND psp_refund_id='PSP-CB' AND phase='initiated'",
             s.tenant
@@ -2017,7 +2017,7 @@ async fn dispute_hold_queue_rows(raw: &DatabaseConnection, s: &Seller, status: &
 /// the 14-day quarantine aging horizon AND clear `apply_after` so it is immediately
 /// claimable. Mirrors `age_clawback_row`.
 async fn age_quarantine_row(raw: &DatabaseConnection, s: &Seller) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_pending_event_queue \
          SET queued_at = now() - interval '30 days', apply_after = NULL \
          WHERE tenant_id='{}' AND flow='REFUND_QUARANTINE'",
@@ -2036,7 +2036,7 @@ async fn open_dispute(
     payment_id: &str,
     disputed: i64,
 ) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_dispute \
          (tenant_id, dispute_id, payment_id, currency, variant, last_phase, cycle, \
           disputed_amount_minor, cash_hold_minor, version) \

@@ -1,0 +1,39 @@
+[package]
+name = "cf-gears-event-broker"
+description = "Event Broker: Ingest/Delivery/Dispatcher composite module (deployment-topology skeleton)"
+version = "0.2.1"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["constructorfabric", "cf-gears", "event-broker"]
+categories = ["asynchronous"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "event_broker"
+
+[lints]
+workspace = true
+
+[dependencies]
+cluster = { workspace = true }
+cluster-sdk = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+chrono = { workspace = true, features = ["clock", "serde"] }
+
+toolkit = { workspace = true }
+toolkit-security = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

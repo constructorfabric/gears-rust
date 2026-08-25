@@ -30,7 +30,7 @@ marks it `✓`.
 
 These are designed and documented in the framework but **not yet implemented**:
 
-- **Cluster plane** — leader election, distributed locks, service discovery, distributed cache.
+- **Cluster plane** — leader election, distributed locks, distributed cache.
 - **GenAI gears** — Chat Engine, LLM Gateway, Models / Prompts / AI Agents registries, MCP
   Registry, Agent Memory, Web Search Gateway, URL Crawler, Model Scheduler, Local Search Index.
 - **Serverless gears** — Serverless Gateway & Runtimes, Durable Objects.

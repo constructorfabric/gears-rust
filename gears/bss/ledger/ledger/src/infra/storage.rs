@@ -1,4 +1,7 @@
-//! Persistence layer: migrations, entities, repos (added incrementally).
+//! SeaORM persistence for the ledger-owned `bss` schema.
+//!
+//! Provides the ordered migration chain, table entities, scoped repositories,
+//! and OData-to-column mappings used by posting and inquiry services.
 
 pub mod entity;
 pub mod migrations;

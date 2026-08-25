@@ -1,6 +1,8 @@
-//! Gear configuration. The `database.server` reference selects the
-//! Postgres connection; `search_path` is set on that connection's
-//! `params` in `config/server.yaml` (see Task 3 notes).
+//! Validated behavioral configuration for the Billing Ledger gear.
+//!
+//! Defines background-job cadences, seller tenant types, recognition, FX,
+//! reconciliation, payment limits, and the event-publication gate. Database
+//! selection is handled separately by the ToolKit `db` capability.
 
 use std::time::Duration;
 
@@ -138,6 +140,13 @@ pub enum ConfigError {
     AboveMax {
         field: &'static str,
         max: u64,
+        reason: &'static str,
+    },
+    /// A field fell below its allowed minimum (for bounds stricter than "> 0").
+    #[error("config: {field} must be >= {min} ({reason})")]
+    BelowMin {
+        field: &'static str,
+        min: u64,
         reason: &'static str,
     },
 }
@@ -302,6 +311,10 @@ pub struct FxConfig {
     /// Deterministic provider fallback order (by `provider_id`); empty until an
     /// adapter is configured.
     pub provider_order: Vec<String>,
+    /// Vendor of the FX rate-provider plugin the `RateSyncJob` discovers each tick
+    /// from the types-registry (`RateProviderPluginSpecV1` instances). Must match
+    /// the external `bss-rate-provider` core gear's advertised `vendor`.
+    pub provider_vendor: String,
 }
 
 impl Default for FxConfig {
@@ -313,6 +326,7 @@ impl Default for FxConfig {
             rate_sync_tick_secs: 3_600,
             revaluation_run_tick_secs: 86_400,
             provider_order: Vec::new(),
+            provider_vendor: "cf.bss".to_owned(),
         }
     }
 }
@@ -323,6 +337,15 @@ impl Default for FxConfig {
 /// window overflows chrono's millisecond representation) — bound it at `validate`.
 const MAX_STALE_G10_HOURS: u64 = 168;
 
+/// Lower bound on `rate_sync_tick_secs`. The `FxNoFetchAttempted` alert reads a
+/// `3 × rate_sync_tick_secs` window of the adapter's completion metrics, and one
+/// source attempt can stay in flight for up to the adapter's 30 s per-source
+/// timeout ceiling — with a sub-minute tick a single slow attempt could span the
+/// whole alert window and read as "no attempt occurred". A 60 s floor keeps that
+/// window at ≥ 180 s, and nothing needs sub-minute FX syncs against feeds that
+/// publish daily.
+const MIN_RATE_SYNC_TICK_SECS: u64 = 60;
+
 impl FxConfig {
     /// Validate the FX tunables.
     ///
@@ -330,10 +353,11 @@ impl FxConfig {
     /// Returns `Err` if `stale_default_max_days > 7` (F3: a threshold above the
     /// 7-day bound must be rejected, never silently clamped), if `stale_g10_hours`
     /// exceeds [`MAX_STALE_G10_HOURS`] (a larger window overflows
-    /// `chrono::Duration::hours` and panics in `rate_source::is_stale`), or if any
-    /// of `stale_g10_hours` / `rate_sync_tick_secs` / `revaluation_run_tick_secs`
-    /// is `0` (a zero staleness window admits any rate; a zero tick panics
-    /// `tokio::time::interval`).
+    /// `chrono::Duration::hours` and panics in `rate_source::is_stale`), if
+    /// `rate_sync_tick_secs` is below [`MIN_RATE_SYNC_TICK_SECS`] (the
+    /// `FxNoFetchAttempted` alert-window bound — see the constant's docs), or if
+    /// `stale_g10_hours` / `revaluation_run_tick_secs` is `0` (a zero staleness
+    /// window admits any rate; a zero tick panics `tokio::time::interval`).
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.stale_default_max_days > 7 {
             return Err(ConfigError::AboveMax {
@@ -354,9 +378,11 @@ impl FxConfig {
                 reason: "7-day bound",
             });
         }
-        if self.rate_sync_tick_secs == 0 {
-            return Err(ConfigError::MustBePositive {
+        if self.rate_sync_tick_secs < MIN_RATE_SYNC_TICK_SECS {
+            return Err(ConfigError::BelowMin {
                 field: "fx.rate_sync_tick_secs",
+                min: MIN_RATE_SYNC_TICK_SECS,
+                reason: "FxNoFetchAttempted alert-window bound",
             });
         }
         if self.revaluation_run_tick_secs == 0 {

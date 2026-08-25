@@ -340,5 +340,5 @@ custom table, remote sink, or in-memory parking can still implement
 |---|---|---|
 | (default) | DB-free direct producer, consumer | — |
 | `db` | `LocalDbOffsetManager`, `TxCommitHandle` | `toolkit-db` |
-| `outbox` | DB-aware producer outbox helper | `db`, `toolkit-db/preview-outbox` |
+| `outbox` | DB-aware producer outbox helper | `db` |
 | `integration` | Integration tests (gated) | — |

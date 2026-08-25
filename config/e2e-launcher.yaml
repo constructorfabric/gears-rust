@@ -1,0 +1,50 @@
+# Global defaults for the local E2E launcher (tools/scripts/run_e2e.py).
+#
+# Per-suite manifests live at testing/e2e/suites/<suite>/e2e.yaml.
+base_config: config/e2e-local.yaml
+base_features:
+  - static-tenants
+  - static-authn
+  - static-authz
+core_config_gears:
+  - api-gateway
+  - types-registry
+  - tenant-resolver
+  - authn-resolver
+  - authz-resolver
+  - static-tr-plugin
+  - static-authn-plugin
+  - static-authz-plugin
+generated_config_dir: target
+
+# Declarative pruning of seed data that belongs to gears which are not part of a
+# focused run. Keeps the runner free of any gear-specific string literals.
+# For each rule: drop every list entry under `path` matching `match`, unless one
+# of `keep_when_config_gears` is present in the focused run's config gear set.
+config_prune:
+  - path: gears.types-registry.config.entities
+    match:
+      id_contains: "gts.cf.core.am."
+    keep_when_config_gears:
+      - account-management
+
+# Shared (unscoped) `make e2e-local` behaviour.
+shared:
+  features_file: config/e2e-features.txt
+  sidecars:
+    - file-storage
+  launcher: e2e-launcher
+
+# Sidecar build + env definitions, referenced by name from `shared.sidecars` or
+# a suite manifest's `sidecars:` list.
+sidecars:
+  file-storage:
+    build:
+      - cargo
+      - build
+      - -p
+      - cf-gears-file-storage
+      - --bin
+      - sidecar
+    env:
+      FS_SIDECAR_BINARY: target/debug/sidecar

@@ -59,7 +59,7 @@ impl StandaloneClusterBuilder {
     /// Builds the plugin: creates the native cache and starts its TTL sweeper.
     ///
     /// The wiring crate (`cf-gears-cluster`) wraps the cache backend with the SDK
-    /// default leader-election, lock, and service-discovery backends (DESIGN §3.11).
+    /// default leader-election and lock backends (DESIGN §3.11).
     ///
     /// # Errors
     /// - [`ClusterError::InvalidConfig`] if `sweep_interval` is zero.

@@ -6,7 +6,7 @@
 //! (`prev_hash == first.row_hash`); a raw UPDATE/DELETE on the record is
 //! rejected (append-only); a clean re-walk recomputes the seal exactly, and a
 //! tampered row (trigger disabled + UPDATE) breaks the recompute.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -38,7 +38,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 
 /// Hex string of a single-column, single-row SELECT, `None` when absent/NULL.
 async fn scalar_hex(conn: &DatabaseConnection, sql: &str) -> Option<String> {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.and_then(|r| r.try_get_by_index::<Option<String>>(0).unwrap())
 }
 
@@ -159,7 +159,7 @@ async fn appends_first_record_sealed_with_genesis_prev() {
     );
 
     let tip_points: i64 = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT COUNT(*) FROM bss.audit_chain_state \
              WHERE tenant_id='{tenant}' AND last_audit_id='{audit_id}' AND last_seq=1"
         )))
@@ -229,7 +229,7 @@ async fn links_second_record_to_first() {
     );
 
     let tip_seq: i64 = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT last_seq FROM bss.audit_chain_state WHERE tenant_id='{tenant}'"
         )))
         .await
@@ -262,7 +262,7 @@ async fn append_only_trigger_rejects_update_and_delete() {
     .await;
 
     let upd = raw
-        .execute(pg(format!(
+        .execute_raw(pg(format!(
             "UPDATE bss.secured_audit_record SET reason_code='X' WHERE audit_id='{audit_id}'"
         )))
         .await;
@@ -273,7 +273,7 @@ async fn append_only_trigger_rejects_update_and_delete() {
     );
 
     let del = raw
-        .execute(pg(format!(
+        .execute_raw(pg(format!(
             "DELETE FROM bss.secured_audit_record WHERE audit_id='{audit_id}'"
         )))
         .await;
@@ -285,7 +285,28 @@ async fn append_only_trigger_rejects_update_and_delete() {
 }
 
 /// A clean re-walk recomputes each record's row_hash exactly; a tampered row
-/// (trigger disabled + row_hash overwritten) breaks the recompute.
+/// (trigger disabled + row_hash overwritten) is **reported by a re-walk run over
+/// the row as it now stands**, at the row itself and at its successor's
+/// back-link.
+///
+/// # What this does and does not exercise
+///
+/// The re-walk is this test's own, over
+/// [`bss_ledger::domain::audit_chain::audit_row_hash`] — the encoder the seal
+/// uses — because **nothing in production re-walks this chain**.
+/// `ChainVerifierJob` walks `ledger_journal_entry` via `chain_row_hash` and knows
+/// nothing about `secured_audit_record`, and `audit_row_hash` has exactly one
+/// production caller: the seal in `SecuredAuditStore::append`. So this asserts
+/// that the chain *carries* the evidence of a tamper, not that any deployed code
+/// acts on it; the sibling `postgres_chain.rs::verifier_freezes_tampered_chain`
+/// is the journal chain's version of the latter and the audit chain has no
+/// counterpart.
+///
+/// The tamper half used to end at `assert_ne!(recomputed, tampered_hash)` against
+/// the `deadbeef…` constant the test had just written, which said only that the
+/// test's own `UPDATE` had landed. What is asserted now is the pair of checks a
+/// walker makes — content-vs-seal on the row, and seal-vs-`prev_hash` across the
+/// link — and the second of them is what localises the break to the tampered row.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn rewalk_detects_tamper() {
@@ -308,7 +329,7 @@ async fn rewalk_detects_tamper() {
         None,
     )
     .await;
-    let _second = append(
+    let second = append(
         &provider,
         tenant,
         AuditEventType::MetadataChange,
@@ -322,33 +343,108 @@ async fn rewalk_detects_tamper() {
 
     // Clean re-walk: recompute the FIRST record's row_hash from its stored
     // columns (genesis prev) and assert it matches the sealed value.
-    let stored_first_hash = scalar_hex(
-        &raw,
-        &format!(
-            "SELECT encode(row_hash,'hex') FROM bss.secured_audit_record WHERE audit_id='{first}'"
-        ),
-    )
+    let clean = rewalk_record(&raw, tenant, first, &audit_genesis_prev_hash(tenant)).await;
+    assert_eq!(
+        clean.recomputed, clean.stored,
+        "clean re-walk must recompute the sealed row_hash exactly"
+    );
+    // The link the walk crosses next, while the chain is still whole.
+    assert_eq!(
+        prev_hash_of(&raw, second).await,
+        clean.stored,
+        "the successor's prev_hash is its parent's sealed row_hash"
+    );
+
+    // Tamper the first record's row_hash out-of-band (the append-only trigger
+    // forbids any UPDATE, so disable it for the tamper and re-enable after).
+    raw.execute_raw(pg(
+        "ALTER TABLE bss.secured_audit_record DISABLE TRIGGER trg_secured_audit_append_only",
+    ))
     .await
-    .expect("first row_hash");
+    .unwrap();
+    raw.execute_raw(pg(format!(
+        "UPDATE bss.secured_audit_record \
+         SET row_hash = decode('deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef','hex') \
+         WHERE audit_id='{first}'"
+    )))
+    .await
+    .unwrap();
+    raw.execute_raw(pg(
+        "ALTER TABLE bss.secured_audit_record ENABLE TRIGGER trg_secured_audit_append_only",
+    ))
+    .await
+    .unwrap();
+
+    // The re-walk is run AGAIN, over the row as it now stands. Nothing about the
+    // record's *content* moved, so the recompute is unchanged and the stored seal
+    // is not: that disagreement is the break, and it is read out of the database
+    // rather than compared against the constant this test wrote.
+    let broken = rewalk_record(&raw, tenant, first, &audit_genesis_prev_hash(tenant)).await;
+    assert_eq!(
+        broken.recomputed, clean.recomputed,
+        "the tamper moved the seal, not the content it seals"
+    );
+    assert_ne!(
+        broken.recomputed, broken.stored,
+        "the re-walk must report the break: the stored row_hash no longer matches what \
+         this record's own columns hash to"
+    );
+
+    // And the back-link is broken too, which is how a walk localises the break to
+    // this row rather than to its successor: the successor still carries the
+    // parent's ORIGINAL seal.
+    let successor_prev = prev_hash_of(&raw, second).await;
+    assert_ne!(
+        successor_prev, broken.stored,
+        "the successor's prev_hash must no longer equal its parent's stored row_hash"
+    );
+    assert_eq!(
+        successor_prev, broken.recomputed,
+        "and it still equals what the parent's content hashes to, so the break is the \
+         parent's seal and not the child's link"
+    );
+}
+
+/// One record's seal, as stored and as recomputed from its own stored columns.
+struct Rewalked {
+    /// `row_hash` recomputed over [`audit_row_hash`] — the encoder the seal used.
+    recomputed: String,
+    /// `row_hash` as the row currently carries it.
+    stored: String,
+}
+
+/// Re-walk one record: read its stored columns, recompute the seal over `prev`,
+/// and answer both hashes as hex.
+///
+/// Read back out of the database on **every** call, so that running it after a
+/// tamper measures the tampered row rather than restating an earlier result.
+async fn rewalk_record(
+    raw: &DatabaseConnection,
+    tenant: Uuid,
+    audit_id: Uuid,
+    prev: &[u8; 32],
+) -> Rewalked {
     // Microseconds since the Unix epoch. For current-era timestamps the value
     // (~1.8e15) is well within f64's exact-integer range (< 2^53), so the
     // epoch-seconds product and the bigint cast are lossless — the recompute
     // matches the seal exactly.
     let row = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT event_type, actor_ref, reason_code, before_after::text, \
-                    correlation_id::text, (EXTRACT(epoch FROM at_utc) * 1000000)::bigint \
-             FROM bss.secured_audit_record WHERE audit_id='{first}'"
+                    correlation_id::text, (EXTRACT(epoch FROM at_utc) * 1000000)::bigint, \
+                    encode(row_hash,'hex') \
+             FROM bss.secured_audit_record WHERE audit_id='{audit_id}'"
         )))
         .await
         .unwrap()
-        .expect("first record row");
+        .expect("the record row");
     let event_type: String = row.try_get_by_index(0).unwrap();
     let actor_ref: Option<String> = row.try_get_by_index(1).unwrap();
     let reason_code: Option<String> = row.try_get_by_index(2).unwrap();
     let before_after_text: String = row.try_get_by_index(3).unwrap();
     let correlation_text: Option<String> = row.try_get_by_index(4).unwrap();
     let at_micros: i64 = row.try_get_by_index(5).unwrap();
+    let stored: String = row.try_get_by_index(6).unwrap();
 
     let before_after: serde_json::Value = serde_json::from_str(&before_after_text).unwrap();
     let correlation_id = correlation_text.map(|s| Uuid::parse_str(&s).unwrap());
@@ -356,7 +452,7 @@ async fn rewalk_detects_tamper() {
 
     let recomputed = audit_row_hash(
         &AuditHashInput {
-            audit_id: first,
+            audit_id,
             tenant_id: tenant,
             event_type: &event_type,
             actor_ref: actor_ref.as_deref(),
@@ -365,53 +461,31 @@ async fn rewalk_detects_tamper() {
             at_utc,
             before_after: &before_after,
         },
-        &audit_genesis_prev_hash(tenant),
+        prev,
     )
     .expect("recompute audit row_hash");
-    assert_eq!(
-        hex32(&recomputed),
-        stored_first_hash,
-        "clean re-walk must recompute the sealed row_hash exactly"
-    );
+    Rewalked {
+        recomputed: hex32(&recomputed),
+        stored,
+    }
+}
 
-    // Tamper the first record's row_hash out-of-band (the append-only trigger
-    // forbids any UPDATE, so disable it for the tamper and re-enable after).
-    raw.execute(pg(
-        "ALTER TABLE bss.secured_audit_record DISABLE TRIGGER trg_secured_audit_append_only",
-    ))
-    .await
-    .unwrap();
-    raw.execute(pg(format!(
-        "UPDATE bss.secured_audit_record \
-         SET row_hash = decode('deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef','hex') \
-         WHERE audit_id='{first}'"
-    )))
-    .await
-    .unwrap();
-    raw.execute(pg(
-        "ALTER TABLE bss.secured_audit_record ENABLE TRIGGER trg_secured_audit_append_only",
-    ))
-    .await
-    .unwrap();
-
-    let tampered_hash = scalar_hex(
-        &raw,
+/// One record's stored `prev_hash`, as hex.
+async fn prev_hash_of(raw: &DatabaseConnection, audit_id: Uuid) -> String {
+    scalar_hex(
+        raw,
         &format!(
-            "SELECT encode(row_hash,'hex') FROM bss.secured_audit_record WHERE audit_id='{first}'"
+            "SELECT encode(prev_hash,'hex') FROM bss.secured_audit_record \
+             WHERE audit_id='{audit_id}'"
         ),
     )
     .await
-    .expect("tampered row_hash");
-    assert_ne!(
-        hex32(&recomputed),
-        tampered_hash,
-        "a tampered row_hash must NOT match the recompute"
-    );
+    .expect("the record's prev_hash")
 }
 
 /// Collect a single text column over many rows into a `Vec<String>`.
 async fn fetch_hex_set(conn: &DatabaseConnection, sql: &str) -> Vec<String> {
-    conn.query_all(pg(sql.to_owned()))
+    conn.query_all_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .into_iter()
@@ -527,7 +601,7 @@ async fn concurrent_appends_form_linear_audit_chain() {
 
     // The tip advanced exactly N times.
     let tip_seq: i64 = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT last_seq FROM bss.audit_chain_state WHERE tenant_id='{tenant}'"
         )))
         .await

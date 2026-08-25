@@ -1,7 +1,7 @@
 //! Runs the shared, backend-agnostic conformance suites from
 //! `cf-gears-cluster-conformance` against this gear's real cache-derived default
 //! backends (`CasBasedLeaderElectionBackend`, `CasBasedDistributedLockBackend`,
-//! `CacheBasedServiceDiscoveryBackend`), each built over the crate's known-good
+//! `CasBasedLeaderElectionBackend`), each built over the crate's known-good
 //! linearizable `MemCache` fixture.
 //!
 //! This is the "first real exercise" the conformance crate's docs describe: the
@@ -17,44 +17,38 @@
 
 use std::sync::Arc;
 
-use cluster::defaults::{
-    CacheBasedServiceDiscoveryBackend, CasBasedDistributedLockBackend,
-    CasBasedLeaderElectionBackend,
-};
+use cluster::defaults::{CasBasedDistributedLockBackend, CasBasedLeaderElectionBackend};
 use cluster_conformance::MemCache;
 use cluster_conformance::{
-    run_discovery_conformance, run_leader_conformance, run_lock_conformance,
+    ScenarioBackend, TimeControl, run_leader_conformance, run_lock_conformance,
 };
-use cluster_sdk::discovery::ServiceDiscoveryBackend;
 use cluster_sdk::leader::LeaderElectionBackend;
 use cluster_sdk::lock::DistributedLockBackend;
 
 #[tokio::test]
 async fn leader_election_conformance() {
-    run_leader_conformance(|| {
-        let cache = MemCache::linearizable();
-        Arc::new(CasBasedLeaderElectionBackend::new(cache).expect("linearizable cache is accepted"))
-            as Arc<dyn LeaderElectionBackend>
-    })
+    run_leader_conformance(
+        || async {
+            let cache = MemCache::linearizable();
+            ScenarioBackend::bare(Arc::new(
+                CasBasedLeaderElectionBackend::new(cache).expect("linearizable cache is accepted"),
+            ) as Arc<dyn LeaderElectionBackend>)
+        },
+        TimeControl::Virtual,
+    )
     .await;
 }
 
 #[tokio::test]
 async fn distributed_lock_conformance() {
-    run_lock_conformance(|| {
-        let cache = MemCache::linearizable();
-        Arc::new(
-            CasBasedDistributedLockBackend::new(cache).expect("linearizable cache is accepted"),
-        ) as Arc<dyn DistributedLockBackend>
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn service_discovery_conformance() {
-    run_discovery_conformance(|| {
-        let cache = MemCache::linearizable();
-        Arc::new(CacheBasedServiceDiscoveryBackend::new(cache)) as Arc<dyn ServiceDiscoveryBackend>
-    })
+    run_lock_conformance(
+        || async {
+            let cache = MemCache::linearizable();
+            ScenarioBackend::bare(Arc::new(
+                CasBasedDistributedLockBackend::new(cache).expect("linearizable cache is accepted"),
+            ) as Arc<dyn DistributedLockBackend>)
+        },
+        TimeControl::Virtual,
+    )
     .await;
 }

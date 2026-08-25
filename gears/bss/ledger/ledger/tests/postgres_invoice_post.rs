@@ -60,7 +60,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -132,7 +132,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -450,7 +450,7 @@ async fn closed_ar_account_post_is_rejected_at_the_db_guard() {
     // Close the provisioned AR account (the post's DR leg targets it). The chart
     // of accounts is `bss.ledger_tenant_account`; `find_account` reads lifecycle_state
     // from it during the post.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_tenant_account SET lifecycle_state='CLOSED' \
          WHERE tenant_id='{}' AND account_id='{}'",
         s.tenant, s.ar

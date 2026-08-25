@@ -18,6 +18,7 @@ pub mod hooks;
 pub mod integrity;
 pub mod model;
 pub mod repo;
+pub mod resolve;
 pub mod resource_checker;
 pub mod retention;
 pub mod service;

@@ -64,7 +64,7 @@ async fn test_middleware_allows_configured_content_type() {
         responses: vec![],
         handler_id: "test".to_owned(),
         authenticated: false,
-        is_public: true,
+        exposed: false,
         license_requirement: None,
         rate_limit: None,
         allowed_request_content_types: Some(vec!["application/json"]),
@@ -109,7 +109,7 @@ async fn test_middleware_strips_content_type_parameters() {
         responses: vec![],
         handler_id: "test".to_owned(),
         authenticated: false,
-        is_public: true,
+        exposed: false,
         license_requirement: None,
         rate_limit: None,
         allowed_request_content_types: Some(vec!["application/json"]),
@@ -154,7 +154,7 @@ async fn test_middleware_rejects_disallowed_content_type() {
         responses: vec![],
         handler_id: "test".to_owned(),
         authenticated: false,
-        is_public: true,
+        exposed: false,
         license_requirement: None,
         rate_limit: None,
         allowed_request_content_types: Some(vec!["application/json"]),
@@ -185,7 +185,7 @@ async fn test_middleware_rejects_disallowed_content_type() {
     assert_eq!(content_type(&response), PROBLEM_JSON);
 
     let problem = extract_problem(response).await;
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(problem.problem_type, INVALID_ARGUMENT_TYPE);
     let violations = problem
         .context
@@ -215,7 +215,7 @@ async fn test_middleware_rejects_missing_content_type() {
         responses: vec![],
         handler_id: "test".to_owned(),
         authenticated: false,
-        is_public: true,
+        exposed: false,
         license_requirement: None,
         rate_limit: None,
         allowed_request_content_types: Some(vec!["multipart/form-data"]),
@@ -244,7 +244,7 @@ async fn test_middleware_rejects_missing_content_type() {
     assert_eq!(content_type(&response), PROBLEM_JSON);
 
     let problem = extract_problem(response).await;
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(problem.problem_type, INVALID_ARGUMENT_TYPE);
     let violations = problem
         .context
@@ -305,7 +305,7 @@ async fn test_middleware_allows_multiple_content_types() {
         responses: vec![],
         handler_id: "test".to_owned(),
         authenticated: false,
-        is_public: true,
+        exposed: false,
         license_requirement: None,
         rate_limit: None,
         allowed_request_content_types: Some(vec![

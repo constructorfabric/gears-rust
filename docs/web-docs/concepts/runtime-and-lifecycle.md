@@ -58,10 +58,10 @@ by the shutdown deadline (see the lifecycle above).
 
 ## The cluster plane (planned)
 
-For multi-instance deployments the framework defines four coordination primitives behind
-stable contracts — **distributed cache**, **leader election**, **distributed locks**, and
-**service discovery** — where a consumer declares what it needs and the platform resolves it
-against an operator-selected backend.
+For multi-instance deployments the framework defines three coordination primitives behind
+stable contracts — **distributed cache**, **leader election**, and **distributed locks** —
+where a consumer declares what it needs and the platform resolves it against an
+operator-selected backend.
 
 :::caution[Not yet implemented]
 The cluster-plane primitives are designed but **not yet implemented** in the framework

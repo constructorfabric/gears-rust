@@ -1,6 +1,7 @@
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use toolkit_contract::runtime::config::InternalTokenProvider;
 use uuid::Uuid;
 
 // Import configuration types from the config gear
@@ -22,6 +23,7 @@ pub struct GearCtx {
     config_provider: Arc<dyn ConfigProvider>,
     client_hub: Arc<crate::client_hub::ClientHub>,
     cancellation_token: CancellationToken,
+    internal_token_provider: Option<InternalTokenProvider>,
     #[cfg(feature = "db")]
     db: Option<DbProvider>,
 }
@@ -36,6 +38,7 @@ pub struct GearContextBuilder {
     config_provider: Arc<dyn ConfigProvider>,
     client_hub: Arc<crate::client_hub::ClientHub>,
     root_token: CancellationToken,
+    internal_token_provider: Option<InternalTokenProvider>,
     #[cfg(feature = "db")]
     db_manager: Option<Arc<DbManager>>, // internal only, never exposed to gears
 }
@@ -52,9 +55,17 @@ impl GearContextBuilder {
             config_provider,
             client_hub,
             root_token,
+            internal_token_provider: None,
             #[cfg(feature = "db")]
             db_manager: None,
         }
+    }
+
+    /// Set the process-wide platform-plane credential source applied to every
+    /// built [`GearCtx`]. See [`GearCtx::internal_token_provider`].
+    pub fn with_internal_token_provider(mut self, provider: Option<InternalTokenProvider>) -> Self {
+        self.internal_token_provider = provider;
+        self
     }
 
     /// Attach a `DbManager` used by [`for_gear`](Self::for_gear) to resolve
@@ -69,6 +80,14 @@ impl GearContextBuilder {
     #[must_use]
     pub fn instance_id(&self) -> Uuid {
         self.instance_id
+    }
+
+    /// The process-wide platform-plane credential source, if any. Used by the
+    /// runtime proxy-wiring phase to thread the credential into
+    /// directory-resolving (`#[toolkit::consumes]`) clients.
+    #[must_use]
+    pub(crate) fn internal_token_provider(&self) -> Option<&InternalTokenProvider> {
+        self.internal_token_provider.as_ref()
     }
 
     /// Build a gear-scoped context, resolving the `DbHandle` for the given
@@ -88,7 +107,8 @@ impl GearContextBuilder {
             self.config_provider.clone(),
             self.client_hub.clone(),
             self.root_token.child_token(),
-        );
+        )
+        .with_internal_token_provider(self.internal_token_provider.clone());
         #[cfg(feature = "db")]
         let ctx = if let Some(mgr) = &self.db_manager
             && let Some(handle) = mgr.get(gear_name).await?
@@ -118,9 +138,43 @@ impl GearCtx {
             config_provider,
             client_hub,
             cancellation_token,
+            internal_token_provider: None,
             #[cfg(feature = "db")]
             db: None,
         }
+    }
+
+    /// Attach the process-wide platform-plane credential source.
+    ///
+    /// **Wiring-only** (`#[doc(hidden)]`): set by [`GearContextBuilder::for_gear`]
+    /// from the bootstrap-selected `InternalCredential`, not part of the public
+    /// gear-facing API. See [`GearCtx::internal_token_provider`] for why the
+    /// credential is kept off the gear API.
+    #[doc(hidden)]
+    pub fn with_internal_token_provider(mut self, provider: Option<InternalTokenProvider>) -> Self {
+        self.internal_token_provider = provider;
+        self
+    }
+
+    /// The process-wide platform-plane credential source, if any.
+    ///
+    /// **Wiring-only.** This is `#[doc(hidden)]` and intended solely for the
+    /// `#[toolkit::provides]`-generated wiring, which moves it onto a generated
+    /// client's [`ClientConfig`](toolkit_contract::runtime::config::ClientConfig)
+    /// so platform-plane methods attach `X-ToolKit-Internal-Token`. It is **not**
+    /// part of the public gear-facing API: the two-plane design injects the
+    /// platform credential *below* the contract layer, and gear/plugin code must
+    /// not read it — `InternalTokenProvider::current()` yields the rotating
+    /// process credential that grants access to every system service, so exposing
+    /// it to arbitrary co-hosted (incl. third-party) gears would let them forge
+    /// platform-plane requests (`cpt-cf-adr-two-plane-auth`).
+    ///
+    /// `None` (Profile 1 / in-process) means platform-plane calls attach no
+    /// credential.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn internal_token_provider(&self) -> Option<InternalTokenProvider> {
+        self.internal_token_provider.clone()
     }
 
     /// Attach the per-gear database entrypoint.
@@ -264,7 +318,7 @@ impl GearCtx {
         let mut cfg: T = self.config()?;
         cfg.expand_vars().map_err(|e| ConfigError::VarExpand {
             gear: self.gear_name.to_string(),
-            source: e,
+            cause: e,
         })?;
         Ok(cfg)
     }
@@ -299,7 +353,7 @@ impl GearCtx {
         let mut cfg: T = self.config_or_default()?;
         cfg.expand_vars().map_err(|e| ConfigError::VarExpand {
             gear: self.gear_name.to_string(),
-            source: e,
+            cause: e,
         })?;
         Ok(cfg)
     }
@@ -333,6 +387,7 @@ impl GearCtx {
             config_provider: self.config_provider.clone(),
             client_hub: self.client_hub.clone(),
             cancellation_token: self.cancellation_token.clone(),
+            internal_token_provider: self.internal_token_provider.clone(),
             #[cfg(feature = "db")]
             db: None,
         }
@@ -444,6 +499,56 @@ mod tests {
 
         let config = result.unwrap();
         assert_eq!(config, TestConfig::default());
+    }
+
+    #[tokio::test]
+    async fn internal_token_provider_flows_from_builder_to_ctx() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The builder's provider must be threaded onto every `GearCtx` it
+        // builds, and `GearCtx::internal_token_provider()` must return the SAME
+        // provider (proven by observing the closure fire on `.current()`).
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_in_closure = Arc::clone(&invoked);
+        let provider = InternalTokenProvider::new(move || {
+            invoked_in_closure.store(true, Ordering::SeqCst);
+            toolkit_contract::runtime::config::CredentialState::NotConfigured
+        });
+
+        let builder = GearContextBuilder::new(
+            Uuid::new_v4(),
+            Arc::new(MockConfigProvider::new()),
+            Arc::new(crate::client_hub::ClientHub::default()),
+            CancellationToken::new(),
+        )
+        .with_internal_token_provider(Some(provider));
+
+        let ctx = builder.for_gear("test_gear").await.unwrap();
+        let threaded = ctx.internal_token_provider();
+        assert!(threaded.is_some(), "provider must be threaded onto GearCtx");
+
+        // Invoking it runs the original closure — confirming identity, not a
+        // freshly-defaulted provider. The configured closure yields no token.
+        assert!(matches!(
+            threaded.unwrap().current(),
+            toolkit_contract::runtime::config::CredentialState::NotConfigured
+        ));
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "the threaded provider must be the one configured on the builder"
+        );
+
+        // A builder without a provider yields a context with none (Profile 1).
+        let bare = GearContextBuilder::new(
+            Uuid::new_v4(),
+            Arc::new(MockConfigProvider::new()),
+            Arc::new(crate::client_hub::ClientHub::default()),
+            CancellationToken::new(),
+        )
+        .for_gear("test_gear")
+        .await
+        .unwrap();
+        assert!(bare.internal_token_provider().is_none());
     }
 
     #[test]

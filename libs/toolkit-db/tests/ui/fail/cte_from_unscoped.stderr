@@ -1,0 +1,11 @@
+error[E0599]: no method named `with_ctes` found for struct `SecureSelect<test_entity::Entity, Unscoped>` in the current scope
+  --> tests/ui/fail/cte_from_unscoped.rs:36:46
+   |
+36 |     let _cte_query = Entity::find().secure().with_ctes();
+   |                                              ^^^^^^^^^
+   |
+help: there is a method `white` with a similar name
+   |
+36 -     let _cte_query = Entity::find().secure().with_ctes();
+36 +     let _cte_query = Entity::find().secure().white();
+   |

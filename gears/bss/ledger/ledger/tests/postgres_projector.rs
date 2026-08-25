@@ -2,7 +2,7 @@
 //! projects normal-side-positive deltas into `account_balance` and
 //! `ar_payer_balance`; a follow-up CR AR beyond the AR balance trips the
 //! no-negative guard (`ProjectError::NegativeBalance`). Ignored by default;
-//! run with `cargo test -p bss-ledger -- --ignored`.
+//! run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -103,7 +103,7 @@ fn line(account: Uuid, class: AccountClass, side: Side, amount: i64, payer: Uuid
 }
 
 async fn balance(raw: &sea_orm::DatabaseConnection, sql: &str) -> Option<i64> {
-    raw.query_one(pg(sql.to_owned()))
+    raw.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|row| row.try_get_by_index::<i64>(0).unwrap())
@@ -117,7 +117,7 @@ async fn ar_invoice_stamps(
     invoice_id: &str,
 ) -> (Option<DateTime<Utc>>, Option<NaiveDate>) {
     let row = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT original_posted_at, due_date FROM bss.ledger_ar_invoice_balance \
              WHERE account_id='{account}' AND invoice_id='{invoice_id}'"
         )))

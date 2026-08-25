@@ -23,8 +23,8 @@
 - *Expected:* backoff grows from initial toward max within the jitter band; after `n` retries the last `Closed(err)` is propagated unchanged.
 - *Done-when:* asserts the backoff schedule (within jitter) and propagation on exhaustion.
 
-**SC-REST-004 — uniform across all three watch types** · L2 · ☐
-- *Intent:* one `RetryPolicy` type drives the combinator for cache, leader, and service-discovery watches — one canonical pattern.
-- *Steps:* construct `RestartingWatch` over `CacheWatch`, `LeaderWatch`, and `ServiceWatch` with the same policy; run SC-REST-001's retryable-close case on each.
+**SC-REST-004 — uniform across both watch types** · L2 · ☐
+- *Intent:* one `RetryPolicy` type drives the combinator for both the cache and leader watches — one canonical pattern.
+- *Steps:* construct `RestartingWatch` over `CacheWatch` and `LeaderWatch` with the same policy; run SC-REST-001's retryable-close case on each.
 - *Expected:* identical reconnect/`Reset` behavior across all three.
 - *Done-when:* asserts the same outcome for each watch type under one policy.

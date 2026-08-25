@@ -1,0 +1,5 @@
+error: conflicting visibility: a method cannot be both `#[exposed]` and `#[internal]`. Pick one, or drop both to inherit the trait's `visibility` default
+  --> tests/ui/fail/rest_conflicting_visibility.rs:19:5
+   |
+19 |     #[internal]
+   |     ^

@@ -74,6 +74,8 @@ This design satisfies the requirements for centralized outbound traffic manageme
 - `cpt-cf-oagw-adr-error-source-distinction` — Response header for gateway vs upstream errors
 - `cpt-cf-oagw-adr-grpc-support` — HTTP/2 multiplexing with protocol detection
 - `cpt-cf-oagw-adr-rust-abi-client-library` — Rust ABI client for internal gear routing
+- `cpt-cf-oagw-adr-oauth2-client-credentials-auth-plugin` — OAuth2 Client Credentials auth plugin with internal token cache
+- `cpt-cf-oagw-adr-required-headers-guard-plugin` — Stateless builtin `GuardPlugin` enforcing required request/response headers, fail-open when unconfigured
 
 ### 1.3 Architecture Layers
 
@@ -264,10 +266,10 @@ One per upstream. Named auth plugins resolved via in-process registries, not sto
 Built-in auth plugins:
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.noop.v1`
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1`
-- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.basic.v1`
-- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.bearer.v1`
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1`
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1`
+
+`basic.v1` and `bearer.v1` are reserved GTS identifiers cataloged in the types-registry with no backing `AuthPlugin` implementation in `AuthPluginRegistry` — using either as `auth.plugin_type` fails with `unknown auth plugin`.
 
 **Guard Plugin** — Base type: `gts.cf.core.oagw.guard_plugin.v1~` — [schemas/guard_plugin.v1.schema.json](./schemas/guard_plugin.v1.schema.json)
 
@@ -275,10 +277,9 @@ Multiple per upstream/route. Can reject requests before they reach upstream.
 
 | Plugin ID | Description |
 |---|---|
-| `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` | Request timeout enforcement |
-| `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.cors.v1` | CORS origin validation (actual requests; preflight handled at handler level — see [ADR: CORS](./ADR/0006-cors.md)) |
+| `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.required_headers.v1` | Required header enforcement (request/response) — see [ADR: Required Headers Guard Plugin](./ADR/0017-required-headers-guard-plugin.md) |
 
-Circuit breaker is **core functionality** (not a plugin). See [ADR: Circuit Breaker](./ADR/0005-circuit-breaker.md).
+`required_headers.v1` is the only guard identifier resolvable via `GuardPluginRegistry` and bindable through `plugins.items[].plugin_ref`. Timeout and CORS are core Data Plane functionality, not `GuardPlugin` trait implementations: request timeout is gear-level configuration, and CORS is configured via the dedicated `cors` field on `Upstream`/`Route` (see [ADR: CORS](./ADR/0006-cors.md)). Their `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` / `...cors.v1` identifiers exist only for types-registry cataloging and cannot be bound via `plugins.items[].plugin_ref`. Circuit breaker is likewise **core functionality** (not a plugin). See [ADR: Circuit Breaker](./ADR/0005-circuit-breaker.md).
 
 **Transform Plugin** — Base type: `gts.cf.core.oagw.transform_plugin.v1~` — [schemas/transform_plugin.v1.schema.json](./schemas/transform_plugin.v1.schema.json)
 
@@ -286,9 +287,9 @@ Multiple per upstream/route, executed in order. Each plugin declares supported p
 
 | Plugin ID | Phase | Description |
 |---|---|---|
-| `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.logging.v1` | request, response, error | Request/response logging |
-| `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.metrics.v1` | request, response | Prometheus metrics |
 | `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.request_id.v1` | request, response | X-Request-ID injection/propagation |
+
+`logging.v1` and `metrics.v1` are core Data Plane instrumentation (`infra/metrics.rs`, `tracing`), not `TransformPlugin` trait implementations. Their GTS identifiers exist for types-registry cataloging only and are not resolvable via `TransformPluginRegistry`.
 
 #### Plugin Identification Model
 
@@ -387,10 +388,15 @@ Execution order: Auth → Guards → Transform(on_request) → Upstream call →
 
 Plugin chain composition: upstream plugins execute before route plugins (`[U1, U2] + [R1, R2] => [U1, U2, R1, R2]`).
 
-**Built-in Plugins**:
-- Auth: `noop`, `apikey`, `basic`, `bearer`, `oauth2_client_cred`, `oauth2_client_cred_basic`
+**Built-in Plugins** (registered and resolvable via their plugin registry):
+- Auth: `noop`, `apikey`, `oauth2_client_cred`, `oauth2_client_cred_basic`
+- Guard: `required_headers`
+- Transform: `request_id`
+
+**Catalog-only identifiers** (reserved GTS ids, not resolvable via a plugin registry — `basic`/`bearer` have no backing implementation; `timeout`/`cors`/`logging`/`metrics` are core Data Plane logic instead):
+- Auth: `basic`, `bearer`
 - Guard: `timeout`, `cors`
-- Transform: `logging`, `metrics`, `request_id`
+- Transform: `logging`, `metrics`
 
 **Custom Plugins**: Starlark scripts with sandboxed execution (no network/file I/O, timeout/memory limits enforced). Immutable after creation; GC for unlinked plugins after configurable TTL.
 
@@ -436,16 +442,15 @@ Alias behavior is determined entirely by endpoint type. The system enforces stri
 
 **Hostname Validation**: Endpoint hostnames are validated per RFC 1123: max 253 characters total, each label 1–63 characters, labels contain only ASCII alphanumeric and hyphen, labels cannot start or end with hyphen. A trailing dot (FQDN notation) is tolerated and stripped.
 
-**Alias Update Behavior**:
+**Alias Update Behavior**: The alias is **immutable once set** — it is the routing key in `/v1/proxy/{alias}/...`, so any endpoint change that would alter the derived alias is rejected (400 Validation); the operator must delete and re-create the upstream instead.
 
-| Transition | Behavior |
-|---|---|
-| Derivable → Derivable (new endpoints) | Alias recomputed from new endpoints |
-| Derivable → Non-derivable | **Rejected** unless user provides explicit alias |
-| Non-derivable → Non-derivable | Existing alias retained; user may provide a new one |
-| Non-derivable → Derivable | Alias recomputed (old explicit alias replaced) |
-| Derivable (no endpoint change) | Alias override **rejected** (400 Validation) |
-| Non-derivable (no endpoint change) | User may update alias freely |
+| Transition | Alias unchanged | Alias would change |
+|---|---|---|
+| Derivable → Derivable (endpoints change) | Allowed — recomputed alias equals existing | **Rejected** — delete and re-create |
+| Derivable → Non-derivable (hostname → IP) | — | **Rejected** always, even when an explicit alias is provided |
+| Non-derivable → Non-derivable (IP → IP) | Existing alias retained | **Rejected** — a differing user-provided alias is not accepted |
+| Non-derivable → Derivable (IP → hostname) | Allowed — derived alias equals existing | **Rejected** — delete and re-create |
+| No endpoint change (derivable or non-derivable) | Exact-match alias tolerated (no-op) | **Rejected** — alias override not allowed |
 
 "Derivable" means `compute_derived_alias()` returns a value (single hostname, or multiple hostnames with a registrable common suffix). "Non-derivable" means derivation fails — this includes IP-based endpoints, heterogeneous hostnames with no common suffix, and hostname pools whose only common suffix is a bare public suffix (e.g., `co.uk`). See `enforce_alias_update_with()` / `enforce_alias_update_derived()` for the full branching logic.
 

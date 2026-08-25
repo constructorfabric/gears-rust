@@ -1,0 +1,9 @@
+error: rest_contract: query parameter `count` on method `ticks` is a bare scalar. A query string deserializes as a map at the top level, so this route would reject every request with 400. Wrap it in a struct:
+
+           #[derive(serde::Serialize, serde::Deserialize, toolkit_contract::QueryParams)]
+           pub struct TicksQuery { pub count: u64 }
+
+  --> tests/ui/fail/rest_scalar_query_param.rs:18:50
+   |
+18 |     async fn ticks(&self, ctx: &SecurityContext, count: u64) -> Result<u32, std::io::Error>;
+   |                                                  ^^^^^

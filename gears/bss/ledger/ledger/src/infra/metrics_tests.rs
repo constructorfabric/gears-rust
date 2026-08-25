@@ -317,3 +317,37 @@ fn reconciliation_slice7_metrics_are_observable() {
         4
     );
 }
+
+#[test]
+fn fx_rate_sync_heartbeat_is_observable_and_unlabelled() {
+    let h = MetricsHarness::new();
+    let m = h.metrics();
+    // The job-liveness heartbeat: one increment per scheduler tick started. It is
+    // the only signal that catches a stalled ticker — no fetch is attempted, so no
+    // fetch error is produced and FX_SNAPSHOT_MISSING never fires. An alert reads
+    // it as "no increase over 3 x fx.rate_sync_tick_secs", which only works if the
+    // series exists and carries no attributes to split it.
+    m.fx_rate_sync_ticked();
+    m.fx_rate_sync_ticked();
+    m.fx_rate_sync_ticked();
+    h.force_flush();
+    assert_eq!(h.counter_value("ledger_fx_rate_sync_ticks_total", &[]), 3);
+}
+
+#[test]
+fn fx_rate_sync_duration_is_observable_and_unlabelled() {
+    let h = MetricsHarness::new();
+    let m = h.metrics();
+    // The whole-pass latency: the only series that can be compared against
+    // `fx.rate_sync_tick_secs`, since the adapter's per-source histogram times one
+    // HTTP round-trip while the composite tries its sources one after another.
+    // Unlabelled for the same reason as the heartbeat it pairs with — the pass
+    // spans discovery, so it belongs to no single provider.
+    m.fx_rate_sync_duration(0.4);
+    m.fx_rate_sync_duration(2.5);
+    h.force_flush();
+    assert_eq!(
+        h.histogram_count("ledger_fx_rate_sync_duration_seconds", &[]),
+        2
+    );
+}

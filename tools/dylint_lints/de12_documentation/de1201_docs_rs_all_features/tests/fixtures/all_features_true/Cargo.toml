@@ -1,7 +1,0 @@
-[package]
-name = "de1201_all_features_true"
-version = "0.1.0"
-edition = "2024"
-metadata.docs.rs.all-features = true
-
-[workspace]

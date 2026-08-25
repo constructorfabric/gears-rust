@@ -12,7 +12,7 @@
 //!   * `reidentify` without a reason is rejected `MISSING_INVESTIGATION_REASON`,
 //!     writing NO record.
 //!
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -49,19 +49,19 @@ fn pg(sql: impl Into<String>) -> Statement {
 
 /// Hex string of a single-column, single-row SELECT, `None` when absent/NULL.
 async fn scalar_hex(conn: &DatabaseConnection, sql: &str) -> Option<String> {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.and_then(|r| r.try_get_by_index::<Option<String>>(0).unwrap())
 }
 
 /// Count rows matching a bss-qualified predicate.
 async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.map_or(0, |r| r.try_get_by_index::<i64>(0).unwrap())
 }
 
 /// Read a boolean scalar (`erased`), `None` when absent.
 async fn scalar_bool(conn: &DatabaseConnection, sql: &str) -> Option<bool> {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.map(|r| r.try_get_by_index::<bool>(0).unwrap())
 }
 
@@ -108,7 +108,7 @@ async fn setup(
         .await
         .unwrap();
 
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{legal_entity}','{period_id}','UTC','OPEN')"
     )))
@@ -287,7 +287,7 @@ async fn erase_tombstones_and_leaves_journal_unchanged_then_reidentify() {
     .expect("entry row_hash before");
 
     // Seed the payer_pii_map row (raw insert — the upsert path is unit-covered).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.payer_pii_map (tenant_id, payer_tenant_id, pii_ref, erased) \
          VALUES ('{}','{payer}','{pii_ref}', false)",
         f.tenant
@@ -538,7 +538,7 @@ async fn erase_is_idempotent_and_unmapped_noleak_and_reidentify_404() {
     // (1) Idempotency: a mapped payer erased TWICE — both succeed and the
     //     tombstone stays set (a repeat erase is not an error).
     let mapped = Uuid::now_v7();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.payer_pii_map (tenant_id, payer_tenant_id, pii_ref, erased) \
          VALUES ('{}','{mapped}','pii://m', false)",
         f.tenant

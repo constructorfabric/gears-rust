@@ -13,6 +13,9 @@ mod builder_tests;
 #[cfg(test)]
 mod commit_tests;
 #[cfg(test)]
+#[cfg(feature = "test-util")]
+mod dispatcher_test_util;
+#[cfg(test)]
 mod dispatcher_tests;
 #[cfg(test)]
 #[cfg(feature = "db")]

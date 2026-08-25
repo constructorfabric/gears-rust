@@ -143,6 +143,31 @@ pub struct ParamSpec {
     pub required: bool,
     pub description: Option<String>,
     pub param_type: String, // JSON Schema type (string, integer, etc.)
+    /// Whether the parameter repeats. When set, `param_type` describes the
+    /// *item* type and the parameter renders as `type: array` with
+    /// `style: form, explode: true` — i.e. `?tag=a&tag=b`, which is how the
+    /// generated REST client encodes a `Vec<T>` query field.
+    pub array: bool,
+}
+
+impl ParamSpec {
+    /// A single-valued parameter of `param_type`.
+    fn scalar(
+        name: String,
+        location: ParamLocation,
+        required: bool,
+        description: Option<String>,
+        param_type: String,
+    ) -> Self {
+        Self {
+            name,
+            location,
+            required,
+            description,
+            param_type,
+            array: false,
+        }
+    }
 }
 
 pub trait LicenseFeature: AsRef<str> {}
@@ -182,14 +207,53 @@ pub struct RequestBodySpec {
     pub required: bool,
 }
 
+/// Response body schema variants.
+///
+/// Mirrors [`RequestBodySchema`]. `Array` exists because utoipa's default
+/// `ToSchema::name()` strips generic arguments, so `Vec<A>` and `Vec<B>` both
+/// resolve to the component name `Vec` and clobber each other in
+/// `components.schemas`. A top-level array is therefore emitted **inline** —
+/// `{type: array, items: {$ref: T}}` — registering only the item type as a
+/// named component. That is both the `OpenAPI` norm and what utoipa's own
+/// `#[utoipa::path]` produces for a `Vec<T>` body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResponseSchema {
+    /// Reference to a component schema in `#/components/schemas/{schema_name}`
+    Ref { schema_name: String },
+    /// Inline array whose items `$ref` the named item component.
+    Array { items_schema_name: String },
+}
+
+impl ResponseSchema {
+    /// The component name this response ultimately references: the type itself
+    /// for [`Self::Ref`], the item type for [`Self::Array`].
+    #[must_use]
+    pub fn schema_name(&self) -> &str {
+        match self {
+            Self::Ref { schema_name } => schema_name,
+            Self::Array { items_schema_name } => items_schema_name,
+        }
+    }
+}
+
 /// Response specification for API operations
 #[derive(Clone, Debug)]
 pub struct ResponseSpec {
     pub status: u16,
     pub content_type: &'static str,
     pub description: String,
-    /// Name of a registered component schema (if any).
-    pub schema_name: Option<String>,
+    /// Schema of the response body (if any).
+    pub schema: Option<ResponseSchema>,
+}
+
+impl ResponseSpec {
+    /// Name of the component schema this response references, if any.
+    ///
+    /// For an array response this is the **item** component, not the array.
+    #[must_use]
+    pub fn schema_name(&self) -> Option<&str> {
+        self.schema.as_ref().map(ResponseSchema::schema_name)
+    }
 }
 
 /// License requirement specification for an operation
@@ -212,11 +276,18 @@ pub struct OperationSpec {
     pub responses: Vec<ResponseSpec>,
     /// Internal handler id; can be used by registry/generator to map a handler identity
     pub handler_id: String,
-    /// Whether this operation requires authentication.
-    /// `true` = authenticated endpoint, `false` = public endpoint.
+    /// Auth axis: whether this operation requires a validated tenant JWT.
+    /// `true` = authenticated (bearer required); `false` = anonymous (a missing
+    /// bearer is allowed — a present bearer is still always re-validated).
+    /// Independent of [`exposed`](Self::exposed); maps 1:1 to the
+    /// `AnonymousRoute` marker in the `OoP` per-gear middleware (`!authenticated`).
     pub authenticated: bool,
-    /// Explicitly mark route as public (no auth required)
-    pub is_public: bool,
+    /// Visibility axis: whether this route is registered in the gateway for
+    /// external access (`true`) or is internal-only, reachable only via
+    /// inter-gear communication (`false`). Defaults to `false` (internal).
+    /// Independent of [`authenticated`](Self::authenticated) — an exposed route
+    /// may still require a JWT.
+    pub exposed: bool,
     /// Optional rate & concurrency limits for this operation
     pub rate_limit: Option<RateLimitSpec>,
     /// Optional whitelist of allowed request Content-Type values (without parameters).
@@ -325,25 +396,25 @@ where
             _ = write!(description, "\n- {}: {}", name, ops.join("|"));
             filter.allowed_fields.insert(name.clone(), ops);
         }
-        self.spec.params.push(ParamSpec {
-            name: "$filter".to_owned(),
-            location: ParamLocation::Query,
-            required: false,
-            description: Some(description),
-            param_type: "string".to_owned(),
-        });
+        self.spec.params.push(ParamSpec::scalar(
+            "$filter".to_owned(),
+            ParamLocation::Query,
+            false,
+            Some(description),
+            "string".to_owned(),
+        ));
         self.spec.vendor_extensions.x_odata_filter = Some(filter);
         self
     }
 
     fn with_odata_select(mut self) -> Self {
-        self.spec.params.push(ParamSpec {
-            name: "$select".to_owned(),
-            location: ParamLocation::Query,
-            required: false,
-            description: Some("OData v4 select expression".to_owned()),
-            param_type: "string".to_owned(),
-        });
+        self.spec.params.push(ParamSpec::scalar(
+            "$select".to_owned(),
+            ParamLocation::Query,
+            false,
+            Some("OData v4 select expression".to_owned()),
+            "string".to_owned(),
+        ));
         self
     }
 
@@ -373,13 +444,13 @@ where
                 order_by.allowed_fields.push(desc);
             }
         }
-        self.spec.params.push(ParamSpec {
-            name: "$orderby".to_owned(),
-            location: ParamLocation::Query,
-            required: false,
-            description: Some(description),
-            param_type: "string".to_owned(),
-        });
+        self.spec.params.push(ParamSpec::scalar(
+            "$orderby".to_owned(),
+            ParamLocation::Query,
+            false,
+            Some(description),
+            "string".to_owned(),
+        ));
         self.spec.vendor_extensions.x_odata_orderby = Some(order_by);
         self
     }
@@ -439,7 +510,7 @@ impl<S> OperationBuilder<Missing, Missing, S, AuthNotSet> {
                 responses: Vec::new(),
                 handler_id,
                 authenticated: false,
-                is_public: false,
+                exposed: false,
                 rate_limit: None,
                 allowed_request_content_types: None,
                 vendor_extensions: VendorExtensions::default(),
@@ -542,13 +613,13 @@ where
 
     /// Add a path parameter with type inference (defaults to string)
     pub fn path_param(mut self, name: impl Into<String>, description: impl Into<String>) -> Self {
-        self.spec.params.push(ParamSpec {
-            name: name.into(),
-            location: ParamLocation::Path,
-            required: true,
-            description: Some(description.into()),
-            param_type: "string".to_owned(),
-        });
+        self.spec.params.push(ParamSpec::scalar(
+            name.into(),
+            ParamLocation::Path,
+            true,
+            Some(description.into()),
+            "string".to_owned(),
+        ));
         self
     }
 
@@ -559,13 +630,13 @@ where
         required: bool,
         description: impl Into<String>,
     ) -> Self {
-        self.spec.params.push(ParamSpec {
-            name: name.into(),
-            location: ParamLocation::Query,
+        self.spec.params.push(ParamSpec::scalar(
+            name.into(),
+            ParamLocation::Query,
             required,
-            description: Some(description.into()),
-            param_type: "string".to_owned(),
-        });
+            Some(description.into()),
+            "string".to_owned(),
+        ));
         self
     }
 
@@ -577,12 +648,56 @@ where
         description: impl Into<String>,
         param_type: impl Into<String>,
     ) -> Self {
+        self.spec.params.push(ParamSpec::scalar(
+            name.into(),
+            ParamLocation::Query,
+            required,
+            Some(description.into()),
+            param_type.into(),
+        ));
+        self
+    }
+
+    /// Register every query parameter declared by a
+    /// `#[derive(toolkit_contract::QueryParams)]` struct.
+    ///
+    /// The generated REST routes use this so the spec and the wire format come
+    /// from one declaration. Fields render as scalars or, for `Vec` fields, as
+    /// `style: form, explode: true` arrays.
+    pub fn query_params_from<T: toolkit_contract::query::QueryParams>(mut self) -> Self {
+        for p in T::openapi_params() {
+            self.spec.params.push(ParamSpec {
+                name: p.name.to_owned(),
+                location: ParamLocation::Query,
+                required: p.required,
+                description: None,
+                param_type: p.openapi_type.to_owned(),
+                array: p.array,
+            });
+        }
+        self
+    }
+
+    /// Add a repeating query parameter — `?tag=a&tag=b`.
+    ///
+    /// `item_type` is the `OpenAPI` type of one element; the parameter renders
+    /// as an array with `style: form, explode: true`, which is the encoding the
+    /// generated REST client and its server extractor agree on for a `Vec<T>`
+    /// field.
+    pub fn query_param_array(
+        mut self,
+        name: impl Into<String>,
+        required: bool,
+        description: impl Into<String>,
+        item_type: impl Into<String>,
+    ) -> Self {
         self.spec.params.push(ParamSpec {
             name: name.into(),
             location: ParamLocation::Query,
             required,
             description: Some(description.into()),
-            param_type: param_type.into(),
+            param_type: item_type.into(),
+            array: true,
         });
         self
     }
@@ -694,7 +809,7 @@ where
     ///     .operation_id("upload_file")
     ///     .summary("Upload a file")
     ///     .multipart_file_request("file", Some("File to upload"))
-    ///     .public()
+    ///     .anonymous()
     ///     .handler(upload_handler)
     ///     .json_response(StatusCode::OK, "Upload successful")
     ///     .register(router, &registry);
@@ -755,7 +870,7 @@ where
     ///     .operation_id("upload_file")
     ///     .summary("Upload a file")
     ///     .octet_stream_request(Some("Raw file bytes to parse"))
-    ///     .public()
+    ///     .anonymous()
     ///     .handler(upload_handler)
     ///     .json_response(StatusCode::OK, "Upload successful")
     ///     .register(router, &registry);
@@ -798,7 +913,7 @@ where
     /// let router = OperationBuilder::post("/files/v1/upload")
     ///     .operation_id("upload_file")
     ///     .allow_content_types(&["multipart/form-data", "application/pdf"])
-    ///     .public()
+    ///     .anonymous()
     ///     .handler(upload_handler)
     ///     .json_response(StatusCode::OK, "Upload successful")
     ///     .register(router, &registry);
@@ -806,6 +921,18 @@ where
     /// ```
     pub fn allow_content_types(mut self, types: &[&'static str]) -> Self {
         self.spec.allowed_request_content_types = Some(types.to_vec());
+        self
+    }
+
+    /// Mark this route as **publicly visible** — registered in the gateway for
+    /// external access (the *visibility* axis).
+    ///
+    /// This is independent of authentication (`.authenticated()` /
+    /// `.anonymous()`): an exposed route may still require a JWT. Routes are
+    /// **internal by default** (not registered in the gateway). Available at any
+    /// stage of the builder.
+    pub fn exposed(mut self) -> Self {
+        self.spec.exposed = true;
         self
     }
 }
@@ -891,7 +1018,9 @@ where
     ///
     /// # Example
     /// ```rust
-    /// # use toolkit::api::operation_builder::{OperationBuilder, LicenseFeature};
+    /// # use toolkit::api::operation_builder::{
+    /// #     OperationBuilder, LicenseFeature, CORE_GLOBAL_BASE_LICENSE_FEATURE,
+    /// # };
     /// # use axum::{extract::Json, Router };
     /// # use serde::{Serialize};
     /// #
@@ -932,7 +1061,6 @@ where
     /// ```
     pub fn authenticated(mut self) -> OperationBuilder<H, R, S, AuthSet, L> {
         self.spec.authenticated = true;
-        self.spec.is_public = false;
         OperationBuilder {
             spec: self.spec,
             method_router: self.method_router,
@@ -944,9 +1072,14 @@ where
         }
     }
 
-    /// Mark this route as public (no authentication required).
+    /// Mark this route as **anonymous** — no authentication required (the *auth*
+    /// axis).
     ///
-    /// This explicitly opts out of the `require_auth_by_default` setting.
+    /// A missing `Authorization: Bearer` header is allowed; a present bearer is
+    /// still always re-validated. This explicitly opts out of the
+    /// `require_auth_by_default` setting and maps to the `AnonymousRoute` marker
+    /// in the `OoP` per-gear middleware. It is independent of visibility — use
+    /// [`exposed`](Self::exposed) to also register the route in the gateway.
     /// This method transitions from `AuthNotSet` to `AuthSet` state.
     ///
     /// # Example
@@ -961,14 +1094,13 @@ where
     /// # let registry = OpenApiRegistryImpl::new();
     /// # let router: Router<()> = Router::new();
     /// let router = OperationBuilder::get("/users-info/v1/health")
-    ///     .public()
+    ///     .anonymous()
     ///     .handler(health_check)
     ///     .json_response(StatusCode::OK, "OK")
     ///     .register(router, &registry);
     /// # let _ = router;
     /// ```
-    pub fn public(mut self) -> OperationBuilder<H, R, S, AuthSet, LicenseSet> {
-        self.spec.is_public = true;
+    pub fn anonymous(mut self) -> OperationBuilder<H, R, S, AuthSet, LicenseSet> {
         self.spec.authenticated = false;
         OperationBuilder {
             spec: self.spec,
@@ -979,6 +1111,24 @@ where
             _auth_state: PhantomData,
             _license_state: PhantomData,
         }
+    }
+
+    /// Deprecated alias for the old single-axis `.public()`.
+    ///
+    /// The old `.public()` meant both **anonymous** (no auth) *and* **edge
+    /// visible**. Those are now separate axes: [`anonymous`](Self::anonymous)
+    /// (auth) and [`exposed`](Self::exposed) (visibility). This shim maps to
+    /// `.anonymous().exposed()` so out-of-tree gears keep compiling for one
+    /// release; a bare `.anonymous()` (the naive mechanical replacement) would
+    /// silently drop the route from the edge, which this warning surfaces at
+    /// compile time instead.
+    #[deprecated(
+        since = "0.6.21",
+        note = "`.public()` split into two axes; use `.anonymous().exposed()` \
+                (this alias forwards to exactly that)"
+    )]
+    pub fn public(self) -> OperationBuilder<H, R, S, AuthSet, LicenseSet> {
+        self.anonymous().exposed()
     }
 }
 
@@ -1067,7 +1217,7 @@ where
             status: status.as_u16(),
             content_type: "application/json",
             description: description.into(),
-            schema_name: None,
+            schema: None,
         });
         OperationBuilder {
             spec: self.spec,
@@ -1096,7 +1246,7 @@ where
             status: status.as_u16(),
             content_type: "",
             description: description.into(),
-            schema_name: None,
+            schema: None,
         });
         OperationBuilder {
             spec: self.spec,
@@ -1124,7 +1274,45 @@ where
             status: status.as_u16(),
             content_type: "application/json",
             description: description.into(),
-            schema_name: Some(name),
+            schema: Some(ResponseSchema::Ref { schema_name: name }),
+        });
+        OperationBuilder {
+            spec: self.spec,
+            method_router: self.method_router,
+            _has_handler: self._has_handler,
+            _has_response: PhantomData::<Present>,
+            _state: self._state,
+            _auth_state: self._auth_state,
+            _license_state: self._license_state,
+        }
+    }
+
+    /// Add a JSON response whose body is a **top-level array** of `T`
+    /// (transitions from Missing to Present).
+    ///
+    /// `T` is the *item* type — pass `GearDto`, not `Vec<GearDto>`. Registers
+    /// `T` as a named component and emits an inline
+    /// `{type: array, items: {$ref: T}}` schema for the response body.
+    ///
+    /// Never pass `Vec<T>` to [`Self::json_response_with_schema`]: utoipa's
+    /// default `ToSchema::name()` strips generic arguments, so every `Vec<_>`
+    /// registers under the single component name `Vec` and two such responses
+    /// collide fatally in `OpenApiRegistryImpl::ensure_schema_raw`.
+    pub fn json_array_response_with_schema<T>(
+        mut self,
+        registry: &dyn OpenApiRegistry,
+        status: http::StatusCode,
+        description: impl Into<String>,
+    ) -> OperationBuilder<H, Present, S, A, L>
+    where
+        T: utoipa::ToSchema + utoipa::PartialSchema + api_dto::ResponseApiDto + 'static,
+    {
+        let items_schema_name = ensure_schema::<T>(registry);
+        self.spec.responses.push(ResponseSpec {
+            status: status.as_u16(),
+            content_type: "application/json",
+            description: description.into(),
+            schema: Some(ResponseSchema::Array { items_schema_name }),
         });
         OperationBuilder {
             spec: self.spec,
@@ -1159,7 +1347,7 @@ where
             status: status.as_u16(),
             content_type,
             description: description.into(),
-            schema_name: None,
+            schema: None,
         });
         OperationBuilder {
             spec: self.spec,
@@ -1182,7 +1370,7 @@ where
             status: status.as_u16(),
             content_type: "text/html",
             description: description.into(),
-            schema_name: None,
+            schema: None,
         });
         OperationBuilder {
             spec: self.spec,
@@ -1208,7 +1396,9 @@ where
             status: status.as_u16(),
             content_type: problem::APPLICATION_PROBLEM_JSON,
             description: description.into(),
-            schema_name: Some(problem_name),
+            schema: Some(ResponseSchema::Ref {
+                schema_name: problem_name,
+            }),
         });
         OperationBuilder {
             spec: self.spec,
@@ -1235,7 +1425,7 @@ where
             status: http::StatusCode::OK.as_u16(),
             content_type: "text/event-stream",
             description: description.into(),
-            schema_name: Some(name),
+            schema: Some(ResponseSchema::Ref { schema_name: name }),
         });
         OperationBuilder {
             spec: self.spec,
@@ -1268,7 +1458,7 @@ where
             status: status.as_u16(),
             content_type: "application/json",
             description: description.into(),
-            schema_name: None,
+            schema: None,
         });
         self
     }
@@ -1283,7 +1473,7 @@ where
             status: status.as_u16(),
             content_type: "",
             description: description.into(),
-            schema_name: None,
+            schema: None,
         });
         self
     }
@@ -1303,7 +1493,31 @@ where
             status: status.as_u16(),
             content_type: "application/json",
             description: description.into(),
-            schema_name: Some(name),
+            schema: Some(ResponseSchema::Ref { schema_name: name }),
+        });
+        self
+    }
+
+    /// Add a JSON response whose body is a **top-level array** of `T` (additional).
+    ///
+    /// `T` is the *item* type — pass `GearDto`, not `Vec<GearDto>`. See
+    /// [`OperationBuilder::json_array_response_with_schema`] on the
+    /// `Missing`-response builder for why arrays are emitted inline.
+    pub fn json_array_response_with_schema<T>(
+        mut self,
+        registry: &dyn OpenApiRegistry,
+        status: http::StatusCode,
+        description: impl Into<String>,
+    ) -> Self
+    where
+        T: utoipa::ToSchema + utoipa::PartialSchema + api_dto::ResponseApiDto + 'static,
+    {
+        let items_schema_name = ensure_schema::<T>(registry);
+        self.spec.responses.push(ResponseSpec {
+            status: status.as_u16(),
+            content_type: "application/json",
+            description: description.into(),
+            schema: Some(ResponseSchema::Array { items_schema_name }),
         });
         self
     }
@@ -1330,7 +1544,7 @@ where
             status: status.as_u16(),
             content_type,
             description: description.into(),
-            schema_name: None,
+            schema: None,
         });
         self
     }
@@ -1345,7 +1559,7 @@ where
             status: status.as_u16(),
             content_type: "text/html",
             description: description.into(),
-            schema_name: None,
+            schema: None,
         });
         self
     }
@@ -1363,7 +1577,9 @@ where
             status: status.as_u16(),
             content_type: problem::APPLICATION_PROBLEM_JSON,
             description: description.into(),
-            schema_name: Some(problem_name),
+            schema: Some(ResponseSchema::Ref {
+                schema_name: problem_name,
+            }),
         });
         self
     }
@@ -1382,7 +1598,7 @@ where
             status: http::StatusCode::OK.as_u16(),
             content_type: "text/event-stream",
             description: description.into(),
-            schema_name: Some(name),
+            schema: Some(ResponseSchema::Ref { schema_name: name }),
         });
         self
     }
@@ -1406,7 +1622,7 @@ where
     /// # let registry = OpenApiRegistryImpl::new();
     /// # let router: Router<()> = Router::new();
     /// let op = OperationBuilder::get("/user-info/v1/users")
-    ///     .public()
+    ///     .anonymous()
     ///     .handler(list_users)
     ///     .json_response(StatusCode::OK, "List of users")
     ///     .standard_errors(&registry);
@@ -1421,13 +1637,16 @@ where
     /// - 403 Forbidden
     /// - 404 Not Found
     /// - 409 Conflict
-    /// - 422 Unprocessable Entity
     /// - 429 Too Many Requests
     /// - 500 Internal Server Error
     ///
-    /// 422 is intentionally absent: canonical `InvalidArgument` maps to 400
-    /// per `docs/arch/errors/DESIGN.md` §1.2, so no canonical-handler path
-    /// produces a 422 response.
+    /// 413/415/422 are intentionally absent here: canonical `InvalidArgument`
+    /// maps to 400 per `docs/arch/errors/DESIGN.md` §1.2, so no
+    /// canonical-handler path alone produces those statuses. An operation
+    /// whose handler takes `toolkit::api::rest::extract::Json<T>` can produce
+    /// all three (oversized body, wrong `Content-Type`, schema violation) -
+    /// add [`Self::error_413`]/[`Self::error_415`]/[`Self::error_422`]
+    /// individually for such an operation.
     pub fn standard_errors(mut self, registry: &dyn OpenApiRegistry) -> Self {
         use http::StatusCode;
         // Canonical Problem schema (RFC 9457 + GTS-typed). Component name "Problem".
@@ -1448,7 +1667,9 @@ where
                 status: status.as_u16(),
                 content_type: problem::APPLICATION_PROBLEM_JSON,
                 description: description.to_owned(),
-                schema_name: Some(problem_name.clone()),
+                schema: Some(ResponseSchema::Ref {
+                    schema_name: problem_name.clone(),
+                }),
             });
         }
 
@@ -1482,7 +1703,7 @@ where
     /// # let registry = OpenApiRegistryImpl::new();
     /// # let router: Router<()> = Router::new();
     /// let op = OperationBuilder::post("/users-info/v1/users")
-    ///     .public()
+    ///     .anonymous()
     ///     .handler(create_user)
     ///     .json_request::<CreateUserRequest>(&registry, "User data")
     ///     .json_response(StatusCode::CREATED, "User created")
@@ -1498,7 +1719,9 @@ where
             status: http::StatusCode::BAD_REQUEST.as_u16(),
             content_type: problem::APPLICATION_PROBLEM_JSON,
             description: "Validation Error".to_owned(),
-            schema_name: Some(problem_name),
+            schema: Some(ResponseSchema::Ref {
+                schema_name: problem_name,
+            }),
         });
 
         self
@@ -1537,6 +1760,20 @@ where
     /// This is a convenience wrapper around `problem_response`.
     pub fn error_409(self, registry: &dyn OpenApiRegistry) -> Self {
         self.problem_response(registry, http::StatusCode::CONFLICT, "Conflict")
+    }
+
+    /// Add a 413 Payload Too Large error response.
+    ///
+    /// This is a convenience wrapper around `problem_response`. Relevant to
+    /// any operation whose handler takes
+    /// [`toolkit::api::rest::extract::Json<T>`](crate::api::rest::extract::Json)
+    /// as a parameter - an oversized request body produces this status.
+    pub fn error_413(self, registry: &dyn OpenApiRegistry) -> Self {
+        self.problem_response(
+            registry,
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+            "Payload Too Large",
+        )
     }
 
     /// Add a 415 Unsupported Media Type error response.
@@ -1643,581 +1880,5 @@ where
 // -------------------------------------------------------------------------------------------------
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-mod tests {
-    use super::*;
-    use axum::Json;
-
-    // Mock registry for testing: stores operations; records schema names
-    struct MockRegistry {
-        operations: std::sync::Mutex<Vec<OperationSpec>>,
-        schemas: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl MockRegistry {
-        fn new() -> Self {
-            Self {
-                operations: std::sync::Mutex::new(Vec::new()),
-                schemas: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    enum TestLicenseFeatures {
-        FeatureA,
-        FeatureB,
-    }
-    impl AsRef<str> for TestLicenseFeatures {
-        fn as_ref(&self) -> &str {
-            match self {
-                TestLicenseFeatures::FeatureA => "feature_a",
-                TestLicenseFeatures::FeatureB => "feature_b",
-            }
-        }
-    }
-    impl LicenseFeature for TestLicenseFeatures {}
-
-    impl OpenApiRegistry for MockRegistry {
-        fn register_operation(&self, spec: &OperationSpec) {
-            if let Ok(mut ops) = self.operations.lock() {
-                ops.push(spec.clone());
-            }
-        }
-
-        fn ensure_schema_raw(
-            &self,
-            name: &str,
-            _schemas: Vec<(
-                String,
-                utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
-            )>,
-        ) -> String {
-            let name = name.to_owned();
-            if let Ok(mut s) = self.schemas.lock() {
-                s.push(name.clone());
-            }
-            name
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
-    async fn test_handler() -> Json<serde_json::Value> {
-        Json(serde_json::json!({"status": "ok"}))
-    }
-
-    #[toolkit_macros::api_dto(request)]
-    struct SampleDtoRequest;
-
-    #[toolkit_macros::api_dto(response)]
-    struct SampleDtoResponse;
-
-    #[test]
-    fn builder_descriptive_methods() {
-        let builder = OperationBuilder::<Missing, Missing, (), AuthNotSet>::get("/tests/v1/test")
-            .operation_id("test.get")
-            .summary("Test endpoint")
-            .description("A test endpoint for validation")
-            .tag("test")
-            .path_param("id", "Test ID");
-
-        assert_eq!(builder.spec.method, Method::GET);
-        assert_eq!(builder.spec.path, "/tests/v1/test");
-        assert_eq!(builder.spec.operation_id, Some("test.get".to_owned()));
-        assert_eq!(builder.spec.summary, Some("Test endpoint".to_owned()));
-        assert_eq!(
-            builder.spec.description,
-            Some("A test endpoint for validation".to_owned())
-        );
-        assert_eq!(builder.spec.tags, vec!["test"]);
-        assert_eq!(builder.spec.params.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn builder_with_request_response_and_handler() {
-        let registry = MockRegistry::new();
-        let router = Router::new();
-
-        let _router = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/test")
-            .summary("Test endpoint")
-            .json_request::<SampleDtoRequest>(&registry, "optional body") // registers schema
-            .public()
-            .handler(test_handler)
-            .json_response_with_schema::<SampleDtoResponse>(
-                &registry,
-                http::StatusCode::OK,
-                "Success response",
-            ) // registers schema
-            .register(router, &registry);
-
-        // Verify that the operation was registered
-        let ops = registry.operations.lock().unwrap();
-        assert_eq!(ops.len(), 1);
-        let op = &ops[0];
-        assert_eq!(op.method, Method::POST);
-        assert_eq!(op.path, "/tests/v1/test");
-        assert!(op.request_body.is_some());
-        assert!(op.request_body.as_ref().unwrap().required);
-        assert_eq!(op.responses.len(), 1);
-        assert_eq!(op.responses[0].status, 200);
-
-        // Verify schemas recorded
-        let schemas = registry.schemas.lock().unwrap();
-        assert!(!schemas.is_empty());
-    }
-
-    #[test]
-    fn convenience_constructors() {
-        let get_builder =
-            OperationBuilder::<Missing, Missing, (), AuthNotSet>::get("/tests/v1/get");
-        assert_eq!(get_builder.spec.method, Method::GET);
-        assert_eq!(get_builder.spec.path, "/tests/v1/get");
-
-        let post_builder =
-            OperationBuilder::<Missing, Missing, (), AuthNotSet>::post("/tests/v1/post");
-        assert_eq!(post_builder.spec.method, Method::POST);
-        assert_eq!(post_builder.spec.path, "/tests/v1/post");
-
-        let put_builder =
-            OperationBuilder::<Missing, Missing, (), AuthNotSet>::put("/tests/v1/put");
-        assert_eq!(put_builder.spec.method, Method::PUT);
-        assert_eq!(put_builder.spec.path, "/tests/v1/put");
-
-        let delete_builder =
-            OperationBuilder::<Missing, Missing, (), AuthNotSet>::delete("/tests/v1/delete");
-        assert_eq!(delete_builder.spec.method, Method::DELETE);
-        assert_eq!(delete_builder.spec.path, "/tests/v1/delete");
-
-        let patch_builder =
-            OperationBuilder::<Missing, Missing, (), AuthNotSet>::patch("/tests/v1/patch");
-        assert_eq!(patch_builder.spec.method, Method::PATCH);
-        assert_eq!(patch_builder.spec.path, "/tests/v1/patch");
-    }
-
-    #[test]
-    fn normalize_to_axum_path_should_normalize() {
-        // Axum 0.8+ uses {param} syntax, same as OpenAPI
-        assert_eq!(
-            normalize_to_axum_path("/tests/v1/users/{id}"),
-            "/tests/v1/users/{id}"
-        );
-        assert_eq!(
-            normalize_to_axum_path("/tests/v1/projects/{project_id}/items/{item_id}"),
-            "/tests/v1/projects/{project_id}/items/{item_id}"
-        );
-        assert_eq!(
-            normalize_to_axum_path("/tests/v1/simple"),
-            "/tests/v1/simple"
-        );
-        assert_eq!(
-            normalize_to_axum_path("/tests/v1/users/{id}/edit"),
-            "/tests/v1/users/{id}/edit"
-        );
-    }
-
-    #[test]
-    fn axum_to_openapi_path_should_convert() {
-        // Regular parameters stay the same
-        assert_eq!(
-            axum_to_openapi_path("/tests/v1/users/{id}"),
-            "/tests/v1/users/{id}"
-        );
-        assert_eq!(
-            axum_to_openapi_path("/tests/v1/projects/{project_id}/items/{item_id}"),
-            "/tests/v1/projects/{project_id}/items/{item_id}"
-        );
-        assert_eq!(axum_to_openapi_path("/tests/v1/simple"), "/tests/v1/simple");
-        // Wildcards: Axum uses {*path}, OpenAPI uses {path}
-        assert_eq!(
-            axum_to_openapi_path("/tests/v1/static/{*path}"),
-            "/tests/v1/static/{path}"
-        );
-        assert_eq!(
-            axum_to_openapi_path("/tests/v1/files/{*filepath}"),
-            "/tests/v1/files/{filepath}"
-        );
-    }
-
-    #[test]
-    fn path_normalization_in_constructors() {
-        // Test that paths are kept as-is (Axum 0.8+ uses same {param} syntax)
-        let builder = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/users/{id}");
-        assert_eq!(builder.spec.path, "/tests/v1/users/{id}");
-
-        let builder = OperationBuilder::<Missing, Missing, ()>::post(
-            "/tests/v1/projects/{project_id}/items/{item_id}",
-        );
-        assert_eq!(
-            builder.spec.path,
-            "/tests/v1/projects/{project_id}/items/{item_id}"
-        );
-
-        // Simple paths remain unchanged
-        let builder = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/simple");
-        assert_eq!(builder.spec.path, "/tests/v1/simple");
-    }
-
-    #[test]
-    fn standard_errors() {
-        let registry = MockRegistry::new();
-        let builder = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/test")
-            .public()
-            .handler(test_handler)
-            .json_response(http::StatusCode::OK, "Success")
-            .standard_errors(&registry);
-
-        // Should have 1 success response + 7 standard error responses
-        // (422 is intentionally omitted — canonical InvalidArgument is 400).
-        assert_eq!(builder.spec.responses.len(), 8);
-
-        // Check that all standard error status codes are present
-        let statuses: Vec<u16> = builder.spec.responses.iter().map(|r| r.status).collect();
-        assert!(statuses.contains(&200)); // success response
-        assert!(statuses.contains(&400));
-        assert!(statuses.contains(&401));
-        assert!(statuses.contains(&403));
-        assert!(statuses.contains(&404));
-        assert!(statuses.contains(&409));
-        assert!(!statuses.contains(&422));
-        assert!(statuses.contains(&429));
-        assert!(statuses.contains(&500));
-
-        // All error responses should use Problem content type
-        let error_responses: Vec<_> = builder
-            .spec
-            .responses
-            .iter()
-            .filter(|r| r.status >= 400)
-            .collect();
-
-        for resp in error_responses {
-            assert_eq!(
-                resp.content_type,
-                toolkit_canonical_errors::problem::APPLICATION_PROBLEM_JSON
-            );
-            assert!(resp.schema_name.is_some());
-        }
-    }
-
-    #[test]
-    fn authenticated() {
-        let builder = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/test")
-            .authenticated()
-            .handler(test_handler)
-            .json_response(http::StatusCode::OK, "Success");
-
-        assert!(builder.spec.authenticated);
-        assert!(!builder.spec.is_public);
-    }
-
-    #[test]
-    fn require_license_features_none() {
-        let builder = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/test")
-            .authenticated()
-            .require_license_features::<TestLicenseFeatures>([])
-            .handler(|| async {})
-            .json_response(http::StatusCode::OK, "OK");
-
-        assert!(builder.spec.license_requirement.is_none());
-    }
-
-    #[test]
-    fn no_license_required_transitions_and_allows_register() {
-        let builder = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/test")
-            .authenticated()
-            .no_license_required()
-            .handler(|| async {})
-            .json_response(http::StatusCode::OK, "OK");
-
-        assert!(builder.spec.license_requirement.is_none());
-        assert!(!builder.spec.is_public);
-    }
-
-    #[test]
-    fn require_license_features_one() {
-        let feature = TestLicenseFeatures::FeatureA;
-
-        let builder = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/test")
-            .authenticated()
-            .require_license_features([&feature])
-            .handler(|| async {})
-            .json_response(http::StatusCode::OK, "OK");
-
-        let license_req = builder
-            .spec
-            .license_requirement
-            .as_ref()
-            .expect("Should have license requirement");
-        assert_eq!(license_req.license_names, vec!["feature_a".to_owned()]);
-    }
-
-    #[test]
-    fn require_license_features_many() {
-        let feature_a = TestLicenseFeatures::FeatureA;
-        let feature_b = TestLicenseFeatures::FeatureB;
-
-        let builder = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/test")
-            .authenticated()
-            .require_license_features([&feature_a, &feature_b])
-            .handler(|| async {})
-            .json_response(http::StatusCode::OK, "OK");
-
-        let license_req = builder
-            .spec
-            .license_requirement
-            .as_ref()
-            .expect("Should have license requirement");
-        assert_eq!(
-            license_req.license_names,
-            vec!["feature_a".to_owned(), "feature_b".to_owned()]
-        );
-    }
-
-    #[tokio::test]
-    async fn public_does_not_require_license_features_and_can_register() {
-        let registry = MockRegistry::new();
-        let router = Router::new();
-
-        let _router = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/test")
-            .public()
-            .handler(test_handler)
-            .json_response(http::StatusCode::OK, "Success")
-            .register(router, &registry);
-
-        let ops = registry.operations.lock().unwrap();
-        assert_eq!(ops.len(), 1);
-        assert!(ops[0].license_requirement.is_none());
-    }
-
-    #[test]
-    fn with_400_validation_error() {
-        let registry = MockRegistry::new();
-        let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/test")
-            .public()
-            .handler(test_handler)
-            .json_response(http::StatusCode::CREATED, "Created")
-            .with_400_validation_error(&registry);
-
-        // Should have success response + validation error response
-        assert_eq!(builder.spec.responses.len(), 2);
-
-        let validation_response = builder
-            .spec
-            .responses
-            .iter()
-            .find(|r| r.status == 400)
-            .expect("Should have 400 response");
-
-        assert_eq!(validation_response.description, "Validation Error");
-        assert_eq!(
-            validation_response.content_type,
-            toolkit_canonical_errors::problem::APPLICATION_PROBLEM_JSON
-        );
-        assert!(validation_response.schema_name.is_some());
-    }
-
-    #[test]
-    fn allow_content_types_with_existing_request_body() {
-        let registry = MockRegistry::new();
-        let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/test")
-            .json_request::<SampleDtoRequest>(&registry, "Test request")
-            .allow_content_types(&["application/json", "application/xml"])
-            .public()
-            .handler(test_handler)
-            .json_response(http::StatusCode::OK, "Success");
-
-        // allowed_content_types should be on OperationSpec, not RequestBodySpec
-        assert!(builder.spec.request_body.is_some());
-        assert!(builder.spec.allowed_request_content_types.is_some());
-        let allowed = builder.spec.allowed_request_content_types.as_ref().unwrap();
-        assert_eq!(allowed.len(), 2);
-        assert!(allowed.contains(&"application/json"));
-        assert!(allowed.contains(&"application/xml"));
-    }
-
-    #[test]
-    fn allow_content_types_without_existing_request_body() {
-        let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/test")
-            .allow_content_types(&["multipart/form-data"])
-            .public()
-            .handler(test_handler)
-            .json_response(http::StatusCode::OK, "Success");
-
-        // Should NOT create synthetic request body, only set allowed_request_content_types
-        assert!(builder.spec.request_body.is_none());
-        assert!(builder.spec.allowed_request_content_types.is_some());
-        let allowed = builder.spec.allowed_request_content_types.as_ref().unwrap();
-        assert_eq!(allowed.len(), 1);
-        assert!(allowed.contains(&"multipart/form-data"));
-    }
-
-    #[test]
-    fn allow_content_types_can_be_chained() {
-        let registry = MockRegistry::new();
-        let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/test")
-            .operation_id("test.post")
-            .summary("Test endpoint")
-            .json_request::<SampleDtoRequest>(&registry, "Test request")
-            .allow_content_types(&["application/json"])
-            .public()
-            .handler(test_handler)
-            .json_response(http::StatusCode::OK, "Success")
-            .problem_response(
-                &registry,
-                http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "Unsupported Media Type",
-            );
-
-        assert_eq!(builder.spec.operation_id, Some("test.post".to_owned()));
-        assert!(builder.spec.request_body.is_some());
-        assert!(builder.spec.allowed_request_content_types.is_some());
-        assert_eq!(builder.spec.responses.len(), 2);
-    }
-
-    #[test]
-    fn multipart_file_request() {
-        let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/upload")
-            .operation_id("test.upload")
-            .summary("Upload file")
-            .multipart_file_request("file", Some("Upload a file"))
-            .public()
-            .handler(test_handler)
-            .json_response(http::StatusCode::OK, "Success");
-
-        // Should set request body with multipart/form-data
-        assert!(builder.spec.request_body.is_some());
-        let rb = builder.spec.request_body.as_ref().unwrap();
-        assert_eq!(rb.content_type, "multipart/form-data");
-        assert!(rb.description.is_some());
-        assert!(rb.description.as_ref().unwrap().contains("file"));
-        assert!(rb.required);
-
-        // Should use MultipartFile schema variant
-        assert_eq!(
-            rb.schema,
-            RequestBodySchema::MultipartFile {
-                field_name: "file".to_owned()
-            }
-        );
-
-        // Should also set allowed_request_content_types
-        assert!(builder.spec.allowed_request_content_types.is_some());
-        let allowed = builder.spec.allowed_request_content_types.as_ref().unwrap();
-        assert_eq!(allowed.len(), 1);
-        assert!(allowed.contains(&"multipart/form-data"));
-    }
-
-    #[test]
-    fn multipart_file_request_without_description() {
-        let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/upload")
-            .multipart_file_request("file", None)
-            .public()
-            .handler(test_handler)
-            .json_response(http::StatusCode::OK, "Success");
-
-        assert!(builder.spec.request_body.is_some());
-        let rb = builder.spec.request_body.as_ref().unwrap();
-        assert_eq!(rb.content_type, "multipart/form-data");
-        assert!(rb.description.is_none());
-        assert_eq!(
-            rb.schema,
-            RequestBodySchema::MultipartFile {
-                field_name: "file".to_owned()
-            }
-        );
-    }
-
-    #[test]
-    fn octet_stream_request() {
-        let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/upload")
-            .operation_id("test.upload")
-            .summary("Upload raw file")
-            .octet_stream_request(Some("Raw file bytes"))
-            .public()
-            .handler(test_handler)
-            .json_response(http::StatusCode::OK, "Success");
-
-        // Should set request body with application/octet-stream
-        assert!(builder.spec.request_body.is_some());
-        let rb = builder.spec.request_body.as_ref().unwrap();
-        assert_eq!(rb.content_type, "application/octet-stream");
-        assert_eq!(rb.description, Some("Raw file bytes".to_owned()));
-        assert!(rb.required);
-
-        // Should use Binary schema variant
-        assert_eq!(rb.schema, RequestBodySchema::Binary);
-
-        // Should also set allowed_request_content_types
-        assert!(builder.spec.allowed_request_content_types.is_some());
-        let allowed = builder.spec.allowed_request_content_types.as_ref().unwrap();
-        assert_eq!(allowed.len(), 1);
-        assert!(allowed.contains(&"application/octet-stream"));
-    }
-
-    #[test]
-    fn octet_stream_request_without_description() {
-        let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/upload")
-            .octet_stream_request(None)
-            .public()
-            .handler(test_handler)
-            .json_response(http::StatusCode::OK, "Success");
-
-        assert!(builder.spec.request_body.is_some());
-        let rb = builder.spec.request_body.as_ref().unwrap();
-        assert_eq!(rb.content_type, "application/octet-stream");
-        assert!(rb.description.is_none());
-        assert_eq!(rb.schema, RequestBodySchema::Binary);
-    }
-
-    #[test]
-    fn json_request_uses_ref_schema() {
-        let registry = MockRegistry::new();
-        let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/test")
-            .json_request::<SampleDtoRequest>(&registry, "Test request body")
-            .public()
-            .handler(test_handler)
-            .json_response(http::StatusCode::OK, "Success");
-
-        assert!(builder.spec.request_body.is_some());
-        let rb = builder.spec.request_body.as_ref().unwrap();
-        assert_eq!(rb.content_type, "application/json");
-
-        // Should use Ref schema variant with the registered schema name
-        match &rb.schema {
-            RequestBodySchema::Ref { schema_name } => {
-                assert!(!schema_name.is_empty());
-            }
-            _ => panic!("Expected RequestBodySchema::Ref for JSON request"),
-        }
-    }
-
-    #[test]
-    fn response_content_types_must_not_contain_parameters() {
-        // This test ensures OpenAPI correctness: media type keys cannot include
-        // parameters like "; charset=utf-8"
-        let registry = MockRegistry::new();
-        let builder = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/test")
-            .operation_id("test.content_type_purity")
-            .summary("Test response content types")
-            .json_request::<SampleDtoRequest>(&registry, "Test")
-            .public()
-            .handler(test_handler)
-            .text_response(http::StatusCode::OK, "Text", "text/plain")
-            .text_response(http::StatusCode::OK, "Markdown", "text/markdown")
-            .html_response(http::StatusCode::OK, "HTML")
-            .json_response(http::StatusCode::OK, "JSON")
-            .problem_response(&registry, http::StatusCode::BAD_REQUEST, "Error");
-
-        // Verify no response content_type contains semicolon (parameter separator)
-        for response in &builder.spec.responses {
-            assert!(
-                !response.content_type.contains(';'),
-                "Response content_type '{}' must not contain parameters. \
-                 Use pure media type without charset or other parameters. \
-                 OpenAPI media type keys cannot include parameters.",
-                response.content_type
-            );
-        }
-    }
-}
+#[path = "operation_builder_tests.rs"]
+mod tests;

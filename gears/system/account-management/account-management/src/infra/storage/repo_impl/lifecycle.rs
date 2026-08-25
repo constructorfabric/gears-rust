@@ -12,7 +12,8 @@ use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
 use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_db::secure::{
-    DbTx, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureOnConflict, SecureUpdateExt,
+    DbTx, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureInsertManyExt, SecureOnConflict,
+    SecureUpdateExt,
 };
 use toolkit_security::AccessScope;
 use uuid::Uuid;

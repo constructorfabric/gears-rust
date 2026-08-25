@@ -50,9 +50,10 @@ pub(super) fn register_usage_type_routes(
             StatusCode::OK,
             "Usage types page",
         )
+        // No `.with_odata_select()`: nothing in this gear applies the
+        // projection. See the sibling comment on the record-list route.
         .with_odata_filter::<UsageTypeFilterField>()
         .with_odata_orderby::<UsageTypeFilterField>()
-        .with_odata_select()
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);

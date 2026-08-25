@@ -1,4 +1,14 @@
 #!/usr/bin/env python
+"""Cross-platform Gears CI utility (fmt, clippy, test, security, fuzz, E2E).
+
+For E2E this is the *orchestration engine*: `e2e-local` / `e2e-docker` build (or
+reuse) the server binary, start it from a config file, wait for `/healthz`, run
+pytest against the live HTTP API, then tear the server down. Focused local runs
+are driven by `tools/scripts/run_e2e.py`, which calls this script's
+`e2e-local` subcommand for suites whose `launcher` is `e2e-launcher`.
+
+See `testing/e2e/README.md` ("How E2E Is Executed") for the full picture.
+"""
 import argparse
 import os
 import shutil
@@ -173,8 +183,6 @@ def cmd_check(args):
     cmd_cfs_validate(args)
     cmd_clippy(args)
     cmd_test(args)
-    cmd_dylint_test(args)
-    cmd_dylint(args)
     cmd_gts_docs(args)
     cmd_security(args)
     print("All checks passed")
@@ -262,19 +270,27 @@ def wait_for_health(
 
 def check_pytest():
     step("Checking pytest")
-    # First try "python -m pytest"
     result = run_cmd_allow_fail([PYTHON, "-m", "pytest", "--version"])
-    if result.returncode == 0:
-        return
-    # Then try "pytest" directly
-    result = run_cmd_allow_fail(["pytest", "--version"])
-    if result.returncode == 0:
-        return
-    print(
-        "ERROR: pytest is not installed. Install with: "
-        "pip install -r testing/e2e/requirements.txt"
-    )
-    sys.exit(1)
+    if result.returncode != 0:
+        print(
+            "ERROR: pytest is not installed in the active Python environment. Install with: "
+            f"{PYTHON} -m pip install -r testing/e2e/requirements.txt"
+        )
+        sys.exit(1)
+
+    required_modules = ["cryptography"]
+    missing = []
+    for module in required_modules:
+        result = run_cmd_allow_fail([PYTHON, "-c", f"import {module}"])
+        if result.returncode != 0:
+            missing.append(module)
+    if missing:
+        print(
+            "ERROR: missing E2E Python dependencies: "
+            f"{', '.join(missing)}. Install with: "
+            f"{PYTHON} -m pip install -r testing/e2e/requirements.txt"
+        )
+        sys.exit(1)
 
 
 def kill_existing_server(port):
@@ -364,50 +380,44 @@ def cmd_e2e(args):
         server_process = None
         print("Starting cf-gears-server for local E2E...")
 
-        # Build only the release binary required for local execution.
-        # Invoke cargo directly (mirrors the Makefile `cargo-build` target)
-        # instead of shelling out to `make`, which is unavailable on Windows
-        # where this script is the documented entry point.
-        step("Building release binary for local E2E")
-        build_cmd = [
-            "cargo",
-            "build",
-            "--release",
-            "--bin",
-            "cf-gears-example-server",
-        ]
-        e2e_features = read_e2e_features(Path(PROJECT_ROOT))
-        if e2e_features:
-            build_cmd.extend(["--features", e2e_features])
-        run_cmd(build_cmd)
+        env_e2e_binary = os.environ.get("E2E_SERVER_BINARY") or os.environ.get("E2E_BINARY")
+        env_fs_sidecar_binary = os.environ.get("FS_SIDECAR_BINARY")
+        release_sidecar_bin = None
 
-        # Also build the file-storage sidecar binary (no feature flags needed —
-        # it is a standalone binary in the cf-gears-file-storage package).
-        step("Building release sidecar binary for local E2E")
-        run_cmd([
-            "cargo",
-            "build",
-            "--release",
-            "-p",
-            "cf-gears-file-storage",
-            "--bin",
-            "sidecar",
-        ])
+        if env_e2e_binary:
+            release_bin = env_e2e_binary
+            if not os.path.isfile(release_bin):
+                print(f"\nERROR: E2E server binary does not exist: {release_bin}")
+                sys.exit(1)
+        else:
+            step("Building release binary for local E2E")
+            build_cmd = [
+                "cargo",
+                "build",
+                "--release",
+                "--bin",
+                "cf-gears-example-server",
+            ]
+            e2e_features = read_e2e_features(Path(PROJECT_ROOT))
+            if e2e_features:
+                build_cmd.extend(["--features", e2e_features])
+            run_cmd(build_cmd)
 
-        # Use the release binary produced by the cargo build above
-        release_bin = str(find_binary(
-            Path(PROJECT_ROOT) / "target", "release", "cf-gears-example-server"
-        ))
+            release_bin = str(find_binary(
+                Path(PROJECT_ROOT) / "target", "release", "cf-gears-example-server"
+            ))
 
-        if not os.path.isfile(release_bin):
-            print(f"\nERROR: Release binary not found at: {release_bin}")
-            print("Build it first with:")
-            print("  make cargo-build")
-            sys.exit(1)
+            if not os.path.isfile(release_bin):
+                print(f"\nERROR: Release binary not found at: {release_bin}")
+                print("Build it first with:")
+                print("  make cargo-build")
+                sys.exit(1)
 
-        release_sidecar_bin = str(find_binary(
-            Path(PROJECT_ROOT) / "target", "release", "sidecar"
-        ))
+        if env_fs_sidecar_binary:
+            release_sidecar_bin = env_fs_sidecar_binary
+            if not os.path.isfile(release_sidecar_bin):
+                print(f"\nERROR: FS_SIDECAR_BINARY does not exist: {release_sidecar_bin}")
+                sys.exit(1)
 
         # Create logs directory if it doesn't exist
         logs_dir = os.path.join(PROJECT_ROOT, "testing", "e2e", "logs")
@@ -477,16 +487,6 @@ def cmd_e2e(args):
     env = os.environ.copy()
     env["E2E_BASE_URL"] = base_url
 
-    # Export the release server + sidecar paths so the orchestrator-based
-    # lifecycle suite (testing/e2e/gears/file_storage/lifecycle/) can start
-    # its own private server+sidecar pair.
-    #
-    # NOTE: we deliberately use DEDICATED vars (FS_E2E_BINARY / FS_SIDECAR_BINARY)
-    # rather than the shared E2E_BINARY.  Other gears (e.g. mini-chat) gate their
-    # own suites on E2E_BINARY and expect a scoped invocation (make e2e-mini-chat);
-    # setting E2E_BINARY here would un-skip them under generic e2e-local and they
-    # would fail/time-out without their bespoke fixtures.  The lifecycle conftest
-    # reads FS_E2E_BINARY for the server and FS_SIDECAR_BINARY for the sidecar.
     if release_bin is not None:
         env.setdefault("FS_E2E_BINARY", release_bin)
     if release_sidecar_bin is not None:
@@ -552,104 +552,6 @@ def cmd_e2e_local(args):
 def cmd_e2e_docker(args):
     args.docker = True
     cmd_e2e(args)
-
-
-def cmd_dylint(_args):
-    step("Building dylint lints")
-    dylint_dir = os.path.join(PROJECT_ROOT, "tools/dylint_lints")
-    run_cmd(["cargo", "build", "--release"], cwd=dylint_dir)
-    # Copy toolchain-suffixed names similar to Makefile
-    rustc_host = (
-        subprocess.check_output(["rustc", "--version", "--verbose"])
-        .decode()
-        .splitlines()
-    )
-    host = next((line.split()[-1] for line in rustc_host if line.startswith("host:")), "")
-    toolchain = "nightly"
-    rust_toolchain_path = os.path.join(dylint_dir, "rust-toolchain.toml")
-    if os.path.isfile(rust_toolchain_path):
-        with open(rust_toolchain_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if "channel" in line:
-                    toolchain = line.split('"')[1]
-                    break
-    target_release = os.path.join(dylint_dir, "target", "release")
-    for fname in os.listdir(target_release):
-        if not fname.startswith("libde") and not fname.startswith("de"):
-            continue
-        if "@" in fname:
-            continue
-        if fname.endswith(".dylib"):
-            ext = ".dylib"
-        elif fname.endswith(".so"):
-            ext = ".so"
-        elif fname.endswith(".dll"):
-            ext = ".dll"
-        else:
-            continue
-        base = fname[: -len(ext)]
-        target = f"{base}@{toolchain}-{host}{ext}"
-        src = os.path.join(target_release, fname)
-        dst = os.path.join(target_release, target)
-        try:
-            shutil.copyfile(src, dst)
-        except OSError:
-            pass
-    dylint_libs = sorted(
-        [
-            os.path.join(target_release, f)
-            for f in os.listdir(target_release)
-            if (f.startswith("libde") or f.startswith("de"))
-            and ("@" in f)
-            and (
-                f.endswith(".dylib")
-                or f.endswith(".so")
-                or f.endswith(".dll")
-            )
-        ]
-    )
-    if not dylint_libs:
-        print("ERROR: No dylint libraries found after build.")
-        sys.exit(1)
-    lib_args = []
-    for lib in dylint_libs:
-        lib_args.extend(["--lib-path", lib])
-    run_cmd(
-        ["cargo", f"+{toolchain}", "dylint", *lib_args, "--workspace"],
-        cwd=PROJECT_ROOT,
-    )
-    print("Dylint checks passed")
-
-
-def cmd_dylint_test(_args):
-    step("Running dylint tests")
-    dylint_dir = os.path.join(PROJECT_ROOT, "tools/dylint_lints")
-    run_cmd(["cargo", "test"], cwd=dylint_dir)
-    print("Dylint tests passed")
-
-
-def cmd_dylint_list(_args):
-    step("Listing dylint lints")
-    dylint_dir = os.path.join(PROJECT_ROOT, "tools/dylint_lints")
-    target_release = os.path.join(dylint_dir, "target", "release")
-    dylint_libs = sorted(
-        [
-            os.path.join(target_release, f)
-            for f in os.listdir(target_release)
-            if (f.startswith("libde") or f.startswith("de"))
-            and (
-                f.endswith(".dylib")
-                or f.endswith(".so")
-                or f.endswith(".dll")
-            )
-        ]
-    )
-    if not dylint_libs:
-        print("ERROR: No dylint libraries found. Run 'python scripts/ci.py dylint' first.")
-        sys.exit(1)
-    for lib in dylint_libs:
-        print(f"=== {lib} ===")
-        run_cmd(["cargo", "dylint", "list", "--lib-path", lib], cwd=PROJECT_ROOT)
 
 
 def ensure_nightly_toolchain():
@@ -903,18 +805,6 @@ def build_parser():
         help="Extra arguments passed to pytest (use -- to separate)",
     )
     p_e2e_docker.set_defaults(func=cmd_e2e_docker)
-
-    # dylint
-    p_dylint = subparsers.add_parser("dylint", help="Build and run dylint lints")
-    p_dylint.set_defaults(func=cmd_dylint)
-
-    # dylint-test
-    p_dylint_test = subparsers.add_parser("dylint-test", help="Run dylint UI tests")
-    p_dylint_test.set_defaults(func=cmd_dylint_test)
-
-    # dylint-list
-    p_dylint_list = subparsers.add_parser("dylint-list", help="List available dylint lints")
-    p_dylint_list.set_defaults(func=cmd_dylint_list)
 
     # fuzz-build
     p_fuzz_build = subparsers.add_parser("fuzz-build", help="Build all fuzz targets")

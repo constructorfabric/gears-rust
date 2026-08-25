@@ -26,7 +26,7 @@ pub fn register_routes(
         .authenticated()
         .no_license_required()
         .handler(handlers::list_gears)
-        .json_response_with_schema::<Vec<GearDto>>(
+        .json_array_response_with_schema::<GearDto>(
             openapi,
             http::StatusCode::OK,
             "List of registered gears",

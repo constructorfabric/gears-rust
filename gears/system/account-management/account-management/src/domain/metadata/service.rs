@@ -144,6 +144,11 @@ pub(crate) mod pep {
         /// not AM.
         pub const WRITE: &str = "write";
         pub const DELETE: &str = "delete";
+
+        /// Every action in this vocabulary — see the note on the user
+        /// service's `actions::ALL`. Add new actions here as well as above.
+        #[cfg(test)]
+        pub const ALL: &[&str] = &[READ, LIST, WRITE, DELETE];
     }
 }
 

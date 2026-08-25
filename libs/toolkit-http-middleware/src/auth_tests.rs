@@ -37,13 +37,13 @@ impl BearerAuthenticator for StubAuthenticator {
     }
 }
 
-fn app(is_public: bool) -> Router {
+fn app(is_anonymous: bool) -> Router {
     let authenticator = Arc::new(StubAuthenticator);
 
     // `security_context_middleware` runs as a `route_layer` (after routing); the
-    // `PublicRoute` marker is added as an outer router `layer` so it is
+    // `AnonymousRoute` marker is added as an outer router `layer` so it is
     // present in the request extensions by the time the middleware reads it
-    // (this mirrors how the bootstrap layer surfaces `OperationSpec.is_public` per-route).
+    // (this mirrors how the bootstrap layer surfaces `!OperationSpec.authenticated` per-route).
     let secctx = axum::middleware::from_fn_with_state(
         authenticator,
         security_context_middleware::<StubAuthenticator>,
@@ -53,8 +53,8 @@ fn app(is_public: bool) -> Router {
         .route("/", get(|| async { StatusCode::OK }))
         .route_layer(secctx);
 
-    if is_public {
-        router.layer(axum::Extension(PublicRoute))
+    if is_anonymous {
+        router.layer(axum::Extension(AnonymousRoute))
     } else {
         router
     }
@@ -152,7 +152,7 @@ fn stacked_public_app() -> Router {
         .route("/", get(|| async { StatusCode::OK }))
         .route_layer(secctx)
         .route_layer(internal_layer)
-        .layer(axum::Extension(PublicRoute))
+        .layer(axum::Extension(AnonymousRoute))
 }
 
 /// Drive a request with arbitrary headers through `router`, returning
@@ -324,14 +324,14 @@ async fn invalid_internal_token_rejected_before_tenant_plane() {
 
 #[tokio::test]
 async fn system_call_to_public_endpoint_passes() {
-    // Valid SA token, no JWT, route is PublicRoute — the normal probe/platform path.
+    // Valid SA token, no JWT, route is AnonymousRoute — the normal probe/platform path.
     let (status, _, _) = send_headers(stacked_public_app(), &[(INTERNAL_HEADER, SA_GOOD)]).await;
     assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
 async fn public_endpoint_with_no_credentials_passes() {
-    // No SA token and no JWT on a PublicRoute: passes (health probe).
+    // No SA token and no JWT on an AnonymousRoute: passes (health probe).
     let (status, _, _) = send_headers(stacked_public_app(), &[]).await;
     assert_eq!(status, StatusCode::OK);
 }

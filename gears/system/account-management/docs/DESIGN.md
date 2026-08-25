@@ -108,6 +108,11 @@ graph LR
 | `cpt-cf-account-management-fr-idp-user-deprovision` | `IdpPluginClient::deprovision_user` with session revocation; an already-absent IdP user is treated as a successful no-op so `DELETE /tenants/{id}/users/{user_id}` remains idempotent. |
 | `cpt-cf-account-management-fr-idp-user-update` | `IdpPluginClient::update_user` applies a JSON Merge Patch of mutable attributes (`username`, `email`, `display_name`, `first_name`, `last_name`, `password`) as a pass-through; AM persists no user state. An absent user surfaces as `not_found` (NOT folded into success, unlike deprovision); a `username` collision as `already_exists`. Backed by `cpt-cf-account-management-adr-user-attribute-update`. |
 | `cpt-cf-account-management-fr-idp-user-query` | `IdpPluginClient::list_users` with tenant filter; supports optional user-ID filter for single-user lookups. |
+| `cpt-cf-account-management-fr-service-account-provision` | `ServiceAccountService::create` gates on the `create` action, resolves the tenant through the guard shared with the user pass-through, caps the payload, then calls `IdpPluginClient::provision_service_account`. The 201 carries `Location` plus `Cache-Control: no-store` and discloses the secret once — there is no read-back path. A name already live in the tenant comes back from the provider as the invalid-input category (400) and the existing account is never resumed or revealed; the `(tenant_id, name)` uniqueness the provider enforces atomically is what makes the name a usable correlation key. |
+| `cpt-cf-account-management-fr-service-account-list` | `ServiceAccountService::list` calls `IdpPluginClient::list_service_accounts` and returns the tenant's whole collection unpaginated, each entry carrying the caller-supplied name verbatim. Unpaginated on purpose: this listing doubles as the ambiguous-outcome reconciliation path, and no field carries a secret. |
+| `cpt-cf-account-management-fr-service-account-rotate` | `ServiceAccountService::rotate_secret` gates on the separately grantable `rotate_secret` action and calls `IdpPluginClient::rotate_service_account_secret`; the 200 carries `Cache-Control: no-store` and a new one-time secret with the account's identity unchanged. Unlike revoke, a provider-reported absence is surfaced as `not_found` (404) carrying the addressed `client_id` — a rotation that found nothing minted no usable credential. |
+| `cpt-cf-account-management-fr-service-account-revoke` | `ServiceAccountService::revoke` calls `IdpPluginClient::revoke_service_account` and folds a provider-reported absence into the same 204 as a removal (idempotency by error-mapping: the adapter maps vendor errors, AM assigns meaning), which also makes revoke useless as a probe for accounts owned by other tenants. A clean failure or an ambiguous outcome is NOT absence-equivalent. |
+| `cpt-cf-account-management-fr-service-account-secret-confidentiality` | The secret is wrapped in `secrecy::SecretString` (redacted `Debug`, zeroize-on-drop, no Serde) from the contract boundary to the single DTO conversion that serialises it; nothing persists it and no endpoint reads it back. `ServiceAccountFailureExt` discards every provider `detail` and `field` rather than digesting them, substituting fixed AM-owned messages and logging only category, length, and whether a field was attributed — see §4.2 Credential Handling on the Machine-Identity Surface. |
 | `cpt-cf-account-management-fr-user-group-rg-type` | `AccountManagementGear` idempotently registers the user-group Resource Group type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` during gear initialization, with `allowed_memberships` including the platform user resource type (`gts.cf.core.am.user.v1~`). |
 | `cpt-cf-account-management-fr-user-group-lifecycle` | Consumers call `ResourceGroupClient` directly for group create/update/delete. AM does not proxy these operations. |
 | `cpt-cf-account-management-fr-user-group-membership` | Consumers call `ResourceGroupClient` directly for membership add/remove. Callers verify user existence via AM's user-list endpoint; RG treats `resource_id` as opaque. |
@@ -131,7 +136,7 @@ graph LR
 | `cpt-cf-account-management-nfr-tenant-model-versatility` | Both managed and self-managed in same tree | `self_managed` boolean per tenant, independent of siblings | Sibling tenants under the same parent can have different `self_managed` values; mode conversion is a per-tenant operation. | Integration tests with mixed-mode hierarchies |
 | `cpt-cf-account-management-nfr-compatibility` | No breaking changes within minor release | Path-based API versioning + stable SDK trait contract | REST API uses `/api/account-management/v1/` prefix; SDK trait changes require new major version with migration path. | Contract tests on SDK trait + API schema regression tests |
 | `cpt-cf-account-management-nfr-production-scale` | Approved deployment profile before DESIGN sign-off | Schema design + index strategy | Approved deployment profile: 100K tenants, depth 5 (advisory threshold 10), 300K users (IdP-stored), 30K user groups / 300K memberships (RG-stored), 1K rps peak. All targets within planning envelope. Schema impact assessment confirms existing indexes and B-tree depths are sufficient for that profile; no partitioning is required. | Capacity test against approved profile (100K tenants, 300K users, 1K rps) |
-| `cpt-cf-account-management-nfr-data-classification` | Persisted data classes documented; no credentials/profile PII stored by AM | Security architecture + data model boundaries | Tenant hierarchy metadata is classified as commercially sensitive; metadata schema classification is derived per `schema_id`; AM persists IdP-issued UUID identity references only where required for traceability and never stores credentials or IdP profile data outside the platform audit infrastructure. | Design review of persisted fields and audit payloads; integration checks confirm user lifecycle paths do not create local user/profile records |
+| `cpt-cf-account-management-nfr-data-classification` | Persisted data classes documented; no credentials/profile PII stored by AM | Security architecture + data model boundaries | Tenant hierarchy metadata is classified as commercially sensitive; metadata schema classification is derived per `schema_id`; AM persists IdP-issued UUID identity references only where required for traceability and never stores credentials or IdP profile data outside the platform audit infrastructure. Service-account client secrets are restricted authentication credentials: never persisted, wrapped in a redacting non-serializable type in process, and present in exactly two responses. Text an IdP adapter returns with a service-account failure is treated as unclassifiable and therefore discarded rather than digested. | Design review of persisted fields and audit payloads; integration checks confirm user lifecycle paths do not create local user/profile records, that credential-bearing responses set `Cache-Control: no-store`, and that a credential-shaped provider `detail` appears in neither the response body nor any log record |
 | `cpt-cf-account-management-nfr-reliability` | Reads stay available during IdP outages; retry contract is explicit | Saga-based tenant creation + degraded-mode reads + reaper compensation | Non-IdP-dependent reads and admin operations continue during IdP outages. Tenant creation uses the three-step provisioning saga; clean step-2 compensation returns `idp_unavailable` and is retryable, while transport failure, timeout, or finalization failure after IdP-side success leave `POST /tenants` in an ambiguous, non-idempotent state that callers must reconcile before retry. | Integration tests for clean compensation, ambiguous finalization failure, provisioning reaper cleanup, and degraded reads during IdP outage |
 | `cpt-cf-account-management-nfr-data-lifecycle` | Tenant deprovisioning cascades cleanup | `TenantService::delete_tenant` + background hard-delete job | Soft delete transitions to `deleted` status; background job hard-deletes after retention period; cascade triggers IdP `deprovision_tenant` (with retry on failure), Resource Group cleanup for tenant-scoped user groups (via `ResourceGroupClient`), and metadata entry deletion. | Integration tests verifying cascaded cleanup |
 | `cpt-cf-account-management-nfr-authentication-context` | Authenticated requests via platform SecurityContext; MFA for admin ops deferred to platform AuthN policy | `SecurityContext` requirement on all REST handlers via framework middleware | AM does not validate tokens or enforce MFA directly. All REST endpoints require a valid `SecurityContext` provided by the framework AuthN pipeline. MFA enforcement for administrative operations such as tenant creation and mode conversion is a platform AuthN policy concern — AM relies on the framework to reject requests that do not meet the configured authentication strength. | API tests: every endpoint returns 401 without valid `SecurityContext`; E2E: admin operations succeed only with authenticated requests |
@@ -441,12 +446,14 @@ graph TD
         AM[AccountManagementGear]
         TS[TenantService]
         MS[MetadataService]
+        SPS[ServiceAccountService]
         BS[BootstrapService]
 
         subgraph API["REST API Layer"]
             TH[Tenant Handlers]
             MH[Metadata Handlers]
             UH[User Handlers]
+            SPH[Service Account Handlers]
         end
 
         subgraph INFRA["Infrastructure"]
@@ -478,6 +485,9 @@ graph TD
     TS --> IDP
     MS --> META_REPO
     MS --> GTS
+    SPH --> SPS
+    SPS --> REPO
+    SPS --> IDP
     BS --> TS
     BS --> IDP
     REPO --> DB
@@ -677,6 +687,33 @@ Does not define metadata schemas — schemas are registered in GTS. Does not int
 - `cpt-cf-account-management-component-tenant-service` — related; metadata entries cascade-deleted via DB `ON DELETE CASCADE` when tenant row is removed; MetadataService called by TenantService for tenant metadata resolution in user operations
 - `cpt-cf-account-management-component-gear` — called by; for route registration
 
+#### ServiceAccountService
+
+- [ ] `p2` - **ID**: `cpt-cf-account-management-component-service-account-service`
+
+##### Why this component exists
+
+Owns the machine-identity half of the IdP contract: tenant-scoped provision, list, rotate-secret, and revoke of confidential `client_credentials` clients. It is a separate component from `TenantService` and from the user pass-through because what crosses its boundary is a live credential rather than a profile, and that difference drives two obligations neither sibling carries — one-time secret disclosure with no read-back path, and outright discard of provider-supplied failure text (see §4.2 and §3.8).
+
+##### Responsibility scope
+
+Per request: run the PEP gate for the operation's own action (`create` / `list` / `rotate_secret` / `revoke`) against the explicit owning tenant; resolve that tenant to an `active` one through the guard shared with the user pass-through, under the PDP-compiled `AccessScope`; bound the caller's payload; invoke the corresponding `IdpPluginClient` method with the resolved `TenantContext` (including the plugin-private `metadata` replay); and map the outcome. Emits `am.events` audit lines carrying `tenant_id`, `client_id`, the submitted name, and the actor — never the credential.
+
+Ordering is fixed: gate, then tenant guard, then input caps, then the provider call. The gate runs first so a denied caller is refused before any tenant read; the tenant guard precedes the caps so a request against an invisible tenant does not surface as a payload-shape error.
+
+Object-level scoping needs no separate assertion: the tenant read runs under the compiled `AccessScope`, so a caller whose grant does not cover the target cannot resolve it and receives a `NotFound` — the tenant is invisible rather than merely forbidden, which also keeps tenant topology from leaking through a 403. That clamp resolves against `tenant_closure`, so it is strictly stronger than comparing the target against a scope's uuid set. Below the tenant, `(tenant_id, client_id)` addressing is the provider's to enforce.
+
+Revoke folds a provider-reported absence into success (idempotency by error-mapping, as on the tenant side: adapters map vendor errors 1:1, AM assigns meaning); rotate-secret does not, because a rotation that found nothing minted no usable credential.
+
+##### Responsibility boundaries
+
+Holds no storage handle and no credential: there is no account table, inventory projection, provider-state replica, or credential cache, so a restart loses nothing and a provider outage yields an error rather than a stale inventory. Does not validate name charset, scope-allowlist membership, or per-tenant quota — those belong to the adapter, which owns client-id derivation and its own limits; AM applies only size caps so an oversized payload never rides the wire. Does not reconcile an ambiguous outcome: it surfaces the category and the caller reconciles by matching its submitted name in the listing. Does not orchestrate tenant offboarding — a tenant's accounts are removed by the adapter through the existing `deprovision_tenant` hook.
+
+##### Related components (by ID)
+
+- `cpt-cf-account-management-component-tenant-service` — related; owns the `TenantRepo` and the tenant-resolve guard this component reuses verbatim, and owns the `deprovision_tenant` hook through which accounts are removed at tenant offboarding
+- `cpt-cf-account-management-component-gear` — called by; for route registration and service wiring
+
 #### BootstrapService
 
 - [ ] `p2` - **ID**: `cpt-cf-account-management-component-bootstrap-service`
@@ -754,6 +791,25 @@ This interface is an orchestration boundary over the IdP contract rather than a 
 - user lifecycle errors are surfaced as deterministic public problem categories, but provider-specific request and response shapes remain behind the IdP plugin contract
 - group lifecycle and membership remain delegated to Resource Group; AM does not expose user-group storage from this interface
 
+#### Service Account REST API
+
+- [ ] `p2` - **ID**: `cpt-cf-account-management-interface-service-account-rest`
+
+- **Interfaces**: `cpt-cf-account-management-interface-service-account-api`
+- **Contracts**: `cpt-cf-account-management-contract-idp-provider`, `cpt-cf-account-management-contract-authz-resolver`
+- **Technology**: REST / OpenAPI
+- **Location**: `gears/system/account-management/account-management/src/api/rest/`
+
+This interface is the tenant-scoped machine-identity lifecycle over the same IdP contract, not a local credential store. The architectural rules are:
+
+- four operations only — provision and list on the collection, rotate-secret as a named action on the item, revoke on the item. Secret rotation is an action rather than a `PUT`/`PATCH` body because it mints a new credential and invalidates the old one, which no state-edit shape expresses honestly
+- the item path registers no `GET`: the contract exposes no by-id read, so the URL a provision returns in `Location` answers `DELETE` and prefixes rotate-secret but 405s a read. RFC 9110 §10.2.2 has `Location` *identify* the created resource without promising it is `GET`-able, and the collection listing covers reads
+- the plaintext secret appears in exactly two responses (provision, rotate-secret), each carrying `Cache-Control: no-store`; no path reads back an existing secret, and no listing field carries one
+- the listing is unpaginated by contract, because it is also the reconciliation path after an ambiguous outcome — "is my name already live here?" must not become a multi-round-trip question with a cursor to invalidate
+- each listing entry reports the caller-supplied name verbatim; that is the only contractual bridge from a submitted name to a provider-assigned client id, whose format is an adapter convention and never contract
+- an ambiguous provider outcome renders as `Aborted` (409, `reason = AMBIGUOUS_OUTCOME`) rather than `ServiceUnavailable`, so the envelope does not invite the retry that would collide with a landed provision
+- no provider-supplied failure text reaches the response body; each category is answered with a fixed AM-owned message (see §3.8 and §4.2)
+
 #### Tenant Metadata REST API
 
 - [ ] `p2` - **ID**: `cpt-cf-account-management-interface-metadata-rest`
@@ -776,9 +832,9 @@ This interface exposes raw and resolved tenant metadata keyed by registered GTS 
 - [ ] `p2` - **ID**: `cpt-cf-account-management-interface-sdk-client`
 
 - **Technology**: Rust trait + ClientHub
-- **Location**: `gears/system/account-management/account-management-sdk/src/api.rs`
+- **Location**: `gears/system/account-management/account-management-sdk/src/client.rs`
 
-`AccountManagementClient` is the transport-agnostic in-process contract for gear-to-gear reads and administrative calls. It mirrors the public capability groups of the REST surface, but does not supersede the OpenAPI file as the public wire contract. Consumers resolve it through ClientHub so that AM remains replaceable behind a stable capability interface.
+`AccountManagementClient` is the transport-agnostic in-process contract for gear-to-gear reads and administrative calls. It mirrors the public capability groups of the REST surface, including tenant-scoped service-account create, list, rotate-secret, and revoke, but does not supersede the OpenAPI file as the public wire contract. Consumers resolve it through the global ClientHub registration so that AM remains replaceable behind a stable capability interface; the implementation delegates service-account calls to the same `ServiceAccountService` used by REST, preserving authorization and canonical-error behavior without an HTTP loopback.
 
 #### IdP Provider Plugin
 
@@ -789,7 +845,7 @@ This interface exposes raw and resolved tenant metadata keyed by registered GTS 
 - **Location**: `gears/system/account-management/account-management-sdk/src/idp.rs`
 - **ADR**: `cpt-cf-account-management-adr-idp-contract-separation`
 
-`IdpPluginClient` is the deployment-specific outbound identity boundary for tenant provisioning, tenant deprovisioning, and user lifecycle operations. `provision_tenant` IS the readiness signal — there is no separate availability probe; plugins return `IdpProvisionFailure::CleanFailure` for failures that proved no `IdP`-side state was retained and `IdpProvisionFailure::Ambiguous` for uncertain outcomes, and AM's saga handles retry vs reaper-deferral per variant. The architecture expects:
+`IdpPluginClient` is the deployment-specific outbound identity boundary for tenant provisioning, tenant deprovisioning, user lifecycle operations, and the service-account (machine-identity) lifecycle. Every method ships a default implementation returning the `UnsupportedOperation` category for its half, so a partial adapter — tenant-only, or users without machine identities — compiles and declines explicitly rather than no-opping silently; AM renders that category as `Unimplemented` (501). `provision_tenant` IS the readiness signal — there is no separate availability probe; plugins return `IdpProvisionFailure::CleanFailure` for failures that proved no `IdP`-side state was retained and `IdpProvisionFailure::Ambiguous` for uncertain outcomes, and AM's saga handles retry vs reaper-deferral per variant. The architecture expects:
 
 - provider implementations to be discoverable and replaceable without changing AM's public API contract
 - tenant provisioning and user lifecycle calls to accept AM-owned tenant identifiers plus resolved tenant metadata, with provider-specific interpretation remaining outside AM
@@ -1342,9 +1398,9 @@ populated unconditionally by `am_error_to_problem`):
 
 - `status` — HTTP status, fixed by the canonical category below
 - `type` — GTS resource-type tag
-  (`gts.cf.core.am.{tenant|tenant_metadata|conversion_request}.v1~`,
-  exported as `account_management_sdk::gts::{TENANT_RESOURCE_TYPE, TENANT_METADATA_RESOURCE_TYPE, CONVERSION_REQUEST_RESOURCE_TYPE}`)
-  identifying the resource the failure pertains to
+  (`gts.cf.core.am.{tenant|tenant_metadata|conversion_request|user|service_account}.v1~`,
+  exported as `account_management_sdk::gts::{TENANT_RESOURCE_TYPE, TENANT_METADATA_RESOURCE_TYPE, CONVERSION_REQUEST_RESOURCE_TYPE, USER_RESOURCE_TYPE, SERVICE_ACCOUNT_RESOURCE_TYPE}`)
+  identifying the resource the failure pertains to. A machine-identity failure never rides the user type: the `resource_type` is what a client keys "can I grant this?" off, and collapsing the two would advertise credential minting as user management
 - `title` — canonical category title (`Invalid Argument`, `Failed
   Precondition`, `Aborted`, `Service Unavailable`, …)
 - `code` — stable category snake_case token (`invalid_argument`,
@@ -1367,12 +1423,12 @@ populated unconditionally by `am_error_to_problem`):
 | `InvalidArgument` | 400 | Validation failures: schema validation, name length, invalid tenant type, root-tenant-cannot-delete, root-tenant-cannot-convert. `errors[]` carries field-level violations with `reason` tokens (`INVALID_TENANT_TYPE`, `ROOT_TENANT_CANNOT_DELETE`, `ROOT_TENANT_CANNOT_CONVERT`, …). |
 | `NotFound` | 404 | Tenant, conversion request, metadata schema, or metadata entry not found. `type` selects the specific resource (`tenant.v1~` / `tenant_metadata.v1~` / `conversion_request.v1~`), `resource_name` carries the missing identifier. |
 | `FailedPrecondition` | 400 | State precondition violations: `TENANT_HAS_CHILDREN`, `TENANT_HAS_RESOURCES`, `TYPE_NOT_ALLOWED`, `TENANT_DEPTH_EXCEEDED`, `PENDING_EXISTS`, `INVALID_ACTOR_FOR_TRANSITION`, `ALREADY_RESOLVED`, generic precondition. The `errors[]` precondition-violation list carries the discriminating `reason`. |
-| `Aborted` | 409 | Concurrency conflict — currently emitted only when SERIALIZABLE retry budget is exhausted on a hierarchy-mutating transaction (`reason = "SERIALIZATION_CONFLICT"`). The losing concurrent writer receives a deterministic 409 envelope per `feature-tenant-hierarchy-management §6 / AC line 711`. Always safe to retry from the client. |
+| `Aborted` | 409 | Two distinct situations. (a) Concurrency conflict — SERIALIZABLE retry budget exhausted on a hierarchy-mutating transaction (`reason = "SERIALIZATION_CONFLICT"`); the losing writer receives a deterministic 409 per `feature-tenant-hierarchy-management §6 / AC line 711`, and retrying is always safe. (b) Ambiguous IdP outcome on a service-account operation (`reason = "AMBIGUOUS_OUTCOME"`, `type = service_account.v1~`); the provider may have retained state, so retrying the same request is **not** safe — it would come back as a 400 name collision. The caller reconciles by listing the tenant and matching the name it submitted. The two reasons are what separate "retry" from "reconcile" within this category. |
 | `AlreadyExists` | 409 | Unique-constraint violation on a tenant write (Postgres `23505` / SQLite `2067`). Currently funnels through `From<DbErr>` classification at the boundary — direct domain emission is reserved for future flows. |
 | `PermissionDenied` | 403 | Barrier violation or unauthorized cross-tenant access (`reason = "CROSS_TENANT_DENIED"`). Cross-tenant denials originating from the PEP/PDP chain land here. |
 | `ResourceExhausted` | 429 | Integrity audit single-flight refusal — the `integrity_check_runs` singleton PK gate enforces single-flight, and concurrent callers receive this category. The 429 envelope carries `quota_violations[].subject = "integrity_check"` so the client can disambiguate this contention category; the gate itself is observable via that subject token rather than a public reason discriminator. Safe to retry with backoff. |
 | `ServiceUnavailable` | 503 | Transient infrastructure outage: IdP contract call failed/timed out, AuthZ PDP transport failure, DB connectivity loss. `retry_after_seconds` populated when the caller has a defensible retry-budget hint (e.g. IdP-supplied `Retry-After`); absent for DB outages where no SLA hint is available. |
-| `Unimplemented` | 501 | IdP plugin does not support the requested administrative operation. |
+| `Unimplemented` | 501 | IdP plugin does not support the requested administrative operation — including the whole service-account half, which a tenant-only or user-only adapter declines through the contract's default implementations. Never a simulated success. |
 | `Internal` | 500 | Unexpected internal failure. The audit-only `diagnostic` field is recorded server-side; the public `detail` is generic. |
 
 Renaming the canonical-error mapping above requires a contract-version bump (per `dod-errors-observability-versioning-discipline`).
@@ -1416,6 +1472,7 @@ AM uses `PolicyEnforcer` as the PEP boundary. AuthZ decisions are delegated to t
 | User (IdP proxy) | `gts.cf.core.am.user.v1~` | `OWNER_TENANT_ID` |
 | TenantMetadata | `gts.cf.core.am.tenant_metadata.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID`, `SCHEMA_ID` |
 | ConversionRequest | `gts.cf.core.am.conversion_request.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID` |
+| ServiceAccount (IdP-backed machine identity) | `gts.cf.core.am.service_account.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID` |
 
 | Action | Resource Type | Purpose |
 |--------|---------------|---------|
@@ -1423,8 +1480,19 @@ AM uses `PolicyEnforcer` as the PEP boundary. AuthZ decisions are delegated to t
 | `read`, `write` | ConversionRequest | Create, discover, and resolve dual-consent conversion requests |
 | `create`, `update`, `delete`, `list` | User | IdP-backed user lifecycle operations exposed through the AM user proxy surface |
 | `read`, `write`, `delete`, `list` | TenantMetadata | Schema-scoped metadata CRUD and listing |
+| `create`, `list`, `rotate_secret`, `revoke` | ServiceAccount | IdP-backed machine-identity lifecycle. Per-verb rather than a read/write/delete triad: minting a credential and re-keying an existing account are separately grantable, so an operator who may rotate need not be able to create |
 
 `Tenant.list_children` remains separate from `Tenant.read` because hierarchy enumeration exposes collection-level structure and barrier-sensitive topology, not just one tenant object.
+
+`ServiceAccount` is a resource type of its own rather than a flavour of `User`, and the separation is a security boundary rather than taxonomy: a grant over users must not confer machine-credential minting, and `rotate_secret` has no user-side action to inherit a permission from. It is also distinct from the service-account *subject* classification type (`cf.core.security.subject_service.v1~`) — that is what an account IS when it authenticates, this is what RBAC protects when it is managed — and the two sit in separate namespaces (`cf.core.am` vs `cf.core.security`) and are compared for equality wherever either is classified, so neither can stand in for the other. The per-account `client_id` is not policy-visible: it is an IdP-side identifier in an adapter-chosen format, so a policy keyed on it could not be written portably; `RESOURCE_ID` carries the tenant id, which is also what lets the compiled subtree clamp resolve through the `tenants` entity.
+
+#### Credential Handling on the Machine-Identity Surface
+
+Service-account operations are the only AM path that carries a live credential, and two rules follow from that rather than from the general control-plane posture:
+
+**One-time disclosure.** A client secret enters AM only in a successful provision or rotate result and remains wrapped in a redacting, zeroize-on-drop, non-serializable secret type through the public boundary. There is no read-back path in the REST surface, the SDK, or the plugin contract, so recovery from a lost secret is a rotation. REST serialises the one-time value into the two credential-bearing responses, both carrying `Cache-Control: no-store`; an in-process `AccountManagementClient` caller may expose it only to transfer it into its own credential custodian. AM never persists, logs, caches, audits, or re-reads the plaintext.
+
+**Provider failure text is discarded, not digested.** The tenant and user halves of the IdP contract forward a non-reversible FNV digest of the provider's `detail` so operators can correlate a redacted envelope with the raw vendor response. The machine-identity half forwards nothing: each failure category is answered with a fixed AM-owned message, and the only record kept is the category label, the discarded text's length, and whether a field was attributed. Character filtering was tried and removed — a credential such as `secret=abc123` is ordinary ASCII graphic text, so no filter or length cap distinguishes it from operator prose; each only launders or bounds a leak. Adapter-attributed field names are discarded on the same grounds, so every provider-sourced rejection is attributed to `request` as a whole. The obligation this shifts onto adapters is stated normatively in the contract: **log your own diagnostics in-process**, where you alone know what is safe to emit.
 
 AM performs unscoped hierarchy reads only for structural validation that cannot be expressed through a single tenant access scope, such as parent-status checks, root invariants, child-count validation, and metadata inheritance stopping at barriers. Those reads do not bypass policy for data disclosure and do not replace AuthZ.
 

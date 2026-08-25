@@ -1,9 +1,9 @@
 // Created: 2026-06-10 by Constructor Tech
 // @cpt-dod:cpt-cf-clst-dod-smoke-tests-watch:p1
-//! Contract smoke tests: watch lifecycle across all three watch types
+//! Contract smoke tests: watch lifecycle across both watch types
 //! (`cpt-cf-clst-dod-smoke-tests-watch`).
 //!
-//! Each of the cache, leader, and service watches must surface the full
+//! Each of the cache and leader watches must surface the full
 //! watch-union (`Event`/`Lagged`/`Reset`/`Closed`), preserve per-key ordering,
 //! and deliver each event at most once. The union signals are injected through
 //! the public `*Watch::channel` seam (the same seam every backend drives), and
@@ -17,16 +17,11 @@ use std::sync::Arc;
 use cluster_sdk::cache::{
     CacheEvent, CacheWatch, CacheWatchEvent, ClusterCacheBackend, ClusterCacheV1, PutRequest, Ttl,
 };
-use cluster_sdk::discovery::{
-    InstanceState, ServiceInstance, ServiceWatch, ServiceWatchEvent, TopologyChange,
-};
 use cluster_sdk::error::{ClusterError, ProviderErrorKind};
 use cluster_sdk::leader::{LeaderStatus, LeaderWatch, LeaderWatchEvent};
 use cluster_sdk::profile::ClusterProfile;
 use cluster_sdk::registration::register_cache_backend;
 use common::{MemCacheBackend, SmokeProfile};
-use std::collections::HashMap;
-use std::time::SystemTime;
 use toolkit::client_hub::ClientHub;
 
 #[tokio::test]
@@ -126,56 +121,6 @@ async fn leader_watch_surfaces_status_lagged_reset_closed() {
 }
 
 #[tokio::test]
-async fn service_watch_surfaces_change_lagged_reset_closed_in_order() {
-    // @cpt-begin:cpt-cf-clst-flow-service-discovery-watch:p1:inst-tw-subscribe
-    let (tx, mut watch) = ServiceWatch::channel(8);
-    // @cpt-end:cpt-cf-clst-flow-service-discovery-watch:p1:inst-tw-subscribe
-    assert!(
-        tx.send(ServiceWatchEvent::Change(TopologyChange::Joined(instance(
-            "i-1"
-        ))))
-        .await
-        .is_ok()
-    );
-    assert!(
-        tx.send(ServiceWatchEvent::Lagged { dropped: 9 })
-            .await
-            .is_ok()
-    );
-    assert!(tx.send(ServiceWatchEvent::Reset).await.is_ok());
-    assert!(
-        tx.send(ServiceWatchEvent::Closed(ClusterError::Shutdown))
-            .await
-            .is_ok()
-    );
-
-    // @cpt-begin:cpt-cf-clst-flow-service-discovery-watch:p1:inst-tw-filter
-    assert!(matches!(
-        watch.recv().await,
-        Some(ServiceWatchEvent::Change(TopologyChange::Joined(i))) if i.instance_id == "i-1"
-    ));
-    // @cpt-end:cpt-cf-clst-flow-service-discovery-watch:p1:inst-tw-filter
-    // @cpt-begin:cpt-cf-clst-flow-service-discovery-watch:p1:inst-tw-lag
-    assert!(matches!(
-        watch.recv().await,
-        Some(ServiceWatchEvent::Lagged { dropped: 9 })
-    ));
-    assert!(matches!(watch.recv().await, Some(ServiceWatchEvent::Reset)));
-    // @cpt-end:cpt-cf-clst-flow-service-discovery-watch:p1:inst-tw-lag
-    // @cpt-begin:cpt-cf-clst-flow-service-discovery-watch:p1:inst-tw-closed
-    assert!(matches!(
-        watch.recv().await,
-        Some(ServiceWatchEvent::Closed(ClusterError::Shutdown))
-    ));
-    // @cpt-end:cpt-cf-clst-flow-service-discovery-watch:p1:inst-tw-closed
-    // Each event was delivered exactly once; the stream then ends.
-    // @cpt-begin:cpt-cf-clst-flow-service-discovery-watch:p1:inst-tw-stop
-    drop(tx);
-    assert!(watch.recv().await.is_none());
-    // @cpt-end:cpt-cf-clst-flow-service-discovery-watch:p1:inst-tw-stop
-}
-
-#[tokio::test]
 async fn cache_watch_preserves_per_key_ordering_end_to_end() {
     let hub = ClientHub::new();
     let cache: Arc<dyn ClusterCacheBackend> = MemCacheBackend::linearizable();
@@ -229,15 +174,4 @@ async fn cache_watch_preserves_per_key_ordering_end_to_end() {
         watch.recv().await,
         Some(CacheWatchEvent::Event(CacheEvent::Deleted { key })) if key == "k"
     ));
-}
-
-/// A minimal discoverable instance for the topology-change assertions.
-fn instance(id: &str) -> ServiceInstance {
-    ServiceInstance {
-        instance_id: id.to_owned(),
-        address: "10.0.0.1:9000".to_owned(),
-        metadata: HashMap::new(),
-        state: InstanceState::Enabled,
-        registered_at: SystemTime::UNIX_EPOCH,
-    }
 }

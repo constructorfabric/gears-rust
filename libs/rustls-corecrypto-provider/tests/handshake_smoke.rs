@@ -14,6 +14,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,7 @@ use std::time::Duration;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, Stream};
 use rustls_corecrypto_provider::{default_provider, fips_provider};
+use serial_test::file_serial;
 
 /// Custom verifier that accepts any server certificate but routes
 /// signature verification through our provider's `SUPPORTED_SIG_ALGS`.
@@ -75,16 +77,99 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
     }
 }
 
+/// Resolve a genuine OpenSSL binary for the `s_server` handshake peer.
+///
+/// These tests use OpenSSL-3 `s_server` syntax that Apple's bundled
+/// **LibreSSL** does not support: the `-ciphersuites` flag (TLS 1.3) and the
+/// `-accept host:port` form (LibreSSL wants a bare port and fails with
+/// `getservbyname failure`). Depending on `$PATH` ordering — notably under a
+/// login shell (`bash -lc`), where `/usr/bin` can precede Homebrew/MacPorts —
+/// a bare `openssl` may resolve to LibreSSL and make every spawn exit
+/// immediately.
+///
+/// Probe order: `$OPENSSL_BIN` override, then `openssl` on `PATH`, then the
+/// common Homebrew/MacPorts/`/usr/local` locations. The first candidate whose
+/// `version` reports "OpenSSL" (not "LibreSSL") wins. Returns `None` when only
+/// LibreSSL (or nothing) is available, so callers can skip rather than fail.
+fn resolve_openssl() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("OPENSSL_BIN") {
+        if !p.is_empty() {
+            candidates.push(PathBuf::from(p));
+        }
+    }
+    candidates.push(PathBuf::from("openssl")); // resolved via PATH
+    for p in [
+        "/opt/homebrew/bin/openssl",
+        "/opt/local/bin/openssl",
+        "/usr/local/bin/openssl",
+    ] {
+        candidates.push(PathBuf::from(p));
+    }
+
+    for bin in candidates {
+        let Ok(out) = Command::new(&bin).arg("version").output() else {
+            continue;
+        };
+        if out.status.success() && String::from_utf8_lossy(&out.stdout).starts_with("OpenSSL") {
+            return Some(bin);
+        }
+    }
+    None
+}
+
+/// Resolve a genuine OpenSSL binary or emit a skip notice and return `None`.
+///
+/// Each `s_server`-based test calls this first and returns early when it is
+/// `None`, so environments with only LibreSSL (e.g. a benchmark harness that
+/// shells out via `bash -lc`) are skipped with a clear reason instead of
+/// panicking. CI and dev machines with a real OpenSSL keep full coverage.
+fn openssl_or_skip() -> Option<PathBuf> {
+    let resolved = resolve_openssl();
+    if resolved.is_none() {
+        eprintln!(
+            "SKIP: no genuine OpenSSL binary found (checked $OPENSSL_BIN, PATH, \
+             and Homebrew/MacPorts/local paths). Apple's LibreSSL is not usable \
+             here: its s_server lacks `-ciphersuites` and rejects `-accept \
+             host:port`. Set OPENSSL_BIN to a real OpenSSL to run these tests."
+        );
+    }
+    resolved
+}
+
+/// RAII guard for a spawned `openssl s_server`.
+///
+/// `std::process::Child` does **not** terminate the process on drop, so any
+/// panic between spawn and an explicit `kill()`/`wait()` — e.g. inside
+/// `do_handshake_and_get` or socket setup — would leak the server process.
+/// This guard reaps the child in `Drop`, making cleanup unwind-safe. The
+/// tempdir holding the cert/key is held alongside so it outlives the server.
+struct SServer {
+    child: Child,
+    /// Port the server is listening on.
+    port: u16,
+    _tmp: tempfile::TempDir,
+}
+
+impl Drop for SServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Spawn openssl s_server with a fresh self-signed cert/key.
 ///
-/// Returns (child handle, listening port, tempdir holding cert files).
-fn spawn_s_server(extra_args: &[&str]) -> (Child, u16, tempfile::TempDir) {
+/// `openssl` is a genuine OpenSSL binary from [`resolve_openssl`]. Returns an
+/// [`SServer`] guard that carries the child handle, listening port, and the
+/// tempdir holding cert files, and reaps the child on drop.
+fn spawn_s_server(openssl: &Path, extra_args: &[&str]) -> SServer {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cert = tmp.path().join("cert.pem");
     let key = tmp.path().join("key.pem");
 
     // Generate self-signed RSA 2048 cert valid for localhost.
-    let req = Command::new("openssl")
+    let req = Command::new(openssl)
         .args([
             "req",
             "-x509",
@@ -108,18 +193,32 @@ fn spawn_s_server(extra_args: &[&str]) -> (Child, u16, tempfile::TempDir) {
         .expect("openssl req");
     assert!(req.success(), "openssl req failed");
 
-    // Reserve an ephemeral port from the OS, then release it immediately
-    // so openssl can bind to the same number. There's a tiny TOCTOU race
-    // window, but in practice the OS doesn't recycle ports that fast — and
-    // if a collision happens we retry up to 5 times.
-    for _ in 0..5 {
+    // Reserve an ephemeral port, release it, then let openssl bind to it.
+    // There is a TOCTOU window: between dropping our listener and openssl
+    // binding, another process can steal the port. We detect that by
+    // observing the child exit, and retry with a fresh port. openssl
+    // startup + 2048-bit RSA key parse is a sub-second operation, so a
+    // 30s ceiling is generous headroom even on a saturated machine while
+    // still failing fast on a genuine wedge (nextest has no configured
+    // slow-timeout that would terminate a longer hang).
+    //
+    // s_server stderr is redirected to a file (not discarded) so that a
+    // genuine startup failure surfaces its actual message + exit code in the
+    // diagnostics below, rather than a bare "exited early". stdin is pinned
+    // to /dev/null so the peer never inherits a TTY and behaves identically
+    // regardless of how the test runner was launched.
+    const MAX_ATTEMPTS: usize = 5;
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const MAX_WAIT: Duration = Duration::from_secs(30);
+    let stderr_path = tmp.path().join("s_server.stderr");
+    for attempt in 0..MAX_ATTEMPTS {
         let port = match TcpListener::bind("127.0.0.1:0") {
             Ok(l) => l.local_addr().expect("local_addr").port(),
             Err(_) => continue,
         };
         // Listener dropped here; openssl can reclaim the port.
 
-        let mut cmd = Command::new("openssl");
+        let mut cmd = Command::new(openssl);
         cmd.args([
             "s_server",
             "-cert",
@@ -127,27 +226,68 @@ fn spawn_s_server(extra_args: &[&str]) -> (Child, u16, tempfile::TempDir) {
             "-key",
             key.to_str().unwrap(),
             "-accept",
-            &port.to_string(),
+            &format!("127.0.0.1:{port}"),
             "-www",
             "-quiet",
         ]);
         for a in extra_args {
             cmd.arg(a);
         }
-        let Ok(mut child) = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn() else {
+        let stderr_sink = std::fs::File::create(&stderr_path).expect("create s_server stderr file");
+        let Ok(mut child) = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_sink))
+            .spawn()
+        else {
             continue;
         };
 
-        // Wait briefly for the server to bind. Up to 1s.
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(50));
-            if TcpStream::connect(("localhost", port)).is_ok() {
-                return (child, port, tmp);
+        let deadline = std::time::Instant::now() + MAX_WAIT;
+        loop {
+            // Observe the child FIRST. If openssl exited (e.g. the port was
+            // stolen in the TOCTOU window and its bind failed), a later
+            // connect() could succeed against a DIFFERENT listener that now
+            // owns the port — handing back a dead child and a port we don't
+            // own. Reap the child and retry with a fresh port instead.
+            if let Ok(Some(status)) = child.try_wait() {
+                let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+                eprintln!(
+                    "openssl s_server exited early on attempt {}/{MAX_ATTEMPTS} \
+                     (port {port}, {status}); retrying with a new port. stderr:\n{}",
+                    attempt + 1,
+                    stderr.trim()
+                );
+                break;
             }
+            // Child still alive: a successful connect means our server is
+            // ready and owns the port.
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return SServer {
+                    child,
+                    port,
+                    _tmp: tmp,
+                };
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "openssl s_server did not become ready within {MAX_WAIT:?} \
+                     on attempt {}/{MAX_ATTEMPTS} (port {port})",
+                    attempt + 1
+                );
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
-        let _ = child.kill();
     }
-    panic!("could not bind openssl s_server on an ephemeral port after 5 attempts");
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    panic!(
+        "openssl s_server ({}) failed to start after {MAX_ATTEMPTS} attempts \
+         (all exited early). Last stderr:\n{}",
+        openssl.display(),
+        stderr.trim()
+    );
 }
 
 fn client_config() -> ClientConfig {
@@ -196,11 +336,16 @@ fn do_handshake_and_get(
 /// ECDHE P-256, RSA-PSS-SHA256 signature verification, AEAD encrypt+decrypt
 /// of TLS 1.3 wire records.
 #[test]
+#[file_serial(openssl_s_server)]
 fn handshake_tls13_aes128_gcm_sha256() {
-    let (mut server, port, _tmp) =
-        spawn_s_server(&["-tls1_3", "-ciphersuites", "TLS_AES_128_GCM_SHA256"]);
-    let (version, suite, body) = do_handshake_and_get(client_config(), port);
-    let _ = server.kill();
+    let Some(openssl) = openssl_or_skip() else {
+        return;
+    };
+    let server = spawn_s_server(
+        &openssl,
+        &["-tls1_3", "-ciphersuites", "TLS_AES_128_GCM_SHA256"],
+    );
+    let (version, suite, body) = do_handshake_and_get(client_config(), server.port);
 
     assert_eq!(version, rustls::ProtocolVersion::TLSv1_3);
     assert_eq!(suite.suite(), rustls::CipherSuite::TLS13_AES_128_GCM_SHA256);
@@ -215,11 +360,16 @@ fn handshake_tls13_aes128_gcm_sha256() {
 /// Full TLS 1.3 handshake: AES-256-GCM-SHA384. Different hash, HKDF, and
 /// AEAD key length — catches bugs that only manifest with the longer suite.
 #[test]
+#[file_serial(openssl_s_server)]
 fn handshake_tls13_aes256_gcm_sha384() {
-    let (mut server, port, _tmp) =
-        spawn_s_server(&["-tls1_3", "-ciphersuites", "TLS_AES_256_GCM_SHA384"]);
-    let (version, suite, body) = do_handshake_and_get(client_config(), port);
-    let _ = server.kill();
+    let Some(openssl) = openssl_or_skip() else {
+        return;
+    };
+    let server = spawn_s_server(
+        &openssl,
+        &["-tls1_3", "-ciphersuites", "TLS_AES_256_GCM_SHA384"],
+    );
+    let (version, suite, body) = do_handshake_and_get(client_config(), server.port);
 
     assert_eq!(version, rustls::ProtocolVersion::TLSv1_3);
     assert_eq!(suite.suite(), rustls::CipherSuite::TLS13_AES_256_GCM_SHA384);
@@ -235,11 +385,16 @@ fn handshake_tls13_aes256_gcm_sha384() {
 /// TLS-1.3-only — TLS 1.2 negotiation cannot succeed.
 #[cfg(not(feature = "fips"))]
 #[test]
+#[file_serial(openssl_s_server)]
 fn handshake_tls12_ecdhe_rsa_aes256_gcm_sha384() {
-    let (mut server, port, _tmp) =
-        spawn_s_server(&["-tls1_2", "-cipher", "ECDHE-RSA-AES256-GCM-SHA384"]);
-    let (version, suite, body) = do_handshake_and_get(client_config(), port);
-    let _ = server.kill();
+    let Some(openssl) = openssl_or_skip() else {
+        return;
+    };
+    let server = spawn_s_server(
+        &openssl,
+        &["-tls1_2", "-cipher", "ECDHE-RSA-AES256-GCM-SHA384"],
+    );
+    let (version, suite, body) = do_handshake_and_get(client_config(), server.port);
 
     assert_eq!(version, rustls::ProtocolVersion::TLSv1_2);
     assert_eq!(
@@ -473,22 +628,29 @@ fn server_handshake_tls12_ecdhe_ecdsa() {
 /// the server to offer only `rsa_pkcs1_sha256`; rustls then has no
 /// admissible TLS 1.3 sig-alg overlap and the handshake terminates.
 #[test]
+#[file_serial(openssl_s_server)]
 fn tls13_pkcs1_v1_5_certificate_verify_is_rejected() {
+    let Some(openssl) = openssl_or_skip() else {
+        return;
+    };
     // `-sigalgs rsa_pkcs1_sha256` restricts openssl's offered signature
     // schemes; under TLS 1.3 this is the disallowed half of the surface.
-    let (mut server, port, _tmp) = spawn_s_server(&[
-        "-tls1_3",
-        "-ciphersuites",
-        "TLS_AES_256_GCM_SHA384",
-        "-sigalgs",
-        "rsa_pkcs1_sha256",
-    ]);
+    let server = spawn_s_server(
+        &openssl,
+        &[
+            "-tls1_3",
+            "-ciphersuites",
+            "TLS_AES_256_GCM_SHA384",
+            "-sigalgs",
+            "rsa_pkcs1_sha256",
+        ],
+    );
 
     // Drive a real handshake. We expect failure — either at sig-alg
     // negotiation (`NoCommonSignatureAlgorithms`-style) or at
     // CertificateVerify validation. Both are acceptable; the contract
     // is "must not complete with PKCS#1 v1.5 in TLS 1.3".
-    let mut sock = TcpStream::connect(("localhost", port)).expect("tcp connect");
+    let mut sock = TcpStream::connect(("localhost", server.port)).expect("tcp connect");
     sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     sock.set_write_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -501,7 +663,6 @@ fn tls13_pkcs1_v1_5_certificate_verify_is_rejected() {
     // Failure mode is `Err`; on success (i.e. regression) we keep going
     // and surface it via the version/suite check.
     let neg_version = conn.protocol_version();
-    let _ = server.kill();
 
     assert!(
         probe.is_err() || neg_version.is_none(),

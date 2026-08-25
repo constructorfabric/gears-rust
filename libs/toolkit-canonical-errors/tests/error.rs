@@ -1,7 +1,7 @@
 extern crate toolkit_canonical_errors;
 
 use toolkit_canonical_errors::resource_error;
-use toolkit_canonical_errors::{CanonicalError, Problem};
+use toolkit_canonical_errors::{CanonicalError, Http, Problem};
 use toolkit_gts::{GtsId, gts_id};
 
 #[resource_error(gts_id!("cf.core.users.user.v1~"))]
@@ -95,8 +95,89 @@ fn all_16_categories_convert_to_problem() {
         let problem = Problem::from(err);
         assert!(!problem.problem_type.is_empty());
         assert!(!problem.title.is_empty());
-        assert!(problem.status > 0);
+        assert!(problem.status > Some(0));
     }
+}
+
+// =========================================================================
+// Transport overrides
+// =========================================================================
+
+#[test]
+fn no_override_returns_category_default_status() {
+    let err = R::not_found("Resource not found")
+        .with_resource("user-123")
+        .create();
+    assert_eq!(err.status_code(), 404);
+    assert_eq!(err.http_status_override(), None);
+}
+
+#[test]
+fn override_changes_status_but_not_category() {
+    let err = R::not_found("Resource permanently removed")
+        .with_resource("user-123")
+        .with_override(Http::status_code(410))
+        .create();
+    assert_eq!(err.status_code(), 410);
+    assert_eq!(err.http_status_override(), Some(410));
+    assert_eq!(
+        err.gts_type(),
+        gts_id!("cf.core.errors.err.v1~cf.core.err.not_found.v1~")
+    );
+    assert_eq!(err.title(), "Not Found");
+}
+
+#[test]
+fn override_on_service_unavailable_builder() {
+    let err = CanonicalError::service_unavailable()
+        .with_retry_after_seconds(30)
+        .with_override(Http::status_code(503))
+        .create();
+    assert_eq!(err.status_code(), 503);
+    assert_eq!(err.http_status_override(), Some(503));
+}
+
+#[test]
+fn override_before_or_after_with_resource_is_equivalent() {
+    let before = R::not_found("Resource permanently removed")
+        .with_override(Http::status_code(410))
+        .with_resource("user-123")
+        .create();
+    let after = R::not_found("Resource permanently removed")
+        .with_resource("user-123")
+        .with_override(Http::status_code(410))
+        .create();
+    assert_eq!(before.status_code(), after.status_code());
+    assert_eq!(before.resource_name(), after.resource_name());
+    assert_eq!(before.detail(), after.detail());
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "different HTTP status class")]
+fn create_panics_in_debug_on_cross_class_override() {
+    // debug_assert! only fires with debug assertions enabled (the default
+    // for `cargo test`); skipped entirely in release builds via the cfg.
+    drop(
+        R::invalid_argument()
+            .with_field_violation("field", "bad format", "INVALID_FORMAT")
+            .with_override(Http::status_code(500))
+            .create(),
+    );
+}
+
+#[test]
+fn reapplying_override_for_same_transport_replaces_prior_value() {
+    // Both overrides stay in the 4xx class (same as `not_found`'s 404
+    // default) so this only exercises "replaces prior value", not the
+    // separate cross-class-override assertion covered by
+    // `create_panics_in_debug_on_cross_class_override`.
+    let err = R::not_found("Resource not found")
+        .with_resource("user-123")
+        .with_override(Http::status_code(410))
+        .with_override(Http::status_code(422))
+        .create();
+    assert_eq!(err.status_code(), 422);
 }
 
 // =========================================================================

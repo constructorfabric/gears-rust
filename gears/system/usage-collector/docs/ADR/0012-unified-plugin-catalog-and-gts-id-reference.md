@@ -290,7 +290,7 @@ inputs/outputs table), DECOMPOSITION (catalog-row shape bullet), the
 usage-type-lifecycle feature (every row-shape mention + the changelog),
 and the OpenAPI YAML (the `UsageTypeRecord` and
 `CreateUsageTypeRequest` schemas merge into a single `UsageType`
-schema; `UsageTypeList.items` references it; the `created_at`
+schema; `Page_UsageType.items` references it; the `created_at`
 property is dropped). The wire shape is broken at the `v1` surface
 because this is pre-release foundation work.
 

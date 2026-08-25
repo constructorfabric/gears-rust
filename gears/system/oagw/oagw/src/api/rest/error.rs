@@ -584,7 +584,7 @@ mod tests {
             instance: "/oagw/v1/upstreams".into(),
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE);
         assert_eq!(p.title, "Invalid Argument");
         // `instance` is filled by the canonical error middleware on the
@@ -618,7 +618,7 @@ mod tests {
         // doesn't lie about which field was bad.
         let err = DomainError::validation("alias must be 1-63 chars");
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE);
         // No field_violations array — this is the Format variant.
         assert!(
@@ -643,7 +643,7 @@ mod tests {
             detail: "alias already exists".into(),
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 409);
+        assert_eq!(p.status, Some(409));
         assert_eq!(p.problem_type, ALREADY_EXISTS_TYPE);
         assert_eq!(p.context["resource_name"], "my-alias");
         assert_eq!(p.title, "Already Exists");
@@ -660,7 +660,7 @@ mod tests {
             reset_epoch: Some(1706626800),
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 429);
+        assert_eq!(p.status, Some(429));
         assert_eq!(p.problem_type, RESOURCE_EXHAUSTED_TYPE);
     }
 
@@ -671,7 +671,7 @@ mod tests {
             id: uuid::Uuid::nil(),
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 404);
+        assert_eq!(p.status, Some(404));
         assert_eq!(p.problem_type, NOT_FOUND_TYPE);
     }
 
@@ -682,7 +682,7 @@ mod tests {
             detail: "auth plugin not registered".into(),
         };
         let p: Problem = auth.into_test_problem();
-        assert_eq!(p.status, 404);
+        assert_eq!(p.status, Some(404));
         assert_eq!(p.context["resource_type"], gts::AUTH_PLUGIN_SCHEMA);
         assert_eq!(
             p.context["resource_name"],
@@ -701,7 +701,7 @@ mod tests {
             detail: "transform plugin in use".into(),
         };
         let p: Problem = xform.into_test_problem();
-        assert_eq!(p.status, 409);
+        assert_eq!(p.status, Some(409));
         assert_eq!(p.context["resource_type"], gts::TRANSFORM_PLUGIN_SCHEMA);
     }
 
@@ -713,7 +713,7 @@ mod tests {
         // the per-failure-mode default.
         fn assert_retry(err: DomainError, expected: u64, label: &str) {
             let p: Problem = err.into_test_problem();
-            assert_eq!(p.status, 503, "{label} should map to 503");
+            assert_eq!(p.status, Some(503), "{label} should map to 503");
             assert_eq!(
                 p.context["retry_after_seconds"].as_u64(),
                 Some(expected),
@@ -790,7 +790,7 @@ mod tests {
         };
         let p: Problem = err.into_test_problem();
         // ⚠ wire change accepted in the migration plan: 413 → 400.
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
     }
 
     #[test]
@@ -801,7 +801,7 @@ mod tests {
         };
         let p: Problem = err.into_test_problem();
         // ⚠ wire change accepted in the migration plan: 502 → 503.
-        assert_eq!(p.status, 503);
+        assert_eq!(p.status, Some(503));
     }
 
     #[test]
@@ -811,7 +811,7 @@ mod tests {
             instance: "/oagw/v1/proxy/api.openai.com/v1/chat".into(),
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 503);
+        assert_eq!(p.status, Some(503));
     }
 
     #[test]
@@ -821,7 +821,7 @@ mod tests {
             instance: "/oagw/v1/proxy/api.openai.com/v1/chat".into(),
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 503);
+        assert_eq!(p.status, Some(503));
     }
 
     #[test]
@@ -990,7 +990,7 @@ mod tests {
             resource_id: None,
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 403);
+        assert_eq!(p.status, Some(403));
     }
 
     #[test]
@@ -1003,7 +1003,7 @@ mod tests {
             resource_id: None,
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 503);
+        assert_eq!(p.status, Some(503));
     }
 
     #[test]
@@ -1016,7 +1016,7 @@ mod tests {
             resource_id: None,
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
     }
 
     #[test]
@@ -1029,7 +1029,7 @@ mod tests {
             resource_id: None,
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
     }
 
     #[test]
@@ -1042,7 +1042,7 @@ mod tests {
             resource_id: None,
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
     }
 
     #[test]
@@ -1055,7 +1055,7 @@ mod tests {
             resource_id: Some("widget-42".into()),
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 404);
+        assert_eq!(p.status, Some(404));
         assert_eq!(p.problem_type, NOT_FOUND_TYPE);
         assert_eq!(p.context["resource_name"], "widget-42");
         assert_eq!(p.context["resource_type"], gts::GUARD_PLUGIN_SCHEMA);
@@ -1071,7 +1071,7 @@ mod tests {
             resource_id: None,
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(
             p.problem_type,
             gts_uri!("cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~")
@@ -1090,7 +1090,7 @@ mod tests {
             instance: "/test".into(),
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(
             p.problem_type,
             gts_uri!("cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~")
@@ -1107,7 +1107,7 @@ mod tests {
             resource_id: Some("invoice-7".into()),
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 409);
+        assert_eq!(p.status, Some(409));
         assert_eq!(p.problem_type, ALREADY_EXISTS_TYPE);
         assert_eq!(p.context["resource_name"], "invoice-7");
         assert_eq!(p.context["resource_type"], gts::GUARD_PLUGIN_SCHEMA);
@@ -1123,7 +1123,7 @@ mod tests {
             resource_id: None,
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 409);
+        assert_eq!(p.status, Some(409));
         assert_eq!(
             p.problem_type,
             gts_uri!("cf.core.errors.err.v1~cf.core.err.aborted.v1~")
@@ -1147,7 +1147,7 @@ mod tests {
                 instance: "/test".into(),
             };
             let p: Problem = err.into_test_problem();
-            assert_eq!(p.status, 401);
+            assert_eq!(p.status, Some(401));
             assert_eq!(
                 p.problem_type,
                 gts_uri!("cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~")
@@ -1169,7 +1169,7 @@ mod tests {
             "subject not allowed to act outside its tenant",
         );
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, 403);
+        assert_eq!(p.status, Some(403));
         assert_eq!(
             p.context["reason"],
             reason::permission::TENANT_BOUNDARY_VIOLATION

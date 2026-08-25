@@ -86,7 +86,7 @@ Constructor Gears deliberately does **not**:
 ## Key defining characteristics
 
 1. **Secure by default (defense-in-depth)** — security is structural, not opt-in, validated at build time.
-2. **Architecture enforced at compile time** - use custom lint rules via `dylint`
+2. **Architecture enforced at compile time** - use custom lint rules via `cargo gears lint`
 3. **Three-tier gears hierarchy** — toolkit, System gears, Service gears.
 4. **Composable libraries, vendor-controlled deployment** — own API + DB, SDK facades local vs. remote.
 5. **Local-first shift-left development** - run and test everything locally, LLM-friendly
@@ -120,21 +120,21 @@ The platform owns a **linear security data-path**:
 
 Custom static analysis is a **core architectural mechanism**, not a coding aid.
 
-- `tools/dylint_lints/` — a dedicated Dylint suite that checks:
+- Architecture lints (in `cargo-gears` CLI) — a dedicated `cargo gears lint` suite that checks:
   - contract-layer purity, DTO placement & schema derives
   - domain-layer isolation, direct-SQL restrictions
   - versioned REST paths, mandatory `OperationBuilder` metadata
   - OData extension usage, GTS* identifier correctness
 - Runs alongside Clippy + CI → **violations fail fast, before review or runtime**
 
-> "Shift-left": architecture that lives in markdown decays; Dylint makes it executable.
-> GTS* = Global Type System identifers like `gts.cf.core.events.v1~a.b.c.d.v1~`
+> "Shift-left": architecture that lives in markdown decays; `cargo gears lint` makes it executable.
+> GTS* = Global Type System identifiers like `gts.cf.core.events.v1~a.b.c.d.v1~`
 
 ---
 
-## Dylint — compile-time architecture validation
+## `cargo gears lint` — compile-time architecture validation
 
-Repository-specific lints in `tools/dylint_lints/` make the design **executable** — not just documented - code won't compile in case of violation:
+Repository-specific architecture lints (via `cargo gears lint`) make the design **executable** — not just documented - code won't compile in case of violation:
 
 - **Domain-layer isolation** — no infra imports (`sqlx`, `sea_orm`, ...) in `domain/`
 - **Direct-SQL restriction** — raw SQL only in migration infrastructure
@@ -145,7 +145,7 @@ Repository-specific lints in `tools/dylint_lints/` make the design **executable*
 - **GTS identifier correctness** — valid IDs; no `schema_for!` on GTS structs
 - ...
 
-> Runs Dylint in CI → architecture violations **fail the build** before review or runtime.
+> Runs `cargo gears lint` in CI → architecture violations **fail the build** before review or runtime.
 
 ---
 
@@ -216,7 +216,7 @@ Every backbone concern is a **regular, replaceable gear** with its own SDK:
 ## Engineering principles (how we work)
 
 - **Spec-Driven Development** — PRD → Design & ADR → Feature *before* code
-- **Code validation** — custom Dylints + Clippy + tests + fuzzing + audits in CI
+- **Code validation** — custom architecture lints + Clippy + tests + fuzzing + audits in CI
 - **Quality First** — 90%+ coverage target across unit / integration / E2E / perf / security
 - **Core in Rust** — compile-time safety + deep static analysis
 - **Monorepo** — atomic refactors, consistent tooling, realistic local E2E
@@ -236,7 +236,7 @@ correctness, and maintainability matter more than raw implementation speed.
 
 - **Compile-time safety** — eliminates broad classes of memory & concurrency bugs
 - **Great fit for reusable platform code** — predictable perf, explicit interfaces
-- **Static analysis as architecture** — Clippy + custom Dylints enforce rules at build
+- **Static analysis as architecture** — Clippy + custom architecture lints enforce rules at build
 - **Operational efficiency** — low footprint → realistic local/edge runs & E2E
 - **AI-friendly** - great compiler and linters assistant to catch problems early
 - **Universal language** — cloud/on-prem/edge, kernel + even frontend, mobile
@@ -270,14 +270,14 @@ Same gear code & API — three physical shapes via `runtime.type: local | oop`:
 ## Repository structure
 
 ```text
-cyberware-rust/
+gears-rust/
 ├─ libs/            # Toolkit — runtime substrate (middleware, DB, errors, security, macros)
 ├─ gears/
 │  ├─ system/       # Control plane (api-gateway, authn/authz, tenant, registries, oagw)
 │  └─ <service>/    # Business/domain & GenAI gears (mini-chat, file-parser, ...)
 ├─ apps/            # Executable apps composing gears (example server)
 ├─ examples/        # Reference gears (users-info, oop-gears, fips-probe)
-├─ tools/           # Dylints, CI scripts, fuzz targets
+├─ tools/           # CI scripts, fuzz targets
 └─ docs/            # Manifest, gears registry, toolkit_unified_system, arch, security
 ```
 
@@ -434,7 +434,7 @@ Gears Toolkit is the **central framework** that turns the gear architecture into
 `OperationBuilder` is the authoritative route-registration mechanism — one place declares:
 
 - HTTP method + **versioned path** (`/resource-group/v1/groups`)
-- **Auth posture** (`.authenticated()` / `.public()`) + **license posture**
+- **Auth posture** (`.authenticated()` / `.anonymous()`) + **license posture**
 - Request/response schemas, tags, summary, registered error responses
 
 Result:
@@ -533,7 +533,7 @@ Gateway middleware order:
 - **`SecurityContext` propagation** — explicit data, no thread-local magic
 - **Outbound boundary** — `oagw` centralizes egress policy + credential injection
 - **Credential handling** — `credstore` + `secrecy`-aware types
-- **Static & CI gates** — Clippy, Dylints, `cargo-deny`, CodeQL, fuzzing, Scorecard/Snyk/Aikido
+- **Static & CI gates** — Clippy, architecture lints, `cargo-deny`, CodeQL, fuzzing, Scorecard/Snyk/Aikido
 
 ---
 
@@ -562,7 +562,7 @@ without modifying core code.
 - `gts.cf.core.events.event.v1~` style IDs as a **platform contract surface**
 - GTS **JSON Schemas generated directly from Rust types** → registered in Types Registry
 - The non-HTTP counterpart to OpenAPI: describes **plugin specs, events, permissions**
-- GTS-specific **Dylints** validate identifier correctness
+- GTS-specific **architecture lints** validate identifier correctness
 
 ---
 
@@ -600,8 +600,8 @@ One platform-wide error vocabulary, aligned with the **16 gRPC categories**:
 - **Golden path** templates for new Gears (SDK + gear crate scaffolding)
 - **Type-safe REST** — `OperationBuilder` prevents half-wired routes at compile time
 - **OpenAPI auto-generated** from the same route declarations that run the service
-- **`GET /cw/docs`** live Swagger UI on the example server
-- **Architectural Dylints** enforce design rules and patterns at build time
+- **`GET /cf/docs`** live Swagger UI on the example server
+- **Architecture lints** enforce design rules and patterns at build time
 - **Rich docs**: `docs/toolkit_unified_system/` (13 topic files) + per-gear specs
 
 ---
@@ -653,15 +653,19 @@ Unit-test gate: (1) deterministic domain logic? (2) atomic & fast? (3) removing 
 
 ```bash
 git clone --recurse-submodules <repository-url>
-cd cyberware-rust
+cd gears-rust
 
-make build      # build libs + example server
-make example    # run the example server
-# → API docs at http://127.0.0.1:8087/cw/docs
+make build      # whole-project example server release binary
+make run        # run the default example server
+make example    # run with the default E2E feature set
+# → API docs at http://127.0.0.1:8087/cf/docs
+
+make build GEAR=file-parser  # build one gear + SDK package scope
+make run GEAR=file-parser    # run server with only that gear feature set
 
 # Health checks
-curl http://127.0.0.1:8087/cw/health   # detailed JSON
-curl http://127.0.0.1:8087/healthz      # liveness "ok"
+curl http://127.0.0.1:8087/cf/health   # detailed JSON
+curl http://127.0.0.1:8087/cf/healthz  # liveness "ok"
 ```
 
 Run modes: SQLite (`config/quickstart.yaml`), no-DB (`config/no-db.yaml`), or `--mock`.
@@ -671,7 +675,7 @@ Run modes: SQLite (`config/quickstart.yaml`), no-DB (`config/no-db.yaml`), or `-
 ## Configuration
 
 ```yaml
-server:   { home_dir: "~/.cyberware" }
+server:   { home_dir: "~/.cfgears" }
 database: { url: "sqlite://database/database.db", max_conns: 10 }
 gears:
   api_gateway:
@@ -681,8 +685,9 @@ gears:
     config:   { default_page_size: 5, max_page_size: 100 }
 ```
 
-Env overrides with `CYBERFABRIC_` prefix, e.g.
-`CYBERFABRIC_DATABASE_URL=postgres://...`
+Build selects compiled-in gears by Cargo feature flags. YAML config supplies each compiled-in gear's `config` and optional gear-owned `database` settings.
+
+Env overrides with `CF_` prefix, e.g. `CF_GEARS_DATABASE_URL=postgres://...`
 
 ---
 
@@ -690,10 +695,14 @@ Env overrides with `CYBERFABRIC_` prefix, e.g.
 
 ```bash
 make check           # full quality gate: fmt + clippy + test + security
+make all             # build + check + SQLite integration + E2E + OpenAPI
 make test            # unit tests (workspace)
+make test GEAR=file-parser  # unit tests for one gear + SDK scope
 make test-sqlite     # integration tests (SQLite, no external DB)
 make e2e-local       # E2E — builds + starts server automatically
+make e2e-local SUITE=file-parser  # suite E2E scope + default E2E target
 make coverage-unit   # unit-test coverage
+make coverage GEAR=file-parser   # unit + E2E coverage for one gear scope
 make fuzz            # fuzz smoke tests (30s/target)
 ```
 
@@ -733,7 +742,7 @@ On **Windows** (no `make`): `python tools/scripts/ci.py check`
 
 1. **XaaS-friendly** - built-in multi-tenancy, licensing, usage, etc
 2. **Security by architecture** — AuthN/AuthZ, tenancy, scoped DB access, FIPS 140-3
-3. **Compile-time governance** — linters and Dylints detect violations before runtime
+3. **Compile-time governance** — linters and architecture lints detect violations before runtime
 4. **Composable gear model** — single code - multiple builds and deployments
 5. **Shift-left productivity** — all-in-one gears process for local build and test
 6. **Extensible by design** — custom API data types, plugins, serverless gears
@@ -749,6 +758,6 @@ On **Windows** (no `make`): `python tools/scripts/ci.py check`
 
 *Secure · Modular · Composable · GenAI-ready*
 
-Start: `make example` → http://127.0.0.1:8087/cw/docs
+Start: `make example` → http://127.0.0.1:8087/cf/docs
 
 Apache-2.0 · Cyber Fabric Foundation

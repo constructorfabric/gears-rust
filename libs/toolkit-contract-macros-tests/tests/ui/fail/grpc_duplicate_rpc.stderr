@@ -1,0 +1,5 @@
+error: duplicate gRPC rpc_name `Dup`; each method must have a unique RPC name
+  --> tests/ui/fail/grpc_duplicate_rpc.rs:21:14
+   |
+21 |     async fn two(&self, body: String) -> Result<u32, std::io::Error>;
+   |              ^^^

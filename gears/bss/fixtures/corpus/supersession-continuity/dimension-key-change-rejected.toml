@@ -1,0 +1,48 @@
+family     = "supersession-continuity"
+id         = "dimension-key-change-rejected"
+kind       = "publish"
+provenance = ["inst-tb-supersession-units", "D-22", "D-82"]
+
+# The sibling of `meter-change-rejected`, and the other half of the counter key
+# the guard names. `dimensionKey` selects **which** counter under a meter the
+# row is denominated against - per region, per project, per whatever axis the
+# meter declares - so moving it re-points the row at a different accumulation
+# just as surely as changing the meter does, and does it more quietly, because
+# the meter name still matches.
+#
+# Both sides carry a non-empty key: an empty-to-non-empty move is also a
+# mismatch, but it would be indistinguishable from "the predecessor had no
+# dimension at all", and the case that names the guard should be the one where
+# both rows are fully specified.
+
+[predecessor]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "storage.gb"
+dimension_key           = "region"
+billing_granularity     = "per_day"
+tier_aggregation_window = "invoice_period"
+
+  [[predecessor.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 5
+
+[successor]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "storage.gb"
+dimension_key           = "project"
+billing_granularity     = "per_day"
+tier_aggregation_window = "invoice_period"
+
+  [[successor.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 5
+
+[[assert]]
+expect = { publish = "rejected", error_code = "SUPERSESSION_UNIT_MISMATCH" }
+why    = "same meter, different counter: the successor is denominated per project where the predecessor was per region, so the continued Q is not the Q this row would rate"

@@ -7,7 +7,7 @@
 //! is a Docker-gated `#[ignore]` testcontainer test.
 //!
 //! Ignored Docker tests run with
-//! `cargo test -p bss-ledger --lib 'infra::jobs::rate_sync::tests' -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --lib 'infra::jobs::rate_sync::tests' -- --ignored`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -52,20 +52,47 @@ impl RateProviderV1 for FakeProvider {
         _request_id: &str,
     ) -> Result<Vec<ProviderRate>, RateProviderError> {
         match &self.outcome {
-            Outcome::Ok(rates) => Ok(rates.clone()),
+            // Stamp this source's own id onto every rate, exactly as a real
+            // source does — the fixtures deliberately carry a different
+            // placeholder, so a rate reaching the store still labelled
+            // `unstamped` proves the provenance was never applied.
+            Outcome::Ok(rates) => Ok(rates
+                .iter()
+                .map(|r| ProviderRate {
+                    provider: self.id.clone(),
+                    ..r.clone()
+                })
+                .collect()),
             Outcome::Fail => Err(RateProviderError::Unreachable("fake outage".to_owned())),
         }
+    }
+
+    /// Always reachable. The sync job never calls this — it only fetches — so the
+    /// fake keeps it trivially `Ok` rather than modelling an outcome no assertion
+    /// here reads.
+    async fn health(
+        &self,
+        _ctx: &SecurityContext,
+        _request_id: &str,
+    ) -> Result<(), RateProviderError> {
+        Ok(())
     }
 }
 
 /// A `ProviderRate` literal (timestamp = now; staleness is the resolver's
 /// concern, not the sync job's).
+///
+/// `provider` is a placeholder the serving source overwrites with its own id,
+/// which is where the value the job stores actually comes from. Left distinct
+/// from any fake's id on purpose: an assertion on the stored provenance then
+/// fails loudly if the stamping step is ever dropped.
 fn rate(base: &str, quote: &str, rate_micro: i64) -> ProviderRate {
     ProviderRate {
         base: base.to_owned(),
         quote: quote.to_owned(),
         rate_micro,
         as_of: Utc::now(),
+        provider: "unstamped".to_owned(),
     }
 }
 
@@ -109,6 +136,28 @@ async fn configured_provider_failure_never_aborts() {
     let report = job.run().await.expect("a provider outage never aborts");
     assert!(!report.fetched);
     assert_eq!(report.rates, 0);
+}
+
+#[test]
+fn snapshot_missing_detail_carries_the_request_id_for_log_correlation() {
+    // The alarm's own fields cannot identify the outage: `provider_id` is the
+    // composite adapter's id, not the source that broke, and the error is only the
+    // LAST source a composite tried. The `request_id` is what makes the tick
+    // reconstructable — the adapter stamps the same id on a `warn` line per
+    // attempted source, so filtering by it yields the full sequence in priority
+    // order. Assert every part an operator reads, since dropping any one of them
+    // leaves the alarm unactionable.
+    let detail = snapshot_missing_detail(
+        "fx-composite",
+        "0199a3c4-1d2e-7f00-8000-000000000001",
+        &RateProviderError::Unreachable("connect timed out".to_owned()),
+    );
+    assert!(detail.contains("fx-composite"), "{detail}");
+    assert!(
+        detail.contains("request_id=0199a3c4-1d2e-7f00-8000-000000000001"),
+        "the alarm must carry the tick's request_id: {detail}"
+    );
+    assert!(detail.contains("connect timed out"), "{detail}");
 }
 
 #[tokio::test]
@@ -155,7 +204,7 @@ async fn fans_rates_out_to_every_provisioned_tenant() {
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
     for t in [tenant_a, tenant_b] {
-        raw.execute(pg(format!(
+        raw.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_fiscal_calendar
                (tenant_id, legal_entity_id, fiscal_tz, granularity, fy_start_month)
              VALUES ('{t}','{t}','UTC','MONTH',1)"

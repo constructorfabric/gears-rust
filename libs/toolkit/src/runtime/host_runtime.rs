@@ -7,11 +7,19 @@
 //! - `pre_init` (system gears only)
 //! - DB migrations (gears with DB capability)
 //! - `init` (all gears)
+//! - proxy-wiring (`#[toolkit::consumes]` clients; feature-gated)
 //! - `post_init` (system gears only; runs after *all* `init` complete)
 //! - REST wiring (gears with REST capability; requires a single REST host)
 //! - gRPC registration (gears with gRPC capability; requires a single gRPC hub)
 //! - start/stop (stateful gears)
 //! - `OoP` spawn / wait / stop (host-only orchestration)
+//!
+//! Both lifecycle paths — in-process (`run_phases_internal`) and `OoP`
+//! (`run_oop_serving`) — run these in the same relative order. Proxy-wiring in
+//! particular must stay before `start`: a gear resolving a consumed contract
+//! during its own `start` has to find the client in the `ClientHub` regardless
+//! of profile. The `OoP` path additionally has no REST-wiring, directory-register
+//! or spawn phases (`oop_serve` owns those concerns).
 
 use axum::Router;
 use std::collections::HashSet;
@@ -68,14 +76,45 @@ pub const DEFAULT_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::
 /// `HostRuntime` owns the lifecycle orchestration for `ToolKit`.
 ///
 /// It encapsulates all runtime state and drives gears through the full lifecycle (see gear docs).
+/// Read a consumer's ADR-0004 static-endpoint override for `dep_gear` from
+/// `gears.<owner_gear>.config.consumer_wiring.<dep_gear>` (a base endpoint URI
+/// string). This is the dev/test escape hatch that bypasses service discovery;
+/// returns `None` when unset.
+fn static_endpoint_override(
+    cfg: &dyn ConfigProvider,
+    owner_gear: &str,
+    dep_gear: &str,
+) -> Option<String> {
+    cfg.get_gear_config(owner_gear)?
+        .get("config")?
+        .get("consumer_wiring")?
+        .get(dep_gear)?
+        .as_str()
+        .map(str::to_owned)
+}
+
 pub struct HostRuntime {
     registry: GearRegistry,
     ctx_builder: GearContextBuilder,
     instance_id: Uuid,
     gear_manager: Arc<GearManager>,
     grpc_installers: Arc<GrpcInstallerStore>,
-    #[allow(dead_code)]
     client_hub: Arc<ClientHub>,
+    /// Per-gear config, retained for the proxy-wiring phase to read a consumer's
+    /// static-endpoint override (dev/test escape hatch, ADR-0004).
+    gears_cfg: Arc<dyn ConfigProvider>,
+    /// Process-level dependency-resolution + draining signal, published in
+    /// `client_hub` for the `/readyz` probe and updated by the proxy-wiring
+    /// readiness loop + draining watcher. In-process, an
+    /// [`ReadinessHealthcheck`](super::readiness::ReadinessHealthcheck) leaf
+    /// bridges it into the gateway's healthcheck registry.
+    dep_checker: Arc<super::readiness::DependencyChecker>,
+    /// Set once the in-process directory-register phase has advertised this
+    /// process's REST providers, so shutdown deregisters them exactly once — and
+    /// only in the in-process host path. In `OoP` serving, presence + deregister
+    /// is owned by `oop_serve`, so this stays `false` and avoids a double
+    /// deregister.
+    rest_providers_registered: std::sync::atomic::AtomicBool,
     cancel: CancellationToken,
     #[allow(dead_code)]
     db_options: DbOptions,
@@ -102,9 +141,19 @@ impl HostRuntime {
         let gear_manager = Arc::new(GearManager::new());
         let grpc_installers = Arc::new(GrpcInstallerStore::new());
 
+        // Process-level dependency/draining signal, published so the gateway's
+        // /readyz handler can fetch it (concrete-type key). Created before any
+        // phase runs.
+        let dep_checker = Arc::new(super::readiness::DependencyChecker::new());
+        client_hub.register::<super::readiness::DependencyChecker>(dep_checker.clone());
+
         // Build the context builder that will resolve per-gear DbHandles
-        let ctx_builder =
-            GearContextBuilder::new(instance_id, gears_cfg, client_hub.clone(), cancel.clone());
+        let ctx_builder = GearContextBuilder::new(
+            instance_id,
+            gears_cfg.clone(),
+            client_hub.clone(),
+            cancel.clone(),
+        );
         #[cfg(feature = "db")]
         let ctx_builder = match &db_options {
             DbOptions::Manager(mgr) => ctx_builder.with_db_manager(mgr.clone()),
@@ -118,6 +167,9 @@ impl HostRuntime {
             gear_manager,
             grpc_installers,
             client_hub,
+            gears_cfg,
+            dep_checker,
+            rest_providers_registered: std::sync::atomic::AtomicBool::new(false),
             cancel,
             db_options,
             oop_options,
@@ -143,6 +195,20 @@ impl HostRuntime {
     #[must_use]
     pub fn with_shutdown_deadline(mut self, deadline: std::time::Duration) -> Self {
         self.shutdown_deadline = deadline;
+        self
+    }
+
+    /// Set the process-wide platform-plane credential source, applied to every
+    /// [`GearCtx`](crate::context::GearCtx) this runtime builds so
+    /// `#[toolkit::provides]`-generated clients attach `X-ToolKit-Internal-Token`
+    /// on platform-plane methods. `None` (Profile 1 / in-process, or no
+    /// credential configured) attaches nothing.
+    #[must_use]
+    pub fn with_internal_token_provider(
+        mut self,
+        provider: Option<toolkit_contract::runtime::config::InternalTokenProvider>,
+    ) -> Self {
+        self.ctx_builder = self.ctx_builder.with_internal_token_provider(provider);
         self
     }
 
@@ -352,8 +418,223 @@ impl HostRuntime {
 
     /// `POST_INIT` phase: optional hook after ALL gears completed `init()`.
     ///
+    /// Consumer proxy-wiring phase (eventual readiness).
+    ///
+    /// Runs after init (compile-time / local registrations) and before
+    /// post-init. Replays each `ConsumerRegistration` emitted by
+    /// `#[toolkit::consumes]`: if a compile-time impl is already in the
+    /// `ClientHub` it wins (the wiring closure short-circuits); otherwise a
+    /// directory-resolving REST client is registered under the contract trait.
+    ///
+    /// Non-blocking: endpoint discovery is lazy/per-call inside the resolving
+    /// client, so this phase never waits on provider availability (ADR-0007).
+    /// A no-op when no consumer is registered, preserving the phase-order
+    /// invariants relied on by existing tests.
+    #[allow(
+        clippy::unused_async,
+        reason = "kept async for symmetry with the other `run_*_phase` steps awaited in sequence by `run_gear_phases`; the awaited work runs in a spawned readiness-probe task"
+    )]
+    async fn run_proxy_wiring_phase(&self) -> Result<(), RegistryError> {
+        use crate::discovery::{
+            ConsumerRegistration, DirectoryEndpointResolver, NullEndpointResolver,
+        };
+        use toolkit_contract::runtime::resolving::EndpointResolver;
+
+        let regs: Vec<&ConsumerRegistration> = inventory::iter::<ConsumerRegistration>
+            .into_iter()
+            .collect();
+        if regs.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            count = regs.len(),
+            "Phase: proxy-wiring (consumer discovery)"
+        );
+
+        // Without a DirectoryClient we cannot resolve *remote* providers, but we
+        // must NOT silently skip wiring: co-located consumers still short-circuit
+        // to their local impl, and remote consumers must register as unresolved
+        // readiness gates so `/readyz` stays 503 (a misconfigured consumer must
+        // not report Ready). A null resolver makes every remote lookup `Ok(None)`
+        // so the loop below classifies deps correctly without a directory.
+        let (resolver, have_directory): (Arc<dyn EndpointResolver>, bool) =
+            if let Ok(dir) = self.client_hub.get::<dyn crate::DirectoryClient>() {
+                (Arc::new(DirectoryEndpointResolver::new(dir)), true)
+            } else {
+                tracing::error!(
+                    consumers = regs.len(),
+                    "proxy-wiring: no DirectoryClient in ClientHub; remote consumer \
+                     dependencies cannot be resolved and will gate /readyz (503). \
+                     Co-located (local) dependencies are unaffected."
+                );
+                (Arc::new(NullEndpointResolver), false)
+            };
+
+        // Wire each consumer contract. The outcome distinguishes a co-located
+        // local impl (hub short-circuit) from a directory-resolving REST client.
+        // Every dep is registered as a readiness gate; local ones are marked
+        // resolved immediately, and only remote ones gate readiness + get the
+        // background directory-resolve loop (ADR-0007: startup-gating + sticky).
+        // `owner_gear` is derived by `#[toolkit::consumes]` from the struct
+        // ident, while `#[toolkit::gear(name = ...)]` sets the registry name
+        // independently. When they diverge, wiring still works (the loop below
+        // does not filter on owner) but the static-override config key silently
+        // resolves to nothing. Say so rather than leaving the operator to wonder
+        // why `consumer_wiring` is ignored.
+        let known_gears: std::collections::HashSet<&str> =
+            self.registry.gears().iter().map(GearEntry::name).collect();
+        for reg in &regs {
+            if !known_gears.contains(reg.owner_gear) {
+                tracing::warn!(
+                    owner = reg.owner_gear,
+                    dep = reg.dep_gear,
+                    "proxy-wiring: consumer's owner gear name does not match any registered gear; \
+                     the `gears.{}.config.consumer_wiring.{}` static override will never resolve. \
+                     Rename the gear to the kebab-case of its struct ident.",
+                    reg.owner_gear,
+                    reg.dep_gear,
+                );
+            }
+        }
+
+        let mut remote_deps: Vec<String> = Vec::new();
+        for reg in &regs {
+            // ADR-0004 static-endpoint override (dev/test escape hatch): if the
+            // consumer's config declares a fixed endpoint for this dep, wire it
+            // directly (bypassing discovery) via a `StaticEndpointResolver`. A
+            // fixed endpoint needs no probe loop, so it is readiness-resolved
+            // immediately. Emitted at `warn!` — it must not be used in production.
+            let static_override =
+                static_endpoint_override(self.gears_cfg.as_ref(), reg.owner_gear, reg.dep_gear);
+            let (reg_resolver, is_static): (Arc<dyn EndpointResolver>, bool) =
+                if let Some(endpoint) = &static_override {
+                    tracing::warn!(
+                        owner = reg.owner_gear,
+                        dep = reg.dep_gear,
+                        endpoint = %endpoint,
+                        "proxy-wiring: STATIC endpoint override in use (ADR-0004 dev/test \
+                         escape hatch) - bypasses service discovery; MUST NOT be used in \
+                         production"
+                    );
+                    (
+                        Arc::new(crate::discovery::StaticEndpointResolver::new(
+                            endpoint.clone(),
+                        )),
+                        true,
+                    )
+                } else {
+                    (Arc::clone(&resolver), false)
+                };
+
+            // Thread the process's platform-plane credential onto the wired
+            // (directory-resolving) client so its platform-plane methods attach
+            // `X-ToolKit-Internal-Token` (`cpt-cf-adr-two-plane-auth`). This is
+            // the genuine remote inter-gear path (Profile 2/3); a co-located
+            // local impl short-circuits before the credential is used.
+            let outcome = (reg.wire)(
+                &self.client_hub,
+                reg_resolver,
+                self.ctx_builder.internal_token_provider(),
+            )
+            .map_err(|source| RegistryError::ProxyWiring {
+                gear: reg.owner_gear,
+                source,
+            })?;
+            self.dep_checker.register_dep(reg.dep_gear.to_owned());
+            match outcome {
+                // Local impl won the hub short-circuit — resolved.
+                crate::discovery::WireOutcome::Local => {
+                    self.dep_checker.mark_resolved(reg.dep_gear);
+                }
+                // Static override → fixed endpoint, always resolvable — no probe.
+                crate::discovery::WireOutcome::Remote if is_static => {
+                    self.dep_checker.mark_resolved(reg.dep_gear);
+                }
+                // Directory-resolved remote → gate readiness + background probe.
+                crate::discovery::WireOutcome::Remote => remote_deps.push(reg.dep_gear.to_owned()),
+            }
+            tracing::debug!(
+                owner = reg.owner_gear,
+                dep = reg.dep_gear,
+                outcome = ?outcome,
+                static_override = is_static,
+                "wired consumer contract"
+            );
+        }
+
+        // Only remote deps need directory resolution; local wins are already
+        // resolved above. Without a directory the null resolver can never resolve
+        // them, so skip the probe entirely and leave those deps gating /readyz.
+        if !have_directory || remote_deps.is_empty() {
+            return Ok(());
+        }
+
+        let readiness = Arc::clone(&self.dep_checker);
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            const BASE: std::time::Duration = std::time::Duration::from_millis(100);
+            const MAX: std::time::Duration = std::time::Duration::from_secs(30);
+            let mut pending = remote_deps;
+            let mut backoff = BASE;
+            while !pending.is_empty() {
+                let mut still_pending = Vec::new();
+                for dep in pending {
+                    match resolver.resolve_endpoint(&dep).await {
+                        Ok(Some(_)) => {
+                            readiness.mark_resolved(&dep);
+                            tracing::info!(dep = %dep, "readiness: dependency resolved");
+                        }
+                        // No live instance yet — expected during startup churn.
+                        Ok(None) => still_pending.push(dep),
+                        // Genuine directory-backend failure: surface it (a stuck
+                        // Starting / 503 pod otherwise has no diagnostic trail).
+                        Err(e) => {
+                            tracing::warn!(dep = %dep, error = %e, "readiness: directory lookup failed");
+                            still_pending.push(dep);
+                        }
+                    }
+                }
+                pending = still_pending;
+                if pending.is_empty() {
+                    break;
+                }
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    () = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(MAX);
+            }
+        });
+
+        Ok(())
+    }
+
     /// This provides a global barrier between initialization-time registration
     /// and subsequent phases that may rely on a fully-populated runtime registry.
+    /// `init` -> proxy-wiring -> `post_init`, the segment both lifecycle paths
+    /// share.
+    ///
+    /// Extracted so the two paths cannot disagree on it. They did once: the
+    /// `OoP` path ran proxy-wiring *after* `start`, because the call was dropped
+    /// where a retired untyped `resolve_deps` stopgap used to sit rather than
+    /// chosen deliberately. A gear resolving a consumed contract during its own
+    /// `start` then found nothing in the `ClientHub` under Profile 2/3 while
+    /// working fine in Profile 1.
+    ///
+    /// Everything after this segment legitimately differs — the in-process path
+    /// composes a REST router, the `OoP` path leaves that to `oop_serve`.
+    ///
+    /// Keeping this a single private method is what enforces the invariant: if
+    /// a future change inlines the three calls back into both paths, this method
+    /// becomes dead code and the workspace's `-D warnings` build fails.
+    async fn run_init_wiring_post_init(&self) -> Result<(), RegistryError> {
+        self.run_init_phase().await?;
+
+        self.run_proxy_wiring_phase().await?;
+
+        self.run_post_init_phase().await
+    }
+
     ///
     /// System gears run first, followed by user gears, preserving topo order.
     async fn run_post_init_phase(&self) -> Result<(), RegistryError> {
@@ -446,6 +727,18 @@ impl HostRuntime {
             crate::healthcheck::RestHealthcheckRegistry::with_cancellation(
                 host_ctx.cancellation_token().clone(),
             ),
+        );
+
+        // Bridge the process-level eventual-readiness state into the served
+        // probe: while any consumed dependency is unresolved (or the process is
+        // draining) this synthetic check reports Unhealthy, so the gateway's
+        // `/readyz` returns 503 until all `#[toolkit::consumes]` deps are wired.
+        // (`/healthz` is a static liveness handler and is unaffected.)
+        hc_registry.register(
+            "readiness",
+            Arc::new(super::readiness::ReadinessHealthcheck::new(
+                self.dep_checker.clone(),
+            )),
         );
 
         // 1) Host prepare: base Router / global middlewares / basic OAS meta
@@ -625,6 +918,10 @@ impl HostRuntime {
     async fn run_stop_phase(&self) -> Result<(), RegistryError> {
         tracing::info!("Phase: stop");
 
+        // Drop our REST providers from the directory first, so consumers stop
+        // resolving an endpoint that is about to disappear.
+        self.deregister_rest_providers().await;
+
         let deadline = self.shutdown_deadline;
 
         // Stop all gears in reverse order, each with its own independent deadline
@@ -658,6 +955,46 @@ impl HostRuntime {
         }
 
         Ok(())
+    }
+
+    /// Run the stop phase with a watchdog that force-exits the process if the
+    /// stop phase hangs on a blocking syscall. The watchdog is disarmed whether
+    /// the stop phase succeeds or fails, so a failing stop phase does not leave
+    /// the watchdog active and eventually force-exit the process.
+    async fn run_stop_phase_guarded(&self) -> Result<(), RegistryError> {
+        let gear_count = u32::try_from(self.registry.gears().len().max(1)).unwrap_or(1);
+        let stop_timeout = self
+            .shutdown_deadline
+            .checked_mul(gear_count)
+            .and_then(|d| d.checked_add(std::time::Duration::from_secs(5)))
+            .unwrap_or(self.shutdown_deadline);
+
+        // Use a channel to arm/disarm the watchdog. If the lifecycle future is
+        // dropped before the stop phase finishes (e.g. an outer timeout), the
+        // sender is dropped and the watchdog exits without killing the process.
+        let (disarm_tx, disarm_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            match disarm_rx.recv_timeout(stop_timeout) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    // Stop phase completed, or the lifecycle future was cancelled.
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::warn!(
+                        timeout_secs = stop_timeout.as_secs(),
+                        "shutdown: stop phase timed out, force exiting"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        });
+
+        let stop_result = self.run_stop_phase().await;
+        // Disarm the watchdog before propagating the stop-phase result. This runs
+        // for both success and failure so a failing stop phase does not leave the
+        // watchdog armed and eventually force-exit the process.
+        let _ = disarm_tx.send(()).ok();
+
+        stop_result
     }
 
     /// `OoP` SPAWN phase: spawn out-of-process gears after start phase.
@@ -757,6 +1094,172 @@ impl HostRuntime {
         }
     }
 
+    /// Wait for the REST host gateway to publish its bound endpoint.
+    ///
+    /// The gateway binds its listener asynchronously in the start phase, so the
+    /// bound endpoint may not be set the instant the start phase returns; poll
+    /// with a short interval until available or timeout.
+    async fn wait_for_rest_endpoint(
+        &self,
+        host: &Arc<dyn crate::contracts::ApiGatewayCapability>,
+    ) -> Option<String> {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+        const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(endpoint) = host.bound_endpoint() {
+                return Some(endpoint);
+            }
+            if start.elapsed() > MAX_WAIT {
+                tracing::warn!("Timed out waiting for REST host to bind");
+                return None;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Directory-register phase (eventual readiness, provider side).
+    ///
+    /// After the REST server has bound, advertise every in-process REST provider
+    /// gear in the service directory under its own gear name, pointing at the
+    /// shared gateway endpoint. Consumers resolving a provider gear name then
+    /// receive this endpoint and the gateway routes to the provider's handlers.
+    ///
+    /// No-op when there is no REST host or no REST provider gears, so non-REST
+    /// deployments and existing tests are unaffected. Registers through the
+    /// `DirectoryClient` in the `ClientHub`, which uniformly targets the
+    /// in-process directory (`LocalDirectoryClient`) or the central directory
+    /// (`DirectoryGrpcClient` for `OoP`) depending on what the host wired.
+    async fn run_directory_register_phase(&self) -> Result<(), RegistryError> {
+        let rest_gears = self.rest_provider_gears();
+        if rest_gears.is_empty() {
+            return Ok(());
+        }
+
+        let Some(host) = self
+            .registry
+            .gears()
+            .iter()
+            .find_map(|e| e.caps.query::<ApiGatewayCap>())
+        else {
+            return Ok(()); // no REST host serving the routes
+        };
+
+        let Some(endpoint) = self.wait_for_rest_endpoint(&host).await else {
+            tracing::warn!(
+                "directory-register: REST host endpoint unavailable; skipping REST provider registration"
+            );
+            return Ok(());
+        };
+
+        let Ok(dir) = self.client_hub.get::<dyn crate::DirectoryClient>() else {
+            tracing::debug!(
+                "directory-register: no DirectoryClient in ClientHub; skipping REST provider registration"
+            );
+            return Ok(());
+        };
+
+        let instance_id = self.instance_id.to_string();
+        for gear in rest_gears {
+            // The directory keys instances by (gear, instance_id) and replaces
+            // wholesale. grpc-hub may have already registered this same
+            // (gear, instance_id) with gRPC services during the start phase, so
+            // carry the grpc services and version forward instead of clobbering
+            // them to empty — adding the REST endpoint must augment, not
+            // replace, the entry.
+            //
+            // Labels are deliberately NOT read-and-rewritten here. Carrying them
+            // through would make this a cross-process read-modify-write with no
+            // compare-and-set: any label change committed between the read and
+            // the write would be silently reverted. Instead we register with an
+            // empty label set, which `GearInstance::with_metadata_of` treats as
+            // "preserve the stored labels" — an atomic no-op on labels.
+            let (grpc_services, version) = match dir.list_instances(gear).await {
+                Ok(insts) => insts
+                    .into_iter()
+                    .find(|i| i.instance_id == instance_id)
+                    .map(|i| (i.grpc_services, i.version))
+                    .unwrap_or_default(),
+                Err(e) => {
+                    // A failed directory read must not silently drop the
+                    // carried-forward metadata: log it, then fall back to an
+                    // empty augmentation so REST registration still proceeds.
+                    tracing::warn!(
+                        gear,
+                        error = %e,
+                        "directory-register: failed to read existing registration; \
+                         re-registering with empty grpc_services/version"
+                    );
+                    (Vec::new(), None)
+                }
+            };
+            // OpenAPI spec is published separately (grpc-hub start phase); the
+            // REST-augmentation registration does not carry it. Labels are
+            // omitted so the store preserves the stored set (see above).
+            let mut info = crate::RegisterInstanceInfo::new(gear.to_owned(), instance_id.clone())
+                .with_grpc_services(grpc_services)
+                .with_rest_endpoint(crate::ServiceEndpoint::new(endpoint.clone()));
+            if let Some(version) = version {
+                info = info.with_version(version);
+            }
+            match dir.register_instance(info).await {
+                Ok(()) => {
+                    tracing::info!(gear, endpoint = %endpoint, "registered REST provider in directory");
+                }
+                Err(e) => {
+                    tracing::warn!(gear, error = %e, "directory-register: failed to register REST provider");
+                }
+            }
+        }
+        // Mark that this (in-process host) process advertised its REST providers,
+        // so the stop phase deregisters them exactly once. `OoP` serving never
+        // runs this phase, so its deregister is owned solely by `oop_serve`.
+        self.rest_providers_registered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Names of all gears that provide a REST API (have `RestApiCap`), excluding
+    /// the REST host gateway itself (`ApiGatewayCap`) — the gateway is the
+    /// transport, not a contract provider, so it must not be advertised in the
+    /// directory under its own gear name.
+    fn rest_provider_gears(&self) -> Vec<&'static str> {
+        self.registry
+            .gears()
+            .iter()
+            .filter(|e| e.caps.has::<RestApiCap>() && !e.caps.has::<ApiGatewayCap>())
+            .map(|e| e.name)
+            .collect()
+    }
+
+    /// Deregister this process's REST providers from the directory on shutdown,
+    /// so consumers stop resolving an endpoint that is going away. Best-effort.
+    async fn deregister_rest_providers(&self) {
+        // Only the in-process host path registers REST providers in the directory
+        // (via `run_directory_register_phase`). In `OoP` serving, `oop_serve`
+        // owns presence + deregister, so skip here to avoid a double deregister.
+        if !self
+            .rest_providers_registered
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let rest_gears = self.rest_provider_gears();
+        if rest_gears.is_empty() {
+            return;
+        }
+        let Ok(dir) = self.client_hub.get::<dyn crate::DirectoryClient>() else {
+            return;
+        };
+        let instance_id = self.instance_id.to_string();
+        for gear in rest_gears {
+            if let Err(e) = dir.deregister_instance(gear, &instance_id).await {
+                tracing::warn!(gear, error = %e, "directory-deregister: failed to deregister REST provider");
+            }
+        }
+    }
+
     /// Run the full gear lifecycle (all phases).
     ///
     /// This is the standard entry point for normal application execution.
@@ -834,11 +1337,8 @@ impl HostRuntime {
             return Ok(());
         }
 
-        // 3. Init phase (system gears first)
-        self.run_init_phase().await?;
-
-        // 4. Post-init phase (barrier after ALL init; system gears only)
-        self.run_post_init_phase().await?;
+        // 3. Init -> proxy-wiring -> post-init (shared with the OoP path)
+        self.run_init_wiring_post_init().await?;
 
         // 5. REST phase (synchronous router composition)
         let _router = self.run_rest_phase().await?;
@@ -849,6 +1349,22 @@ impl HostRuntime {
         // 7. Start phase
         self.run_start_phase().await?;
 
+        // Draining watcher: flip readiness to Draining the moment shutdown
+        // begins so /readyz reports 503 and the orchestrator drains the pod out
+        // of the load balancer before the stop phase tears gears down.
+        {
+            let readiness = Arc::clone(&self.dep_checker);
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                cancel.cancelled().await;
+                readiness.set_draining(true);
+            });
+        }
+
+        // 7b. Directory-register phase: advertise in-process REST providers in
+        //     the directory once the gateway has bound its listener.
+        self.run_directory_register_phase().await?;
+
         // 8. OoP spawn phase (after grpc_hub is running)
         self.run_oop_spawn_phase().await?;
 
@@ -856,30 +1372,185 @@ impl HostRuntime {
         self.cancel.cancelled().await;
 
         // 10. Stop phase with hard timeout.
-        //     Blocking syscalls (e.g. libc getaddrinfo in tokio spawn_blocking)
-        //     can saturate all tokio worker threads, preventing tokio timers
-        //     from firing. Use an OS thread so the watchdog works even when
-        //     the tokio runtime is fully blocked.
-        let stop_timeout = std::time::Duration::from_secs(15);
-        let disarm = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let disarm_clone = std::sync::Arc::clone(&disarm);
-        std::thread::spawn(move || {
-            std::thread::sleep(stop_timeout);
-            if !disarm_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                tracing::warn!(
-                    timeout_secs = stop_timeout.as_secs(),
-                    "shutdown: stop phase timed out, force exiting"
-                );
-                std::process::exit(1);
-            }
-        });
-
-        self.run_stop_phase().await?;
-        disarm.store(true, std::sync::atomic::Ordering::Relaxed);
-
+        //     Blocking stop implementations are guarded by a watchdog thread so
+        //     a hang cannot block shutdown, whether in the in-process or OoP path.
+        self.run_stop_phase_guarded().await?;
         Ok(())
     }
 }
+
+/// Out-of-process HTTP serving lifecycle (`cpt-cf-component-oop-bootstrap`).
+#[cfg(feature = "bootstrap")]
+impl HostRuntime {
+    /// Compose a **host-less** REST router from all `RestApiCap` gears, plus the
+    /// gear's generated `OpenAPI` document (serialized JSON).
+    ///
+    /// Unlike [`run_rest_phase`](Self::run_rest_phase), this does not require an
+    /// `ApiGatewayCap` host: `OoP` gears serve their own routes directly.
+    async fn compose_oop_router(
+        &self,
+        options: &crate::runtime::OopServeOptions,
+        hc_registry: &Arc<crate::healthcheck::RestHealthcheckRegistry>,
+    ) -> anyhow::Result<(Router, String)> {
+        use crate::api::{OpenApiInfo, OpenApiRegistryImpl};
+        use anyhow::Context as _;
+
+        let registry = OpenApiRegistryImpl::new();
+        let mut router = Router::new();
+
+        for entry in self.registry.gears() {
+            if let Some(rest) = entry.caps.query::<RestApiCap>() {
+                let ctx = self
+                    .ctx_builder
+                    .for_gear(entry.name)
+                    .await
+                    .with_context(|| format!("OoP router: build context for '{}'", entry.name))?;
+                router = rest
+                    .register_rest(&ctx, router, &registry)
+                    .with_context(|| format!("OoP router: register_rest for '{}'", entry.name))?;
+
+                // Register the gear's readiness healthcheck (the same mechanism
+                // the api-gateway host uses), so /readyz reflects it identically
+                // whether the gear runs in-process or OoP.
+                if let Some(hc) = rest.healthcheck(&ctx) {
+                    hc_registry.register(entry.name, hc);
+                }
+            }
+        }
+
+        let info = OpenApiInfo {
+            title: options.gear_name.clone(),
+            version: options
+                .version
+                .clone()
+                .unwrap_or_else(|| "0.0.0".to_owned()),
+            description: None,
+            servers: vec![],
+        };
+        let openapi = registry
+            .build_openapi(&info)
+            .context("OoP router: build OpenAPI document")?;
+        let json = serde_json::to_string(&openapi).context("OoP router: serialize OpenAPI")?;
+
+        Ok((router, json))
+    }
+
+    /// Run the full `OoP` gear lifecycle: phases (`pre_init` … `start`), then
+    /// serve the composed router with framework probes, background
+    /// self-registration, dependency resolution, and graceful drain, then the
+    /// `stop` phase.
+    ///
+    /// # Errors
+    /// Returns an error if any lifecycle phase or the HTTP server fails.
+    pub async fn run_oop_serving(
+        self,
+        options: crate::runtime::OopServeOptions,
+    ) -> anyhow::Result<()> {
+        use crate::runtime::ReadinessState;
+
+        tracing::info!("Running OoP serving lifecycle");
+
+        // Make the directory client reachable to the proxy-wiring phase, which
+        // resolves remote `#[toolkit::consumes]` providers through the
+        // `ClientHub`. The `OoP` presence loop uses `options.directory`
+        // directly; consumer wiring reads it here.
+        if self.client_hub.get::<dyn crate::DirectoryClient>().is_err() {
+            self.client_hub
+                .register::<dyn crate::DirectoryClient>(Arc::clone(&options.directory));
+        }
+
+        // Shared gear healthcheck registry (same mechanism as the api-gateway
+        // host path). Seeded with the root cancellation token so in-flight
+        // checks are aborted on shutdown. Populated during router composition.
+        let hc_registry = Arc::new(
+            crate::healthcheck::RestHealthcheckRegistry::with_cancellation(self.cancel.clone()),
+        );
+
+        // Readiness gates on `#[toolkit::consumes]` dependencies only — the same
+        // policy as the in-process host path — via the shared `DependencyChecker`
+        // fed by the proxy-wiring phase below. `deps = [...]`-only declarations
+        // remain for topo-sort ordering but do NOT gate `/readyz`. The
+        // healthcheck registry supplies the per-gear readiness dimension; both
+        // feed the `/readyz` aggregate.
+        let readiness = ReadinessState::from_checker(
+            Arc::clone(&self.dep_checker),
+            Arc::clone(&hc_registry),
+            options.healthcheck_timeout,
+        );
+
+        // Bind the HTTP server and serve probes BEFORE the (possibly slow)
+        // lifecycle phases, so the kubelet's liveness probe (`/healthz`) passes
+        // immediately instead of getting connection-refused during `start()`.
+        // Gear routes reply `503 starting` until attached below.
+        let mut server = super::oop_serve::OopHttpServer::start(
+            Arc::clone(&readiness),
+            options,
+            self.cancel.clone(),
+        )
+        .await?;
+
+        // Lifecycle phases up to start, then wire consumers (typed
+        // directory-resolving clients feed the shared `DependencyChecker`),
+        // then compose the host-less REST router + OpenAPI spec (collecting each
+        // gear's healthcheck into the shared registry). Grouped so a failure
+        // tears the probe server down cleanly.
+        let mut started = false;
+        let composed: anyhow::Result<(Router, String)> = async {
+            self.run_pre_init_phase()?;
+            #[cfg(feature = "db")]
+            self.run_db_phase().await?;
+            // Init -> proxy-wiring -> post-init, shared with the in-process path
+            // so a gear resolving a consumed contract during `start` finds the
+            // client in the hub under both profiles.
+            self.run_init_wiring_post_init().await?;
+            self.run_grpc_phase().await?;
+            self.run_start_phase().await?;
+            started = true;
+            // The gear lifecycle has populated the ClientHub. If an in-process
+            // authn stack (e.g. a linked authn-resolver gear) registered a
+            // DynBearerAuthenticator bridge, install the tenant plane now —
+            // before `attach` layers security_context_middleware. (The platform
+            // plane is built eagerly at bootstrap from `oop_http.internal_auth`.)
+            server.resolve_bearer_authenticator(&self.client_hub);
+            self.compose_oop_router(server.options(), &hc_registry)
+                .await
+        }
+        .await;
+
+        let serve_result = match composed {
+            Ok((gear_router, openapi_json)) => {
+                // Publish gear routes (they go live) + start directory presence.
+                // Dependency resolution already ran in the proxy-wiring phase.
+                server.attach(gear_router, openapi_json);
+                // Serve until cancelled, drain, then deregister.
+                server.join().await
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "OoP startup failed before serving gear routes");
+                // Tear down the probe server that is already bound.
+                self.cancel.cancel();
+                if let Err(join_err) = server.join().await {
+                    tracing::warn!(error = %join_err, "OoP probe server teardown after startup failure errored");
+                }
+                Err(e)
+            }
+        };
+
+        // Stop phase runs only if start completed successfully. Errors are logged
+        // but do not fail the shutdown process (same contract as run_stop_phase).
+        if started && let Err(e) = self.run_stop_phase_guarded().await {
+            tracing::warn!(error = %e, "OoP stop phase reported an error");
+        }
+
+        serve_result
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "bootstrap")]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "host_runtime_oop_tests.rs"]
+mod host_runtime_oop_tests;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1064,6 +1735,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn static_endpoint_override_reads_nested_consumer_wiring_key() {
+        struct MapCfg(std::collections::HashMap<String, serde_json::Value>);
+        impl ConfigProvider for MapCfg {
+            fn get_gear_config(&self, gear: &str) -> Option<&serde_json::Value> {
+                self.0.get(gear)
+            }
+        }
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "orders".to_owned(),
+            serde_json::json!({
+                "config": { "consumer_wiring": { "billing": "http://localhost:8081" } }
+            }),
+        );
+        let cfg = MapCfg(map);
+
+        // Present override is read from `config.consumer_wiring.<dep>`.
+        assert_eq!(
+            super::static_endpoint_override(&cfg, "orders", "billing").as_deref(),
+            Some("http://localhost:8081")
+        );
+        // Absent dep / owner → None (falls through to directory resolution).
+        assert_eq!(
+            super::static_endpoint_override(&cfg, "orders", "inventory"),
+            None
+        );
+        assert_eq!(
+            super::static_endpoint_override(&cfg, "warehouse", "billing"),
+            None
+        );
+        assert_eq!(
+            super::static_endpoint_override(&EmptyConfigProvider, "orders", "billing"),
+            None
+        );
+    }
+
+    /// The override is keyed by the *gear name* (kebab), which is what
+    /// `#[toolkit::consumes]` puts in `ConsumerRegistration::owner_gear`.
+    /// Regression guard: the macro used to emit `stringify!(StructIdent)`, so
+    /// the lookup asked for `gears.ApiContractsConsumer` — a key no config
+    /// declares — and the escape hatch could never fire.
+    #[test]
+    fn static_endpoint_override_is_keyed_by_kebab_gear_name() {
+        struct MapCfg(std::collections::HashMap<String, serde_json::Value>);
+        impl ConfigProvider for MapCfg {
+            fn get_gear_config(&self, gear: &str) -> Option<&serde_json::Value> {
+                self.0.get(gear)
+            }
+        }
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "api-contracts-consumer".to_owned(),
+            serde_json::json!({
+                "config": { "consumer_wiring": { "api-contracts": "http://localhost:9099" } }
+            }),
+        );
+        let cfg = MapCfg(map);
+
+        assert_eq!(
+            super::static_endpoint_override(&cfg, "api-contracts-consumer", "api-contracts")
+                .as_deref(),
+            Some("http://localhost:9099"),
+        );
+        // The pre-fix value — the Rust struct ident — must NOT resolve.
+        assert_eq!(
+            super::static_endpoint_override(&cfg, "ApiContractsConsumer", "api-contracts"),
+            None,
+        );
+    }
+
     #[tokio::test]
     async fn test_post_init_runs_after_all_init_and_system_first() {
         #[derive(Clone)]
@@ -1157,6 +1899,71 @@ mod tests {
                 "post_init:sys_a",
             ]
         );
+    }
+
+    /// The in-process and `OoP` paths must agree on where proxy-wiring sits.
+    ///
+    /// They did not: the `OoP` path ran it *after* `start`, so a gear resolving
+    /// a consumed contract during its own `start` found nothing in the
+    /// `ClientHub` under Profile 2/3 while working under Profile 1. Both paths
+    /// now go through `run_init_wiring_post_init`, which pins the order.
+    ///
+    /// This test covers the two observable endpoints of that segment. The
+    /// wiring step between them is a no-op here (no `#[toolkit::consumes]`
+    /// registration is linked into this test binary), so what actually stops
+    /// the paths diverging again is the shared method itself — inlining it back
+    /// into both call sites makes it dead code and fails the `-D warnings`
+    /// build.
+    #[tokio::test]
+    async fn init_wiring_post_init_runs_as_one_ordered_segment() {
+        #[derive(Clone)]
+        struct TrackHooks {
+            events: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Gear for TrackHooks {
+            async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+                self.events.lock().await.push("init".to_owned());
+                Ok(())
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl SystemCapability for TrackHooks {
+            fn pre_init(&self, _sys: &crate::runtime::SystemContext) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn post_init(&self, _sys: &crate::runtime::SystemContext) -> anyhow::Result<()> {
+                self.events.lock().await.push("post_init".to_owned());
+                Ok(())
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let gear = Arc::new(TrackHooks {
+            events: events.clone(),
+        });
+
+        let mut builder = RegistryBuilder::default();
+        builder.register_core_with_meta("sys", &[], gear.clone() as Arc<dyn Gear>);
+        builder.register_system_with_meta("sys", gear.clone() as Arc<dyn SystemCapability>);
+        let registry = builder.build_topo_sorted().unwrap();
+
+        let runtime = HostRuntime::new(
+            registry,
+            Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+            DbOptions::None,
+            Arc::new(ClientHub::new()),
+            CancellationToken::new(),
+            Uuid::new_v4(),
+            None,
+        );
+
+        runtime.run_init_wiring_post_init().await.unwrap();
+
+        assert_eq!(events.lock().await.clone(), vec!["init", "post_init"]);
     }
 
     #[tokio::test]

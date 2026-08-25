@@ -253,11 +253,7 @@ pub(crate) async fn upload_attachment(
         let err = CanonicalError::service_unavailable()
             .with_retry_after_seconds(UPLOAD_RETRY_AFTER_SECS)
             .create();
-        let mut resp = Problem::from(err).into_response();
-        resp.headers_mut().insert(
-            http::header::RETRY_AFTER,
-            http::HeaderValue::from_static("5"),
-        );
+        let resp = Problem::from(err).into_response();
         return Ok(resp);
     };
 

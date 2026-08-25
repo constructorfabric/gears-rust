@@ -1,0 +1,6 @@
+error: `#[retryable]` on a `NotIdempotent` method: a transient failure can arrive after the server committed, so retrying would duplicate the write.
+       Either make the operation idempotent (e.g. accept an idempotency key) and declare `#[idempotency_level(Idempotent)]`, or drop `#[retryable]` and let the caller decide.
+  --> tests/ui/fail/grpc_retryable_non_idempotent.rs:25:14
+   |
+25 |     async fn charge(&self, ctx: SecurityContext, amount: u64) -> Result<u64, std::io::Error>;
+   |              ^^^^^^

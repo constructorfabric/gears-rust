@@ -44,12 +44,12 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.map_or(0, |r| r.try_get_by_index::<i64>(0).unwrap())
 }
 
 async fn scalar_text(conn: &DatabaseConnection, sql: &str) -> Option<String> {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.and_then(|r| r.try_get_by_index::<Option<String>>(0).unwrap())
 }
 
@@ -308,12 +308,12 @@ async fn audit_retrieval_and_tamper_status_reads() {
     // A line-less header would trip the DEFERRABLE balanced-entry constraint
     // trigger at commit; this test only needs a readable header, so disable that
     // trigger for the raw insert (the append-only guard still allows INSERT).
-    raw.execute(pg(
+    raw.execute_raw(pg(
         "ALTER TABLE bss.ledger_journal_entry DISABLE TRIGGER trg_journal_entry_balanced",
     ))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_entry \
            (entry_id, tenant_id, legal_entity_id, period_id, entry_currency, \
             source_doc_type, source_business_id, posted_at_utc, effective_at, \
@@ -324,7 +324,7 @@ async fn audit_retrieval_and_tamper_status_reads() {
     )))
     .await
     .unwrap();
-    raw.execute(pg(
+    raw.execute_raw(pg(
         "ALTER TABLE bss.ledger_journal_entry ENABLE TRIGGER trg_journal_entry_balanced",
     ))
     .await
@@ -383,7 +383,7 @@ async fn audit_retrieval_and_tamper_status_reads() {
     assert!(clean.verified, "no freeze ⇒ verified (MVP)");
 
     // Insert an ACTIVE freeze, then re-read: frozen + not verified + one row.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.scope_freeze \
            (tenant_id, scope, period_id, reason, frozen_at, set_by) \
          VALUES ('{tenant}','tenant','ALL','broken chain', now(), 'verifier')"

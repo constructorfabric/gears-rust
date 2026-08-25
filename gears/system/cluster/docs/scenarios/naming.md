@@ -25,13 +25,11 @@
 - *Done-when:* asserts rejection.
 
 **SC-NAME-004 — invalid service name rejected** · L2 · ☐
-- *Intent:* the same rule guards service names (metadata keys/values are *not* subject to it — see SC-DISC-008).
-- *Steps:* `register(ServiceRegistration { name: invalid_name, .. })`.
 - *Expected:* `Err(InvalidName)`.
 - *Done-when:* asserts rejection of the service name while metadata with the same characters is accepted.
 
 **SC-NAME-005 — rule is uniform across primitives** · L2 · ☐
-- *Intent:* the whole point of `fr-cache-storage`'s uniform convention — consumers learn one rule, not four.
+- *Intent:* the whole point of `fr-cache-storage`'s uniform convention — consumers learn one rule, not three.
 - *Steps:* take a small set of names spanning the valid/invalid boundary; submit each to cache key, election, lock, and service name.
-- *Expected:* every name's validity verdict is identical across all four primitives.
+- *Expected:* every name's validity verdict is identical across all three primitives.
 - *Done-when:* asserts no primitive accepts a name another rejects (or vice versa).

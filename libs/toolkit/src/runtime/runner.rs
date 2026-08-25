@@ -73,29 +73,38 @@ pub enum ShutdownOptions {
 /// Configuration for a single `OoP` gear to be spawned.
 #[derive(Clone)]
 pub struct OopGearSpawnConfig {
-    /// Gear name (e.g., "calculator")
+    /// Name of the gear (e.g., "calculator").
     pub gear_name: String,
-    /// Path to the executable
+    /// Path to the gear executable.
     pub binary: PathBuf,
-    /// Command-line arguments (user controls --config via execution.args in master config)
+    /// Command-line arguments passed to the gear binary.
+    ///
+    /// Note: the user controls `--config` via `execution.args` in the master config.
     pub args: Vec<String>,
-    /// Environment variables to set
+    /// Environment variables to set for the spawned process.
     pub env: HashMap<String, String>,
-    /// Working directory for the process
+    /// Working directory for the spawned process.
     pub working_directory: Option<String>,
-    /// Rendered gear config JSON (for `TOOLKIT_MODULE_CONFIG` env var)
+    /// Rendered gear configuration JSON, injected as the `TOOLKIT_MODULE_CONFIG` environment variable.
     pub rendered_config_json: String,
 }
 
 /// Options for spawning `OoP` gears.
 pub struct OopSpawnOptions {
-    /// List of `OoP` gears to spawn after the start phase
+    /// Gears to spawn after the start phase, once shared infrastructure is ready.
     pub gears: Vec<OopGearSpawnConfig>,
-    /// Backend for spawning `OoP` gears (e.g., `LocalProcessBackend`)
+    /// Backend used to spawn gear processes (e.g. `LocalProcessBackend`).
     pub backend: Box<dyn OopBackend>,
 }
 
 /// Options for running the `ToolKit` runner.
+///
+/// `#[non_exhaustive]`: construct via [`RunOptions::new`] + the `with_*`
+/// builders rather than a struct literal, so adding a new optional field does
+/// not break every call site (and out-of-crate consumers get a deprecation-free
+/// upgrade path). The four arguments to `new` are the always-required fields;
+/// everything else defaults to "off".
+#[non_exhaustive]
 pub struct RunOptions {
     /// Provider of gear config sections (raw JSON by gear name).
     pub gears_cfg: Arc<dyn ConfigProvider>,
@@ -126,23 +135,83 @@ pub struct RunOptions {
     /// See `HostRuntime::with_shutdown_deadline` for details on the relationship
     /// with `WithLifecycle::stop_timeout`.
     pub shutdown_deadline: Option<std::time::Duration>,
+    /// Process-wide platform-plane credential source (the selected
+    /// `InternalCredential`), threaded into every [`GearCtx`] so
+    /// `#[toolkit::provides]`-generated clients attach `X-ToolKit-Internal-Token`
+    /// on platform-plane (`PlatformSecurityContext`) methods. `None` (Profile 1
+    /// / in-process, or no credential configured) attaches nothing.
+    pub internal_token_provider: Option<toolkit_contract::runtime::config::InternalTokenProvider>,
 }
 
-/// Full cycle is orchestrated by `HostRuntime` (see `runtime/host_runtime.rs` docs).
+impl RunOptions {
+    /// Create `RunOptions` with the four always-required fields; all optional
+    /// fields default to "off" (`clients` empty, no `oop`, default shutdown
+    /// deadline, no platform credential). Layer options on with the `with_*`
+    /// builders.
+    #[must_use]
+    pub fn new(
+        gears_cfg: Arc<dyn ConfigProvider>,
+        db: DbOptions,
+        shutdown: ShutdownOptions,
+        instance_id: Uuid,
+    ) -> Self {
+        Self {
+            gears_cfg,
+            db,
+            shutdown,
+            clients: Vec::new(),
+            instance_id,
+            oop: None,
+            shutdown_deadline: None,
+            internal_token_provider: None,
+        }
+    }
+
+    /// Pre-register clients to inject into the `ClientHub` before gear init.
+    #[must_use]
+    pub fn with_clients(mut self, clients: Vec<ClientRegistration>) -> Self {
+        self.clients = clients;
+        self
+    }
+
+    /// Set the `OoP` gear spawn configuration.
+    #[must_use]
+    pub fn with_oop(mut self, oop: Option<OopSpawnOptions>) -> Self {
+        self.oop = oop;
+        self
+    }
+
+    /// Override the per-gear graceful-shutdown deadline.
+    #[must_use]
+    pub fn with_shutdown_deadline(mut self, deadline: Option<std::time::Duration>) -> Self {
+        self.shutdown_deadline = deadline;
+        self
+    }
+
+    /// Set the process-wide platform-plane credential source (see the field).
+    #[must_use]
+    pub fn with_internal_token_provider(
+        mut self,
+        provider: Option<toolkit_contract::runtime::config::InternalTokenProvider>,
+    ) -> Self {
+        self.internal_token_provider = provider;
+        self
+    }
+}
+
+/// Construct a `HostRuntime` by wiring shutdown, discovering gears, building
+/// the `ClientHub`, and injecting pre-registered clients.
 ///
-/// This function is a thin wrapper around `HostRuntime` that handles shutdown signal setup
-/// and then delegates all lifecycle orchestration to the `HostRuntime`.
-///
-/// # Errors
-/// Returns an error if any lifecycle phase fails.
-pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
-    // 1. Prepare cancellation token based on shutdown options
+/// Shared by [`run`] and [`run_oop_serving`]. `opts` is consumed; the returned
+/// `HostRuntime` owns the root lifecycle `CancellationToken`.
+fn build_host_runtime(opts: RunOptions) -> anyhow::Result<HostRuntime> {
+    // 1. Prepare cancellation token based on shutdown options.
     let cancel = match &opts.shutdown {
         ShutdownOptions::Token(t) => t.clone(),
         _ => CancellationToken::new(),
     };
 
-    // 2. Spawn shutdown waiter (Signals / Future) just like before
+    // 2. Spawn shutdown waiter (Signals / Future).
     match opts.shutdown {
         ShutdownOptions::Signals => {
             let c = cancel.clone();
@@ -176,33 +245,57 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         }
     }
 
-    // 3. Discover gears
+    // 3. Discover gears.
     let registry = GearRegistry::discover_and_build()?;
 
-    // 4. Build shared ClientHub
+    // 4. Build shared `ClientHub` and inject pre-registered clients.
     let hub = Arc::new(ClientHub::default());
-
-    // 4b. Apply pre-registered clients from RunOptions
     for registration in opts.clients {
         registration.apply(&hub);
     }
 
-    // 5. Instantiate HostRuntime
+    // 5. Instantiate `HostRuntime`.
     let mut host = HostRuntime::new(
         registry,
         opts.gears_cfg.clone(),
         opts.db,
         hub,
-        cancel.clone(),
+        cancel,
         opts.instance_id,
         opts.oop,
     );
-
-    // 5b. Apply custom shutdown deadline if provided
     if let Some(deadline) = opts.shutdown_deadline {
         host = host.with_shutdown_deadline(deadline);
     }
+    host = host.with_internal_token_provider(opts.internal_token_provider);
 
-    // 6. Run full lifecycle
+    Ok(host)
+}
+
+/// Run the full gear lifecycle.
+///
+/// Discovers gears, wires shutdown, and delegates phase execution to [`HostRuntime`].
+///
+/// # Errors
+/// Returns an error if any lifecycle phase fails.
+pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
+    let host = build_host_runtime(opts)?;
     host.run_gear_phases().await
+}
+
+/// Run an out-of-process gear and serve its HTTP routes.
+///
+/// Uses the same setup as [`run`], then drives the `OoP` serving lifecycle:
+/// lifecycle phases, an Axum HTTP server with framework probes, background
+/// self-registration, dependency resolution, and graceful drain.
+///
+/// # Errors
+/// Returns an error if discovery, any lifecycle phase, or the HTTP server fails.
+#[cfg(feature = "bootstrap")]
+pub async fn run_oop_serving(
+    opts: RunOptions,
+    serve: crate::runtime::OopServeOptions,
+) -> anyhow::Result<()> {
+    let host = build_host_runtime(opts)?;
+    host.run_oop_serving(serve).await
 }

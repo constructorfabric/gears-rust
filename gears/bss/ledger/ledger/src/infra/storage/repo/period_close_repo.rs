@@ -31,6 +31,10 @@ impl PeriodCloseRepo {
     /// columns (`status`, `blocked_reasons`, `recon_watermark`, `closed_at`) are
     /// set from the args; the PK identifies the period. `initiated_by` is set
     /// only on the initial INSERT (the first closer).
+    ///
+    /// # Errors
+    /// Returns [`RepoError::Db`] if conflict-clause construction, scope
+    /// validation, or the upsert fails.
     #[allow(
         clippy::too_many_arguments,
         reason = "the close-process row carries the full gate result; a param object would not reduce the call-site count"
@@ -92,6 +96,10 @@ impl PeriodCloseRepo {
 
     /// Read the close-process row (out-of-txn). SQL-level BOLA: a foreign tenant
     /// yields no row.
+    ///
+    /// # Errors
+    /// Returns [`DomainError::Internal`] if acquiring a connection or reading
+    /// the close-process row fails.
     pub async fn read(
         &self,
         scope: &AccessScope,

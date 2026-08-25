@@ -1,0 +1,6 @@
+error: `tags` is a repeated query parameter and needs `#[serde(default)]`.
+       An empty `Vec` emits no key at all, so without a default the request fails to deserialize with `missing field `tags``.
+  --> tests/ui/fail/query_params_vec_without_default.rs:12:5
+   |
+12 |     pub tags: Vec<String>,
+   |     ^^^

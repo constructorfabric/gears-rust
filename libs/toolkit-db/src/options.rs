@@ -71,9 +71,19 @@ fn is_memory_filename(path: &std::path::Path) -> bool {
 impl DbConnectOptions {
     /// Connect to the database using the configured options.
     ///
+    /// `lock_keepalive` sets the ping interval for the dedicated advisory-lock session
+    /// (PG/MySQL only; ignored for SQLite/file locks).
+    ///
     /// # Errors
     /// Returns an error if the database connection fails.
-    pub async fn connect(&self, pool: PoolCfg) -> Result<DbHandle> {
+    pub async fn connect(
+        &self,
+        pool: PoolCfg,
+        lock_keepalive: std::time::Duration,
+    ) -> Result<DbHandle> {
+        // Referenced here so the parameter is "used" in SQLite-only / no-backend builds where the
+        // PG/MySQL arms below are compiled out.
+        let _ = lock_keepalive;
         match self {
             #[cfg(feature = "sqlite")]
             DbConnectOptions::Sqlite(opts) => {
@@ -86,13 +96,17 @@ impl DbConnectOptions {
 
                 let sqlx_pool = pool_opts.connect_with(opts.clone()).await?;
 
+                let filename = opts.get_filename().display().to_string();
+                let dsn = format!("sqlite://{filename}");
+                let database_scope = crate::advisory_locks::database_scope_from_dsn(&dsn);
+                let locks = crate::advisory_locks::LockManager::file(database_scope);
                 let sea = sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(sqlx_pool);
 
-                let filename = opts.get_filename().display().to_string();
                 let handle = DbHandle {
                     engine: crate::DbEngine::Sqlite,
-                    dsn: format!("sqlite://{filename}"),
+                    dsn,
                     sea,
+                    locks,
                 };
 
                 Ok(handle)
@@ -103,17 +117,25 @@ impl DbConnectOptions {
 
                 let sqlx_pool = pool_opts.connect_with(opts.clone()).await?;
 
+                let host = opts.get_host();
+                let port = opts.get_port();
+                let database = opts.get_database().unwrap_or("");
+                let identity = crate::advisory_locks::server_database_identity(
+                    "postgres", host, port, database,
+                );
+                let database_scope = crate::advisory_locks::database_scope_from_identity(&identity);
+                let locks = crate::advisory_locks::LockManager::postgres_lazy(
+                    opts.clone(),
+                    database_scope,
+                    lock_keepalive,
+                )?;
                 let sea = sea_orm::SqlxPostgresConnector::from_sqlx_postgres_pool(sqlx_pool);
 
                 let handle = DbHandle {
                     engine: crate::DbEngine::Postgres,
-                    dsn: format!(
-                        "postgresql://<redacted>@{}:{}/{}",
-                        opts.get_host(),
-                        opts.get_port(),
-                        opts.get_database().unwrap_or("")
-                    ),
+                    dsn: format!("postgresql://<redacted>@{host}:{port}/{database}"),
                     sea,
+                    locks,
                 };
 
                 Ok(handle)
@@ -124,12 +146,24 @@ impl DbConnectOptions {
 
                 let sqlx_pool = pool_opts.connect_with(opts.clone()).await?;
 
+                let host = opts.get_host();
+                let port = opts.get_port();
+                let database = opts.get_database().unwrap_or("");
+                let identity =
+                    crate::advisory_locks::server_database_identity("mysql", host, port, database);
+                let database_scope = crate::advisory_locks::database_scope_from_identity(&identity);
+                let locks = crate::advisory_locks::LockManager::mysql_lazy(
+                    opts.clone(),
+                    database_scope,
+                    lock_keepalive,
+                )?;
                 let sea = sea_orm::SqlxMySqlConnector::from_sqlx_mysql_pool(sqlx_pool);
 
                 let handle = DbHandle {
                     engine: crate::DbEngine::MySql,
-                    dsn: "mysql://<redacted>@...".to_owned(),
+                    dsn: format!("mysql://<redacted>@{host}:{port}/{database}"),
                     sea,
+                    locks,
                 };
 
                 Ok(handle)
@@ -288,13 +322,16 @@ pub(crate) async fn build_db_handle(
 
     // Build pool configuration
     let pool_cfg = cfg.pool.unwrap_or_default();
+    let lock_keepalive = cfg
+        .lock_keepalive
+        .unwrap_or(crate::advisory_locks::DEFAULT_LOCK_KEEPALIVE);
 
     // Log connection attempt (without credentials)
     let log_dsn = redact_credentials_in_dsn(cfg.dsn.as_ref().map(SecretString::expose));
     tracing::debug!(dsn = log_dsn, engine = ?engine, "Building database connection");
 
     // Connect to database
-    let handle = connect_options.connect(pool_cfg).await?;
+    let handle = connect_options.connect(pool_cfg, lock_keepalive).await?;
 
     Ok(handle)
 }

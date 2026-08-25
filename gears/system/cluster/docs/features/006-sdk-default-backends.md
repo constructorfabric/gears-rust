@@ -12,17 +12,15 @@
   - [1.3 Actors](#13-actors)
   - [1.4 References](#14-references)
 - [2. Actor Flows (CDSL)](#2-actor-flows-cdsl)
-  - [Cache-Only Plugin Gets All Four Primitives](#cache-only-plugin-gets-all-four-primitives)
+  - [Cache-Only Plugin Gets All Three Primitives](#cache-only-plugin-gets-all-three-primitives)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [CAS-Based Leader Election](#cas-based-leader-election)
   - [CAS-Based Distributed Lock](#cas-based-distributed-lock)
-  - [Cache-Based Service Discovery](#cache-based-service-discovery)
   - [Constructor Safety Guard](#constructor-safety-guard)
 - [4. States (CDSL)](#4-states-cdsl)
 - [5. Definitions of Done](#5-definitions-of-done)
   - [CAS-Based Leader-Election Default Backend](#cas-based-leader-election-default-backend)
   - [CAS-Based Distributed-Lock Default Backend](#cas-based-distributed-lock-default-backend)
-  - [Cache-Based Service-Discovery Default Backend](#cache-based-service-discovery-default-backend)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 
 <!-- /toc -->
@@ -31,7 +29,7 @@
 
 ### 1.1 Overview
 
-Delivers the "implement cache only, get all four primitives" guarantee. Provides compare-and-swap-based default implementations of leader election and distributed lock and a cache-based default implementation of service discovery, all built on the cache backend, with a safety constructor pair that rejects eventually-consistent caches by default for the consistency-sensitive primitives.
+Delivers the "implement cache only, get all three primitives" guarantee. Provides compare-and-swap-based default implementations of leader election and distributed lock, both built on the cache backend, with a safety constructor pair that rejects eventually-consistent caches by default.
 
 ### 1.2 Purpose
 
@@ -45,7 +43,7 @@ Lowering the barrier to integrating a new backend means a plugin author should o
 
 | Actor | Role in Feature |
 |-------|-----------------|
-| `cpt-cf-clst-actor-plugin-author` | Implements only the cache backend and gets all four primitives |
+| `cpt-cf-clst-actor-plugin-author` | Implements only the cache backend and gets all three primitives |
 | `cpt-cf-clst-actor-platform-gear` | Consumes the default-backed primitives transparently |
 
 ### 1.4 References
@@ -57,7 +55,6 @@ Lowering the barrier to integrating a new backend means a plugin author should o
   - [x] `p2` - `cpt-cf-clst-feature-cache-primitive`
   - [x] `p2` - `cpt-cf-clst-feature-leader-election`
   - [x] `p2` - `cpt-cf-clst-feature-distributed-lock`
-  - [x] `p2` - `cpt-cf-clst-feature-service-discovery`
 
 **Review domains**:
 - Security — not applicable: the SDK contract exposes no authentication or authorization surface; transport authentication, credential wiring, and tenant isolation are backend/plugin concerns deferred to the OOP deployment design (PRD §4.2).
@@ -66,24 +63,24 @@ Lowering the barrier to integrating a new backend means a plugin author should o
 
 ## 2. Actor Flows (CDSL)
 
-### Cache-Only Plugin Gets All Four Primitives
+### Cache-Only Plugin Gets All Three Primitives
 
 - [x] `p1` - **ID**: `cpt-cf-clst-flow-sdk-default-backends-cache-only`
 
 **Actor**: `cpt-cf-clst-actor-plugin-author`
 
 **Success Scenarios**:
-- A plugin implementing only the cache backend obtains working leader election, lock, and service discovery via SDK defaults.
+- A plugin implementing only the cache backend obtains working leader election and lock via SDK defaults.
 
 **Error Scenarios**:
 - The cache is eventually consistent and a default for a consistency-sensitive primitive is constructed without opt-in — construction is rejected.
 
 **Steps**:
 1. [x] - `p1` - Plugin author implements only the cache backend - `inst-co-cache`
-2. [x] - `p1` - SDK wraps the cache backend in the default leader-election, lock, and service-discovery backends - `inst-co-wrap`
+2. [x] - `p1` - SDK wraps the cache backend in the default leader-election and lock backends - `inst-co-wrap`
 3. [x] - `p1` - **IF** a consistency-sensitive default is constructed over an eventually-consistent cache without opt-in - `inst-co-guard`
    1. [x] - `p1` - **RETURN** an invalid-config error - `inst-co-reject`
-4. [x] - `p1` - **RETURN** four working primitives backed by the single cache implementation - `inst-co-return`
+4. [x] - `p1` - **RETURN** three working primitives backed by the single cache implementation - `inst-co-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -116,19 +113,6 @@ Lowering the barrier to integrating a new backend means a plugin author should o
 3. [x] - `p1` - Release conditionally via compare-and-swap so a foreign holder cannot release - `inst-cl-release`
 4. [x] - `p1` - Rely on the cache TTL to reap a crashed holder's entry - `inst-cl-reap`
 
-### Cache-Based Service Discovery
-
-- [x] `p1` - **ID**: `cpt-cf-clst-algo-sdk-default-backends-cache-sd`
-
-**Input**: A cache backend and a service name
-
-**Output**: Registration, discovery, and topology over cache operations
-
-**Steps**:
-1. [x] - `p1` - Store each instance under a per-instance key with a heartbeat TTL - `inst-cs-put`
-2. [x] - `p1` - Watch the service prefix for topology change events - `inst-cs-watch`
-3. [x] - `p1` - Apply metadata filtering client-side - `inst-cs-filter`
-
 ### Constructor Safety Guard
 
 - [x] `p1` - **ID**: `cpt-cf-clst-algo-sdk-default-backends-constructor-guard`
@@ -145,7 +129,7 @@ Lowering the barrier to integrating a new backend means a plugin author should o
 
 ## 4. States (CDSL)
 
-Not applicable — the default backends reuse the leadership and serving-intent state machines defined by the leader-election and service-discovery features; they introduce no new entity lifecycle.
+Not applicable — the default backends reuse the leadership state machine defined by the leader-election feature; they introduce no new entity lifecycle.
 
 ## 5. Definitions of Done
 
@@ -177,23 +161,9 @@ The system **MUST** provide a CAS-based default lock backend over the cache, wit
 **Touches**:
 - Entities: CasBasedDistributedLockBackend
 
-### Cache-Based Service-Discovery Default Backend
-
-- [x] `p1` - **ID**: `cpt-cf-clst-dod-sdk-default-backends-sd`
-
-The system **MUST** provide a cache-based default service-discovery backend over the cache with a single constructor (transient staleness is acceptable for set-membership semantics), per-instance keys with heartbeat TTL, prefix-watch topology, and client-side metadata filtering.
-
-**Implements**:
-- `cpt-cf-clst-flow-sdk-default-backends-cache-only`
-- `cpt-cf-clst-algo-sdk-default-backends-cache-sd`
-
-**Touches**:
-- Entities: CacheBasedServiceDiscoveryBackend
-
 ## 6. Acceptance Criteria
 
-- [x] A plugin implementing only the cache backend yields working leader election, lock, and service discovery via SDK defaults.
+- [x] A plugin implementing only the cache backend yields working leader election and lock via SDK defaults.
 - [x] The default-safe constructor rejects an eventually-consistent cache for leader election and lock; the weak-consistency constructor succeeds and warns.
 - [x] Under a linearizable cache, the default leader-election backend preserves at-most-one-leader.
 - [x] The default lock backend releases conditionally and recovers crashed holders via TTL.
-- [x] The default service-discovery backend supports registration, prefix-watch topology, and client-side metadata filtering.

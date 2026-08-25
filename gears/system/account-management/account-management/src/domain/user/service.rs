@@ -66,7 +66,6 @@ use crate::domain::error::DomainError;
 use crate::domain::idp::UserOperationFailureExt;
 use crate::domain::metrics::{AM_DEPENDENCY_HEALTH, MetricKind, emit_metric};
 use crate::domain::tenant::TenantContext;
-use crate::domain::tenant::model::TenantStatus;
 use crate::domain::tenant::repo::TenantRepo;
 
 /// Upper bound on `username` length enforced at the AM boundary
@@ -133,6 +132,16 @@ pub(crate) mod pep {
         pub const LIST: &str = "list";
         pub const DELETE: &str = "delete";
         pub const UPDATE: &str = "update";
+
+        /// Every action in this vocabulary, in declaration order. The
+        /// permission-catalog test asserts one `AuthzPermissionV1` per
+        /// `(resource_type, action)` pair drawn from these slices, so an
+        /// action that is enforced at a PEP gate but never declared as a
+        /// grantable permission fails the test instead of silently
+        /// becoming ungrantable. Add new actions here as well as above.
+        /// Test-only: nothing in the production path enumerates actions.
+        #[cfg(test)]
+        pub const ALL: &[&str] = &[CREATE, LIST, DELETE, UPDATE];
     }
 }
 
@@ -329,7 +338,7 @@ impl UserService {
     ///
     /// * [`DomainError::NotFound`] -- `tenant_id` does not resolve.
     /// * [`DomainError::Validation`] -- tenant exists but is not
-    ///   [`TenantStatus::Active`] (provisioning, suspended, deleted).
+    ///   [`crate::domain::tenant::model::TenantStatus::Active`] (provisioning, suspended, deleted).
     /// * [`DomainError::Validation`] -- payload rejected before the
     ///   `IdP` call: empty / whitespace-only username, username or
     ///   email / `display_name` exceeding the length cap, or GTS
@@ -508,7 +517,7 @@ impl UserService {
     ///
     /// * [`DomainError::NotFound`] -- `tenant_id` does not resolve.
     /// * [`DomainError::Validation`] -- tenant exists but is not
-    ///   [`TenantStatus::Active`].
+    ///   [`crate::domain::tenant::model::TenantStatus::Active`].
     /// * [`DomainError::ServiceUnavailable`] -- GTS Types Registry or
     ///   DB transport failure inside `resolve_active_tenant`, or
     ///   resource-group transport / overall-budget timeout during the
@@ -638,6 +647,13 @@ impl UserService {
     ///   rejection (incl. rejected password).
     /// * [`DomainError::UserAlreadyExists`] -- a username rename
     ///   collided with an existing login (HTTP 409).
+    /// * [`DomainError::IdpFieldNotWritable`] -- the provider refused one
+    ///   or more patched attributes as `IdP`-managed and not overridable
+    ///   (HTTP 400, carrying every offending field as its own
+    ///   `field_violations[].field` with `reason =
+    ///   "IDP_MANAGED_FIELD"`). Distinct from
+    ///   [`DomainError::UnsupportedOperation`], which means the provider
+    ///   implements no `update_user` at all.
     /// * [`DomainError::UserNotFound`] -- the `IdP` reports the target
     ///   user absent in this tenant scope (HTTP 404).
     /// * [`DomainError::NotFound`] -- `tenant_id` does not resolve.
@@ -840,7 +856,7 @@ impl UserService {
     ///   check, not a paginated query).
     /// * [`DomainError::NotFound`] -- `tenant_id` does not resolve.
     /// * [`DomainError::Validation`] -- tenant exists but is not
-    ///   [`TenantStatus::Active`].
+    ///   [`crate::domain::tenant::model::TenantStatus::Active`].
     /// * [`DomainError::ServiceUnavailable`] -- GTS Types Registry or
     ///   DB transport failure inside `resolve_active_tenant`.
     /// * [`DomainError::IdpUnavailable`] -- transport failure or
@@ -989,7 +1005,7 @@ impl UserService {
     // Helpers
     // ----------------------------------------------------------------
 
-    /// Resolve `tenant_id` to an [`TenantStatus::Active`] tenant and
+    /// Resolve `tenant_id` to an [`crate::domain::tenant::model::TenantStatus::Active`] tenant and
     /// build the [`TenantContext`] forwarded to the `IdP` plugin.
     ///
     /// Centralised so each flow shares one tenant guard implementation
@@ -1009,65 +1025,17 @@ impl UserService {
         scope: &AccessScope,
         tenant_id: Uuid,
     ) -> Result<TenantContext, DomainError> {
-        let tenant = self
-            .tenant_repo
-            .find_by_id(scope, tenant_id)
-            .await?
-            .ok_or_else(|| DomainError::NotFound {
-                detail: format!("tenant {tenant_id} not found"),
-                resource: tenant_id.to_string(),
-            })?;
-
-        if !matches!(tenant.status, TenantStatus::Active) {
-            return Err(DomainError::Validation {
-                detail: format!(
-                    "tenant {} is not active (status={})",
-                    tenant.id,
-                    tenant.status.as_str()
-                ),
-            });
-        }
-
-        // Resolve the chained `tenant_type` mandatorily — the
-        // plugin contract no longer accepts `None`. A registry
-        // blip surfaces as `ServiceUnavailable` (HTTP 503): user
-        // ops cannot proceed without the type because plugins may
-        // route on it (Keycloak realm name, Zitadel organization
-        // selection, vendor-side org id derivation).
-        // `get_type_schema_by_uuid` returns the typed
-        // `GtsTypeId` directly so no string round-trip is
-        // needed.
-        let tenant_type = match self
-            .types_registry
-            .get_type_schema_by_uuid(tenant.tenant_type_uuid)
-            .await
-        {
-            Ok(schema) => schema.type_id,
-            Err(err) => {
-                tracing::warn!(
-                    target: "am.user.service",
-                    tenant_type_uuid = %tenant.tenant_type_uuid,
-                    error = %err,
-                    "tenant_type uuid -> chained-id resolution failed; surfacing ServiceUnavailable"
-                );
-                return Err(DomainError::service_unavailable(format!(
-                    "tenant_type resolution failed for tenant {}: {err}",
-                    tenant.id
-                )));
-            }
-        };
-
-        // Load the plugin-private metadata blob AM stamped at
-        // `activate_tenant` time. AM does not interpret the shape;
-        // the value flows verbatim into `TenantContext::metadata`
-        // so the plugin sees its own state.
-        let metadata = self.tenant_repo.find_idp_metadata(scope, tenant.id).await?;
-        Ok(TenantContext::new(
-            tenant.id,
-            tenant.name,
-            tenant_type,
-            metadata,
-        ))
+        // The ladder itself lives in
+        // [`crate::domain::tenant::resolve::resolve_active_tenant`] so
+        // the service-account pass-through applies a byte-identical
+        // guard rather than a second copy that can drift.
+        crate::domain::tenant::resolve::resolve_active_tenant(
+            &*self.tenant_repo,
+            &*self.types_registry,
+            scope,
+            tenant_id,
+        )
+        .await
     }
 
     // ----------------------------------------------------------------

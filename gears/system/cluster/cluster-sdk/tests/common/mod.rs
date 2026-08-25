@@ -17,7 +17,7 @@
 //!
 //! The three remaining primitives are obtained as the "siblings" of this cache
 //! through the SDK default backends (`CasBased*` / `CacheBased*`), which is the
-//! whole point of the "implement cache only, get all four primitives" guarantee
+//! whole point of the "implement cache only, get all three primitives" guarantee
 //! — so the smoke tests need only this one hand-written stub.
 
 #![allow(

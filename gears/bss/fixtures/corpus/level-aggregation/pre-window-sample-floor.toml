@@ -1,0 +1,64 @@
+family     = "level-aggregation"
+id         = "pre-window-sample-floor"
+kind       = "evaluation"
+provenance = ["AC#60", "D-44", "T-D-17"]
+
+# The reference semantics the oracle's own `held_level` doc says belong here and
+# not in the helper: **a sample taken before the window sits in granule 0,
+# however far before**.
+#
+# `seconds(window_start, last.at)` floors at zero, so a level observed one second
+# before the window and one observed a year before it are the same distance from
+# every granule, and both are carried wherever `g_index <= maxHoldGranules`. It
+# is a floor rather than a measurement, and it means `maxHoldGranules` does not
+# bound staleness on the one side where staleness is unbounded: an opening level
+# can be arbitrarily old and is still carried into the window's first granules.
+#
+# Defensible for a step function - a gauge sample is an assertion about every
+# instant after it until the next one, and the level really did persist - but it
+# is a *choice*, and it is the kind rating will reproduce or contradict. Until
+# now no committed case carried a sample before `window_start`, so nothing in the
+# corpus pinned it; only `oracle_tests` did, which is one implementation talking
+# to itself.
+#
+# The sample is deliberately **a year** early rather than a minute. A minute
+# early is indistinguishable from a rounding question; a year early makes the
+# claim unmissable, and if the semantics are ever changed to age a pre-window
+# sample by its true distance, this case is what has to be edited - deliberately,
+# with the reason written beside it.
+#
+# The window is `late-sample-refold`'s, so the arithmetic is comparable across
+# the family: three hourly granules, `peak`, `maxHoldGranules = 1`.
+
+[snapshot]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "cloudlet.count"
+aggregation_function    = "peak"
+aggregation_granularity = "hour"
+max_hold_granules       = 1
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+
+  [[snapshot.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 3
+
+[runtime]
+window_start = "2026-01-01T00:00:00Z"
+window_end   = "2026-01-01T03:00:00Z"
+
+  # A year before the window opens. Nothing else is observed until hour 2.
+  [[runtime.samples]]
+  at    = "2025-01-01T00:00:00Z"
+  level = 50
+  [[runtime.samples]]
+  at    = "2026-01-01T02:00:00Z"
+  level = 10
+
+[[assert]]
+given  = { }
+expect = { folded_q = 110 }
+why    = "the year-old sample reads as granule 0, so it is carried into granule 0 (distance 0) and granule 1 (distance 1, exactly maxHold) at 50 each, and drops out of granule 2 (distance 2) where the fresh 10 stands alone. Q = 50 + 50 + 10 = 110. Aged by its true distance it would be carried nowhere and Q would be 10 — which is the whole of what this case pins"

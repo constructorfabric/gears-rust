@@ -164,7 +164,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 async fn count_files_rows(dsn: &str) -> i64 {
     let conn = Database::connect(dsn).await.expect("raw connect");
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT COUNT(*) AS c FROM files".to_owned(),
         ))
@@ -208,7 +208,7 @@ async fn tamper_request_hash(
              AND owner_id = X'{owner_hex}' AND idempotency_key = '{key}'"
     );
     let res = conn
-        .execute(Statement::from_string(conn.get_database_backend(), sql))
+        .execute_raw(Statement::from_string(conn.get_database_backend(), sql))
         .await
         .expect("tamper request_hash");
     assert_eq!(
@@ -1775,7 +1775,7 @@ async fn multipart_complete_uses_reported_parts_not_empty_list() {
     );
 }
 
-/// CodeRabbit (Major): the report-part callback is `.public()` +
+/// CodeRabbit (Major): the report-part callback is `.anonymous()` +
 /// token-authenticated, so a holder of the signed part token could otherwise
 /// report an arbitrary `size` in the JSON body. `complete_multipart_upload`
 /// sums stored part sizes into `version.size` unchecked, so a forged size

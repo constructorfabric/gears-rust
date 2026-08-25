@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::{Expr, SimpleExpr};
-use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, ExprTrait, QueryFilter};
 use toolkit_db::secure::{
     ScopeError, SecureEntityExt, SecureUpdateExt, TxConfig, is_unique_violation, secure_insert,
 };

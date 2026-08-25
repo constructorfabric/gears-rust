@@ -3,7 +3,7 @@
 
 # E2E Testing Guide
 
-This document defines the philosophy, infrastructure, and patterns for end-to-end (E2E) tests across all ToolKit gears. Gear-specific test plans (which seams to test, actual test implementations) live in each gear's `docs/features/` folder and `testing/e2e/gears/<gear>/`.
+This document defines the philosophy, infrastructure, and patterns for end-to-end (E2E) tests across all ToolKit gears. Gear-specific test plans (which seams to test, actual test implementations) live in each gear's `docs/features/` folder and `testing/e2e/suites/<gear>/`.
 
 ---
 
@@ -19,7 +19,7 @@ This is **not** "another way to verify business logic." Business logic is verifi
 
 E2E tests live at two levels, and both matter:
 
-**Single-gear E2E** — verifies that the gear's own integration seams work end-to-end: routing, JSON wire format, real AuthZ wiring, PostgreSQL-specific SQL. Each gear has its own suite under `testing/e2e/gears/<gear>/`. These tests are the baseline.
+**Single-gear E2E** — verifies that the gear's own integration seams work end-to-end: routing, JSON wire format, real AuthZ wiring, PostgreSQL-specific SQL. Each gear has its own suite under `testing/e2e/suites/<gear>/`. These tests are the baseline.
 
 **Cross-gear E2E** — verifies that **2–5 gears work correctly together**. This is the primary reason E2E tests exist at all. Unit tests verify each gear in isolation (mocking its dependencies). Only an E2E test can catch bugs that appear at the boundary between gears: gear A calls gear B's SDK, gear B reads from a table that gear C seeded, the combined result flows through gear D's API. None of these seams are visible to any single gear's unit tests.
 
@@ -83,6 +83,19 @@ All of the above is **deterministic logic** that works identically whether calle
 Every important API endpoint should be called **at most once** across the entire E2E suite in a **positive (happy-path) scenario**. Negative scenarios are rare exceptions — only when the negative behavior is a genuine integration seam (e.g., real FK constraint on PostgreSQL, real AuthZ denial with a live token) that cannot be caught by unit tests.
 
 **Corner case and edge-case coverage in E2E is only acceptable if it could not be achieved in unit tests.** Before adding an E2E test for an edge case, verify that the same scenario cannot be written as a unit test against SQLite or a mock. If it can — it goes there, not here.
+
+**Divergence between SQLite and PostgreSQL is on its own sufficient grounds for a PostgreSQL venue**, and is the most common reason a case legitimately cannot move down a tier. Which of the two venues below it selects depends on the seam the case actually needs — HTTP E2E when it needs the transport, a direct Rust integration suite when the divergence is in the SQL or the schema. Numeric column widths (`SMALLINT` vs `INTEGER` range and comparison), `CHECK` constraint enforcement, FK actions, domain types, isolation levels and type affinity all behave differently, and SQLite's dynamic typing hides mismatches rather than surfacing them. If you can name the way the two backends differ, the test belongs here.
+
+That permission does not loosen the restraint above it. E2E carries far fewer tests than the unit suite by design, and every case has to be justified by what a unit test cannot reach; where two cases would cover the same ground, the coverage checklist below is what removes the duplicate. "It is database-related" is not the criterion — "it behaves differently on PostgreSQL, and here is how" is.
+
+**Check which venue you actually have.** The definition above is normative: a suite is only an E2E suite if it runs against real PostgreSQL. A pytest harness that seeds SQLite directly and drives HTTP over it is a useful integration suite, but it **cannot discharge any PostgreSQL-specific claim** — the very divergences listed above are the ones it cannot see. So confirm before routing, and know that there are two venues, not one:
+
+- **This suite**, when it genuinely runs against PostgreSQL. Use it when the case needs the full HTTP chain as well as the real database.
+- **A feature-gated Rust suite against real PostgreSQL via `testcontainers`**, calling repository or service code directly — in-process, no HTTP, no running server. Use it when the divergence is in the SQL or the schema rather than in the transport, which is the common case: dialect rejections, column widths, `CHECK` and FK enforcement, isolation. It gives a far more precise diagnosis than an HTTP status can, and it costs seconds rather than a server boot.
+
+The second is in use, not hypothetical. The established wiring is a `--features integration` suite behind `#![cfg(feature = "integration")]`, a dedicated `test-<gear>-pg` `Makefile` target, and a matching step in `.github/workflows/ci.yml`'s `integration` job. `resource-group` is the worked example, and it writes the deviation from this guide down in its own docs rather than leaving it implicit — do the same if you adopt the pattern.
+
+Only when neither venue exists is the behaviour genuinely untested, and that is what belongs in the backlog rather than in an assumption.
 
 After adding or removing any E2E test, **check the coverage checklist**: verify which HTTP methods (GET, POST, PUT, PATCH, DELETE) are called across all tests in the gear suite. If a method is already exercised in test A, test B does not need to call it again. Remove redundant calls without hesitation.
 
@@ -266,7 +279,7 @@ Never use `pytest-rerunfailures` as a permanent fix. Retrying a flaky test hides
 ### File Layout
 
 ```
-testing/e2e/gears/<gear_name>/
+testing/e2e/suites/<gear_name>/
 ├── conftest.py                   ← helpers, timeout config, factory fixtures
 ├── test_authz_tenant_scoping.py  ← AuthZ + tenant isolation seams (if applicable)
 ├── test_mtls_auth.py             ← MTLS certificate verification (if applicable; p2 — deferred, not implemented yet)
@@ -505,9 +518,9 @@ async def test_pagination_cursor_roundtrip(client, create_entities):
     all_ids = []
     cursor = None
     while True:
-        params = {"$top": 2}
+        params = {"limit": 2}
         if cursor:
-            params["$skiptoken"] = cursor
+            params["cursor"] = cursor
         r = await client.get("/cf/<gear>/v1/entities", params=params)
         assert r.status_code == 200
         page = r.json()

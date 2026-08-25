@@ -28,6 +28,7 @@ use std::collections::HashMap;
 
 use bss_ledger_sdk::{AccountClass, Side, SourceDocType};
 use chrono::{DateTime, Utc};
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, DbErr, EntityTrait, Order};
 use toolkit_db::secure::{
@@ -480,6 +481,9 @@ impl RecognitionRepo {
     /// not released blocks close, design §4.5). In-txn so it joins the close's
     /// `SERIALIZABLE` snapshot (a concurrent release conflicts under SSI).
     /// Returns [`DbError`] so a serialization conflict stays retryable.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if scope application or the segment query fails.
     pub async fn count_due_not_done_in_txn(
         txn: &DbTx<'_>,
         scope: &AccessScope,

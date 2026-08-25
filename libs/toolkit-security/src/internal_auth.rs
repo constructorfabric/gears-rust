@@ -95,6 +95,14 @@ pub enum PlatformIdentity {
         /// Version component of the SPIFFE ID.
         version: String,
     },
+    /// A caller authenticated by a pre-shared secret (dev / single-node
+    /// profiles). Not tied to any deployment substrate: it exists so the
+    /// platform plane can be exercised end-to-end without Kubernetes. The
+    /// `name` is a configured label used for workload-policy decisions.
+    Shared {
+        /// Configured caller label (returned by [`PlatformIdentity::peer_name`]).
+        name: String,
+    },
     /// Catch-all for variants introduced in a newer library version.
     ///
     /// Produced only by `serde::Deserialize` when the `"type"` field holds an
@@ -116,7 +124,7 @@ impl PlatformIdentity {
             Self::KubernetesServiceAccount {
                 service_account, ..
             } => service_account,
-            Self::Spiffe { name, .. } => name,
+            Self::Spiffe { name, .. } | Self::Shared { name } => name,
             Self::Unknown => "<unknown>",
         }
     }

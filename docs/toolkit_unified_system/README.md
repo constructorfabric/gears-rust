@@ -23,13 +23,14 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 | Errors, RFC-9457 Problem | `05_errors_rfc9457.md` | |
 | Lifecycle, background tasks, cancellation | `08_lifecycle_stateful_tasks.md` | |
 | Out-of-Process / gRPC / SDK pattern | `09_oop_grpc_sdk_pattern.md` | |
-| Domain model macro, DDD enforcement | `02_gear_layout_and_sdk_pattern.md` (§ Domain types) | `dylint_lints/de03_domain_layer/de0309_must_have_domain_model/README.md` |
+| Domain model macro, DDD enforcement | `02_gear_layout_and_sdk_pattern.md` (§ Domain types) | Architecture lint DE0309 (via `cargo gears lint`) |
 | Quick checklists, templates | `10_checklists_and_templates.md` | |
 | Unit & integration testing (philosophy, patterns, infrastructure) | `12_unit_testing.md` | |
 | E2E testing (philosophy, patterns, infrastructure) | `13_e2e_testing.md` | |
 | HTTP client (TLS, retries, timeouts, concurrency, OTel tracing, auth hook) | | `docs/adrs/toolkit/0001-toolkit-hyper-tower-http-client.md` |
 | AuthN/AuthZ, PolicyEnforcer, PEP enforcement | `06_authn_authz_secure_orm.md` | `docs/arch/authorization/DESIGN.md` |
 | Authentication (inbound JWT/OIDC policies, outbound OAuth2 client-credentials) | | `docs/adrs/toolkit/0002-toolkit-auth-oauth2-client.md` |
+| Which control catches which class of defect (inverse lookup, before merge) | `16_defect_class_to_control_map.md` | |
 
 ## Core invariants (apply everywhere)
 
@@ -61,6 +62,7 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 - `11_database_patterns.md` – DBRunner/SecureTx executors, transactions, repository pattern, database migrations.
 - `12_unit_testing.md` – Philosophy, reliability principles, infrastructure, assert patterns, naming, priority matrix for unit/integration tests.
 - `13_e2e_testing.md` – Philosophy, integration seams concept, pytest infrastructure, test patterns, anti-patterns for E2E tests.
+- `16_defect_class_to_control_map.md` – The inverse lookup: given a class of defect (tenant bypass, missing gate, global tables, wire/storage type mismatch, error classification, disclosure, in-process bypass, N+1, write-skew, API completeness, coverage that proves nothing), which control is supposed to catch it. Use it to find the class a defect belongs to, and to check that an applicable class has a control rather than an intention.
 
 ### Related ADRs
 

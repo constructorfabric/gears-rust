@@ -34,7 +34,7 @@ The example ships a master config wiring the gateway, gRPC hub, and orchestrator
 
 ## Kubernetes
 
-Gears run as containerized services with cluster-native discovery. Each service is an out-of-process gear plus the system gears it depends on. The cluster-plane coordination primitives (leader election, distributed locks, service discovery, distributed cache) are **designed but not yet implemented** — see [Status and roadmap](../../capabilities/status-and-roadmap/).
+Gears run as containerized services with cluster-native discovery. Each service is an out-of-process gear plus the system gears it depends on. The cluster-plane coordination primitives (leader election, distributed locks, distributed cache) are **designed but not yet implemented** — see [Status and roadmap](../../capabilities/status-and-roadmap/).
 
 ## Build considerations
 

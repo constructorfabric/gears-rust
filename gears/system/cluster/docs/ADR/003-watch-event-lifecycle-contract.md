@@ -7,7 +7,7 @@ date: 2026-04-02
 
 **ID**: `cpt-cf-clst-adr-watch-event-lifecycle-contract`
 
-> Originally accepted 2026-04-02 for cache watch only. Generalized 2026-04-27 to leader-election and service-discovery watches; lightweight-notifications principle folded in. Decision is unchanged; the generalization is captured in §"Generalization to all three watches".
+> Originally accepted 2026-04-02 for cache watch only. Generalized 2026-04-27 to the leader-election watch; lightweight-notifications principle folded in. Decision is unchanged; the generalization is captured in §"Generalization to both watches".
 
 <!-- toc -->
 
@@ -15,7 +15,7 @@ date: 2026-04-02
 - [Decision Drivers](#decision-drivers)
 - [Considered Options](#considered-options)
 - [Decision Outcome](#decision-outcome)
-  - [Generalization to all three watches](#generalization-to-all-three-watches)
+  - [Generalization to both watches](#generalization-to-both-watches)
   - [Lightweight notifications: events carry no value payload](#lightweight-notifications-events-carry-no-value-payload)
   - [Shutdown sequence](#shutdown-sequence)
   - [Consequences](#consequences)
@@ -54,7 +54,7 @@ All five scenarios share the same root: **watch is inherently unreliable across 
 ## Decision Drivers
 
 - Gears' cluster gears remote-only — every watcher crosses a network boundary.
-- SDK-default backends (`CacheBasedServiceDiscovery`, `CasBasedLeaderElection`, `CasBasedDistributedLock` — see ADR-001) depend on watch. Silent lag or reset would silently break these primitives.
+- SDK-default backends (`CasBasedLeaderElection`, `CasBasedDistributedLock` — see ADR-001) depend on watch. Silent lag or reset would silently break these primitives.
 - Rust's `Result`-based error propagation via `?` is idiomatic — any signal that looks like an error will be propagated as one, which is wrong for transient lag signals.
 - Every target backend has a native notion of "you missed events" (etcd compaction, K8s 410 Gone, NATS KV sequence gap, Postgres NOTIFY overflow marker, Redis Pub/Sub backpressure). The trait should expose this uniformly.
 - Analogous Rust libraries (`tokio::sync::broadcast`, `kube-rs::watcher`) already solved this problem by surfacing lag and reset as first-class events.
@@ -89,9 +89,9 @@ The consumer contract:
 - `Reset`: the subscription was re-established (reconnect, compaction, provider restart). Consumer MUST re-read all keys in the watch scope.
 - `Closed(err)`: the stream ended with a terminal error. `CacheWatch` is no longer usable; consumer must call `watch()` again to continue observing.
 
-### Generalization to all three watches
+### Generalization to both watches
 
-The same union shape applies to `LeaderWatchEvent` and `ServiceWatchEvent`. All three watches yield events of the form `{value-variant, Lagged{dropped}, Reset, Closed(err)}` and are infallible at the type level — there is no `Result`-returning `changed()` on any watch.
+The same union shape applies to `LeaderWatchEvent`. Both watches yield events of the form `{value-variant, Lagged{dropped}, Reset, Closed(err)}` and are infallible at the type level — there is no `Result`-returning `changed()` on any watch.
 
 ```rust
 enum CacheWatchEvent {
@@ -108,36 +108,29 @@ enum LeaderWatchEvent {
     Closed(ClusterError),
 }
 
-enum ServiceWatchEvent {
-    Change(TopologyChange),
-    Lagged { dropped: u64 },
-    Reset,
-    Closed(ClusterError),
-}
 ```
 
-Why generalize: the original cache-watch problem is not cache-specific. Every long-lived watch over a remote backend faces the same failure modes — slow consumer, provider reconnect, busy fan-in, network partition, backend restart. A `LeaderWatch` that silently misses the `Lost` transition is just as wrong as a cache watch that silently misses a `Changed` event; in fact more wrong, because the consumer may continue acting as leader. A `ServiceWatch` that silently misses a `Left` event causes consumers to keep routing to a deregistered instance.
+Why generalize: the original cache-watch problem is not cache-specific. Every long-lived watch over a remote backend faces the same failure modes — slow consumer, provider reconnect, busy fan-in, network partition, backend restart. A `LeaderWatch` that silently misses the `Lost` transition is just as wrong as a cache watch that silently misses a `Changed` event; in fact more wrong, because the consumer may continue acting as leader.
 
-Three watch types, one contract: same variants, same consumer obligations, same per-backend mapping. The only difference is the value-variant payload (`CacheEvent` vs `LeaderStatus` vs `TopologyChange`).
+Two watch types, one contract: same variants, same consumer obligations, same per-backend mapping. The only difference is the value-variant payload (`CacheEvent` vs `LeaderStatus`).
 
 **Transient errors stay below the contract.** Each watch's background task retries `ConnectionLost`, `Timeout`, and `ResourceExhausted` internally; only terminal errors propagate to `Closed(err)`. Transient-vs-terminal classification is the backend's responsibility.
 
 #### Watch task and renewal task: independent signal paths
 
-Cluster primitives that hold ephemeral state (`LeaderElectionV1`, `DistributedLockV1`, `ServiceDiscoveryV1`) carry two independent signal paths to the consumer:
+Cluster primitives that hold ephemeral state (`LeaderElectionV1`, `DistributedLockV1`) carry two independent signal paths to the consumer:
 
 - The **watch task** publishes `*WatchEvent { value-variant, Lagged, Reset, Closed(err) }` and conveys subscription observability — whether change notifications are flowing.
 - The **renewal task** publishes a primitive-specific state-loss signal and conveys state validity — whether the backend still recognizes the consumer's hold.
 
-A `Closed(ConnectionLost)` on a `LeaderWatch`, `ServiceWatch`, or `CacheWatch` is a subscription event. State validity is determined by the renewal-task path.
+A `Closed(ConnectionLost)` on a `LeaderWatch` or `CacheWatch` is a subscription event. State validity is determined by the renewal-task path.
 
 **State-loss signals per primitive**:
 
 - `LeaderElectionV1` — when `max_missed_renewals` consecutive renewal attempts fail, or the backend confirms TTL expiry, the renewal task emits `LeaderWatchEvent::Status(Lost)`. Auto-reenroll follows per the `LeaderWatch` lifecycle (DESIGN §3.3).
 - `DistributedLockV1` — the renewal task surfaces state loss through the next `LockGuard::renew(new_ttl).await`, which returns `Err(ClusterError::LockExpired { name })`. A subsequent `LockGuard::release(self).await` against a foreign-held lock is a benign no-op (delete-if-still-holder CAS).
-- `ServiceDiscoveryV1` — when the registration's heartbeat task fails, the registered instance disappears from any `discover()` result after `TTL + epsilon`, and active `ServiceWatch` subscribers receive `ServiceWatchEvent::Change(TopologyChange::Left { instance_id })`.
 
-**Authoritative state-loss declarations**. Leadership is invalidated when the renewal task emits `Status(Lost)`, or when the shutdown sequence emits the `Status(Lost) → Closed(Shutdown)` two-step (§"Shutdown sequence"). Lock state is invalidated when `LockExpired` returns from `renew()`. Service-discovery instance state is invalidated when the instance disappears from the discovery set. These are the authoritative state-loss events.
+**Authoritative state-loss declarations**. Leadership is invalidated when the renewal task emits `Status(Lost)`, or when the shutdown sequence emits the `Status(Lost) → Closed(Shutdown)` two-step (§"Shutdown sequence"). Lock state is invalidated when `LockExpired` returns from `renew()`. These are the authoritative state-loss events.
 
 **TTL as the staleness bound**. The TTL+heartbeat model gives every primitive a deterministic upper bound on staleness, independent of any backend-managed session concept. Backends with native session semantics (e.g., a future ZooKeeper plugin using ephemeral nodes) surface session-loss earlier: the renewal task observes the native session-loss signal and emits `Status(Lost)` / `LockExpired` ahead of TTL expiry. The consumer-facing surface is identical across all backends.
 
@@ -166,7 +159,6 @@ Reliable messaging with values, ordering guarantees, replay, and consumer groups
 
 - For every active `LeaderWatch` currently in `Leader` state: `LeaderWatchEvent::Status(Lost)` synchronously, immediately followed by `LeaderWatchEvent::Closed(ClusterError::Shutdown)`. **Two distinct events at the type level.** `Status(Lost)` revokes the leader's confidence — any code path keying on `is_leader()` stops the moment the consumer reads the `Lost` transition. `Closed(Shutdown)` then ends the watch.
 - For every active cache watch: `CacheWatchEvent::Closed(ClusterError::Shutdown)`.
-- For every active service-discovery watch: `ServiceWatchEvent::Closed(ClusterError::Shutdown)`.
 
 Why the leader two-step: a single `Closed(Shutdown)` event would tell the consumer the watch ended but would NOT separately signal "stop acting as leader." The consumer's leader-only work (e.g., a worker that runs only when leader) needs to see `Lost` before the watch closes, so the consumer can short-circuit any pending leader-only operations before observing shutdown. The two-step sequence makes leader confidence revocation explicit at the type level, not implicit in stream termination.
 
@@ -178,7 +170,7 @@ Why the union shape makes this clean: terminal errors are `Closed(err)`, a regul
 - Every provider must emit the four variants. Providers with native lag/reset signals (NATS, etcd, Postgres NOTIFY marker) map directly. Providers without (Redis keyspace notifications) synthesize signals from local state (broadcast channel overflow → Lagged; connection reset → Reset).
 - Standalone plugin emits `Lagged` when its internal `tokio::sync::broadcast` channel overflows and `Closed(ClusterError::Shutdown)` on shutdown. `Reset` does not occur in standalone operation.
 - The `CacheWatchEvent::Closed` variant is terminal. Providers MUST ensure no further items are yielded after `Closed`. Consumer loops that do not pattern-match `Closed` will spin forever; doc comments and example code must make this explicit.
-- **SDK auto-restart combinator.** The SDK ships an opt-in combinator `*Watch::auto_restart(policy: RetryPolicy)` over the `*WatchEvent` contract. The combinator translates `Closed(retryable)` — where retryability is read from `ProviderErrorKind` (`ConnectionLost`, `Timeout`, `ResourceExhausted`) — into transparent reconnection with backoff and jitter, synthesizing a `Reset` event to the consumer on each successful resubscribe. `Closed(non-retryable)` (`AuthFailure`, `CapabilityNotMet`, `Other`) and `Closed(Shutdown)` are propagated to the consumer unchanged. `RetryPolicy` carries `initial_backoff`, `max_backoff`, `jitter_factor`, and an optional `max_retries` cap; the SDK default is exponential backoff `1s → 30s` with full jitter and no retry cap (matches Curator's recommended default). The combinator wraps any `CacheWatch`, `LeaderWatch`, or `ServiceWatch`; consumers that want a custom restart loop continue to consume the raw `*WatchEvent` stream without it.
+- **SDK auto-restart combinator.** The SDK ships an opt-in combinator `*Watch::auto_restart(policy: RetryPolicy)` over the `*WatchEvent` contract. The combinator translates `Closed(retryable)` — where retryability is read from `ProviderErrorKind` (`ConnectionLost`, `Timeout`, `ResourceExhausted`) — into transparent reconnection with backoff and jitter, synthesizing a `Reset` event to the consumer on each successful resubscribe. `Closed(non-retryable)` (`AuthFailure`, `CapabilityNotMet`, `Other`) and `Closed(Shutdown)` are propagated to the consumer unchanged. `RetryPolicy` carries `initial_backoff`, `max_backoff`, `jitter_factor`, and an optional `max_retries` cap; the SDK default is exponential backoff `1s → 30s` with full jitter and no retry cap (matches Curator's recommended default). The combinator wraps either `CacheWatch` or `LeaderWatch`; consumers that want a custom restart loop continue to consume the raw `*WatchEvent` stream without it.
 - **Read amplification under fan-out.** A `Changed`/`Deleted`/`Expired` cache event triggers `cache.get(key)` re-reads on every active watcher. For a `watch_prefix` subscription with N watchers, a single key change produces N reads; a coordinated state change across M keys produces N×M reads in a short window. Sizing fan-out against backend capacity is an operator concern, addressed by cluster's per-primitive routing (PRD §5.5): each cluster-consuming gear documents its fan-out load expectations (subscriber count, event rate, coordinated-burst size) in its own PRD/DESIGN; each cluster backend plugin documents its sustained throughput and connection model in its own DESIGN; the operator matches consumer profiles to backends. ADR-001 §"Pros and Cons of the Options" carries the per-backend qualitative envelopes that inform the match (PRD §6.2 explicitly excludes per-backend performance numbers from cluster's own NFRs).
 
     Read amplification is bounded at two architectural layers: the plugin and the consumer.
@@ -186,13 +178,12 @@ Why the union shape makes this clean: terminal errors are `Closed(err)`, a regul
     **Plugin layer.** Cluster backend plugins are positioned between the SDK facade and the underlying store. Plugins backing throughput-bounded stores absorb fan-out reads with an internal cache — typically an LRU keyed on `(scope, key)`, invalidated by the same change-event stream the plugin already publishes to watchers. The Postgres plugin's LRU is invalidated on `Changed`/`Deleted`/`Expired` events drawn from LISTEN/NOTIFY — the same source that drives consumer-facing `CacheWatchEvent::Event` — so a consumer's `cache.get(key)` resolves from the LRU on a hit and queries the database only on miss or post-invalidation. Cache shape, eviction policy, and capacity limits are per-plugin DESIGN concerns.
 
     **Consumer layer.** A consumer holding multiple watchers on overlapping prefixes coalesces events per key within a small window before issuing `cache.get(key)`. Consumer-layer coalescing composes orthogonally with plugin-layer caching.
-- SDK-default sub-capabilities (`CasBasedLeaderElection`, `CacheBasedServiceDiscovery`) treat `Lagged` and `Reset` as "invalidate my cached state and re-read." This is the correct semantics — they already use `get()` after every event — but needs explicit handling.
+- The SDK-default `CasBasedLeaderElection` treats `Lagged` and `Reset` as "invalidate my cached state and re-read." This is the correct semantics — they already use `get()` after every event — but needs explicit handling.
 - Metrics: providers SHOULD export a counter of `Lagged` events with the `dropped` sum, and a counter of `Reset` events. Excessive lag in production is a capacity-planning signal; excessive reset is a stability signal.
 
 ### Confirmation
 
 - Unit tests verify each provider emits `Lagged`, `Reset`, and `Closed` variants under the expected conditions (broadcast overflow for Lagged; simulated reconnect for Reset; shutdown for Closed).
-- Integration tests verify `CacheBasedServiceDiscovery` correctly invalidates its cached instance list on `Lagged` and `Reset` (i.e., re-reads via prefix `get`).
 - A consumer using the idiomatic `watch.changed().await?` syntax does not compile — verified by a compile-fail test in the SDK.
 
 ## Pros and Cons of the Options
@@ -221,7 +212,7 @@ Why the union shape makes this clean: terminal errors are `Closed(err)`, a regul
 
 - Good, because it lets consumers who don't care about lag use a simpler interface.
 - Good, because providers that cannot implement reliable watch (e.g., Redis Pub/Sub under extreme backpressure) can explicitly not implement the reliable trait.
-- Bad, because every SDK-default backend (per ADR-001) requires reliable watch semantics. `CacheBasedServiceDiscovery` silently missing events means silently wrong service discovery — exactly the failure mode we need to avoid.
+- Bad, because every SDK-default backend (per ADR-001) requires reliable watch semantics. `CasBasedLeaderElection` silently missing events means a consumer that keeps acting as leader after losing the claim — exactly the failure mode we need to avoid.
 - Bad, because it creates a two-tier system where the "correct" tier carries all implementation burden and the "easy" tier is a footgun by design. Consumers who "don't care about lag" are usually wrong about not caring — they would in fact care if they understood the failure modes.
 - Bad, because the hybrid compositor must route sub-capabilities that require `ReliableCacheWatch` to providers that implement it, and silently or explicitly refuse to wire sub-capabilities that don't have a reliable cache. This is complexity on top of complexity.
 - Bad, because it doubles the trait surface (`watch` and `watch_reliable`, `ReliableCacheWatch`, etc.) for dubious gain.
@@ -302,10 +293,9 @@ This decision directly addresses the following requirements and design elements:
 
 - `cpt-cf-clst-fr-cache-watch` — Cache reactive notifications via `CacheWatchEvent` union.
 - `cpt-cf-clst-fr-leader-observability` — Leader election status changes via `LeaderWatchEvent` union.
-- `cpt-cf-clst-fr-sd-watch` — Service-discovery topology watch via `ServiceWatchEvent` union.
 - `cpt-cf-clst-nfr-watch-delivery` — At-most-once with per-key ordering and lifecycle signals (`Lagged`/`Reset`/`Closed`).
 - `cpt-cf-clst-fr-watch-auto-restart` — SDK-shipped opt-in `*Watch::auto_restart(RetryPolicy)` combinator over the `*WatchEvent` contract.
-- `cpt-cf-clst-principle-watch-union-shape` (DESIGN §2.1) — Union shape across all three watches.
+- `cpt-cf-clst-principle-watch-union-shape` (DESIGN §2.1) — Union shape across both watches.
 - `cpt-cf-clst-principle-lightweight-notifications` (DESIGN §2.1) — Cache events carry no value payload.
 - DESIGN §3.9 Watch Event Shape — Three enum definitions consistent with this ADR.
 - DESIGN §3.13 Interactions & Sequences — Shutdown sequence (`Status(Lost) → Closed(Shutdown)` two-step for leaders).

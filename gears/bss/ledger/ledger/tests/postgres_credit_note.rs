@@ -62,7 +62,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -147,7 +147,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
     // `eff_date = Utc::now()`), so a fixed historical period alone makes the test
     // date-dependent (green only in that calendar month). ON CONFLICT dedups when
     // `now` already equals `s.period_id`.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{t}','{t}','{p}','UTC','OPEN'), ('{t}','{t}','{cur}','UTC','OPEN')
          ON CONFLICT DO NOTHING",
@@ -569,7 +569,7 @@ async fn paid_invoice_credit_seeds_reusable_credit_wallet() {
         .expect("invoice posts");
     // Drain open AR to 0 directly in the cache (test shortcut — the open-AR read is
     // what gates the AR-vs-wallet split; a real payment would net it the same).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_ar_invoice_balance SET balance_minor = 0 \
          WHERE tenant_id='{}' AND invoice_id='INV-PAID'",
         s.tenant
@@ -698,7 +698,7 @@ async fn goodwill_credit_over_open_ar_is_rejected() {
         .post_invoice(&ctx, &scope, &inv, true)
         .await
         .expect("invoice posts");
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_ar_invoice_balance SET balance_minor = 200 \
          WHERE tenant_id='{}' AND invoice_id='INV-GWO'",
         s.tenant
@@ -709,7 +709,7 @@ async fn goodwill_credit_over_open_ar_is_rejected() {
     // per-account AR grain that `bal(s.ar)` reads (`ledger_account_balance`). The
     // raw shortcut must touch both, else the post-rejection assertion `bal(s.ar) ==
     // 200` sees the untouched 1000 from the invoice post.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_account_balance SET balance_minor = 200 \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         s.tenant, s.ar

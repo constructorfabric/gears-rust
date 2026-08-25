@@ -453,6 +453,6 @@ Total plugin overhead: ~2-3ms for typical chain.
 
 ## Related ADRs
 
-- [ADR: Plugin System](../docs/adr-plugin-system.md)
-- [ADR: State Management](../docs/adr-state-management.md)
-- [ADR: Component Architecture](../docs/adr-component-architecture.md)
+- [ADR: Plugin System](../../docs/ADR/0003-plugin-system.md)
+- [ADR: State Management](../../docs/ADR/0008-state-management.md)
+- [ADR: Component Architecture](../../docs/ADR/0001-component-architecture.md)

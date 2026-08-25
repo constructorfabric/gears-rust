@@ -2,7 +2,7 @@
 //! Contract smoke tests: per-primitive resolution and capability-mismatch
 //! startup failure (`cpt-cf-clst-dod-smoke-tests-resolution`).
 //!
-//! Resolution succeeds for a bound backend across all four primitives, an
+//! Resolution succeeds for a bound backend across all three primitives, an
 //! unbound profile reports [`ClusterError::ProfileNotBound`], and a declared
 //! capability the bound backend cannot satisfy fails *at resolution* (startup)
 //! with a [`ClusterError::CapabilityNotMet`] naming the primitive, the unmet
@@ -12,21 +12,16 @@ mod common;
 
 use std::sync::Arc;
 
-use cluster::defaults::{
-    CacheBasedServiceDiscoveryBackend, CasBasedDistributedLockBackend,
-    CasBasedLeaderElectionBackend,
-};
+use cluster::defaults::{CasBasedDistributedLockBackend, CasBasedLeaderElectionBackend};
 use cluster_sdk::cache::{CacheCapability, ClusterCacheBackend};
-use cluster_sdk::discovery::ServiceDiscoveryCapability;
 use cluster_sdk::error::ClusterError;
 use cluster_sdk::leader::LeaderElectionCapability;
 use cluster_sdk::lock::LockCapability;
 use cluster_sdk::profile::ClusterProfile;
 use cluster_sdk::registration::{
     register_cache_backend, register_leader_election_backend, register_lock_backend,
-    register_service_discovery_backend,
 };
-use cluster_sdk::{ClusterCacheV1, DistributedLockV1, LeaderElectionV1, ServiceDiscoveryV1};
+use cluster_sdk::{ClusterCacheV1, DistributedLockV1, LeaderElectionV1};
 use common::{MemCacheBackend, SmokeProfile};
 use toolkit::client_hub::ClientHub;
 
@@ -42,16 +37,13 @@ fn hub_with_all_primitives(cache: Arc<dyn ClusterCacheBackend>) -> ClientHub {
     let Ok(lock) = CasBasedDistributedLockBackend::new(Arc::clone(&cache)) else {
         panic!("lock backend must construct over a linearizable cache");
     };
-    let discovery = CacheBasedServiceDiscoveryBackend::new(Arc::clone(&cache));
 
     let cache_ok = register_cache_backend(&hub, SmokeProfile::NAME, cache).is_ok();
     let leader_ok =
         register_leader_election_backend(&hub, SmokeProfile::NAME, Arc::new(leader)).is_ok();
     let lock_ok = register_lock_backend(&hub, SmokeProfile::NAME, Arc::new(lock)).is_ok();
-    let discovery_ok =
-        register_service_discovery_backend(&hub, SmokeProfile::NAME, Arc::new(discovery)).is_ok();
     assert!(
-        cache_ok && leader_ok && lock_ok && discovery_ok,
+        cache_ok && leader_ok && lock_ok,
         "registration under a valid profile must succeed"
     );
     hub
@@ -87,13 +79,6 @@ async fn every_primitive_resolves_against_a_bound_backend() {
             .resolve()
             .is_ok(),
         "distributed lock must resolve against the bound backend"
-    );
-    assert!(
-        ServiceDiscoveryV1::resolver(&hub)
-            .profile(SmokeProfile)
-            .resolve()
-            .is_ok(),
-        "service discovery must resolve against the bound backend"
     );
 }
 
@@ -205,36 +190,6 @@ async fn lock_capability_mismatch_fails_startup() {
     assert_eq!(capability, "Linearizable");
     assert!(
         provider.contains("CasBasedDistributedLockBackend"),
-        "provider must name the concrete backend, got `{provider}`"
-    );
-}
-
-#[tokio::test]
-async fn service_discovery_capability_mismatch_fails_startup() {
-    let hub = ClientHub::new();
-    // The cache-based default evaluates metadata predicates client-side, so it
-    // declares no `metadata_pushdown`; a `MetadataFiltering` requirement is unmet.
-    let cache: Arc<dyn ClusterCacheBackend> = MemCacheBackend::linearizable();
-    let discovery = CacheBasedServiceDiscoveryBackend::new(cache);
-    assert!(
-        register_service_discovery_backend(&hub, SmokeProfile::NAME, Arc::new(discovery)).is_ok()
-    );
-
-    let Err(ClusterError::CapabilityNotMet {
-        primitive,
-        capability,
-        provider,
-    }) = ServiceDiscoveryV1::resolver(&hub)
-        .profile(SmokeProfile)
-        .require(ServiceDiscoveryCapability::MetadataFiltering)
-        .resolve()
-    else {
-        panic!("an unmet metadata-filtering requirement must fail resolution");
-    };
-    assert_eq!(primitive, "ServiceDiscoveryV1");
-    assert_eq!(capability, "MetadataFiltering");
-    assert!(
-        provider.contains("CacheBasedServiceDiscoveryBackend"),
         "provider must name the concrete backend, got `{provider}`"
     );
 }

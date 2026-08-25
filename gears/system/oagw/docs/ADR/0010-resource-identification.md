@@ -186,6 +186,28 @@ Given endpoints: ["us.vendor.com", "eu.vendor.com", "ap.vendor.com"]
 
 > No common suffix, explicit alias required
 
+**Alias Immutability on Update**:
+
+The alias is a trust signal used as the routing key in `/v1/proxy/{alias}/...`.
+Silently changing it would break API clients, and allowing endpoint swaps on a
+hostname-derived upstream would let the alias become a lie (e.g., `api.openai.com`
+pointing at `evil.server.com`).
+
+Any endpoint update that would alter the derived alias is **rejected** — the user
+must delete and re-create the upstream instead. The full rules:
+
+| Transition | Alias unchanged | Alias would change |
+|---|---|---|
+| **hostname → hostname** | Allowed (e.g., swap regions within same suffix) | Rejected — delete and re-create |
+| **hostname → IP** | — | Always rejected |
+| **IP → hostname** | Allowed (existing alias matches derived) | Rejected — delete and re-create |
+| **IP → IP** | Allowed (alias retained) | Rejected — delete and re-create |
+
+The alias is immutable once set — regardless of whether it was auto-derived
+(hostname-based) or explicitly provided (IP-based). To change an alias, delete
+the upstream and re-create it. Providing the existing alias value on update is
+tolerated as a no-op.
+
 **Multi-endpoint with shared alias** (load balancing pool):
 
 ```text

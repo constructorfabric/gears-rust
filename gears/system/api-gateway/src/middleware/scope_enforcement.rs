@@ -332,7 +332,7 @@ mod tests {
 
         let canonical = result.unwrap_err();
         let problem: Problem = canonical.into();
-        assert_eq!(problem.status, 403);
+        assert_eq!(problem.status, Some(403));
         assert_eq!(
             problem.problem_type,
             gts_uri!("cf.core.errors.err.v1~cf.core.err.permission_denied.v1~")
@@ -351,7 +351,7 @@ mod tests {
 
         let canonical = result.unwrap_err();
         let problem: Problem = canonical.into();
-        assert_eq!(problem.status, 403);
+        assert_eq!(problem.status, Some(403));
         assert_eq!(
             problem.problem_type,
             gts_uri!("cf.core.errors.err.v1~cf.core.err.permission_denied.v1~")

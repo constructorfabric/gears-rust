@@ -1,4 +1,4 @@
-use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Statement};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseExecutor, DbErr, Statement};
 use sea_orm_migration::prelude::*;
 
 use super::tables::OutboxTables;
@@ -11,16 +11,11 @@ use super::types::OutboxError;
 ///
 /// # Idempotency
 ///
-/// All `CREATE TABLE` statements use `IF NOT EXISTS` so the migration is safe
-/// to re-run (e.g., after a partial failure). `CREATE INDEX` statements do
-/// **not** -- `MySQL` has no `IF NOT EXISTS` syntax for indexes, and keeping the
-/// Pg/SQLite paths consistent avoids a false sense of safety on only some
-/// backends. Because each index immediately follows its `CREATE TABLE IF NOT
-/// EXISTS`, the index can only pre-exist if the migration crashed between the
-/// two statements *and* the migration runner retries without rolling back.
-/// The sea-orm migration framework tracks completed migrations, so this edge
-/// case requires a crash mid-transaction -- acceptable for a `preview-outbox`
-/// alpha feature with no production deployments.
+/// The whole migration is safe to re-run, e.g. after a partial failure. All
+/// `CREATE TABLE` statements use `IF NOT EXISTS`, and every index goes through
+/// [`create_index_if_absent`], which is idempotent on all three backends --
+/// `IF NOT EXISTS` on Postgres/SQLite and an `information_schema` probe on
+/// `MySQL`, which has no such syntax for indexes.
 struct CreateOutboxSchema {
     tables: OutboxTables,
 }
@@ -77,7 +72,7 @@ impl MigrationTrait for CreateOutboxSchema {
             self.tables.partitions(),
             self.tables.body(),
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 backend,
                 format!("DROP TABLE IF EXISTS {table}"),
             ))
@@ -87,13 +82,142 @@ impl MigrationTrait for CreateOutboxSchema {
     }
 }
 
+/// Error for a database backend the outbox schema has no DDL for.
+///
+/// `DatabaseBackend` is `#[non_exhaustive]` as of `SeaORM` 2.0, so every DDL
+/// helper below needs a fallback arm. Returning an error (rather than picking a
+/// dialect) keeps us from creating outbox tables with SQL meant for a different
+/// engine.
+///
+/// `coverage(off)`: the enum has exactly three constructible variants, so the
+/// nine arms that call this are unreachable without transmuting an invalid
+/// discriminant. Excluded from the denominator rather than faked with a test.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn unsupported_backend(backend: DatabaseBackend) -> DbErr {
+    DbErr::Custom(format!(
+        "outbox migrations support Postgres, SQLite and MySQL only; \
+         got unsupported database backend {backend:?}"
+    ))
+}
+
+/// One index to create, in a backend-agnostic form.
+///
+/// `columns` and `filter` are already backend-appropriate: the call sites that
+/// differ per engine (see [`create_dead_letters`]) pick them before building the
+/// spec.
+struct IndexSpec<'a> {
+    /// Emit `CREATE UNIQUE INDEX` instead of `CREATE INDEX`.
+    unique: bool,
+    name: &'a str,
+    table: &'a str,
+    /// Column list exactly as it appears inside the parentheses.
+    columns: &'a str,
+    /// Partial-index predicate without the leading `WHERE`. Postgres only.
+    filter: Option<&'a str>,
+}
+
+/// Looks up one index by name in the current `MySQL` schema.
+///
+/// Parameterised rather than interpolated: the two `?` placeholders are compared
+/// as *values* against `information_schema` columns, not spliced in as identifiers.
+const MYSQL_INDEX_PROBE_SQL: &str = "SELECT 1 FROM information_schema.STATISTICS \
+     WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? \
+     LIMIT 1";
+
+/// How to create one index idempotently on one backend.
+///
+/// Separating the plan from its execution keeps every per-backend decision --
+/// which engines support `IF NOT EXISTS`, whether a partial filter survives,
+/// whether the probe binds parameters -- assertable without a live database.
+#[derive(Debug, PartialEq, Eq)]
+enum IndexPlan {
+    /// Backend supports `CREATE INDEX IF NOT EXISTS`: one statement, no pre-check.
+    Guarded { create: String },
+    /// Backend has no such syntax: probe for the index, create it only if absent.
+    ProbeThenCreate {
+        probe_sql: &'static str,
+        /// `[table, index_name]`, bound to the probe's placeholders in order.
+        probe_args: [String; 2],
+        create: String,
+    },
+}
+
+/// Decide how to create `spec` on `backend`.
+///
+/// Postgres and `SQLite` get `CREATE INDEX IF NOT EXISTS`. `MySQL` has no such
+/// syntax for indexes, so it is probed through `information_schema.STATISTICS`
+/// first. The probe is preferred over tolerating error 1061 (`ER_DUP_KEYNAME`)
+/// because it needs no error-code matching, and it also covers `MariaDB` — which
+/// `DatabaseBackend::MySql` does not distinguish, and whose `IF NOT EXISTS`
+/// support differs. The check-then-create race is irrelevant here: the migration
+/// runner does not run two migrations against one schema at once.
+fn plan_create_index(backend: DatabaseBackend, spec: &IndexSpec<'_>) -> Result<IndexPlan, DbErr> {
+    let unique = if spec.unique { "UNIQUE " } else { "" };
+    // Appended verbatim on every backend. Only the Postgres call sites pass a
+    // filter; a backend that cannot express one must fail loudly rather than
+    // silently create a non-partial index under the requested name.
+    let filter = spec
+        .filter
+        .map_or_else(String::new, |f| format!(" WHERE {f}"));
+    let tail = format!("{} ON {} ({}){filter}", spec.name, spec.table, spec.columns);
+
+    match backend {
+        DatabaseBackend::Postgres | DatabaseBackend::Sqlite => Ok(IndexPlan::Guarded {
+            create: format!("CREATE {unique}INDEX IF NOT EXISTS {tail}"),
+        }),
+        DatabaseBackend::MySql => Ok(IndexPlan::ProbeThenCreate {
+            probe_sql: MYSQL_INDEX_PROBE_SQL,
+            probe_args: [spec.table.to_owned(), spec.name.to_owned()],
+            create: format!("CREATE {unique}INDEX {tail}"),
+        }),
+        _ => Err(unsupported_backend(backend)),
+    }
+}
+
+/// Create an index, skipping it if one of that name already exists.
+///
+/// Thin executor over [`plan_create_index`], which owns the per-backend logic.
+async fn create_index_if_absent(
+    conn: &DatabaseExecutor<'_>,
+    backend: DatabaseBackend,
+    spec: &IndexSpec<'_>,
+) -> Result<(), DbErr> {
+    match plan_create_index(backend, spec)? {
+        IndexPlan::Guarded { create } => {
+            conn.execute_raw(Statement::from_string(backend, create))
+                .await?;
+        }
+        IndexPlan::ProbeThenCreate {
+            probe_sql,
+            probe_args: [table, index_name],
+            create,
+        } => {
+            let existing = conn
+                .query_one_raw(Statement::from_sql_and_values(
+                    backend,
+                    probe_sql,
+                    [
+                        sea_orm::Value::from(table),
+                        sea_orm::Value::from(index_name),
+                    ],
+                ))
+                .await?;
+            if existing.is_none() {
+                conn.execute_raw(Statement::from_string(backend, create))
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn create_body(
-    conn: &dyn ConnectionTrait,
+    conn: &DatabaseExecutor<'_>,
     backend: DatabaseBackend,
     tables: &OutboxTables,
 ) -> Result<(), DbErr> {
     let body_table = tables.body();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         match backend {
             DatabaseBackend::Postgres => {
@@ -126,6 +250,7 @@ async fn create_body(
             )"
                 )
             }
+            _ => return Err(unsupported_backend(backend)),
         },
     ))
     .await?;
@@ -133,12 +258,12 @@ async fn create_body(
 }
 
 async fn create_partitions(
-    conn: &dyn ConnectionTrait,
+    conn: &DatabaseExecutor<'_>,
     backend: DatabaseBackend,
     tables: &OutboxTables,
 ) -> Result<(), DbErr> {
     let partitions = tables.partitions();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         match backend {
             DatabaseBackend::Postgres => {
@@ -174,6 +299,7 @@ async fn create_partitions(
             )"
                 )
             }
+            _ => return Err(unsupported_backend(backend)),
         },
     ))
     .await?;
@@ -181,14 +307,14 @@ async fn create_partitions(
 }
 
 async fn create_incoming(
-    conn: &dyn ConnectionTrait,
+    conn: &DatabaseExecutor<'_>,
     backend: DatabaseBackend,
     tables: &OutboxTables,
 ) -> Result<(), DbErr> {
     let incoming = tables.incoming();
     let partitions = tables.partitions();
     let body_table = tables.body();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         match backend {
             DatabaseBackend::Postgres => {
@@ -220,43 +346,50 @@ async fn create_incoming(
             )"
                 )
             }
+            _ => return Err(unsupported_backend(backend)),
         },
     ))
     .await?;
 
-    conn.execute(Statement::from_string(
+    create_index_if_absent(
+        conn,
         backend,
-        format!(
-            "CREATE INDEX {} ON {} (partition_id, id)",
-            tables.idx_incoming_partition(),
-            tables.incoming()
-        ),
-    ))
+        &IndexSpec {
+            unique: false,
+            name: tables.idx_incoming_partition(),
+            table: tables.incoming(),
+            columns: "partition_id, id",
+            filter: None,
+        },
+    )
     .await?;
 
     // Index on body_id to accelerate FK constraint checks during
     // DELETE FROM outbox body WHERE id IN (...).
-    conn.execute(Statement::from_string(
+    create_index_if_absent(
+        conn,
         backend,
-        format!(
-            "CREATE INDEX {} ON {} (body_id)",
-            tables.idx_incoming_body_id(),
-            tables.incoming()
-        ),
-    ))
+        &IndexSpec {
+            unique: false,
+            name: tables.idx_incoming_body_id(),
+            table: tables.incoming(),
+            columns: "body_id",
+            filter: None,
+        },
+    )
     .await?;
     Ok(())
 }
 
 async fn create_outgoing(
-    conn: &dyn ConnectionTrait,
+    conn: &DatabaseExecutor<'_>,
     backend: DatabaseBackend,
     tables: &OutboxTables,
 ) -> Result<(), DbErr> {
     let outgoing = tables.outgoing();
     let partitions = tables.partitions();
     let body_table = tables.body();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         match backend {
             DatabaseBackend::Postgres => {
@@ -294,42 +427,49 @@ async fn create_outgoing(
             )"
                 )
             }
+            _ => return Err(unsupported_backend(backend)),
         },
     ))
     .await?;
 
-    conn.execute(Statement::from_string(
+    create_index_if_absent(
+        conn,
         backend,
-        format!(
-            "CREATE UNIQUE INDEX {} ON {} (partition_id, seq)",
-            tables.idx_outgoing_partition_seq(),
-            tables.outgoing()
-        ),
-    ))
+        &IndexSpec {
+            unique: true,
+            name: tables.idx_outgoing_partition_seq(),
+            table: tables.outgoing(),
+            columns: "partition_id, seq",
+            filter: None,
+        },
+    )
     .await?;
 
     // Index on body_id to accelerate FK constraint checks during
     // DELETE FROM outbox body WHERE id IN (...).
-    conn.execute(Statement::from_string(
+    create_index_if_absent(
+        conn,
         backend,
-        format!(
-            "CREATE INDEX {} ON {} (body_id)",
-            tables.idx_outgoing_body_id(),
-            tables.outgoing()
-        ),
-    ))
+        &IndexSpec {
+            unique: false,
+            name: tables.idx_outgoing_body_id(),
+            table: tables.outgoing(),
+            columns: "body_id",
+            filter: None,
+        },
+    )
     .await?;
     Ok(())
 }
 
 async fn create_dead_letters(
-    conn: &dyn ConnectionTrait,
+    conn: &DatabaseExecutor<'_>,
     backend: DatabaseBackend,
     tables: &OutboxTables,
 ) -> Result<(), DbErr> {
     let dead_letters = tables.dead_letters();
     let partitions = tables.partitions();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         match backend {
             DatabaseBackend::Postgres => {
@@ -387,64 +527,61 @@ async fn create_dead_letters(
             )"
                 )
             }
+            _ => return Err(unsupported_backend(backend)),
         },
     ))
     .await?;
 
     // Index for replay query (status = 'pending' OR (status = 'reprocessing' AND deadline < now()))
-    conn.execute(Statement::from_string(
-        backend,
-        match backend {
-            DatabaseBackend::Postgres => {
-                format!(
-                    "CREATE INDEX {} ON {} (status, deadline) WHERE status IN ('pending', 'reprocessing')",
-                    tables.idx_dl_replayable(),
-                    tables.dead_letters()
-                )
-            }
-            DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
-                format!(
-                    "CREATE INDEX {} ON {} (status, deadline)",
-                    tables.idx_dl_status_deadline(),
-                    tables.dead_letters()
-                )
-            }
+    //
+    // Postgres gets a *partial* index, under its own name. MySQL has no partial
+    // indexes at all; SQLite has them (3.8.0+) but has never used one here, so
+    // both get a plain index under a different name. Preserved as-is: switching
+    // SQLite over would rename an index on existing databases.
+    let replay_index = match backend {
+        DatabaseBackend::Postgres => IndexSpec {
+            unique: false,
+            name: tables.idx_dl_replayable(),
+            table: tables.dead_letters(),
+            columns: "status, deadline",
+            filter: Some("status IN ('pending', 'reprocessing')"),
         },
-    ))
-    .await?;
+        DatabaseBackend::Sqlite | DatabaseBackend::MySql => IndexSpec {
+            unique: false,
+            name: tables.idx_dl_status_deadline(),
+            table: tables.dead_letters(),
+            columns: "status, deadline",
+            filter: None,
+        },
+        _ => return Err(unsupported_backend(backend)),
+    };
+    create_index_if_absent(conn, backend, &replay_index).await?;
 
-    // Index for list queries with status filter + ORDER BY failed_at DESC
-    conn.execute(Statement::from_string(
-        backend,
-        match backend {
-            DatabaseBackend::Postgres => {
-                format!(
-                    "CREATE INDEX {} ON {} (status, failed_at DESC)",
-                    tables.idx_dl_status_failed(),
-                    tables.dead_letters()
-                )
-            }
-            DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
-                format!(
-                    "CREATE INDEX {} ON {} (status, failed_at)",
-                    tables.idx_dl_status_failed(),
-                    tables.dead_letters()
-                )
-            }
+    // Index for list queries with status filter + ORDER BY failed_at DESC.
+    // Only Postgres records the DESC direction.
+    let status_failed_index = IndexSpec {
+        unique: false,
+        name: tables.idx_dl_status_failed(),
+        table: tables.dead_letters(),
+        columns: match backend {
+            DatabaseBackend::Postgres => "status, failed_at DESC",
+            DatabaseBackend::Sqlite | DatabaseBackend::MySql => "status, failed_at",
+            _ => return Err(unsupported_backend(backend)),
         },
-    ))
-    .await?;
+        filter: None,
+    };
+    create_index_if_absent(conn, backend, &status_failed_index).await?;
     Ok(())
 }
 
 async fn create_processor(
-    conn: &dyn ConnectionTrait,
+    conn: &DatabaseExecutor<'_>,
     backend: DatabaseBackend,
     tables: &OutboxTables,
 ) -> Result<(), DbErr> {
     let processor = tables.processor();
     let partitions = tables.partitions();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         match backend {
             DatabaseBackend::Postgres => {
@@ -484,6 +621,7 @@ async fn create_processor(
             )"
                 )
             }
+            _ => return Err(unsupported_backend(backend)),
         },
     ))
     .await?;
@@ -491,13 +629,13 @@ async fn create_processor(
 }
 
 async fn create_vacuum_counter(
-    conn: &dyn ConnectionTrait,
+    conn: &DatabaseExecutor<'_>,
     backend: DatabaseBackend,
     tables: &OutboxTables,
 ) -> Result<(), DbErr> {
     let vacuum_counter = tables.vacuum_counter();
     let partitions = tables.partitions();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         match backend {
             DatabaseBackend::Postgres => {
@@ -527,6 +665,7 @@ async fn create_vacuum_counter(
             )"
                 )
             }
+            _ => return Err(unsupported_backend(backend)),
         },
     ))
     .await?;
@@ -534,7 +673,7 @@ async fn create_vacuum_counter(
 }
 
 async fn create_mysql_id_sequence_tables(
-    conn: &dyn ConnectionTrait,
+    conn: &DatabaseExecutor<'_>,
     backend: DatabaseBackend,
     tables: &OutboxTables,
 ) -> Result<(), DbErr> {
@@ -543,12 +682,12 @@ async fn create_mysql_id_sequence_tables(
     }
 
     for table in [tables.body_id_sequence(), tables.incoming_id_sequence()] {
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             backend,
             mysql_create_id_sequence_sql(table),
         ))
         .await?;
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             backend,
             mysql_seed_id_sequence_sql(table),
         ))
@@ -652,6 +791,161 @@ mod tests {
         assert!(!incoming_create.contains("toolkit_outbox_incoming_id_sequence"));
     }
 
+    /// Every backend the outbox supports DDL for.
+    const BACKENDS: [DatabaseBackend; 3] = [
+        DatabaseBackend::Postgres,
+        DatabaseBackend::MySql,
+        DatabaseBackend::Sqlite,
+    ];
+
+    fn plan(backend: DatabaseBackend, spec: &IndexSpec<'_>) -> IndexPlan {
+        plan_create_index(backend, spec).unwrap()
+    }
+
+    /// The `create` statement of a plan, whichever variant it is.
+    fn create_sql(plan: &IndexPlan) -> &str {
+        match plan {
+            IndexPlan::Guarded { create } | IndexPlan::ProbeThenCreate { create, .. } => create,
+        }
+    }
+
+    fn simple_spec<'a>(name: &'a str, table: &'a str) -> IndexSpec<'a> {
+        IndexSpec {
+            unique: false,
+            name,
+            table,
+            columns: "status, deadline",
+            filter: None,
+        }
+    }
+
+    #[test]
+    fn plan_create_index_is_idempotent_on_every_backend() {
+        // The point of the helper: re-running the migration must not fail on a
+        // pre-existing index, on any backend. Postgres/SQLite express that with
+        // IF NOT EXISTS; MySQL has no such syntax and must probe instead.
+        for backend in BACKENDS {
+            let spec = simple_spec("idx_x", "tbl");
+            match plan(backend, &spec) {
+                IndexPlan::Guarded { create } => {
+                    assert!(
+                        matches!(backend, DatabaseBackend::Postgres | DatabaseBackend::Sqlite),
+                        "{backend:?} should not use the guarded path"
+                    );
+                    assert!(
+                        create.contains("IF NOT EXISTS"),
+                        "{backend:?} guarded DDL must be conditional, got: {create}"
+                    );
+                }
+                IndexPlan::ProbeThenCreate {
+                    probe_sql,
+                    probe_args,
+                    create,
+                } => {
+                    assert_eq!(
+                        backend,
+                        DatabaseBackend::MySql,
+                        "only MySQL lacks CREATE INDEX IF NOT EXISTS"
+                    );
+                    // MySQL would reject IF NOT EXISTS on an index, so the
+                    // guard must come from the probe, not the DDL.
+                    assert!(
+                        !create.contains("IF NOT EXISTS"),
+                        "MySQL DDL must not use IF NOT EXISTS, got: {create}"
+                    );
+                    assert!(probe_sql.contains("information_schema.STATISTICS"));
+                    assert_eq!(probe_args, ["tbl".to_owned(), "idx_x".to_owned()]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mysql_index_probe_binds_identifiers_instead_of_interpolating_them() {
+        // A regression here would splice table/index names into the probe SQL.
+        // They are compared as values against information_schema, so they must
+        // stay bound to the two placeholders.
+        let spec = simple_spec("idx_dl_status_deadline", "toolkit_outbox_dead_letters");
+        let IndexPlan::ProbeThenCreate {
+            probe_sql,
+            probe_args,
+            ..
+        } = plan(DatabaseBackend::MySql, &spec)
+        else {
+            panic!("MySQL must use the probe path")
+        };
+
+        assert_eq!(probe_sql.matches('?').count(), 2, "probe: {probe_sql}");
+        assert!(
+            !probe_sql.contains("toolkit_outbox_dead_letters")
+                && !probe_sql.contains("idx_dl_status_deadline"),
+            "names must not appear in the SQL text, got: {probe_sql}"
+        );
+        assert_eq!(
+            probe_args,
+            [
+                "toolkit_outbox_dead_letters".to_owned(),
+                "idx_dl_status_deadline".to_owned()
+            ],
+            "table then index name, matching placeholder order"
+        );
+    }
+
+    #[test]
+    fn plan_create_index_preserves_partial_index_filter() {
+        // The Postgres replay index is partial. Routing it through the shared
+        // helper must not drop the predicate -- that would silently widen the
+        // index and change the replay query's access path.
+        let spec = IndexSpec {
+            unique: false,
+            name: "idx_dl_replayable",
+            table: "toolkit_outbox_dead_letters",
+            columns: "status, deadline",
+            filter: Some("status IN ('pending', 'reprocessing')"),
+        };
+
+        assert_eq!(
+            create_sql(&plan(DatabaseBackend::Postgres, &spec)),
+            "CREATE INDEX IF NOT EXISTS idx_dl_replayable ON toolkit_outbox_dead_letters \
+             (status, deadline) WHERE status IN ('pending', 'reprocessing')"
+        );
+    }
+
+    #[test]
+    fn plan_create_index_omits_where_clause_when_unfiltered() {
+        // Negative space: an unfiltered spec must not grow a WHERE clause.
+        for backend in BACKENDS {
+            let spec = simple_spec("idx_x", "tbl");
+            let plan = plan(backend, &spec);
+            assert!(
+                !create_sql(&plan).contains("WHERE"),
+                "{backend:?} emitted a WHERE for an unfiltered index: {}",
+                create_sql(&plan)
+            );
+        }
+    }
+
+    #[test]
+    fn plan_create_index_keeps_unique_on_every_backend() {
+        // The outgoing (partition_id, seq) index is UNIQUE and that uniqueness
+        // is a correctness invariant, not an optimisation.
+        for backend in BACKENDS {
+            let spec = IndexSpec {
+                unique: true,
+                name: "idx_outgoing_partition_seq",
+                table: "toolkit_outbox_outgoing",
+                columns: "partition_id, seq",
+                filter: None,
+            };
+            let plan = plan(backend, &spec);
+            assert!(
+                create_sql(&plan).starts_with("CREATE UNIQUE INDEX "),
+                "{backend:?} dropped UNIQUE: {}",
+                create_sql(&plan)
+            );
+        }
+    }
+
     #[test]
     fn mysql_sequence_table_sql_has_singleton_primary_key_and_seed() {
         let tables = OutboxTables::default();
@@ -665,5 +959,113 @@ mod tests {
             seed,
             "INSERT IGNORE INTO toolkit_outbox_body_id_sequence (slot, next_id) VALUES (1, 1)"
         );
+    }
+
+    /// Live-database checks. The unit tests above pin the *emitted SQL*; these
+    /// pin what the database actually ends up with.
+    #[cfg(feature = "sqlite")]
+    mod sqlite_tests {
+        use super::*;
+        use crate::{ConnectOpts, Db, connect_db};
+        use sea_orm::DbBackend;
+
+        /// Single pooled connection over a shared-cache in-memory database, so
+        /// two sequential `up()` calls hit the *same* schema. With a larger pool
+        /// the second call could land on a fresh empty database and the test
+        /// would pass without proving anything.
+        async fn setup_shared_db(name: &str) -> Db {
+            let url = format!("sqlite:file:{name}?mode=memory&cache=shared");
+            let opts = ConnectOpts {
+                max_conns: Some(1),
+                min_conns: Some(1),
+                ..Default::default()
+            };
+            connect_db(&url, opts).await.expect("connect")
+        }
+
+        async fn outbox_index_names(conn: &sea_orm::DatabaseConnection) -> Vec<String> {
+            let rows = conn
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT name FROM sqlite_master \
+                     WHERE type = 'index' AND name LIKE 'idx_toolkit_outbox%' \
+                     ORDER BY name",
+                ))
+                .await
+                .expect("list indexes");
+            rows.iter()
+                .map(|row| row.try_get::<String>("", "name").expect("index name"))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn migration_up_is_rerunnable_over_a_fully_created_schema() {
+            // This is the scenario the schema DDL has to survive: the runner
+            // applied the migration, crashed before recording it, and retries.
+            // Before `create_index_if_absent`, the second run died on the first
+            // pre-existing index.
+            let db = setup_shared_db("outbox_migration_rerun").await;
+            let conn = db.sea_internal();
+            let manager = SchemaManager::new(&conn);
+            let migration = CreateOutboxSchema::default();
+
+            migration.up(&manager).await.expect("first up");
+            let after_first = outbox_index_names(&conn).await;
+
+            migration
+                .up(&manager)
+                .await
+                .expect("second up must succeed over an existing schema");
+            let after_second = outbox_index_names(&conn).await;
+
+            // Non-empty guards against a vacuous pass: if the first run had
+            // created nothing, re-running would trivially succeed.
+            assert!(
+                !after_first.is_empty(),
+                "first up() created no outbox indexes"
+            );
+            assert_eq!(
+                after_first, after_second,
+                "re-running the migration changed the index set"
+            );
+        }
+
+        #[tokio::test]
+        async fn migration_up_completes_after_indexes_were_created_but_tables_were_not_recorded() {
+            // Narrower version of the above: drop one index between runs and
+            // confirm the retry re-creates exactly that one rather than either
+            // failing on the survivors or leaving the dropped one missing.
+            let db = setup_shared_db("outbox_migration_partial").await;
+            let conn = db.sea_internal();
+            let manager = SchemaManager::new(&conn);
+            let migration = CreateOutboxSchema::default();
+
+            migration.up(&manager).await.expect("first up");
+            let complete = outbox_index_names(&conn).await;
+
+            let tables = OutboxTables::default();
+            conn.execute_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                format!("DROP INDEX {}", tables.idx_incoming_body_id()),
+            ))
+            .await
+            .expect("drop one index");
+            assert_ne!(
+                outbox_index_names(&conn).await,
+                complete,
+                "the DROP INDEX did not take effect"
+            );
+
+            migration
+                .up(&manager)
+                .await
+                .expect("retry after partial loss");
+
+            assert_eq!(
+                outbox_index_names(&conn).await,
+                complete,
+                "retry did not restore the dropped index"
+            );
+        }
     }
 }

@@ -14,6 +14,7 @@
 //
 // @cpt-cf-chat-engine-domain-root:p2
 
+pub mod authz; // PolicyEnforcer + ResourceType constants (Phase 3)
 pub mod context;
 pub mod error;
 pub mod export;

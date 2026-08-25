@@ -23,14 +23,13 @@
 use cluster_sdk::cache::{CacheWatch, CacheWatchEvent};
 use cluster_sdk::error::{ClusterError, ProviderErrorKind};
 use cluster_sdk::leader::{LeaderStatus, LeaderWatch, LeaderWatchEvent};
-use cluster_sdk::{RestartingWatch, RetryPolicy, ServiceWatch, ServiceWatchEvent};
+use cluster_sdk::{RestartingWatch, RetryPolicy};
 
 /// Runs every implemented SC-REST-* scenario. No backend factory is needed —
 /// all scenarios drive the combinator via the watch test-harness channels.
 pub async fn run_restart_conformance() {
     scenario_rest_002_cache().await;
     scenario_rest_002_leader().await;
-    scenario_rest_002_service().await;
     scenario_rest_002_capability_and_other().await;
     scenario_rest_pass_through().await;
     scenario_rest_retry_policy_smoke().await;
@@ -86,25 +85,6 @@ pub async fn scenario_rest_002_leader() {
     assert!(
         matches!(event, LeaderWatchEvent::Closed(ClusterError::Shutdown)),
         "SC-REST-002(leader): Shutdown must propagate verbatim, got {event:?}"
-    );
-}
-
-/// SC-REST-002 (service): a non-retryable `Shutdown` close propagates verbatim.
-pub async fn scenario_rest_002_service() {
-    let (tx, watch) = ServiceWatch::channel(8);
-    let mut restarting: RestartingWatch<ServiceWatch> = watch.auto_restart(RetryPolicy::default());
-
-    tx.send(ServiceWatchEvent::Closed(ClusterError::Shutdown))
-        .await
-        .ok();
-
-    let event = restarting
-        .recv()
-        .await
-        .expect("SC-REST-002(service): must receive Closed");
-    assert!(
-        matches!(event, ServiceWatchEvent::Closed(ClusterError::Shutdown)),
-        "SC-REST-002(service): Shutdown must propagate verbatim, got {event:?}"
     );
 }
 
@@ -202,9 +182,9 @@ pub async fn scenario_rest_retry_policy_smoke() {
     );
 }
 
-// TODO(SC-REST-001) [deferred]: retryable close → backoff → resubscribe → Reset
+// Deferred (SC-REST-001): retryable close → backoff → resubscribe → Reset
 //   requires a facade-installed resubscribe seam (needs ClientHub). Defer to L3.
-// TODO(SC-REST-003) [deferred]: backoff schedule and retry-cap enforcement
+// Deferred (SC-REST-003): backoff schedule and retry-cap enforcement
 //   require the resubscribe path — same reason.
-// TODO(SC-REST-004) [deferred]: uniform across CacheWatch/LeaderWatch/ServiceWatch
+// Deferred (SC-REST-004): uniform across CacheWatch/LeaderWatch
 //   for the reconnect path — same reason.

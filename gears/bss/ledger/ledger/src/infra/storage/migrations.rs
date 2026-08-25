@@ -1,5 +1,7 @@
-//! Migration set for the bss-ledger gear (schema `bss`). Greenfield
-//! chain; migrations are added by subsequent tasks.
+//! Ordered migration chain for the ledger-owned `bss` schema.
+//!
+//! Creates the journal foundation, derived balances, workflow tables, audit and
+//! integrity controls, FX support, recognition, reconciliation, and indexes.
 
 pub mod m20260619_000001_create_bss_schema;
 pub mod m20260619_000002_create_journal_tables;

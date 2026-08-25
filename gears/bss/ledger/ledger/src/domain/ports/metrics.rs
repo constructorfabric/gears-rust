@@ -303,6 +303,41 @@ pub trait LedgerMetricsPort: Send + Sync + 'static {
     /// the one monotonic counter). Both labels are bounded cardinality (the
     /// functional currency is per-tenant; direction is a two-value closed set).
     fn fx_realized_minor(&self, amount_minor: i64, functional_currency: &str, direction: &str);
+    /// Increment the FX rate-sync heartbeat: `ledger_fx_rate_sync_ticks_total` —
+    /// one `RateSyncJob` scheduler tick *started*.
+    ///
+    /// Counts ticks, not fetches, and is therefore the only signal that separates
+    /// two failure modes an error-based alert cannot tell apart:
+    ///
+    /// * counter flat → the ticker task is dead, so nothing is syncing at all. No
+    ///   fetch is attempted, so no fetch error is produced and the provider-failure
+    ///   alarm (`FX_SNAPSHOT_MISSING`) never fires — the rate store just ages until
+    ///   a post blocks on staleness.
+    /// * counter rising while the adapter's `fx_provider_fetch_duration_seconds`
+    ///   count stays flat → the job is alive but discovery yields no sources (a
+    ///   `vendor` typo, an unavailable types-registry, no source plugin registered).
+    ///
+    /// Unlabelled on purpose: the tick happens before any provider is resolved, so
+    /// there is no provider identity to attribute it to.
+    fn fx_rate_sync_ticked(&self);
+    /// Record one `RateSyncJob` pass latency sample in seconds:
+    /// `ledger_fx_rate_sync_duration_seconds` (histogram) — the wall time from the
+    /// start of a tick until the pass returned, provider discovery and every source
+    /// attempt included.
+    ///
+    /// The pass is what has to fit inside `fx.rate_sync_tick_secs`, and until this
+    /// existed nothing measured it. The adapter's
+    /// `fx_provider_fetch_duration_seconds` times one source's HTTP round-trip,
+    /// while the composite tries its sources **sequentially**, so a pass costs their
+    /// sum plus discovery — a quantity no per-source series reports.
+    ///
+    /// The heartbeat above catches an overrun only once it is severe enough to skip
+    /// whole tick windows. This is the direct measure: compare its p95 against the
+    /// configured interval and an overrun is visible before it starves a refresh.
+    ///
+    /// Recorded on every pass, including a failed one — a slow failure is exactly
+    /// the case worth seeing — and unlabelled, matching the heartbeat it pairs with.
+    fn fx_rate_sync_duration(&self, secs: f64);
 
     // ── Slice 7 Phase 3 reconciliation ─────────────────────────────────────────
     /// Record the signed variance (minor units) observed by one reconciliation
@@ -380,6 +415,8 @@ impl LedgerMetricsPort for NoopLedgerMetrics {
     fn fx_revaluation_duration(&self, _: f64) {}
     fn fx_provider_fallback(&self, _: &str) {}
     fn fx_realized_minor(&self, _: i64, _: &str, _: &str) {}
+    fn fx_rate_sync_ticked(&self) {}
+    fn fx_rate_sync_duration(&self, _: f64) {}
     fn reconciliation_variance_minor(&self, _: &str, _: i64) {}
     fn reconciliation_run(&self, _: &str) {}
     fn reconciliation_out_of_tolerance(&self, _: &str) {}
@@ -471,6 +508,8 @@ mod tests {
         m.fx_revaluation_duration(1.5);
         m.fx_provider_fallback("ecb");
         m.fx_realized_minor(240, "USD", "loss");
+        m.fx_rate_sync_ticked();
+        m.fx_rate_sync_duration(0.8);
     }
 
     // `NoopLedgerMetrics` is the trait's safe default — usable behind the

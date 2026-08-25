@@ -151,9 +151,22 @@ pub async fn seed_message(
     let scope = AccessScope::allow_all();
     let id = Uuid::new_v4();
     let now = OffsetDateTime::now_utc();
+    // Denormalized owner pair mirrors production: copy it from the parent
+    // session so the row carries the same `(owner_tenant_id, owner_id)` the
+    // scoped repo writes would stamp.
+    let owner = session::Entity::find()
+        .secure()
+        .scope_with(&scope)
+        .filter(Condition::all().add(session::Column::SessionId.eq(session_id)))
+        .one(&conn)
+        .await
+        .expect("load session for owner pair")
+        .expect("parent session exists");
     let am = message::ActiveModel {
         message_id: Set(id),
         session_id: Set(session_id),
+        owner_tenant_id: Set(owner.tenant_id),
+        owner_id: Set(owner.user_id),
         tenant_id: Set(None),
         user_id: Set(None),
         parent_message_id: Set(parent_message_id),

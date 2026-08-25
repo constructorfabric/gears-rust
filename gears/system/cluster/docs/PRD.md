@@ -21,11 +21,10 @@
   - [5.1 P1 — Distributed Cache](#51-p1--distributed-cache)
   - [5.2 P1 — Leader Election](#52-p1--leader-election)
   - [5.3 P1 — Distributed Locks](#53-p1--distributed-locks)
-  - [5.4 P1 — Service Discovery](#54-p1--service-discovery)
-  - [5.5 P1 — Per-Backend Routing](#55-p1--per-backend-routing)
-  - [5.6 P1 — Consumer Requirements and Startup Validation](#56-p1--consumer-requirements-and-startup-validation)
-  - [5.7 P1 — Lifecycle and Shutdown](#57-p1--lifecycle-and-shutdown)
-  - [5.8 P1 — Operational Namespacing](#58-p1--operational-namespacing)
+  - [5.4 P1 — Per-Backend Routing](#54-p1--per-backend-routing)
+  - [5.5 P1 — Consumer Requirements and Startup Validation](#55-p1--consumer-requirements-and-startup-validation)
+  - [5.6 P1 — Lifecycle and Shutdown](#56-p1--lifecycle-and-shutdown)
+  - [5.7 P1 — Operational Namespacing](#57-p1--operational-namespacing)
 - [6. Non-Functional Requirements](#6-non-functional-requirements)
   - [6.1 Gear-Specific NFRs](#61-gear-specific-nfrs)
   - [6.2 NFR Exclusions](#62-nfr-exclusions)
@@ -61,7 +60,7 @@ REQUIREMENT LANGUAGE:
 
 ### 1.1 Purpose
 
-Cluster is the platform-level coordination service that gives every Gear a uniform way to share state and coordinate across instances. It offers four kinds of coordination — a distributed cache, leader election, distributed locks, and service discovery — and lets each be served by whichever backend (in-process, Postgres, Redis, K8s, NATS, etcd) the operator chooses for a given deployment. Consumers ask for the coordination they need; the platform validates that the operator's deployment can actually deliver it; if not, startup fails with a clear message rather than silently misbehaving in production.
+Cluster is the platform-level coordination service that gives every Gear a uniform way to share state and coordinate across instances. It offers three kinds of coordination — a distributed cache, leader election, and distributed locks — and lets each be served by whichever backend (in-process, Postgres, Redis, K8s, NATS, etcd) the operator chooses for a given deployment. Consumers ask for the coordination they need; the platform validates that the operator's deployment can actually deliver it; if not, startup fails with a clear message rather than silently misbehaving in production.
 
 The product exists because, today, every gear that needs cross-instance coordination either reinvents it from scratch or simply ships a single-instance version. Cluster removes that gap by making coordination a first-class platform capability with consistent semantics across gears and a stable contract that survives backend changes.
 
@@ -69,11 +68,11 @@ The product exists because, today, every gear that needs cross-instance coordina
 
 Gears increasingly need cross-instance coordination — the event broker has to assign topic shards to workers without two instances claiming the same shard, OAGW has to enforce per-tenant rate limits across replicas, mini-chat has to elect a single leader per chat room, and a future out-of-process (OOP) deployment will need to route requests to the specific delivery instance currently serving a given topic. Today these needs are met inconsistently: one team built K8s-Lease leader election inside mini-chat, another built file-based advisory locks inside `toolkit-db`, the nodes-registry exists as an in-memory bag of IDs. None of them is reusable across gears, none of them composes with the others, and none of them works the same way in dev (where there's no K8s) and production.
 
-A unified cluster gear gives every Gear the same four coordination primitives — distributed cache, leader election, distributed lock, and service discovery — with the same observable behavior, regardless of whether the deployment runs locally on a developer laptop, on a multi-instance VM cluster with Postgres, or in production on Kubernetes with Redis. The same code that an event broker writes against the cluster gear works in every deployment shape — the operator picks the backend, the consumer doesn't change. This eliminates an entire class of "works in dev, breaks in prod" bugs and lets the platform's plugin model own coordination instead of having every gear reinvent it.
+A unified cluster gear gives every Gear the same three coordination primitives — distributed cache, leader election, and distributed lock — with the same observable behavior, regardless of whether the deployment runs locally on a developer laptop, on a multi-instance VM cluster with Postgres, or in production on Kubernetes with Redis. The same code that an event broker writes against the cluster gear works in every deployment shape — the operator picks the backend, the consumer doesn't change. This eliminates an entire class of "works in dev, breaks in prod" bugs and lets the platform's plugin model own coordination instead of having every gear reinvent it.
 
 ### 1.3 Goals (Business Outcomes)
 
-- **Eliminate duplicated coordination code** — a single platform gear replaces the per-gear fragments (mini-chat's K8s leader election, toolkit-db's file locks, the nodes-registry). Target: zero per-gear reimplementations of cache / leader election / lock / service discovery in Gears within two release cycles of cluster GA.
+- **Eliminate duplicated coordination code** — a single platform gear replaces the per-gear fragments (mini-chat's K8s leader election, toolkit-db's file locks, the nodes-registry). Target: zero per-gear reimplementations of cache / leader election / lock in Gears within two release cycles of cluster GA.
 - **Enable reliable multi-instance deployments** — gears that today run in single-instance mode (because they cannot coordinate state across replicas) can be deployed at any replica count once they adopt cluster. Target: at least two gears (event broker, OAGW) running multi-instance in production within one release cycle of cluster GA.
 - **Support zero-infrastructure dev/test** — every cluster-aware behavior can be exercised on a developer laptop without spinning up Postgres, Redis, K8s, or any other backend. Target: full gear test suites pass against the in-process backend with no external dependencies.
 - **Allow per-deployment backend selection without consumer code changes** — the same gear binary works against different backends in different environments by changing operator configuration only. Target: zero recompilations required to switch a deployment from Postgres to Redis-plus-K8s.
@@ -83,16 +82,16 @@ A unified cluster gear gives every Gear the same four coordination primitives �
 
 | Term | Definition |
 |------|------------|
-| Coordination primitive | One of the four capabilities the cluster gear exposes: distributed cache, leader election, distributed lock, service discovery. |
+| Coordination primitive | One of the three capabilities the cluster gear exposes: distributed cache, leader election, distributed lock. |
 | Backend | An external (or in-process) system that implements one or more coordination primitives. Examples: Postgres, Redis, Kubernetes API, NATS, etcd, in-process. |
 | Plugin | A piece of code that adapts a backend to the cluster's primitive contracts. One plugin per backend. Plugins ship as separate releases on independent schedules; cluster's primitive contracts are stable across plugin versions. |
 | Profile | A named configuration that maps each coordination primitive to a backend. Operators define profiles in deployment YAML; consumer gears reference profiles by name. The same gear can use different profiles in different deployments without code changes. |
-| Capability requirement | A specific guarantee a consumer gear declares it needs from a primitive — for example, "the cache I'm using for leader-election state must be linearizable" or "the service-discovery I'm using must support server-side metadata filtering." Requirements are matched against backend characteristics at startup. |
+| Capability requirement | A specific guarantee a consumer gear declares it needs from a primitive — for example, "the cache I'm using for leader-election state must be linearizable" or "the lock I'm using must be linearizable." Requirements are matched against backend characteristics at startup. |
 | Capability mismatch | A startup error raised when a consumer's declared capability requirements are not met by the operator-chosen backend bound for the consumer's profile. The error names the consumer requirement and the bound backend, and prevents startup from completing. |
 | Serving intent (instance state) | A binary signal a registered service instance can flip to indicate "send me work" or "drain me, don't send new work." Distinct from health: a stuck instance cannot flip its own intent — health is observed externally (via probes, circuit breakers, etc.). |
-| Watch lifecycle signal | A non-data event a watch subscriber may receive: lag (events were dropped because the subscriber fell behind), reset (the underlying subscription was re-established from scratch), or close (the watch ended terminally). All three watches in cluster — cache, leader election, service discovery — surface these signals uniformly so consumers can recover the same way regardless of primitive. |
+| Watch lifecycle signal | A non-data event a watch subscriber may receive: lag (events were dropped because the subscriber fell behind), reset (the underlying subscription was re-established from scratch), or close (the watch ended terminally). Both watches in cluster — cache and leader election — surface these signals uniformly so consumers can recover the same way regardless of primitive. |
 | TTL safety net | The backend-side time-to-live on every cluster-managed resource (lock entries, leader election keys, service registrations). If a consumer crashes or forgets to release explicitly, TTL bounds the leak window. Cluster never relies on Rust `Drop` to make remote calls. |
-| In-scope vs out-of-scope (this change) | The cluster gear ships in multiple coordinated changes. THIS change ships the platform contract — the SDK that defines the four primitives, the consumer-side resolution and validation, the per-primitive backend interface, and the SDK-default backends built on the cache primitive — **plus the lifecycle wiring (the `ClusterHandle` builder/stop sequence) and one production-shaped in-process backend (the standalone plugin)** so the contract is exercised end-to-end. The cluster gear and its lifecycle owner are collapsed into a single gear crate (there is no separate host gear). External per-backend plugins (Postgres, K8s, Redis, NATS, etcd) remain explicit follow-up changes. |
+| In-scope vs out-of-scope (this change) | The cluster gear ships in multiple coordinated changes. THIS change ships the platform contract — the SDK that defines the three primitives, the consumer-side resolution and validation, the per-primitive backend interface, and the SDK-default backends built on the cache primitive — **plus the lifecycle wiring (the `ClusterHandle` builder/stop sequence) and one production-shaped in-process backend (the standalone plugin)** so the contract is exercised end-to-end. The cluster gear and its lifecycle owner are collapsed into a single gear crate (there is no separate host gear). External per-backend plugins (Postgres, K8s, Redis, NATS, etcd) remain explicit follow-up changes. |
 
 ## 2. Actors
 
@@ -123,8 +122,8 @@ A unified cluster gear gives every Gear the same four coordination primitives �
 **ID**: `cpt-cf-clst-actor-event-broker`
 
 <!-- cpt-cf-id-content -->
-**Role**: Uses leader election to pick a single instance to manage worker pool coordination, uses cache to publish shard-assignment state, and uses service discovery to route messages to the specific delivery instance currently serving a given topic shard. Topics and shards are dynamic — added at runtime, redistributed when delivery instances scale up or down.
-**Needs**: Linearizable leader election (no split-brain when shards move). Reactive notifications when shard assignments change (no polling). Service discovery that filters by metadata (find the delivery instance serving topic-shard "t-42" in one call) and supports fan-out routing (find all instances serving any of these shards). Drain semantics — when an instance shuts down, the broker must stop sending it new work before it disappears entirely.
+**Role**: Uses leader election to pick a single instance to manage worker pool coordination and uses cache to publish shard-assignment state. Topics and shards are dynamic — added at runtime, redistributed when delivery instances scale up or down. Routing to the delivery instance serving a given shard is a DirectoryService concern, not a cluster one.
+**Needs**: Linearizable leader election (no split-brain when shards move). Reactive notifications when shard assignments change (no polling).
 <!-- cpt-cf-id-content -->
 
 #### Outbound API Gateway (OAGW)
@@ -168,7 +167,7 @@ The cluster gear is designed to work across the full range of Gears deployments:
 - **Single-host multi-process** — a few processes on one machine, coordinating through a shared backend (typically Postgres). No K8s, no Redis. Cluster delivers full functionality with one optional database dependency.
 - **Multi-instance, no K8s** — multiple machines or containers without K8s orchestration. Cluster coordinates through a backend that's reachable from all instances (typically Postgres or Redis).
 - **K8s, low-throughput** — K8s deployment where coordination volume is modest. Cluster uses K8s-native resources (Lease for leader election and locks, custom resources for cache).
-- **K8s + high-throughput cache** — production-shaped K8s deployment. Cluster mixes backends: Redis for the high-volume cache and lock paths, K8s Lease for leader election (where consistency matters more than throughput), K8s Lease-per-instance for service discovery (so the dispatcher can filter delivery instances by topic shard).
+- **K8s + high-throughput cache** — production-shaped K8s deployment. Cluster mixes backends: Redis for the high-volume cache and lock paths, K8s Lease for leader election (where consistency matters more than throughput).
 
 A consumer gear's code does not change between these shapes. The operator picks the backend per primitive in deployment YAML.
 
@@ -176,7 +175,7 @@ A consumer gear's code does not change between these shapes. The operator picks 
 
 - The in-process backend has no external dependencies and is the default for development.
 - Each backend other than in-process has its own infrastructure prerequisites (Postgres requires a database; K8s requires API-server access with appropriate permissions; Redis requires network reachability). These belong to the per-backend plugin and the operator's deployment plan, not to the cluster gear itself.
-- Within one profile, each primitive can be served by a different backend. There is no requirement to use a single backend for all four primitives.
+- Within one profile, each primitive can be served by a different backend. There is no requirement to use a single backend for all three primitives.
 - The gear host is responsible for bringing cluster up before any consumer gear can resolve a primitive. Gears' existing gear-dependency mechanism enforces this at the gear level — the cluster gear host is registered as a dependency of every consumer gear.
 
 ## 4. Scope
@@ -187,15 +186,15 @@ This change ships the **platform contract** — the part of the cluster gear tha
 
 In scope for this change:
 
-- The four coordination primitives — distributed cache, leader election, distributed lock, service discovery — defined as a stable contract.
+- The three coordination primitives — distributed cache, leader election, distributed lock — defined as a stable contract.
 - The cluster lifecycle wiring: the `ClusterHandle` builder that registers each profile's backends (auto-filling unbound primitives with the SDK defaults over the cache) and the single `stop()` shutdown sequence that revokes active leadership, deregisters backends, and runs plugin stop hooks. The lifecycle owner is the cluster gear crate itself (host collapsed in).
-- One production-shaped in-process backend (the standalone plugin): a `ClusterCacheBackend` with monotonic versioning, a TTL sweeper, native exact + prefix watches with non-blocking fan-out, declaring linearizable consistency — enough for the SDK defaults to derive all four primitives over it.
+- One production-shaped in-process backend (the standalone plugin): a `ClusterCacheBackend` with monotonic versioning, a TTL sweeper, native exact + prefix watches with non-blocking fan-out, declaring linearizable consistency — enough for the SDK defaults to derive all three primitives over it.
 - Consumer-side primitive resolution: a consumer gear declares the profile and capability requirements it needs and gets back a working primitive (or a clear error).
 - Capability validation at startup: when the operator-chosen backend cannot deliver what a consumer requires, startup fails with a specific, actionable error.
 - Plugin contract: the narrow interface a plugin author implements to adapt a backend to a primitive, plus the characteristic-declaration mechanism by which plugins honestly state what they support.
-- SDK-default primitive implementations built on the cache primitive: a plugin that only implements the cache primitive automatically gets working leader election, locks, and service discovery via cluster-provided defaults built on cache CAS operations.
+- SDK-default primitive implementations built on the cache primitive: a plugin that only implements the cache primitive automatically gets working leader election and locks via cluster-provided defaults built on cache CAS operations.
 - Operational namespacing: a consumer can carve out a sub-namespace within a primitive (per-gear key prefixes, per-shard subdivisions) without affecting other consumers.
-- Watch lifecycle signaling: a uniform way for watch subscribers across all three watches (cache, leader election, service discovery) to recover from lag, reset, or terminal close.
+- Watch lifecycle signaling: a uniform way for watch subscribers across both watches (cache, leader election) to recover from lag, reset, or terminal close.
 - A workspace-wide static-analysis rule that catches cluster-lock misuse — specifically, cross-instance remote calls inside a lock's critical section, which would create stale-writer scenarios.
 - Smoke tests against in-process test backends to verify the contract works end-to-end.
 - Showcase example gears demonstrating typical consumer patterns.
@@ -204,9 +203,9 @@ In scope for this change:
 
 The following are out of scope for this change and ship as follow-ups:
 
-- External per-backend plugins (Postgres, K8s, Redis, NATS, etcd, Hazelcast). Each plugin is a separate change that builds against the contract this change establishes. The in-process standalone plugin shipped here is the reference backend, not a substitute for these.
-- Operator-YAML-driven instantiation of **non-cache** native backends. The wiring reads config and instantiates the cache provider, then auto-fills leader election, lock, and service discovery with the SDK defaults over that cache. Binding a native non-cache backend in YAML is **rejected at config time** (loud `InvalidConfig`) until the per-primitive routing follow-up lands — see `cpt-cf-clst-fr-routing-per-primitive`.
-- Active **remote release** of held lock and service-discovery state on shutdown. In-flight lock waiters and active service-discovery / cache watches now receive a terminal `Shutdown` (`cpt-cf-clst-fr-shutdown-revoke`), but **held** locks and live service registrations are not remotely deleted — they lapse via their backend TTL (`cpt-cf-clst-fr-shutdown-ttl-cleanup`).
+- External per-backend plugins (K8s, Redis, NATS, etcd, Hazelcast). Each plugin is a separate change that builds against the contract this change establishes. The in-process standalone plugin shipped here is the reference backend, not a substitute for these. The **Postgres plugin is delivered** (cache provider plus a standalone native lock provider), and is the first plugin to exercise per-primitive routing end to end.
+- ~~Operator-YAML-driven instantiation of **non-cache** native backends.~~ **Delivered** (see `cpt-cf-clst-fr-routing-per-primitive`). The wiring's YAML path dispatches each of `leader_election` / `lock` against its own provider registry, so an operator can bind a native non-cache backend alongside — or independently of — the cache binding. A primitive left omitted still rides the SDK default over that profile's cache.
+- Active **remote release** of held lock state on shutdown. In-flight lock waiters and active cache watches now receive a terminal `Shutdown` (`cpt-cf-clst-fr-shutdown-revoke`), but **held** locks are not remotely deleted — they lapse via their backend TTL (`cpt-cf-clst-fr-shutdown-ttl-cleanup`).
 - Migration of existing per-gear coordination code (mini-chat's K8s leader election, toolkit-db's file locks, the nodes-registry). Each migration is a separate per-gear change.
 - Reliable pub/sub messaging with delivery guarantees, consumer groups, offsets, replay. The event broker gear owns reliable messaging; cluster's reactive cache notifications serve a different role (data-change observation, not message delivery).
 - Cross-cluster or geo-distributed coordination. Cluster is single-cluster.
@@ -355,65 +354,17 @@ Consumers **MUST NOT** make remote calls inside the critical section protected b
 **Actors**: `cpt-cf-clst-actor-oagw`, `cpt-cf-clst-actor-platform-gear`
 <!-- cpt-cf-id-content -->
 
-### 5.4 P1 — Service Discovery
-
-#### Instance Registration with Metadata
-
-- [x] `p1` - **ID**: `cpt-cf-clst-fr-sd-register`
-
-<!-- cpt-cf-id-content -->
-The system **MUST** allow gears to register themselves as instances of a named service, with an endpoint address and arbitrary metadata key-value pairs (string keys, string values). The system **MUST** assign an instance identifier if the registering gear doesn't provide one. Registrations are TTL-bounded — if a registered instance stops heartbeating, it disappears from discovery automatically. Consumers **MUST** be able to deregister explicitly during graceful shutdown.
-
-**Rationale**: Out-of-process deployments need to know which instances are alive and where they are. Metadata enables routing decisions beyond just "is this instance up" (e.g., "which instance currently owns topic-shard t-42").
-**Actors**: `cpt-cf-clst-actor-platform-gear`, `cpt-cf-clst-actor-event-broker`
-<!-- cpt-cf-id-content -->
-
-#### Discovery with State and Metadata Filtering
-
-- [x] `p1` - **ID**: `cpt-cf-clst-fr-sd-discover`
-
-<!-- cpt-cf-id-content -->
-The system **MUST** provide a single discovery operation that returns the registered instances of a named service matching a filter. The filter **MUST** support both serving-state predicates (only enabled instances, only disabled instances, all) and metadata predicates (key equals a value, key is in a set of values). Multiple metadata predicates combine with AND semantics. The default filter **MUST** return only enabled instances with no metadata constraint, so consumers using the default cannot accidentally route traffic to drained instances. Callers needing all instances regardless of state **MUST** opt in explicitly. The filter contract **MUST** be designed so that future additions (geographic region, version selectors, result limits) extend the filter without breaking existing consumers. The order of the returned instance set is **unspecified** and may differ across backends and across calls; consumers requiring deterministic selection sort client-side.
-
-**Rationale**: A single extensible filter is forward-compatible; multiple disjoint discovery methods would force every new filter dimension to be a new method. Defaulting to "enabled only" eliminates a class of misconfigurations where an admin-tool query path leaks into production routing.
-**Actors**: `cpt-cf-clst-actor-platform-gear`, `cpt-cf-clst-actor-event-broker`
-<!-- cpt-cf-id-content -->
-
-#### Topology Watch with Lifecycle Signals
-
-- [x] `p1` - **ID**: `cpt-cf-clst-fr-sd-watch`
-
-<!-- cpt-cf-id-content -->
-The system **MUST** provide a watch operation that yields topology change events (instance joined, left, or updated). Watches are unfiltered — consumers apply filtering client-side to each change event. After a lag or reset signal (see §5.7 lifecycle signals), consumers **MUST** be able to recover by re-reading current membership.
-
-**Rationale**: Reactive topology awareness avoids polling and enables efficient connection-pool management. Unfiltered watches sidestep the ambiguity of "did this enabled-to-disabled transition produce a Joined or a Left event" — consumers apply consistent filtering on their side.
-**Actors**: `cpt-cf-clst-actor-platform-gear`, `cpt-cf-clst-actor-event-broker`
-<!-- cpt-cf-id-content -->
-
-#### Gear-Declared Serving Intent (Not Health)
-
-- [x] `p1` - **ID**: `cpt-cf-clst-fr-sd-state`
-
-<!-- cpt-cf-id-content -->
-Each registered service instance **MUST** carry a binary serving intent (enabled or disabled) that the registering gear can flip at any time. New registrations default to enabled. Gears that need to start in a non-serving state (warm-up, dependency wait, drain on shutdown) **MUST** be able to register as disabled or flip to disabled before exposing themselves to traffic.
-
-The serving-intent signal **MUST NOT** be presented as health observation. A stuck or deadlocked instance cannot flip its own intent; it disappears from discovery only when its TTL-bounded heartbeat stops. External health observation (Kubernetes readiness probes, service-mesh outlier detection, client-side circuit breakers) is the mechanism for detecting unexpected failure and is explicitly out of scope for this primitive.
-
-**Rationale**: A gear-owned drain signal is genuinely useful for graceful shutdown, warm-up, and maintenance — but the operator must understand it as intent rather than observation. Conflating the two has caused outages in other systems where gears silently kept claiming to be healthy while their request handlers were broken.
-**Actors**: `cpt-cf-clst-actor-platform-gear`, `cpt-cf-clst-actor-event-broker`
-<!-- cpt-cf-id-content -->
-
-### 5.5 P1 — Per-Backend Routing
+### 5.4 P1 — Per-Backend Routing
 
 #### Per-Primitive Backend Selection
 
-- [ ] `p1` - **ID**: `cpt-cf-clst-fr-routing-per-primitive`
+- [x] `p1` - **ID**: `cpt-cf-clst-fr-routing-per-primitive`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** allow operators to bind each coordination primitive to a different backend within one profile. For example: cache served by Redis, leader election served by K8s Lease, distributed lock served by Redis, service discovery served by K8s Lease-per-instance — all under the same profile. Consumer gears referencing this profile see four working primitives without knowing or caring that they're served by different backends.
+The system **MUST** allow operators to bind each coordination primitive to a different backend within one profile. For example: cache served by Redis, leader election served by K8s Lease, distributed lock served by Redis — all under the same profile. Consumer gears referencing this profile see three working primitives without knowing or caring that they're served by different backends.
 
-**Rationale**: Different backends excel at different things. Forcing one backend to serve all four primitives produces either suboptimal performance (Redis for leader election with weaker consistency than K8s Lease) or impossible-to-deploy combinations (K8s for cache when application throughput is too high).
-**Status (this change)**: Deferred. The wiring exposes `with_leader_election` / `with_lock` / `with_service_discovery` programmatically, but the YAML path **rejects** an explicit non-cache native binding at config time (loud `InvalidConfig` naming the primitive) rather than silently ignoring it. Operators get per-primitive backends once native non-cache providers ship; until then, omit the non-cache bindings to use the SDK defaults over the cache.
+**Rationale**: Different backends excel at different things. Forcing one backend to serve all three primitives produces either suboptimal performance (Redis for leader election with weaker consistency than K8s Lease) or impossible-to-deploy combinations (K8s for cache when application throughput is too high).
+**Status**: Realized. Both paths work: the wiring exposes `with_leader_election` / `with_lock` programmatically, and the YAML path resolves each non-cache primitive's `provider` against its own registry (`ProviderRegistry::with_leader_election_provider` and siblings), building that backend with its own options and its own stop hook. Naming a provider that isn't registered for that primitive still fails startup loudly with `InvalidConfig` — the registries are independent, so a plugin that ships only a cache provider cannot be bound to `lock` by mistake. Any primitive left omitted rides the SDK default over the profile's cache. Capability validation is unchanged and still applies per primitive, so a mixed-backend profile fails startup on a capability mismatch (`cpt-cf-clst-nfr-capability-validation`). First shipped native non-cache backend: the Postgres plugin's standalone `PostgresLockProvider`.
 **Actors**: `cpt-cf-clst-actor-operator`
 <!-- cpt-cf-id-content -->
 
@@ -422,7 +373,7 @@ The system **MUST** allow operators to bind each coordination primitive to a dif
 - [x] `p1` - **ID**: `cpt-cf-clst-fr-routing-omit-default`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** provide a convenient configuration shorthand for "use one backend for everything." When an operator binds a backend to the cache primitive but does not bind anything to leader election, lock, or service discovery, the system **MUST** automatically provide working implementations of the unbound primitives via cluster-provided defaults built on the cache backend. Explicit per-primitive bindings **MUST** always override the default.
+The system **MUST** provide a convenient configuration shorthand for "use one backend for everything." When an operator binds a backend to the cache primitive but does not bind anything to leader election or lock, the system **MUST** automatically provide working implementations of the unbound primitives via cluster-provided defaults built on the cache backend. Explicit per-primitive bindings **MUST** always override the default.
 
 **Rationale**: The "single-backend Postgres-only" deployment is the most common starting point. Forcing operators to write four config blocks for it (or to introduce a magic-string sentinel for "use the default") is friction without benefit. Omission as an opt-in is unambiguous and minimal.
 **Actors**: `cpt-cf-clst-actor-operator`
@@ -433,13 +384,13 @@ The system **MUST** provide a convenient configuration shorthand for "use one ba
 - [x] `p1` - **ID**: `cpt-cf-clst-fr-routing-cache-only-plugin`
 
 <!-- cpt-cf-id-content -->
-A plugin author **MUST** be able to ship a working integration by implementing only the cache primitive. The cluster gear **MUST** ship default implementations of leader election, distributed lock, and service discovery built on the cache primitive's atomic conditional operations and reactive notifications. When a backend natively supports a primitive better than the default (Kubernetes Lease for leader election, Redis SET-NX-EX for locks), the plugin author **MAY** override the default with a native implementation; otherwise the default is used.
+A plugin author **MUST** be able to ship a working integration by implementing only the cache primitive. The cluster gear **MUST** ship default implementations of leader election and distributed lock built on the cache primitive's atomic conditional operations and reactive notifications. When a backend natively supports a primitive better than the default (Kubernetes Lease for leader election, Redis SET-NX-EX for locks), the plugin author **MAY** override the default with a native implementation; otherwise the default is used.
 
 **Rationale**: Lowers the barrier to integrating new backends. A plugin author wanting to add NATS support shouldn't need to also figure out how to model leader election in NATS — they get it for free if they implement cache.
 **Actors**: `cpt-cf-clst-actor-plugin-author`
 <!-- cpt-cf-id-content -->
 
-### 5.6 P1 — Consumer Requirements and Startup Validation
+### 5.5 P1 — Consumer Requirements and Startup Validation
 
 #### Consumer Declares Profile by Typed Reference
 
@@ -457,7 +408,7 @@ Consumer gears **MUST** reference profiles by a typed identifier defined once in
 - [x] `p1` - **ID**: `cpt-cf-clst-fr-validation-capability-declarations`
 
 <!-- cpt-cf-id-content -->
-When resolving a primitive, a consumer **MUST** be able to declare specific capability requirements — for example, "the cache I'm using must be linearizable" or "the cache I'm using must support native prefix subscriptions" or "the service-discovery I'm using must support server-side metadata pushdown." Each declared requirement **MUST** map to a concrete characteristic of the bound backend that the system can check directly. Multiple requirements combine with AND semantics.
+When resolving a primitive, a consumer **MUST** be able to declare specific capability requirements — for example, "the cache I'm using must be linearizable" or "the cache I'm using must support native prefix subscriptions." Each declared requirement **MUST** map to a concrete characteristic of the bound backend that the system can check directly. Multiple requirements combine with AND semantics.
 
 **Rationale**: Different consumer gears need different guarantees from the same primitive. Without per-consumer requirements, the platform either has to lock every consumer to the strongest guarantees (forcing all deployments to use linearizable backends even when some consumers don't need them) or accept that some consumers will silently misbehave on weaker backends.
 **Actors**: `cpt-cf-clst-actor-platform-gear`
@@ -485,7 +436,7 @@ When a consumer's declared capability requirements cannot be met by the operator
 **Actors**: `cpt-cf-clst-actor-operator`, `cpt-cf-clst-actor-platform-gear`
 <!-- cpt-cf-id-content -->
 
-### 5.7 P1 — Lifecycle and Shutdown
+### 5.6 P1 — Lifecycle and Shutdown
 
 #### Single Lifecycle Owner
 
@@ -504,7 +455,7 @@ The cluster gear **MUST** be brought up and down by a single owning gear in the 
 - [x] `p1` - **ID**: `cpt-cf-clst-fr-watch-lifecycle-signals`
 
 <!-- cpt-cf-id-content -->
-All three watch types — cache, leader election, service discovery — **MUST** surface three lifecycle signals beyond ordinary value events: lag (the watcher fell behind, events were dropped, some count or "unknown" is reported), reset (the underlying subscription was re-established from scratch, all prior assumptions are invalid), and close (the watch ended terminally, no further events will arrive). Consumers **MUST** be able to handle these signals uniformly across the three watch types — same recovery patterns regardless of which primitive's watch they're observing.
+Both watch types — cache and leader election — **MUST** surface three lifecycle signals beyond ordinary value events: lag (the watcher fell behind, events were dropped, some count or "unknown" is reported), reset (the underlying subscription was re-established from scratch, all prior assumptions are invalid), and close (the watch ended terminally, no further events will arrive). Consumers **MUST** be able to handle these signals uniformly across both watch types — same recovery patterns regardless of which primitive's watch they're observing.
 
 **Rationale**: Watches are unreliable across network and process boundaries. Pretending otherwise causes silent state divergence between consumer and backend. Surfacing lag, reset, and close as first-class events lets consumers recover correctly. Uniform shape across the three watches lets consumer code handle them once instead of three different ways.
 **Actors**: `cpt-cf-clst-actor-platform-gear`, `cpt-cf-clst-actor-event-broker`
@@ -515,7 +466,7 @@ All three watch types — cache, leader election, service discovery — **MUST**
 - [x] `p1` - **ID**: `cpt-cf-clst-fr-watch-auto-restart`
 
 <!-- cpt-cf-id-content -->
-The cluster SDK **MUST** ship an opt-in watch-restart combinator that wraps the consumer-facing `*Watch` types and turns terminal close events into transparent reconnection with operator-configurable backoff. The combinator distinguishes retryable terminal causes (connection lost, timeout, resource exhausted, transient backend outage) from non-retryable terminal causes (auth failure, capability mismatch, explicit shutdown), retries the former according to a `RetryPolicy` (initial backoff, maximum backoff, jitter, and an optional retry-attempt cap), surfaces a `Reset` event to the consumer on each successful resubscribe so the consumer re-reads state, and propagates non-retryable closes to the consumer unchanged. The combinator **MUST** be available for all three watch types (cache, leader-election, service-discovery) using a single uniform policy type. Consumers that want a custom restart loop **MUST** still be able to consume the raw `*WatchEvent` stream without going through the combinator.
+The cluster SDK **MUST** ship an opt-in watch-restart combinator that wraps the consumer-facing `*Watch` types and turns terminal close events into transparent reconnection with operator-configurable backoff. The combinator distinguishes retryable terminal causes (connection lost, timeout, resource exhausted, transient backend outage) from non-retryable terminal causes (auth failure, capability mismatch, explicit shutdown), retries the former according to a `RetryPolicy` (initial backoff, maximum backoff, jitter, and an optional retry-attempt cap), surfaces a `Reset` event to the consumer on each successful resubscribe so the consumer re-reads state, and propagates non-retryable closes to the consumer unchanged. The combinator **MUST** be available for both watch types (cache, leader-election) using a single uniform policy type. Consumers that want a custom restart loop **MUST** still be able to consume the raw `*WatchEvent` stream without going through the combinator.
 
 **Rationale**: Without an SDK-shipped combinator, every consumer gear reinvents the same restart loop independently, with inconsistent backoff and inconsistent retryability classification. That diverges across gears and produces thundering-herd reconnect storms against a recovering backend. A single combinator at the SDK layer, parameterized by `RetryPolicy`, eliminates this class of regression and gives consumer code one canonical pattern to follow.
 **Actors**: `cpt-cf-clst-actor-platform-gear`, `cpt-cf-clst-actor-event-broker`, `cpt-cf-clst-actor-oagw`
@@ -526,10 +477,10 @@ The cluster SDK **MUST** ship an opt-in watch-restart combinator that wraps the 
 - [x] `p1` - **ID**: `cpt-cf-clst-fr-shutdown-revoke`
 
 <!-- cpt-cf-id-content -->
-On graceful shutdown, the system **MUST** revoke any active leader's claim before shutdown completes. A current leader **MUST** observe loss-of-leadership before any consumer code runs again on the assumption that the leader is still in charge. After loss has been observed, the watch then ends terminally (close signal). In-flight blocking operations (lock acquisitions, leader claims, discovery requests) **MUST** be cancelled with a specific shutdown error so consumers know the difference between "I lost my lock" and "the cluster is going down."
+On graceful shutdown, the system **MUST** revoke any active leader's claim before shutdown completes. A current leader **MUST** observe loss-of-leadership before any consumer code runs again on the assumption that the leader is still in charge. After loss has been observed, the watch then ends terminally (close signal). In-flight blocking operations (lock acquisitions, leader claims) **MUST** be cancelled with a specific shutdown error so consumers know the difference between "I lost my lock" and "the cluster is going down."
 
 **Rationale**: Without explicit revocation, a graceful shutdown can leave a leader-process believing it still leads while the cluster handle is gone — a stale-writer setup. Revoking confidence before shutdown completes prevents this.
-**Status (this change)**: Fully implemented (leader + in-flight lock + service-discovery watch + cache watch). `ClusterHandle::stop` revokes each wiring-created default backend before it returns: the leader-election backend latches `Status(Lost)` then emits `Closed(ClusterError::Shutdown)` to every active leader and awaits those tasks; an in-flight blocking `lock()` waiter returns `Err(ClusterError::Shutdown)` (not `LockTimeout`); an active service-discovery watch observes `Closed(ClusterError::Shutdown)`. Active **cache** watches are closed with `Closed(ClusterError::Shutdown)` via the standalone plugin's stop hook (`StandaloneCache::shutdown`), one phase after the leader/lock/SD revocation but still within `stop()`. No remote release is performed — held claims, locks, and registrations lapse via TTL per `cpt-cf-clst-fr-shutdown-ttl-cleanup`.
+**Status (this change)**: Fully implemented (leader + in-flight lock + cache watch). `ClusterHandle::stop` revokes each wiring-created default backend before it returns: the leader-election backend latches `Status(Lost)` then emits `Closed(ClusterError::Shutdown)` to every active leader and awaits those tasks; an in-flight blocking `lock()` waiter returns `Err(ClusterError::Shutdown)` (not `LockTimeout`). Active **cache** watches are closed with `Closed(ClusterError::Shutdown)` via the standalone plugin's stop hook (`StandaloneCache::shutdown`), one phase after the leader/lock revocation but still within `stop()`. No remote release is performed — held claims and locks lapse via TTL per `cpt-cf-clst-fr-shutdown-ttl-cleanup`.
 **Actors**: `cpt-cf-clst-actor-host`, `cpt-cf-clst-actor-platform-gear`
 <!-- cpt-cf-id-content -->
 
@@ -545,7 +496,7 @@ On shutdown, the system **MUST NOT** make best-effort remote cleanup calls (dele
 **Actors**: `cpt-cf-clst-actor-host`
 <!-- cpt-cf-id-content -->
 
-### 5.8 P1 — Operational Namespacing
+### 5.7 P1 — Operational Namespacing
 
 #### Per-Primitive Sub-Namespacing for Consumers
 
@@ -554,20 +505,10 @@ On shutdown, the system **MUST NOT** make best-effort remote cleanup calls (dele
 <!-- cpt-cf-id-content -->
 A consumer gear **MUST** be able to carve out a sub-namespace within any primitive — typically per-gear (so two gears using the same profile don't collide on cache keys) and optionally per-shard (so a sharded gear can subdivide its own namespace). Sub-namespacing **MUST** compose so a sharded gear's per-shard namespace nests cleanly inside its per-gear namespace. Consumers see name-relative names; the sub-namespacing is invisible inside the consumer's own code.
 
-**Rationale**: Without per-gear namespacing, two unrelated gears using the same profile would collide on cache keys, lock names, election names, and service names. Forcing every consumer to manually prefix every name is bug-prone (one missed prefix and you have a collision). The platform should handle namespacing for them.
+**Rationale**: Without per-gear namespacing, two unrelated gears using the same profile would collide on cache keys, lock names, and election names. Forcing every consumer to manually prefix every name is bug-prone (one missed prefix and you have a collision). The platform should handle namespacing for them.
 **Actors**: `cpt-cf-clst-actor-platform-gear`, `cpt-cf-clst-actor-event-broker`
 <!-- cpt-cf-id-content -->
 
-#### Service Discovery Metadata Is Not Namespaced
-
-- [x] `p1` - **ID**: `cpt-cf-clst-fr-namespacing-sd-metadata-unscoped`
-
-<!-- cpt-cf-id-content -->
-For service discovery specifically, sub-namespacing **MUST** apply only to service names, not to metadata keys or values. Two unrelated services in different namespaces **MUST** be able to use the same metadata key (for example, both using "region" or "topic-shard") without collision and without silent renaming.
-
-**Rationale**: Metadata keys are an attribute namespace per instance, not a coordination namespace. Scoping "region" to "gear-name/region" would either silently rename the key (breaking interop with platform tools that read raw metadata) or rename it inconsistently across consumers. The platform's coordination namespace lives on the service name; metadata is per-instance attribute data.
-**Actors**: `cpt-cf-clst-actor-platform-gear`, `cpt-cf-clst-actor-event-broker`
-<!-- cpt-cf-id-content -->
 
 ## 6. Non-Functional Requirements
 
@@ -678,7 +619,7 @@ The following non-functional concerns are deliberately NOT in scope for this cha
 - **Cluster-wide compliance NFRs** (FedRAMP, FIPS-140, PCI, etc.): platform-tier concern handled by the platform compliance baseline, not by individual gears.
 - **Backend authentication and credential management NFRs**: deferred to the broader OOP deployment design as captured in §13 Open Questions.
 - **Cross-cluster / geo-distributed coordination performance**: cluster is single-cluster scope per §4.2.
-- **Universal linearizability across all primitives regardless of backend**: cluster does NOT promise linearizability as a flat NFR — each primitive's consistency depends on its bound backend, surfaced through capability validation per §5.6.
+- **Universal linearizability across all primitives regardless of backend**: cluster does NOT promise linearizability as a flat NFR — each primitive's consistency depends on its bound backend, surfaced through capability validation per §5.5.
 
 ## 7. Public Library Interfaces
 
@@ -693,7 +634,7 @@ The cluster gear exposes a public API consumed by Gears and a separate plugin-fa
 <!-- cpt-cf-id-content -->
 **Type**: Rust public-API per-primitive surface
 **Stability**: stable (V1)
-**Description**: Consumer gears see four primitive-specific entry points (cache, leader election, distributed lock, service discovery). For each, they declare a profile and any required capabilities, and receive a working primitive or a startup error. The consumer surface is intentionally narrow — consumers do not hold or name plugin-side types; the platform mediates entirely.
+**Description**: Consumer gears see three primitive-specific entry points (cache, leader election, distributed lock). For each, they declare a profile and any required capabilities, and receive a working primitive or a startup error. The consumer surface is intentionally narrow — consumers do not hold or name plugin-side types; the platform mediates entirely.
 **Breaking Change Policy**: Major version bump per primitive, ships independently of the others; the platform supports one previous major version concurrently to give consumers a migration window.
 <!-- cpt-cf-id-content -->
 
@@ -704,7 +645,7 @@ The cluster gear exposes a public API consumed by Gears and a separate plugin-fa
 <!-- cpt-cf-id-content -->
 **Type**: Rust plugin-facing surface
 **Stability**: stable (V1)
-**Description**: Plugin authors implement one or more primitive contracts and declare their backend's characteristics so the platform can validate consumer capability requirements. Plugins ship as separate crates on independent release schedules. A plugin implementing only the cache primitive automatically gets working leader election, lock, and service discovery via cluster-provided defaults built on cache.
+**Description**: Plugin authors implement one or more primitive contracts and declare their backend's characteristics so the platform can validate consumer capability requirements. Plugins ship as separate crates on independent release schedules. A plugin implementing only the cache primitive automatically gets working leader election and lock via cluster-provided defaults built on cache.
 **Breaking Change Policy**: Major version bump per primitive contract, ships independently; the prior major version remains supported during a migration window.
 <!-- cpt-cf-id-content -->
 
@@ -713,7 +654,7 @@ The cluster gear exposes a public API consumed by Gears and a separate plugin-fa
 Per-backend wire formats and external resource layouts are deferred to per-plugin follow-up changes per §4.2 Out of Scope. This includes:
 
 - **Postgres plugin**: schema (cache table, lock table, advisory-lock key allocation, NOTIFY channel naming), `synchronous_commit` configuration requirements (per ADR-009).
-- **K8s plugin**: API resources used (`coordination.k8s.io/v1.Lease` per leader election and per service-discovery instance per ADR-008; CRD shape for cache; RBAC requirements).
+- **K8s plugin**: API resources used (`coordination.k8s.io/v1.Lease` per leader election; CRD shape for cache; RBAC requirements).
 - **Redis plugin**: key naming patterns, Lua script catalog for atomic operations, keyspace-notification configuration.
 - **NATS plugin**: KV bucket naming, JetStream replication factor requirements (per ADR-009 — R≥3 for leader/lock).
 - **etcd plugin**: KV key layout, lease/watch usage patterns.
@@ -810,64 +751,39 @@ This PRD does not enumerate these contracts. Each plugin's own PRD/DESIGN docume
 <!-- cpt-cf-id-content -->
 **Actor**: `cpt-cf-clst-actor-operator`
 
+**Status**: The per-primitive routing this use case depends on is realized (`cpt-cf-clst-fr-routing-per-primitive`). The Redis/K8s pairing in the main flow below is **illustrative of the target provider cohort** — those plugins have not shipped yet. The shipped-today realization of the same shape is a `standalone` (or Postgres) cache bound alongside the Postgres plugin's native lock provider; see the "Shipped-provider realization" alternative flow.
+
 **Preconditions**:
 - K8s deployment with Redis provisioned
 - Operator wants Redis for cache (high throughput) and K8s Lease for leader election (consistency)
 
-**Main Flow**:
-1. Operator writes a profile with per-primitive bindings: cache → Redis, leader election → K8s Lease, lock → Redis, service discovery → K8s Lease (per instance)
+**Main Flow** *(target cohort; K8s and Redis plugins are follow-up work)*:
+1. Operator writes a profile with per-primitive bindings: cache → Redis, leader election → K8s Lease, lock → Redis
 2. The cluster gear starts each plugin once and registers each backend under the profile
-3. Consumer gears referencing this profile resolve cache and lock through Redis, leader election and service discovery through K8s
+3. Consumer gears referencing this profile resolve cache and lock through Redis, leader election through K8s
 
 **Postconditions**:
 - Each primitive routes to the operator's chosen backend; consumer gears are unaware of the mix
 
 **Alternative Flows**:
-- **Single-backend convenience**: Operator binds only the cache primitive to Postgres for a profile; the system automatically provides leader election, lock, and service discovery via cluster-provided defaults built on the Postgres cache. Operator writes one config block instead of four.
+- **Shipped-provider realization**: Operator binds `cache` to the in-process `standalone` provider (or to Postgres) and `lock` to the Postgres plugin's native lock provider in one profile; leader election rides the SDK default over that cache. Two providers, two backends, one profile — the same routing path the target cohort above will use.
+- **Single-backend convenience**: Operator binds only the cache primitive to Postgres for a profile; the system automatically provides leader election and lock via cluster-provided defaults built on the Postgres cache. Operator writes one config block instead of three.
 - **Capability mismatch at startup**: Operator binds an eventually-consistent cache and a consumer requires linearizable; startup fails with a specific error before traffic ever reaches the consumer gear.
-<!-- cpt-cf-id-content -->
-
-#### UC-005: Dispatcher Routes by Topic Shard via Service Discovery
-
-- [ ] `p1` - **ID**: `cpt-cf-clst-usecase-service-discovery`
-
-<!-- cpt-cf-id-content -->
-**Actor**: `cpt-cf-clst-actor-event-broker`
-
-**Preconditions**:
-- Multiple event-broker delivery instances are running, each owning one or more topic shards
-- The deployment binds service discovery to a backend supporting metadata-based discovery
-- Topics and their shards are dynamic — added at runtime, redistributed when delivery instances scale
-
-**Main Flow**:
-1. Each delivery instance registers itself under the "delivery" service name with metadata indicating which topic shard it currently owns
-2. The dispatcher discovers the delivery instance(s) currently serving a specific topic shard by passing a metadata filter to the discovery operation; for fan-out routing across multiple shards, the dispatcher passes a set-membership filter so all matching instances come back in one call
-3. The dispatcher subscribes to the delivery service's topology watch and updates its routing table when instances join, leave, or change ownership
-
-**Postconditions**:
-- The dispatcher has an up-to-date view of enabled delivery instances filtered by topic shard
-- Sharded routing decisions are made in one discovery call, not N+1 lookups for fan-out
-
-**Alternative Flows**:
-- **No instances currently own the requested shard**: Discovery returns an empty list; the dispatcher applies its no-owner policy (queue, retry, or fail).
-- **Delivery instance shuts down gracefully**: The instance flips its serving intent to disabled before deregistering; the dispatcher excludes it from new routing as soon as the topology watch notifies the change.
-- **Delivery instance crashes**: TTL-bounded heartbeat stops; the instance disappears from discovery within the TTL window. Detection of the crash is via heartbeat expiry, not via the serving-intent signal — serving intent is gear-declared, not externally observed.
-- **Dispatcher's topology watch falls behind**: The watch surfaces a lag or reset signal; the dispatcher re-reads current membership via discovery to recover.
 <!-- cpt-cf-id-content -->
 
 ## 9. Acceptance Criteria
 
-- [ ] All four coordination primitives are exposed through a uniform consumer-facing surface where consumers declare a profile and capability requirements and receive either a working primitive or a startup error
-- [ ] All four primitives have a corresponding plugin interface that backend authors implement, with honest characteristic declaration so the platform can validate consumer requirements
-- [ ] The system ships default leader-election, lock, and service-discovery implementations built on the cache primitive, so a plugin author implementing only cache produces a working four-primitive integration
-- [ ] An operator binding only the cache primitive in a profile results in working leader-election, lock, and service-discovery automatically
+- [ ] All three coordination primitives are exposed through a uniform consumer-facing surface where consumers declare a profile and capability requirements and receive either a working primitive or a startup error
+- [ ] All three primitives have a corresponding plugin interface that backend authors implement, with honest characteristic declaration so the platform can validate consumer requirements
+- [ ] The system ships default leader-election and lock implementations built on the cache primitive, so a plugin author implementing only cache produces a working three-primitive integration
+- [ ] An operator binding only the cache primitive in a profile results in working leader-election and lock automatically
 - [ ] An operator binding different backends to different primitives within one profile results in each primitive routing to its bound backend
 - [ ] A consumer gear declaring a capability requirement that the bound backend cannot meet produces a startup error within bounded time, naming the gear, primitive, unmet requirement, and bound backend
-- [ ] All three watch types — cache, leader election, service discovery — surface lag, reset, and close lifecycle signals that consumers handle uniformly
+- [ ] Both watch types — cache and leader election — surface lag, reset, and close lifecycle signals that consumers handle uniformly
 - [ ] Graceful shutdown revokes leadership confidence before consumer code can run again on stale assumptions; the watch then ends terminally
 - [ ] Consumer code holding a cluster lock cannot make remote calls inside the critical section without triggering a workspace-wide static-analysis error at compile time
 - [ ] Consumer gears declare profile references once per crate as typed identifiers, never as bare strings at call sites
-- [ ] Per-gear sub-namespacing inside a primitive is composable and applies to coordination names (cache keys, lock names, election names, service names) but does NOT apply to service-discovery metadata keys or values
+- [ ] Per-gear sub-namespacing inside a primitive is composable and applies to coordination names (cache keys, lock names, election names)
 - [ ] Backend-specific errors are wrapped in a structured form supporting programmatic retryability decisions
 - [ ] Smoke tests cover all of the above against minimal in-process test backends without external infrastructure
 - [ ] Showcase example gears demonstrate single-primitive, multi-primitive, multi-profile, and plugin-author usage patterns
@@ -911,11 +827,10 @@ The functional and non-functional requirements above are realized by architectur
 | Cache (5.1) | §3.3 cache contract; §3.11 SDK default backends | ADR-001 (backend compatibility); ADR-003 (watch lifecycle) |
 | Leader election (5.2) | §3.3 leader-election contract; §3.11 SDK default backends | ADR-001; ADR-003 (watch lifecycle); ADR-009 (per-backend safety under failure) |
 | Distributed lock (5.3) | §3.3 lock contract; §2 no-I/O-in-Drop and no-remote-in-critical-section principles | ADR-002; ADR-009 (per-backend safety under failure) |
-| Service discovery (5.4) | §3.3 service-discovery contract; serving-intent vs health note | ADR-001; ADR-003 (watch lifecycle); ADR-008 (state is intent, not health) |
-| Per-backend routing (5.5) | §3.2 component model; §3.11 SDK defaults; §3.12 polyfill | ADR-001; ADR-006 (builder/handle pattern) |
-| Consumer requirements and validation (5.6) | §3.6 resolution pattern; §3.10 capability validation | ADR-007 (capability typing and profile resolution) |
-| Lifecycle and shutdown (5.7) | §3.7 builder/handle pattern; §3.13 shutdown sequence | ADR-002; ADR-006 (builder/handle pattern) |
-| Operational namespacing (5.8) | §3.8 per-primitive scoping | (covered in DESIGN.md §3) |
+| Per-backend routing (5.4) | §3.2 component model; §3.11 SDK defaults; §3.12 polyfill | ADR-001; ADR-006 (builder/handle pattern) |
+| Consumer requirements and validation (5.5) | §3.6 resolution pattern; §3.10 capability validation | ADR-007 (capability typing and profile resolution) |
+| Lifecycle and shutdown (5.6) | §3.7 builder/handle pattern; §3.13 shutdown sequence | ADR-002; ADR-006 (builder/handle pattern) |
+| Operational namespacing (5.7) | §3.8 per-primitive scoping | (covered in DESIGN.md §3) |
 | Capability validation NFR | §3.6; §3.10 | ADR-007 |
 | Cross-backend stability NFR | §3.2; §3.3; §3.6 | ADR-005 (facade + backend trait pattern) |
 | Leader guarantee NFR | §3.3 leader-election contract; §3.11 default leader-election backend | ADR-001; ADR-009 (per-backend safety; constructor pair) |

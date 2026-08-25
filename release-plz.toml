@@ -1,14 +1,36 @@
 [workspace]
-# Keep the defaults simple and explicit. We rely on Cargo manifests for:
-# - which crates are publishable (`publish = false` disables)
-# - per-crate versioning (every crate has its own explicit `version = ...`)
+# Two different questions, decided in two different places — do not conflate them:
+#
+# - *Is a crate published at all?* Decided by its Cargo manifest alone (`publish = false`
+#   disables it). release-plz skips such a crate entirely — no version bump, no tag, no
+#   changelog, no release — so it needs no entry in this file. Adding one is dead config.
+# - *What does a published crate get on top of the publish?* Decided here: a section in
+#   CHANGELOG.md (`changelog_update`) and a GitHub Release page (`git_release_enable`).
+#
+# The rule for the second question, by path:
+#
+# - `gears/**` (gears, their SDKs, their plugins) — own changelog section, own GitHub
+#   Release. That is exactly what the defaults below give, so a new gear needs NO entry
+#   in this file.
+# - `libs/**` (the framework) — published and tagged, but folded into the single
+#   `cf-gears-toolkit` release: no changelog section, no Release page of its own. Each
+#   one is listed below, so a new `libs/**` crate DOES need one entry here.
+#
+# Per-crate versions come from the manifests (every crate has an explicit `version`).
+# Per-crate git tags are created for every published crate under either rule —
+# `git_tag_enable` is left at its default and is not set anywhere in this file.
 #
 # NOTE: release-plz may temporarily checkout commits while computing diffs.
 # Some repos can end up "dirty" due to generated/normalized files, so we allow it.
 allow_dirty = true
 
-# Add a stable label to the release PR so the publish workflow can filter on it.
+# Label the release PR so it is easy to spot in the PR list. No workflow filters on it:
+# the publish job decides what to release by comparing manifests against crates.io.
 pr_labels = ["release-plz"]
+
+# Defaults, i.e. the `gears/**` behaviour. These are also release-plz's own defaults;
+# kept explicit because they are load-bearing here — they are what every unlisted crate
+# inherits.
 changelog_update = true
 git_release_enable = true
 
@@ -61,9 +83,15 @@ body = """
 {% endmacro -%}
 """
 
-# ToolKit Framework - unified release
-# Only cf-gears-toolkit gets changelog entries and GitHub releases
-# All other cf-gears-toolkit-* crates are published to crates.io but without separate changelog/releases
+# ─────────────────────────────────────────────────────────────────────────────
+# Framework — everything under `libs/**`.
+#
+# `cf-gears-toolkit` carries the framework's changelog and its GitHub Release; every
+# other `libs/**` crate is published and tagged but folded into it. Keep this list in
+# sync with the publishable crates under `libs/**` — an omission is not inert, the crate
+# silently starts producing its own changelog section and Release page.
+# ─────────────────────────────────────────────────────────────────────────────
+
 [[package]]
 name = "cf-gears-toolkit"
 changelog_update = true
@@ -71,6 +99,16 @@ git_release_enable = true
 
 [[package]]
 name = "cf-gears-toolkit-auth"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "cf-gears-toolkit-canonical-errors"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "cf-gears-toolkit-canonical-errors-macro"
 changelog_update = false
 git_release_enable = false
 
@@ -85,15 +123,39 @@ changelog_update = false
 git_release_enable = false
 
 [[package]]
-name = "cf-gears-toolkit-macros"
+name = "cf-gears-toolkit-gateway"
 changelog_update = false
 git_release_enable = false
 
 [[package]]
-name = "cf-gears-toolkit-macros-tests"
+name = "cf-gears-toolkit-gts"
 changelog_update = false
 git_release_enable = false
-publish = false
+
+[[package]]
+name = "cf-gears-toolkit-gts-macros"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "cf-gears-toolkit-http"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "cf-gears-toolkit-http-middleware"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "cf-gears-toolkit-k8s-auth"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "cf-gears-toolkit-macros"
+changelog_update = false
+git_release_enable = false
 
 [[package]]
 name = "cf-gears-toolkit-node-info"
@@ -121,6 +183,11 @@ changelog_update = false
 git_release_enable = false
 
 [[package]]
+name = "cf-gears-toolkit-stable-hash"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
 name = "cf-gears-toolkit-transport-grpc"
 changelog_update = false
 git_release_enable = false
@@ -130,17 +197,37 @@ name = "cf-gears-toolkit-utils"
 changelog_update = false
 git_release_enable = false
 
+# Contract layer (libs/toolkit-contract*) — same unified-release rule as the rest of the
+# framework.
 [[package]]
-name = "cf-gears-toolkit-gts"
+name = "cf-gears-toolkit-contract"
 changelog_update = false
 git_release_enable = false
 
 [[package]]
-name = "cf-gears-toolkit-gts-macros"
+name = "cf-gears-toolkit-contract-macros"
 changelog_update = false
 git_release_enable = false
 
-# System SDK libraries - published to crates.io but without separate changelog/releases
+[[package]]
+name = "cf-gears-toolkit-contract-protogen"
+changelog_update = false
+git_release_enable = false
+
+# TLS/FIPS support crates (libs/rustls-*). Framework infrastructure, so they follow the
+# `libs/**` rule. Flip these two to `true` if they should ever get their own release
+# notes — they are the only judgement call in this list.
+[[package]]
+name = "cf-gears-rustls-corecrypto-provider"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "cf-gears-rustls-fips-shim"
+changelog_update = false
+git_release_enable = false
+
+# System SDK libraries (libs/system-sdks/**).
 [[package]]
 name = "cf-gears-system-sdks"
 changelog_update = false
@@ -150,132 +237,3 @@ git_release_enable = false
 name = "cf-gears-system-sdk-directory"
 changelog_update = false
 git_release_enable = false
-
-# System gears and their SDKs - published to crates.io but without separate changelog/releases
-[[package]]
-name = "cf-gears-api-gateway"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-grpc-hub"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-file-parser"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-nodes-registry"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-nodes-registry-sdk"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-gear-orchestrator"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-types-registry"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-types-registry-sdk"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-simple-user-settings"
-publish = false
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-simple-user-settings-sdk"
-publish = false
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-resource-group-sdk"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-resource-group"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-tenant-resolver-sdk"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-tenant-resolver"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-authn-resolver-sdk"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-authn-resolver"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-authz-resolver-sdk"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-authz-resolver"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-oagw-sdk"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-oagw"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-credstore-sdk"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-credstore"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-mini-chat-sdk"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-mini-chat"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cf-gears-model-registry-sdk"
-changelog_update = false
-git_release_enable = false
-

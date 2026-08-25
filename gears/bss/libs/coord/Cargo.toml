@@ -1,8 +1,11 @@
 [package]
-name = "coord"
+name = "cf-gears-bss-coord"
 edition.workspace = true
 license.workspace = true
 description = "Shared BSS coordination primitives — a DB-backed distributed lease (single-active job/run guard), ported from the account-management lease pattern. Works entirely within the existing SecureORM API (unscoped `coord_leases` table via `AccessScope::allow_all()`); no toolkit changes."
+
+[lib]
+name = "coord"
 
 [lints]
 workspace = true

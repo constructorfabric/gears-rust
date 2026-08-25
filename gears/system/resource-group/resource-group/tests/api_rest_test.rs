@@ -9,7 +9,7 @@
 mod common;
 
 use std::sync::Arc;
-use toolkit_gts::gts_id;
+use toolkit_gts::{gts_id, gts_uri};
 
 use async_trait::async_trait;
 use axum::Router;
@@ -45,6 +45,8 @@ macro_rules! rg_type_id {
         format!("{}{}", gts_id!("cf.core.rg.type.v1~"), format_args!($($arg)*))
     };
 }
+
+const ALREADY_EXISTS_TYPE: &str = gts_uri!("cf.core.errors.err.v1~cf.core.err.already_exists.v1~");
 
 // ── Noop OpenAPI Registry for tests ─────────────────────────────────────
 
@@ -446,6 +448,61 @@ async fn get_group_not_found_returns_404() {
     );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// POST group with an already-taken id returns 409 with a problem body.
+#[tokio::test]
+async fn create_group_duplicate_id_returns_409() {
+    let (router, type_svc) = build_test_router().await;
+    let tenant_id = Uuid::now_v7();
+    let type_code = rg_type_id!("test.dupid.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let id = Uuid::now_v7();
+    let payload = |name: &str| {
+        serde_json::json!({
+            "id": id,
+            "type": type_code,
+            "name": name
+        })
+    };
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(payload("First")),
+        tenant_id,
+    );
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(payload("Second")),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let body = response_body(resp).await;
+    assert_eq!(body["type"], ALREADY_EXISTS_TYPE, "problem type: {body}");
+    assert_eq!(body["status"], 409, "problem status: {body}");
+    assert_eq!(
+        body["context"]["resource_name"],
+        id.to_string(),
+        "problem resource_name: {body}"
+    );
 }
 
 // ── Error format tests (RFC 9457 Problem Details) ───────────────────────

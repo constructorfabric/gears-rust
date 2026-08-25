@@ -1,0 +1,53 @@
+family     = "reserved"
+id         = "capacity-on-level"
+kind       = "evaluation"
+provenance = ["inst-rv-level", "D-53", "D-139", "T-D-25"]
+
+# The scenario D-53 requires before any level row with a reservation publishes.
+#
+# `capacity` bills the allocation regardless of usage and never touches Q. Under
+# D-139 (pricing's adoption of rating T-D-25) the charge carries a time factor:
+# `reservedRate` is denominated in the row's billable unit - level unit x granule
+# duration - so it is money per granule, and the period charge multiplies by the
+# reservation's covered granules. Without that factor a disk allocated late in
+# the period would bill as if held all period, with no proration path to fix it.
+#
+# The row carries `tierAggregationWindow` because it is a `graduated` usage row
+# and `inst-tb-window` requires one of every tiered usage row - the bands below
+# are the on-demand ladder the remainder would be priced by, and a band set
+# without a window prices an unbounded accumulation. It touches neither assertion:
+# `capacity` never reads `Q` at all, which is the property both assertions exist
+# to pin, so the counter this window bounds is the counter this case proves is
+# not consulted. `invoice_period` matches the family's other reserved rows.
+
+[snapshot]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "storage.gb"
+aggregation_function    = "peak"
+aggregation_granularity = "hour"
+max_hold_granules       = 1
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+reserved_rate_minor     = 3
+reservation_flavor      = "capacity"
+
+  [[snapshot.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 5
+
+[runtime]
+reserved_quantity = 500
+covered_granules  = 240
+
+[[assert]]
+given  = { q = 0 }
+expect = { charge_minor = 360000 }
+why    = "zero usage still bills the allocation: 3 x 500 x 240 = 360000. The quantity is deliberately unread - capacity is never reduced by absent usage. Dropping the covered-granules factor would have billed 1500, a 240x under-charge, and would have left a mid-period allocation with no way to bill less than a full one"
+
+[[assert]]
+given  = { q = 900 }
+expect = { charge_minor = 360000 }
+why    = "usage moved and the charge did not: capacity never touches Q. The on-demand side of a level row is a separate line, not part of this one"

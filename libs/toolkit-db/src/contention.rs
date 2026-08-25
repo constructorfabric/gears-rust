@@ -91,6 +91,10 @@ pub fn is_retryable_contention(backend: DbBackend, err: &DbErr) -> bool {
                 DbBackend::MySql => is_mysql_deadlock(&msg),
                 DbBackend::Postgres => is_pg_contention(&msg),
                 DbBackend::Sqlite => is_sqlite_busy(&msg),
+                // `DbBackend` is `#[non_exhaustive]` as of SeaORM 2.0. We have no
+                // contention signatures for a backend we don't know, so treat it
+                // as non-retryable rather than retrying blindly.
+                _ => false,
             }
         }
         _ => false,

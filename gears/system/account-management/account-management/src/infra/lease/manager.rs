@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::{Expr, SimpleExpr};
 use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, QueryFilter};
 use time::OffsetDateTime;
@@ -242,5 +243,7 @@ pub(super) fn ttl_secs_i64(ttl: Duration) -> i64 {
     // `as_secs() -> u64`; coordinator-side TTLs are minutes (15 min
     // by default), well within `i64::MAX`. Saturate as a defensive
     // floor against pathological inputs.
-    ttl.as_secs().min(i64::MAX as u64) as i64
+    // `Ord::min` spelled explicitly: `ExprTrait` (in scope for the SQL builders
+    // in this module) also has a `min`, which makes the method call ambiguous.
+    Ord::min(ttl.as_secs(), i64::MAX as u64) as i64
 }

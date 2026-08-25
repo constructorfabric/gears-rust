@@ -7,11 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::test_cache::MemoryCache;
-use super::{
-    CacheBasedServiceDiscoveryBackend, CasBasedDistributedLockBackend,
-    CasBasedLeaderElectionBackend,
-};
-use cluster_sdk::discovery::{DiscoveryFilter, ServiceDiscoveryBackend, ServiceRegistration};
+use super::{CasBasedDistributedLockBackend, CasBasedLeaderElectionBackend};
 use cluster_sdk::leader::{LeaderElectionBackend, LeaderStatus, LeaderWatchEvent};
 use cluster_sdk::lock::DistributedLockBackend;
 use cluster_sdk::observability::ClusterMetrics;
@@ -20,7 +16,6 @@ use cluster_sdk::observability::ClusterMetrics;
 struct Rec {
     lock_ops: Mutex<Vec<(String, String)>>,
     leader_transitions: Mutex<Vec<String>>,
-    discovery_ops: Mutex<Vec<(String, String)>>,
 }
 
 impl ClusterMetrics for Rec {
@@ -38,12 +33,6 @@ impl ClusterMetrics for Rec {
             .lock()
             .unwrap()
             .push(transition.to_owned());
-    }
-    fn discovery_op(&self, op: &str, result: &str) {
-        self.discovery_ops
-            .lock()
-            .unwrap()
-            .push((op.to_owned(), result.to_owned()));
     }
     fn watch_reset(&self, _primitive: &str) {}
     fn provider_error(&self, _kind: &str) {}
@@ -100,35 +89,5 @@ async fn leader_records_acquired_transition() {
             .unwrap()
             .contains(&"acquired".to_owned()),
         "sole candidate must record an `acquired` transition"
-    );
-}
-
-#[tokio::test]
-async fn discovery_records_register_and_discover() {
-    let rec = Arc::new(Rec::default());
-    let backend = CacheBasedServiceDiscoveryBackend::new(MemoryCache::linearizable())
-        .with_observability("test", Arc::clone(&rec) as _);
-
-    let _handle = backend
-        .register(ServiceRegistration {
-            name: "delivery".to_owned(),
-            instance_id: Some("i-1".to_owned()),
-            address: "127.0.0.1:9000".to_owned(),
-            metadata: std::collections::HashMap::new(),
-        })
-        .await
-        .expect("registration succeeds");
-    let _discovered = backend
-        .discover("delivery", DiscoveryFilter::default())
-        .await;
-
-    let ops = rec.discovery_ops.lock().unwrap();
-    assert!(
-        ops.contains(&("register".to_owned(), "ok".to_owned())),
-        "expected a successful register, got {ops:?}"
-    );
-    assert!(
-        ops.contains(&("discover".to_owned(), "ok".to_owned())),
-        "expected a successful discover, got {ops:?}"
     );
 }

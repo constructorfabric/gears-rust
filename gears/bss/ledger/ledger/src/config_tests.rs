@@ -152,6 +152,30 @@ fn over_seven_days_stale_default_rejected() {
     assert!(cfg.validate().is_err());
 }
 
+/// A sub-floor tick must be rejected: the `FxNoFetchAttempted` alert window is
+/// `3 ×` the tick, and one attempt can stay in flight for up to the adapter's
+/// 30 s per-source timeout ceiling — a sub-minute tick would let a single slow
+/// attempt span the whole window and read as "no attempt occurred".
+#[test]
+fn sub_floor_rate_sync_tick_rejected() {
+    let cfg = FxConfig {
+        rate_sync_tick_secs: MIN_RATE_SYNC_TICK_SECS - 1,
+        ..FxConfig::default()
+    };
+    assert!(cfg.validate().is_err());
+}
+
+/// The floor itself must validate — together with the rejection above this pins
+/// the bound exactly, where either test alone would pass for an arbitrary one.
+#[test]
+fn rate_sync_tick_at_the_floor_validates() {
+    let cfg = FxConfig {
+        rate_sync_tick_secs: MIN_RATE_SYNC_TICK_SECS,
+        ..FxConfig::default()
+    };
+    assert!(cfg.validate().is_ok());
+}
+
 #[test]
 fn default_recon_config_validates() {
     assert!(ReconConfig::default().validate().is_ok());

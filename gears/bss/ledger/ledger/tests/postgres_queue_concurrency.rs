@@ -1,7 +1,7 @@
 //! Postgres-only **concurrency** tests for the deferred-apply queue (Slice 2b,
 //! Phase 3, Group F): two appliers racing the SAME queued allocation must apply
 //! it EXACTLY ONCE. Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_queue_concurrency -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_queue_concurrency -- --ignored`.
 //!
 //! Run discipline (controller): testcontainer `#[ignore]` tests; run the bin
 //! sequentially (each test boots its own container).
@@ -138,7 +138,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -238,7 +238,7 @@ async fn queue_status(
     s: &Seller,
     allocation_id: Uuid,
 ) -> Option<String> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT status FROM bss.ledger_pending_event_queue \
          WHERE tenant_id='{}' AND flow='PAYMENT_ALLOCATE' AND business_id='{allocation_id}'",
         s.tenant
@@ -253,7 +253,7 @@ async fn dedup_status(
     s: &Seller,
     allocation_id: Uuid,
 ) -> Option<(String, Option<Uuid>)> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT status, result_entry_id FROM bss.ledger_idempotency_dedup \
          WHERE tenant_id='{}' AND flow='PAYMENT_ALLOCATE' AND business_id='{allocation_id}'",
         s.tenant
@@ -273,7 +273,7 @@ async fn ar_invoice_balance(
     s: &Seller,
     invoice_id: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
@@ -284,7 +284,7 @@ async fn ar_invoice_balance(
 }
 
 async fn count_allocations(raw: &sea_orm::DatabaseConnection, s: &Seller, payment_id: &str) -> i64 {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT COUNT(*) FROM bss.ledger_payment_allocation \
          WHERE tenant_id='{}' AND payment_id='{}'",
         s.tenant, payment_id
@@ -458,7 +458,7 @@ async fn queue_with_seeded_settlement(
     // `unallocated_balance` pool. Without `account_balance` the projector's
     // guarded no-negative pre-check on the aggregate drives it to -amount and the
     // allocation is (correctly) blocked.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_account_balance \
             (tenant_id, account_id, currency, account_class, normal_side, balance_minor) \
          VALUES ('{}','{}','USD','UNALLOCATED','CR',1000)",
@@ -466,7 +466,7 @@ async fn queue_with_seeded_settlement(
     )))
     .await
     .expect("seed unallocated account_balance");
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_unallocated_balance \
             (tenant_id, payer_tenant_id, account_id, currency, balance_minor) \
          VALUES ('{}','{}','{}','USD',1000)",

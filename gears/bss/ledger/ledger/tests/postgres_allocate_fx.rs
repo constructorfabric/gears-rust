@@ -66,7 +66,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -146,14 +146,14 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
             .unwrap();
     }
     // S5-F3: the functional-currency source (USD) — what ACTIVATES the FX locks.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_calendar
            (tenant_id, legal_entity_id, fiscal_tz, granularity, fy_start_month, functional_currency)
          VALUES ('{tenant}','{tenant}','UTC','MONTH',1,'USD')"
     )))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{tenant}','{period_id}','UTC','OPEN')"
     )))

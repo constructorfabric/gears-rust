@@ -7,8 +7,8 @@ developer laptops and unit/integration tests (PRD §3.1, DESIGN §3.11).
 It implements the **cache** primitive natively over an in-memory store
 (`HashMap` + monotonic per-key versions, lazy TTL, a background sweeper emitting
 `Expired`, and exact/prefix watches) and derives **leader election**,
-**distributed lock**, and **service discovery** from the SDK's cache-based
-default backends — the "implement cache only, get all four" guarantee. The cache
+and **distributed lock** from the SDK's cache-based
+default backends — the "implement cache only, get all three" guarantee. The cache
 declares `Linearizable` consistency, which the default leader/lock backends
 require.
 
@@ -27,7 +27,6 @@ let handle = StandaloneClusterPlugin::builder().build_and_start()?;
 let cache     = handle.cache();
 let leader    = handle.leader_election();
 let lock      = handle.lock();
-let discovery = handle.service_discovery();
 
 // On graceful shutdown:
 handle.stop().await;
@@ -41,7 +40,7 @@ resources are bounded by their TTL.
 
 ## Status
 
-Cache is native. Leader election, lock, and service discovery currently ride the
+Cache is native. Leader election and lock currently ride the
 SDK default backends over the native cache. Native implementations of those three
 (the DESIGN §3.11 end state) are a follow-up optimization.
 

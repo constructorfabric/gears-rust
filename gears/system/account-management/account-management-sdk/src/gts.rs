@@ -50,6 +50,25 @@ pub const CONVERSION_REQUEST_RESOURCE_TYPE: &str = gts_id!("cf.core.am.conversio
 /// feature (`feature-idp-user-operations-contract`).
 pub const USER_RESOURCE_TYPE: &str = gts_id!("cf.core.am.user.v1~");
 
+/// AM **service account** resource — the tenant-scoped machine
+/// identity RBAC/PEP authorizes provision / list / rotate / revoke
+/// against, and the `resource_type` on service-account canonical
+/// errors (`feature-service-accounts`).
+///
+/// Deliberately NOT folded into [`USER_RESOURCE_TYPE`]: a service
+/// account is an `IdP` client plus service-account subject with its
+/// own lifecycle (secret rotation) and no AM user record. Sharing the
+/// user type would let "manage users" silently grant machine-credential
+/// minting.
+///
+/// Also distinct from the service-account *subject* type
+/// (`cf.core.security.subject_service.v1~`): that is what the account
+/// IS when it authenticates; this is what RBAC protects when it is
+/// managed. The two live in separate namespaces (`cf.core.am` vs
+/// `cf.core.security`) and are compared for equality wherever either is
+/// classified, so neither can stand in for the other.
+pub const SERVICE_ACCOUNT_RESOURCE_TYPE: &str = gts_id!("cf.core.am.service_account.v1~");
+
 // ---------------------------------------------------------------------------
 // IdpUser-groups feature -- two flavours of identifiers
 // ---------------------------------------------------------------------------
@@ -283,6 +302,28 @@ pub struct TenantV1 {
     pub name: String,
 }
 
+/// GTS type-schema mirror for the AM **service account** PEP resource
+/// (`gts.cf.core.am.service_account.v1~`, enforced by
+/// `ServiceAccountService`'s `pep::SERVICE_ACCOUNT`). See
+/// [`TenantV1`] for the RBAC-authorizability rationale.
+///
+/// The body is `id`-only: authorization needs the type *id* known to the
+/// registry (RBAC validates a role's `target_type` against it) and
+/// nothing from the schema body — the tenant-scope binding comes from
+/// the impl crate's `ResourceType` (`OWNER_TENANT_ID`). AM stores no
+/// account rows, so there is no projection to mirror here either.
+#[gts_type_schema(
+    dir_path = "schemas",
+    type_id = gts_id!("cf.core.am.service_account.v1~"),
+    description = "Account Management service account — tenant-scoped machine identity, RBAC/PEP target type",
+    properties = "id",
+    base = true
+)]
+pub struct ServiceAccountV1 {
+    /// Required by the `gts-macros` base-struct contract; inert for authorization.
+    pub id: gts::GtsInstanceId,
+}
+
 /// GTS type-schema mirror for the AM **conversion request** PEP resource
 /// (`gts.cf.core.am.conversion_request.v1~`, enforced by `ConversionService`'s
 /// `pep::CONVERSION`). See [`TenantV1`] for the RBAC-authorizability rationale.
@@ -440,6 +481,10 @@ mod resource_type_tests {
             blob.contains(super::CONVERSION_REQUEST_RESOURCE_TYPE),
             "conversion_request.v1~ type schema not registered in inventory"
         );
+        assert!(
+            blob.contains(super::SERVICE_ACCOUNT_RESOURCE_TYPE),
+            "service_account.v1~ type schema not registered in inventory"
+        );
     }
 
     /// The generated `TYPE_ID` const is the source-of-truth tie between the
@@ -451,6 +496,10 @@ mod resource_type_tests {
         assert_eq!(
             super::ConversionRequestV1::TYPE_ID,
             super::CONVERSION_REQUEST_RESOURCE_TYPE
+        );
+        assert_eq!(
+            super::ServiceAccountV1::TYPE_ID,
+            super::SERVICE_ACCOUNT_RESOURCE_TYPE
         );
     }
 }

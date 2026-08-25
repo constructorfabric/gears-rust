@@ -1,0 +1,25 @@
+family     = "proration"
+id         = "by-second"
+kind       = "evaluation"
+provenance = ["AC#61", "PRD 1.4", "K1"]
+
+# The finest grain the enum offers. Same period arithmetic as the calendar
+# bases, one unit down - which is exactly why the corpus reports a unit *ratio*
+# rather than a day count: the unit follows the basis.
+
+[snapshot]
+model_kind      = "flat"
+charge_kind     = "recurring"
+currency        = "USD"
+amount_minor    = 9900
+proration_basis = "by_second"
+
+[[assert]]
+given  = { period_start = "2026-01-01T00:00:00Z", period_end = "2026-01-02T00:00:00Z" }
+expect = { units_charged = 86400, units_in_basis = 86400 }
+why    = "one full day is 86400 seconds of 86400"
+
+[[assert]]
+given  = { period_start = "2026-01-01T00:00:00Z", period_end = "2026-01-02T00:00:00Z", from = "2026-01-01T12:00:00Z" }
+expect = { units_charged = 43200, units_in_basis = 86400 }
+why    = "half a day to the second - a calendar basis would have rounded this to 0 days charged, which is the difference the basis exists to express"

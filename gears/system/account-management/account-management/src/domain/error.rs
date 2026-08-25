@@ -36,6 +36,22 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// can eyeball-check exhaustiveness against
 /// [`From<DomainError> for CanonicalError`] in
 /// [`crate::infra::canonical_mapping`].
+/// Which administrative surface an [`DomainError::UnsupportedOperation`]
+/// was raised against.
+///
+/// The three halves of `IdpPluginClient` (tenant, user, machine identity)
+/// each surface "the provider does not implement this" through the same
+/// domain variant. This discriminator is what survives that collapse, so
+/// the boundary can stamp the correct `resource_type` on the 501 envelope
+/// instead of naming one surface for all three.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedResource {
+    Tenant,
+    User,
+    ServiceAccount,
+}
+
 // @cpt-begin:cpt-cf-account-management-dod-errors-observability-error-taxonomy-and-envelope:p1:inst-dod-error-taxonomy-enum
 #[domain_model]
 #[derive(Debug, Error)]
@@ -97,6 +113,80 @@ pub enum DomainError {
         field: Option<String>,
     },
 
+    /// The `IdP` rejected the supplied password against its configured
+    /// password policy. Distinct from [`Self::Validation`]
+    /// so the canonical envelope carries the structured
+    /// `password` / `PASSWORD_POLICY` field-violation tokens instead
+    /// of the generic `request` / `VALIDATION` pair — clients can
+    /// attribute the failure to the password input. The raw policy
+    /// text is redacted upstream (digest in `am.idp` logs); `detail`
+    /// is the curated public summary. Surfaces as HTTP 400
+    /// `invalid_argument`.
+    #[error("password rejected by IdP policy: {detail}")]
+    IdpPasswordPolicy { detail: String },
+
+    /// The `IdP` refused to write one or more patched attributes because
+    /// they are provider-managed and not overridable through AM
+    /// (federated from a read-only mapper, or marked non-writable in the
+    /// provider's user-profile configuration). Distinct from
+    /// [`Self::UnsupportedOperation`] (the provider implements no
+    /// `update_user` at all, HTTP 501) and from [`Self::Validation`]
+    /// (the *value* was rejected, not the field).
+    ///
+    /// Carries the typed attributes only — the boundary mapping derives
+    /// both each `field_violations[].field` token and the curated public
+    /// detail from them, so the wording lives in exactly one place and no
+    /// caller can pair an inconsistent detail/field. Surfaces as HTTP
+    /// 400 `invalid_argument` with `reason = "IDP_MANAGED_FIELD"`, one
+    /// violation per refused attribute, so a client learns the whole
+    /// refused set from a single round-trip.
+    ///
+    /// `fields` is non-empty by contract; the canonical mapping degrades
+    /// an empty set to the generic `request` / `VALIDATION` pair rather
+    /// than emitting a 400 that attributes the refusal to nothing.
+    ///
+    /// Deliberately NOT 403: writability is a property of the provider's
+    /// schema, identical for every caller, so no grant would make the
+    /// write succeed. Modelling it as a permission denial would make a
+    /// configuration fact look like a privilege problem.
+    #[error("IdP-managed fields not writable ({})", fields.iter().map(|f| f.as_field_token()).collect::<Vec<_>>().join(", "))]
+    IdpFieldNotWritable {
+        fields: Vec<account_management_sdk::IdpUserAttribute>,
+    },
+
+    /// The `IdP` rejected a service-account request with no
+    /// provider-side state retained: a name that violates the adapter's
+    /// structural rules, a name already live in the tenant, a scope
+    /// outside the allowlist, or a provider quota. Permanent — the same
+    /// input will not start working.
+    ///
+    /// Distinct from [`Self::IdpInvalidInput`] (which rides the tenant
+    /// resource type and carries the plugin's dotted-path `field`) on
+    /// both counts: the envelope must name the service-account
+    /// resource type, and it carries **no** field, because the adapter's
+    /// own field attribution is untrusted text like the rest of its
+    /// payload. Every provider-sourced rejection is therefore attributed
+    /// to the request as a whole. `detail` is always one of the fixed
+    /// messages in [`crate::domain::idp`] — never adapter text.
+    /// Surfaces as HTTP 400 `invalid_argument`.
+    #[error("invalid service-account request: {detail}")]
+    ServiceAccountInvalidInput { detail: String },
+
+    /// Transport uncertainty on a service-account call: the provider
+    /// may have retained state, so the outcome is neither a success nor
+    /// a clean failure.
+    ///
+    /// Mapped to HTTP 409, NOT 503. A `503` advertises "retry the same
+    /// request", which for a half-applied provision would come back as
+    /// [`Self::ServiceAccountInvalidInput`] ("name already live"). The
+    /// 409 tells the caller to reconcile instead — list the tenant and
+    /// match the submitted name — which is the only adapter-independent
+    /// recovery, since client-id formats are conventions rather than
+    /// contract. `detail` is the fixed reconciliation message from
+    /// [`crate::domain::idp`].
+    #[error("service-account outcome ambiguous: {detail}")]
+    ServiceAccountAmbiguous { detail: String },
+
     // ---- NotFound (HTTP 404) ----
     // For every variant in this group, `resource` is the stable id
     // surfaced through the AIP-193 `NotFound` envelope's `with_resource`,
@@ -109,6 +199,16 @@ pub enum DomainError {
     /// `IdP` user lookup miss within a tenant scope.
     #[error("user not found: {detail}")]
     UserNotFound { detail: String, resource: String },
+
+    /// Service-account lookup miss within a tenant scope — the
+    /// `(tenant_id, client_id)` address does not resolve, whether
+    /// because the account never existed or because it belongs to a
+    /// different tenant (the two are indistinguishable to the caller by
+    /// design). `revoke` folds this into success for idempotency;
+    /// `rotate_secret` surfaces it, since rotating an absent account
+    /// produced no credential the caller could use.
+    #[error("service account not found: {detail}")]
+    ServiceAccountNotFound { detail: String, resource: String },
 
     /// Conversion-request lookup miss.
     #[error("conversion request not found: {detail}")]
@@ -167,18 +267,6 @@ pub enum DomainError {
     UserAlreadyExists {
         field: account_management_sdk::IdpUserDuplicateField,
     },
-
-    /// The `IdP` rejected the supplied password against its configured
-    /// password policy. Distinct from [`Self::Validation`]
-    /// so the canonical envelope carries the structured
-    /// `password` / `PASSWORD_POLICY` field-violation tokens instead
-    /// of the generic `request` / `VALIDATION` pair — clients can
-    /// attribute the failure to the password input. The raw policy
-    /// text is redacted upstream (digest in `am.idp` logs); `detail`
-    /// is the curated public summary. Surfaces as HTTP 400
-    /// `invalid_argument`.
-    #[error("password rejected by IdP policy: {detail}")]
-    IdpPasswordPolicy { detail: String },
 
     // ---- Aborted (HTTP 409) ----
     /// Retry-budget-exhausted serialization failure surfaced by
@@ -277,8 +365,18 @@ pub enum DomainError {
     /// Former `IdpUnsupportedOperation` — the `IdP` plugin signalled the
     /// requested administrative operation is not supported in its
     /// current implementation profile.
+    ///
+    /// `resource` records which administrative surface the caller
+    /// addressed. All three halves of `IdpPluginClient` collapse into this
+    /// one variant, so without it the boundary cannot tell a tenant call
+    /// from a machine-identity call and has to guess the envelope's
+    /// `resource_type` — which is the one field clients use to tell a
+    /// service account apart from a user or a tenant.
     #[error("operation not supported: {detail}")]
-    UnsupportedOperation { detail: String },
+    UnsupportedOperation {
+        detail: String,
+        resource: UnsupportedResource,
+    },
 
     // ---- ResourceExhausted (HTTP 429) ----
     /// Hierarchy-integrity check refused because another check is

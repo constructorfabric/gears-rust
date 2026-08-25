@@ -211,6 +211,37 @@ impl From<anyhow::Error> for ChatEngineError {
     }
 }
 
+// @cpt-cf-chat-engine-constraint-fail-closed-authz
+//
+// PEP enforcement mapping: every `EnforcerError` fails closed to a client-safe
+// status. A denied decision, unresolvable constraints (`CompileFailed`), and an
+// unreachable/invalid PDP (`EvaluationFailed`) all map to 403 Forbidden — never
+// 503/500 — so PDP availability cannot leak to the caller and the absence of a
+// positive decision is treated as denial (DESIGN §3.5.5). The underlying infra
+// cause for the non-`Denied` arms is logged internally, never surfaced.
+impl From<authz_resolver_sdk::pep::EnforcerError> for ChatEngineError {
+    fn from(err: authz_resolver_sdk::pep::EnforcerError) -> Self {
+        use authz_resolver_sdk::pep::EnforcerError;
+        match err {
+            EnforcerError::Denied { .. } => Self::Forbidden {
+                reason: "authorization denied".to_string(),
+            },
+            EnforcerError::CompileFailed(cause) => {
+                tracing::error!(%cause, "authz constraint compilation failed; failing closed");
+                Self::Forbidden {
+                    reason: "authorization unavailable".to_string(),
+                }
+            }
+            EnforcerError::EvaluationFailed(cause) => {
+                tracing::error!(%cause, "authz evaluation failed; failing closed");
+                Self::Forbidden {
+                    reason: "authorization unavailable".to_string(),
+                }
+            }
+        }
+    }
+}
+
 /// Crate-wide result alias bound to [`ChatEngineError`].
 pub type Result<T> = std::result::Result<T, ChatEngineError>;
 

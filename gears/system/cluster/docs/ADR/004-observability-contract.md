@@ -170,7 +170,7 @@ Per-key detail goes to spans (via `cluster.cache.key` attribute) and log events,
 This decision directly addresses the following requirements and design elements:
 
 - `cpt-cf-clst-nfr-observability` — Spans / metrics / log events as a versioned naming contract; cardinality discipline.
-- DESIGN §3.3 telemetry expectations across all four primitive contracts.
+- DESIGN §3.3 telemetry expectations across all three primitive contracts.
 
 **Sibling ADRs:**
 

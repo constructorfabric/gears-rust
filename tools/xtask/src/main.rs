@@ -10,6 +10,7 @@ fn main() -> ExitCode {
 
     match cmd {
         "split-debug" => split_debug(&args[1..]),
+        "proto-regen" => proto_regen(&args[1..]),
         "help" | "--help" | "-h" => {
             print_help();
             ExitCode::SUCCESS
@@ -28,10 +29,19 @@ fn print_help() {
 Usage: cargo xtask <COMMAND>
 
 Commands:
-  split-debug <NAME>  Split debug symbols out of a release binary
-                      using platform-native tools.
-                      NAME is the binary name (e.g. cf-gears-server).
-                      Resolved as target/release/<NAME>.
+  split-debug <NAME>    Split debug symbols out of a release binary
+                        using platform-native tools.
+                        NAME is the binary name (e.g. cf-gears-server).
+                        Resolved as target/release/<NAME>.
+
+  proto-regen [--check] Regenerate `.proto` files and `proto.lock.toml`
+                        for every workspace SDK crate that has an
+                        `examples/gen_grpc_proto.rs`. Runs
+                        `cargo run --example gen_grpc_proto -p <pkg>`
+                        for each.
+                        With `--check`, fails if any tracked `.proto`
+                        or `proto.lock.toml` would change (CI guard).
+
   help                  Show this message."
     );
 }
@@ -272,4 +282,152 @@ fn show_file_type(path: &Path) {
         return;
     };
     run_tool("file", &[s]);
+}
+
+// ---------------------------------------------------------------------------
+// proto-regen
+// ---------------------------------------------------------------------------
+
+/// Regenerate `.proto` files for every workspace SDK that ships an
+/// `examples/gen_grpc_proto.rs` codegen entry point. With `--check`,
+/// fails if any tracked file would change (CI guard).
+fn proto_regen(args: &[String]) -> ExitCode {
+    let check = args.iter().any(|a| a == "--check");
+
+    let sdks = discover_protogen_sdks();
+    if sdks.is_empty() {
+        eprintln!("proto-regen: no workspace SDK crates with `examples/gen_grpc_proto.rs` found");
+        return ExitCode::SUCCESS;
+    }
+
+    eprintln!("proto-regen: regenerating {} crate(s)", sdks.len());
+    let mut failed: Vec<String> = Vec::new();
+    for (pkg, dir) in &sdks {
+        eprintln!("  · {pkg}  (in {})", dir.display());
+        // The example references gRPC binding/codegen symbols that are
+        // gated behind the `grpc-client` feature on every SDK we've seen.
+        // Pass it unconditionally; SDKs without that feature would have
+        // failed at example compile-time anyway.
+        let ok = run(
+            &[
+                "cargo",
+                "run",
+                "--quiet",
+                "--features",
+                "grpc-client",
+                "--example",
+                "gen_grpc_proto",
+                "-p",
+                pkg,
+            ],
+            Path::new("."),
+        );
+        if !ok {
+            failed.push(pkg.clone());
+        }
+    }
+
+    if !failed.is_empty() {
+        eprintln!("proto-regen: codegen failed for: {}", failed.join(", "));
+        return ExitCode::FAILURE;
+    }
+
+    if check {
+        // Detect any tracked-file drift after regeneration. We look at
+        // `.proto` and `proto.lock.toml` paths specifically so unrelated
+        // working-tree changes don't trip this guard.
+        let dirty = git_dirty_paths();
+        if !dirty.is_empty() {
+            eprintln!(
+                "proto-regen --check: {} file(s) would change after regeneration:",
+                dirty.len()
+            );
+            for p in &dirty {
+                eprintln!("  ~ {p}");
+            }
+            eprintln!("\nRun `cargo xtask proto-regen` locally and commit the result.");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("proto-regen --check: committed files are up to date");
+    } else {
+        eprintln!(
+            "proto-regen: {} crate(s) regenerated successfully",
+            sdks.len()
+        );
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// Walk `cargo metadata` for workspace members and return those whose
+/// crate root contains `examples/gen_grpc_proto.rs`.
+///
+/// Returns `(package_name, manifest_dir)` pairs.
+fn discover_protogen_sdks() -> Vec<(String, PathBuf)> {
+    let output = Command::new(env!("CARGO"))
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .output();
+    let Ok(output) = output else {
+        eprintln!("proto-regen: failed to run `cargo metadata`");
+        return Vec::new();
+    };
+    let Ok(json) = String::from_utf8(output.stdout) else {
+        eprintln!("proto-regen: `cargo metadata` output is not UTF-8");
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else {
+        eprintln!("proto-regen: failed to parse `cargo metadata` JSON");
+        return Vec::new();
+    };
+
+    let mut sdks = Vec::new();
+    if let Some(packages) = value["packages"].as_array() {
+        for pkg in packages {
+            let Some(name) = pkg["name"].as_str() else {
+                continue;
+            };
+            let Some(manifest_path) = pkg["manifest_path"].as_str() else {
+                continue;
+            };
+            let Some(dir) = PathBuf::from(manifest_path).parent().map(PathBuf::from) else {
+                continue;
+            };
+            let example = dir.join("examples").join("gen_grpc_proto.rs");
+            if example.exists() {
+                sdks.push((name.to_owned(), dir));
+            }
+        }
+    }
+    sdks.sort_by(|a, b| a.0.cmp(&b.0));
+    sdks
+}
+
+/// Paths (relative to the workspace root) under tracked `.proto` /
+/// `proto.lock.toml` whose contents differ from the index. Used by
+/// `--check` to detect drift after a regen pass.
+fn git_dirty_paths() -> Vec<String> {
+    // `git status --porcelain -- '*.proto' '**/proto.lock.toml'` would be
+    // nicer but pathspec semantics differ across git versions; iterate
+    // over `git status --porcelain` once and filter ourselves.
+    let output = Command::new("git").args(["status", "--porcelain"]).output();
+    let Ok(output) = output else {
+        eprintln!("proto-regen --check: `git status` failed; assuming dirty");
+        return vec!["<git unavailable>".to_owned()];
+    };
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return vec!["<git output not UTF-8>".to_owned()];
+    };
+
+    let mut dirty = Vec::new();
+    for line in text.lines() {
+        // Porcelain format: "XY <path>" where XY is the two-char status.
+        // Path starts at column 3.
+        let Some(path) = line.get(3..) else {
+            continue;
+        };
+        if path.ends_with(".proto") || path.ends_with("proto.lock.toml") {
+            dirty.push(path.to_owned());
+        }
+    }
+    dirty
 }

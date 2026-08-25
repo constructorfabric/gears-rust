@@ -57,12 +57,10 @@ impl ODataFieldMapping<ChatCursorField> for ChatODataMapper {
     fn extract_cursor_value(model: &Model, field: ChatCursorField) -> sea_orm::Value {
         match field {
             ChatCursorField::UpdatedAt => {
-                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.updated_at)))
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(model.updated_at))
             }
-            ChatCursorField::Id => sea_orm::Value::Uuid(Some(Box::new(model.id))),
-            ChatCursorField::Title => {
-                sea_orm::Value::String(model.title.as_ref().map(|s| Box::new(s.clone())))
-            }
+            ChatCursorField::Id => sea_orm::Value::Uuid(Some(model.id)),
+            ChatCursorField::Title => sea_orm::Value::String(model.title.clone()),
         }
     }
 }
@@ -115,16 +113,16 @@ impl ODataFieldMapping<MessageField> for MessageODataMapper {
     fn extract_cursor_value(model: &MsgModel, field: MessageField) -> sea_orm::Value {
         match field {
             MessageField::CreatedAt => {
-                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.created_at)))
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(model.created_at))
             }
-            MessageField::Id => sea_orm::Value::Uuid(Some(Box::new(model.id))),
+            MessageField::Id => sea_orm::Value::Uuid(Some(model.id)),
             MessageField::Role => {
                 let s = match model.role {
                     crate::infra::db::entity::message::MessageRole::User => "user",
                     crate::infra::db::entity::message::MessageRole::Assistant => "assistant",
                     crate::infra::db::entity::message::MessageRole::System => "system",
                 };
-                sea_orm::Value::String(Some(Box::new(s.to_owned())))
+                sea_orm::Value::String(Some(s.to_owned()))
             }
         }
     }

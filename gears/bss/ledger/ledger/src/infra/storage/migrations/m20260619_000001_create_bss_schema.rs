@@ -15,14 +15,14 @@ impl MigrationTrait for Migration {
         let conn = manager.get_connection();
         match backend {
             sea_orm::DatabaseBackend::Postgres => {
-                conn.execute(Statement::from_string(
+                conn.execute_raw(Statement::from_string(
                     backend,
                     "CREATE SCHEMA IF NOT EXISTS bss".to_owned(),
                 ))
                 .await?;
             }
             sea_orm::DatabaseBackend::Sqlite => { /* single namespace; no-op */ }
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Migration(
                     "MySQL not supported for bss-ledger".to_owned(),
                 ));
@@ -35,7 +35,7 @@ impl MigrationTrait for Migration {
         let backend = manager.get_database_backend();
         let conn = manager.get_connection();
         if backend == sea_orm::DatabaseBackend::Postgres {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 backend,
                 "DROP SCHEMA IF EXISTS bss CASCADE".to_owned(),
             ))

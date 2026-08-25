@@ -103,7 +103,7 @@ impl RestApiCapability for CorsTestGear {
         let router = OperationBuilder::get("/tests/v1/cors/v1/cors-test")
             .operation_id("cors:test")
             .summary("CORS test endpoint")
-            .public()
+            .anonymous()
             .json_response(http::StatusCode::OK, "Success")
             .handler(get(test_handler))
             .register(router, openapi);
@@ -112,7 +112,7 @@ impl RestApiCapability for CorsTestGear {
             .operation_id("cors:post")
             .summary("CORS POST endpoint")
             .json_request::<TestData>(openapi, "Test data")
-            .public()
+            .anonymous()
             .json_response(http::StatusCode::OK, "Success")
             .handler(axum::routing::post(post_handler))
             .register(router, openapi);

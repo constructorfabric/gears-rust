@@ -1,0 +1,262 @@
+//! Bounded exponential-backoff retry helper used by generated clients.
+
+use std::future::Future;
+use std::time::Duration;
+
+use rand::RngExt;
+
+use crate::runtime::config::RetryConfig;
+use crate::runtime::transport_error::TransportError;
+
+/// Run `f` with bounded exponential backoff while it returns transient errors.
+///
+/// Non-transient errors short-circuit immediately. The total number of
+/// invocations is capped by [`RetryConfig::max_attempts`].
+///
+/// # Errors
+/// Returns the last [`TransportError`] produced by `f` once retries are
+/// exhausted, or the first non-transient error short-circuited from `f`.
+pub async fn retry_with_backoff<F, Fut, T>(
+    config: &RetryConfig,
+    mut f: F,
+) -> Result<T, TransportError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, TransportError>>,
+{
+    let mut attempt: u32 = 0;
+    let max = config.max_attempts.max(1);
+    loop {
+        let result = f().await;
+        attempt += 1;
+
+        match result {
+            Ok(v) => return Ok(v),
+            Err(err) if attempt >= max => return Err(err),
+            Err(err) if !err.is_transient() => return Err(err),
+            Err(err) => {
+                let delay = next_delay(config, attempt, &err);
+                // Retry is unusual control flow that hides latency and repeated
+                // upstream failures from the caller; without this, operators
+                // have no visibility into attempt counts or backoff. Emitted
+                // under whatever span is current (the generated client's
+                // per-method span), so it's attributed to the right call.
+                tracing::warn!(
+                    attempt,
+                    max_attempts = max,
+                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    error = %err,
+                    "retrying transient error with backoff"
+                );
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+}
+
+/// Delay before the next retry: a server-advised `Retry-After` when the error
+/// carries one, otherwise computed exponential backoff. The number of retries
+/// is bounded by `max_attempts` regardless of this value.
+///
+/// A server-advised `Retry-After` is **clamped to `max_delay`** so a hostile or
+/// misconfigured peer cannot stall the client for an unbounded time (e.g.
+/// `Retry-After: 86400`). `max_delay` is the client's own ceiling on how long a
+/// single backoff may last, and it applies to both the computed and the
+/// server-advised paths.
+fn next_delay(config: &RetryConfig, attempt: u32, err: &TransportError) -> Duration {
+    match err.retry_after() {
+        Some(advised) => advised.min(config.max_delay),
+        None => compute_delay(config, attempt),
+    }
+}
+
+fn compute_delay(config: &RetryConfig, attempt: u32) -> Duration {
+    let base_secs = config.base_delay.as_secs_f64();
+    let exp_i32 = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
+    let exp = config.multiplier.powi(exp_i32);
+    let target = base_secs * exp;
+    let max_secs = config.max_delay.as_secs_f64();
+    let capped = target.min(max_secs);
+    if capped <= 0.0 {
+        return Duration::ZERO;
+    }
+    // Floor jitter at `base_delay` so retries never collapse to ~0 while a
+    // non-zero base is configured (degenerate config where base > capped is
+    // clamped down to capped).
+    let floor = base_secs.min(capped);
+    if !floor.is_finite() || !capped.is_finite() {
+        return if config.base_delay.as_secs_f64().is_finite() {
+            config.base_delay
+        } else {
+            Duration::ZERO
+        };
+    }
+    let jitter: f64 = rand::rng().random_range(floor..=capped);
+    Duration::from_secs_f64(jitter)
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn fast_config(max_attempts: u32) -> RetryConfig {
+        RetryConfig {
+            max_attempts,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+            multiplier: 1.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_first_success() {
+        let cfg = fast_config(3);
+        let result = retry_with_backoff(&cfg, || async { Ok::<_, TransportError>(42_u32) }).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn retries_transient_then_succeeds() {
+        let cfg = fast_config(4);
+        let counter = Arc::new(AtomicU32::new(0));
+        let result = retry_with_backoff(&cfg, || {
+            let counter = Arc::clone(&counter);
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(TransportError::network("transient"))
+                } else {
+                    Ok::<_, TransportError>("ok")
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_max_attempts() {
+        let cfg = fast_config(2);
+        let counter = Arc::new(AtomicU32::new(0));
+        let result: Result<&str, _> = retry_with_backoff(&cfg, || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(TransportError::network("nope"))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn compute_delay_handles_non_finite_inputs() {
+        // `Duration::from_secs_f64(NaN)` panics on construction, so we
+        // exercise the NaN-guard path indirectly by feeding a NaN
+        // `multiplier`. With the guard in place, `compute_delay` must
+        // not panic regardless of the (non-finite) arithmetic.
+        // NOTE: `f64::min` treats NaN as "ignore me, return the other operand"
+        // (IEEE 754 minNum semantics) — so `NaN.min(max_secs)` yields the
+        // FINITE `max_secs`, not NaN, and the guard's own dedicated
+        // non-finite fallback branch is not even reached for this multiplier.
+        // The guarantee this test verifies is therefore "the result stays
+        // finite and within [0, max_delay]" — not a specific fallback value —
+        // which is exactly the bounded, sane result the `#20` fix requires
+        // instead of merely "did not panic".
+        let cfg = RetryConfig {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(2),
+            multiplier: f64::NAN,
+        };
+        let delay = compute_delay(&cfg, 2);
+        assert!(
+            delay.as_secs_f64().is_finite(),
+            "delay must be finite, got {delay:?}"
+        );
+        assert!(
+            delay <= cfg.max_delay,
+            "delay must be bounded by max_delay, got {delay:?}"
+        );
+
+        let cfg_inf = RetryConfig {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(50),
+            max_delay: Duration::from_secs(1),
+            multiplier: f64::INFINITY,
+        };
+        let delay_inf = compute_delay(&cfg_inf, 2);
+        assert!(
+            delay_inf.as_secs_f64().is_finite(),
+            "delay must be finite, got {delay_inf:?}"
+        );
+        assert!(
+            delay_inf <= cfg_inf.max_delay,
+            "delay must be bounded by max_delay, got {delay_inf:?}"
+        );
+    }
+
+    #[test]
+    fn next_delay_prefers_retry_after() {
+        let cfg = RetryConfig {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_secs(30),
+            multiplier: 2.0,
+        };
+        // Server-advised Retry-After wins over computed backoff.
+        let err = TransportError::HttpStatus {
+            status: 429,
+            body: String::new(),
+            retry_after: Some(Duration::from_secs(2)),
+        };
+        assert_eq!(next_delay(&cfg, 1, &err), Duration::from_secs(2));
+
+        // Without Retry-After, falls back to computed backoff (bounded range).
+        let err = TransportError::network("boom");
+        let d = next_delay(&cfg, 1, &err);
+        assert!(d <= cfg.max_delay);
+    }
+
+    #[test]
+    fn next_delay_caps_retry_after_at_max_delay() {
+        // A hostile/misconfigured peer advising a huge Retry-After must not
+        // stall the client beyond its own `max_delay` ceiling (M-2).
+        let cfg = RetryConfig {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_secs(2),
+            multiplier: 2.0,
+        };
+        let err = TransportError::HttpStatus {
+            status: 503,
+            body: String::new(),
+            retry_after: Some(Duration::from_hours(24)),
+        };
+        assert_eq!(next_delay(&cfg, 1, &err), Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_non_transient() {
+        let cfg = fast_config(5);
+        let counter = Arc::new(AtomicU32::new(0));
+        let result: Result<(), _> = retry_with_backoff(&cfg, || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(TransportError::serialization("permanent"))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+}

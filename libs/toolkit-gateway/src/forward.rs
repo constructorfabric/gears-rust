@@ -1,0 +1,470 @@
+//! Reverse-proxy request forwarder over a shared [`ProxyRegistry`].
+//!
+//! [`Forwarder::forward`] matches the inbound request path against the registry,
+//! forwards the request to the owning gear's endpoint via a
+//! [`toolkit_http::HttpClient`], and returns the upstream response. The
+//! `Authorization: Bearer <jwt>` header is propagated as-is for per-hop
+//! re-validation (ADR-0008); hop-by-hop headers are dropped, and platform-plane
+//! (`x-toolkit-internal-token`) and client-supplied `x-forwarded-*` headers are
+//! stripped so an external caller cannot spoof the system plane or the
+//! forwarding chain.
+
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::response::{IntoResponse, Response};
+use http::{HeaderMap, HeaderName, Method, StatusCode};
+use toolkit_canonical_errors::{ForeignPassthrough, Problem};
+use toolkit_http::{HttpClient, HttpError, HttpResponse, RequestBuilder};
+use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
+
+use crate::registry::{ProxyRegistry, RouteMatch};
+
+/// Maximum request body buffered in memory before forwarding (100 MiB).
+///
+/// This is an **interim memory-safety bound**, not an upstream size policy: the
+/// forwarder currently buffers the whole request body because `toolkit-http`
+/// has no streaming request-body API. It is deliberately generous so ordinary
+/// uploads are not rejected with a gateway-side `413` (the owning gear should
+/// enforce its own limit). Streaming the body — removing this bound entirely —
+/// is tracked in constructorfabric/gears-rust#4488.
+const MAX_PROXY_BODY_BYTES: usize = 100 * 1024 * 1024;
+
+/// Reverse-proxy forwarder backed by a shared [`ProxyRegistry`].
+///
+/// Cheap to clone: it holds an `Arc` to the registry and a cloneable
+/// [`HttpClient`].
+#[derive(Clone)]
+pub struct Forwarder {
+    registry: Arc<ProxyRegistry>,
+    client: HttpClient,
+}
+
+impl Forwarder {
+    /// Builds a forwarder over `registry`, using `client` for upstream calls.
+    #[must_use]
+    pub fn new(registry: Arc<ProxyRegistry>, client: HttpClient) -> Self {
+        Self { registry, client }
+    }
+
+    /// Forwards `req` to the registered upstream for its path.
+    ///
+    /// Returns the upstream response verbatim (minus hop-by-hop headers), or an
+    /// RFC 9457 `problem+json` response: `404` if no route matches, `413` if the
+    /// body exceeds the proxy limit, `400` if the request body cannot be read
+    /// (e.g. a client abort mid-stream), `501` for an unsupported method, and
+    /// `502`/`503`/`504` for upstream failures.
+    pub async fn forward(&self, req: Request) -> Response {
+        let path = req.uri().path().to_owned();
+        let Some(target) = self.registry.match_path(&path) else {
+            return problem(
+                StatusCode::NOT_FOUND,
+                format!("no upstream route registered for '{path}'"),
+            );
+        };
+
+        let method = req.method().clone();
+        let url = build_target_url(&target, req.uri());
+        let headers = req.headers().clone();
+
+        let body = match axum::body::to_bytes(req.into_body(), MAX_PROXY_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(err) => return body_read_problem(&err),
+        };
+
+        let Some(builder) = self.start_request(&method, &url) else {
+            return problem(
+                StatusCode::NOT_IMPLEMENTED,
+                format!("method '{method}' is not supported by the gateway proxy"),
+            );
+        };
+        let builder = apply_request_headers(builder, &headers).body_bytes(body);
+
+        match builder.send().await {
+            Ok(resp) => upstream_to_response(resp),
+            Err(err) => {
+                tracing::warn!(error = %err, upstream = %url, "proxy upstream request failed");
+                problem(upstream_status(&err), "upstream request failed".to_owned())
+            }
+        }
+    }
+
+    /// Starts a request builder for `method`, or `None` if the method is not
+    /// supported by the underlying client (e.g. `TRACE`/`CONNECT`).
+    fn start_request(&self, method: &Method, url: &str) -> Option<RequestBuilder> {
+        let builder = match method.as_str() {
+            "GET" => self.client.get(url),
+            "POST" => self.client.post(url),
+            "PUT" => self.client.put(url),
+            "PATCH" => self.client.patch(url),
+            "DELETE" => self.client.delete(url),
+            "HEAD" => self.client.head(url),
+            "OPTIONS" => self.client.options(url),
+            _ => return None,
+        };
+        Some(builder)
+    }
+}
+
+/// Axum fallback handler that forwards any unmatched request via a [`Forwarder`]
+/// supplied as router state.
+pub async fn proxy_fallback(State(forwarder): State<Forwarder>, req: Request) -> Response {
+    forwarder.forward(req).await
+}
+
+/// Build the upstream URL: `scheme://authority` + inbound path (+ query).
+fn build_target_url(target: &RouteMatch, uri: &http::Uri) -> String {
+    let mut url = format!(
+        "{}://{}{}",
+        target.endpoint.scheme(),
+        target.endpoint.authority(),
+        uri.path()
+    );
+    if let Some(query) = uri.query() {
+        url.push('?');
+        url.push_str(query);
+    }
+    url
+}
+
+/// Copy inbound headers onto the outbound request, dropping hop-by-hop headers.
+/// `Authorization` is preserved for per-hop re-validation.
+fn apply_request_headers(mut builder: RequestBuilder, headers: &HeaderMap) -> RequestBuilder {
+    for (name, value) in headers {
+        if strip_from_request(name) {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            builder = builder.header(name.as_str(), value);
+        }
+    }
+    builder
+}
+
+/// Convert an upstream [`HttpResponse`] into an axum [`Response`], copying status
+/// and headers (minus hop-by-hop / decompression headers).
+///
+/// The upstream body is streamed through [`HttpResponse::into_limited_body`]
+/// rather than fully buffered, bounding memory use while still enforcing the
+/// client's configured size limit. Because status and headers are emitted before
+/// the body is read, a mid-stream upstream read error terminates the response
+/// body rather than producing a `502` problem response.
+fn upstream_to_response(resp: HttpResponse) -> Response {
+    let status = resp.status();
+    let headers = resp.headers().clone();
+
+    let mut response = Response::new(Body::new(resp.into_limited_body()));
+    *response.status_mut() = status;
+    let out = response.headers_mut();
+    for (name, value) in &headers {
+        if strip_from_response(name) {
+            continue;
+        }
+        out.append(name.clone(), value.clone());
+    }
+    // This is the owning gear's real response, relayed verbatim - it was
+    // never constructed via `CanonicalError` and was never meant to be.
+    // `canonical_error_middleware` (layered on every gear, including
+    // whichever gear mounts this fallback) must not rewrite or even read
+    // this body: doing so would destroy the owning gear's own error
+    // identity and force full buffering of what is still a streamed body.
+    response.extensions_mut().insert(ForeignPassthrough);
+    response
+}
+
+/// Map an upstream transport error to the client-facing gateway status.
+fn upstream_status(err: &HttpError) -> StatusCode {
+    match err {
+        HttpError::Timeout(_) | HttpError::DeadlineExceeded(_) => StatusCode::GATEWAY_TIMEOUT,
+        HttpError::Overloaded | HttpError::ServiceClosed => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
+
+/// Headers dropped from an inbound (external) request before forwarding:
+///
+/// - Hop-by-hop headers (RFC 9110 §7.6.1) plus `host`/`content-length`, which
+///   the proxy client sets itself.
+/// - The platform-plane [`INTERNAL_TOKEN_HEADER`]: this is a system-plane
+///   credential the edge must never accept from an external client, otherwise a
+///   caller could forge it and reach the `internal_auth_middleware` on the
+///   proxied gear (ADR-0008). It is stripped unconditionally.
+/// - `x-forwarded-*` proxy metadata: dropped so a client cannot spoof the
+///   forwarding chain seen by upstream gears.
+fn strip_from_request(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "host"
+            | "content-length"
+            | "x-forwarded-for"
+            | "x-forwarded-proto"
+            | "x-forwarded-host"
+    ) || name.as_str().eq_ignore_ascii_case(INTERNAL_TOKEN_HEADER)
+}
+
+/// Response headers to drop: hop-by-hop plus `content-encoding` (the client has
+/// already transparently decompressed the body).
+fn strip_from_response(name: &HeaderName) -> bool {
+    strip_from_request(name) || name.as_str() == "content-encoding"
+}
+
+/// Map a request-body buffering failure to a problem response.
+///
+/// Returns `413 Payload Too Large` only when the body exceeded
+/// [`MAX_PROXY_BODY_BYTES`] (an [`http_body_util::LengthLimitError`]); any other
+/// failure is a client stream read error (e.g. an aborted upload or reset
+/// connection) and maps to `400 Bad Request`.
+fn body_read_problem(err: &axum::Error) -> Response {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(cause) = source {
+        if cause.is::<http_body_util::LengthLimitError>() {
+            return problem(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeded the proxy limit".to_owned(),
+            );
+        }
+        source = cause.source();
+    }
+
+    tracing::warn!(error = %err, "reading proxied request body failed");
+    problem(
+        StatusCode::BAD_REQUEST,
+        "failed to read request body".to_owned(),
+    )
+}
+
+/// Build an RFC 9457 `problem+json` response with the given status and detail.
+fn problem(status: StatusCode, detail: String) -> Response {
+    Problem {
+        problem_type: "about:blank".to_owned(),
+        title: status.canonical_reason().unwrap_or("Error").to_owned(),
+        status: Some(status.as_u16()),
+        detail,
+        instance: None,
+        trace_id: None,
+        context: serde_json::Value::Object(serde_json::Map::new()),
+        // Gateway-level transport failures carry no contract error identity:
+        // they originate here, not in a gear's typed error enum.
+        error_code: None,
+        error_domain: None,
+    }
+    .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::extract::{Request, State};
+    use http::{HeaderMap, Method, StatusCode};
+    use toolkit_http::HttpClient;
+
+    use super::{
+        Forwarder, apply_request_headers, body_read_problem, proxy_fallback, strip_from_request,
+    };
+    use crate::registry::{ProxyRegistry, RouteTemplate};
+    use crate::types::{Endpoint, GearName};
+
+    /// A registry with a single GET/POST route for `/p/v1/x` pointing at
+    /// `endpoint`, plus a forwarder over it.
+    fn forwarder_with_route(endpoint: &str) -> (Arc<ProxyRegistry>, Forwarder) {
+        let registry = Arc::new(ProxyRegistry::new());
+        registry.register(
+            GearName::from("p"),
+            "p-1",
+            Endpoint::parse(endpoint).expect("endpoint"),
+            vec![
+                RouteTemplate::new(Method::GET, "/p/v1/x", false),
+                RouteTemplate::new(Method::POST, "/p/v1/x", false),
+            ],
+        );
+        let client = HttpClient::new().expect("client builds");
+        let forwarder = Forwarder::new(Arc::clone(&registry), client);
+        (registry, forwarder)
+    }
+
+    #[tokio::test]
+    async fn start_request_supports_standard_methods_and_rejects_others() {
+        let client = HttpClient::new().expect("client builds");
+        let forwarder = Forwarder::new(Arc::new(ProxyRegistry::new()), client);
+        for method in [
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::HEAD,
+            Method::OPTIONS,
+        ] {
+            assert!(
+                forwarder
+                    .start_request(&method, "http://gear:8080/x")
+                    .is_some(),
+                "{method} should be forwardable"
+            );
+        }
+        // TRACE/CONNECT are not proxied.
+        assert!(
+            forwarder
+                .start_request(&Method::TRACE, "http://gear:8080/x")
+                .is_none()
+        );
+        assert!(
+            forwarder
+                .start_request(&Method::CONNECT, "http://gear:8080/x")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_request_headers_drops_hop_by_hop() {
+        let client = HttpClient::new().expect("client builds");
+        let builder = client.get("http://127.0.0.1:9/x");
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", "keep-alive".parse().expect("value"));
+        headers.insert("host", "gear:8080".parse().expect("value"));
+        headers.insert("authorization", "Bearer abc".parse().expect("value"));
+        // Exercises both the strip (continue) and the copy paths, then consumes
+        // the returned builder (the send fails against the dead loopback port).
+        let result = apply_request_headers(builder, &headers)
+            .body_bytes(bytes::Bytes::new())
+            .send()
+            .await;
+        assert!(result.is_err(), "send to a dead port must fail");
+    }
+
+    #[test]
+    fn strips_platform_plane_and_forwarding_headers() {
+        // The platform-plane internal token must never be accepted from an
+        // external client and forwarded upstream (spoofing the system plane).
+        assert!(strip_from_request(
+            &"x-toolkit-internal-token".parse().expect("name")
+        ));
+        assert!(strip_from_request(
+            &"X-ToolKit-Internal-Token".parse().expect("name")
+        ));
+        // Client-supplied forwarding metadata is dropped so it cannot be spoofed.
+        assert!(strip_from_request(
+            &"x-forwarded-for".parse().expect("name")
+        ));
+        assert!(strip_from_request(
+            &"x-forwarded-proto".parse().expect("name")
+        ));
+        assert!(strip_from_request(
+            &"x-forwarded-host".parse().expect("name")
+        ));
+        // A regular application header is preserved.
+        assert!(!strip_from_request(&"authorization".parse().expect("name")));
+        assert!(!strip_from_request(&"content-type".parse().expect("name")));
+    }
+
+    #[tokio::test]
+    async fn unsupported_method_on_matched_route_returns_501() {
+        let (_registry, forwarder) = forwarder_with_route("http://127.0.0.1:9");
+        let req = Request::builder()
+            .method(Method::TRACE)
+            .uri("/p/v1/x")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = forwarder.forward(req).await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn body_read_failure_on_matched_route_returns_400() {
+        let (_registry, forwarder) = forwarder_with_route("http://127.0.0.1:9");
+        let stream = futures_util::stream::once(async {
+            Err::<bytes::Bytes, std::io::Error>(std::io::Error::other("client aborted"))
+        });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/p/v1/x")
+            .body(Body::from_stream(stream))
+            .expect("request builds");
+        let response = forwarder.forward(req).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unreachable_upstream_returns_bad_gateway() {
+        // Port 9 (discard) on loopback refuses the connection quickly; the
+        // transport error must map to 502 Bad Gateway.
+        let (_registry, forwarder) = forwarder_with_route("http://127.0.0.1:9");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/p/v1/x")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = forwarder.forward(req).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn proxy_fallback_forwards_to_registry() {
+        let registry = Arc::new(ProxyRegistry::new());
+        let client = HttpClient::new().expect("client builds");
+        let forwarder = Forwarder::new(registry, client);
+        let req = Request::builder()
+            .uri("/unmatched")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = proxy_fallback(State(forwarder), req).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oversize_body_maps_to_413() {
+        // A body larger than the limit yields a `LengthLimitError`, which must
+        // map to 413 Payload Too Large.
+        let err = axum::body::to_bytes(Body::from(vec![0u8; 128]), 16)
+            .await
+            .expect_err("body exceeds limit");
+        assert_eq!(
+            body_read_problem(&err).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn client_read_error_maps_to_400() {
+        // A stream that errors mid-read (client abort / reset) is not a size-limit
+        // failure and must map to 400 Bad Request, not 413.
+        let stream = futures_util::stream::once(async {
+            Err::<bytes::Bytes, std::io::Error>(std::io::Error::other("client aborted"))
+        });
+        let err = axum::body::to_bytes(Body::from_stream(stream), 1024)
+            .await
+            .expect_err("stream read fails");
+        assert_eq!(body_read_problem(&err).status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unmatched_path_returns_404_problem() {
+        let registry = Arc::new(ProxyRegistry::new());
+        let client = HttpClient::new().expect("client builds");
+        let forwarder = Forwarder::new(registry, client);
+
+        let req = Request::builder()
+            .uri("/nope/v1/thing")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = forwarder.forward(req).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let content_type = response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(content_type, Some("application/problem+json"));
+    }
+}

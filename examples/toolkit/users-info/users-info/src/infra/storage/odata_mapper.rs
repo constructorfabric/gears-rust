@@ -43,10 +43,10 @@ impl ODataFieldMapping<UserFilterField> for UserODataMapper {
 
     fn extract_cursor_value(model: &Model, field: UserFilterField) -> sea_orm::Value {
         match field {
-            UserFilterField::Id => sea_orm::Value::Uuid(Some(Box::new(model.id))),
-            UserFilterField::Email => sea_orm::Value::String(Some(Box::new(model.email.clone()))),
+            UserFilterField::Id => sea_orm::Value::Uuid(Some(model.id)),
+            UserFilterField::Email => sea_orm::Value::String(Some(model.email.clone())),
             UserFilterField::CreatedAt => {
-                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.created_at)))
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(model.created_at))
             }
         }
     }
@@ -89,13 +89,11 @@ impl ODataFieldMapping<CityFilterField> for CityODataMapper {
 
     fn extract_cursor_value(model: &CityModel, field: CityFilterField) -> sea_orm::Value {
         match field {
-            CityFilterField::Id => sea_orm::Value::Uuid(Some(Box::new(model.id))),
-            CityFilterField::Name => sea_orm::Value::String(Some(Box::new(model.name.clone()))),
-            CityFilterField::Country => {
-                sea_orm::Value::String(Some(Box::new(model.country.clone())))
-            }
+            CityFilterField::Id => sea_orm::Value::Uuid(Some(model.id)),
+            CityFilterField::Name => sea_orm::Value::String(Some(model.name.clone())),
+            CityFilterField::Country => sea_orm::Value::String(Some(model.country.clone())),
             CityFilterField::CreatedAt => {
-                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.created_at)))
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(model.created_at))
             }
         }
     }
@@ -124,17 +122,15 @@ impl ODataFieldMapping<AddressFilterField> for AddressODataMapper {
 
     fn extract_cursor_value(model: &AddressModel, field: AddressFilterField) -> sea_orm::Value {
         match field {
-            AddressFilterField::Id => sea_orm::Value::Uuid(Some(Box::new(model.id))),
-            AddressFilterField::UserId => sea_orm::Value::Uuid(Some(Box::new(model.user_id))),
-            AddressFilterField::CityId => sea_orm::Value::Uuid(Some(Box::new(model.city_id))),
-            AddressFilterField::Street => {
-                sea_orm::Value::String(Some(Box::new(model.street.clone())))
-            }
+            AddressFilterField::Id => sea_orm::Value::Uuid(Some(model.id)),
+            AddressFilterField::UserId => sea_orm::Value::Uuid(Some(model.user_id)),
+            AddressFilterField::CityId => sea_orm::Value::Uuid(Some(model.city_id)),
+            AddressFilterField::Street => sea_orm::Value::String(Some(model.street.clone())),
             AddressFilterField::PostalCode => {
-                sea_orm::Value::String(Some(Box::new(model.postal_code.clone())))
+                sea_orm::Value::String(Some(model.postal_code.clone()))
             }
             AddressFilterField::CreatedAt => {
-                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.created_at)))
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(model.created_at))
             }
         }
     }

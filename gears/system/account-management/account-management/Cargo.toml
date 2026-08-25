@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-account-management"
-version = "0.4.2"
+version = "0.7.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -41,6 +41,10 @@ inventory = { workspace = true }
 
 axum = { workspace = true, features = ["macros"] }
 http = { workspace = true }
+# `Location` on a 201 embeds the adapter-chosen `client_id`, which the
+# contract declares opaque — it is percent-encoded as a path segment so a
+# reserved or non-ASCII byte cannot reshape the URL or void the header.
+percent-encoding = { workspace = true }
 utoipa = { workspace = true, features = ["time"] }
 resource-group-sdk = { workspace = true }
 resource-group = { workspace = true }
@@ -56,6 +60,11 @@ time = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Service-account credentials cross this crate as `SecretString`
+# (redacted `Debug`, zeroize-on-drop, no Serde). REST exposes it only in
+# the one-time credential DTO; SDK callers receive the wrapper unchanged
+# for immediate transfer to their own credential custodian.
+secrecy = { workspace = true }
 
 arc-swap = { workspace = true }
 async-trait = { workspace = true }

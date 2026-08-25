@@ -1,3 +1,8 @@
+//! Secret lifecycle domain.
+//!
+//! Defines metadata models, persistence and type-resolution ports, hierarchical
+//! lookup, crash-safe writes, expiry, and the value-fingerprint fence.
+
 pub mod fence;
 pub mod model;
 pub mod repo;

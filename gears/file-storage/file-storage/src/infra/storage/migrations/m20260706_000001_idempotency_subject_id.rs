@@ -56,7 +56,7 @@ impl MigrationTrait for Migration {
         let sql = match manager.get_database_backend() {
             sea_orm::DatabaseBackend::Postgres => POSTGRES_UP,
             sea_orm::DatabaseBackend::Sqlite => SQLITE_UP,
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(
                     "file-storage migrations support Postgres and SQLite only".to_owned(),
                 ));
@@ -73,7 +73,7 @@ impl MigrationTrait for Migration {
                 conn.execute_unprepared(DOWN).await?;
                 Ok(())
             }
-            sea_orm::DatabaseBackend::MySql => Err(DbErr::Custom(
+            _ => Err(DbErr::Custom(
                 "file-storage migrations support Postgres and SQLite only".to_owned(),
             )),
         }

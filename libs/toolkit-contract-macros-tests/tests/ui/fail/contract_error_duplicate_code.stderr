@@ -1,0 +1,5 @@
+error: duplicate contract error `(billing.v1, DUP)`; each `(error_domain, error_code)` pair must be unique
+  --> tests/ui/fail/contract_error_duplicate_code.rs:13:5
+   |
+13 |     #[error_code("DUP")]
+   |     ^

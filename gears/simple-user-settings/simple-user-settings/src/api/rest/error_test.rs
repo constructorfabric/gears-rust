@@ -18,7 +18,7 @@ mod tests {
     fn test_not_found_error_to_problem() {
         let problem = wire(DomainError::NotFound);
 
-        assert_eq!(problem.status, 404);
+        assert_eq!(problem.status, Some(404));
         assert!(problem.instance.is_none());
         assert!(problem.detail.contains("Settings not found"));
         assert_eq!(
@@ -38,7 +38,7 @@ mod tests {
         });
 
         // InvalidArgument is 400 in canonical (decision C).
-        assert_eq!(problem.status, 400);
+        assert_eq!(problem.status, Some(400));
         assert!(problem.instance.is_none());
 
         // Caller-supplied field + message live in context.field_violations[0].
@@ -67,7 +67,7 @@ mod tests {
             "connection failed".to_owned(),
         )));
 
-        assert_eq!(problem.status, 500);
+        assert_eq!(problem.status, Some(500));
         assert!(problem.instance.is_none());
     }
 
@@ -79,7 +79,7 @@ mod tests {
         let raw = "user 42 lacks scope settings:write";
         let problem = wire(DomainError::Forbidden(raw.to_owned()));
 
-        assert_eq!(problem.status, 404);
+        assert_eq!(problem.status, Some(404));
         assert!(!problem.detail.contains("scope settings:write"));
         assert!(!problem.detail.contains("user 42"));
         assert_eq!(
@@ -98,7 +98,7 @@ mod tests {
         // the wire.
         let problem = wire(DomainError::Internal("db pool exhausted".to_owned()));
 
-        assert_eq!(problem.status, 500);
+        assert_eq!(problem.status, Some(500));
         assert!(!problem.detail.contains("db pool exhausted"));
     }
 }

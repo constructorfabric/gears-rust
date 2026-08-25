@@ -472,8 +472,8 @@ Parse and extract structured content from user files for downstream indexing, se
 #### More details
 - [PRD](../gears/file-parser/docs/PRD.md)
 - [Design](../gears/file-parser/docs/DESIGN.md)
-- [API](../gears/file-parser/README.md)
-- TODO: SDK link
+- [API](../gears/file-parser/file-parser/README.md)
+- [SDK](../gears/file-parser/file-parser-sdk/README.md)
 
 ### Analytics
 #### Responsibility

@@ -1,0 +1,20 @@
+family     = "tier-boundary"
+role       = "publish"
+gates      = ["graduated", "volume"]
+provenance = ["AC#60", "PRD §17.2", "D-17"]
+
+# The aggregation window this family's rows carry is authored but **not
+# asserted about**, and that is a property of where the corpus cuts rather than
+# an oversight. Every assertion supplies `q` directly, because deriving `Q` from
+# events — which is what a window governs — is Rating's, not the catalog's
+# (`03-price-structure.md` §1.5: "tier resets / Q derivation semantics
+# (Tariffs; catalog persists the window enum only)"). So no case here can
+# falsify the window's value: a subject that reset the counter on calendar
+# months rather than invoice periods would pass this family unchanged.
+#
+# The consequence to know: `invoice_period` on these rows is a **decision** made
+# when the out-of-vocabulary `billing_period` was corrected, not a translation,
+# and the corpus cannot check it. If the window's effect ever needs pinning, it
+# needs a case shape that accumulates rather than one that is handed `q` — which
+# would be asserting about Rating's half of the seam, and belongs in a joint
+# case written with that gear.

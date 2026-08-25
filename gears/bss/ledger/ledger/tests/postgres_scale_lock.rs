@@ -2,7 +2,7 @@
 //! exists for a (tenant, currency), a changed scale is rejected
 //! (`CurrencyScaleLocked`); the same scale is idempotent; a currency with
 //! no postings is freely (re)scalable. Ignored by default; run with
-//! `cargo test -p bss-ledger -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -62,7 +62,7 @@ async fn scale_locked_once_postings_exist() {
     // Seed entry + lines in one transaction so the deferred balance trigger
     // sees both lines at COMMIT (an autocommitted empty header would fail).
     let seed = raw.begin().await.unwrap();
-    seed.execute(pg(format!(
+    seed.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_entry
             (entry_id, tenant_id, legal_entity_id, period_id, entry_currency,
              source_doc_type, source_business_id, posted_at_utc, effective_at,
@@ -75,7 +75,7 @@ async fn scale_locked_once_postings_exist() {
     .unwrap();
     for (side, class) in [("DR", "AR"), ("CR", "CASH_CLEARING")] {
         let line = Uuid::now_v7();
-        seed.execute(pg(format!(
+        seed.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_journal_line
                 (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id,
                  account_class, side, amount_minor, currency, currency_scale, mapping_status)
@@ -131,7 +131,7 @@ async fn scale_locked_once_postings_exist() {
     // rejected by the `trg_currency_scale_immutable` trigger once a posting
     // exists — USD has a posted line, so re-denominating its scale must fail.
     let raw_update = raw
-        .execute(pg(format!(
+        .execute_raw(pg(format!(
             "UPDATE bss.ledger_currency_scale_registry SET minor_units = 3 \
              WHERE tenant_id = '{tenant}' AND currency = 'USD'"
         )))
@@ -142,7 +142,7 @@ async fn scale_locked_once_postings_exist() {
     );
 
     // The trigger fires only on a genuine change: a same-value UPDATE passes.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_currency_scale_registry SET minor_units = 2 \
          WHERE tenant_id = '{tenant}' AND currency = 'USD'"
     )))
@@ -150,7 +150,7 @@ async fn scale_locked_once_postings_exist() {
     .expect("same-value UPDATE must pass the trigger");
 
     // And a currency with no postings can be re-denominated by direct SQL.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_currency_scale_registry SET minor_units = 3 \
          WHERE tenant_id = '{tenant}' AND currency = 'EUR'"
     )))

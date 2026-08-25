@@ -1,0 +1,44 @@
+family     = "supersession-continuity"
+id         = "per-unit-non-usage-price-change-accepted"
+kind       = "publish"
+provenance = ["inst-tb-supersession-units", "inst-mk-chargekind", "inst-mk-required", "inst-mk-forbidden", "D-18", "D-127"]
+
+# The third `per_unit` row, and the one that says what draws the boundary.
+#
+# The accepted and rejected usage cases together show that a `per_unit` usage row
+# is inside the guard. This row is the *same kind* and is outside it, because
+# `inst-tb-supersession-units` binds a **usage row** - the guard's subject is the
+# row's charge component, never its `modelKind`. Without this case the two usage
+# cases read equally well as "the guard binds `per_unit`", and the next kind
+# added would inherit the wrong rule.
+#
+# The shape is what makes it non-usage and it is authored, not implied: no
+# `meter`, so nothing meters it; `quantitySource` instead, which
+# `inst-mk-required` makes mandatory here and `inst-mk-forbidden` forbids on the
+# usage side - the two rows above and this one cannot both be right about where
+# `Q` comes from, and that is the point. No `billingGranularity` and no
+# `tierAggregationWindow` either: `inst-mk-forbidden` makes both usage-row-only,
+# so this row has **no unit field to preserve** even though its kind is one the
+# guard otherwise binds.
+#
+# The quantity here is Subscriptions' seat count, which is exactly why no counter
+# continues: it is read live at rating time from the subscription, not
+# accumulated against a window by the meter stream.
+
+[predecessor]
+model_kind      = "per_unit"
+charge_kind     = "recurring"
+currency        = "USD"
+quantity_source = "subscription_seat_count"
+amount_minor    = 1500
+
+[successor]
+model_kind      = "per_unit"
+charge_kind     = "recurring"
+currency        = "USD"
+quantity_source = "subscription_seat_count"
+amount_minor    = 1900
+
+[[assert]]
+expect = { publish = "accepted" }
+why    = "a per-seat recurring row has no metered quantity stream, so there is no continued `Q` and no denomination that could be reinterpreted under it. Rejecting this would mean the guard had been read as binding a `modelKind` rather than a usage row - and every seat-price increase in the catalog would then need a plan revision, which is the same over-reach the flat case guards against, reached through the kind axis instead of the amount"

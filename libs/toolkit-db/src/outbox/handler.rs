@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use sea_orm::ConnectionTrait;
+use sea_orm::DatabaseExecutor;
 
 use super::batch::Batch;
 
@@ -122,7 +122,7 @@ impl<H: LeasedMessageHandler> LeasedHandler for H {
 /// token is passed.
 #[async_trait::async_trait]
 pub trait TransactionalHandler: Send + Sync {
-    async fn handle(&self, txn: &dyn ConnectionTrait, msgs: &[OutboxMessage]) -> HandlerResult;
+    async fn handle(&self, txn: &DatabaseExecutor<'_>, msgs: &[OutboxMessage]) -> HandlerResult;
 
     /// Number of messages successfully processed before the batch completed.
     /// Returns `None` for batch handlers (default), `Some(n)` for `PerMessageAdapter`.
@@ -140,7 +140,7 @@ pub trait TransactionalHandler: Send + Sync {
 /// Same delivery guarantees and cancellation semantics as [`TransactionalHandler`].
 #[async_trait::async_trait]
 pub trait TransactionalMessageHandler: Send + Sync {
-    async fn handle(&self, txn: &dyn ConnectionTrait, msg: &OutboxMessage) -> HandlerResult;
+    async fn handle(&self, txn: &DatabaseExecutor<'_>, msg: &OutboxMessage) -> HandlerResult;
 }
 
 /// Adapter: single-message transactional handler → batch transactional handler.
@@ -166,7 +166,7 @@ impl<H> PerMessageAdapter<H> {
 
 #[async_trait::async_trait]
 impl<H: TransactionalMessageHandler> TransactionalHandler for PerMessageAdapter<H> {
-    async fn handle(&self, txn: &dyn ConnectionTrait, msgs: &[OutboxMessage]) -> HandlerResult {
+    async fn handle(&self, txn: &DatabaseExecutor<'_>, msgs: &[OutboxMessage]) -> HandlerResult {
         self.processed.store(0, Ordering::Release);
         for msg in msgs {
             let result = self.handler.handle(txn, msg).await;

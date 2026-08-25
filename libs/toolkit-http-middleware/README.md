@@ -15,7 +15,7 @@ maintaining their own.
     `X-ToolKit-Internal-Token` via an injected `InternalAuthenticator` and inserts
     a `PlatformSecurityContext` plus `PeerAuthenticated`
 - Header extractors for `Authorization: Bearer` and `X-ToolKit-Internal-Token`
-- `PublicRoute` marker so routes that carry no JWT pass through without `401`
+- `AnonymousRoute` marker so routes that carry no JWT pass through without `401`
 - Renders rejections as canonical RFC 9457 `application/problem+json`
 
 ## What it does NOT do

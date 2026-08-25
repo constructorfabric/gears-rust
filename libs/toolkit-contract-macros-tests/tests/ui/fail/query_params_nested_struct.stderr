@@ -1,0 +1,58 @@
+error[E0277]: `Page` cannot be a query-parameter field
+  --> tests/ui/fail/query_params_nested_struct.rs:17:15
+   |
+17 |     pub page: Page,
+   |               ^^^^ not a query scalar
+   |
+help: the trait `QueryScalar` is not implemented for `Page`
+  --> tests/ui/fail/query_params_nested_struct.rs:11:1
+   |
+11 | pub struct Page {
+   | ^^^^^^^^^^^^^^^
+   = note: a query string is a flat list of key/value pairs, so a query struct's fields must be scalars, `Option<scalar>`, or `Vec<scalar>` — nested structs cannot be represented
+   = note: for a unit-only enum or a newtype that serializes as a string, add `impl toolkit_contract::query::QueryScalar for Page {}`
+   = note: for a genuinely nested shape, mark the method `#[server_manual]` and handle the query string by hand
+   = help: the following other types implement trait `QueryScalar`:
+             bool
+             f32
+             f64
+             i128
+             i16
+             i32
+             i64
+             i8
+           and $N others
+note: required by a bound in `assert_query_scalar`
+  --> tests/ui/fail/query_params_nested_struct.rs:15:34
+   |
+15 | #[derive(Serialize, Deserialize, QueryParams)]
+   |                                  ^^^^^^^^^^^ required by this bound in `assert_query_scalar`
+16 | pub struct Filter {
+17 |     pub page: Page,
+   |               ---- required by a bound in this function
+   = note: this error originates in the derive macro `QueryParams` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Page` cannot be a query-parameter field
+  --> tests/ui/fail/query_params_nested_struct.rs:17:15
+   |
+17 |     pub page: Page,
+   |               ^^^^ not a query scalar
+   |
+help: the trait `QueryScalar` is not implemented for `Page`
+  --> tests/ui/fail/query_params_nested_struct.rs:11:1
+   |
+11 | pub struct Page {
+   | ^^^^^^^^^^^^^^^
+   = note: a query string is a flat list of key/value pairs, so a query struct's fields must be scalars, `Option<scalar>`, or `Vec<scalar>` — nested structs cannot be represented
+   = note: for a unit-only enum or a newtype that serializes as a string, add `impl toolkit_contract::query::QueryScalar for Page {}`
+   = note: for a genuinely nested shape, mark the method `#[server_manual]` and handle the query string by hand
+   = help: the following other types implement trait `QueryScalar`:
+             bool
+             f32
+             f64
+             i128
+             i16
+             i32
+             i64
+             i8
+           and $N others

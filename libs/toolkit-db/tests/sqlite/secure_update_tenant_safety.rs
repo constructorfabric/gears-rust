@@ -258,6 +258,7 @@ async fn tenant_scoped_update_rejects_attempt_to_change_tenant_id() {
 
 #[tokio::test]
 async fn update_many_rejects_setting_tenant_id() {
+    use sea_orm::ExprTrait;
     use sea_orm::sea_query::Expr;
 
     let test_db = TestDb::new().await;

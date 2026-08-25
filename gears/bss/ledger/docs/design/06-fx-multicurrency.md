@@ -106,7 +106,7 @@ Inherits Slice 1 C1–C4 + A1–A6 (A4 money type applies per currency), Slices 
 | F1 | FX provider primary + fallback | Tenant-configured provider list; **ECB / central bank primary** (reference), **PSP / bank feed fallback** (settlement evidence); fallback order deterministic + recorded on the snapshot. **Ratified 2026-06-10 (needs-discussion F1).** | PRD |
 | F2 | Unrealized revaluation | **Default-on for Mode B** (BSS = ledger of record) with multi-currency monetary positions; **off for Mode A** (ERP revalues) — a dedicated **idempotent, next-period-reversed** revaluation of **all foreign-currency monetary grains** `{AR, UNALLOCATED, REUSABLE_CREDIT}` (`CONTRACT_LIABILITY` excluded — non-monetary), per ASC 830/IAS 21, never a silent recompute of S1. | PRD |
 | F3 | Stale-rate thresholds | **G10 currencies: > 24 h = stale**; other currencies tenant policy with an **upper bound 7 days**; a tenant threshold above 7 days MUST be **rejected at config time** (no silent clamp, Slice 1 config-validation pattern). Stale rates carry `stale=true`. | PRD |
-| F4 | Provider-unreachable at S1 | Post **blocks** until a rate is available, **except** where tenant policy explicitly allows fallback to the last-good rate marked `stale=true`; silent fallback without the marker is forbidden. | PRD |
+| F4 | Rate unavailable at S1 | **(🔄 corrected 2026-07-30 — this row keyed the block on provider-unreachability, which the post-path-local rewrite removed; see `inst-rs-sync`/`inst-rs-local`.)** A provider being unreachable does **not** block a post — the posting path never calls a provider, so unreachability fails the **background sync job** and alarms there. A post **blocks** (`FX_RATE_UNAVAILABLE`, 409) only when the **local store holds no acceptable rate for the pair**, **except** where tenant policy explicitly allows the last-good rate snapshotted `stale=true`; silent fallback without the marker is forbidden. The guarantee the PRD wanted is unchanged — no silent post on a missing or stale rate — only the trigger moved. ⏳ **Open: `PRD.md` `fr-fx-rate-source-failure` still keys the MUST on "the rate provider is unreachable" and needs the same correction — PM + Architecture.** | Corrected against `inst-rs-local`; derives from Slice 1 C3 (no external blocking dependency on the post path) |
 | F5 | Functional-currency scope | One functional currency **per legal entity** (Slice 1: default one legal entity per tenant). One functional rate per entry for the base translation. | PRD |
 
 ### 1.7 Naming & Design-Introduced Names
@@ -427,12 +427,53 @@ The system **MUST** lock exactly one functional rate per entry at the defined lo
 
 The system **MUST** acquire rates via the background sync job into a local rates store (no synchronous provider call on the posting path), resolve deterministically over the tenant-configured provider list with recorded `fallback_order`, enforce the F3 staleness thresholds (G10 24 h; others ≤ 7 d, over-7-d config rejected), block with `FX_RATE_UNAVAILABLE`/`FX_RATE_STALE_NOT_ALLOWED` per policy, mark allowed fallbacks `stale=true`, and handle ECB non-publication dates + EUR triangulation on the snapshot.
 
+The sync job **MUST** also be **observably alive**, independently of whether any fetch
+succeeds or fails. A stalled ticker is not a provider failure: it attempts no fetch, so it
+produces no fetch error, raises no `fx-snapshot-missing` alarm, and leaves the rate store
+quietly ageing until an unrelated post blocks on staleness — up to the F3 window (24 h for
+G10). Liveness is therefore alerted on the **absence of ticks**, never on errors:
+
+| Alert | Condition | Owner | Rationale |
+|-------|-----------|-------|-----------|
+| `FxRateSyncStalled` | `increase(ledger_fx_rate_sync_ticks_total[3 × fx.rate_sync_tick_secs]) == 0` | Platform on-call (job liveness) | "The scheduler is not ticking at all". Three missed ticks tolerate one transient stall without paging; at the 3600 s default that fires ~3 h in, well inside the 24 h G10 staleness window, so it precedes any `FX_RATE_UNAVAILABLE` post failure. |
+| `FxRateSyncNeverRan` | `ledger_fx_rate_sync_ticks_total` absent for a deployment with a configured provider | Platform on-call (job liveness) | The fresh-deploy failure mode. An `increase()` over a missing series never fires, so absence must be alerted separately. |
+| `FxRateSyncOverrunning` | `histogram_quantile(0.95, rate(ledger_fx_rate_sync_duration_seconds_bucket[24h])) > 0.5 × fx.rate_sync_tick_secs` | Platform on-call (job liveness) | A pass that grows past its own interval delays the next one, so refreshes thin out. `FxRateSyncStalled` catches this only once a pass exceeds 3 × the interval — by then refreshes are already being starved. Warn, not page: half the interval is a trend signal with room to act, and the fail-safe below still holds meanwhile. |
+
+`ledger_fx_rate_sync_ticks_total` counts **ticks, not fetches**, and is unlabelled — the tick
+is counted before any provider is resolved, so there is no provider identity to attribute it
+to. Read together with the adapter's own `fx_provider_fetch_duration_seconds` count it also
+separates two states that error-based alerting cannot tell apart: a flat heartbeat means the
+ticker is dead, while a rising heartbeat with a flat fetch count means the job is alive but
+discovery yields no sources (a `vendor` typo, an unavailable types-registry, no source plugin
+registered). Feed freshness is a **separate** concern with a separate threshold set by the
+feed's publication cadence — see the rate-provider adapter's DESIGN § "Feature metrics".
+
+`ledger_fx_rate_sync_duration_seconds` is the heartbeat's companion: the wall time of one
+pass, discovery and every source attempt included, recorded whether the pass succeeded or
+failed. It exists because the heartbeat answers "is the job running" but not "is it keeping
+up" — and the adapter's per-source `fx_provider_fetch_duration_seconds` cannot answer that
+either, since the composite tries its sources **sequentially**, so a pass costs their sum.
+The pass is what must fit inside `fx.rate_sync_tick_secs`; this is the only series that
+measures it. Also unlabelled, for the same reason as the heartbeat.
+
+**Acceptance test.** With a configured provider, stop the rate-sync ticker and assert that
+`ledger_fx_rate_sync_ticks_total` stops increasing while no fetch error is recorded and no
+`fx-snapshot-missing` alarm is raised — i.e. that the stall is invisible to error-based
+alerting and only the no-tick condition catches it. Assert separately that the adapter's
+`fx_provider_last_success_timestamp` alone would NOT have caught it, since it can read
+arbitrarily stale on a healthy feed between publications. Separately, with a source that
+takes longer than the configured interval to answer, assert that
+`ledger_fx_rate_sync_duration_seconds` records a sample above `fx.rate_sync_tick_secs` while
+the heartbeat keeps rising — the overrun state the tick counter alone cannot express.
+
 **Implements**:
 - `cpt-cf-bss-ledger-algo-fx-rate-source-fallback`
 
 **Touches**:
 - DB: local rates store, `rate_snapshot`
 - Entities: `RateSnapshot`, `RateSource`
+- Metrics: `ledger_fx_rate_sync_ticks_total` (job-liveness heartbeat),
+  `ledger_fx_rate_sync_duration_seconds` (whole-pass latency, read against the tick interval)
 
 ### Realized FX Posting
 
@@ -513,7 +554,7 @@ NFR verification:
 
 - **Performance / NFR mapping**: Inherits Slice 1 targets (e.g. write p95 ≤ 500 ms — the Foundation NFR mapping). Slice-5-specific: missing FX snapshot **blocks** the post (Critical); stale-allowed is Warn; stale-not-allowed blocks (422) (AC #18). FX adds at most one functional-only line per entry → negligible latency impact on the inherited write-p95 target. Traces to `cpt-cf-bss-ledger-nfr-posting-performance`.
 - **Security & AuthZ**: Inherits Slice 1: RLS, append-only, PII-minimized events. Triggering revaluation runs requires the finance scope; rate snapshots are read-only references. The ledger trusts the provider feed's authenticity (provider auth is upstream/ops).
-- **Observability / Feature metrics**: `ledger_fx_realized_minor{functional_currency}`, `ledger_fx_snapshot_missing_total`, `ledger_fx_snapshot_stale_allowed_total`, `ledger_fx_snapshot_stale_blocked_total`, `ledger_fx_revaluation_duration_seconds` (— aligned with the `revaluation_completed` event rename), `ledger_fx_provider_fallback_total{provider}`. Thresholds wire to the NFR mapping + the snapshot alarms.
+- **Observability / Feature metrics**: `ledger_fx_realized_minor{functional_currency}`, `ledger_fx_snapshot_missing_total`, `ledger_fx_snapshot_stale_allowed_total`, `ledger_fx_snapshot_stale_blocked_total`, `ledger_fx_revaluation_duration_seconds` (— aligned with the `revaluation_completed` event rename), `ledger_fx_provider_fallback_total{provider}`, `ledger_fx_rate_sync_ticks_total` (the sync-job liveness heartbeat — alerted on absence of ticks, never on errors), `ledger_fx_rate_sync_duration_seconds` (whole-pass latency, alerted against the configured tick interval — see the `FxRateSyncStalled` / `FxRateSyncNeverRan` / `FxRateSyncOverrunning` definitions under the rate-source DoD in §8). Thresholds wire to the NFR mapping + the snapshot alarms.
 - **Risks & deferred work**: **FX provider** — **ratified 2026-06-10: ECB primary, PSP/bank feed fallback**; the snapshot/lock/realized-FX mechanics are stable. The **Foundation's dual-column commit trigger** (functional balance, two checks) + the relaxed `amount_minor` CHECK are Foundation-owned (native, on every leaf partition); this feature posts functional-only lines that exercise them; covered by integration tests. **Deferred:** FX consistency reconciliation vs external rates + ERP FX export → Slice 7; pricing-side FX/rate-lock → Catalog; cross-currency conversion event → deferred post-MVP.
 - **Needs discussion** (inherits Slices 1–4 open items; slice-specific):
 

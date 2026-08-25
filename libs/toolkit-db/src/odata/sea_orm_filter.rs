@@ -8,7 +8,7 @@ use crate::secure::{Scoped, SecureSelect};
 use bigdecimal::ToPrimitive;
 use chrono::SecondsFormat;
 use sea_orm::{
-    Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    Condition, EntityTrait, ExprTrait, QueryFilter, QueryOrder, QuerySelect,
     sea_query::{Expr, Order},
 };
 use toolkit_odata::filter::{
@@ -125,9 +125,9 @@ pub trait FieldToColumn<F: FilterField> {
 ///
 ///     fn extract_cursor_value(model: &Model, field: UserDtoFilterField) -> sea_orm::Value {
 ///         match field {
-///             UserDtoFilterField::Id => sea_orm::Value::Uuid(Some(Box::new(model.id))),
-///             UserDtoFilterField::Email => sea_orm::Value::String(Some(Box::new(model.email.clone()))),
-///             UserDtoFilterField::CreatedAt => sea_orm::Value::ChronoDateTimeUtc(Some(Box::new(model.created_at))),
+///             UserDtoFilterField::Id => sea_orm::Value::Uuid(Some(model.id)),
+///             UserDtoFilterField::Email => sea_orm::Value::String(Some(model.email.clone())),
+///             UserDtoFilterField::CreatedAt => sea_orm::Value::ChronoDateTimeUtc(Some(model.created_at)),
 ///         }
 ///     }
 /// }
@@ -323,7 +323,7 @@ where
 /// Convert an `ODataValue` to a `sea_orm::Value`.
 fn odata_value_to_sea_value(value: &ODataValue) -> Result<sea_orm::Value, String> {
     Ok(match value {
-        ODataValue::String(s) => sea_orm::Value::String(Some(Box::new(s.clone()))),
+        ODataValue::String(s) => sea_orm::Value::String(Some(s.clone())),
         ODataValue::Number(n) => {
             // Try to convert to i64 first, then f64
             if let Some(i) = n.to_i64() {
@@ -335,10 +335,10 @@ fn odata_value_to_sea_value(value: &ODataValue) -> Result<sea_orm::Value, String
             }
         }
         ODataValue::Bool(b) => sea_orm::Value::Bool(Some(*b)),
-        ODataValue::Uuid(u) => sea_orm::Value::Uuid(Some(Box::new(*u))),
-        ODataValue::DateTime(dt) => sea_orm::Value::ChronoDateTimeUtc(Some(Box::new(*dt))),
-        ODataValue::Date(d) => sea_orm::Value::ChronoDate(Some(Box::new(*d))),
-        ODataValue::Time(t) => sea_orm::Value::ChronoTime(Some(Box::new(*t))),
+        ODataValue::Uuid(u) => sea_orm::Value::Uuid(Some(*u)),
+        ODataValue::DateTime(dt) => sea_orm::Value::ChronoDateTimeUtc(Some(*dt)),
+        ODataValue::Date(d) => sea_orm::Value::ChronoDate(Some(*d)),
+        ODataValue::Time(t) => sea_orm::Value::ChronoTime(Some(*t)),
         ODataValue::Null => {
             return Err("NULL values should be handled separately".to_owned());
         }
@@ -365,7 +365,7 @@ fn odata_value_to_sea_value_for_kind(
                 .to_string()
                 .parse::<rust_decimal::Decimal>()
                 .map_err(|_| "Invalid decimal value".to_owned())?;
-            Ok(sea_orm::Value::Decimal(Some(Box::new(d))))
+            Ok(sea_orm::Value::Decimal(Some(d)))
         }
         _ => odata_value_to_sea_value(value),
     }
@@ -408,7 +408,7 @@ pub fn encode_cursor_value(value: &sea_orm::Value, kind: FieldKind) -> Result<St
     use sea_orm::Value as V;
 
     let result: Result<String, String> = match (kind, value) {
-        (FieldKind::String, V::String(Some(s))) => Ok(s.to_string()),
+        (FieldKind::String, V::String(Some(s))) => Ok(s.clone()),
         (FieldKind::I64, V::BigInt(Some(i))) => Ok(i.to_string()),
         // Storage-shaped integer narrower than i64 (e.g. a SMALLINT
         // lifecycle ordinal a mapper exposes under `cursor_kind = I64`):
@@ -452,7 +452,7 @@ pub fn parse_cursor_value(kind: FieldKind, s: &str) -> Result<sea_orm::Value, St
     use sea_orm::Value as V;
 
     let result = match kind {
-        FieldKind::String => V::String(Some(Box::new(s.to_owned()))),
+        FieldKind::String => V::String(Some(s.to_owned())),
         FieldKind::I64 => {
             let i = s
                 .parse::<i64>()
@@ -475,37 +475,37 @@ pub fn parse_cursor_value(kind: FieldKind, s: &str) -> Result<sea_orm::Value, St
             let u = s
                 .parse::<uuid::Uuid>()
                 .map_err(|_| "invalid uuid in cursor".to_owned())?;
-            V::Uuid(Some(Box::new(u)))
+            V::Uuid(Some(u))
         }
         FieldKind::DateTimeUtc => {
             if let Ok(dt) =
                 time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
             {
-                V::TimeDateTimeWithTimeZone(Some(Box::new(dt)))
+                V::TimeDateTimeWithTimeZone(Some(dt))
             } else {
                 let dt = chrono::DateTime::parse_from_rfc3339(s)
                     .map_err(|_| "invalid datetime in cursor".to_owned())?
                     .with_timezone(&chrono::Utc);
-                V::ChronoDateTimeUtc(Some(Box::new(dt)))
+                V::ChronoDateTimeUtc(Some(dt))
             }
         }
         FieldKind::Date => {
             let d = s
                 .parse::<chrono::NaiveDate>()
                 .map_err(|_| "invalid date in cursor".to_owned())?;
-            V::ChronoDate(Some(Box::new(d)))
+            V::ChronoDate(Some(d))
         }
         FieldKind::Time => {
             let t = s
                 .parse::<chrono::NaiveTime>()
                 .map_err(|_| "invalid time in cursor".to_owned())?;
-            V::ChronoTime(Some(Box::new(t)))
+            V::ChronoTime(Some(t))
         }
         FieldKind::Decimal => {
             let d = s
                 .parse::<rust_decimal::Decimal>()
                 .map_err(|_| "invalid decimal in cursor".to_owned())?;
-            V::Decimal(Some(Box::new(d)))
+            V::Decimal(Some(d))
         }
     };
 

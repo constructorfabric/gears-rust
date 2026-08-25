@@ -33,7 +33,7 @@ major SDK version bump. Adding a new signal is non-breaking.
 
 ## 2. Cardinality rule
 
-Operation keys, lock names, election names, and service instance IDs **never**
+Operation keys, lock names, and election names **never**
 appear as metric labels — they are unbounded and would explode Prometheus
 cardinality. They may appear only as **span attributes** (traces are sampled)
 and **log-event fields** (log volume is filter-controlled).
@@ -53,17 +53,16 @@ Metric labels are restricted to the bounded, enum-like keys enumerated by
 | `result` | Bounded operation outcome | `ok`, `conflict`, `timeout`, `contended` |
 | `transition` | Leadership transition kind | `acquired`, `lost`, `resigned` |
 | `kind` | Provider-error retryability class | `connection_lost`, `timeout`, `auth_failure` |
-| `primitive` | Primitive name | `cache`, `lock`, `leader`, `discovery` |
+| `primitive` | Primitive name | `cache`, `lock`, `leader` |
 
 ### Attribute keys (high-cardinality — spans and logs only, never metric labels)
 
 | Key | Meaning |
 |---|---|
 | `key` | Cache key |
-| `name` | Coordination name (service/generic name) |
+| `name` | Coordination name |
 | `lock` | Lock name |
 | `election` | Election name |
-| `instance_id` | Service instance ID |
 | `profile` | Cluster profile |
 
 ## 4. Spans
@@ -85,10 +84,6 @@ Metric labels are restricted to the bounded, enum-like keys enumerated by
 | `cluster.lock.lock` | `DistributedLockV1::lock` | `provider`, `lock` |
 | `cluster.lock.renew` | `LockGuard::renew` | `provider`, `lock` |
 | `cluster.lock.release` | `LockGuard::release` | `provider`, `lock` |
-| `cluster.discovery.register` | `ServiceDiscoveryV1::register` | `provider`, `name`, `instance_id` |
-| `cluster.discovery.discover` | `ServiceDiscoveryV1::discover` | `provider`, `name` |
-| `cluster.discovery.watch` | `ServiceDiscoveryV1::watch` | `provider`, `name` |
-| `cluster.discovery.deregister` | `ServiceHandle::deregister` | `provider`, `name`, `instance_id` |
 
 ## 5. Metrics
 
@@ -99,15 +94,13 @@ Metric labels are restricted to the bounded, enum-like keys enumerated by
 | `cluster_lock_ops_total` | counter | — | `provider`, `op`, `result` |
 | `cluster_lock_op_duration_seconds` | histogram | seconds | `provider`, `op` |
 | `cluster_leader_transitions_total` | counter | — | `provider`, `transition` |
-| `cluster_discovery_ops_total` | counter | — | `provider`, `op`, `result` |
 | `cluster_watch_resets_total` | counter | — | `provider`, `primitive` |
 | `cluster_provider_errors_total` | counter | — | `provider`, `kind` |
 
 The `op` label is a bounded set of facade operations: cache —
 `get`/`put`/`delete`/`contains`/`put_if_absent`/`compare_and_swap`/`watch`/`watch_prefix`
 plus the backend-internal `compare_and_delete`/`scan_prefix`; lock —
-`try_lock`/`lock`/`renew`/`release`; discovery —
-`register`/`discover`/`watch`/`deregister`.
+`try_lock`/`lock`/`renew`/`release`.
 
 ### 5.1 OpenTelemetry instrument names and the `_total` suffix
 
@@ -128,15 +121,15 @@ source of truth.
 The metrics sink is the OTel-agnostic `cluster_sdk::observability::ClusterMetrics`
 port (with `NoopMetrics` as the default and the feature-gated `OtelClusterMetrics`
 as the concrete adapter). The cache primitive emits via the
-`cluster_sdk::InstrumentedCache` decorator; the SDK default lock, leader, and
-service-discovery backends emit via their `with_observability(provider, metrics)`
-builder. The **standalone** plugin wires all four (`provider = "standalone"`).
+`cluster_sdk::InstrumentedCache` decorator; the SDK default lock and leader
+backends emit via their `with_observability(provider, metrics)` builder. The
+**standalone** plugin wires all three (`provider = "standalone"`).
 
 `cluster_watch_resets_total` (and the `cluster.watch.reset` WARN log) is emitted
 by the watch auto-restart combinator (`RestartingWatch`) on each transparent
 reconnect: the backend stamps a `(provider, metrics)` context onto the watch it
 hands out, which the combinator captures and reports against the watch's
-`primitive` label (`cache` / `leader` / `discovery`). The full contract is now
+`primitive` label (`cache` / `leader`). The full contract is now
 emitted.
 
 ## 6. Log events

@@ -118,7 +118,7 @@ Collapsing to fewer contract types would force callers into unnecessary defensiv
 
 - Four contract types (Api, Embedded, Backend, Extension) with naming convention enforcement
 - Base trait definition as plain Rust traits with zero transport annotations
-- REST transport projection via `#[toolkit_rest_contract]` proc macro
+- REST transport projection via `#[toolkit::rest_contract]` proc macro
 - REST client code generation implementing both base and transport traits
 - OpenAPI 3.1 spec generation from transport projection traits
 - SSE streaming support via `#[streaming]` annotation
@@ -135,7 +135,6 @@ Collapsing to fewer contract types would force callers into unnecessary defensiv
 
 ### 4.2 Out of Scope
 
-- gRPC transport projection (`#[toolkit_grpc_contract]`) -- future work, same pattern
 - Service directory implementation -- delivered by cluster service discovery workstream
 - Transaction guard (TxGuard) compile-time mechanism -- open design question, separate ADR
 - Transaction context propagation for Embedded/Extension contracts -- separate ADR
@@ -228,7 +227,7 @@ All base contract traits MUST have `Send + Sync` supertraits to support sharing 
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-rest-macro`
 
-The `#[toolkit_rest_contract]` proc macro SHALL generate a REST client struct and OpenAPI spec function from a trait that extends a base contract trait. When a trait annotated with `#[toolkit_rest_contract]` extends a base trait (e.g., `trait FooApiRest: FooApi`), the macro SHALL generate a `FooApiRestClient` struct that implements both the base trait (with HTTP dispatch logic) and the transport trait.
+The `#[toolkit::rest_contract]` proc macro SHALL generate a REST client struct and OpenAPI spec function from a trait that extends a base contract trait. When a trait annotated with `#[toolkit::rest_contract]` extends a base trait (e.g., `trait FooApiRest: FooApi`), the macro SHALL generate a `FooApiRestClient` struct that implements both the base trait (with HTTP dispatch logic) and the transport trait.
 
 - **Rationale**: Eliminates hand-written HTTP client code, ensures generated clients conform to the contract.
 - **Actors**: `cpt-cf-binding-actor-gear-developer`
@@ -264,7 +263,18 @@ Transport projection methods MUST declare their HTTP method and path via annotat
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-param-annotations`
 
-Transport projection methods MUST support parameter annotations: `#[path]`, `#[query]`, `#[header]`. Annotations are on the actual parameters with real types, not separate strings.
+Transport projection methods MUST bind parameters by real Rust type rather than by separate strings, so a mismatch between the path template and the parameter list is a compile error.
+
+> **Implementation note (current behavior).** Binding is **by convention**, not
+> by explicit annotation: a parameter whose name matches a `{placeholder}` in
+> the path template is a path parameter, the first remaining parameter on a
+> body-carrying verb is the JSON body, and any other parameter is the query
+> parameter (`classify_params`, `libs/toolkit-contract-macros/src/rest_contract.rs`).
+> A template placeholder with no matching parameter is a `compile_error!`. The
+> explicit `#[path]` / `#[query]` / `#[header]` vocabulary this requirement
+> originally specified was **not** implemented; header injection in particular
+> falls to a manual `impl` (ADR-0002 escape hatch). A query parameter must be a
+> struct deriving `QueryParams` — see §5.4.
 
 - **Rationale**: Type-safe parameter binding prevents runtime mismatches between path templates and parameter types.
 - **Actors**: `cpt-cf-binding-actor-gear-developer`
@@ -282,18 +292,48 @@ The macro MUST read transport annotations (`#[post(...)]`, `#[get(...)]`, `#[str
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-rest-only-methods`
 
-The transport projection trait MAY add methods with default implementations that are not in the base trait (e.g., `deliver_batch` that delegates to `deliver` in a loop). These methods SHALL be available on the generated REST client. Compile-time plugins implementing only the base trait SHALL NOT be affected.
+> **Superseded by ADR-0003.** This requirement is **not** implemented and is
+> retained only to record the decision against it. A projection method with no
+> counterpart in the base trait is rejected at macro-expansion time
+> (`rest_extra_projection_method` trybuild fixture), because the projection is a
+> *projection*: allowing it to add surface makes the base trait no longer the
+> single source of truth, and a consumer holding `Arc<dyn Base>` could not call
+> the extra method anyway. REST-specific convenience endpoints are registered by
+> hand via `OperationBuilder` alongside the generated routes.
 
 - **Rationale**: Enables REST-specific convenience endpoints (batch, pagination) without polluting the domain contract.
 - **Actors**: `cpt-cf-binding-actor-gear-developer`
 
 ### 5.4 OpenAPI Generation
 
+> **Implementation note (current behavior).**
+> - The served OpenAPI document is produced by the framework `OperationBuilder`
+>   → `OpenApiRegistry` (utoipa) path: the macro-generated
+>   `register_<trait>_routes()` registers routes/schemas (including path
+>   parameters) into the shared registry. The OoP runtime serves it at
+>   **`/.well-known/openapi.json`** (`libs/toolkit/src/runtime/oop_serve.rs`, with
+>   coverage in `oop_serve_tests.rs` / `host_runtime_oop_tests.rs`), matching
+>   DESIGN/ADR-0002. The document now carries the
+>   `x-toolkit-spec-scope: minimum-conformance` vendor extension (ADR-0002),
+>   emitted at document level by `OpenApiRegistryImpl::build_openapi`.
+> - There is a single OpenAPI producer: the standalone
+>   `toolkit_contract::openapi::generator` module (a second, unwired generator
+>   that risked drift, ADR-0003 "Gap 2") has been **removed**; the utoipa /
+>   `OperationBuilder` path is the sole source (it already renders SSE via
+>   `OperationBuilder::sse_json` and carries `x-*` vendor extensions).
+> - **Registration-time OpenAPI conformance validation** (below) is **deferred
+>   together with the service-directory implementation** (which §4.2/§7.1 place
+>   out of scope). The in-tree `ir::validation` performs structural IR validation
+>   only, not remote-spec conformance. Treat the p1 "validation at registration"
+>   requirement as deferred until the directory workstream lands; it matters only
+>   for polyglot / independently-released providers (Rust gears built from the
+>   same SDK conform by construction).
+
 #### OpenAPI 3.1 Spec Generation
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-openapi-generation`
 
-The `#[toolkit_rest_contract]` macro SHALL generate a function (e.g., `foo_api_rest_openapi_spec()`) returning a `serde_json::Value` with a valid OpenAPI 3.1 spec. The spec SHALL include endpoint paths, HTTP methods, request/response schemas (via `schemars`), and error schemas.
+The `#[toolkit::rest_contract]` macro SHALL generate a function (e.g., `foo_api_rest_openapi_spec()`) returning a `serde_json::Value` with a valid OpenAPI 3.1 spec. The spec SHALL include endpoint paths, HTTP methods, request/response schemas (via `schemars`), and error schemas.
 
 - **Rationale**: OpenAPI spec is the conformance target for remote implementations and enables spec validation at registration.
 - **Actors**: `cpt-cf-binding-actor-gear-developer`, `cpt-cf-binding-actor-service-directory`
@@ -326,6 +366,31 @@ Endpoints marked as optional (description contains "MAY omit") SHALL NOT cause r
 - **Actors**: `cpt-cf-binding-actor-service-directory`
 
 ### 5.5 Error Mapping
+
+> **Implementation note (supersedes the FR wording below).** The error model was
+> consolidated onto the platform canonical-error system (`docs/arch/errors`)
+> rather than a bespoke `ProblemDetails`. Concretely:
+> - `#[derive(ContractError)]` uses per-variant `#[error_code("…")]` (explicit,
+>   not auto-derived from the variant name — this is rename-stable),
+>   `#[error_domain("…")]` (enum-level default or per-variant), and
+>   `#[canonical(<ProblemCategory>)]` (one of the 16 AIP-193 categories, which
+>   determines HTTP status, GTS `type`, and title). There is no
+>   `#[contract_error(domain=…)]` or `#[error(status=…, problem_type=…)]`.
+> - It generates `From<MyError> for Problem` (server side) and
+>   `TryFrom<Problem> for MyError` (client side) — not `to_problem_details()` /
+>   `from_problem_details()`. The wire envelope type is
+>   `toolkit_canonical_errors::Problem`, not a `ProblemDetails` struct.
+> - **Unknown-error fallback:** an unrecognized `(error_domain, error_code)`
+>   round-trips back the **original `Problem`** (via `TryFrom`'s `Err`), rather
+>   than collapsing to an `Internal` variant — no information loss, never panics.
+> - Opting a variant into `#[contract_error(fallback)]` additionally generates a
+>   total `From<TransportError> for MyError` (gated on `rest-client`) so the
+>   generated client reconstructs typed variants and routes un-reconstructable
+>   transport/protocol failures into the fallback variant.
+> - Duplicate `(error_domain, error_code)` pairs are a compile error.
+>
+> The requirement text below is retained for intent; treat the note above as the
+> current contract.
 
 #### ContractError Derive Macro
 
@@ -396,6 +461,22 @@ Methods annotated with `#[retryable]` SHALL generate retry logic with exponentia
 
 ### 5.8 Runtime Support
 
+> **Implementation naming note (supersedes the identifiers used below).**
+> - Client construction is `FooApiRestClient::new(config) -> Result<Self, HttpError>`
+>   (plus `with_http_client`), not `from_config`.
+> - The retry helper is `retry_with_backoff(&RetryConfig, f)`, not `with_retry()`.
+> - The macro attribute is `#[toolkit::rest_contract]` (namespaced), not
+>   `#[toolkit::rest_contract]`.
+> - The generated per-trait `*_openapi_spec()` function is **not** emitted; the
+>   OpenAPI document is assembled by the framework `OperationBuilder` →
+>   `OpenApiRegistry` (utoipa) path as `register_<trait>_routes()` registers
+>   routes, and served at `/.well-known/openapi.json` (see §5.4 note). The
+>   previously-unwired standalone `toolkit_contract::openapi::generator` module
+>   has been removed (single OpenAPI source of truth, ADR-0003).
+> - Feature-gated HTTP/schema deps are `toolkit-http` (hyper/rustls, not
+>   `reqwest`) and `utoipa` (not `openapiv3`); `schemars` is used for
+>   JSON-schema derivation on request/response DTOs.
+
 #### ProblemDetails Type
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-problem-details-type`
@@ -436,7 +517,12 @@ The runtime crate SHALL provide a `with_retry()` function implementing exponenti
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-feature-gate`
 
-The generated REST client and its dependencies (`reqwest`, `schemars`) SHALL be behind a `rest-client` Cargo feature flag. Consumers depending on the SDK crate without the `rest-client` feature SHALL NOT compile HTTP dependencies.
+The generated REST client and its HTTP dependencies SHALL be behind a `rest-client` Cargo feature flag. Consumers depending on the SDK crate without the `rest-client` feature SHALL NOT compile HTTP dependencies.
+
+> **Implementation note (current behavior).** The gate covers the transport
+> stack (`toolkit-http` and friends). `schemars` and `utoipa` are **not**
+> gated — DTOs derive their schemas unconditionally, since the same types are
+> used by the server-side registry and by local callers.
 
 - **Rationale**: Compile-time-only consumers should not pay for HTTP dependencies they do not use.
 - **Actors**: `cpt-cf-binding-actor-gear-developer`, `cpt-cf-binding-actor-plugin-developer`
@@ -460,6 +546,16 @@ When no compile-time plugin AND no service directory entry exist for a required 
 
 - **Rationale**: Fail-fast prevents runtime surprises from unsatisfied dependencies.
 - **Actors**: `cpt-cf-binding-actor-host-runtime`
+
+> **Supersession note (governed by ADR-0004 + ADR-0007 eventual readiness).** For
+> **remote-capable** `Backend`/`Api` dependencies the runtime does **not**
+> fail-fast: the proxy-wiring phase registers a directory-resolving client and
+> gates `/readyz` (503) until the provider resolves, self-healing when it appears
+> (a remote provider is frequently a separate OoP process absent at local boot).
+> Fail-fast still applies to always-local `Extension`/`Embedded` contracts. This
+> FR is retained for intent; the eventual-readiness model in ADR-0004/0007
+> governs. (Edge case fixed: with no `DirectoryClient` present at all, remote deps
+> are registered **unresolved** so `/readyz` stays 503 rather than falsely Ready.)
 
 #### Proxy Wiring Lifecycle Phase
 
@@ -492,6 +588,22 @@ The system SHALL define a trait for service directory resolution. Given a GTS ID
 
 ### 5.11 Versioning & Non-Exhaustive Types
 
+> **Major-version strategy — see [ADR-0007](./ADR/0007-cpt-cf-binding-adr-contract-versioning.md).**
+> The two requirements below are the *additive* primitives: within a major
+> version only additive changes are allowed, and they do not get a new version.
+> A **breaking** change introduces a **parallel trait pair** (new base trait +
+> projection) served alongside the old one from the same SDK crate, with the
+> version spelled as a **trailing marker on the trait name** (`PaymentApiV2` +
+> `PaymentApiV2Rest`). The trait-name suffix rule still applies — the macro
+> strips a trailing `V<digits>` before classifying the contract type, so
+> `PaymentServiceV2` is still rejected and a local-only contract is never widened.
+> Module-per-version (`v2::PaymentApi`) is **not** recommended: identical trait
+> names produce duplicate `operationId`s and collide in `#[toolkit::provides]`.
+> The contract's `version = "vN"` must match the `/vN` segment of the
+> projection's `base_path` (and the trait-name marker), which
+> `require_full_coverage` asserts. Breaking changes are detected in CI by
+> `oasdiff breaking` (`.github/workflows/api_contracts.yml`).
+
 #### Non-Exhaustive Request/Response Types
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-non-exhaustive`
@@ -518,7 +630,7 @@ New methods added to transport projection traits MUST have default implementatio
 
 - [ ] `p2` - **ID**: `cpt-cf-binding-nfr-macro-transparency`
 
-The generated code from `#[toolkit_rest_contract]` MUST be inspectable via `cargo expand`. Generated struct names, method names, and trait implementations MUST follow predictable naming conventions (e.g., `{Trait}Client` for the client struct).
+The generated code from `#[toolkit::rest_contract]` MUST be inspectable via `cargo expand`. Generated struct names, method names, and trait implementations MUST follow predictable naming conventions (e.g., `{Trait}Client` for the client struct).
 
 - **Rationale**: Developers and LLM agents must be able to understand and debug generated code.
 
@@ -526,7 +638,10 @@ The generated code from `#[toolkit_rest_contract]` MUST be inspectable via `carg
 
 - [ ] `p2` - **ID**: `cpt-cf-binding-nfr-compile-time`
 
-SDK crates with the `rest-client` feature disabled MUST NOT incur additional compile time from HTTP-related dependencies (`reqwest`, `schemars`, `openapiv3`).
+SDK crates with the `rest-client` feature disabled MUST NOT incur additional compile time from HTTP transport dependencies.
+
+> **Implementation note.** `schemars`/`utoipa` are outside this gate — see the
+> note on `cpt-cf-binding-fr-feature-gate`.
 
 - **Rationale**: Compile-time-only consumers should have the same build performance as before the binding system is introduced.
 
@@ -535,7 +650,7 @@ SDK crates with the `rest-client` feature disabled MUST NOT incur additional com
 ### 7.1 Constraints
 
 - The system is built on Gears Toolkit framework and uses its ClientHub, inventory-based plugin discovery, and gear lifecycle.
-- REST is the first transport. gRPC is a future transport following the same two-layer pattern.
+- REST was the first transport; gRPC followed the same two-layer pattern and has since shipped (`#[toolkit::grpc_contract]`, ADR-0008).
 - The service directory implementation is delivered by a separate workstream. This change defines only the interface trait.
 - Alignment with ADR-0004 (PR #1380) gear/plugin declaration macros is required.
 
@@ -550,7 +665,6 @@ SDK crates with the `rest-client` feature disabled MUST NOT incur additional com
 
 - **Transaction guard (TxGuard)**: A compile-time mechanism that restricts which contracts can be called inside a transaction scope. Within a `TxGuard<'tx>`, only Embedded/Extension contracts would be callable -- the compiler would reject calls to Api/Backend traits. This would enforce the operational semantics table at the type level, not just by naming convention. Needs its own ADR to design the type-state mechanism and interaction with database transactions (SeaORM/SQLx). Not a requirement for this change.
 - **Remote backend unavailability**: Circuit breakers, fallback methods, degraded-mode behavior when remote plugins are temporarily down.
-- **gRPC transport projection**: `#[toolkit_grpc_contract]` macro design, proto generation approach, interaction with tonic.
 - **Transaction context propagation**: How Embedded/Extension contracts receive and participate in the caller's transaction scope.
 
 ## 8. Prior Art
@@ -569,4 +683,5 @@ SDK crates with the `rest-client` feature disabled MUST NOT incur additional com
 - **Design**: [`./DESIGN.md`](./DESIGN.md)
 - **ADR-0001** — contract source of truth: [`./ADR/0001-cpt-cf-binding-adr-contract-source-of-truth.md`](./ADR/0001-cpt-cf-binding-adr-contract-source-of-truth.md)
 - **ADR-0002** — OpenAPI spec limits: [`./ADR/0002-cpt-cf-binding-adr-openapi-spec-limits.md`](./ADR/0002-cpt-cf-binding-adr-openapi-spec-limits.md)
+- **ADR-0006** — client observability (tracing/OTEL): [`./ADR/0006-cpt-cf-binding-adr-client-observability.md`](./ADR/0006-cpt-cf-binding-adr-client-observability.md)
 - **PoC**: [striped-zebra-dev/toolkit-binding-poc](https://github.com/striped-zebra-dev/toolkit-binding-poc)

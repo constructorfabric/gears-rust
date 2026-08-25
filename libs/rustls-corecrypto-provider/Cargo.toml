@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-rustls-corecrypto-provider"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -69,6 +69,7 @@ tempfile = { workspace = true }
 # Hermetic env-var manipulation for the `oe::tests::override_*` tests --
 # safer than direct `std::env::set_var` calls under parallel cargo-test.
 temp-env = { workspace = true }
+serial_test = { workspace = true, features = ["file_locks"] }
 # Test-cert + test-key generation for server-side handshake_smoke.
 rcgen = { workspace = true }
 # Cross-implementation RSA-PSS verifier (pure-Rust RustCrypto) — used to

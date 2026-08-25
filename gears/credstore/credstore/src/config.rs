@@ -1,3 +1,8 @@
+//! Validated credential-store configuration.
+//!
+//! Controls backend plugin selection, hierarchy-cache lifetime, and recovery
+//! cadences for provisioning and deprovisioning sagas.
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]

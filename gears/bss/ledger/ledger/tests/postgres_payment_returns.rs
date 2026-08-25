@@ -4,7 +4,7 @@
 //! fee_share) / CR PSP_FEE_EXPENSE fee_share` — and decrements BOTH the original
 //! payment's `settled_minor` and `fee_minor` in the same txn. Ignored by default;
 //! run with
-//! `cargo test -p bss-ledger --test postgres_payment_returns -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_payment_returns -- --ignored`.
 //!
 //! Covers: (a) a return after a settle decrements `settled_minor` and drains the
 //! pool by the returned amount; (b) a re-posted return (same `psp_return_id`)
@@ -121,7 +121,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -156,7 +156,7 @@ async fn account_balance(
     s: &Seller,
     account: Uuid,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_account_balance \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         s.tenant, account

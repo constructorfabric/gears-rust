@@ -513,7 +513,6 @@ pub struct TestDpBuilder {
     token_cache_config: TokenCacheConfig,
     websocket_idle_timeout: Option<Duration>,
     websocket_close_timeout: Option<Duration>,
-    websocket_max_frame_size: Option<usize>,
 }
 
 impl TestDpBuilder {
@@ -529,7 +528,6 @@ impl TestDpBuilder {
             token_cache_config: TokenCacheConfig::default(),
             websocket_idle_timeout: None,
             websocket_close_timeout: None,
-            websocket_max_frame_size: None,
         }
     }
 
@@ -598,13 +596,6 @@ impl TestDpBuilder {
         self
     }
 
-    /// Override the maximum WebSocket frame payload size.
-    #[must_use]
-    pub fn with_websocket_max_frame_size(mut self, size: Option<usize>) -> Self {
-        self.websocket_max_frame_size = size;
-        self
-    }
-
     /// Fetch `CredStoreClientV1` from the hub, create a DP service with
     /// the given CP, and return the trait object.
     pub(crate) fn build_and_register(
@@ -666,9 +657,6 @@ impl TestDpBuilder {
         if let Some(timeout) = self.websocket_close_timeout {
             svc = svc.with_websocket_close_timeout(timeout);
         }
-        if let Some(size) = self.websocket_max_frame_size {
-            svc = svc.with_websocket_max_frame_size(Some(size));
-        }
 
         Arc::new(svc)
     }
@@ -718,7 +706,6 @@ pub fn build_test_app_state(
                 max_body_size_bytes: 100 * 1024 * 1024, // 100 MB default for tests
                 websocket_idle_timeout_secs: 300,
                 websocket_close_timeout_secs: 5,
-                websocket_max_frame_size_bytes: None,
                 streaming_idle_timeout_secs: 300,
                 management_api_enabled: true,
             },

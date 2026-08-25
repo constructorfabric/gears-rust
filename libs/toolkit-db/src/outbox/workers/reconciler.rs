@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+use sea_orm::{FromQueryResult, Statement};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 

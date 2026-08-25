@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sea_orm::ConnectionTrait;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 

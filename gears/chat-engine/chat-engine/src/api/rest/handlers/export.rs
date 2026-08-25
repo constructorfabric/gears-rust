@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use toolkit_security::SecurityContext;
 
-use crate::api::rest::handlers::sessions::{identity_from_ctx, reject_body_identity};
+use crate::api::rest::handlers::sessions::reject_body_identity;
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::export::{ExportFormat, ExportedSession, ShareTokenIssue, SharedSessionView};
 use crate::domain::service::export_service::{ExportService, is_share_token_expired};
@@ -100,13 +100,12 @@ pub async fn export_session(
     Path(session_id): Path<Uuid>,
     Query(query): Query<ExportSessionQuery>,
 ) -> Result<Json<ExportSessionResponse>> {
-    let identity = identity_from_ctx(&ctx)?;
     let format = parse_format(query.format.as_deref())?;
     tracing::Span::current().record("format", tracing::field::display(format.as_str()));
 
     let exported = svc
         .export(
-            &identity,
+            &ctx,
             session_id,
             format,
             query.include_plugin_metadata.unwrap_or(false),
@@ -130,9 +129,8 @@ pub async fn create_share(
     Json(body): Json<CreateShareBody>,
 ) -> Result<(StatusCode, Json<CreateShareResponse>)> {
     reject_body_identity(&body.tenant_id, &body.user_id)?;
-    let identity = identity_from_ctx(&ctx)?;
     let issue = svc
-        .create_share(&identity, session_id, body.expires_in_hours)
+        .create_share(&ctx, session_id, body.expires_in_hours)
         .await?;
     Ok((StatusCode::CREATED, Json(issue)))
 }
@@ -149,8 +147,7 @@ pub async fn revoke_share(
     Extension(svc): Extension<Arc<ExportService>>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Json<RevokeShareResponse>> {
-    let identity = identity_from_ctx(&ctx)?;
-    svc.revoke_share(&identity, session_id).await?;
+    svc.revoke_share(&ctx, session_id).await?;
     Ok(Json(RevokeShareResponse {}))
 }
 

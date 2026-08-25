@@ -1,3 +1,8 @@
+//! Domain models for secret metadata and write concurrency.
+//!
+//! Models lifecycle status, sharing, expiry, optimistic preconditions, and the
+//! metadata persisted separately from secret values.
+
 use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId, WriteOptions};
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;

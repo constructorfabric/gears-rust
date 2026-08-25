@@ -173,6 +173,12 @@ gears:
         # rather than silently shipping a half-wired stack.
         required: true
 
+  chat-engine:
+    database:
+      server: "sqlite_users"
+      file: "chat_engine.db"
+    config: {}
+
   mini-chat:
     # Gear-specific database configuration
     database:

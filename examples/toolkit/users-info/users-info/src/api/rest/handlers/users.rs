@@ -1,11 +1,13 @@
+use std::sync::Arc;
+
 use axum::Extension;
-use axum::extract::Path;
 use axum::http::Uri;
 use axum::response::IntoResponse;
 use tracing::field::Empty;
 use uuid::Uuid;
 
 use toolkit::api::odata::OData;
+use toolkit::api::rest::extract;
 
 use super::{
     ApiResult, Json, JsonBody, JsonPage, SecurityContext, UpdateUserReq, UserDto, UserFullDto,
@@ -25,7 +27,7 @@ use crate::gear::ConcreteAppServices;
 )]
 pub async fn list_users(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
+    Extension(svc): Extension<Arc<ConcreteAppServices>>,
     OData(query): OData,
 ) -> ApiResult<JsonPage<serde_json::Value>> {
     info!(
@@ -50,8 +52,8 @@ pub async fn list_users(
 )]
 pub async fn get_user(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
-    Path(id): Path<Uuid>,
+    Extension(svc): Extension<Arc<ConcreteAppServices>>,
+    extract::Path(id): extract::Path<Uuid>,
     OData(query): OData,
 ) -> ApiResult<JsonBody<serde_json::Value>> {
     info!(
@@ -80,8 +82,12 @@ pub async fn get_user(
 pub async fn create_user(
     uri: Uri,
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
-    Json(req_body): Json<CreateUserReq>,
+    Extension(svc): Extension<Arc<ConcreteAppServices>>,
+    // `extract::Json`, not the prelude's `Json` - a malformed body here
+    // renders as an RFC 9457 `Problem` (see toolkit's
+    // `docs/arch/errors/ADR/0006-cpt-cf-adr-error-middleware-catchall.md`)
+    // instead of axum's default plain-text rejection.
+    extract::Json(req_body): extract::Json<CreateUserReq>,
 ) -> ApiResult<impl IntoResponse> {
     info!(
         email = %req_body.email,
@@ -91,19 +97,7 @@ pub async fn create_user(
         "Creating new user"
     );
 
-    let CreateUserReq {
-        id,
-        tenant_id,
-        email,
-        display_name,
-    } = req_body;
-
-    let new_user = users_info_sdk::NewUser {
-        id,
-        tenant_id,
-        email,
-        display_name,
-    };
+    let new_user = req_body.into();
 
     let user = svc.users.create_user(&ctx, new_user).await?;
     let id_str = user.id.to_string();
@@ -121,9 +115,9 @@ pub async fn create_user(
 )]
 pub async fn update_user(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
-    Path(id): Path<Uuid>,
-    Json(req_body): Json<UpdateUserReq>,
+    Extension(svc): Extension<Arc<ConcreteAppServices>>,
+    extract::Path(id): extract::Path<Uuid>,
+    extract::Json(req_body): extract::Json<UpdateUserReq>,
 ) -> ApiResult<JsonBody<UserDto>> {
     info!(
         user_id = %id,
@@ -147,8 +141,8 @@ pub async fn update_user(
 )]
 pub async fn delete_user(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
-    Path(id): Path<Uuid>,
+    Extension(svc): Extension<Arc<ConcreteAppServices>>,
+    extract::Path(id): extract::Path<Uuid>,
 ) -> ApiResult<impl IntoResponse> {
     info!(
         user_id = %id,

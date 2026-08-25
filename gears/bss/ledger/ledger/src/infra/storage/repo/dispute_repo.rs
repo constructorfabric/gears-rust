@@ -15,6 +15,7 @@
 //! tenant yields no row); the service uses it for the pre-read that selects the
 //! variant + validates the transition before opening the post transaction.
 
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use toolkit_db::odata::sea_orm_filter::{LimitCfg, paginate_odata};

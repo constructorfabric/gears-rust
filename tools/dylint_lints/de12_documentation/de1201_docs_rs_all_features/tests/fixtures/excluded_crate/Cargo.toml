@@ -1,6 +1,0 @@
-[package]
-name = "de1201_excluded_crate"
-version = "0.1.0"
-edition = "2024"
-
-[workspace]

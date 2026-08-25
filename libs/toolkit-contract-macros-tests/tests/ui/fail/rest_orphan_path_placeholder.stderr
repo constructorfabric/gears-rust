@@ -1,0 +1,5 @@
+error: rest_contract: path template `/tenants/{tenant_id}/thing/{id}` on method `get_thing` has placeholder(s) `{tenant_id}` with no matching parameter in the method signature. Add a parameter with that exact name, or correct the template.
+  --> tests/ui/fail/rest_orphan_path_placeholder.rs:20:14
+   |
+20 |     async fn get_thing(&self, ctx: &SecurityContext, id: String) -> Result<u32, std::io::Error>;
+   |              ^^^^^^^^^

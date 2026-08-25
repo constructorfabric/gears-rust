@@ -247,10 +247,9 @@ single usage-type catalog, managed via the Plugin SPI and persisted in the
 active storage plugin's database. See ADR 0012
 (`./ADR/0012-unified-plugin-catalog-and-gts-id-reference.md`).
 
-Each UsageType is a **GTS Type Schema** — its identifier is a GTS _type_ id
-whose last segment ends `~` per the GTS naming convention — not a GTS instance
-id. UsageType types are flat for v1: there is no parent pointer on the catalog
-row and no inheritance chain walked at validation time. Every registered
+Each UsageType is a concrete derivation of the reserved abstract base type —
+its identifier is a GTS _instance_ id. UsageType types are flat for v1: there is no parent pointer on
+the catalog row and no inheritance chain walked at validation time. Every registered
 usage type is concrete and may receive usage rows on its declared shape.
 UsageType definitions are owned by usage-collector (semantic ownership) and
 physically stored on the active storage plugin's backend database alongside
@@ -319,25 +318,32 @@ does not block the usage-type / dimensions decision. The UsageType entity
 does NOT yet declare a `unit` field.
 
 `UsageTypeGtsId` is a newtype wrapping the platform-primitive `gts::GtsID`
-(re-exported by `libs/toolkit-gts`). Its `Deserialize` impl parses the input
-string as a GTS type id (trailing `~`) and asserts the parsed value derives
-from the reserved abstract base `USAGE_RECORD_BASE = "gts.cf.core.uc.usage_record.v1~"`
-(exposed by the usage-collector SDK / contracts crate) with at least one
-further `~`-separated derivation segment. The newtype is the validation
-point on REST `Json<UsageType>` deserialization at
-`POST /usage-collector/v1/usage-types`. The `kind` field is validated
+(re-exported by `libs/toolkit-gts`). `UsageTypeGtsId::new` parses the input
+string as a GTS *instance* id and rejects a type id (one ending in `~`),
+then asserts the parsed value derives directly from the reserved abstract
+base `USAGE_RECORD_BASE = "gts.cf.core.uc.usage_record.v1~"` (exposed by the
+usage-collector SDK / contracts crate) — the base plus exactly one further
+`~`-separated derivation segment, so a well-formed value contains one `~`
+and never ends with one. The bare base is itself a type id and is rejected.
+The newtype is the validation point inside the
+`POST /usage-collector/v1/usage-types` handler, not at deserialization:
+`CreateUsageTypeRequest::gts_id` is a permissive `String` so the handler can
+surface the canonical `invalid_base_gts_id` `Problem` rather than axum's
+`text/plain` rejection. The `kind` field is validated
 independently by parsing the permissive `CreateUsageTypeRequest::kind`
 string through `UsageKind::from_str` at the handler boundary (unknown
 values rejected).
 
 Invariants:
 
-- `gts_id` is unique across the deployment, is a GTS _type_ id (ends `~`), and
-  MUST derive from the reserved abstract base
-  `gts.cf.core.uc.usage_record.v1~` with at least one further `~`-separated
-  segment. Identifiers that do not satisfy that derivation (or are
-  non-type identifiers) are rejected at the `UsageTypeGtsId::deserialize`
-  boundary and surface on the REST path as a structured `400` `InvalidArgument`
+- `gts_id` is unique across the deployment and is a GTS _instance_ id deriving
+  directly from the reserved abstract base
+  `gts.cf.core.uc.usage_record.v1~` — the base plus exactly one further
+  `~`-separated segment. Identifiers that do not satisfy that derivation —
+  including the bare base and any other GTS type id (trailing `~`) — are
+  rejected at the `UsageTypeGtsId::new` boundary inside the
+  `POST /usage-collector/v1/usage-types` handler and surface on the REST path
+  as a structured `400` `InvalidArgument`
   `Problem` (`field_violations[0].field="gts_id"`, `.reason="INVALID_BASE_GTS_ID"`).
 - UsageType semantics (counter / gauge) is carried by the closed
   `UsageKind` enum on the catalog row's `kind` field per ADR 0012's

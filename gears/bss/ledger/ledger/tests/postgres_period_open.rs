@@ -3,7 +3,7 @@
 //! raw SQL, then runs the job and asserts it created the current + next
 //! `YYYYMM` periods (`status='OPEN'`) and is idempotent on a re-run.
 //! Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_period_open -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_period_open -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -33,7 +33,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 /// extraction idiom: `row.try_get::<i64>("", "count")`).
 async fn count(db: &DatabaseConnection, sql: impl Into<String>) -> i64 {
     let row = db
-        .query_one(pg(sql))
+        .query_one_raw(pg(sql))
         .await
         .unwrap()
         .expect("count query must return a row");
@@ -73,7 +73,7 @@ async fn period_open_creates_current_and_next_and_is_idempotent() {
     };
 
     // Seed a MONTH calendar for (tenant, le) via raw, bss-qualified SQL.
-    db.execute(pg(format!(
+    db.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_calendar (tenant_id, legal_entity_id, fiscal_tz, granularity, fy_start_month)
          VALUES ('{tenant}','{legal_entity}','UTC','MONTH',1)"
     )))

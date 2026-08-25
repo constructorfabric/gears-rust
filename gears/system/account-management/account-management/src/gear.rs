@@ -38,6 +38,7 @@ use crate::domain::metadata::registry::MetadataSchemaRegistry;
 use crate::domain::metadata::repo::MetadataRepo;
 use crate::domain::metadata::service::MetadataService;
 use crate::domain::metrics::install_facade_bridge;
+use crate::domain::service_account::service::ServiceAccountService;
 use crate::domain::tenant::TenantRepo;
 use crate::domain::tenant::hooks::TenantHardDeleteHook;
 use crate::domain::tenant::resource_checker::ResourceOwnershipChecker;
@@ -101,6 +102,13 @@ pub struct AccountManagementGear {
     /// flows without re-discovering the resolved `IdpPluginClient`.
     /// Wired during [`Gear::init`]; remains unset until init runs.
     user_service: OnceLock<Arc<UserService>>,
+    /// Service-account domain service handle, published alongside
+    /// [`Self::service`] so the REST surface for
+    /// `/tenants/{id}/service-accounts` can drive provision / list /
+    /// rotate / revoke without re-discovering the resolved
+    /// `IdpPluginClient`. Wired during [`Gear::init`]; remains unset
+    /// until init runs.
+    service_account_service: OnceLock<Arc<ServiceAccountService>>,
     /// Tenant-metadata domain service handle, published alongside
     /// [`Self::service`] so SDK consumers and the REST surface for
     /// `/tenants/{id}/metadata` can drive the list / get / put /
@@ -133,6 +141,7 @@ impl Default for AccountManagementGear {
             service: OnceLock::new(),
             conversion_service: OnceLock::new(),
             user_service: OnceLock::new(),
+            service_account_service: OnceLock::new(),
             metadata_service: OnceLock::new(),
             pending_hard_delete_hooks: Mutex::new(Vec::new()),
             bootstrap_params: Mutex::new(None),
@@ -849,6 +858,7 @@ impl Gear for AccountManagementGear {
         // the same authz-resolver client and capability set
         // (`TenantHierarchy`) without any duplicated wiring.
         let user_enforcer = enforcer.clone();
+        let service_account_enforcer = enforcer.clone();
         let metadata_enforcer = enforcer.clone();
         let conversion_enforcer = enforcer.clone();
         // Snapshot `cfg.listing.max_top` before `cfg` moves into
@@ -1068,6 +1078,20 @@ impl Gear for AccountManagementGear {
             .with_listing_max_top(listing_max_top),
         );
 
+        // Build the service-account domain service. Shares the same
+        // `TenantRepoImpl` + `TypesRegistryClient` the user service uses
+        // for the tenant guard, and the same resolved `IdpPluginClient`
+        // — machine identities are a separate PEP resource type, not a
+        // separate provider. Holds no storage handles: like the user
+        // surface it is a pure pass-through, and it never persists a
+        // credential.
+        let service_account_service = Arc::new(ServiceAccountService::new(
+            Arc::clone(&repo) as Arc<dyn TenantRepo>,
+            Arc::clone(&idp),
+            Arc::clone(&types_registry),
+            service_account_enforcer,
+        ));
+
         // Build the tenant-metadata domain service.
         //
         // Three dependencies (per
@@ -1106,7 +1130,7 @@ impl Gear for AccountManagementGear {
             .with_listing_max_top(listing_max_top),
         );
 
-        // Atomic publish of all four `OnceLock` handles together,
+        // Atomic publish of all five `OnceLock` handles together,
         // ordered so a half-published state is unobservable:
         //
         // 1. Acquire the pre-init hook buffer lock and drain it into
@@ -1117,9 +1141,9 @@ impl Gear for AccountManagementGear {
         //    == Some(_)` and forwards directly).
         // 2. Publish primary `self.service` first so any caller that
         //    observes one of the secondary handles (conversion / user /
-        //    metadata) and then probes the primary sees a published
-        //    state (or the same `init` failure path on a re-entry).
-        // 3. Publish the three secondary handles after the primary.
+        //    service-account / metadata) and then probes the primary sees a
+        //    published state (or the same `init` failure path on a re-entry).
+        // 3. Publish the four secondary handles after the primary.
         //    Failure to set any of them (init re-entered) returns
         //    `Err` with no rollback of the already-set primary; the
         //    second `init` is supposed to fail closed anyway per the
@@ -1151,6 +1175,14 @@ impl Gear for AccountManagementGear {
                     Self::MODULE_NAME
                 )
             })?;
+        self.service_account_service
+            .set(Arc::clone(&service_account_service))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "{} gear already initialized (service-account service)",
+                    Self::MODULE_NAME
+                )
+            })?;
         self.metadata_service
             .set(Arc::clone(&metadata_service))
             .map_err(|_| {
@@ -1173,9 +1205,9 @@ impl Gear for AccountManagementGear {
         })?;
 
         // Publish the SDK-facing `AccountManagementClient` via
-        // `ClientHub` so sibling gears / the REST handler resolve
-        // AM's tenant + user surfaces through the trait, not the
-        // impl-side `TenantService<R>` / `UserService` directly.
+        // `ClientHub` so sibling gears resolve AM's tenant, user,
+        // service-account, and metadata surfaces through the trait, not the
+        // impl-side domain services directly.
         // Mirrors the registration pattern in
         // `tenant-resolver`, `authn-resolver`, `authz-resolver`,
         // `nodes-registry`, and `types-registry`.
@@ -1189,6 +1221,7 @@ impl Gear for AccountManagementGear {
             Arc::new(crate::client::AccountManagementClientImpl::new(
                 Arc::clone(&tenant_service),
                 Arc::clone(&user_service),
+                Arc::clone(&service_account_service),
                 Arc::clone(&metadata_service),
             ));
         ctx.client_hub()
@@ -1252,6 +1285,11 @@ impl RestApiCapability for AccountManagementGear {
             .get()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("UserService not initialized"))?;
+        let service_account_service = self
+            .service_account_service
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("ServiceAccountService not initialized"))?;
         let conversion_service = self
             .conversion_service
             .get()
@@ -1264,6 +1302,7 @@ impl RestApiCapability for AccountManagementGear {
             tenant_service,
             metadata_service,
             user_service,
+            service_account_service,
             conversion_service,
         );
 

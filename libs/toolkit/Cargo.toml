@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit"
-version = "0.6.16"
+version = "0.7.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -56,6 +56,21 @@ fips = [
 # Database integration (toolkit-db, migrations, DbManager/DbHandle in contexts/runtime)
 db = ["dep:toolkit-db", "dep:sea-orm-migration"]
 
+# Concrete Kubernetes TokenReview platform-plane authenticator, auto-wired into
+# the OoP bootstrap when `oop_http.internal_auth` is configured (Profile 3).
+k8s-auth = ["bootstrap", "dep:toolkit-k8s-auth"]
+
+# Forward toolkit-contract's grpc-client feature so the `contract_support::grpc`
+# module re-export is visible to `#[grpc_contract]`-generated code in SDKs that
+# depend on `toolkit` but not on `toolkit-contract` directly (see
+# `toolkit_contract_macros::support::contract_support_path`). No such SDK exists
+# in-tree yet; the feature stays because `grpc-client` pulls tonic +
+# toolkit-transport-grpc, and a gRPC projection is the exception, not the norm.
+# The REST counterpart is deliberately NOT a feature: gears consume other gears
+# over REST as a matter of course, so `discovery` and the proxy-wiring phase are
+# unconditional and `toolkit-contract` is depended on with `rest-client` below.
+contract-grpc-client = ["toolkit-contract/grpc-client"]
+
 # OpenTelemetry support for distributed tracing
 otel = [
     "dep:opentelemetry",
@@ -65,8 +80,6 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:tonic",
 ]
-# Transactional outbox pipeline (preview — API may change)
-preview-outbox = ["db", "toolkit-db/preview-outbox"]
 
 bootstrap = [
     "db",
@@ -81,6 +94,12 @@ bootstrap = [
     "dep:dsn",
     "dep:supports-color",
     "dep:enable-ansi-support",
+    # OoP HTTP server: two-plane auth middleware + security primitives
+    "dep:toolkit-security",
+    "dep:toolkit-http-middleware",
+    # OoP outbound platform-plane credential (InternalAuthInterceptor + SA reader)
+    "dep:toolkit-transport-grpc",
+    "dep:secrecy",
 ]
 
 [dependencies]
@@ -92,6 +111,19 @@ sea-orm-migration = { workspace = true, optional = true }
 toolkit-odata = { workspace = true }
 toolkit-sdk = { workspace = true }
 cf-gears-system-sdks = { workspace = true, features = ["directory"] }
+# `rest-client` is not optional: `discovery` and the runtime proxy-wiring phase
+# use `toolkit_contract::runtime::resolving`, which lives behind it.
+toolkit-contract = { workspace = true, features = ["rest-client"] }
+
+# OoP HTTP server (bootstrap feature): two-plane auth middleware + primitives
+toolkit-security = { workspace = true, optional = true }
+toolkit-http-middleware = { workspace = true, optional = true }
+# OoP outbound platform-plane credential attachment (bootstrap feature).
+toolkit-transport-grpc = { workspace = true, optional = true }
+# Wrapping the shared-secret / SA token as a redacting SecretString (bootstrap).
+secrecy = { workspace = true, optional = true }
+# Concrete K8s TokenReview InternalAuthenticator (k8s-auth feature).
+toolkit-k8s-auth = { workspace = true, optional = true }
 
 # Core deps
 anyhow = { workspace = true }
@@ -130,6 +162,9 @@ toolkit-gts = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 arc-swap = { workspace = true }
+# `util` provides `ServiceExt::oneshot`, used by the OoP probe-first serve path
+# to delegate to the gear router that is swapped in after `start()`.
+tower = { workspace = true, features = ["util"] }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 urlencoding = { workspace = true }
@@ -170,7 +205,6 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
 rustls-cng-crypto = { workspace = true, optional = true }
 
 [dev-dependencies]
-tower = { workspace = true }
 trybuild = { workspace = true }
 tempfile = { workspace = true }
 temp-env = { workspace = true }

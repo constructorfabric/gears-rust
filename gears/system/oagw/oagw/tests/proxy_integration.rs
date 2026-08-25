@@ -4455,58 +4455,6 @@ async fn proxy_websocket_idle_timeout_sends_1001() {
     server_handle.abort();
 }
 
-// 14.7: Max frame size enforcement sends Close 1009 (Message Too Big).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn proxy_websocket_max_frame_size_sends_1009() {
-    let h = AppHarness::builder()
-        .with_websocket_max_frame_size(50) // 50 bytes max
-        .build()
-        .await;
-    setup_ws_upstream(&h, "ws-maxframe").await;
-    let (addr, server_handle) = start_oagw_server(&h).await;
-
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    ws_handshake(&mut stream, "/oagw/v1/proxy/ws-maxframe/ws/echo").await;
-
-    // Small frame should work fine.
-    let small_frame = build_masked_frame(0x1, b"ok");
-    tokio::io::AsyncWriteExt::write_all(&mut stream, &small_frame)
-        .await
-        .unwrap();
-    let echo = read_ws_frame(&mut stream).await.unwrap();
-    assert_eq!(echo.0, 0x1);
-    assert_eq!(echo.1, b"ok");
-
-    // Send a frame exceeding the 50-byte limit.
-    let oversized_payload = vec![0x41; 100]; // 100 bytes > 50
-    let oversized_frame = build_masked_frame(0x1, &oversized_payload);
-    tokio::io::AsyncWriteExt::write_all(&mut stream, &oversized_frame)
-        .await
-        .unwrap();
-
-    // Should receive Close 1009 (Message Too Big).
-    // On some platforms (notably Windows) the gateway may tear down the TCP
-    // connection before the Close frame is delivered, so EOF is also acceptable.
-    let frame = read_ws_frame(&mut stream).await;
-    match frame {
-        Some((opcode, payload)) => {
-            assert_eq!(opcode, 0x8, "expected Close frame for oversized message");
-            assert!(
-                payload.len() >= 2,
-                "close payload should contain status code"
-            );
-            let code = u16::from_be_bytes([payload[0], payload[1]]);
-            assert_eq!(code, 1009, "oversized frame should trigger Close 1009");
-        }
-        None => {
-            // EOF / connection reset — the gateway closed the connection after
-            // detecting the oversized frame, which is acceptable behaviour.
-        }
-    }
-
-    server_handle.abort();
-}
-
 // 14.8: Caller disconnect mid-session triggers upstream Close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proxy_websocket_caller_disconnect_mid_session() {

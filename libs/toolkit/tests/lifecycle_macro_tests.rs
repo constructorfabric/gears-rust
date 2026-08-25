@@ -42,8 +42,13 @@ async fn stays_starting_until_ready_signal() {
 
     // Should be Starting until ReadySignal triggers inside the method
     assert_eq!(m.status(), Status::Starting);
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    assert_eq!(m.status(), Status::Running);
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while !matches!(m.status(), Status::Running) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("gear did not become Running within 500 ms");
 
     parent.cancel();
     m.stop(CancellationToken::new()).await.unwrap();
@@ -54,10 +59,17 @@ async fn stays_starting_until_ready_signal() {
 async fn auto_notify_when_no_ready_param() {
     let m = AutoNotify.into_gear();
     let parent = CancellationToken::new();
+
     m.start(parent.clone()).await.unwrap();
-    // Await-ready=true but method has no ReadySignal -> auto-notify -> Running quickly
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    assert!(matches!(m.status(), Status::Running | Status::Starting));
+    // await_ready=true, but the method has no ReadySignal parameter,
+    // so readiness must be reported automatically.
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while !matches!(m.status(), Status::Running) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("gear did not become Running after automatic readiness notification");
 
     parent.cancel();
     m.stop(CancellationToken::new()).await.unwrap();

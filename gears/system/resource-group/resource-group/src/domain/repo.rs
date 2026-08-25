@@ -81,6 +81,17 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         tenant_id: Uuid,
     ) -> Result<rg_entity::Model, DomainError>;
 
+    /// Apply the update and return the number of rows it touched.
+    ///
+    /// Deliberately not the updated row: `update_many` reports a row count,
+    /// so returning the model meant reading it straight back, and both
+    /// callers threw that model away and read again for themselves. Every
+    /// value the row now holds was supplied by the caller, so a caller that
+    /// wants the updated entity can assemble it without asking (RG-08).
+    ///
+    /// `rows_affected` is `0` when `id` doesn't match any row; what to do
+    /// about that is the caller's call, not this method's -- both current
+    /// callers turn it into not-found.
     async fn update<C: DBRunner>(
         &self,
         db: &C,
@@ -89,7 +100,7 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         gts_type_id: i16,
         name: &str,
         metadata: Option<&serde_json::Value>,
-    ) -> Result<rg_entity::Model, DomainError>;
+    ) -> Result<u64, DomainError>;
 
     async fn delete_by_id<C: DBRunner>(&self, db: &C, id: Uuid) -> Result<(), DomainError>;
 
@@ -108,11 +119,37 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         parent_id: Uuid,
     ) -> Result<(), DomainError>;
 
-    async fn get_descendant_ids<C: DBRunner>(
+    /// Delete every group in `group_ids` in one statement per bind-parameter
+    /// chunk, not one per group (RG-10).
+    async fn delete_by_id_many<C: DBRunner>(&self, db: &C, ids: &[Uuid])
+    -> Result<(), DomainError>;
+
+    /// Delete all memberships for every group in `group_ids` in one statement
+    /// per bind-parameter chunk, not one per group (RG-10).
+    async fn delete_memberships_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError>;
+
+    /// Delete all closure rows (both as ancestor and as descendant) for
+    /// every group in `group_ids`, in 2 statements per bind-parameter chunk
+    /// rather than 2 per group (RG-10) — safe since the whole batch is
+    /// deleted together with no ordering to preserve.
+    async fn delete_all_closure_rows_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError>;
+
+    /// Every descendant of `group_id` (the self-row excluded) with its depth
+    /// relative to `group_id`, so callers needing that depth (RG-05's depth
+    /// check, RG-10's depth-level batching) don't re-query for it.
+    async fn get_descendant_ids_with_depth<C: DBRunner>(
         &self,
         db: &C,
         group_id: Uuid,
-    ) -> Result<Vec<Uuid>, DomainError>;
+    ) -> Result<Vec<(Uuid, i32)>, DomainError>;
 
     async fn get_depth<C: DBRunner>(&self, db: &C, group_id: Uuid) -> Result<i32, DomainError>;
 
@@ -155,12 +192,6 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         group_id: Uuid,
     ) -> Result<bool, DomainError>;
 
-    async fn delete_memberships<C: DBRunner>(
-        &self,
-        db: &C,
-        group_id: Uuid,
-    ) -> Result<(), DomainError>;
-
     async fn resolve_type_paths_batch<C: DBRunner>(
         &self,
         db: &C,
@@ -175,6 +206,19 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
         db: &C,
         code: &str,
     ) -> Result<Option<ResourceGroupType>, DomainError>;
+
+    /// Same lookup as `find_by_code`, but also returns the `gts_type` row
+    /// itself alongside the assembled `ResourceGroupType`, in one query
+    /// (RG-11).
+    ///
+    /// The row, not just its surrogate id: the update path needs
+    /// `created_at` off it to assemble its answer without reading the row
+    /// back a second time after the write, and this query already held it.
+    async fn find_by_code_with_model<C: DBRunner>(
+        &self,
+        db: &C,
+        code: &str,
+    ) -> Result<Option<(gts_type::Model, ResourceGroupType)>, DomainError>;
 
     async fn load_full_type_by_id<C: DBRunner>(
         &self,
@@ -224,13 +268,18 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
         type_id: i16,
     ) -> Result<(), DomainError>;
 
+    /// Update `metadata_schema` and `updated_at` on one `gts_type` row.
+    ///
+    /// Returns the `updated_at` it wrote rather than the row: every other
+    /// column is either the key it was addressed by or immutable, so the
+    /// caller can assemble the new row from what it already holds. Reading
+    /// it back cost a second `gts_type` SELECT per update (RG-08).
     async fn update_type<C: DBRunner>(
         &self,
         db: &C,
         type_id: i16,
-        code: &str,
         metadata_schema: Option<&serde_json::Value>,
-    ) -> Result<gts_type::Model, DomainError>;
+    ) -> Result<time::OffsetDateTime, DomainError>;
 
     async fn delete_by_id<C: DBRunner>(&self, db: &C, type_id: i16) -> Result<(), DomainError>;
 
@@ -240,12 +289,32 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
         type_id: i16,
     ) -> Result<u64, DomainError>;
 
-    async fn find_groups_using_parent_type<C: DBRunner>(
+    /// Batch replacement for a removed-allowed-parent-types sweep: resolves
+    /// every candidate parent-type path to its surrogate id and finds every
+    /// group of `child_type_id` whose direct parent is of one of those
+    /// types, in a small constant number of queries regardless of how many
+    /// paths are checked (was one `resolve_id` + one single-parent
+    /// violation lookup per candidate -- slope 2.0, N+1 audit finding (b)
+    /// -- see `check_hierarchy_safety`).
+    ///
+    /// A `parent_code` that doesn't currently resolve to any `gts_type` row
+    /// is silently skipped (mirrors the pre-batch code's per-item `if let
+    /// Some(parent_id) = ...` guard) -- reachable when the parent type was
+    /// deleted out from under a still-referencing junction row (junction
+    /// FKs declare `ON DELETE CASCADE`, but that cascade only fires when
+    /// the connection actually enforces FK constraints; the test suite's
+    /// `SQLite` connections don't turn that pragma on, see
+    /// `type_update_hierarchy_check_skips_deleted_parent`). A type that no
+    /// longer exists has no groups referencing it, so there's nothing to
+    /// check either way. Returns `(parent_code, group_id, group_name)`
+    /// triples so callers can attribute each violation back to the specific
+    /// removed-parent path that caused it.
+    async fn find_groups_violating_removed_parents<C: DBRunner>(
         &self,
         db: &C,
         child_type_id: i16,
-        parent_type_id: i16,
-    ) -> Result<Vec<(Uuid, String)>, DomainError>;
+        parent_codes: &[String],
+    ) -> Result<Vec<(String, Uuid, String)>, DomainError>;
 
     async fn find_root_groups_of_type<C: DBRunner>(
         &self,

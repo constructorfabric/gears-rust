@@ -19,7 +19,7 @@
 
 **SC-LIFE-003 — cache & SD watches close with `Shutdown`** · L3 · ☐
 - *Intent:* every active watch ends terminally with a clear cause on shutdown.
-- *Steps:* open a cache `watch` and a service-discovery `watch`; call `stop()`.
+- *Steps:* open a cache `watch` and a leader `watch`; call `stop()`.
 - *Expected:* both receive `Closed(Shutdown)` as their terminal event.
 - *Done-when:* asserts the `Closed(Shutdown)` on both watch types.
 

@@ -44,6 +44,9 @@ use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
 use toolkit_db::DBProvider;
 use tracing::{error, info, warn};
 
+use authz_resolver_sdk::AuthZResolverClient;
+use authz_resolver_sdk::pep::PolicyEnforcer;
+
 use crate::infra::db::repo::ChatEngineDb;
 
 use chat_engine_sdk::plugin::ChatEngineBackendPlugin;
@@ -105,6 +108,7 @@ const STREAM_BUFFER_SWEEP_PERIOD: Duration = Duration::from_mins(5);
 /// `GearCtx` is available.
 #[toolkit::gear(
     name = "chat-engine",
+    deps = [authz_resolver],
     capabilities = [db, rest, stateful],
     client = chat_engine_sdk::ChatEngineBackendPlugin,
     ctor = ChatEngineModule::new(),
@@ -342,6 +346,14 @@ impl Gear for ChatEngineModule {
 
         // --- ClientHub plugin registration ----------------------------------
         let client_hub = ctx.client_hub();
+
+        // @cpt-cf-chat-engine-component-policy-enforcer
+        // Resolve the AuthZ PDP client and build a single PolicyEnforcer Arc-cloned into
+        // every domain service. No service constructs AccessScope manually.
+        let authz: Arc<dyn AuthZResolverClient> = client_hub
+            .get::<dyn AuthZResolverClient>()
+            .map_err(|e| anyhow::anyhow!("chat-engine: failed to resolve AuthZ client: {e}"))?;
+        let enforcer = PolicyEnforcer::new(authz);
         let webhook_compat = Arc::new(
             WebhookCompatPlugin::new(DEFAULT_WEBHOOK_COMPAT_INSTANCE_ID)
                 .map_err(|e| anyhow::anyhow!("failed to build webhook-compat plugin: {e}"))?,
@@ -380,6 +392,7 @@ impl Gear for ChatEngineModule {
                 session_types_repo.clone(),
                 plugin_service.clone(),
                 webhooks_domain.clone(),
+                enforcer.clone(),
             )
             .with_plugin_timeout(plugin_deadline),
         );
@@ -396,6 +409,7 @@ impl Gear for ChatEngineModule {
                 session_types_repo.clone(),
                 messages_repo.clone(),
                 plugin_service.clone(),
+                enforcer.clone(),
             )
             .with_webhook_emitter(webhooks_domain.clone())
             .with_streaming_buffer_size(config.ndjson_buffer_size)
@@ -411,6 +425,7 @@ impl Gear for ChatEngineModule {
                 variants_repo.clone(),
                 plugin_service.clone(),
                 Arc::clone(&messages),
+                enforcer.clone(),
             )
             .with_plugin_timeout(plugin_deadline),
         );
@@ -421,6 +436,7 @@ impl Gear for ChatEngineModule {
             messages_repo.clone(),
             reactions_repo.clone(),
             plugin_service.clone(),
+            enforcer.clone(),
         ));
 
         // Production wiring intentionally uses the not-implemented backend:
@@ -434,6 +450,7 @@ impl Gear for ChatEngineModule {
             sessions_repo.clone(),
             messages_repo.clone(),
             search_backend,
+            enforcer.clone(),
         ));
 
         let intelligence = Arc::new(
@@ -442,6 +459,7 @@ impl Gear for ChatEngineModule {
                 session_types_repo.clone(),
                 messages_repo.clone(),
                 plugin_service.clone(),
+                enforcer.clone(),
             )
             .with_buffer_size(config.summary_buffer_size)
             .with_summary_deadline(plugin_deadline)
@@ -463,8 +481,13 @@ impl Gear for ChatEngineModule {
         // `memory://` URL (RUST-NO-001).
         let export_storage = Arc::new(NotImplementedExportStorage);
         let export = Arc::new(
-            ExportService::new(sessions_repo.clone(), messages_repo.clone(), export_storage)
-                .with_share_urls(share_urls),
+            ExportService::new(
+                sessions_repo.clone(),
+                messages_repo.clone(),
+                export_storage,
+                enforcer.clone(),
+            )
+            .with_share_urls(share_urls),
         );
 
         let services = ChatEngineServices {

@@ -28,7 +28,7 @@
 
 ### 1.1 Overview
 
-Ships one canonical, opt-in watch-restart combinator for all three watch types. It turns retryable terminal closes into transparent reconnection with backoff, synthesizes a reset on each successful resubscribe so the consumer re-reads state, and propagates non-retryable closes unchanged. Consumers wanting a custom loop can still consume the raw watch stream.
+Ships one canonical, opt-in watch-restart combinator for both watch types. It turns retryable terminal closes into transparent reconnection with backoff, synthesizes a reset on each successful resubscribe so the consumer re-reads state, and propagates non-retryable closes unchanged. Consumers wanting a custom loop can still consume the raw watch stream.
 
 ### 1.2 Purpose
 
@@ -56,7 +56,6 @@ The related uniform watch-lifecycle-signals requirement (`cpt-cf-clst-fr-watch-l
 - **Dependencies**:
   - [x] `p2` - `cpt-cf-clst-feature-cache-primitive`
   - [x] `p2` - `cpt-cf-clst-feature-leader-election`
-  - [x] `p2` - `cpt-cf-clst-feature-service-discovery`
 
 **Review domains**:
 - Security — not applicable: the SDK contract exposes no authentication or authorization surface; transport authentication, credential wiring, and tenant isolation are backend/plugin concerns deferred to the OOP deployment design (PRD §4.2).
@@ -79,7 +78,7 @@ The related uniform watch-lifecycle-signals requirement (`cpt-cf-clst-fr-watch-l
 - The retry cap is exhausted — the most recent close propagates unchanged.
 
 **Steps**:
-1. [x] - `p1` - Consumer wraps any of the three watches with the auto-restart combinator and a retry policy - `inst-ar-wrap`
+1. [x] - `p1` - Consumer wraps either watch with the auto-restart combinator and a retry policy - `inst-ar-wrap`
 2. [x] - `p1` - Consumer awaits events as if from the raw watch - `inst-ar-next`
 3. [x] - `p1` - **IF** a terminal close is retryable - `inst-ar-retryable`
    1. [x] - `p1` - Reconnect after backoff and emit a reset on successful resubscribe - `inst-ar-reset`
@@ -143,7 +142,7 @@ The system **MUST** provide a retry policy with initial backoff, maximum backoff
 
 - [x] `p1` - **ID**: `cpt-cf-clst-dod-watch-auto-restart-combinator`
 
-The system **MUST** provide a restarting-watch combinator available for all three watch types via a single uniform policy type, reading retryability from the provider error classification, emitting a reset on each successful resubscribe, and propagating non-retryable and shutdown closes unchanged. The raw watch stream **MUST** remain consumable without the combinator.
+The system **MUST** provide a restarting-watch combinator available for both watch types via a single uniform policy type, reading retryability from the provider error classification, emitting a reset on each successful resubscribe, and propagating non-retryable and shutdown closes unchanged. The raw watch stream **MUST** remain consumable without the combinator.
 
 **Implements**:
 - `cpt-cf-clst-flow-watch-auto-restart-wrap`
@@ -154,7 +153,7 @@ The system **MUST** provide a restarting-watch combinator available for all thre
 
 ## 6. Acceptance Criteria
 
-- [x] The combinator is available for cache, leader-election, and service-discovery watches via one uniform policy type.
+- [x] The combinator is available for the cache and leader-election watches via one uniform policy type.
 - [x] Retryable terminal closes (connection-lost, timeout, resource-exhausted) trigger reconnect with backoff and a synthesized reset.
 - [x] Non-retryable closes (auth-failure, other, shutdown, capability-not-met, lock/leader terminal) propagate unchanged.
 - [x] The default policy is one second to thirty seconds exponential backoff with full jitter and no cap; an exhausted cap propagates the most recent close.

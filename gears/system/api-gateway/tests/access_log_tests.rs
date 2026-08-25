@@ -344,7 +344,7 @@ async fn e2e_full_middleware_stack_logs_remote_addr() -> anyhow::Result<()> {
     let router = OperationBuilder::get("/tests/v1/access-log-e2e")
         .operation_id("test:access-log-e2e")
         .summary("E2E access log test")
-        .public()
+        .anonymous()
         .json_response(StatusCode::OK, "OK")
         .handler(get(e2e_handler))
         .register(Router::new(), &api);

@@ -1,4 +1,8 @@
-//! Domain layer: repo-facing value types and errors.
+//! Pure accounting domain model and rules.
+//!
+//! Contains money and posting types, invariants, policies, errors, and workflows
+//! for invoices, payments, adjustments, FX, recognition, and period handling.
+//! Outbound [`ports`] keep transport and persistence concerns outside the domain.
 
 pub mod adjustment;
 pub mod allocate;

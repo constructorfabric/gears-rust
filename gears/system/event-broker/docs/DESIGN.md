@@ -51,7 +51,7 @@ The architecture follows a **multi-service decomposition** with four internal se
 - **Dispatcher Service**: HTTP gateway that routes requests between ingest and delivery services. In cluster mode, the dispatcher performs **topic-based routing** for producers (directing writes to the ingest shard owning the topic) and **consumer-group sticky routing** for consumers (directing polls to the delivery shard owning the consumer group). Optional — not needed in standalone mode.
 - **Storage Backend**: Pluggable persistence layer following the ModKit plugin pattern. Backend implementations (in-memory, database, file-based, remote archive) register themselves via GTS instance discovery, provide a JSON Schema for their configuration, and are resolved at runtime by the event broker module — `types_registry` for discovery, `ClientHub` scoped clients for resolution.
 
-All four services are implemented as **domain traits within a single `event_broker` crate**, using DDD-Light layering. In standalone mode they run in-process, communicating directly via trait calls. In cluster mode, a **ClusterCapabilities** platform abstraction provides the coordination primitives (pub/sub, leader election, distributed locks, service discovery) needed for ingest and delivery to scale independently.
+All four services are implemented as **domain traits within a single `event_broker` crate**, using DDD-Light layering. In standalone mode they run in-process, communicating directly via trait calls. In cluster mode, a **ClusterCapabilities** platform abstraction provides the coordination primitives (pub/sub, leader election, distributed locks) needed for ingest and delivery to scale independently; instance discovery comes from `DirectoryService`.
 
 The dispatcher is a **stateless HTTP router** — it performs topic-based and consumer-group-based routing using consistent hashing, but does **not** relay notifications. Event notifications flow directly from ingest to delivery shards via `ClusterCapabilities.publish()`, bypassing the dispatcher entirely. This means multiple dispatcher instances can run behind a load balancer without coordination.
 
@@ -78,13 +78,13 @@ The **producer client library** (`cf-gears-event-broker-sdk`) is built on top of
 
 **Architecture Decision Records**:
 
-- future ADR (service-decomposition) — Multi-service composite (ingest, delivery, dispatcher, storage backends)
+- `cpt-cf-evbk-adr-service-decomposition` — Multi-service composite (ingest, delivery, dispatcher, storage backends); single-binary/multi-mode process shape; per-mode `cluster` gear resolution. See [`ADR/0007-service-decomposition.md`](ADR/0007-service-decomposition.md).
 - future ADR (storage-backend-plugin) — Storage backends as ModKit plugins with GTS discovery and self-describing config schemas
 - `cpt-cf-evbk-design-sequence-assignment` — Three-sequence model: producer chain (`previous`, `sequence`) for ingest-side dedup (chained / monotonic / stateless modes); outbox sequence (toolkit-db) for in-pipeline order preservation; offset (backend) for consumer-visible ordering
 - future ADR (idempotent-producers) — Idempotent producers via Producer-Id + per-`(producer_id, topic, partition)` sequence tracking. No epoch fencing — sequence ordering itself acts as the fence.
 - future ADR (consumer-lifecycle) — Subscription-based consumers with session timeout and offset tracking
 - future ADR (outbox-ingest) — Outbox-based producer library and ingest pipeline built on `toolkit-db` outbox
-- future ADR (cluster-capabilities) — Platform-level cluster coordination abstraction (pub/sub, leader election, locks, discovery) with pluggable providers
+- future ADR (cluster-capabilities) — Platform-level cluster coordination abstraction (pub/sub, leader election, locks) with pluggable providers
 - future ADR (long-polling) — Notification-based long-poll via ClusterCapabilities pub/sub
 - future ADR (topic-sharding) — Topic-sharded ingest and consumer-group-sharded delivery in cluster mode
 - future ADR (dispatcher) — Stateless HTTP router with topic-based and consumer-group sticky-session routing
@@ -114,7 +114,7 @@ The consumption transport surface (`/events:stream` for `multipart/mixed`, `/eve
 |---|---|
 | Rust / Axum | HTTP transport, async runtime |
 | SeaORM + `toolkit-db` | Database persistence (PostgreSQL, MySQL, SQLite) |
-| `ClusterCapabilities` (Gears platform) | Cluster coordination: pub/sub, leader election, distributed locks, service discovery. Pluggable providers (K8s, Redis, NATS, DB-only, standalone/in-process) |
+| `ClusterCapabilities` (Gears platform) | Cluster coordination: pub/sub, leader election, distributed locks. Pluggable providers (K8s, Redis, NATS, DB-only, standalone/in-process) |
 | `toolkit-security` | Bearer token authentication & authorization |
 | `types_registry` | GTS schema/instance registration |
 
@@ -603,9 +603,9 @@ modules/system/event-broker/
         │   │       └── memory.rs  # InMemoryStorageBackend
         │   ├── cluster/           # ClusterCapabilities integration
         │   │   └── notifications.rs # Event notification via cluster.publish/subscribe
-        │   ├── workers/           # Background workers
-        │   │   ├── cleaner.rs     # Fully-consumed event cleanup
-        │   │   ├── retention.rs   # Retention policy enforcement
+        │   ├── workers/           # Background workers (broker-owned only;
+        │   │   │                 # event deletion is the storage backend's
+        │   │   │                 # responsibility, see §3.7 Key Invariants)
         │   │   └── reaper.rs      # Expired subscription + idempotency cleanup
         │   ├── dispatcher/        # Optional HTTP gateway
         │   │   ├── proxy.rs       # Proxy handler (routes to ingest service)
@@ -745,7 +745,20 @@ The event broker consumes the platform-level cluster system module (see `modules
 - **`ClusterCacheV1`** — KV with TTL, version-based CAS, and watch notifications. Methods: `get`, `put`, `delete`, `contains`, `put_if_absent`, `compare_and_swap`, `watch`, `watch_prefix`.
 - **`LeaderElectionV1`** — leader election with TTL and renewal config.
 - **`DistributedLockV1`** — TTL-bounded distributed locks with explicit async release.
-- **`ServiceDiscoveryV1`** — register / discover / watch service instances.
+
+Instance discovery is **not** a cluster-gear primitive. The cluster gear serves cache,
+leader election and locks only; registering and discovering service instances is
+`DirectoryService`'s job (ADR-0009, instance-addressable discovery), which every gear
+already registers with at startup.
+
+> **Open — broker team.** The shard-discovery and liveness rows below were written
+> against the cluster gear's `ServiceDiscoveryV1`, which has been removed. The
+> `DirectoryService` equivalents are `resolve_by_labels` (shard/role targeting) and the
+> framework's own self-registration / drain (registration). Two gaps need the broker
+> team's decision before these rows are settled: ADR-0009's Layer 1 is **poll-based**
+> with no topology watch, and its instance heartbeat-loss timing must be confirmed
+> against the broker's failover budget (PRD §"Convergence on a delivery instance's
+> death").
 
 There is **no separate pub/sub primitive**. The cluster module deliberately keeps reliable messaging out of scope (per its DESIGN.md §"Reliable messaging belongs in the event broker"). The broker realizes its own pub/sub semantics on top of `ClusterCacheV1::put` + `ClusterCacheV1::watch` — a publisher does `cache.put(notif_key, marker, ttl=short)` to trigger watchers; subscribers do `cache.watch(notif_key)` and act on the `Changed` event (the watch event carries only the key, no payload — consumers consult their local data structures or `cache.get` if they need state).
 
@@ -759,8 +772,8 @@ There is **no separate pub/sub primitive**. The cluster module deliberately keep
 | Subscription / GroupState / Cursor cache | `ClusterCacheV1` | `cache.get / put / put_if_absent / compare_and_swap` | Across delivery shard's request handling |
 | Group rebalance serialization | `DistributedLockV1` | `lock.try_lock("evbk.group.{group}.rebalance", ttl)` | Per-group rebalance critical section |
 | Worker singleton (Reaper) | `LeaderElectionV1` | `election.elect("evbk.worker.reaper")` | Ensures one Reaper runner across the cluster |
-| Shard discovery | `ServiceDiscoveryV1` | `sd.discover(role: ingest \| delivery)` | Dispatcher, to build its routing table; delivery shard, to consult instance liveness on circuit-breaker open |
-| Shard registration | `ServiceDiscoveryV1` | `sd.register(info)` / `sd.deregister()` | Ingest and Delivery instances at startup / graceful shutdown |
+| Shard discovery | `DirectoryService` *(open, see above)* | `resolve_by_labels(gear, {role: ingest \| delivery})` | Dispatcher, to build its routing table; delivery shard, to consult instance liveness on circuit-breaker open |
+| Shard registration | Framework self-registration *(open, see above)* | automatic at startup; deregistration on drain | Ingest and Delivery instances at startup / graceful shutdown |
 | Topic rebalancing across ingest shards | `DistributedLockV1` | `lock.try_lock("evbk.rebalance:{T}", ttl)` | When topic ownership transfers between ingest shards (drain outbox before handoff) |
 
 Throughout the design, prose phrasings like *"ingest publishes a notification"* / *"delivery subscribes"* are shorthand for the `cache.put` + `cache.watch` realization above. The high-level abstraction-level pseudo-code (`cluster.publish(...)` / `cluster.subscribe(...)`) preserves readability; implementation maps it to the cache primitive.
@@ -1334,9 +1347,9 @@ When a JOIN arrives for a `consumer_group` with no cache entry (= new group):
 
 ##### Failover
 
-If a delivery instance B becomes unavailable, the broker uses **service-discovery as the source of truth for liveness** — never any single dispatcher's local view. This prevents one dispatcher's connectivity blip from causing cluster-wide ownership thrashing.
+If a delivery instance B becomes unavailable, the broker uses **`DirectoryService` as the source of truth for liveness** — never any single dispatcher's local view. This prevents one dispatcher's connectivity blip from causing cluster-wide ownership thrashing.
 
-**Cache invalidation under partial connectivity**: when a dispatcher A's circuit-breaker opens against delivery instance B, A MUST consult `ServiceDiscoveryV1::discover` to check B's liveness **before** invalidating the shared `evbk.group.endpoint:{...}` cache entry:
+**Cache invalidation under partial connectivity**: when a dispatcher A's circuit-breaker opens against delivery instance B, A MUST consult `DirectoryService` to check B's liveness **before** invalidating the shared `evbk.group.endpoint:{...}` cache entry:
 
 1. **A circuit-breaks on B** — local outbound failures (HTTP timeout, connection refused) trip A's per-endpoint circuit-breaker.
 2. **A consults SD**: `sd.discover(role: delivery, instance: B)`.
@@ -1815,7 +1828,7 @@ The broker validates GTS format on every JOIN. Named identifiers must already be
 **Delivery shard graceful shutdown** (e.g., k8s SIGTERM):
 1. Respond to each in-flight long-poll with `410 Gone`, body `{ "detail": "Subscription terminated; re-JOIN to recover" }`.
 2. Release group ownership in the cache (`evbk.group.endpoint:{group_G}` cleared).
-3. Deregister from service discovery (`cluster.deregister_shard(...)`).
+3. Deregister from `DirectoryService` (framework drain).
 4. Process exits.
 
 Ungraceful kill (SIGKILL / crash) skips steps 1–3: consumer connections drop, dispatcher's circuit breaker on the dead endpoint invalidates the cache, the consumer SDK's next poll routes through dispatcher → fresh resolution → new owner shard, which doesn't recognize the old `subscription_id` and returns `404`. From the SDK's perspective the recovery path is identical to the 410 case.
@@ -1936,7 +1949,7 @@ Both must pass on publish; both must pass at subscribe. They cover different con
 | `api_ingress` | REST API hosting at the platform's HTTP entry point. |
 | `toolkit-db` | Database persistence (SeaORM, multi-backend) and the transactional outbox library used by both producer SDK and ingest pipeline. |
 | `toolkit-security` | Bearer token authentication; populates `SecurityContext`. |
-| `cluster` system module | `ClusterCacheV1` (KV with TTL, CAS, watch), `LeaderElectionV1`, `DistributedLockV1`, `ServiceDiscoveryV1`. |
+| `cluster` system module | `ClusterCacheV1` (KV with TTL, CAS, watch), `LeaderElectionV1`, `DistributedLockV1`. |
 
 ### 3.5 External Dependencies
 
@@ -2239,7 +2252,7 @@ In cluster mode:
   - The dispatcher resolves `subscription_id` → `consumer_group` via the subscription resolution cache (§3.2 Subscription Resolution Cache). JOIN endpoints (`POST /v1/subscriptions`) carry `consumer_group` and `topics` in the body so the first lookup is skipped.
   - Dispatchers discover ingest/delivery instances via `cluster.discover_shards()`. All dispatcher instances see the same shard membership.
 - **Event notifications** flow directly from ingest to delivery via `cluster.publish()` / `cluster.subscribe()` — they do NOT pass through the dispatcher. This means multiple dispatcher instances require no shared state for notifications.
-- **Worker leader election** uses `cluster.leader_election()` — only one node runs the cleaner for a given `(topic, partition)`, etc.
+- **Worker leader election** uses `cluster.leader_election()` — only one node runs the `reaper` cluster-wide (`evbk.worker.reaper`).
 - All instances share the same database. The ClusterCapabilities provider is the only external dependency beyond the database.
 
 #### Deployment Variants
@@ -2385,8 +2398,6 @@ modules:
       min_session_timeout: PT1S
 
     workers:
-      cleaner_interval_secs: 60
-      retention_interval_secs: 300
       reaper_interval_secs: 60
 ```
 
@@ -2577,6 +2588,7 @@ This DESIGN traces back to the [PRD.md](PRD.md) functional and non-functional re
 - [ADR/0002-partition-selection.md](ADR/0002-partition-selection.md) — `cpt-cf-evbk-adr-partition-selection`. **Revised** to drop the explicit `partition` producer override; the broker is now authoritative for partition assignment, deriving from `partition_key` (when present) or `tenant_id` (default). Realizes the Event-schema partition derivation referenced in §3.1 Event Schema and §3.6 Two Sequences. Native Kafka producer partitioner compatibility is not a supported producer contract.
 - [ADR/0003-event-schema.md](ADR/0003-event-schema.md) — `cpt-cf-evbk-adr-event-schema`. Defines the canonical event schema: single JSON Schema with field-level `readOnly` / `writeOnly` markers (no separate read-side file), optional versioned `meta` block for transport mechanics (marked `writeOnly`), `tenant_id` as producer-supplied, `subject_type` retained, `created_at` dropped, `offset`/`offset_time` renamed to `sequence`/`sequence_time` (`readOnly`), broker-native naming (no CloudEvents conformance), ASCII event-field encoding rule. Realized by `schemas/event.v1.schema.json`.
 - [ADR/0004-idempotent-producer-protocol.md](ADR/0004-idempotent-producer-protocol.md) — `cpt-cf-evbk-adr-idempotent-producer-protocol`. Mode declared at registration (`POST /v1/producers { mode }`), enforced per request. Mode-shape hard errors at the wire boundary. Producer-registration TTL + operator-driven `POST :reset`. Single-writer concurrency. Realized by §3.2 Producer Modes (shrunk) and `docs/features/0001-idempotent-producers.md`.
+- [ADR/0007-service-decomposition.md](ADR/0007-service-decomposition.md) — `cpt-cf-evbk-adr-service-decomposition`. Single binary, multi-mode (not a three-binary split); `domain/cluster.rs` resolves the platform `cluster` gear's real `cluster-sdk` facades directly rather than a bespoke `ClusterCapabilities` abstraction; no dispatcher is constructed in standalone mode. Realized by the `event-broker` crate skeleton and `DeploymentMode`'s per-mode activation predicates (`ingest_active()` etc.) - structure and mode-decision scaffolding only; real service construction and route gating land with #4345/#4346/#4347.
 
 The remaining ADR identifiers referenced in §1.2 (future ADR (cluster-capabilities), future ADR (long-polling), future ADR (topic-sharding), future ADR (dispatcher), `cpt-cf-evbk-design-sequence-assignment`, future ADR (outbox-ingest)) are documented inline in this DESIGN.md and will be extracted into standalone canonical ADR files in follow-up design iterations.
 

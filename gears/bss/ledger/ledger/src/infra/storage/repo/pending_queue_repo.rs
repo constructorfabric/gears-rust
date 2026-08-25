@@ -30,6 +30,7 @@
 //! (`.secure().scope_with…`) for SQL-level BOLA — a foreign tenant sees no rows.
 
 use chrono::{DateTime, Utc};
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveValue::Set,

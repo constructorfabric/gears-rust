@@ -59,7 +59,6 @@ pub struct AppHarnessBuilder {
     skip_upstream_tls_verify: bool,
     websocket_idle_timeout: Option<Duration>,
     websocket_close_timeout: Option<Duration>,
-    websocket_max_frame_size: Option<usize>,
 }
 
 impl AppHarnessBuilder {
@@ -103,12 +102,6 @@ impl AppHarnessBuilder {
         self
     }
 
-    /// Override the maximum WebSocket frame payload size.
-    pub fn with_websocket_max_frame_size(mut self, size: usize) -> Self {
-        self.websocket_max_frame_size = Some(size);
-        self
-    }
-
     pub async fn build(self) -> AppHarness {
         let hub = ClientHub::new();
 
@@ -133,9 +126,6 @@ impl AppHarnessBuilder {
         }
         if let Some(timeout) = self.websocket_close_timeout {
             dp_builder = dp_builder.with_websocket_close_timeout(timeout);
-        }
-        if let Some(size) = self.websocket_max_frame_size {
-            dp_builder = dp_builder.with_websocket_max_frame_size(Some(size));
         }
         dp_builder =
             dp_builder.with_token_http_config(toolkit_http::HttpClientConfig::for_testing());

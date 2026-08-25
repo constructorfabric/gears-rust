@@ -71,7 +71,7 @@ async fn fixture() -> DlqOutboxFixture {
     let dsn = format!("sqlite:file:evbk_showcase_outbox_dlq_{seq}?mode=memory&cache=shared");
     let raw = Database::connect(&dsn).await.expect("raw sqlite connect");
     let backend = raw.get_database_backend();
-    raw.execute(Statement::from_string(
+    raw.execute_raw(Statement::from_string(
         backend,
         LOCAL_DB_OFFSET_STORE_MIGRATION_SQL.to_owned(),
     ))

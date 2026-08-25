@@ -1,7 +1,7 @@
 //! Custom table-prefix outbox example.
 //!
 //! Run:
-//!   cargo run -p cf-gears-toolkit-db --example `outbox_custom_prefix` --features sqlite,preview-outbox
+//!   cargo run -p cf-gears-toolkit-db --example `outbox_custom_prefix` --features sqlite
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

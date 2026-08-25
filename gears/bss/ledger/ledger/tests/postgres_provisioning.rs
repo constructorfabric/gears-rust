@@ -1,6 +1,6 @@
 //! Postgres-only integration tests for the transactional seller-provisioning
 //! seed (`ProvisioningService::provision`). Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_provisioning -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_provisioning -- --ignored`.
 //!
 //! Covers: (a) the seed is idempotent + additive across repeated calls
 //! (created-vs-existing counts + raw row counts hold); (b) a scale exceeding
@@ -41,7 +41,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 /// extraction idiom: `row.try_get::<i64>("", "count")`).
 async fn count(db: &DatabaseConnection, sql: impl Into<String>) -> i64 {
     let row = db
-        .query_one(pg(sql))
+        .query_one_raw(pg(sql))
         .await
         .unwrap()
         .expect("count query must return a row");
@@ -165,7 +165,7 @@ async fn provision_is_idempotent_and_additive() {
         1
     );
     let status_row = db
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT status FROM bss.ledger_fiscal_period \
              WHERE tenant_id='{tenant_id}' AND legal_entity_id='{tenant_id}' \
                AND period_id='{expected_period}'"

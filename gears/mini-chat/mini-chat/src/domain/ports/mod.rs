@@ -21,7 +21,7 @@ use super::error::DomainError;
 ///
 /// Identical shape to `oagw_sdk::BodyStream` — conversion at the infra
 /// boundary is zero-cost. Defined here to keep the domain layer free of
-/// HTTP / infra SDK dependencies (enforced by dylint).
+/// HTTP / infra SDK dependencies (enforced by `cargo gears lint`).
 pub type FileStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>>;
 

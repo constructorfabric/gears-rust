@@ -82,23 +82,7 @@ per-primitive file (linked under each section heading) using a fixed template:
 
 **Details:** [lock.md](./lock.md)
 
-## 4. Service Discovery (`SC-DISC-*`)
-
-| ID | Layer | Status | Scenario | Capability gate | Traces to |
-|----|-------|--------|----------|-----------------|-----------|
-| SC-DISC-001 | L2 | ☐ | `register` assigns an `instance_id` when omitted; new registrations default to `Enabled` | — | `fr-sd-register` |
-| SC-DISC-002 | L2 | ☐ | default `DiscoveryFilter` returns only `Enabled` instances | — | `fr-sd-discover` |
-| SC-DISC-003 | L2 | ☐ | metadata predicates AND-combine; `Equals` and `OneOf` match correctly | `metadata_pushdown` (else client-side) | `fr-sd-discover` |
-| SC-DISC-004 | L2 | ☐ | result-set order is treated as unspecified (suite sorts before asserting) | — | `fr-sd-discover` |
-| SC-DISC-005 | L2 | ☐ | `set_state(Disabled)` drains an instance; `deregister` removes it (watchers see `Left`) | — | `fr-sd-state` |
-| SC-DISC-006 | L2 | ☐ | a registration disappears after its heartbeat/TTL stops (liveness ≠ intent) | — | `fr-sd-state`, ADR-008 |
-| SC-DISC-007 | L2 | ☐ | `watch` yields `Joined`/`Left`/`Updated`; filtering is client-side | — | `fr-sd-watch` |
-| SC-DISC-008 | L2 | ☐ | metadata keys are NOT scoped; service `name` IS scoped | — | `fr-namespacing-sd-metadata-unscoped` |
-| SC-DISC-009 | L4 | ☐ | after `Lagged`/`Reset`, re-reading membership via `discover` recovers state | — | `fr-sd-watch` |
-
-**Details:** [discovery.md](./discovery.md)
-
-## 5. Resolution & Capability Validation (`SC-RESV-*`)
+## 4. Resolution & Capability Validation (`SC-RESV-*`)
 
 | ID | Layer | Status | Scenario | Capability gate | Traces to |
 |----|-------|--------|----------|-----------------|-----------|
@@ -109,7 +93,7 @@ per-primitive file (linked under each section heading) using a fixed template:
 
 **Details:** [resolution.md](./resolution.md)
 
-## 6. Scoping & Namespacing (`SC-SCOP-*`)
+## 5. Scoping & Namespacing (`SC-SCOP-*`)
 
 | ID | Layer | Status | Scenario | Capability gate | Traces to |
 |----|-------|--------|----------|-----------------|-----------|
@@ -120,22 +104,21 @@ per-primitive file (linked under each section heading) using a fixed template:
 | SC-SCOP-005 | L2 | ☐ | leader-election names are scoped by `scoped(p)` | — | §3.8 |
 | SC-SCOP-006 | L2 | ☐ | lock names are scoped by `scoped(p)` | — | §3.8 |
 
-(Service-discovery name scoping — and metadata staying unscoped — is [SC-DISC-008](./discovery.md).)
 
 **Details:** [scoping.md](./scoping.md)
 
-## 7. Watch Auto-Restart Combinator (`SC-REST-*`)
+## 6. Watch Auto-Restart Combinator (`SC-REST-*`)
 
 | ID | Layer | Status | Scenario | Capability gate | Traces to |
 |----|-------|--------|----------|-----------------|-----------|
 | SC-REST-001 | L2 | ☐ | retryable `Closed` (`ConnectionLost`/`Timeout`/`ResourceExhausted`) reconnects and emits `Reset` | — | `fr-watch-auto-restart` |
 | SC-REST-002 | L2 | ☐ | non-retryable `Closed` (`AuthFailure`/`Shutdown`/`CapabilityNotMet`) propagates unchanged | — | `fr-watch-auto-restart` |
 | SC-REST-003 | L2 | ☐ | backoff honors `RetryPolicy` (initial/max/jitter); exhausting `max_retries` propagates the last `Closed` | — | `fr-watch-auto-restart` |
-| SC-REST-004 | L2 | ☐ | the combinator is available for all three watch types via one `RetryPolicy` | — | `fr-watch-auto-restart` |
+| SC-REST-004 | L2 | ☐ | the combinator is available for both watch types via one `RetryPolicy` | — | `fr-watch-auto-restart` |
 
 **Details:** [restart.md](./restart.md)
 
-## 8. Lifecycle & Shutdown (`SC-LIFE-*`) — requires the wiring crate
+## 7. Lifecycle & Shutdown (`SC-LIFE-*`) — requires the wiring crate
 
 | ID | Layer | Status | Scenario | Capability gate | Traces to |
 |----|-------|--------|----------|-----------------|-----------|
@@ -148,7 +131,7 @@ per-primitive file (linked under each section heading) using a fixed template:
 
 **Details:** [lifecycle.md](./lifecycle.md)
 
-## 9. Static Analysis (`SC-LINT-*`)
+## 8. Static Analysis (`SC-LINT-*`)
 
 | ID | Layer | Status | Scenario | Capability gate | Traces to |
 |----|-------|--------|----------|-----------------|-----------|
@@ -157,11 +140,11 @@ per-primitive file (linked under each section heading) using a fixed template:
 
 **Details:** [static-analysis.md](./static-analysis.md)
 
-## 10. Watch Lifecycle Uniformity (`SC-WLU-*`)
+## 9. Watch Lifecycle Uniformity (`SC-WLU-*`)
 
-Cross-cutting: the three watches (cache, leader, service-discovery) must expose the same
+Cross-cutting: both watches (cache, leader) must expose the same
 union shape and the same recovery model. Per-primitive instances of these signals also
-appear above (e.g. [SC-CACHE-016/017](./cache.md), [SC-DISC-009](./discovery.md)); this
+appear above (e.g. [SC-CACHE-016/017](./cache.md)); this
 section asserts the *uniformity* itself.
 
 | ID | Layer | Status | Scenario | Capability gate | Traces to |
@@ -173,7 +156,7 @@ section asserts the *uniformity* itself.
 
 **Details:** [watch-lifecycle.md](./watch-lifecycle.md)
 
-## 11. Naming & Validation (`SC-NAME-*`)
+## 10. Naming & Validation (`SC-NAME-*`)
 
 The cluster name rule (`[a-zA-Z0-9_/-]+`-style) is uniform across all coordination names
 so consumers reuse one convention; invalid names are rejected with `InvalidName`.
@@ -184,11 +167,11 @@ so consumers reuse one convention; invalid names are rejected with `InvalidName`
 | SC-NAME-002 | L2 | ☐ | an invalid election name is rejected with `InvalidName` | — | `fr-cache-storage` |
 | SC-NAME-003 | L2 | ☐ | an invalid lock name is rejected with `InvalidName` | — | `fr-cache-storage` |
 | SC-NAME-004 | L2 | ☐ | an invalid service name is rejected with `InvalidName` | — | `fr-sd-register` |
-| SC-NAME-005 | L2 | ☐ | the rule is uniform — a name valid (or invalid) for one primitive is so for all four | — | `fr-cache-storage` |
+| SC-NAME-005 | L2 | ☐ | the rule is uniform — a name valid (or invalid) for one primitive is so for all three | — | `fr-cache-storage` |
 
 **Details:** [naming.md](./naming.md)
 
-## 12. Routing & SDK Defaults (`SC-ROUTE-*`)
+## 11. Routing & SDK Defaults (`SC-ROUTE-*`)
 
 | ID | Layer | Status | Scenario | Capability gate | Traces to |
 |----|-------|--------|----------|-----------------|-----------|
@@ -200,7 +183,7 @@ binding, are wiring-level: [SC-LIFE-006](./lifecycle.md).)
 
 **Details:** [routing.md](./routing.md)
 
-## 13. Observability Contract (`SC-OBS-*`)
+## 12. Observability Contract (`SC-OBS-*`)
 
 Per `cpt-cf-clst-nfr-observability` / ADR-004, signal *names* are a contract every plugin
 must honor. Authoritative catalog: [OBSERVABILITY.md](../OBSERVABILITY.md).
@@ -221,7 +204,7 @@ must honor. Authoritative catalog: [OBSERVABILITY.md](../OBSERVABILITY.md).
 
 **A backend does *not* run every scenario.** The `cluster-conformance` suite is shared,
 but which scenarios a given backend exercises is filtered along three axes — so a
-cache-only plugin author is *not* on the hook to implement or test all four primitives.
+cache-only plugin author is *not* on the hook to implement or test all three primitives.
 
 ### Axis 1 — SDK-level scenarios run once, not per-backend
 
@@ -244,21 +227,21 @@ depends on `cluster`, so it can't be the one to prove this):
 ### Axis 2 — per-backend, only for primitives implemented *natively*
 
 Every backend implements cache, so **every backend runs the cache suite**
-([SC-CACHE-*](./cache.md)) against its real store. Leader/lock/SD obtained from the SDK
+([SC-CACHE-*](./cache.md)) against its real store. Leader/lock obtained from the SDK
 defaults are proven **once**, in the `cluster` gear's own test suite (SC-ROUTE-001); a
-backend re-runs the `cluster-conformance` leader/lock/discovery suites **only when it
+backend re-runs the `cluster-conformance` leader/lock suites **only when it
 ships a native override**. From DESIGN §4.1:
 
 | Backend | Runs natively (own conformance run) | Derived — proven once via SDK defaults |
 |---|---|---|
-| **NATS** | cache | leader, lock, service-discovery |
-| **Postgres** | cache, lock (`pg_advisory_lock`) | leader, service-discovery |
-| **Redis** | cache, lock (`SET NX EX`) | leader, service-discovery |
-| **etcd** | cache, leader, lock (native) | service-discovery |
-| **K8s** | cache, leader, lock, service-discovery (Lease/CRD) | — |
-| **Standalone** | cache, leader, lock, service-discovery (in-process) | — |
+| **NATS** | cache | leader, lock |
+| **Postgres** | cache, lock (`pg_advisory_lock`) | leader |
+| **Redis** | cache, lock (`SET NX EX`) | leader |
+| **etcd** | cache, leader, lock (native) | — |
+| **K8s** | cache, leader, lock (Lease/CRD) | — |
+| **Standalone** | cache, leader, lock (in-process) | — |
 
-So NATS runs ≈ one suite; K8s runs four. Neither runs the full catalog.
+So NATS runs ≈ one suite; K8s runs three. Neither runs the full catalog.
 
 ### Axis 3 — capability gates and layers filter within a run
 
@@ -266,7 +249,7 @@ So NATS runs ≈ one suite; K8s runs four. Neither runs the full catalog.
   (`features()` / `consistency()`); otherwise it asserts the documented fallback. E.g.
   `linearizable` gates [SC-LEAD-002](./leader.md); `prefix_watch` selects
   [SC-CACHE-013](./cache.md) (native) vs. [SC-CACHE-014](./cache.md) (polyfill);
-  `metadata_pushdown` selects server-side vs. client-side [SC-DISC-003](./discovery.md).
+  and `prefix_watch` likewise gates the polyfill path.
 - **L4** scenarios run selectively — typically only for backends claiming strong
   guarantees (e.g. split-brain testing a `linearizable` backend), not every backend.
 - **Observability** ([SC-OBS-*](./observability.md)): the contract assertions (001–004)

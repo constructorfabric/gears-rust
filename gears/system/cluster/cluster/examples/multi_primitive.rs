@@ -1,27 +1,25 @@
 //! Showcase: multi-primitive usage over a single backend.
 //!
-//! One cache backend, bound under one profile, yields all four coordination
-//! primitives — cache, leader election, distributed lock, and service discovery
-//! — via the SDK default backends (`CasBased*` / `CacheBased*`). This is the
-//! "implement cache only, get all four primitives" guarantee in action.
+//! One cache backend, bound under one profile, yields all three coordination
+//! primitives — cache, leader election, and distributed lock — via the SDK
+//! default backends (`CasBased*`). This is the "implement cache only, get all
+//! three primitives" guarantee in action.
 //!
 //! Run with: `cargo run --example multi_primitive`
 
 mod common;
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use cluster_sdk::cache::{PutRequest, Ttl};
-use cluster_sdk::discovery::{DiscoveryFilter, ServiceRegistration};
 use cluster_sdk::error::ClusterError;
 use cluster_sdk::leader::{LeaderStatus, LeaderWatch, LeaderWatchEvent};
 use cluster_sdk::profile::ClusterProfile;
-use cluster_sdk::{ClusterCacheV1, DistributedLockV1, LeaderElectionV1, ServiceDiscoveryV1};
+use cluster_sdk::{ClusterCacheV1, DistributedLockV1, LeaderElectionV1};
 use common::{MemCacheBackend, register_cache_and_siblings};
 use toolkit::client_hub::ClientHub;
 
-/// The single profile all four primitives resolve under.
+/// The single profile all three primitives resolve under.
 #[derive(Clone, Copy)]
 struct AppProfile;
 
@@ -31,14 +29,13 @@ impl ClusterProfile for AppProfile {
 
 #[tokio::main]
 async fn main() -> Result<(), ClusterError> {
-    // Bind one cache plus its three derived default backends under the profile.
+    // Bind one cache plus its two derived default backends under the profile.
     let hub = ClientHub::new();
     register_cache_and_siblings(&hub, AppProfile::NAME, MemCacheBackend::linearizable())?;
 
     cache_demo(&hub).await?;
     leader_demo(&hub).await?;
     lock_demo(&hub).await?;
-    discovery_demo(&hub).await?;
     Ok(())
 }
 
@@ -110,38 +107,5 @@ async fn lock_demo(hub: &ClientHub) -> Result<(), ClusterError> {
     // only local, bounded work belongs here.
     guard.release().await?;
     println!("[lock] released 'rebuild-index'");
-    Ok(())
-}
-
-/// Register an instance, discover it, then deregister via the handle.
-async fn discovery_demo(hub: &ClientHub) -> Result<(), ClusterError> {
-    let discovery = ServiceDiscoveryV1::resolver(hub)
-        .profile(AppProfile)
-        .resolve()?;
-
-    let mut metadata = HashMap::new();
-    metadata.insert("region".to_owned(), "us-east".to_owned());
-    let handle = discovery
-        .register(ServiceRegistration {
-            name: "api".to_owned(),
-            instance_id: None,
-            address: "10.0.0.1:8080".to_owned(),
-            metadata,
-        })
-        .await?;
-    println!("[discovery] registered instance {}", handle.instance_id());
-
-    let instances = discovery
-        .discover("api", DiscoveryFilter::default())
-        .await?;
-    for instance in &instances {
-        println!(
-            "[discovery] discovered {} at {}",
-            instance.instance_id, instance.address
-        );
-    }
-
-    handle.deregister().await?;
-    println!("[discovery] deregistered");
     Ok(())
 }

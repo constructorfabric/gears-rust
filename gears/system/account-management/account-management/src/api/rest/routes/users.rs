@@ -27,7 +27,8 @@ pub(super) fn register_users_routes(mut router: Router, openapi: &dyn OpenApiReg
              String fields (case-insensitive); combine via `and` / `or` / `not`. \
              Sort via `$orderby` over the same fields (default: `username ASC, id ASC` \
              with `id ASC` tiebreaker appended even when the caller supplies their own \
-             order). Point lookup is `$filter=id eq <uuid>` with `top=1`: empty page \
+             order). Point lookup is `$filter=id eq <uuid>` with `limit=1` (the \
+             toolkit-style page-size param; `$top` is not honoured): empty page \
              is the canonical \"user absent\" signal (no 404). Cursor pagination is \
              opaque; caller MUST NOT change `$filter` or `$orderby` between \
              continuation requests with the same cursor. AM persists no local user \
@@ -37,6 +38,18 @@ pub(super) fn register_users_routes(mut router: Router, openapi: &dyn OpenApiReg
         .authenticated()
         .no_license_required()
         .path_param("tenant_id", "Tenant UUID")
+        .query_param_typed(
+            "limit",
+            false,
+            "Maximum number of users to return. Optional in general -- \
+             omitting it falls back to a server-chosen page size. \
+             Conditionally required: when combined with \
+             `$filter=id eq <uuid>` it MUST be exactly 1, or the request \
+             is rejected with 400 -- `$top` is not honoured as a \
+             substitute.",
+            "integer",
+        )
+        .query_param("cursor", false, "Cursor for pagination")
         .with_odata_filter::<account_management_sdk::IdpUserFilterField>()
         .with_odata_orderby::<account_management_sdk::IdpUserFilterField>()
         .handler(handlers::list_users)
@@ -69,7 +82,7 @@ pub(super) fn register_users_routes(mut router: Router, openapi: &dyn OpenApiReg
              local user state -- the IdP becomes the source of truth on success. Returns \
              HTTP 201 Created with the projected user body. AM does NOT expose a per-user \
              GET; clients that need to re-read the user use the filtered listing \
-             `GET /tenants/{tenant_id}/users?$filter=id eq <uuid>&$top=1`.",
+             `GET /tenants/{tenant_id}/users?$filter=id eq <uuid>&limit=1`.",
         )
         .tag(API_TAG)
         .authenticated()
@@ -142,7 +155,13 @@ pub(super) fn register_users_routes(mut router: Router, openapi: &dyn OpenApiReg
              body projected through `gts.cf.core.am.user.v1~`. An empty patch is rejected \
              with `code=validation`. Unlike DELETE, a patch against a user the IdP reports \
              absent returns 404 -- it is NOT folded into success. A username rename that \
-             collides with an existing login returns 409.",
+             collides with an existing login returns 409. Attributes the provider manages \
+             and does not allow AM to override (e.g. federated from a read-only mapper) \
+             return 400 with one `context.field_violations[]` entry per refused property, \
+             each naming the refused request property in `.field` with \
+             `.reason=IDP_MANAGED_FIELD`, so a client can disable those inputs in one pass; \
+             this is deliberately NOT a 403, since writability is a property of the \
+             provider's schema rather than of the caller's grants.",
         )
         .tag(API_TAG)
         .authenticated()

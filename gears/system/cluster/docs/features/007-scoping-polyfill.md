@@ -29,13 +29,13 @@
 
 ### 1.1 Overview
 
-Lets a consumer carve composable sub-namespaces inside any primitive without manual prefixing, and synthesizes prefix-watch semantics on backends that lack native support. Scoping applies to coordination names only; for service discovery it scopes the service name but never the metadata keys or values.
+Lets a consumer carve composable sub-namespaces inside any primitive without manual prefixing, and synthesizes prefix-watch semantics on backends that lack native support. Scoping applies to coordination names only.
 
 ### 1.2 Purpose
 
 Without per-module namespacing, two modules sharing a profile would collide on cache keys, lock names, election names, and service names; manual prefixing is bug-prone. This feature handles namespacing transparently and provides a polyfill so prefix-watch consumers work even on backends without native prefix subscriptions.
 
-**Requirements**: `cpt-cf-clst-fr-namespacing-scoped`, `cpt-cf-clst-fr-namespacing-sd-metadata-unscoped`
+**Requirements**: `cpt-cf-clst-fr-namespacing-scoped`
 
 ### 1.3 Actors
 
@@ -52,7 +52,6 @@ Without per-module namespacing, two modules sharing a profile would collide on c
   - [x] `p2` - `cpt-cf-clst-feature-cache-primitive`
   - [x] `p2` - `cpt-cf-clst-feature-leader-election`
   - [x] `p2` - `cpt-cf-clst-feature-distributed-lock`
-  - [x] `p2` - `cpt-cf-clst-feature-service-discovery`
 
 **Review domains**:
 - Security — not applicable: the SDK contract exposes no authentication or authorization surface; transport authentication, credential wiring, and tenant isolation are backend/plugin concerns deferred to the OOP deployment design (PRD §4.2).
@@ -79,7 +78,6 @@ Without per-module namespacing, two modules sharing a profile would collide on c
    1. [x] - `p1` - **RETURN** an invalid-name error at scope construction - `inst-sn-reject`
 3. [x] - `p1` - On the write path the wrapper prepends the composed prefix to the coordination name - `inst-sn-prepend`
 4. [x] - `p1` - On the read path the wrapper strips the prefix before returning names to the consumer - `inst-sn-strip`
-5. [x] - `p1` - For service discovery the wrapper scopes only the service name; metadata keys and values pass through unchanged - `inst-sn-meta`
 
 ### Prefix Watch via Polyfill
 
@@ -115,7 +113,6 @@ Without per-module namespacing, two modules sharing a profile would collide on c
 1. [x] - `p1` - Compose nested prefixes into a single effective prefix ending with a separator - `inst-pt-compose`
 2. [x] - `p1` - On write, prepend the prefix to the cache key, lock name, election name, or service name - `inst-pt-write`
 3. [x] - `p1` - On read, strip the prefix from returned keys, instance names, and event keys - `inst-pt-read`
-4. [x] - `p1` - **IF** the primitive is service discovery - `inst-pt-sd`
    1. [x] - `p1` - Leave metadata keys and values unchanged - `inst-pt-sd-meta`
 
 ### Polling Diff
@@ -142,14 +139,14 @@ Not applicable — scoping wrappers and the polyfill are stateless translations 
 
 - [x] `p1` - **ID**: `cpt-cf-clst-dod-scoping-polyfill-wrappers`
 
-The system **MUST** provide scoping wrappers for all four primitives that prepend a validated prefix on the write path and strip it on the read path, compose cleanly when nested, and — for service discovery — scope only the service name, never metadata keys or values.
+The system **MUST** provide scoping wrappers for all three primitives that prepend a validated prefix on the write path and strip it on the read path, and compose cleanly when nested.
 
 **Implements**:
 - `cpt-cf-clst-flow-scoping-polyfill-scoped-names`
 - `cpt-cf-clst-algo-scoping-polyfill-prefix-translate`
 
 **Touches**:
-- Entities: ScopedCacheBackend, ScopedLeaderElectionBackend, ScopedDistributedLockBackend, ScopedServiceDiscoveryBackend
+- Entities: ScopedCacheBackend, ScopedLeaderElectionBackend, ScopedDistributedLockBackend
 
 ### Polling Prefix-Watch Polyfill
 
@@ -168,6 +165,5 @@ The system **MUST** provide an opt-in polling prefix-watch that synthesizes pref
 
 - [x] Scoping composes (per-module then per-shard) and is invisible inside consumer code; the backend sees the composed prefix.
 - [x] An invalid prefix is rejected at scope construction with an invalid-name error.
-- [x] For service discovery, scoping applies to the service name only; metadata keys and values are unchanged.
 - [x] The polling polyfill synthesizes changed/deleted prefix-watch events on backends without native support and documents its cost.
 - [x] Dropping a polyfilled watch stops its polling task.

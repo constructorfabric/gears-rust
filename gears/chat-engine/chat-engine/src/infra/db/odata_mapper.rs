@@ -80,24 +80,18 @@ impl ODataFieldMapping<SessionQueryFilterField> for SessionODataMapper {
 
     fn extract_cursor_value(model: &Model, field: SessionQueryFilterField) -> sea_orm::Value {
         match field {
-            SessionQueryFilterField::SessionId => {
-                sea_orm::Value::Uuid(Some(Box::new(model.session_id)))
-            }
+            SessionQueryFilterField::SessionId => sea_orm::Value::Uuid(Some(model.session_id)),
             SessionQueryFilterField::CreatedAt => {
-                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.created_at)))
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(model.created_at))
             }
             SessionQueryFilterField::UpdatedAt => {
-                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.updated_at)))
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(model.updated_at))
             }
             SessionQueryFilterField::LifecycleState => {
-                sea_orm::Value::String(Some(Box::new(model.lifecycle_state.clone())))
+                sea_orm::Value::String(Some(model.lifecycle_state.clone()))
             }
-            SessionQueryFilterField::SessionTypeId => {
-                sea_orm::Value::Uuid(model.session_type_id.map(Box::new))
-            }
-            SessionQueryFilterField::ClientId => {
-                sea_orm::Value::String(model.client_id.as_ref().map(|s| Box::new(s.clone())))
-            }
+            SessionQueryFilterField::SessionTypeId => sea_orm::Value::Uuid(model.session_type_id),
+            SessionQueryFilterField::ClientId => sea_orm::Value::String(model.client_id.clone()),
         }
     }
 }

@@ -32,10 +32,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cluster::defaults::{
-    CacheBasedServiceDiscoveryBackend, CasBasedDistributedLockBackend,
-    CasBasedLeaderElectionBackend,
-};
+use cluster::defaults::{CasBasedDistributedLockBackend, CasBasedLeaderElectionBackend};
 use cluster_sdk::cache::{
     CacheConsistency, CacheEntry, CacheEvent, CacheFeatures, CacheWatch, CacheWatchEvent,
     CacheWatchSender, ClusterCacheBackend, PutRequest, Ttl,
@@ -43,7 +40,6 @@ use cluster_sdk::cache::{
 use cluster_sdk::error::ClusterError;
 use cluster_sdk::registration::{
     register_cache_backend, register_leader_election_backend, register_lock_backend,
-    register_service_discovery_backend,
 };
 use parking_lot::Mutex;
 use tokio::time::Instant;
@@ -402,11 +398,11 @@ impl ClusterCacheBackend for MemCacheBackend {
     }
 }
 
-/// Registers a cache backend under `profile_name` together with the three SDK
-/// default backends derived from it — leader election, distributed lock, and
-/// service discovery — so all four primitives resolve against one cache.
+/// Registers a cache backend under `profile_name` together with the two SDK
+/// default backends derived from it — leader election and distributed lock — so
+/// all three primitives resolve against one cache.
 ///
-/// This is exactly the "implement cache only, get all four primitives"
+/// This is exactly the "implement cache only, get all three primitives"
 /// composition the follow-up wiring crate performs from operator config.
 ///
 /// # Errors
@@ -422,11 +418,9 @@ pub fn register_cache_and_siblings(
     // cache via `new()`; over a linearizable cache they construct cleanly.
     let leader = CasBasedLeaderElectionBackend::new(Arc::clone(&cache))?;
     let lock = CasBasedDistributedLockBackend::new(Arc::clone(&cache))?;
-    let discovery = CacheBasedServiceDiscoveryBackend::new(Arc::clone(&cache));
 
     register_cache_backend(hub, profile_name, cache)?;
     register_leader_election_backend(hub, profile_name, Arc::new(leader))?;
     register_lock_backend(hub, profile_name, Arc::new(lock))?;
-    register_service_discovery_backend(hub, profile_name, Arc::new(discovery))?;
     Ok(())
 }

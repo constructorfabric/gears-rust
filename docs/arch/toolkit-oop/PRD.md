@@ -142,6 +142,7 @@ application code remains deployment-agnostic. ToolKit Distributed Gears bring th
 - Deployment Profile 3: K8s Native (each gear = pod, external gateway, k8s DNS discovery)
 - Two-plane auth — gateway validates the JWT at the edge; OoP gears **re-validate it per hop** (tenant plane) and use a tenant-less identity for infra calls (platform plane). See [ADR-0008](ADR/0008-cpt-cf-adr-two-plane-auth.md)
 - Direct gear-to-gear REST communication (not routed through gateway)
+- Instance-addressable discovery — target a specific gear instance (role/shard) via additive directory metadata + targeted resolve, with round-robin remaining the default. Targeted selection does **not** expand the Toolkit's load-balancing scope beyond round-robin: the directory only enumerates/pinpoints instances; any pick-one over a matched set (e.g. consistent-hash sharding) is application-owned policy in the consuming gear. See [ADR-0009](ADR/0009-cpt-cf-adr-instance-addressable-discovery.md)
 - Public vs. internal API distinction in route registration
 - REST client generation from annotated Rust traits (trait-first, `#[toolkit::rest_contract]` proc-macro)
 - Gateway abstraction trait with built-in ToolKit implementation
@@ -279,6 +280,14 @@ basic service resolution in k8s.
   unnecessary complexity in k8s environments.
 - **Actors**: `cpt-cf-actor-platform-op`, `cpt-cf-actor-oop-worker`
 
+> **Amended by [ADR-0009 (Instance-Addressable Discovery)](ADR/0009-cpt-cf-adr-instance-addressable-discovery.md).**
+> This MUST is **unchanged for basic name resolution** — k8s DNS resolves a gear name and DirectoryService is still
+> not required for it. ADR-0009 adds a distinct **instance / shard targeting** capability that *does* resolve
+> through the directory (a gear cannot pick a *specific* instance through a shared Service VIP), and refines the
+> deployment shape: a gear that runs in differentiated **roles** or is **sharded** maps to *multiple* role-qualified
+> names — i.e. *multiple* k8s Services — rather than a single Service, and shard-targeted instances advertise a
+> **per-instance-addressable** endpoint (not a VIP).
+
 ### 5.4 Client Generation
 
 #### REST Client Generation
@@ -308,8 +317,10 @@ The ToolKit OoP runtime MUST manage the full gear startup lifecycle without gear
 3. In the background, resolve all dependencies declared in the gear's `deps` via DirectoryService. Wire REST clients
    into ClientHub as dependencies become available.
 4. Serve readiness probe (`/readyz`) returning 503 with unresolved dependency list until all critical `deps` are
-   resolved; then 200.
-5. Gear developers MUST NOT write retry loops, health-check polling, or registration code. The `deps` declaration in
+   resolved and the gear's registered healthcheck reports `Healthy`/`Degraded`; then 200.
+5. Serve diagnostics endpoint (`/health`) returning the full `HealthcheckReport` (`status` + per-component `components`),
+   `200` for `Healthy`/`Degraded` and `503` for `Unhealthy`.
+6. Gear developers MUST NOT write retry loops, health-check polling, or registration code. The `deps` declaration in
    `#[toolkit::gear(deps = [...])]` is the only input required.
 
 Gears with no `deps` (e.g., Flight Control, types-registry) become ready immediately after `start()`.
@@ -377,13 +388,16 @@ Active heartbeat-timeout reaping of unresponsive workers by the Platform Host is
 - [ ] `p1` - **ID**: `cpt-cf-fr-api-visibility`
 
 Gears MUST be able to mark API endpoints as public (registered in gateway for external access) or internal (available
-only for inter-gear communication via DirectoryService). The default MUST be internal. The existing
-`OperationBuilder.public()` / `OperationBuilder.authenticated()` mechanism and the resulting `OperationSpec.is_public`
-field MUST be used to drive this distinction.
+only for inter-gear communication via DirectoryService). The default MUST be internal. Visibility is an axis
+**orthogonal to authentication** and MUST be driven by the `OperationSpec.exposed` field, set via
+`OperationBuilder.exposed()`. It is independent of the auth axis (`OperationBuilder.authenticated()` /
+`OperationBuilder.anonymous()`, which set `OperationSpec.authenticated`): an exposed route MAY still require a JWT, and
+an internal route MAY be anonymous (e.g. probes). Auth-skip is carried on the auth axis (`!authenticated`, surfaced as
+the `AnonymousRoute` extension in the per-gear middleware), NOT by `exposed`.
 
 - **Rationale**: Not all gear APIs should be exposed to external consumers. Separating public and internal APIs
-  reduces attack surface and keeps the gateway configuration clean. The `OperationBuilder` already captures this intent
-  via `is_public`.
+  reduces attack surface and keeps the gateway configuration clean. Keeping visibility (`exposed`) orthogonal to
+  authentication (`authenticated`) lets gears expose authenticated public APIs and keep anonymous endpoints internal.
 - **Actors**: `cpt-cf-actor-gear-dev`, `cpt-cf-actor-platform-op`
 
 ### 5.6 Plugin Transparency (P2)

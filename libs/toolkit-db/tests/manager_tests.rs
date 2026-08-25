@@ -70,6 +70,7 @@ async fn test_dbmanager_server_merge() {
                 acquire_timeout: Some(Duration::from_secs(1)),
                 ..Default::default()
             }),
+            lock_keepalive: None,
             server: None,
         },
     );

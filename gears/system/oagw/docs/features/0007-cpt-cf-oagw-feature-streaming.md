@@ -134,25 +134,20 @@ Design constraints enforced: `cpt-cf-oagw-constraint-https-only`.
 5. [x] - `p1` - **ELSE** (upstream rejects upgrade) - `inst-ws-5`
    1. [x] - `p1` - **RETURN** 502 ProtocolError with `X-OAGW-Error-Source: gateway` — upstream rejected WebSocket upgrade - `inst-ws-5a`
 6. [x] - `p1` - **FOR EACH** message from caller - `inst-ws-6`
-   1. [x] - `p1` - **IF** message exceeds configured max frame size (default: no limit; pass-through) - `inst-ws-6a`
-      1. [x] - `p1` - Send Close frame (1009 Message Too Big) to caller and abort upstream - `inst-ws-6a1`
-   2. [x] - `p1` - Forward message to upstream (text or binary frame, preserve opcode) - `inst-ws-6b`
+   1. [x] - `p1` - Relay bytes to upstream verbatim — frames are never parsed, so opcode, masking, RSV bits and fragmentation are preserved by construction, and no per-message size limit is applied - `inst-ws-6b`
 7. [x] - `p1` - **FOR EACH** message from upstream - `inst-ws-7`
-   1. [x] - `p1` - **IF** message exceeds configured max frame size (default: no limit; pass-through) - `inst-ws-7a`
-      1. [x] - `p1` - Send Close frame (1009 Message Too Big) to upstream and close caller - `inst-ws-7a1`
-   2. [x] - `p1` - Forward message to caller (text or binary frame, preserve opcode) - `inst-ws-7b`
+   1. [x] - `p1` - Relay bytes to caller verbatim, with the same guarantees as `inst-ws-6b` - `inst-ws-7b`
 8. [x] - `p1` - **IF** either side sends Close frame - `inst-ws-8`
    1. [x] - `p1` - Forward Close frame to the other side with status code and reason - `inst-ws-8a`
-   2. [x] - `p1` - Wait for Close frame response (up to close timeout) - `inst-ws-8b`
-   3. [x] - `p1` - Release connection resources - `inst-ws-8c`
+   2. [x] - `p1` - Release connection resources once the byte copy ends — the gateway does not interpret the Close frame or wait for the peer's echo - `inst-ws-8c`
 9. [x] - `p1` - **IF** upstream connection drops unexpectedly - `inst-ws-9`
-   1. [x] - `p1` - Send Close frame (1006 Abnormal Closure) to caller - `inst-ws-9a`
+   1. [x] - `p1` - Half-close the caller's leg so it observes EOF with no Close frame; the caller's own stack reports 1006 Abnormal Closure, which the gateway does not synthesise - `inst-ws-9a`
    2. [x] - `p1` - Release connection resources - `inst-ws-9b`
 10. [x] - `p1` - **IF** caller disconnects unexpectedly - `inst-ws-10`
-    1. [x] - `p1` - Send Close frame to upstream - `inst-ws-10a`
+    1. [x] - `p1` - Propagate the disconnect to upstream as a TCP half-close (EOF); no Close frame is synthesised - `inst-ws-10a`
     2. [x] - `p1` - Release connection resources - `inst-ws-10b`
-11. [x] - `p1` - **IF** idle timeout exceeded (no messages in either direction within configured timeout) - `inst-ws-11`
-    1. [x] - `p1` - Send Close frame (1001 Going Away) to both sides - `inst-ws-11a`
+11. [x] - `p1` - **IF** idle timeout exceeded (no bytes in either direction within configured timeout) - `inst-ws-11`
+    1. [x] - `p1` - Send Close frame (1001 Going Away) to both sides, each announcement bounded independently by `websocket_close_timeout_secs` - `inst-ws-11a`
     2. [x] - `p1` - Release connection resources - `inst-ws-11b`
 
 ### WebTransport Proxy Flow
@@ -274,7 +269,7 @@ The system **MUST** detect SSE responses (`Content-Type: text/event-stream`) fro
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-dod-websocket-streaming`
 
-The system **MUST** handle HTTP Upgrade (`Upgrade: websocket`) by negotiating the WebSocket handshake with both the caller and upstream. Messages (text and binary frames) **MUST** be forwarded bidirectionally with opcode preservation. **IF** a configurable max frame size is set, messages exceeding the limit **MUST** trigger Close frame 1009 (Message Too Big); by default, no per-message size limit is enforced (pass-through). Close frames **MUST** be propagated with status code and reason; Close frame reason strings **MUST NOT** include internal gateway details (use standard WebSocket status codes only). The system **MUST** handle unexpected disconnects: upstream drop (send 1006 Abnormal Closure to caller), caller drop (send Close to upstream), idle timeout (send 1001 Going Away to both sides). Auth and guard plugins **MUST** execute before the upgrade handshake. Transform plugins are NOT executed on individual WebSocket frames. Upstream rejection of the upgrade **MUST** return 502 ProtocolError with `X-OAGW-Error-Source: gateway`.
+The system **MUST** handle HTTP Upgrade (`Upgrade: websocket`) by negotiating the WebSocket handshake with both the caller and upstream. After the 101 the connection **MUST** be relayed as an opaque byte stream: frames are not parsed, so opcodes, masking, RSV bits and fragmentation are preserved verbatim, and no per-message or per-frame size limit is enforced. Close frames originated by a peer **MUST** be propagated with status code and reason; Close frame reason strings the gateway itself originates **MUST NOT** include internal gateway details (use standard WebSocket status codes only). The system **MUST** handle unexpected disconnects by propagating them as a half-close rather than a synthesised frame: an upstream drop leaves the caller observing EOF (its stack reports 1006 Abnormal Closure), and a caller drop reaches upstream as EOF. The gateway **MUST** originate Close 1001 (Going Away) toward both sides on idle timeout and on graceful shutdown, announcing to each side independently under its own `websocket_close_timeout_secs` budget so an unresponsive peer cannot suppress the other side's close. Auth and guard plugins **MUST** execute before the upgrade handshake. Transform plugins are NOT executed on individual WebSocket frames. Upstream rejection of the upgrade **MUST** return 502 ProtocolError with `X-OAGW-Error-Source: gateway`.
 
 **Implements**:
 - `cpt-cf-oagw-flow-streaming-websocket`
@@ -320,8 +315,8 @@ The system **MUST** implement adaptive per-host HTTP version detection using ALP
 - [x] WebSocket upgrade requests (`Upgrade: websocket`) are negotiated with both caller and upstream
 - [x] WebSocket text and binary messages are forwarded bidirectionally with opcode preservation
 - [x] WebSocket Close frames are propagated with status code and reason to the other side
-- [x] Upstream WebSocket drop sends 1006 Abnormal Closure to caller
-- [x] Caller WebSocket disconnect sends Close frame to upstream
+- [x] Upstream WebSocket drop half-closes the caller's leg, so the caller sees EOF and reports 1006 Abnormal Closure itself
+- [x] Caller WebSocket disconnect propagates to upstream as a TCP half-close (EOF), without a synthesised Close frame
 - [x] Idle timeout on WebSocket session sends 1001 Going Away to both sides
 - [x] Upstream rejection of WebSocket upgrade returns 502 ProtocolError with `X-OAGW-Error-Source: gateway`
 - [x] Transform plugins are NOT executed on individual WebSocket frames
@@ -337,7 +332,8 @@ The system **MUST** implement adaptive per-host HTTP version detection using ALP
 - [x] `X-OAGW-Error-Source` header is set correctly for all streaming error scenarios (gateway vs upstream)
 - [x] No credentials appear in logs or error messages during streaming sessions
 - [x] WebSocket Close frame reason strings do not leak internal gateway details
-- [x] When a configurable max WebSocket frame size is set, oversized messages trigger Close frame 1009 (Message Too Big)
+- [x] WebSocket messages of any size are relayed without a per-frame or per-message cap; Close 1009 (Message Too Big) is never originated by the gateway
+- [x] A WebSocket peer that has stopped reading cannot suppress or delay the other side's Close 1001 announcement
 - [x] Backpressure is applied via TCP flow control when one side of a streaming connection is slower than the other
 - [x] Protocol version cache entries are evicted on protocol-level errors (re-negotiation on next request)
 
@@ -353,15 +349,14 @@ Streaming connections are forwarded at the TCP/TLS level with no per-event proce
 
 All streaming connections are subject to the same auth and guard plugin chain as regular proxy requests — authentication and authorization are enforced before any upgrade or session establishment. HTTPS-only constraint (`cpt-cf-oagw-constraint-https-only`) applies to all streaming upstream connections. Credential isolation per `cpt-cf-oagw-principle-cred-isolation` is maintained — secrets are resolved from `cred_store` at connection time and never logged or stored. WebSocket and WebTransport sessions do not re-authenticate after the initial handshake (session-scoped auth).
 
-**Input validation**: SSE events and WebSocket/WebTransport frames are forwarded as-is (pass-through proxy). Per-message size limits are not enforced by default — the upstream controls payload granularity. An optional max WebSocket frame size can be configured per upstream/route; oversized messages result in Close frame 1009 (Message Too Big). WebSocket Close frame reason strings **MUST NOT** include internal gateway details to prevent information leakage.
+**Input validation**: SSE events and WebSocket/WebTransport frames are forwarded as-is (pass-through proxy). Per-message size limits are not enforced — the upstream controls payload granularity, and the endpoint that deserialises a message is the one that can bound it. After the 101 the gateway relays bytes without parsing frames, so memory is bounded by the copy buffer rather than by frame size and there is no allocation for a size cap to protect. WebSocket Close frame reason strings **MUST NOT** include internal gateway details to prevent information leakage.
 
 ### Configuration Parameters
 
 | Parameter | Scope | Default | Description |
 |-----------|-------|---------|-------------|
 | `streaming_idle_timeout_seconds` | upstream / route | Inherited from `timeout` guard plugin or system default | Idle timeout for streaming connections (no data in either direction) |
-| `websocket_max_frame_size_bytes` | upstream / route | None (pass-through) | Optional max WebSocket message size; exceeding triggers Close 1009 |
-| `websocket_close_timeout_seconds` | system | 5 | Timeout for WebSocket Close frame handshake |
+| `websocket_close_timeout_secs` | system | 5 | Bound on delivering the gateway's Close 1001 and half-closing both legs at teardown |
 | `protocol_version_cache_ttl_seconds` | system | 3600 (1 hour) | TTL for cached ALPN negotiation results per host |
 
 All parameters are read from upstream/route configuration at connection time. System-level defaults are set via gear configuration (`OagwConfig`).

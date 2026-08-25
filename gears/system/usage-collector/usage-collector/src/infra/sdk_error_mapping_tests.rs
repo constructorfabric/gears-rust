@@ -83,7 +83,7 @@ fn authorization_carries_native_authz_reason_on_both_surfaces() {
             "tenant scope mismatch",
         ))),
     ] {
-        assert_eq!(problem.status, 403);
+        assert_eq!(problem.status, Some(403));
         assert_eq!(
             problem_context_string(&problem, "reason").as_deref(),
             Some("AUTHZ")
@@ -265,14 +265,14 @@ fn corrects_id_not_found_maps_to_404_without_reason() {
     let corrects_id = Uuid::from_u128(0xDEAD_BEEF);
     let problem =
         usage_record_error_to_problem(UsageCollectorError::corrects_id_not_found(corrects_id));
-    assert_eq!(problem.status, 404);
+    assert_eq!(problem.status, Some(404));
     assert_eq!(problem_context_string(&problem, "reason"), None);
 }
 
 #[test]
 fn plugin_unavailable_per_record_problem_is_503_without_reason() {
     let problem = usage_record_error_to_problem(UsageCollectorError::plugin_unavailable());
-    assert_eq!(problem.status, 503);
+    assert_eq!(problem.status, Some(503));
     assert_eq!(problem_context_string(&problem, "reason"), None);
 }
 
@@ -282,14 +282,14 @@ fn service_unavailable_per_record_problem_is_503_without_reason() {
         "downstream connection reset",
         None,
     ));
-    assert_eq!(problem.status, 503);
+    assert_eq!(problem.status, Some(503));
     assert_eq!(problem_context_string(&problem, "reason"), None);
 }
 
 #[test]
 fn types_registry_unavailable_per_record_problem_is_503() {
     let problem = usage_record_error_to_problem(UsageCollectorError::types_registry_unavailable());
-    assert_eq!(problem.status, 503);
+    assert_eq!(problem.status, Some(503));
 }
 
 #[test]
@@ -395,7 +395,7 @@ fn invalid_base_gts_id_envelope_carries_field_violation_discriminator() {
     let problem = Problem::from(lift_type(UsageCollectorError::invalid_usage_type_gts_id(
         &raw, &reason,
     )));
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(
         first_field_violation_string(&problem, "field").as_deref(),
         Some("gts_id")
@@ -423,7 +423,7 @@ fn create_usage_type_already_exists_envelope_carries_resource_identity() {
 #[test]
 fn duplicate_metadata_field_envelope_carries_indexed_field_path() {
     let problem = Problem::from(lift_type(UsageCollectorError::duplicate_metadata_field(1)));
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(
         first_field_violation_string(&problem, "field").as_deref(),
         Some("metadata_fields[1]")
@@ -439,7 +439,7 @@ fn empty_string_metadata_field_envelope_carries_indexed_field_path() {
     let problem = Problem::from(lift_type(UsageCollectorError::invalid_metadata_field(
         0, true,
     )));
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(
         first_field_violation_string(&problem, "field").as_deref(),
         Some("metadata_fields[0]")
@@ -453,7 +453,7 @@ fn empty_string_metadata_field_envelope_carries_indexed_field_path() {
 #[test]
 fn plugin_unavailable_lifts_to_service_unavailable_envelope() {
     let problem = Problem::from(lift_type(UsageCollectorError::plugin_unavailable()));
-    assert_eq!(problem.status, 503);
+    assert_eq!(problem.status, Some(503));
 }
 
 #[test]
@@ -528,8 +528,8 @@ fn lift_type_covers_every_usage_type_surface_variant() {
         let label = format!("{err:?}");
         let problem = Problem::from(lift_type(err));
         assert!(
-            (400..=599).contains(&problem.status),
-            "lift_type({label}) produced an out-of-range status {}",
+            (400..=599).contains(&problem.status.unwrap_or(500)),
+            "lift_type({label}) produced an out-of-range status {:?}",
             problem.status,
         );
     }
@@ -541,8 +541,8 @@ fn lift_record_covers_every_usage_record_surface_variant() {
         let label = format!("{err:?}");
         let problem = Problem::from(lift_record(err));
         assert!(
-            (400..=599).contains(&problem.status),
-            "lift_record({label}) produced an out-of-range status {}",
+            (400..=599).contains(&problem.status.unwrap_or(500)),
+            "lift_record({label}) produced an out-of-range status {:?}",
             problem.status,
         );
     }

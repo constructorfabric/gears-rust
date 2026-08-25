@@ -433,6 +433,6 @@ Alert on:
 
 ## Related ADRs
 
-- [ADR: Control Plane Caching](../docs/adr-data-plane-caching.md)
-- [ADR: State Management](../docs/adr-state-management.md)
-- [ADR: Component Architecture](../docs/adr-component-architecture.md)
+- [ADR: Control Plane Caching](../../docs/ADR/0007-data-plane-caching.md)
+- [ADR: State Management](../../docs/ADR/0008-state-management.md)
+- [ADR: Component Architecture](../../docs/ADR/0001-component-architecture.md)

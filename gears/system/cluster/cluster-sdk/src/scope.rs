@@ -56,7 +56,7 @@ pub fn validated_prefix(prefix: &str) -> Result<String, ClusterError> {
 /// The character rule a cache key must satisfy: slash-separated
 /// `[a-zA-Z0-9_-]` segments, no empty segment (no leading, trailing, or
 /// doubled slash), max 255 bytes. Slashes are permitted because cache keys may
-/// be compound paths (e.g. `svc/name/instance`), unlike
+/// be compound paths (e.g. `shard/42/state`), unlike
 /// [`CLUSTER_NAME_RULE`](crate::profile::CLUSTER_NAME_RULE) which applies to
 /// single-segment names (profiles, elections, locks).
 pub const CACHE_KEY_RULE: &str = SCOPE_PREFIX_RULE;

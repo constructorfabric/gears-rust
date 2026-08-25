@@ -22,10 +22,10 @@
 //! consult it.
 //!
 //! Routes that carry no tenant JWT (probes, platform-plane-only handlers) are
-//! marked with the [`PublicRoute`] request extension by the gear/bootstrap layer;
-//! note this is distinct from `OperationSpec.is_public`, which controls gateway
-//! registration. The concrete authenticator adapters are injected via Axum state
-//! at the same layer.
+//! marked with the [`AnonymousRoute`] request extension by the gear/bootstrap
+//! layer; note this is distinct from `OperationSpec.exposed`, which controls
+//! gateway registration. The concrete authenticator adapters are injected via
+//! Axum state at the same layer.
 
 use std::sync::Arc;
 
@@ -64,13 +64,13 @@ const AUTH_INFRA_FAILURE_DETAIL: &str = "authentication infrastructure failure";
 /// a request without an `Authorization` header pass through instead of
 /// returning `401`.
 ///
-/// **Not the same as `OperationSpec.is_public`.** `is_public` controls whether
+/// **Not the same as `OperationSpec.exposed`.** `exposed` controls whether
 /// a route is registered in the gateway for external access; this marker
 /// controls whether [`security_context_middleware`] requires a JWT. The two are
 /// independent: most gateway-exposed routes DO carry a JWT and do NOT need this
 /// marker; most probe routes are NOT gateway-exposed but DO need it.
 #[derive(Clone, Copy, Debug)]
-pub struct PublicRoute;
+pub struct AnonymousRoute;
 
 /// Tenant-plane `SecurityContext` middleware.
 ///
@@ -78,10 +78,10 @@ pub struct PublicRoute;
 /// - A bearer token, if present, is **always** re-validated via the injected
 ///   [`BearerAuthenticator`]; on success the [`SecurityContext`](toolkit_security::SecurityContext) is inserted
 ///   into request extensions.
-/// - A protected route (no [`PublicRoute`] marker) with a missing or invalid
+/// - A protected route (no [`AnonymousRoute`] marker) with a missing or invalid
 ///   `Authorization` header is rejected with `401`.
-/// - A public / system-only route (carrying the [`PublicRoute`] marker) with no
-///   `Authorization` header passes through.
+/// - An anonymous / system-only route (carrying the [`AnonymousRoute`] marker)
+///   with no `Authorization` header passes through.
 /// - A rejected token is `401`; an unreachable backend is `503`; any other
 ///   unexpected authentication failure is `500`.
 ///
@@ -96,7 +96,7 @@ pub struct PublicRoute;
 /// TODO: Rework to align with the gateway's `authn_middleware`
 /// (`gears/system/api-gateway/src/middleware/auth.rs`), the more mature
 /// implementation: route-policy-driven auth requirements (vs. the binary
-/// `PublicRoute` marker), CORS-preflight handling, anonymous-`SecurityContext`
+/// `AnonymousRoute` marker), CORS-preflight handling, anonymous-`SecurityContext`
 /// insertion for public routes, and RFC 6750 `WWW-Authenticate` Bearer
 /// challenges. Part of consolidating all gateway middlewares into this crate.
 pub async fn security_context_middleware<A>(
@@ -107,7 +107,7 @@ pub async fn security_context_middleware<A>(
 where
     A: BearerAuthenticator + 'static,
 {
-    let is_public = request.extensions().get::<PublicRoute>().is_some();
+    let is_anonymous = request.extensions().get::<AnonymousRoute>().is_some();
 
     match extract_bearer_http(request.headers()) {
         Ok(token) => match authenticator.authenticate(token.expose_secret()).await {
@@ -117,9 +117,9 @@ where
             }
             Err(err) => authn_error_to_response(&err),
         },
-        // No credential presented: allow through only for public/system-only
+        // No credential presented: allow through only for anonymous/system-only
         // routes; protected routes require a user context.
-        Err(SecurityContextHttpError::MissingAuthHeader) if is_public => next.run(request).await,
+        Err(SecurityContextHttpError::MissingAuthHeader) if is_anonymous => next.run(request).await,
         Err(SecurityContextHttpError::MissingAuthHeader) => unauthenticated("MISSING_BEARER"),
         Err(SecurityContextHttpError::InvalidAuthHeader | SecurityContextHttpError::EmptyToken) => {
             unauthenticated("INVALID_BEARER")

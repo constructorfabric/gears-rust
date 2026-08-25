@@ -1,0 +1,2 @@
+# Minimal config file required by the Gears manifest for linting.
+server: {}

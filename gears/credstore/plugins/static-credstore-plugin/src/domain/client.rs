@@ -1,4 +1,8 @@
 // Updated: 2026-06-06 — implements the per-tenant value-store `CredStorePluginClientV1`.
+//! SDK adapter for the static value store.
+//!
+//! Requests are already authorized and resolved by the host gear, so this
+//! adapter keys values only by tenant, reference, and optional owner.
 use async_trait::async_trait;
 use credstore_sdk::{
     CredStoreError, CredStorePluginClientV1, OwnerId, SecretRef, SecretValue, TenantId,

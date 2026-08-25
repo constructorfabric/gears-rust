@@ -1,0 +1,1793 @@
+//! Code generation for `#[toolkit::rest_contract]`.
+//!
+//! Emits two artifacts:
+//! 1. The original projection trait, with HTTP/marker attributes stripped from
+//!    every method so it compiles unchanged outside the macro.
+//! 2. A free function `<trait_snake_case>_http_binding() -> HttpBindingIr`
+//!    that materializes the binding IR derived from the trait declaration.
+
+use proc_macro2::TokenStream;
+use quote::{format_ident, quote, quote_spanned};
+use syn::{Ident, TraitItem, Type};
+
+use crate::projection::{
+    build_delegation_body, client_struct_ident, generate_projection_impl_for_client,
+    is_platform_security_context_type, is_security_context_type, rewrite_streaming_signature,
+    strip_method_attrs,
+};
+use crate::rest_contract_parse::{HttpVerb, RestContractModel, RestMethodModel, RestParam};
+use crate::support::contract_support_path;
+
+const HTTP_ATTRS: &[&str] = &[
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "retryable",
+    "streaming",
+    "server_manual",
+    "exposed",
+    "internal",
+    "anonymous",
+];
+
+fn streaming_idents(method: &RestMethodModel) -> Option<(Type, Type)> {
+    if method.streaming {
+        method.result_types.clone()
+    } else {
+        None
+    }
+}
+
+pub fn generate(model: &RestContractModel) -> TokenStream {
+    if let Some(err) = check_path_placeholders(model) {
+        return err;
+    }
+    if let Some(err) = check_query_params(model) {
+        return err;
+    }
+
+    let support = contract_support_path();
+    let cleaned_trait = generate_cleaned_trait(model);
+    let binding_fn = generate_binding_fn(model, &support);
+    let client_struct = generate_client_struct(model, &support);
+    let client_impl = generate_client_impl(model, &support);
+    let resolving_struct = generate_resolving_client_struct(model, &support);
+    let resolving_impl = generate_resolving_client_impl(model, &support);
+    let projection_impl = generate_projection_impl(model);
+    let server_registration = generate_server_registration(model);
+    let coverage_check = generate_full_coverage_check(model, &support);
+
+    quote! {
+        #cleaned_trait
+        #binding_fn
+        #client_struct
+        #client_impl
+        #resolving_struct
+        #resolving_impl
+        #projection_impl
+        #server_registration
+        #coverage_check
+    }
+}
+
+/// Every `{param}` in a path template must name a real method parameter.
+///
+/// This is transport-independent, so it runs regardless of the `rest-server`
+/// feature: the client substitutes placeholders *by name* at runtime
+/// ([`build_request_url`](toolkit_contract::runtime::http)), so a typo leaves a
+/// literal `{...}` in the URL rather than failing to compile.
+/// `ir::validation::validate_path_params` catches the same mistake, but only at
+/// wiring time in a consumer's process.
+///
+/// Returns the `compile_error!` tokens for the first offending method, spanned
+/// on its ident, or `None` when every template checks out.
+fn check_path_placeholders(model: &RestContractModel) -> Option<TokenStream> {
+    for method in &model.methods {
+        let declared: Vec<String> = classify_params(method)
+            .into_iter()
+            .filter(|(_, class)| *class == FieldClass::Path)
+            .map(|(param, _)| param.ident.to_string())
+            .collect();
+
+        let orphans: Vec<String> = extract_path_param_names(&method.path_template)
+            .into_iter()
+            .filter(|p| !declared.contains(p))
+            .map(|p| format!("`{{{p}}}`"))
+            .collect();
+
+        if !orphans.is_empty() {
+            let method_name = &method.ident;
+            let names = orphans.join(", ");
+            let msg = format!(
+                "rest_contract: path template `{}` on method `{method_name}` has \
+                 placeholder(s) {names} with no matching parameter in the method \
+                 signature. Add a parameter with that exact name, or correct the template.",
+                method.path_template,
+            );
+            return Some(quote_spanned! { method_name.span() =>
+                ::std::compile_error!(#msg);
+            });
+        }
+    }
+    None
+}
+
+/// A method may carry at most one query parameter, and it must be a struct.
+///
+/// Both ends depend on this, so it runs regardless of the `rest-server`
+/// feature. A query string is a flat key/value list that deserializes as a map
+/// at the top level: a bare scalar (`count: u64`) cannot be encoded by the
+/// client's `serde_html_form` serializer nor decoded by the server's extractor,
+/// so such a route rejected every request with 400 — while the generated
+/// `OpenAPI` spec advertised the parameter as perfectly valid.
+///
+/// Returns the `compile_error!` tokens for the first offending method.
+fn check_query_params(model: &RestContractModel) -> Option<TokenStream> {
+    for method in &model.methods {
+        let query_params: Vec<&RestParam> = classify_params(method)
+            .into_iter()
+            .filter(|(_, class)| *class == FieldClass::Query)
+            .map(|(param, _)| param)
+            .collect();
+
+        let method_name = &method.ident;
+
+        if query_params.len() > 1 {
+            let count = query_params.len();
+            let msg = format!(
+                "rest_contract: method `{method_name}` has {count} query parameters; at most one \
+                 is supported. Combine them into a single struct deriving \
+                 `toolkit_contract::QueryParams`, or mark the method `#[server_manual]` and \
+                 register it by hand."
+            );
+            return Some(quote_spanned! { method_name.span() =>
+                ::std::compile_error!(#msg);
+            });
+        }
+
+        // A `#[server_manual]` method has no generated route, so the author owns
+        // the decoding side and a single scalar is unambiguous (`?count=3`).
+        // Only a generated route needs the struct.
+        if let Some(param) = query_params.first()
+            && !method.server_manual
+            && scalar_openapi_type(&param.ty).is_some()
+        {
+            let param_name = &param.ident;
+            let ty = &param.ty;
+            let wrapper = format!("{}Query", to_pascal_case(&method_name.to_string()));
+            let derive_line =
+                "#[derive(serde::Serialize, serde::Deserialize, toolkit_contract::QueryParams)]";
+            let struct_line = format!(
+                "pub struct {wrapper} {{ pub {param_name}: {} }}",
+                quote!(#ty)
+            );
+            let msg = format!(
+                "rest_contract: query parameter `{param_name}` on method `{method_name}` is a \
+                 bare scalar. A query string deserializes as a map at the top level, so this \
+                 route would reject every request with 400. Wrap it in a struct:\
+                 \n\n    {derive_line}\n    {struct_line}\n"
+            );
+            return Some(quote_spanned! { param.ident.span() =>
+                ::std::compile_error!(#msg);
+            });
+        }
+    }
+    None
+}
+
+/// When `require_full_coverage` (ADR-0003) is set, emit a generated test that
+/// asserts (a) the base contract and the REST projection cover exactly the same
+/// method set (both directions), naming any offending method, and (b) the
+/// contract's declared `version` appears as a segment of the projection's
+/// `base_path` (ADR-0007 §3 — the two are otherwise independent inputs and can
+/// silently drift).
+///
+/// This runs under `cargo test`, is feature-independent (does not need
+/// `rest-client`), and reuses the runtime coverage validator
+/// [`validate_http_binding`]. It requires the base trait to be
+/// `#[toolkit::contract]`-annotated (so it implements `Contract`). A purely
+/// compile-time, feature-independent, method-named check is not achievable from
+/// the projection macro alone, because it cannot see the base trait's method
+/// set at macro-expansion time (the base lives behind an imported path); the
+/// signature / no-extra-method direction is already enforced feature-
+/// independently by the delegating default methods, and the missing-method
+/// direction is also caught by the generated client `impl` (E0046) under
+/// `rest-client`.
+fn generate_full_coverage_check(model: &RestContractModel, support: &TokenStream) -> TokenStream {
+    if !model.require_full_coverage {
+        return TokenStream::new();
+    }
+    let base_trait = &model.base_trait;
+    let trait_snake = to_snake_case(&model.trait_ident.to_string());
+    let binding_fn = format_ident!("{}_http_binding", trait_snake);
+    let test_fn = format_ident!("__{}_require_full_coverage", trait_snake);
+    quote! {
+        #[cfg(test)]
+        #[test]
+        fn #test_fn() {
+            let __ir = <dyn #base_trait as #support::Contract>::contract_ir();
+            let __binding = #binding_fn();
+            if let ::std::result::Result::Err(__errs) =
+                #support::ir::validate_http_binding(&__ir, &__binding)
+            {
+                ::std::panic!(
+                    "require_full_coverage: base/projection method-set mismatch: {:?}",
+                    __errs
+                );
+            }
+
+            // ADR-0007 §3: the version-designating segment of `base_path` must
+            // match the contract's declared version, so a major bump cannot land
+            // in one place only. The predicate itself lives in (and is unit-
+            // tested in) `toolkit-contract` so generated code has one definition
+            // to call — see `ir::version_matches_base_path`.
+            let __version = <dyn #base_trait as #support::Contract>::descriptor().version;
+            ::std::assert!(
+                #support::ir::version_matches_base_path(__version, &__binding.base_path),
+                "require_full_coverage: contract version '{}' does not match the version \
+                 segment of the projection base_path '{}' (ADR-0007: the trait-name marker, \
+                 `version`, and `base_path` must all spell the same version)",
+                __version,
+                __binding.base_path,
+            );
+        }
+    }
+}
+
+fn generate_projection_impl(model: &RestContractModel) -> TokenStream {
+    generate_projection_impl_for_client(
+        &model.trait_ident,
+        &client_struct_ident(&model.trait_ident),
+        "rest-client",
+    )
+}
+
+fn generate_cleaned_trait(model: &RestContractModel) -> TokenStream {
+    let mut item = model.item.clone();
+    let base_trait = &model.base_trait;
+
+    let streaming_methods: std::collections::HashMap<String, (Type, Type)> = model
+        .methods
+        .iter()
+        .filter_map(|m| streaming_idents(m).map(|t| (m.ident.to_string(), t)))
+        .collect();
+    let model_methods: std::collections::HashMap<String, &RestMethodModel> = model
+        .methods
+        .iter()
+        .map(|m| (m.ident.to_string(), m))
+        .collect();
+
+    for trait_item in &mut item.items {
+        if let TraitItem::Fn(method) = trait_item {
+            strip_method_attrs(method, HTTP_ATTRS);
+            if let Some((ok, err)) = streaming_methods.get(&method.sig.ident.to_string()) {
+                rewrite_streaming_signature(method, ok, err);
+            }
+            // PRD #1536 D3: projection-trait methods become default fns
+            // that delegate to the base trait via fully-qualified syntax.
+            // The generated REST client implements the base trait; this
+            // delegation lets `Arc<dyn ProjectionTrait>` work for free.
+            if let Some(model_method) = model_methods.get(&method.sig.ident.to_string()) {
+                let arg_idents: Vec<&syn::Ident> = model_method
+                    .params
+                    .iter()
+                    .filter(|p| p.ident != "self")
+                    .map(|p| &p.ident)
+                    .collect();
+                method.default = Some(build_delegation_body(
+                    base_trait,
+                    &model_method.ident,
+                    arg_idents,
+                    model_method.streaming,
+                ));
+            }
+        }
+    }
+
+    quote! {
+        #[::async_trait::async_trait]
+        #item
+    }
+}
+
+fn generate_binding_fn(model: &RestContractModel, support: &TokenStream) -> TokenStream {
+    let trait_name_snake = to_snake_case(&model.trait_ident.to_string());
+    let fn_ident = format_ident!("{}_http_binding", trait_name_snake);
+    let trait_doc = format!("Build the HTTP binding IR for [`{}`].", model.trait_ident);
+    let base_path = &model.base_path;
+
+    let method_entries = model
+        .methods
+        .iter()
+        .map(|m| build_method_binding(m, support));
+
+    quote! {
+        #[doc = #trait_doc]
+        #[must_use]
+        pub fn #fn_ident() -> #support::ir::binding::HttpBindingIr {
+            #support::ir::binding::HttpBindingIr {
+                base_path: #base_path.to_owned(),
+                methods: vec![
+                    #(#method_entries),*
+                ],
+            }
+        }
+    }
+}
+
+fn build_method_binding(method: &RestMethodModel, support: &TokenStream) -> TokenStream {
+    let method_name = method.ident.to_string();
+    let path = &method.path_template;
+    let http_method = http_method_tokens(method.http_method, support);
+    let retryable = method.retryable;
+    let streaming = method.streaming;
+    let optional = method.optional;
+
+    let field_bindings = build_field_bindings(method, support);
+
+    quote! {
+        #support::ir::binding::HttpMethodBindingIr {
+            method_name: #method_name.to_owned(),
+            http_method: #http_method,
+            path_template: #path.to_owned(),
+            field_bindings: vec![ #(#field_bindings),* ],
+            retryable: #retryable,
+            streaming: #streaming,
+            optional: #optional,
+        }
+    }
+}
+
+fn http_method_tokens(verb: HttpVerb, support: &TokenStream) -> TokenStream {
+    let variant = syn::Ident::new(verb.ir_variant(), proc_macro2::Span::call_site());
+    quote! { #support::ir::binding::HttpMethod::#variant }
+}
+
+/// Where a method parameter is carried in the HTTP request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldClass {
+    Path,
+    Body,
+    Query,
+}
+
+/// Classify each non-`self`, non-security-context parameter of a method into its
+/// HTTP carrier. This is the **single source of truth** for path/body/query
+/// binding: the client IR ([`build_field_bindings`]) and the server route
+/// generator ([`body_param_type`], [`generate_unary_handler`]) both consume it,
+/// so they can never disagree on the wire shape (ADR-0003 single-IR intent).
+///
+/// Rule: a param whose name matches a `{param}` in the path template is `Path`;
+/// otherwise the first remaining param on a body-carrying verb (POST/PUT) is the
+/// `Body`; all others are `Query`.
+fn classify_params(method: &RestMethodModel) -> Vec<(&RestParam, FieldClass)> {
+    let path_params = extract_path_param_names(&method.path_template);
+    let mut out = Vec::new();
+    let mut body_assigned = false;
+    for param in &method.params {
+        if param.ident == "self" || is_security_context_type(&param.ty) {
+            continue;
+        }
+        let name = param.ident.to_string();
+        let class = if path_params.iter().any(|p| p == &name) {
+            FieldClass::Path
+        } else if method.http_method.allows_body() && !body_assigned {
+            body_assigned = true;
+            FieldClass::Body
+        } else {
+            FieldClass::Query
+        };
+        out.push((param, class));
+    }
+    out
+}
+
+fn build_field_bindings(method: &RestMethodModel, support: &TokenStream) -> Vec<TokenStream> {
+    classify_params(method)
+        .into_iter()
+        .map(|(param, class)| {
+            let name = param.ident.to_string();
+            match class {
+                FieldClass::Path => quote! {
+                    #support::ir::binding::HttpFieldBinding::Path {
+                        field: #name.to_owned(),
+                        param: #name.to_owned(),
+                    }
+                },
+                FieldClass::Body => {
+                    quote! { #support::ir::binding::HttpFieldBinding::Body }
+                }
+                FieldClass::Query => quote! {
+                    #support::ir::binding::HttpFieldBinding::Query {
+                        field: #name.to_owned(),
+                        param: #name.to_owned(),
+                    }
+                },
+            }
+        })
+        .collect()
+}
+
+/// Strip leading `&`/`&mut` from a type, returning the owned inner type. Axum
+/// extension extractors own their value, so the server handler extracts the
+/// owned context type even when the trait method takes it by reference.
+fn strip_reference(ty: &Type) -> &Type {
+    match ty {
+        Type::Reference(r) => strip_reference(&r.elem),
+        other => other,
+    }
+}
+
+fn extract_path_param_names(template: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        if let Some(end) = rest[start..].find('}') {
+            let inner = &rest[start + 1..start + end];
+            if !inner.is_empty() {
+                names.push(inner.to_owned());
+            }
+            rest = &rest[start + end + 1..];
+        } else {
+            break;
+        }
+    }
+    names
+}
+
+fn generate_client_struct(model: &RestContractModel, support: &TokenStream) -> TokenStream {
+    let client_ident = client_struct_ident(&model.trait_ident);
+    let doc = format!(
+        "Generated REST client for [`{}`].\n\nProduced by `#[toolkit::rest_contract]`.",
+        model.trait_ident
+    );
+    // `client_type` label for the (otel-gated) `toolkit-http` client metrics.
+    let metrics_label = model.trait_ident.to_string();
+
+    quote! {
+        #[cfg(feature = "rest-client")]
+        #[doc = #doc]
+        pub struct #client_ident {
+            http: ::toolkit_http::HttpClient,
+            config: #support::runtime::config::ClientConfig,
+        }
+
+        #[cfg(feature = "rest-client")]
+        impl #client_ident {
+            /// Build a new client with the default `toolkit-http` HTTP client.
+            ///
+            /// The transport is built by
+            /// [`build_default_http_client`](#support::runtime::client::build_default_http_client):
+            /// transport-layer retry disabled (the SDK retries itself), plaintext
+            /// `http://` allowed unless `config.require_tls` is set, and — when
+            /// the `otel` feature is enabled — W3C `traceparent` propagation plus
+            /// RED client metrics labeled with this projection trait name. For
+            /// caller-controlled HTTP client construction use
+            /// [`Self::with_http_client`].
+            ///
+            /// Fallible because the underlying `toolkit-http` builder can fail
+            /// under non-default cryptographic backends (FIPS, custom TLS).
+            ///
+            /// # Errors
+            /// Returns whatever `toolkit_http::HttpClient::builder().build()` returned.
+            pub fn new(
+                config: #support::runtime::config::ClientConfig,
+            ) -> ::std::result::Result<Self, ::toolkit_http::HttpError> {
+                let http = #support::runtime::client::build_default_http_client(
+                    #metrics_label,
+                    config.require_tls,
+                )?;
+                Ok(Self { http, config })
+            }
+
+            /// Build a new client with a caller-supplied `toolkit-http`
+            /// HTTP client.
+            #[must_use]
+            pub fn with_http_client(
+                http: ::toolkit_http::HttpClient,
+                config: #support::runtime::config::ClientConfig,
+            ) -> Self {
+                Self { http, config }
+            }
+        }
+    }
+}
+
+fn generate_client_impl(model: &RestContractModel, support: &TokenStream) -> TokenStream {
+    let client_ident = client_struct_ident(&model.trait_ident);
+    let trait_path = &model.base_trait;
+
+    let methods = model
+        .methods
+        .iter()
+        .map(|m| generate_client_method(m, &model.trait_ident, support));
+
+    quote! {
+        #[cfg(feature = "rest-client")]
+        #[::async_trait::async_trait]
+        impl #trait_path for #client_ident {
+            #(#methods)*
+        }
+    }
+}
+
+/// Generate the directory-resolving wrapper struct + its constructor.
+///
+/// The wrapper holds an `Arc<DirectoryResolvingClient<XxxRestClient>>` and
+/// delegates each base-trait method through it (see
+/// [`generate_resolving_client_impl`]). Shares the `rest-client` gate with
+/// [`XxxRestClient`](generate_client_struct): the wrapper is a thin layer over
+/// that client and cannot exist without it.
+fn generate_resolving_client_struct(
+    model: &RestContractModel,
+    support: &TokenStream,
+) -> TokenStream {
+    let resolving_ident = resolving_struct_ident(&model.trait_ident);
+    let client_ident = client_struct_ident(&model.trait_ident);
+    let doc = format!(
+        "Directory-resolving REST client for [`{}`].\n\nProduced by `#[toolkit::rest_contract]`. \
+         Resolves the provider endpoint from the service directory on every call and rebuilds \
+         the inner [`{client_ident}`] when the endpoint changes, so consumers tolerate eventual \
+         readiness and provider churn.",
+        model.trait_ident
+    );
+
+    quote! {
+        #[cfg(feature = "rest-client")]
+        #[doc = #doc]
+        pub struct #resolving_ident {
+            __inner: ::std::sync::Arc<
+                #support::runtime::resolving::DirectoryResolvingClient<#client_ident>,
+            >,
+        }
+
+        #[cfg(feature = "rest-client")]
+        impl #resolving_ident {
+            /// Build a resolving client that discovers `from_gear` via `resolver`.
+            ///
+            /// The inner REST client is (re)built from the resolved endpoint via
+            /// the generated [`new`](#client_ident::new); `tuning` applies the
+            /// per-call timeout / retry / reconnect overrides.
+            #[must_use]
+            pub fn new(
+                resolver: ::std::sync::Arc<dyn #support::runtime::resolving::EndpointResolver>,
+                from_gear: impl ::std::convert::Into<::std::string::String>,
+                tuning: #support::wiring::ClientTuning,
+            ) -> Self {
+                let __inner = #support::runtime::resolving::DirectoryResolvingClient::new(
+                    resolver,
+                    from_gear,
+                    tuning,
+                    |__cfg| {
+                        <#client_ident>::new(__cfg).map_err(|__e| {
+                            #support::runtime::transport_error::TransportError::network(__e)
+                        })
+                    },
+                );
+                Self { __inner: ::std::sync::Arc::new(__inner) }
+            }
+        }
+    }
+}
+
+/// Generate the base-trait impl for the resolving wrapper. Each method resolves
+/// the live client and delegates; unresolved providers surface as
+/// `TransportError::Unresolved` (mapped into the trait's error type).
+fn generate_resolving_client_impl(model: &RestContractModel, support: &TokenStream) -> TokenStream {
+    let resolving_ident = resolving_struct_ident(&model.trait_ident);
+    let client_ident = client_struct_ident(&model.trait_ident);
+    let trait_path = &model.base_trait;
+
+    let methods = model
+        .methods
+        .iter()
+        .map(|m| generate_resolving_method(m, &client_ident, trait_path, support));
+
+    quote! {
+        #[cfg(feature = "rest-client")]
+        #[::async_trait::async_trait]
+        impl #trait_path for #resolving_ident {
+            #(#methods)*
+        }
+    }
+}
+
+/// One delegating method body for the resolving wrapper.
+fn generate_resolving_method(
+    method: &RestMethodModel,
+    client_ident: &syn::Ident,
+    trait_path: &syn::Path,
+    support: &TokenStream,
+) -> TokenStream {
+    let method_ident = &method.ident;
+    let sig = render_method_signature(method);
+    let arg_idents: Vec<&syn::Ident> = method
+        .params
+        .iter()
+        .filter(|p| p.ident != "self")
+        .map(|p| &p.ident)
+        .collect();
+
+    if method.streaming {
+        let item_ty = streaming_item_type(method);
+        let err_ty = error_type(method);
+        return quote! {
+            fn #method_ident #sig {
+                use ::futures_util::StreamExt as _;
+                let __inner = ::std::sync::Arc::clone(&self.__inner);
+                let __fut = async move {
+                    let __stream: ::std::pin::Pin<::std::boxed::Box<
+                        dyn ::futures_core::Stream<Item = ::std::result::Result<#item_ty, #err_ty>>
+                            + ::std::marker::Send + 'static,
+                    >> = match __inner.resolved().await {
+                        ::std::result::Result::Ok(__c) => {
+                            <#client_ident as #trait_path>::#method_ident(&*__c, #(#arg_idents),*)
+                        }
+                        ::std::result::Result::Err(__e) => ::std::boxed::Box::pin(
+                            ::futures_util::stream::once(async move {
+                                ::std::result::Result::Err(
+                                    <#err_ty as ::std::convert::From<
+                                        #support::runtime::transport_error::TransportError,
+                                    >>::from(__e),
+                                )
+                            }),
+                        ),
+                    };
+                    __stream
+                };
+                ::std::boxed::Box::pin(::futures_util::stream::once(__fut).flatten())
+            }
+        };
+    }
+
+    let err_ty = error_type(method);
+    let convert_err = quote! {
+        |__e| <#err_ty as ::std::convert::From<#support::runtime::transport_error::TransportError>>::from(__e)
+    };
+    quote! {
+        async fn #method_ident #sig {
+            let __c = self.__inner.resolved().await.map_err(#convert_err)?;
+            <#client_ident as #trait_path>::#method_ident(&*__c, #(#arg_idents),*).await
+        }
+    }
+}
+
+fn resolving_struct_ident(trait_ident: &syn::Ident) -> syn::Ident {
+    format_ident!("{}ResolvingClient", trait_ident)
+}
+
+/// Build the `info_span!(...)` expression emitted inside every generated
+/// client method. The span name and all attribute values are baked as string
+/// literals at macro-expansion time. `otel.kind = "client"` makes this the
+/// parent of the `toolkit-http` `outgoing_http` span, so W3C `traceparent`
+/// (`trace_id` / `span_id`) propagates downstream with no manual threading.
+///
+/// Routed through `#support::__tracing` (a `toolkit-contract` re-export) so SDK
+/// crates need no direct `tracing` dependency.
+fn client_span_ctor(
+    service: &str,
+    method_name: &str,
+    method: &RestMethodModel,
+    support: &TokenStream,
+) -> TokenStream {
+    let span_name = format!("{service}.{method_name}");
+    let http_method_str = method.http_method.ir_variant().to_uppercase();
+    let route_str = method.path_template.clone();
+    quote! {
+        #support::__tracing::info_span!(
+            #span_name,
+            otel.kind = "client",
+            rpc.system = "rest",
+            rpc.service = #service,
+            rpc.method = #method_name,
+            http.method = #http_method_str,
+            http.route = #route_str,
+            error = #support::__tracing::field::Empty,
+        )
+    }
+}
+
+fn generate_client_method(
+    method: &RestMethodModel,
+    trait_ident: &syn::Ident,
+    support: &TokenStream,
+) -> TokenStream {
+    let trait_snake = to_snake_case(&trait_ident.to_string());
+    let binding_fn = format_ident!("{}_http_binding", trait_snake);
+    let method_name_str = method.ident.to_string();
+    let method_ident = &method.ident;
+
+    let sig = render_method_signature(method);
+    let fields_init = build_fields_json(method, support);
+    let query_init = build_query_string(method, support);
+    let auth_capture = capture_auth_credentials(method, support);
+    let body_capture = capture_body_param(method);
+
+    // Per-method client span (baked-in telemetry) — see `client_span_ctor`.
+    let span_ctor = client_span_ctor(&trait_ident.to_string(), &method_name_str, method, support);
+
+    if method.streaming {
+        return generate_streaming_method_body(
+            method,
+            &sig,
+            &binding_fn,
+            &method_name_str,
+            &fields_init,
+            &query_init,
+            &auth_capture,
+            &span_ctor,
+            support,
+        );
+    }
+
+    let verb = method.http_method;
+    let verb_call = http_verb_call(verb);
+    let retry_call = if method.retryable {
+        quote! {
+            #support::runtime::retry::retry_with_backoff(&self.config.retry, __attempt).await
+        }
+    } else {
+        quote! { __attempt().await }
+    };
+
+    // `toolkit-http`'s `.json()` is fallible (returns `Result<RequestBuilder,
+    // HttpError>`) — funnel through `with_json_body` which wraps the error
+    // into `TransportError::Serialization` so the macro emit path stays
+    // uniform. Without `body_capture` the closure threads the builder through
+    // unchanged.
+    let body_apply = if let Some(body_ident) = &body_capture {
+        quote! {
+            let __builder = #support::runtime::client::with_json_body(__builder, &#body_ident)?;
+        }
+    } else {
+        quote! {}
+    };
+
+    let response_ty = response_type(method);
+    let err_ty = error_type(method);
+    let convert_err = quote! {
+        |__e| <#err_ty as ::std::convert::From<#support::runtime::transport_error::TransportError>>::from(__e)
+    };
+
+    quote! {
+        async fn #method_ident #sig {
+            let __span = #span_ctor;
+            // Enter the span across the awaited dispatch so `toolkit-http`'s
+            // OtelLayer sees it as `Context::current()` and injects this span's
+            // W3C `traceparent` on the outbound request.
+            #support::__tracing::Instrument::instrument(async move {
+                let __binding = #binding_fn();
+                // The binding is generated from the same trait model, so this is
+                // unreachable in practice — but return a typed error rather than
+                // panicking inside generated library code (no panic paths).
+                let __m = match __binding.find_method(#method_name_str) {
+                    ::std::option::Option::Some(__m) => __m,
+                    ::std::option::Option::None => {
+                        return ::std::result::Result::Err((#convert_err)(
+                            #support::runtime::transport_error::TransportError::UrlBuild(
+                                concat!(
+                                    "missing HTTP binding for method '",
+                                    #method_name_str,
+                                    "'",
+                                )
+                                .to_owned(),
+                            ),
+                        ));
+                    }
+                };
+
+                #fields_init
+                #query_init
+                let __fields = __fields_result.map_err(#convert_err)?;
+                let __query = __query_result.map_err(#convert_err)?;
+                let __url = #support::runtime::http::build_request_url(
+                    &self.config.base_url,
+                    &__binding.base_path,
+                    __m,
+                    &__fields,
+                    __query.as_deref(),
+                )
+                .map_err(#convert_err)?;
+
+                #auth_capture
+
+                let __attempt = || async {
+                    // Tenant bearer forwarded via a sensitive `Authorization`
+                    // header (never logged); see `RequestBuilder::bearer_auth`.
+                    // Platform-plane calls instead carry the runtime internal
+                    // credential as a sensitive `X-ToolKit-Internal-Token`
+                    // (never `Authorization`); at most one of the two is Some.
+                    // The platform credential is resolved fresh on every
+                    // attempt (not once before the retry loop) so a
+                    // rotated/refreshed token is used on retries.
+                    let mut __builder = self.http.#verb_call(&__url);
+                    if let Some(ref __t) = __bearer {
+                        __builder = __builder.bearer_auth(__t);
+                    }
+                    // Platform-plane credential attach routed through the single
+                    // audited runtime helper (shared with the SSE factory), which
+                    // re-resolves per attempt and warns on an unavailable source.
+                    __builder = #support::runtime::http::attach_internal_token(
+                        __builder,
+                        __internal_token_provider.as_ref(),
+                        #method_name_str,
+                    );
+                    #body_apply
+                    let __build_result: ::std::result::Result<
+                        ::toolkit_http::RequestBuilder,
+                        #support::runtime::transport_error::TransportError,
+                    > = ::std::result::Result::Ok(__builder);
+                    // Per-attempt deadline from `ClientConfig::timeout` (mirrors
+                    // the streaming path); elapse → transient `Timeout`.
+                    #support::runtime::client::send_unary::<_, #response_ty>(
+                        || __build_result,
+                        ::std::option::Option::Some(self.config.timeout),
+                    ).await
+                };
+
+                let __result: ::std::result::Result<#response_ty, #support::runtime::transport_error::TransportError> =
+                    #retry_call;
+                if __result.is_err() {
+                    #support::__tracing::Span::current().record("error", true);
+                }
+                __result.map_err(#convert_err)
+            }, __span).await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_streaming_method_body(
+    method: &RestMethodModel,
+    sig: &TokenStream,
+    binding_fn: &syn::Ident,
+    method_name: &str,
+    fields_init: &TokenStream,
+    query_init: &TokenStream,
+    auth_capture: &TokenStream,
+    span_ctor: &TokenStream,
+    support: &TokenStream,
+) -> TokenStream {
+    let method_ident = &method.ident;
+    let item_ty = streaming_item_type(method);
+    let err_ty = error_type(method);
+    let verb_call = http_verb_call(method.http_method);
+    let convert_err = quote! {
+        |__e| <#err_ty as ::std::convert::From<#support::runtime::transport_error::TransportError>>::from(__e)
+    };
+
+    quote! {
+        fn #method_ident #sig {
+            use ::futures_util::StreamExt as _;
+
+            // Per-method client span (baked-in telemetry). Entered per yielded
+            // item so SSE event processing runs under the contract span; the
+            // per-attempt HTTP send is traced by `toolkit-http`'s OtelLayer.
+            let __span = #span_ctor;
+
+            let __binding = #binding_fn();
+            // The binding is generated from the same trait model, so this is
+            // unreachable in practice — but return a typed error rather than
+            // panicking inside generated library code (mirrors the unary path).
+            let __m = match __binding.find_method(#method_name) {
+                ::std::option::Option::Some(__m) => __m.clone(),
+                ::std::option::Option::None => {
+                    let __err = (#convert_err)(
+                        #support::runtime::transport_error::TransportError::UrlBuild(
+                            concat!(
+                                "missing HTTP binding for method '",
+                                #method_name,
+                                "'",
+                            )
+                            .to_owned(),
+                        ),
+                    );
+                    return ::std::boxed::Box::pin(::futures_util::stream::once(async move {
+                        ::std::result::Result::Err(__err)
+                    }));
+                }
+            };
+            let __base_path = __binding.base_path.clone();
+            let __base_url = self.config.base_url.clone();
+            let __http = self.http.clone();
+
+            #fields_init
+            #query_init
+            #auth_capture
+
+            // Bind the convert closure once so we can both call it
+            // imperatively (URL-build error path) and pass it to the map_err
+            // tail below. Boxed because closures don't impl `Copy`.
+            let __convert: ::std::boxed::Box<
+                dyn Fn(#support::runtime::transport_error::TransportError) -> #err_ty + Send,
+            > = ::std::boxed::Box::new(#convert_err);
+            let __fields = match __fields_result {
+                Ok(v) => v,
+                Err(e) => {
+                    let __err = __convert(e);
+                    return ::std::boxed::Box::pin(::futures_util::stream::once(async move {
+                        ::std::result::Result::Err(__err)
+                    }));
+                }
+            };
+            // Compute the URL once; reconnect attempts re-use it.
+            let __query = match __query_result {
+                Ok(v) => v,
+                Err(e) => {
+                    let __err = __convert(e);
+                    return ::std::boxed::Box::pin(::futures_util::stream::once(async move {
+                        ::std::result::Result::Err(__err)
+                    }));
+                }
+            };
+            let __url_result = #support::runtime::http::build_request_url(
+                &__base_url, &__base_path, &__m, &__fields, __query.as_deref(),
+            );
+            let __url = match __url_result {
+                Ok(u) => u,
+                Err(e) => {
+                    let __err = __convert(e);
+                    return ::std::boxed::Box::pin(::futures_util::stream::once(async move {
+                        ::std::result::Result::Err(__err)
+                    }));
+                }
+            };
+            let __reconnect = self.config.sse_reconnect.clone();
+            // Factory: invoked once per attempt with the latest seen
+            // `Last-Event-ID`. On the first attempt `last` is `None`.
+            let __factory = move |last: ::std::option::Option<&str>|
+                -> ::std::result::Result<
+                    ::toolkit_http::RequestBuilder,
+                    #support::runtime::transport_error::TransportError,
+                >
+            {
+                // SSE clients MUST advertise the event-stream media type
+                // (PRD §5.6) so content-negotiating servers/gateways return the
+                // stream rather than JSON.
+                let mut __builder = __http
+                    .#verb_call(&__url)
+                    .header("accept", "text/event-stream");
+                // Tenant bearer via a sensitive `Authorization` header, or the
+                // platform-plane runtime credential via a sensitive
+                // `X-ToolKit-Internal-Token` (never `Authorization`); at most one
+                // of the two is Some. The platform credential is resolved fresh
+                // on every reconnect attempt (not once before the stream
+                // started) so a rotated/refreshed token is used on reconnects.
+                if let Some(ref __t) = __bearer {
+                    __builder = __builder.bearer_auth(__t);
+                }
+                // Platform-plane credential attach routed through the single
+                // audited runtime helper (shared with the unary path), which
+                // re-resolves per reconnect and warns on an unavailable source.
+                __builder = #support::runtime::http::attach_internal_token(
+                    __builder,
+                    __internal_token_provider.as_ref(),
+                    #method_name,
+                );
+                if let Some(__id) = last {
+                    __builder = __builder.header("Last-Event-ID", __id);
+                }
+                ::std::result::Result::Ok(__builder)
+            };
+
+            // SSE uses the per-event idle deadline (NOT the unary `timeout`),
+            // so a healthy slow stream is not killed between events.
+            let __timeout = ::std::option::Option::Some(self.config.sse_idle_timeout);
+            let __stream = #support::runtime::client::send_streaming::<_, #item_ty>(
+                __factory, __reconnect, __timeout,
+            );
+            ::std::boxed::Box::pin(__stream.map(move |r| {
+                let __enter = __span.enter();
+                let __mapped = r.map_err(|e| __convert(e));
+                if __mapped.is_err() {
+                    #support::__tracing::Span::current().record("error", true);
+                }
+                ::std::mem::drop(__enter);
+                __mapped
+            }))
+        }
+    }
+}
+
+fn render_method_signature(method: &RestMethodModel) -> TokenStream {
+    let params = method.params.iter().map(|p| {
+        let ident = &p.ident;
+        let ty = &p.ty;
+        if ident == "self" {
+            return quote! { &self };
+        }
+        quote! { #ident: #ty }
+    });
+
+    let return_ty = match &method.result_types {
+        Some((ok, err)) if !method.streaming => quote! { -> ::std::result::Result<#ok, #err> },
+        _ => streaming_signature_return(method),
+    };
+
+    quote! {
+        ( &self, #(#params),* ) #return_ty
+    }
+}
+
+fn streaming_signature_return(method: &RestMethodModel) -> TokenStream {
+    // For streaming methods we mirror the original trait return type. The
+    // parser recorded it as the function output; we re-emit the same tokens
+    // here by re-using the generic stream signature.
+    if let Some((ok, err)) = &method.result_types {
+        return quote! {
+            -> ::std::pin::Pin<::std::boxed::Box<dyn ::futures_core::Stream<Item = ::std::result::Result<#ok, #err>> + ::std::marker::Send + 'static>>
+        };
+    }
+    quote! { -> ::std::pin::Pin<::std::boxed::Box<dyn ::futures_core::Stream<Item = ()> + ::std::marker::Send + 'static>> }
+}
+
+fn streaming_item_type(method: &RestMethodModel) -> TokenStream {
+    if let Some((ok, _)) = &method.result_types {
+        return quote! { #ok };
+    }
+    quote! { () }
+}
+
+fn response_type(method: &RestMethodModel) -> TokenStream {
+    if let Some((ok, _)) = &method.result_types {
+        return quote! { #ok };
+    }
+    quote! { () }
+}
+
+fn error_type(method: &RestMethodModel) -> TokenStream {
+    if let Some((_, err)) = &method.result_types {
+        return quote! { #err };
+    }
+    quote! { () }
+}
+
+fn http_verb_call(verb: HttpVerb) -> syn::Ident {
+    match verb {
+        HttpVerb::Get => format_ident!("get"),
+        HttpVerb::Post => format_ident!("post"),
+        HttpVerb::Put => format_ident!("put"),
+        HttpVerb::Patch => format_ident!("patch"),
+        HttpVerb::Delete => format_ident!("delete"),
+    }
+}
+
+fn build_fields_json(method: &RestMethodModel, support: &TokenStream) -> TokenStream {
+    // Only PATH fields go into `__fields` (consumed by URL path substitution).
+    // The body param is applied separately via `with_json_body`, and the query
+    // param is encoded by `build_query_string` with `serde_html_form` — the same
+    // codec the server extractor decodes with. Sending query values through this
+    // JSON map is what used to let the two ends disagree.
+    let entries = classify_params(method)
+        .into_iter()
+        .filter_map(|(p, class)| {
+            if class != FieldClass::Path {
+                return None;
+            }
+            let key = p.ident.to_string();
+            let ident = &p.ident;
+            Some(quote! {
+                __obj.insert(
+                    #key.to_owned(),
+                    match ::serde_json::to_value(&#ident) {
+                        ::std::result::Result::Ok(__v) => __v,
+                        ::std::result::Result::Err(__e) => return ::std::result::Result::Err(
+                            #support::runtime::transport_error::TransportError::serialization(__e),
+                        ),
+                    },
+                );
+            })
+        });
+
+    quote! {
+        let __fields_result: ::std::result::Result<
+            ::serde_json::Value,
+            #support::runtime::transport_error::TransportError,
+        > = (|| {
+            let mut __obj = ::serde_json::Map::new();
+            #(#entries)*
+            ::std::result::Result::Ok(::serde_json::Value::Object(__obj))
+        })();
+    }
+}
+
+/// Encode the method's query parameter (if any) with `serde_html_form`.
+///
+/// Binds `__query_result: Result<Option<String>, TransportError>` — `None` when
+/// the method has no query parameter or the encoding is empty, so the caller
+/// appends no `?` at all.
+fn build_query_string(method: &RestMethodModel, support: &TokenStream) -> TokenStream {
+    let query_param = classify_params(method)
+        .into_iter()
+        .find(|(_, class)| *class == FieldClass::Query)
+        .map(|(p, _)| (p.ident.clone(), scalar_openapi_type(&p.ty).is_some()));
+
+    match query_param {
+        // A scalar has no field names of its own, so it is encoded as a
+        // one-entry pair list under the parameter's own name (`?count=3`).
+        // Only `#[server_manual]` methods reach here with a scalar — a
+        // generated route requires a struct (see `check_query_params`).
+        Some((ident, true)) => {
+            let name = ident.to_string();
+            quote! {
+                let __query_result: ::std::result::Result<
+                    ::std::option::Option<::std::string::String>,
+                    #support::runtime::transport_error::TransportError,
+                > = #support::query::to_query_string(&[(#name, &#ident)])
+                    .map_err(#support::runtime::transport_error::TransportError::serialization);
+            }
+        }
+        Some((ident, false)) => quote! {
+            let __query_result: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                #support::runtime::transport_error::TransportError,
+            > = #support::query::to_query_string(&#ident)
+                .map_err(#support::runtime::transport_error::TransportError::serialization);
+        },
+        None => quote! {
+            let __query_result: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                #support::runtime::transport_error::TransportError,
+            > = ::std::result::Result::Ok(::std::option::Option::None);
+        },
+    }
+}
+
+/// Capture the outbound auth credential(s) for a method, binding two locals the
+/// request-build closures consume: `__bearer` (tenant plane, a resolved
+/// `String`) and `__internal_token_provider` (platform plane, the
+/// [`InternalTokenProvider`] itself — NOT a pre-resolved token). At most one
+/// yields a credential; the plane is selected at compile time by the context
+/// type (`cpt-cf-adr-two-plane-auth`).
+///
+/// - Tenant `SecurityContext` → `__bearer` from the argument's bearer token
+///   (attached as `Authorization: Bearer`).
+/// - Platform `PlatformSecurityContext` → `__internal_token_provider` is a
+///   clone of `self.config.internal_token_provider`. The provider — not a
+///   token resolved once here — is what's captured, because both the retry
+///   loop (`__attempt`) and the SSE reconnect factory (`__factory`) may issue
+///   the request long after this line runs; each of those call sites resolves
+///   the credential fresh via `InternalTokenProvider::current` right before
+///   sending, so a rotated/refreshed credential is picked up on every attempt
+///   instead of a stale one captured at method-call time. The credential is
+///   sourced from the runtime, **never** from the argument (which carries no
+///   secret). Permissive: with no provider configured
+///   (`InternalCredential::None`) nothing is attached — the requirement is
+///   enforced server-side.
+/// - No context parameter → both `None`.
+fn capture_auth_credentials(method: &RestMethodModel, support: &TokenStream) -> TokenStream {
+    let secctx = method
+        .params
+        .iter()
+        .find(|p| is_security_context_type(&p.ty));
+
+    match secctx {
+        Some(p) if is_platform_security_context_type(&p.ty) => {
+            let ident = &p.ident;
+            let base_ty = strip_type_refs(&p.ty);
+            quote! {
+                // Compile-time plane guard: the argument selected as the platform
+                // plane must be *exactly* `toolkit_security::PlatformSecurityContext`,
+                // not merely a local type whose name ends in
+                // `PlatformSecurityContext`. Plane selection on REST is otherwise
+                // by name only, so without this a look-alike type would silently
+                // switch a method off the tenant bearer. This mirrors the gRPC
+                // `SecurityContextMarker` guard (`cpt-cf-adr-two-plane-auth`). The
+                // identity function type-checks only when the two types are equal.
+                const _: () = {
+                    #[allow(dead_code)]
+                    fn __assert_platform_plane(
+                        __x: #base_ty,
+                    ) -> ::toolkit_security::PlatformSecurityContext {
+                        __x
+                    }
+                };
+                // The `PlatformSecurityContext` argument is a compile-time plane
+                // marker kept off the wire; consume it so it is not an unused
+                // parameter (the credential is sourced from the runtime below,
+                // never from the argument, which holds no secret).
+                let _ = &#ident;
+                let __bearer: ::std::option::Option<::std::string::String> =
+                    ::std::option::Option::None;
+                let __internal_token_provider: ::std::option::Option<
+                    #support::runtime::config::InternalTokenProvider,
+                > = self.config.internal_token_provider.clone();
+            }
+        }
+        Some(p) => {
+            let ident = &p.ident;
+            quote! {
+                let __bearer: ::std::option::Option<::std::string::String> = #ident
+                    .bearer_token()
+                    .map(|__t| {
+                        use ::secrecy::ExposeSecret as _;
+                        __t.expose_secret().to_owned()
+                    });
+                let __internal_token_provider: ::std::option::Option<
+                    #support::runtime::config::InternalTokenProvider,
+                > = ::std::option::Option::None;
+            }
+        }
+        None => quote! {
+            let __bearer: ::std::option::Option<::std::string::String> =
+                ::std::option::Option::None;
+            let __internal_token_provider: ::std::option::Option<
+                #support::runtime::config::InternalTokenProvider,
+            > = ::std::option::Option::None;
+        },
+    }
+}
+
+/// Strip any leading references (`&T`, `&mut T`) from a type, returning the
+/// underlying value type. Used to build a by-value type-equality assertion for
+/// the platform-plane guard regardless of whether the context argument was
+/// written by-value or by-reference (both forms are accepted, see DESIGN §2.2).
+fn strip_type_refs(ty: &syn::Type) -> &syn::Type {
+    match ty {
+        syn::Type::Reference(r) => strip_type_refs(&r.elem),
+        other => other,
+    }
+}
+
+fn capture_body_param(method: &RestMethodModel) -> Option<syn::Ident> {
+    if !method.http_method.allows_body() {
+        return None;
+    }
+    let path_params = extract_path_param_names(&method.path_template);
+    method
+        .params
+        .iter()
+        .find(|p| {
+            if p.ident == "self" {
+                return false;
+            }
+            if is_security_context_type(&p.ty) {
+                return false;
+            }
+            !path_params.iter().any(|pp| p.ident == pp)
+        })
+        .map(|p| p.ident.clone())
+}
+
+fn generate_server_registration(model: &RestContractModel) -> TokenStream {
+    let fn_name = format_ident!(
+        "register_{}_routes",
+        to_snake_case(&model.trait_ident.to_string())
+    );
+    let base_trait = &model.base_trait;
+    let doc = format!(
+        "Register the macro-generated REST routes for [`{}`] on the given router.\n\n\
+         Methods marked `#[server_manual]` are SKIPPED — register them by hand via \
+         `OperationBuilder` on the returned router. This function is additive and \
+         composable: the returned router can be chained into further manual \
+         `OperationBuilder::verb(..).register(router, openapi)` calls.",
+        model.trait_ident
+    );
+
+    // Methods marked `#[server_manual]` are excluded from generation so the
+    // author can register them by hand. They remain in the client + IR.
+    let method_routes = model
+        .methods
+        .iter()
+        .filter(|method| !method.server_manual)
+        .map(|method| generate_method_route(method, model));
+
+    quote! {
+        #[cfg(feature = "rest-server")]
+        #[doc = #doc]
+        pub fn #fn_name(
+            mut router: ::axum::Router,
+            openapi: &dyn ::toolkit::api::OpenApiRegistry,
+            svc: ::std::sync::Arc<dyn #base_trait>,
+        ) -> ::axum::Router {
+            #(#method_routes)*
+            router
+        }
+    }
+}
+
+fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) -> TokenStream {
+    // Streaming server-side codegen (SSE) is not yet implemented. Such methods
+    // must opt out with `#[server_manual]` and be registered by hand via
+    // `OperationBuilder`. (server_manual methods are filtered out before
+    // reaching this function, so a streaming method here is an un-opted-out one.)
+    if method.streaming {
+        let ident = &method.ident;
+        let msg = format!(
+            "rest_contract: streaming method `{ident}` cannot be auto-registered on the server yet. \
+             Mark it `#[server_manual]` and register it by hand via OperationBuilder."
+        );
+        return quote! { ::std::compile_error!(#msg); };
+    }
+
+    let base_path = &model.base_path;
+    let method_name = &method.ident;
+    let path = &method.path_template;
+    let full_path = format!("{base_path}{path}");
+    let operation_id = format!(
+        "{}_{method_name}",
+        to_snake_case(&model.trait_ident.to_string()),
+    );
+
+    let http_verb_method = match method.http_method {
+        HttpVerb::Get => quote! { get },
+        HttpVerb::Post => quote! { post },
+        HttpVerb::Put => quote! { put },
+        HttpVerb::Patch => quote! { patch },
+        HttpVerb::Delete => quote! { delete },
+    };
+
+    // Placeholder/parameter agreement is checked up front in
+    // `check_path_placeholders`, which runs regardless of the `rest-server`
+    // feature, so by here every `{param}` is known to name a real parameter.
+    let template_params = extract_path_param_names(&method.path_template);
+
+    // Query shape (at most one parameter, and it must be a struct) is validated
+    // up front in `check_query_params`, which runs regardless of the
+    // `rest-server` feature because both ends depend on it.
+    let query_params: Vec<&RestParam> = classify_params(method)
+        .into_iter()
+        .filter(|(_, class)| *class == FieldClass::Query)
+        .map(|(param, _)| param)
+        .collect();
+
+    // OpenAPI path parameters — one per `{param}` in the template, emitted in
+    // template order so the spec lists them in the order they appear in the URL
+    // (matching the `Path<(..)>` tuple the handler is built with).
+    let path_param_registrations = template_params.iter().map(|name| {
+        quote! { .path_param(#name, "") }
+    });
+
+    // OpenAPI query parameters come from the query struct's own
+    // `#[derive(QueryParams)]`, so the spec is generated from the same
+    // declaration that determines the wire format. Previously the macro tried
+    // to infer them from the Rust type at expansion time, could not see a
+    // struct's fields, and therefore documented nothing at all for the one
+    // shape that actually worked.
+    let query_param_registration = match query_params.first() {
+        Some(param) => {
+            let ty = &param.ty;
+            quote! {
+                .query_params_from::<#ty>()
+            }
+        }
+        None => quote! {},
+    };
+
+    // Request-body param type (for OpenAPI request schema) — from the shared
+    // classifier, so it matches the client IR and the handler below.
+    let body_ty = body_param_type(method);
+    let request_registration = match body_ty {
+        Some(ty) => quote! { .json_request::<#ty>(openapi, "") },
+        None => quote! {},
+    };
+
+    let handler = generate_unary_handler(method, &contract_support_path());
+
+    // Response schema: derive from the `Ok` type of `Result<Ok, Err>`. A unit
+    // `Ok` type (`Result<(), E>`) has no schema and is not a `ResponseApiDto`,
+    // so it uses the schema-less `.json_response(..)` — matching the generated
+    // handler, which wraps the unit value in `Json(())` (200 + `null` body).
+    let response_registration = match &method.result_types {
+        Some((ok_ty, _)) if !is_unit_type(ok_ty) => {
+            // A `Vec<T>` Ok type must register the ITEM, not the vector:
+            // utoipa names every `Vec<_>` `Vec`, so registering the vector
+            // would collide with every other list response in the process and
+            // panic at boot. The array-aware builder emits an inline array.
+            if let Some(item_ty) = vec_item_type(ok_ty) {
+                quote! {
+                    .json_array_response_with_schema::<#item_ty>(
+                        openapi, ::axum::http::StatusCode::OK, ""
+                    )
+                }
+            } else {
+                quote! {
+                    .json_response_with_schema::<#ok_ty>(openapi, ::axum::http::StatusCode::OK, "")
+                }
+            }
+        }
+        _ => quote! {
+            .json_response(::axum::http::StatusCode::OK, "")
+        },
+    };
+
+    // Auth axis. `.anonymous()` lands in `LicenseSet` on its own, so
+    // `.no_license_required()` must NOT follow it — that method only exists on
+    // `LicenseNotSet`. `.authenticated()` leaves the license state unset, hence
+    // the pairing.
+    //
+    // A platform-plane method (`PlatformSecurityContext` marker) is authorized
+    // by the platform-plane `internal_auth_middleware` (which validates the
+    // `X-ToolKit-Internal-Token` and inserts the `Extension<PlatformSecurityContext>`
+    // the handler reads) — NOT by the tenant-plane `security_context_middleware`.
+    // `.authenticated()` would demand a tenant JWT and 401 a legitimate
+    // internal-token caller before the handler runs, so the tenant auth axis
+    // must be left off (`.anonymous()`) until `OperationBuilder` grows a
+    // dedicated platform axis (`cpt-cf-adr-two-plane-auth`).
+    let is_platform_plane = method
+        .params
+        .iter()
+        .any(|p| is_platform_security_context_type(&p.ty));
+    let auth_registration = if method.anonymous || is_platform_plane {
+        quote! { .anonymous() }
+    } else {
+        quote! { .authenticated().no_license_required() }
+    };
+
+    // Visibility axis, independent of auth: an exposed route may still require a
+    // JWT, and an anonymous one may stay internal. Per-method `#[exposed]` /
+    // `#[internal]` override the trait's `visibility` default; absent both, the
+    // default applies. `.exposed()` is `Self -> Self` at any builder stage, so
+    // its position in the chain is free.
+    let exposed_registration = if method.exposed.unwrap_or(model.default_exposed) {
+        quote! { .exposed() }
+    } else {
+        quote! {}
+    };
+
+    quote! {
+        router = ::toolkit::api::OperationBuilder::#http_verb_method(#full_path)
+            .operation_id(#operation_id)
+            #auth_registration
+            #exposed_registration
+            #(#path_param_registrations)*
+            #query_param_registration
+            #request_registration
+            .handler(#handler)
+            #response_registration
+            .standard_errors(openapi)
+            .register(router, openapi);
+    }
+}
+
+/// Recognizes a "scalar-like" Rust type usable as a single `OpenAPI` query
+/// parameter — `String`/`&str`/numeric/`bool`, or `Option<...>` of one of
+/// those (peeled once). Returns `(openapi_type, required)`. Returns `None` for
+/// anything else (flat-struct query params), since the macro cannot see a
+/// struct's field definitions at expansion time and registering it under the
+/// Rust parameter's own name would document a parameter shape that does not
+/// match what actually goes on the wire.
+fn scalar_openapi_type(ty: &Type) -> Option<(&'static str, bool)> {
+    fn leaf_ident(ty: &Type) -> Option<&syn::Ident> {
+        match ty {
+            Type::Reference(r) => leaf_ident(&r.elem),
+            Type::Path(p) => p.path.segments.last().map(|s| &s.ident),
+            _ => None,
+        }
+    }
+    fn openapi_type_for(ident: &syn::Ident) -> Option<&'static str> {
+        match ident.to_string().as_str() {
+            "String" | "str" => Some("string"),
+            "bool" => Some("boolean"),
+            "f32" | "f64" => Some("number"),
+            "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
+            | "u128" | "usize" => Some("integer"),
+            _ => None,
+        }
+    }
+
+    // Peel one layer of `Option<...>` (by reference, so `&Option<T>` also
+    // works) to determine both the leaf type and required-ness.
+    if let Type::Path(p) = strip_reference(ty)
+        && let Some(seg) = p.path.segments.last()
+        && seg.ident == "Option"
+        && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+    {
+        return leaf_ident(inner)
+            .and_then(openapi_type_for)
+            .map(|t| (t, false));
+    }
+
+    leaf_ident(ty).and_then(openapi_type_for).map(|t| (t, true))
+}
+
+/// True for the unit type `()`. Server response codegen uses this to pick the
+/// schema-less `.json_response(..)` (the unit type is not a `ResponseApiDto`).
+fn is_unit_type(ty: &Type) -> bool {
+    matches!(ty, Type::Tuple(t) if t.elems.is_empty())
+}
+
+/// If `ty` is syntactically `Vec<Inner>` (or `std::vec::Vec<Inner>`), returns
+/// `Inner`.
+///
+/// Response codegen uses this to route a `Result<Vec<T>, E>` contract method to
+/// `json_array_response_with_schema::<T>()`. Registering the `Vec` itself would
+/// name the component `Vec` — utoipa's `ToSchema::name()` strips generics — and
+/// collide with every other list response in the same process.
+///
+/// Purely syntactic: a type aliased to a vector is not detected. That is safe,
+/// since the alias would register under its own distinct name.
+fn vec_item_type(ty: &Type) -> Option<Type> {
+    let Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last()?;
+    if seg.ident != "Vec" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    match args.args.first()? {
+        syn::GenericArgument::Type(inner) => Some(inner.clone()),
+        _ => None,
+    }
+}
+
+/// Returns the type of the request-body parameter (the `Body`-classified param),
+/// via the shared [`classify_params`]. `None` for GET/DELETE or bodyless methods.
+fn body_param_type(method: &RestMethodModel) -> Option<Type> {
+    classify_params(method)
+        .into_iter()
+        .find(|(_, class)| *class == FieldClass::Body)
+        .map(|(param, _)| param.ty.clone())
+}
+
+fn generate_unary_handler(method: &RestMethodModel, support: &TokenStream) -> TokenStream {
+    let method_ident = &method.ident;
+
+    // The security-plane context is always first (populated by gateway auth
+    // middleware into Axum extensions). Drive the extractor's type from the
+    // actual context parameter (`SecurityContext` / `PlatformSecurityContext`,
+    // value or reference) rather than hardcoding it, and forward it to the
+    // service call by value or by reference to match the trait signature.
+    let ctx_param = method
+        .params
+        .iter()
+        .find(|p| p.ident != "self" && is_security_context_type(&p.ty));
+
+    let (ctx_extractor, ctx_call_arg) = match ctx_param {
+        Some(p) => {
+            let owned_ty = strip_reference(&p.ty);
+            let is_ref = matches!(&p.ty, Type::Reference(_));
+            let call = if is_ref {
+                quote! { &ctx }
+            } else {
+                quote! { ctx }
+            };
+            (
+                quote! { ::axum::Extension(ctx): ::axum::Extension<#owned_ty> },
+                call,
+            )
+        }
+        // Enforced upstream (`parse_method` rejects a remote method without a
+        // plane context), but keep a sane fallback for robustness.
+        None => (
+            quote! { ::axum::Extension(ctx): ::axum::Extension<::toolkit_security::SecurityContext> },
+            quote! { ctx },
+        ),
+    };
+
+    // Collect params by carrier, preserving the trait's declaration order for
+    // `call_args` (the service is invoked as `svc.method(ctx, a, b, ..)`).
+    // Classification is shared with the client IR via `classify_params`.
+    let mut call_args = vec![ctx_call_arg];
+    let mut path_idents: Vec<&Ident> = Vec::new();
+    let mut path_tys: Vec<&Type> = Vec::new();
+    let mut query_extractor: Option<TokenStream> = None;
+    let mut body_extractor: Option<TokenStream> = None;
+
+    for (param, class) in classify_params(method) {
+        let param_name = &param.ident;
+        let param_ty = &param.ty;
+        match class {
+            FieldClass::Path => {
+                path_idents.push(param_name);
+                path_tys.push(param_ty);
+            }
+            FieldClass::Body => {
+                body_extractor = Some(quote! {
+                    ::axum::Json(#param_name): ::axum::Json<#param_ty>
+                });
+            }
+            // At most one query param reaches here, and it is known to be a
+            // struct — `generate_method_route` rejects both >1 and a bare
+            // scalar. The extractor is the contract layer's own, not
+            // `axum::extract::Query`: it decodes with `serde_html_form`, the
+            // same codec the client encodes with, so repeated keys collect into
+            // a `Vec` instead of failing.
+            FieldClass::Query => {
+                query_extractor = Some(quote! {
+                    #support::query::QueryParamsExtractor(#param_name):
+                        #support::query::QueryParamsExtractor<#param_ty>
+                });
+            }
+        }
+        call_args.push(quote! { #param_name });
+    }
+
+    // Aggregate path params into a SINGLE extractor: axum deserializes ALL path
+    // segments through one `Path<_>`, so multiple path params must be one
+    // `Path<(T0, T1, ..)>` tuple (individual `Path<T>` extractors each try to
+    // decode the whole tuple and fail at runtime — the bug this fixes).
+    //
+    // The tuple is POSITIONAL: axum fills it from the URL segments in the order
+    // the `{...}` placeholders appear in the route. `classify_params` yields the
+    // trait's declaration order, which need not match — and when two path params
+    // share a type the mismatch is a silent value swap rather than a type error.
+    // Reorder by the template before building the tuple. `call_args` stays in
+    // declaration order: it feeds `svc.method(ctx, a, b, ..)`.
+    let template_order = extract_path_param_names(&method.path_template);
+    let mut ordered: Vec<(&Ident, &Type)> = path_idents
+        .iter()
+        .copied()
+        .zip(path_tys.iter().copied())
+        .collect();
+    ordered.sort_by_key(|(ident, _)| {
+        let name = ident.to_string();
+        template_order.iter().position(|p| *p == name)
+    });
+    let path_idents: Vec<&Ident> = ordered.iter().map(|(i, _)| *i).collect();
+    let path_tys: Vec<&Type> = ordered.iter().map(|(_, t)| *t).collect();
+
+    let path_extractor: Option<TokenStream> = match path_idents.len() {
+        0 => None,
+        1 => {
+            let i = path_idents[0];
+            let t = path_tys[0];
+            Some(quote! { ::axum::extract::Path(#i): ::axum::extract::Path<#t> })
+        }
+        _ => Some(quote! {
+            ::axum::extract::Path((#(#path_idents),*)): ::axum::extract::Path<(#(#path_tys),*)>
+        }),
+    };
+
+    // Order: ctx (Extension) → path → query → body. The body-consuming `Json`
+    // extractor MUST be last (axum requires the single `FromRequest` extractor to
+    // be the final handler argument); `Extension`/`Path`/`Query` are
+    // `FromRequestParts` and may precede it in any order.
+    let mut extractors = vec![ctx_extractor];
+    if let Some(p) = path_extractor {
+        extractors.push(p);
+    }
+    if let Some(q) = query_extractor {
+        extractors.push(q);
+    }
+    if let Some(body) = body_extractor {
+        extractors.push(body);
+    }
+
+    let extractor_list = quote! { #(#extractors),* };
+
+    // The handler mirrors the hand-written pattern: call the domain method and
+    // wrap the `Ok` value in `Json`. The error type (`CanonicalError` in the
+    // common case) implements `IntoResponse`, so `?`/`map`-style propagation
+    // renders the RFC 9457 `Problem` envelope at the framework boundary.
+    quote! {
+        {
+            let svc = ::std::sync::Arc::clone(&svc);
+            move |#extractor_list| {
+                let svc = ::std::sync::Arc::clone(&svc);
+                async move {
+                    svc.#method_ident(#(#call_args),*).await.map(::axum::Json)
+                }
+            }
+        }
+    }
+}
+
+/// Snake-case a trait ident. Delegates to `heck::ToSnakeCase` — the SAME
+/// converter used by `#[toolkit::provides]` (`provides.rs`) and `codegen.rs` —
+/// so the generated `<trait_snake>_http_binding` symbol name always matches the
+/// name `provides` reconstructs, including for acronym/adjacent-capital trait
+/// names (e.g. `HttpGatewayApi` → `http_gateway_api`, not `h_t_t_p_...`). A
+/// hand-rolled converter here previously diverged on such names and broke the
+/// `provides`↔REST wiring with an `E0425 cannot find function`.
+fn to_snake_case(s: &str) -> String {
+    use heck::ToSnakeCase as _;
+    s.to_snake_case()
+}
+
+/// Only used to suggest a wrapper-struct name in the bare-scalar query
+/// diagnostic, so the author can paste the snippet as-is.
+fn to_pascal_case(s: &str) -> String {
+    use heck::ToPascalCase as _;
+    s.to_pascal_case()
+}
+
+#[cfg(test)]
+mod scalar_openapi_type_tests {
+    use super::scalar_openapi_type;
+    use syn::parse_quote;
+
+    #[test]
+    fn recognizes_scalar_types_as_required() {
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(String)),
+            Some(("string", true))
+        );
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(&str)),
+            Some(("string", true))
+        );
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(bool)),
+            Some(("boolean", true))
+        );
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(u64)),
+            Some(("integer", true))
+        );
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(i32)),
+            Some(("integer", true))
+        );
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(f64)),
+            Some(("number", true))
+        );
+    }
+
+    #[test]
+    fn recognizes_optional_scalars_as_not_required() {
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(Option<String>)),
+            Some(("string", false))
+        );
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(Option<u32>)),
+            Some(("integer", false))
+        );
+    }
+
+    #[test]
+    fn rejects_struct_types() {
+        // A flat-struct query param's fields aren't visible at macro-expansion
+        // time, so it must NOT be registered as a scalar (that would document a
+        // wrong parameter shape) — see the `#11` fix rationale.
+        assert_eq!(scalar_openapi_type(&parse_quote!(ListPaymentsFilter)), None);
+        assert_eq!(
+            scalar_openapi_type(&parse_quote!(Option<ListPaymentsFilter>)),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod vec_item_type_tests {
+    use super::vec_item_type;
+    use syn::{Type, parse_quote};
+
+    fn item_of(ty: &Type) -> Option<String> {
+        vec_item_type(ty).map(|t| quote::quote!(#t).to_string())
+    }
+
+    #[test]
+    fn unwraps_vec() {
+        // The whole point: a `Result<Vec<T>, E>` method must register `T`, not
+        // the vector — utoipa names every `Vec<_>` `Vec`, so registering the
+        // vector collides with every other list response in the process.
+        assert_eq!(
+            item_of(&parse_quote!(Vec<PaymentSummary>)).as_deref(),
+            Some("PaymentSummary")
+        );
+        assert_eq!(
+            item_of(&parse_quote!(std::vec::Vec<Invoice>)).as_deref(),
+            Some("Invoice")
+        );
+        assert_eq!(
+            item_of(&parse_quote!(Vec<models::Invoice>)).as_deref(),
+            Some("models :: Invoice")
+        );
+    }
+
+    #[test]
+    fn leaves_non_vec_types_alone() {
+        assert!(item_of(&parse_quote!(Invoice)).is_none());
+        assert!(item_of(&parse_quote!(Option<Invoice>)).is_none());
+        assert!(item_of(&parse_quote!(Page<Invoice>)).is_none());
+        assert!(item_of(&parse_quote!(())).is_none());
+    }
+
+    #[test]
+    fn nested_vec_unwraps_one_level() {
+        // `Vec<Vec<T>>` yields `Vec<T>`, which would then register as `Vec`.
+        // No contract does this today; documented so the behaviour is a choice
+        // rather than an accident if one ever does.
+        assert_eq!(
+            item_of(&parse_quote!(Vec<Vec<u8>>)).as_deref(),
+            Some("Vec < u8 >")
+        );
+    }
+}

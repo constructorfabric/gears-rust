@@ -1,8 +1,9 @@
-//! REST API layer for the `bss-ledger` gear.
+//! REST API for ledger provisioning, posting, payments, adjustments, revenue
+//! recognition, reconciliation, audit, and period-close operations.
 //!
-//! Hosts the seller-provisioning handler plus the shared error mapping that
-//! converts authz-gate and body-rejection errors into RFC 9457 `Problem`
-//! responses (rendered by `toolkit::api::canonical_error_middleware`).
+//! Handlers share authenticated request context, DTOs, and canonical error
+//! mapping so authorization and body failures become RFC 9457 `Problem`
+//! responses.
 
 pub mod adjustments;
 pub mod approvals;

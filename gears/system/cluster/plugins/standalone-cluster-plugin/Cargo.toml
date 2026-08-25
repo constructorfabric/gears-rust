@@ -1,12 +1,12 @@
 [package]
 name = "cf-gears-standalone-cluster-plugin"
-version = "0.1.2"
+version = "0.2.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "In-process standalone backend plugin for the cluster gear: a native cache plus the SDK default leader-election, lock, and service-discovery backends — the zero-infrastructure dev/test deployment"
+description = "In-process standalone backend plugin for the cluster gear: a native cache plus the SDK default leader-election and lock backends — the zero-infrastructure dev/test deployment"
 readme = "README.md"
 keywords = ["constructorfabric", "cf-gears"]
 categories = ["development-tools"]

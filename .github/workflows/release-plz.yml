@@ -4,9 +4,6 @@ on:
   push:
     branches:
       - main
-  pull_request:
-    types: [ closed ]
-    branches: [ main ]
   workflow_dispatch:
     inputs:
       mode:
@@ -22,15 +19,128 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: release-plz-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+env:
+  # `cargo publish` compiles every crate; CI does not want incremental churn
+  # (see [profile.dev] in Cargo.toml, which enables it for local dev).
+  CARGO_INCREMENTAL: "0"
 
 jobs:
+  # `release-plz release` publishes only versions present in the manifests and absent
+  # from crates.io, so running it on every push is safe and makes an interrupted release
+  # self-healing: the next push to main finishes it. That is why this needs no
+  # pull_request trigger and no label matching to decide whether a release is happening.
+  release:
+    name: Publish crates
+    runs-on: ubuntu-latest
+    if: >-
+      ${{
+        github.repository == 'constructorfabric/gears-rust'
+        && (
+          github.event_name == 'push'
+          || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
+        )
+      }}
+    # No concurrency group, deliberately. Any group can cancel a *pending* run when a
+    # newer one joins it, and a skipped publish is silent — no crates, no tags, no
+    # failure. release-plz's docs mandate this: "the concurrency block cancels the
+    # pending job if a new commit is pushed — we can't risk to skip a release." Two
+    # concurrent publishes are harmless, since each publishes only what crates.io lacks.
+    permissions:
+      contents: write
+      # release-plz resolves PR numbers and contributors for changelogs and releases.
+      pull-requests: read
+    steps:
+      # No `ref:` needed. On push, checkout defaults to github.sha, which is exactly the
+      # commit that was pushed — for a release PR merge, its merge commit.
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Disk report (before cleanup)
+        run: |
+          set -euxo pipefail
+          df -h
+          du -sh . || true
+          du -xh . | sort -h | tail -n 40 || true
+
+      # Removing ~/.cargo/registry also clears its `index` subdirectory, which is the
+      # workaround for release-plz's gix slotmap overflow. Nothing between here and the
+      # publish repopulates it: free-disk-space, setup-go, setup-protoc and
+      # `rustup toolchain install` download no crates.
+      - name: Runner-local cache cleanup
+        run: |
+          set -euxo pipefail
+          rm -rf target || true
+          rm -rf ~/.cargo/registry ~/.cargo/git || true
+          df -h
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Install Go (required for aws-lc-fips-sys FIPS build)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
+          cache: false
+
+      - name: Install protoc
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: protoc@3.34.1
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      # No test run here. ci.yml tests every push to main, and merging a release PR is
+      # the maintainer's release decision — re-testing could only override it, never
+      # inform it. `cargo publish` still compiles every crate, so a crate that does not
+      # build cannot be published.
+
+      - name: release-plz release
+        uses: release-plz/action@52440b50d383aa252927de395c8b2c1e0a9cf8e9 # v0.3.155
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+      - name: Disk report (post-mortem)
+        if: always()
+        run: df -h
+
   release-pr:
     name: Create release PR
     runs-on: ubuntu-latest
-    if: ${{ github.repository == 'constructorfabric/gears-rust' && (github.event_name == 'push' || github.event.inputs.mode == 'release-pr') }}
+    # Ordered after `release` so release-plz never derives the next versions from
+    # crates.io while a publish is mid-flight. `!cancelled()` keeps this running when
+    # `release` was skipped (manual release-pr dispatch) or failed.
+    needs: release
+    if: >-
+      ${{
+        !cancelled()
+        && github.repository == 'constructorfabric/gears-rust'
+        && (
+          github.event_name == 'push'
+          || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release-pr')
+        )
+      }}
+    # Let a running instance finish — it is part-way through committing and force-pushing
+    # the release branch — and keep only the newest waiting one.
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
       pull-requests: write
@@ -52,165 +162,3 @@ jobs:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  cleanup-caches:
-    name: Cleanup PR caches before release
-    runs-on: ubuntu-latest
-    if: >-
-      ${{
-        github.repository == 'constructorfabric/gears-rust'
-        && (
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
-          || (
-            github.event_name == 'pull_request'
-            && github.event.pull_request.merged == true
-            && contains(join(github.event.pull_request.labels.*.name, ','), 'release-plz')
-          )
-        )
-      }}
-    permissions:
-      actions: write
-    steps:
-      - name: Delete PR rust caches
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO_FULL: ${{ github.repository }}
-        run: |
-          set -euxo pipefail
-
-          OWNER="${REPO_FULL%%/*}"
-          REPO="${REPO_FULL##*/}"
-          MAX_DELETE=500
-          DELETED=0
-
-          RESP=$(gh api "/repos/$OWNER/$REPO/actions/caches?per_page=100&page=1")
-          COUNT=$(echo "$RESP" | jq '[.actions_caches[] | select(.key | startswith("v0-rust-pr-"))] | length')
-          SIZE=$(echo "$RESP" | jq '[.actions_caches[] | select(.key | startswith("v0-rust-pr-")) | .size_in_bytes] | add // 0')
-          echo "PR caches (page 1): count=$COUNT, size_bytes=$SIZE"
-
-          PAGE=1
-          while true; do
-            RESP=$(gh api \
-              "/repos/$OWNER/$REPO/actions/caches?per_page=100&page=$PAGE")
-
-            TOTAL=$(echo "$RESP" | jq '.actions_caches | length')
-            [ "$TOTAL" -eq 0 ] && break
-
-            IDS=$(echo "$RESP" | jq -r '
-              .actions_caches[]
-              | select(.key | startswith("v0-rust-pr-"))
-              | .id
-            ')
-
-            if [ -n "$IDS" ]; then
-              for id in $IDS; do
-                if [ "$DELETED" -ge "$MAX_DELETE" ]; then
-                  echo "Reached MAX_DELETE=$MAX_DELETE, stopping."
-                  exit 0
-                fi
-                echo "Deleting cache $id"
-                gh api -X DELETE \
-                  "/repos/$OWNER/$REPO/actions/caches/$id" || true
-                DELETED=$((DELETED+1))
-              done
-            fi
-
-            PAGE=$((PAGE+1))
-          done
-
-          echo "Deleted $DELETED PR cache(s)."
-
-  release:
-    name: Publish crates
-    needs: cleanup-caches
-    runs-on: ubuntu-latest
-    # IMPORTANT: don't publish on every push. Publish only:
-    # - manually via workflow_dispatch (mode=release), or
-    # - when a release PR (labeled `release-plz`) is merged into main.
-    if: >-
-      ${{
-        github.repository == 'constructorfabric/gears-rust'
-        && (
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
-          || (
-            github.event_name == 'pull_request'
-            && github.event.pull_request.merged == true
-            && contains(join(github.event.pull_request.labels.*.name, ','), 'release-plz')
-          )
-        )
-      }}
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Disk report (before cleanup)
-        run: |
-          set -euxo pipefail
-          df -h
-          du -sh . || true
-          du -xh . | sort -h | tail -n 40 || true
-
-      - name: Runner-local cache cleanup
-        run: |
-          set -euxo pipefail
-          rm -rf target || true
-          rm -rf ~/.cargo/registry ~/.cargo/git || true
-          df -h
-
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-
-      - name: Install Go (required for aws-lc-fips-sys FIPS build)
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
-        with:
-          go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
-          cache: false
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install Rust toolchain from rust-toolchain.toml
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          rustup show
-
-      - name: Install nextest
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
-        with:
-          tool: nextest
-
-      - name: cargo test (workspace)
-        run: make test-no-macros
-
-      - name: Clean build artifacts
-        run: rm -rf target
-
-      - name: Clear cargo registry index (workaround gix slotmap overflow)
-        run: rm -rf ~/.cargo/registry/index
-
-      - name: release-plz release
-        uses: release-plz/action@52440b50d383aa252927de395c8b2c1e0a9cf8e9 # v0.3.155
-        with:
-          command: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-          CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-
-      - name: Disk report (post-mortem)
-        if: always()
-        run: df -h

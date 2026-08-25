@@ -31,7 +31,7 @@
 
 ### 1.1 Overview
 
-Delivers the distributed cache primitive — the universal compare-and-swap building block on which leader election, locks, and service discovery are built. It provides versioned key-value storage, atomic conditional operations, TTL, and reactive key/prefix notifications, plus the canonical watch-union event shape and the per-primitive fluent resolver with startup capability validation that every other primitive reuses.
+Delivers the distributed cache primitive — the universal compare-and-swap building block on which leader election and locks are built. It provides versioned key-value storage, atomic conditional operations, TTL, and reactive key/prefix notifications, plus the canonical watch-union event shape and the per-primitive fluent resolver with startup capability validation that every other primitive reuses.
 
 ### 1.2 Purpose
 

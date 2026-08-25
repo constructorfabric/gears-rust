@@ -115,6 +115,10 @@ impl JournalRepo {
     /// passing an already-balanced entry (the deferrable balance trigger
     /// enforces this on Postgres; `SQLite` relies on the P3 app-level
     /// assertion).
+    ///
+    /// # Errors
+    /// Returns [`RepoError::Db`] if a scoped insert or read-back fails, or
+    /// [`RepoError::RowVanished`] if the inserted header cannot be read back.
     pub async fn insert_entry_with_lines(
         &self,
         txn: &DbTx<'_>,
@@ -231,6 +235,10 @@ impl JournalRepo {
     /// Read back an entry and its lines under the supplied scope. The
     /// `SecureORM` `scope_with` narrows by tenant; the key triple pins the
     /// exact row.
+    ///
+    /// # Errors
+    /// Returns [`RepoError::Db`] if acquiring a connection or reading the entry
+    /// and its lines fails.
     pub async fn find_entry(
         &self,
         scope: &AccessScope,

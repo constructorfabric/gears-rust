@@ -33,12 +33,16 @@ pub const MAX_PAGE_SIZE: u64 = 1000;
 /// the look-ahead + `next_cursor` still yield a correct, resumable page, just
 /// a smaller one than an out-of-contract caller asked for.
 ///
-/// The **lower** bound of 1 is not cosmetic: `$top=0` is a legal `OData` value
-/// the core gateway forwards unclamped, and a resolved page size of 0 would
+/// The **lower** bound of 1 is not cosmetic. A resolved page size of 0 would
 /// drive `LIMIT 0+1 = 1` then `truncate(0)` on the look-ahead read — leaving
 /// `rows.last()` `None` on a non-empty table and 500-ing both list paths at
-/// `encode_next_cursor`. Flooring to the smallest legal page (1) keeps the
-/// look-ahead invariant intact without the plugin minting a `4xx`.
+/// `encode_next_cursor`. The REST surface cannot deliver a 0 (the toolkit
+/// `OData` extractor rejects a zero page size — in either the `$top` or the
+/// `limit` spelling — with `InvalidLimit` before the handler runs), but an
+/// in-process SDK caller hands the plugin an `ODataQuery` directly and
+/// reaches neither that check nor the core gateway's
+/// `prepare_list_query`. Flooring to the smallest legal page (1)
+/// keeps the look-ahead invariant intact without the plugin minting a `4xx`.
 #[must_use]
 pub fn effective_page_size(requested: Option<u64>, default_page_size: u64) -> u64 {
     requested

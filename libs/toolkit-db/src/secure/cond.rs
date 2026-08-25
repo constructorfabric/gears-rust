@@ -1,5 +1,5 @@
 use sea_orm::sea_query::{Alias, Query};
-use sea_orm::{ColumnTrait, Condition, EntityTrait, sea_query::Expr};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, sea_query::Expr};
 
 use crate::secure::{AccessScope, ScopableEntity};
 use toolkit_security::access_scope::{

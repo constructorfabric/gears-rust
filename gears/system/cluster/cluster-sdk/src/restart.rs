@@ -16,9 +16,8 @@
 //! ([`ProviderErrorKind::ConnectionLost`](crate::ProviderErrorKind::ConnectionLost),
 //! `Timeout`, `ResourceExhausted` retryable; everything else not).
 //!
-//! Wrap a watch via [`CacheWatch::auto_restart`](crate::cache::CacheWatch::auto_restart),
-//! [`LeaderWatch::auto_restart`](crate::leader::LeaderWatch::auto_restart), or
-//! [`ServiceWatch::auto_restart`](crate::discovery::ServiceWatch::auto_restart).
+//! Wrap a watch via [`CacheWatch::auto_restart`](crate::cache::CacheWatch::auto_restart)
+//! or [`LeaderWatch::auto_restart`](crate::leader::LeaderWatch::auto_restart).
 //! Consumers wanting a custom restart loop keep consuming the raw `*WatchEvent`
 //! stream without the combinator — the combinator is strictly opt-in.
 
@@ -30,7 +29,6 @@ use std::time::Duration;
 use rand::RngExt;
 
 use crate::cache::{CacheWatch, CacheWatchEvent};
-use crate::discovery::{ServiceWatch, ServiceWatchEvent};
 use crate::error::ClusterError;
 use crate::leader::{LeaderStatus, LeaderWatch, LeaderWatchEvent};
 use crate::observability::{ClusterMetrics, logs, primitive};
@@ -44,24 +42,23 @@ pub(crate) type ResubscribeFuture<W> =
 type NextEventFuture<'a, E> = Pin<Box<dyn Future<Output = Option<E>> + Send + 'a>>;
 
 mod sealed {
-    /// Seals [`RestartableWatch`](super::RestartableWatch) so only the three SDK
+    /// Seals [`RestartableWatch`](super::RestartableWatch) so only the two SDK
     /// watch types implement it.
     pub trait Sealed {}
 }
 
 /// The behaviour [`RestartingWatch`] needs from a wrapped watch.
 ///
-/// Sealed — implemented only by [`CacheWatch`], [`LeaderWatch`], and
-/// [`ServiceWatch`]. It unifies the three watches' differing event accessors
+/// Sealed — implemented only by [`CacheWatch`] and [`LeaderWatch`]. It unifies
+/// the two watches' differing event accessors
 /// (`recv` / `changed`) and exposes the internal resubscribe seam the facade
 /// installs (see each `*V1::watch`/`elect`).
 pub trait RestartableWatch: sealed::Sealed + Send + Sized + 'static {
-    /// The watch's union event type (`CacheWatchEvent`, `LeaderWatchEvent`, or
-    /// `ServiceWatchEvent`).
+    /// The watch's union event type (`CacheWatchEvent` or `LeaderWatchEvent`).
     type Event: Send;
 
     /// The bounded `primitive` label this watch's reset signals carry
-    /// (`cache` / `leader` / `discovery`).
+    /// (`cache` / `leader`).
     const PRIMITIVE: &'static str;
 
     /// The `(provider, metrics)` observability context the backend stamped on the
@@ -346,41 +343,6 @@ impl RestartableWatch for CacheWatch {
 
     fn reset_event() -> CacheWatchEvent {
         CacheWatchEvent::Reset
-    }
-
-    fn can_resubscribe(&self) -> bool {
-        self.can_resubscribe()
-    }
-
-    fn resubscribe(&self) -> ResubscribeFuture<Self> {
-        self.try_resubscribe()
-            .unwrap_or_else(|| Box::pin(async { Err(ClusterError::Shutdown) }))
-    }
-}
-
-impl sealed::Sealed for ServiceWatch {}
-impl RestartableWatch for ServiceWatch {
-    type Event = ServiceWatchEvent;
-
-    const PRIMITIVE: &'static str = primitive::DISCOVERY;
-
-    fn observability(&self) -> Option<(&'static str, Arc<dyn ClusterMetrics>)> {
-        self.observability_context()
-    }
-
-    fn next_event(&mut self) -> NextEventFuture<'_, ServiceWatchEvent> {
-        Box::pin(self.recv())
-    }
-
-    fn closed_error(event: &ServiceWatchEvent) -> Option<&ClusterError> {
-        match event {
-            ServiceWatchEvent::Closed(err) => Some(err),
-            _ => None,
-        }
-    }
-
-    fn reset_event() -> ServiceWatchEvent {
-        ServiceWatchEvent::Reset
     }
 
     fn can_resubscribe(&self) -> bool {

@@ -24,6 +24,7 @@
 //! ```
 
 pub mod api;
+pub mod bearer;
 pub mod error;
 pub mod gts;
 pub mod models;
@@ -31,6 +32,7 @@ pub mod plugin_api;
 
 // Re-export main types at crate root
 pub use api::AuthNResolverClient;
+pub use bearer::AuthNResolverBearerAuthenticator;
 pub use error::AuthNResolverError;
 pub use gts::AuthNResolverPluginSpecV1;
 pub use models::{AuthenticationResult, ClientCredentialsRequest};
