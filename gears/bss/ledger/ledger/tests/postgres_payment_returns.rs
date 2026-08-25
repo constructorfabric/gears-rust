@@ -4,7 +4,7 @@
 //! fee_share) / CR PSP_FEE_EXPENSE fee_share` — and decrements BOTH the original
 //! payment's `settled_minor` and `fee_minor` in the same txn. Ignored by default;
 //! run with
-//! `cargo test -p bss-ledger --test postgres_payment_returns -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_payment_returns -- --ignored`.
 //!
 //! Covers: (a) a return after a settle decrements `settled_minor` and drains the
 //! pool by the returned amount; (b) a re-posted return (same `psp_return_id`)

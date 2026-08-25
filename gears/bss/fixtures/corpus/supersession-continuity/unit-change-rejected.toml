@@ -1,0 +1,39 @@
+family     = "supersession-continuity"
+id         = "unit-change-rejected"
+kind       = "publish"
+provenance = ["inst-tb-supersession-units", "D-82", "D-77"]
+
+# The ×24 band-edge class. The tier counter continues across supersession, so an
+# hours-denominated Q applied to day-denominated bands re-prices the window under
+# a unit it was never counted in. This is the door D-82 closed; the same class
+# has since been found at four more (D-98, D-89, D-113, D-127).
+
+[predecessor]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "compute.seconds"
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+
+  [[predecessor.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 5
+
+[successor]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "compute.seconds"
+billing_granularity     = "per_day"
+tier_aggregation_window = "invoice_period"
+
+  [[successor.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 5
+
+[[assert]]
+expect = { publish = "rejected", error_code = "SUPERSESSION_UNIT_MISMATCH" }
+why    = "per_hour to per_day is a 24x move of every band edge against a counter that does not reset - structural, so it routes through plan revisioning, not a price change"

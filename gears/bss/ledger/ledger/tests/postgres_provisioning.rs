@@ -1,6 +1,6 @@
 //! Postgres-only integration tests for the transactional seller-provisioning
 //! seed (`ProvisioningService::provision`). Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_provisioning -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_provisioning -- --ignored`.
 //!
 //! Covers: (a) the seed is idempotent + additive across repeated calls
 //! (created-vs-existing counts + raw row counts hold); (b) a scale exceeding

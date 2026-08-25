@@ -12,8 +12,15 @@ workspace = true
 
 [features]
 default = []
+file-parser = ["dep:file_parser"]
+simple-user-settings = ["dep:simple_user_settings"]
+nodes-registry = ["dep:nodes_registry"]
+resource-group = ["dep:resource_group"]
+grpc-hub = ["dep:grpc_hub"]
+oagw = ["dep:api_egress"]
+credstore = ["dep:credstore"]
 # FIPS-140-3: use the AWS-LC FIPS-validated crypto module for all cryptographic operations
-fips = ["toolkit/fips", "api_egress/fips"]
+fips = ["toolkit/fips", "oagw", "api_egress?/fips"]
 users-info-example = ["dep:users-info"]
 oop-example = ["dep:calculator-gateway", "dep:calculator"]
 single-tenant = ["dep:single-tenant-tr-plugin"]
@@ -22,7 +29,7 @@ static-authn = ["dep:static-authn-plugin"]
 static-authz = ["dep:static-authz-plugin"]
 tr-authz = ["dep:tr-authz-plugin"]
 tenant-resolver-rg = ["dep:rg-tr-plugin"]
-static-credstore = ["dep:static-credstore-plugin"]
+static-credstore = ["credstore", "dep:static-credstore-plugin"]
 mini-chat = ["dep:mini-chat"]
 chat-engine = ["dep:chat-engine"]
 k8s = ["mini-chat/k8s", "chat-engine?/k8s"]
@@ -41,6 +48,10 @@ bss-rate-provider = [
 bss-ledger = ["dep:bss_ledger"]
 usage-collector = ["dep:usage_collector"]
 timescaledb-usage-collector = ["dep:timescaledb_usage_collector_plugin"]
+# Content-based file type detection in file-parser (see that crate's `magika`
+# feature doc comment for what it pulls in).
+magika = ["file_parser/magika"]
+bss-pricing = ["dep:bss_pricing"]
 
 [dependencies]
 mimalloc = { version = "0.1" }
@@ -49,8 +60,8 @@ toolkit = { workspace = true, features = ["bootstrap"] }
 
 # System gears
 api_gateway = { package = "cf-gears-api-gateway", path = "../../gears/system/api-gateway" }
-api_egress = { package = "cf-gears-oagw", path = "../../gears/system/oagw/oagw" }
-grpc_hub = { package = "cf-gears-grpc-hub", path = "../../gears/system/grpc-hub" }
+api_egress = { package = "cf-gears-oagw", path = "../../gears/system/oagw/oagw", optional = true }
+grpc_hub = { package = "cf-gears-grpc-hub", path = "../../gears/system/grpc-hub", optional = true }
 gear_orchestrator = { package = "cf-gears-gear-orchestrator", path = "../../gears/system/gear-orchestrator" }
 types_registry = { package = "cf-gears-types-registry", path = "../../gears/system/types-registry/types-registry" }
 tenant-resolver = { package = "cf-gears-tenant-resolver", path = "../../gears/system/tenant-resolver/tenant-resolver" }
@@ -70,18 +81,19 @@ tr-authz-plugin = { package = "cf-gears-tr-authz-plugin", path = "../../gears/sy
 # Optional credstore plugins
 static-credstore-plugin = { package = "cf-gears-static-credstore-plugin", path = "../../gears/credstore/plugins/static-credstore-plugin", optional = true }
 
-resource_group = { package = "cf-gears-resource-group", path = "../../gears/system/resource-group/resource-group" }
+resource_group = { package = "cf-gears-resource-group", path = "../../gears/system/resource-group/resource-group", optional = true }
 
 # user modules
-file_parser = { package = "cf-gears-file-parser", path = "../../gears/file-parser/file-parser" }
+file_parser = { package = "cf-gears-file-parser", path = "../../gears/file-parser/file-parser", optional = true }
 file_storage = { package = "cf-gears-file-storage", path = "../../gears/file-storage/file-storage", optional = true }
-nodes_registry = { package = "cf-gears-nodes-registry", path = "../../gears/system/nodes-registry/nodes-registry" }
-simple_user_settings = { package = "cf-gears-simple-user-settings", path = "../../gears/simple-user-settings/simple-user-settings" }
-credstore = { package = "cf-gears-credstore", path = "../../gears/credstore/credstore" }
+nodes_registry = { package = "cf-gears-nodes-registry", path = "../../gears/system/nodes-registry/nodes-registry", optional = true }
+simple_user_settings = { package = "cf-gears-simple-user-settings", path = "../../gears/simple-user-settings/simple-user-settings", optional = true }
+credstore = { package = "cf-gears-credstore", path = "../../gears/credstore/credstore", optional = true }
 
 anyhow = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
+serde_json = { workspace = true }
 
 # Optional mini-chat gear
 mini-chat = { package = "cf-gears-mini-chat", path = "../../gears/mini-chat/mini-chat", optional = true }
@@ -94,14 +106,16 @@ account_management = { package = "cf-gears-account-management", path = "../../ge
 static-idp-plugin = { package = "cf-gears-static-idp-plugin", path = "../../gears/system/account-management/plugins/static-idp-plugin", optional = true }
 
 # Optional BSS Billing Ledger gear
-bss_ledger = { package = "bss-ledger", path = "../../gears/bss/ledger/ledger", optional = true }
-bss_rate_provider = { package = "bss-rate-provider", path = "../../gears/bss/rate-provider/rate-provider", optional = true }
-bss_rate_provider_ecb_plugin = { package = "bss-rate-provider-ecb-plugin", path = "../../gears/bss/rate-provider/plugins/ecb-plugin", optional = true }
-bss_rate_provider_http_json_plugin = { package = "bss-rate-provider-http-json-plugin", path = "../../gears/bss/rate-provider/plugins/http-json-plugin", optional = true }
+bss_ledger = { package = "cf-gears-bss-ledger", path = "../../gears/bss/ledger/ledger", optional = true }
+bss_rate_provider = { package = "cf-gears-bss-rate-provider", path = "../../gears/bss/rate-provider/rate-provider", optional = true }
+bss_rate_provider_ecb_plugin = { package = "cf-gears-bss-rate-provider-ecb-plugin", path = "../../gears/bss/rate-provider/plugins/ecb-plugin", optional = true }
+bss_rate_provider_http_json_plugin = { package = "cf-gears-bss-rate-provider-http-json-plugin", path = "../../gears/bss/rate-provider/plugins/http-json-plugin", optional = true }
 
 # Optional Usage Collector gear + its TimescaleDB storage plugin
 usage_collector = { package = "cf-gears-usage-collector", path = "../../gears/system/usage-collector/usage-collector", optional = true }
 timescaledb_usage_collector_plugin = { package = "cf-gears-timescaledb-usage-collector-plugin", path = "../../gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin", optional = true }
+# Optional BSS Plan & Price Modeling gear
+bss_pricing = { package = "cf-gears-bss-pricing", path = "../../gears/bss/pricing/pricing", optional = true }
 
 # Optional example module
 users-info = { path = "../../examples/toolkit/users-info/users-info", optional = true }
@@ -111,4 +125,3 @@ calculator = { path = "../../examples/oop-gears/calculator/calculator", optional
 [dev-dependencies]
 tempfile = { workspace = true }
 serde-saphyr = { workspace = true }
-serde_json = { workspace = true }

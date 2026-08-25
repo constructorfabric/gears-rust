@@ -10,7 +10,7 @@
 //!     `journal_entry` `row_hash` is byte-unchanged;
 //!   * a second set UPSERTs in place (one row) with the description updated.
 //!
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

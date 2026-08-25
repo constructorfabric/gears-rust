@@ -2,7 +2,7 @@
 //! exists for a (tenant, currency), a changed scale is rejected
 //! (`CurrencyScaleLocked`); the same scale is idempotent; a currency with
 //! no postings is freely (re)scalable. Ignored by default; run with
-//! `cargo test -p bss-ledger -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

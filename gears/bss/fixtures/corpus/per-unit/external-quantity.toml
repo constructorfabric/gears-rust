@@ -1,0 +1,26 @@
+family     = "per-unit"
+id         = "external-quantity"
+kind       = "evaluation"
+provenance = ["AC#60", "PRD §17.2"]
+
+[snapshot]
+model_kind      = "per_unit"
+charge_kind     = "recurring"
+currency        = "USD"
+amount_minor    = 1500
+quantity_source = "subscription_seat_count"
+
+[[assert]]
+given  = { q = 0 }
+expect = { charge_minor = 0 }
+why    = "zero seats bills nothing"
+
+[[assert]]
+given  = { q = 1 }
+expect = { charge_minor = 1500 }
+why    = "one seat at the unit price"
+
+[[assert]]
+given  = { q = 7 }
+expect = { charge_minor = 10500 }
+why    = "unit price × the quantity supplied by quantitySource — never metered usage. The quantity is external (Subscriptions' seat count), which is why it arrives as a runtime given rather than from the snapshot"

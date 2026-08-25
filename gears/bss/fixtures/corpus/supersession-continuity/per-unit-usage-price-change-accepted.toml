@@ -1,0 +1,43 @@
+family     = "supersession-continuity"
+id         = "per-unit-usage-price-change-accepted"
+kind       = "publish"
+provenance = ["inst-tb-supersession-units", "inst-mk-chargekind", "inst-tb-window", "D-18", "D-82"]
+
+# `per_unit` is the one kind legal on **both** sides of the guard's boundary
+# (`inst-mk-chargekind`, D-18), which makes it the kind where the boundary is
+# visible without changing anything else about the row. This is its usage side:
+# the plain untiered metered rate, unit price x metered `Q`.
+#
+# A `per_unit` usage row is metered, so it *does* carry a continued counter and
+# it *is* inside the guard - the price-change case therefore has to be authored
+# separately from the `flat` one, which is outside it. What this case pins is
+# that being inside the guard is not the same as being frozen: the unit price is
+# a price, and D-82's whole framing is that supersession is a price change on one
+# key.
+#
+# The row carries `billingGranularity` because `inst-tb-window` requires it on
+# every usage row - it is what one billable unit is - and carries no
+# `tierAggregationWindow`, because that field bounds a **tier counter** and an
+# untiered row has no bands for a window to reset. It carries no
+# `quantitySource` either: on a usage row the meter supplies `Q`, and
+# `inst-mk-forbidden` rejects a row that states both.
+
+[predecessor]
+model_kind          = "per_unit"
+charge_kind         = "usage"
+currency            = "USD"
+meter               = "api.calls"
+billing_granularity = "whole_unit"
+amount_minor        = 40
+
+[successor]
+model_kind          = "per_unit"
+charge_kind         = "usage"
+currency            = "USD"
+meter               = "api.calls"
+billing_granularity = "whole_unit"
+amount_minor        = 55
+
+[[assert]]
+expect = { publish = "accepted" }
+why    = "the meter, the dimension and the billable unit are all unchanged, so the continued `Q` means exactly what it meant before and the successor's rate applies to it directly. Only the price per unit moved, which is the lever supersession exists to pull - a rejection here would say a metered row can never be repriced without a plan revision"

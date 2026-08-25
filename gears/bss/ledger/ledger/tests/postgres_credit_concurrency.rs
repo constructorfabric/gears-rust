@@ -4,7 +4,7 @@
 //! sub-grain no-negative CHECK (`chk_reusable_credit_subbalance_no_negative`) is
 //! the backstop that bounds total draw-down at the funded amount. Ignored by
 //! default; run with
-//! `cargo test -p bss-ledger --test postgres_credit_concurrency -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_credit_concurrency -- --ignored`.
 //!
 //! Covers: (1) two concurrent `apply_credit`s draining ONE wallet never overspend
 //! it — the wallet never goes negative and the total drawn never exceeds the

@@ -2,7 +2,7 @@
 //! Group D): `ChargebackService::record_phase` drives the dispute state machine
 //! (`opened → {won, lost}`) over the foundation engine, in both variants
 //! (`CASH_HOLD` / `AR_RECLASS`). Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_chargebacks -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_chargebacks -- --ignored`.
 //!
 //! Mirrors `postgres_payment_returns.rs` (boot, `setup_seller`, a `settle`
 //! helper) + `postgres_payments.rs` (`seed_ar_invoice`, the over-cap

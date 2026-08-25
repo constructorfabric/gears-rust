@@ -1,23 +1,25 @@
 ---
 name: toolkit-pr-review-v2
-description: "Review Rust PRs against idiomatic Rust guidelines and ToolKit framework rules, post inline comments on GitHub"
+description: "Review Rust changes against idiomatic Rust guidelines and ToolKit framework rules. PR mode posts inline comments on GitHub; local mode reviews a branch against main and writes a markdown report."
 user-invocable: true
 allowed-tools: Bash, Read, Glob, Grep, Write, Agent
 ---
 
 # Rust PR Review
 
-Review a GitHub pull request for Rust code quality and ToolKit framework compliance.
-Posts findings as inline review comments directly on the PR.
+Review Rust code changes for quality and ToolKit framework compliance.
 
-**Usage**: `/toolkit-pr-review-v2 <PR_NUMBER>`
+**Usage**:
+- `/toolkit-pr-review-v2 <PR_NUMBER>` — review a GitHub PR, post findings as inline review comments
+- `/toolkit-pr-review-v2 local [<branch-name>]` — review a local branch against `main`, write findings to a markdown file
 
 ---
 
 ## Table of Contents
 
 - [Inputs](#inputs)
-- [Resolving the target repository](#resolving-the-target-repository)
+- [Modes](#modes)
+- [Resolving the target repository (PR mode)](#resolving-the-target-repository-pr-mode)
 - [Review guidelines](#review-guidelines)
 - [Coding guidelines reference](#coding-guidelines-reference)
 - [Steps](#steps)
@@ -28,12 +30,48 @@ Posts findings as inline review comments directly on the PR.
 
 ## Inputs
 
-- `<PR_NUMBER>` — required, the GitHub PR number (e.g. `123`)
-- `--repo <owner/repo>` — optional, the GitHub repository (e.g. `constructorfabric/gears-rust`)
+- `<PR_NUMBER>` — the GitHub PR number (e.g. `123`). Selects **PR mode**.
+- `local [<branch-name>]` — selects **local mode**. `<branch-name>` is optional; when omitted the current branch is used.
+- `--repo <owner/repo>` — optional, PR mode only (e.g. `constructorfabric/gears-rust`)
 
-## Resolving the target repository
+## Modes
 
-Before fetching PR data, determine which repository to use:
+Resolve the mode from the first argument **before** doing anything else.
+
+### PR mode
+
+First argument is a number. Review target is the GitHub PR; findings are posted as inline review comments.
+
+Set:
+- `MODE=pr`
+- `REVIEW_ID=<PR_NUMBER>`
+
+### Local mode
+
+First argument is the literal word `local`. Review target is the local branch diffed against `main`; findings are written to a markdown file — **nothing is posted to GitHub**.
+
+Resolve:
+
+```bash
+BASE_BRANCH=main
+BRANCH_NAME=<branch-name argument, or `git symbolic-ref --quiet --short HEAD` if omitted>
+REPO_ROOT=$(git rev-parse --show-toplevel)
+HEAD_SHA=$(git rev-parse "$BRANCH_NAME")
+```
+
+If no branch argument was given and `git symbolic-ref` fails, HEAD is detached — print the error and stop.
+Verify the branch exists (`git rev-parse --verify "$BRANCH_NAME"`) and that `main` exists locally
+(`git rev-parse --verify main`; if it does not, fall back to `origin/main` and use that as `BASE_BRANCH`).
+If neither resolves, print the error and stop.
+
+Set:
+- `MODE=local`
+- `BRANCH_SLUG` = `BRANCH_NAME` with `/` replaced by `-`
+- `REVIEW_ID=local-$BRANCH_SLUG`
+
+## Resolving the target repository (PR mode)
+
+PR mode only — skip this in local mode. Before fetching PR data, determine which repository to use:
 
 1. If `--repo` was provided in the arguments, use it.
 2. Otherwise, check if an `upstream` remote exists: `git remote get-url upstream 2>/dev/null`. If it returns a URL, extract `owner/repo` from it.
@@ -73,14 +111,29 @@ When reviewing, also consult:
 
 ## Steps
 
-### Step 1: Fetch PR metadata and diff
+### Step 1: Fetch metadata and diff
+
+**PR mode:**
 
 ```bash
 gh pr view <PR_NUMBER> --repo $REPO --json number,title,body,headRefOid,baseRefName,headRefName
 gh pr diff <PR_NUMBER> --repo $REPO
 ```
 
-Save the diff output for analysis. Extract the HEAD commit SHA — you need it for posting comments.
+Extract the HEAD commit SHA — you need it for posting comments.
+
+**Local mode:**
+
+```bash
+git log --oneline "$BASE_BRANCH..$BRANCH_NAME"
+git diff --stat "$BASE_BRANCH...$BRANCH_NAME"
+git diff "$BASE_BRANCH...$BRANCH_NAME"
+```
+
+Use three-dot diff (merge-base) so the review sees only what the branch adds, matching PR semantics.
+Record the commit count and the `--stat` totals — they go into the report header.
+
+Save the diff output for analysis.
 
 ### Step 2: Identify Rust files in diff
 
@@ -102,20 +155,23 @@ If **any** file is classified as ToolKit-owned, also read `docs/pr-review/toolki
 
 Create the working directory:
 ```bash
-mkdir -p /tmp/toolkit-pr-review-v2-$PR_NUMBER/files
+mkdir -p /tmp/toolkit-pr-review-v2-$REVIEW_ID/files
 ```
 
-Write `/tmp/toolkit-pr-review-v2-$PR_NUMBER/diff.patch` — the raw output of `gh pr diff` from Step 1.
+Write `/tmp/toolkit-pr-review-v2-$REVIEW_ID/diff.patch` — the raw diff from Step 1.
 
-Write `/tmp/toolkit-pr-review-v2-$PR_NUMBER/context.json` with the PR metadata, file lists, and changed line ranges:
+Write `/tmp/toolkit-pr-review-v2-$REVIEW_ID/context.json` with the metadata, file lists, and changed line ranges:
 ```json
 {
-  "pr_number": <PR_NUMBER>,
-  "repo": "<REPO>",
+  "mode": "pr" | "local",
+  "pr_number": <PR_NUMBER, or null in local mode>,
+  "repo": "<REPO, or null in local mode>",
+  "branch": "<BRANCH_NAME, or null in PR mode>",
+  "base_branch": "<BASE_BRANCH, or null in PR mode>",
   "head_sha": "<HEAD_SHA>",
   "rust_files": [<list of .rs files from Step 2>],
   "toolkit_owned_files": [<files classified as ToolKit-owned in Step 3>],
-  "has_test_code": <boolean: true if any rust_files contains #[test], #[tokio::test], #[cfg(test)], or lives under tests/>],
+  "has_test_code": <boolean: true if any rust_files contains #[test], #[tokio::test], #[cfg(test)], or lives under tests/>,
   "changed_ranges": {
     "<filepath>": [[<start_line>, <end_line>], ...]
   }
@@ -124,16 +180,16 @@ Write `/tmp/toolkit-pr-review-v2-$PR_NUMBER/context.json` with the PR metadata, 
 
 The `changed_ranges` dict maps each file to its list of changed line ranges (derived from parsing diff hunks in Step 2). Agents use this to validate that line numbers are within the diff.
 
-For each file in `rust_files`, read the file from the repo (at the PR head commit) and write its full content to:
+For each file in `rust_files`, read the file at the review head (the PR head commit in PR mode, `$BRANCH_NAME` in local mode) and write its full content to:
 ```text
-/tmp/toolkit-pr-review-v2-$PR_NUMBER/files/<escaped-path>
+/tmp/toolkit-pr-review-v2-$REVIEW_ID/files/<escaped-path>
 ```
 where `<escaped-path>` replaces `/` with `__` (e.g., `gears/foo/src/service.rs` → `gears__foo__src__service.rs`).
 
 ### Step 4b: Spawn parallel sub-agents
 
 Spawn all applicable sub-agents in parallel using the `Agent` tool. Pass to each agent:
-- PR number and repo from context
+- The review target identity from context (PR number + repo, or branch + base branch)
 - Paths to context.json, diff.patch, and files/ directory in /tmp
 
 Spawn these agents (skip Agent E if toolkit_owned_files is empty; skip Agent F if has_test_code is false):
@@ -181,7 +237,9 @@ Cap at 30 findings: if the list exceeds 30, drop from the tail (lowest severity)
 
 This merged, filtered, sorted, capped list becomes the input to Step 5.
 
-### Step 5: Post inline review comments on GitHub
+### Step 5 (PR mode): Post inline review comments on GitHub
+
+Local mode skips this step entirely — go to Step 5L.
 
 Use `gh api` to create a pull request review with inline comments.
 
@@ -224,9 +282,59 @@ gh api repos/$REPO/pulls/<PR_NUMBER>/reviews \
   -f body="No issues found."
 ```
 
+### Step 5L (local mode): Write the markdown report
+
+Write the report to `<REPO_ROOT>/REVIEW_<BRANCH_SLUG>.md`, overwriting any existing file at that path.
+
+Structure:
+
+```markdown
+# Branch Review: <BRANCH_NAME>
+
+**Branch:** <BRANCH_NAME> (base: <BASE_BRANCH>)
+**Head:** <HEAD_SHA short>
+**Date:** <today's date, YYYY-MM-DD>
+**Commits:** <commit count from Step 1>
+**Files changed:** <count> (+<additions>, -<deletions>)
+
+## Findings
+
+### Critical
+
+- **<One-sentence issue description>** — `<file>:<line>` (`<ID>`)
+  - **Why:** <one sentence on why it matters>
+  - **Fix:** <concrete change to make>
+
+### High
+
+...
+
+### Medium
+
+...
+
+### Low
+
+...
+
+## Summary
+
+| # | ID | Sev | Location | Issue | Fix |
+|---|----|-----|----------|-------|-----|
+| 1 | RUST-ERR-001 | HIGH | service.rs:42 | Error context lost | Preserve source error |
+```
+
+Rules for the report:
+- One severity section per severity present. Omit empty sections.
+- Findings keep the same wording discipline as inline comments (see [Comment formatting rules](#comment-formatting-rules)) — but the checklist ID **is** included here, since there is no separate terminal-only table.
+- File paths are repo-relative and include the line number, so they are clickable.
+- If there are zero findings, write the header plus a single line: `No issues found.`
+
 ### Step 6: Print summary
 
-After posting, print a compact summary table to the terminal:
+After posting (PR mode) or writing the file (local mode), print a compact summary table to the terminal:
+
+**PR mode:**
 
 ```text
 ## Rust PR Review: #<PR_NUMBER>
@@ -237,6 +345,12 @@ After posting, print a compact summary table to the terminal:
 | 2 | TOOLKIT-SEC-001 | CRIT | handler.rs:18 | Raw DB connection | Use SecureConn |
 
 Posted <N> inline comments on PR #<PR_NUMBER>.
+```
+
+**Local mode:** same table, with the header `## Rust Branch Review: <BRANCH_NAME>` and a final line:
+
+```text
+Wrote <N> findings to <REPO_ROOT>/REVIEW_<BRANCH_SLUG>.md
 ```
 
 ---
@@ -257,7 +371,7 @@ Each inline comment MUST follow this format:
 
 Where `<SEVERITY>` is one of: `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`.
 
-Do NOT include checklist IDs (e.g. RUST-ERR-001, TOOLKIT-SEC-001) in inline comments. IDs appear only in the terminal summary table (Step 6).
+Do NOT include checklist IDs (e.g. RUST-ERR-001, TOOLKIT-SEC-001) in inline comments. IDs appear only in the terminal summary table (Step 6) and — in local mode — in the markdown report.
 
 Rules:
 - Engineering English. No filler, no praise, no hedging.
@@ -271,10 +385,12 @@ Rules:
 ## What NOT to do
 
 - Do not approve or request changes — use `event: "COMMENT"` only
+- Do not post anything to GitHub in local mode — the markdown report is the only output artifact
+- Do not commit the generated `REVIEW_*.md` file
 - Do not post comments on lines outside the diff
 - Do not post generic praise or "LGTM" if there are no issues
 - Do not invent issues without evidence in the code
 - Do not complain about formatting that rustfmt handles
 - Do not suggest speculative abstractions or premature generalization
-- Do not post more than 30 comments per review (prioritize by severity)
-- If there are zero findings, post a single review comment: "No issues found."
+- Do not report more than 30 findings per review (prioritize by severity)
+- If there are zero findings, post a single review comment: "No issues found." (PR mode) / write `No issues found.` into the report (local mode)

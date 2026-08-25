@@ -1552,10 +1552,10 @@ E2E tests verify the full stack running as `cf-gears-server` with real AuthZ, re
 
 **Infrastructure**: running cf-gears-server (Docker or local), `pytest` + `httpx`.
 
-**Location**: `testing/e2e/gears/resource_group/`
+**Location**: `testing/e2e/suites/resource_group/`
 
 ```
-testing/e2e/gears/resource_group/
+testing/e2e/suites/resource_group/
 ├── conftest.py       # fixtures: base_url, tenant_id, seed data
 ├── helpers.py        # create_type(), create_group(), add_membership(), etc.
 ├── test_types.py     # type CRUD, validation, idempotent seed
@@ -1564,7 +1564,7 @@ testing/e2e/gears/resource_group/
 └── test_hierarchy.py    # depth traversal, ancestor/descendant queries
 ```
 
-Fixtures (following `oagw` e2e pattern): session-scoped `rg_base_url` (from env `E2E_BASE_URL`), `tenant_id`, seed data fixtures. See `testing/e2e/gears/resource_group/conftest.py`.
+Fixtures (following `oagw` e2e pattern): session-scoped `rg_base_url` (from env `E2E_BASE_URL`), `tenant_id`, seed data fixtures. See `testing/e2e/suites/resource_group/conftest.py`.
 
 | What to test | Marker | Verification target |
 |---|---|---|

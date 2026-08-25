@@ -11,7 +11,7 @@
 //!    with `PolicyVersionViolation`.
 //!
 //! Mirrors `postgres_chain.rs` / `postgres_invoice_post.rs`. Ignored by default;
-//! run with `cargo test -p bss-ledger -- --ignored`.
+//! run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

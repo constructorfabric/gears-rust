@@ -2,7 +2,7 @@
 //! projects normal-side-positive deltas into `account_balance` and
 //! `ar_payer_balance`; a follow-up CR AR beyond the AR balance trips the
 //! no-negative guard (`ProjectError::NegativeBalance`). Ignored by default;
-//! run with `cargo test -p bss-ledger -- --ignored`.
+//! run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

@@ -2,7 +2,7 @@
 //! `ExceptionRouter` (additive, period-bound, deduped routing) + `ExceptionQueueRepo`
 //! (list / read / resolve) + the close-gate consumption of OPEN rows (incl. the
 //! `GL_WRITEOFF_VARIANCE` acknowledge-to-non-block path). Ignored by default; run
-//! with `cargo test -p bss-ledger --test postgres_exception -- --ignored`.
+//! with `cargo test -p cf-gears-bss-ledger --test postgres_exception -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

@@ -11,7 +11,7 @@
 //!       ONE `cross-tenant-access` forensic record (asserted via the same
 //!       `bss.secured_audit_record` query `postgres_cross_tenant.rs` uses);
 //!       the own-tenant default writes none.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

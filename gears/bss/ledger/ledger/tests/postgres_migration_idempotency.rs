@@ -15,7 +15,7 @@
 //!   the migrations, so runtime DML still resolves them in `bss`.
 //!
 //! Ignored by default (Docker/testcontainers); run with
-//! `cargo test -p bss-ledger --test postgres_migration_idempotency -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_migration_idempotency -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

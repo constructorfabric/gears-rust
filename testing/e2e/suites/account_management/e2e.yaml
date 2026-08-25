@@ -1,0 +1,11 @@
+suite: account-management
+features:
+  - account-management
+  - static-idp
+  - static-tenants
+  - static-authn
+  - static-authz
+launcher: e2e-launcher
+config_gears:
+  - account-management
+  - static-idp-plugin

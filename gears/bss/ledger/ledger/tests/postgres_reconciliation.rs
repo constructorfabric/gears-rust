@@ -6,7 +6,7 @@
 //! bill-run-finished close gate (un-asserted blocks, asserted passes). K5: inert until
 //! the feed lands. Control feeds are exercised through the real in-process store (the
 //! push → framework / close-gate read path). Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_reconciliation -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_reconciliation -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

@@ -3,7 +3,7 @@
 //! drives the full post sequence: a balanced post updates the truth tables
 //! and derived caches and stamps the dedup row; a re-post replays; a closed
 //! period and a negative-balance post are rejected with the right codes.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

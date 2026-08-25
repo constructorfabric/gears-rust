@@ -1,0 +1,26 @@
+family     = "proration"
+id         = "non-apportioning-bases"
+kind       = "evaluation"
+provenance = ["AC#61", "PRD 1.4", "K1"]
+
+# `whole_unit` performs no sub-period proration; `none` means no proration at
+# all - a full-period charge with no partial credit. Both must answer "the whole
+# period" for a partial stretch, and `by_second` is here as the contrast that
+# apportions at the finest grain the enum offers.
+#
+# Carrying all five enum values across this family's cases is deliberate: the
+# canonical enum is owned by pricing and adopted verbatim by Tariffs and
+# Subscriptions under the CI gate `pricing.contracts.enum_drift`, so a value
+# renamed on any side must fail here.
+
+[snapshot]
+model_kind      = "flat"
+charge_kind     = "recurring"
+currency        = "USD"
+amount_minor    = 9900
+proration_basis = "whole_unit"
+
+[[assert]]
+given  = { period_start = "2026-01-01T00:00:00Z", period_end = "2026-02-01T00:00:00Z", from = "2026-01-16T00:00:00Z" }
+expect = { units_charged = 1, units_in_basis = 1 }
+why    = "half a month still bills the whole unit - that is what no sub-period proration means"

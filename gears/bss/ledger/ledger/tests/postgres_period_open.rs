@@ -3,7 +3,7 @@
 //! raw SQL, then runs the job and asserts it created the current + next
 //! `YYYYMM` periods (`status='OPEN'`) and is idempotent on a re-run.
 //! Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_period_open -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_period_open -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

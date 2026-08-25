@@ -1,6 +1,6 @@
 //! Postgres-only repo/service-level tests for the dual-control approval engine
 //! (`ApprovalRepo` + `ApprovalService`, VHP-1852). Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_dual_control -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_dual_control -- --ignored`.
 //!
 //! These are the FAST (testcontainers) counterpart to the cluster-gated e2e
 //! `tests/e2e/tests/bss-ledger/test_dual_control.py`. The e2e drives the full

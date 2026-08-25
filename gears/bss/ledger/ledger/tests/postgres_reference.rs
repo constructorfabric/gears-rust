@@ -1,5 +1,5 @@
 //! Postgres-only integration tests for the idempotency + reference tables.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 //!
 //! Covers: (a) `idempotency_dedup` PK rejects a duplicate
 //! `(tenant, flow, business_id)`; (b) `currency_scale_registry` round-trips;

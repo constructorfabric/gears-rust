@@ -1,7 +1,7 @@
 //! Postgres-only repo tests for `PayerStateRepo` (the payer-lifecycle row
 //! `bss.ledger_payer_state` + the outstanding-balance check over
 //! `bss.ledger_ar_payer_balance`, VHP-1852 Phase 2). Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_payer_state -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_payer_state -- --ignored`.
 //!
 //! Covers: (a) `close` upserts the row to CLOSED, stamping the approver + the
 //! open-balance marker, and `read` reads it back; (b) `close` is idempotent — a

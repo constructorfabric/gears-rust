@@ -1,14 +1,18 @@
 //! Postgres-only repo-level tests for `PaymentRepo` (the payment counter
 //! tables + the allocation candidate / view reads). Ignored by default; run
-//! with `cargo test -p bss-ledger --test postgres_payments -- --ignored`.
+//! with `cargo test -p cf-gears-bss-ledger --test postgres_payments -- --ignored`.
 //!
 //! Covers: (a) `seed_settlement` then `read_settlement` round-trips
 //! `settled_minor`; (b) two `add_allocated` calls net; (c) `add_allocated`
 //! past `settled_minor` trips the cap CHECK → `MoneyOutCapExceeded`;
 //! (d) `insert_allocation_rows` then `list_payment_allocations` returns N
 //! rows; (e) `list_open_ar_invoices` filters `balance_minor > 0` and orders
-//! `original_posted_at, invoice_id`; (f) `bump_allocation_refund` nets and its
-//! refund-vs-allocated CHECK is enforced.
+//! `original_posted_at, invoice_id`, under the tenant's own scope; (f)
+//! `bump_allocation_refund` nets and its refund-vs-allocated CHECK is enforced.
+//!
+//! Every read a foreign tenant must not see is in
+//! `payment_grains_are_invisible_to_a_foreign_tenant_scope`, paired with a
+//! positive control: a negative arm over an empty seed proves nothing.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -248,7 +252,13 @@ async fn list_open_ar_invoices_filters_and_orders() {
     let tenant = Uuid::now_v7();
     let payer = Uuid::now_v7();
     let account = Uuid::now_v7();
-    let scope = AccessScope::allow_all();
+    // The tenant's own scope, not `allow_all()`: a wildcard scope makes the
+    // SecureORM tenant predicate a no-op, so this — the only test of the AR
+    // candidate read that drives every payment allocation — would have stayed
+    // green with `.secure().scope_with(scope)` dropped from the reader. The
+    // cross-tenant negative is in
+    // `payment_grains_are_invisible_to_a_foreign_tenant_scope`.
+    let scope = AccessScope::for_tenant(tenant);
 
     // Seed three AR-invoice cache rows: two open (different posted dates) and
     // one fully paid (balance 0, must be filtered out). inv-late posts AFTER
@@ -1282,10 +1292,11 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
         .await
         .expect("seed tenant A");
 
-    // Seed the other three scoped payment grains for tenant A via raw SQL (these
+    // Seed the remaining scoped payment grains for tenant A via raw SQL (these
     // are projector caches / a policy table with no repo seed helper). They are
     // exactly the grains the first negative test missed; the wallet
-    // (`reusable_credit_subbalance`) is the most sensitive.
+    // (`reusable_credit_subbalance`) is the most sensitive, and the AR candidate
+    // cache is the one every allocation starts from.
     let acct = Uuid::now_v7();
     let ts = Utc::now().to_rfc3339();
     raw.execute_raw(pg(format!(
@@ -1310,6 +1321,18 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
     )))
     .await
     .expect("seed precedence policy");
+    // The AR candidate cache: `list_open_ar_invoices` is the reader every payment
+    // allocation starts from, and until this row existed it was the one payment
+    // entry point with no cross-tenant negative anywhere in the crate — its only
+    // other test runs under a scope that makes the tenant predicate a no-op.
+    raw.execute_raw(pg(format!(
+        "INSERT INTO bss.ledger_ar_invoice_balance \
+         (tenant_id, payer_tenant_id, account_id, invoice_id, currency, \
+          balance_minor, original_posted_at) \
+         VALUES ('{tenant_a}','{payer}','{acct}','INV-BOLA','USD',400,'{ts}')"
+    )))
+    .await
+    .expect("seed ar candidate");
 
     let repo = PaymentRepo::new(provider.clone());
 
@@ -1346,7 +1369,7 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
         "a foreign scope cannot read tenant A's allocations (SQL-level BOLA)"
     );
 
-    // The other three grains: own scope sees them; a foreign scope sees nothing.
+    // The remaining grains: own scope sees them; a foreign scope sees nothing.
     assert_eq!(
         repo.list_credit_subgrains(&own, tenant_a, payer, "USD")
             .await
@@ -1389,5 +1412,20 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
             .unwrap()
             .is_none(),
         "a foreign scope cannot read tenant A's precedence policy (SQL-level BOLA)"
+    );
+    assert_eq!(
+        repo.list_open_ar_invoices(&own, tenant_a, payer, "USD")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "tenant A reads its own open AR candidate"
+    );
+    assert!(
+        repo.list_open_ar_invoices(&foreign, tenant_a, payer, "USD")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a foreign scope cannot read tenant A's AR candidates (SQL-level BOLA)"
     );
 }

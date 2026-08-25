@@ -1,0 +1,45 @@
+family     = "supersession-continuity"
+id         = "carry-allowance-change-rejected"
+kind       = "publish"
+provenance = ["inst-tb-supersession-units", "D-129", "D-43", "D-45"]
+
+# D-129, the newest member of the preserved set. A `carry` allowance compiles
+# into a plan-scoped, revision-immutable grant row, and a supersession opens no
+# plan revision - so it has no way to rewrite the artifact it would be changing.
+# Changing a carry allowance is therefore structural.
+#
+# The mirror case (`none`-policy allowance is a free lever) is the accepted case
+# in this family: a `none` allowance compiles to a $0 band on the row itself and
+# carries no plan-scoped artifact.
+
+[predecessor]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "storage.gb"
+billing_granularity     = "per_day"
+tier_aggregation_window = "invoice_period"
+included_allowance      = { quantity = 100, rollover_policy = "carry" }
+
+  [[predecessor.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 5
+
+[successor]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "storage.gb"
+billing_granularity     = "per_day"
+tier_aggregation_window = "invoice_period"
+included_allowance      = { quantity = 250, rollover_policy = "carry" }
+
+  [[successor.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 5
+
+[[assert]]
+expect = { publish = "rejected", error_code = "SUPERSESSION_UNIT_MISMATCH" }
+why    = "a supersession cannot rewrite a plan-scoped grant row it never opened a revision for; the allowance change has to route through plan revisioning"

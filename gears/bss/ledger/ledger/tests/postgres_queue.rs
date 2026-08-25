@@ -6,7 +6,7 @@
 //! cap-re-evaluation at apply (an over-cap queued allocation stays `QUEUED` +
 //! bumps attempts), and the cross-tenant sweep job (`QueueApplierJob`) as the
 //! restart/backstop path. Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_queue -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_queue -- --ignored`.
 //!
 //! Run discipline (controller): these are testcontainer `#[ignore]` tests; run
 //! the bin sequentially (each test boots its own container).

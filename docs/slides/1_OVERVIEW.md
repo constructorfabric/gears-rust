@@ -270,7 +270,7 @@ Same gear code & API — three physical shapes via `runtime.type: local | oop`:
 ## Repository structure
 
 ```text
-cyberware-rust/
+gears-rust/
 ├─ libs/            # Toolkit — runtime substrate (middleware, DB, errors, security, macros)
 ├─ gears/
 │  ├─ system/       # Control plane (api-gateway, authn/authz, tenant, registries, oagw)
@@ -600,7 +600,7 @@ One platform-wide error vocabulary, aligned with the **16 gRPC categories**:
 - **Golden path** templates for new Gears (SDK + gear crate scaffolding)
 - **Type-safe REST** — `OperationBuilder` prevents half-wired routes at compile time
 - **OpenAPI auto-generated** from the same route declarations that run the service
-- **`GET /cw/docs`** live Swagger UI on the example server
+- **`GET /cf/docs`** live Swagger UI on the example server
 - **Architecture lints** enforce design rules and patterns at build time
 - **Rich docs**: `docs/toolkit_unified_system/` (13 topic files) + per-gear specs
 
@@ -653,15 +653,19 @@ Unit-test gate: (1) deterministic domain logic? (2) atomic & fast? (3) removing 
 
 ```bash
 git clone --recurse-submodules <repository-url>
-cd cyberware-rust
+cd gears-rust
 
-make build      # build libs + example server
-make example    # run the example server
-# → API docs at http://127.0.0.1:8087/cw/docs
+make build      # whole-project example server release binary
+make run        # run the default example server
+make example    # run with the default E2E feature set
+# → API docs at http://127.0.0.1:8087/cf/docs
+
+make build GEAR=file-parser  # build one gear + SDK package scope
+make run GEAR=file-parser    # run server with only that gear feature set
 
 # Health checks
-curl http://127.0.0.1:8087/cw/health   # detailed JSON
-curl http://127.0.0.1:8087/healthz      # liveness "ok"
+curl http://127.0.0.1:8087/cf/health   # detailed JSON
+curl http://127.0.0.1:8087/cf/healthz  # liveness "ok"
 ```
 
 Run modes: SQLite (`config/quickstart.yaml`), no-DB (`config/no-db.yaml`), or `--mock`.
@@ -671,7 +675,7 @@ Run modes: SQLite (`config/quickstart.yaml`), no-DB (`config/no-db.yaml`), or `-
 ## Configuration
 
 ```yaml
-server:   { home_dir: "~/.cyberware" }
+server:   { home_dir: "~/.cfgears" }
 database: { url: "sqlite://database/database.db", max_conns: 10 }
 gears:
   api_gateway:
@@ -681,8 +685,9 @@ gears:
     config:   { default_page_size: 5, max_page_size: 100 }
 ```
 
-Env overrides with `CYBERFABRIC_` prefix, e.g.
-`CYBERFABRIC_DATABASE_URL=postgres://...`
+Build selects compiled-in gears by Cargo feature flags. YAML config supplies each compiled-in gear's `config` and optional gear-owned `database` settings.
+
+Env overrides with `CF_` prefix, e.g. `CF_GEARS_DATABASE_URL=postgres://...`
 
 ---
 
@@ -690,10 +695,14 @@ Env overrides with `CYBERFABRIC_` prefix, e.g.
 
 ```bash
 make check           # full quality gate: fmt + clippy + test + security
+make all             # build + check + SQLite integration + E2E + OpenAPI
 make test            # unit tests (workspace)
+make test GEAR=file-parser  # unit tests for one gear + SDK scope
 make test-sqlite     # integration tests (SQLite, no external DB)
 make e2e-local       # E2E — builds + starts server automatically
+make e2e-local SUITE=file-parser  # suite E2E scope + default E2E target
 make coverage-unit   # unit-test coverage
+make coverage GEAR=file-parser   # unit + E2E coverage for one gear scope
 make fuzz            # fuzz smoke tests (30s/target)
 ```
 
@@ -749,6 +758,6 @@ On **Windows** (no `make`): `python tools/scripts/ci.py check`
 
 *Secure · Modular · Composable · GenAI-ready*
 
-Start: `make example` → http://127.0.0.1:8087/cw/docs
+Start: `make example` → http://127.0.0.1:8087/cf/docs
 
 Apache-2.0 · Cyber Fabric Foundation

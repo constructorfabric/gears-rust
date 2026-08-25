@@ -16,6 +16,7 @@ use crate::api::rest::dto::{
 use crate::domain::error::DomainError;
 use crate::domain::markdown::MarkdownRenderer;
 use crate::domain::service::FileParserService;
+use file_parser_sdk::Detection;
 use toolkit::api::canonical_prelude::*;
 use toolkit_security::SecurityContext;
 
@@ -129,8 +130,16 @@ pub async fn upload_and_parse(
         .into());
     }
 
+    // REST is a public, untrusted-caller entry point — always detect,
+    // regardless of `Detection::Skip` (SDK/ClientHub-only, see
+    // `file_parser_sdk::ParseBytesRequest`).
     let document = svc
-        .parse_bytes(filename_opt, content_type_str.as_deref(), body)
+        .parse_bytes(
+            filename_opt,
+            content_type_str.as_deref(),
+            body,
+            Detection::Auto,
+        )
         .await?;
 
     // Optionally render markdown
@@ -239,7 +248,9 @@ pub async fn upload_and_parse_markdown(
         "Processing uploaded file for Markdown streaming"
     );
 
-    let document = svc.parse_bytes(Some(&file_name), None, file_bytes).await?;
+    let document = svc
+        .parse_bytes(Some(&file_name), None, file_bytes, Detection::Auto)
+        .await?;
 
     // Create streaming response - render_iter takes ownership of document
     let stream = stream::iter(

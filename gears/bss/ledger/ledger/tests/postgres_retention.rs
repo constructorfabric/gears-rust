@@ -17,7 +17,7 @@
 //! `row_hash` / `prev_hash` / `created_seq`, so a hand-seeded chain exercises it
 //! exactly and keeps the test fast and deterministic.
 //!
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

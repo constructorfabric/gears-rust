@@ -125,7 +125,7 @@ pub struct FileStorageConfig {
     /// keeps `local-fs` as the default, preserving today's behavior for every
     /// deployment that doesn't set this. Set this to one of `s3_backends`'
     /// configured ids to make that S3 backend the default instead — e.g. the
-    /// S3 e2e suite (`testing/e2e/gears/file_storage/lifecycle_s3/`) sets
+    /// S3 e2e suite (`testing/e2e/suites/file_storage/lifecycle_s3/`) sets
     /// this so `POST /files` and `POST /files/{id}/multipart` mint upload
     /// URLs whose `claims.backend_id` names the S3 test-double backend,
     /// exercising Stage 5's per-request sidecar dispatch end-to-end. The

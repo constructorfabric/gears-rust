@@ -666,7 +666,7 @@ async fn server_problem_envelope_round_trips() {
         .unwrap_err();
     match err {
         DemoError::Transport(TransportError::Problem { problem: p, .. }) => {
-            assert_eq!(p.status, 503);
+            assert_eq!(p.status, Some(503));
             assert!(p.problem_type.contains("service_unavailable"));
         }
         other @ DemoError::Transport(_) => panic!("unexpected: {other:?}"),

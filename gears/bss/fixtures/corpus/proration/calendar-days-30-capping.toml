@@ -1,0 +1,29 @@
+family     = "proration"
+id         = "calendar-days-30-capping"
+kind       = "evaluation"
+provenance = ["AC#61", "PRD 1.4", "K1"]
+
+# `calendar_days_30`: a fixed 30-day month with the day count capped at 30.
+# The cap is the whole point - without it a 31-day month bills 31/30 of itself.
+
+[snapshot]
+model_kind      = "flat"
+charge_kind     = "recurring"
+currency        = "USD"
+amount_minor    = 9900
+proration_basis = "calendar_days_30"
+
+[[assert]]
+given  = { period_start = "2026-01-01T00:00:00Z", period_end = "2026-02-01T00:00:00Z" }
+expect = { units_charged = 30, units_in_basis = 30 }
+why    = "January runs 31 days but the count caps at 30, so a full month is 30/30 and never 31/30"
+
+[[assert]]
+given  = { period_start = "2026-01-01T00:00:00Z", period_end = "2026-02-01T00:00:00Z", from = "2026-01-16T00:00:00Z" }
+expect = { units_charged = 16, units_in_basis = 30 }
+why    = "16 days remain from Jan 16 to Feb 1; below the cap it passes through, and the basis stays the fixed 30"
+
+[[assert]]
+given  = { period_start = "2026-01-31T00:00:00Z", period_end = "2026-02-28T00:00:00Z" }
+expect = { units_charged = 28, units_in_basis = 30 }
+why    = "a fixed_day(31) anchor rolls February to its month end, giving a 28-day period; under a fixed 30-day basis a full February is 28/30, not 30/30. The rollover itself is anchor math (joint K5 fixture) - what this case pins is the proration over the already-clamped period"

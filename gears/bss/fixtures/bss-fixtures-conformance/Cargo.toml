@@ -1,0 +1,32 @@
+[package]
+name = "cf-gears-bss-fixtures-conformance"
+edition.workspace = true
+license.workspace = true
+description = "Conformance harness over the BSS joint fixture corpus: the CorpusEvaluator and PublishValidator traits, the suite runners, the registry generator, and the reference oracle implementing the pricing PRD §17.2 formula matrix. Gears take this as a dev-dependency only."
+
+[lib]
+name = "bss_fixtures_conformance"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The corpus types this harness runs against. `corpus` by name: the workspace
+# default is the narrow production surface a gear compiles, and this harness is
+# the half that reads the case files from disk.
+bss-fixtures = { workspace = true, features = ["corpus"] }
+# Typed evaluation errors.
+thiserror = { workspace = true }
+# Period arithmetic for the proration family (UTC instants only).
+chrono = { workspace = true }
+# `registry_gen::render` serialises the generated registry back to TOML for the
+# gear's `regen_registry` example, which is what writes the committed file.
+# **Named here rather than inherited** (2026-08-18, the squash-rebase onto
+# upstream/main). The workspace entry is `toml = "0.8"`, which is
+# `toolkit-contract-protogen`'s and predates nothing — `toml` was in neither
+# side's workspace table at the merge base, so this is an add/add: upstream took
+# 0.8 for its tool and this corpus was written against the 1.x API. Moving either
+# crate onto the other's major is a code change nobody has reviewed, so this one
+# states its own. The lockfile already resolves both.
+toml = "1"
+serde = { workspace = true }

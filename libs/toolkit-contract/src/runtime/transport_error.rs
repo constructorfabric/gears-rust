@@ -15,7 +15,7 @@ use toolkit_canonical_errors::Problem;
 pub enum TransportError {
     /// The server returned a structured RFC 9457 `Problem` payload.
     #[cfg(feature = "canonical-errors")]
-    #[error("server returned problem: {} ({})", .problem.title, .problem.status)]
+    #[error("server returned problem: {} ({})", .problem.title, .problem.status.map_or_else(|| "unknown".to_owned(), |s| s.to_string()))]
     Problem {
         /// The structured RFC 9457 problem payload. Boxed: `Problem` itself is
         /// large enough (several `String`/`Value` fields) that an unboxed copy
@@ -158,7 +158,9 @@ impl TransportError {
             | TransportError::Unresolved { .. } => true,
             TransportError::HttpStatus { status, .. } => is_retryable_status(*status),
             #[cfg(feature = "canonical-errors")]
-            TransportError::Problem { problem, .. } => is_retryable_status(problem.status),
+            TransportError::Problem { problem, .. } => {
+                problem.status.is_some_and(is_retryable_status)
+            }
             #[cfg(feature = "grpc-client")]
             TransportError::Grpc { code, .. } => matches!(
                 code,

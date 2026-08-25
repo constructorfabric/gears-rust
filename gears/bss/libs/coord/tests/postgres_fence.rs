@@ -23,7 +23,7 @@
 //! mid-ack, the acknowledged commit must NOT succeed — it must surface
 //! [`AckError::LeaseLost`]. An `Ok(_)` outcome means the fence accepted a stolen
 //! lease (the reviewed concern is real). Ignored by default; run with
-//! `cargo test -p coord --test postgres_fence -- --ignored`.
+//! `cargo test -p cf-gears-bss-coord --test postgres_fence -- --ignored`.
 
 #![allow(
     clippy::unwrap_used,

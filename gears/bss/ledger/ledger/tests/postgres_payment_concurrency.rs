@@ -3,7 +3,7 @@
 //! Postgres and pin the invariants the per-payment cap, the candidate ceiling,
 //! and the payer-grain projector must preserve under contention. Ignored by
 //! default; run with
-//! `cargo test -p bss-ledger --test postgres_payment_concurrency -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_payment_concurrency -- --ignored`.
 //!
 //! Covers: (1) N concurrent `allocate`s of the SAME payment never push
 //! `allocated_minor` past `settled_minor` — the per-payment cap CHECK is the

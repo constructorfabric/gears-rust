@@ -3,7 +3,7 @@
 
 # E2E Testing Guide
 
-This document defines the philosophy, infrastructure, and patterns for end-to-end (E2E) tests across all ToolKit gears. Gear-specific test plans (which seams to test, actual test implementations) live in each gear's `docs/features/` folder and `testing/e2e/gears/<gear>/`.
+This document defines the philosophy, infrastructure, and patterns for end-to-end (E2E) tests across all ToolKit gears. Gear-specific test plans (which seams to test, actual test implementations) live in each gear's `docs/features/` folder and `testing/e2e/suites/<gear>/`.
 
 ---
 
@@ -19,7 +19,7 @@ This is **not** "another way to verify business logic." Business logic is verifi
 
 E2E tests live at two levels, and both matter:
 
-**Single-gear E2E** — verifies that the gear's own integration seams work end-to-end: routing, JSON wire format, real AuthZ wiring, PostgreSQL-specific SQL. Each gear has its own suite under `testing/e2e/gears/<gear>/`. These tests are the baseline.
+**Single-gear E2E** — verifies that the gear's own integration seams work end-to-end: routing, JSON wire format, real AuthZ wiring, PostgreSQL-specific SQL. Each gear has its own suite under `testing/e2e/suites/<gear>/`. These tests are the baseline.
 
 **Cross-gear E2E** — verifies that **2–5 gears work correctly together**. This is the primary reason E2E tests exist at all. Unit tests verify each gear in isolation (mocking its dependencies). Only an E2E test can catch bugs that appear at the boundary between gears: gear A calls gear B's SDK, gear B reads from a table that gear C seeded, the combined result flows through gear D's API. None of these seams are visible to any single gear's unit tests.
 
@@ -279,7 +279,7 @@ Never use `pytest-rerunfailures` as a permanent fix. Retrying a flaky test hides
 ### File Layout
 
 ```
-testing/e2e/gears/<gear_name>/
+testing/e2e/suites/<gear_name>/
 ├── conftest.py                   ← helpers, timeout config, factory fixtures
 ├── test_authz_tenant_scoping.py  ← AuthZ + tenant isolation seams (if applicable)
 ├── test_mtls_auth.py             ← MTLS certificate verification (if applicable; p2 — deferred, not implemented yet)

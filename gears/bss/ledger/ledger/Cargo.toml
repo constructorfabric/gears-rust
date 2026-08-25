@@ -1,8 +1,11 @@
 [package]
-name = "bss-ledger"
+name = "cf-gears-bss-ledger"
 edition.workspace = true
 license.workspace = true
 description = "BSS Billing Ledger gear: double-entry posting foundation, Postgres persistence in the bss schema"
+
+[lib]
+name = "bss_ledger"
 
 [lints]
 workspace = true
@@ -104,7 +107,7 @@ arc-swap = { workspace = true }
 # metrics-harness tests (and any integration test) can use
 # `infra::metrics::test_harness`. Cargo unifies the lib-under-test edge with
 # this dev-dep edge into a single `test-support = on` compilation (RBAC idiom).
-bss-ledger = { path = ".", features = ["test-support"] }
+bss-ledger = { package = "cf-gears-bss-ledger", path = ".", features = ["test-support"] }
 
 toolkit = { workspace = true, features = ["db"] }
 toolkit-db = { workspace = true, features = ["pg", "sqlite"] }

@@ -1,6 +1,6 @@
 //! Postgres-only: the fiscal-period guard. An `OPEN` period pins clean; a
 //! `CLOSED` period and a missing period both yield `PeriodError::Closed`.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

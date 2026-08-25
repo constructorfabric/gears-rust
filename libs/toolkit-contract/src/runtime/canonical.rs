@@ -63,7 +63,10 @@ impl From<TransportError> for CanonicalError {
 }
 
 fn problem_to_canonical(problem: Problem) -> CanonicalError {
-    let status = problem.status;
+    // Falls back to 500 if `try_from` fails on a Problem with no status at
+    // all (only reachable from an SSE error event) - the safest guess when
+    // nothing else is known.
+    let status = problem.status.unwrap_or(500);
     let title = problem.title.clone();
     let detail = problem.detail.clone();
     match CanonicalError::try_from(problem) {
@@ -76,7 +79,7 @@ fn synth_problem(category: ProblemCategory, detail: &str) -> Problem {
     Problem {
         problem_type: format!("gts://{}", category.gts_fragment()),
         title: category.title().to_owned(),
-        status: category.http_status(),
+        status: Some(category.http_status()),
         detail: detail.to_owned(),
         instance: None,
         trace_id: None,

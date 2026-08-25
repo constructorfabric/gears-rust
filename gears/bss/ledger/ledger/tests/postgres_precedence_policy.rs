@@ -12,7 +12,7 @@
 //!   (latest `effective_from <= now`) is the one chosen.
 //!
 //! Ignored by default (Docker/testcontainers); run with
-//! `cargo test -p bss-ledger --test postgres_precedence_policy -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_precedence_policy -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

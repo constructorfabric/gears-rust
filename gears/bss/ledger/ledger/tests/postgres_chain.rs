@@ -5,7 +5,7 @@
 //! links onto the first; N concurrent posts form a single linear chain. The
 //! append-only trigger negatives (a re-seal, a business-column UPDATE, and a
 //! DELETE) are exercised with raw SQL against a posted-and-sealed entry.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

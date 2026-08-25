@@ -279,19 +279,20 @@ The system **MUST** include the following built-in plugins:
 **Auth Plugins**:
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.noop.v1` — No authentication
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1` — API key injection (header/query)
-- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.basic.v1` — HTTP Basic authentication
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1` — OAuth2 client credentials flow
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1` — OAuth2 with Basic auth
-- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.bearer.v1` — Bearer token injection
+- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.basic.v1` — HTTP Basic authentication; catalog identifier only, no backing `AuthPlugin` implementation
+- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.bearer.v1` — Bearer token injection; catalog identifier only, no backing `AuthPlugin` implementation
 
 **Guard Plugins**:
-- `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` — Request timeout enforcement
-- `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.cors.v1` — CORS preflight validation
+- `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.required_headers.v1` — Required header enforcement (request/response); the only guard identifier bindable via `plugins.items[].plugin_ref`
+- `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` — Request timeout enforcement; core Data Plane config, catalog identifier only (not `plugins`-bindable)
+- `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.cors.v1` — CORS preflight validation; core Data Plane config via `Upstream.cors`, catalog identifier only (not `plugins`-bindable)
 
 **Transform Plugins**:
-- `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.logging.v1` — Request/response logging
-- `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.metrics.v1` — Prometheus metrics collection
 - `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.request_id.v1` — X-Request-ID propagation
+- `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.logging.v1` — Request/response logging; core Data Plane instrumentation, catalog identifier only (not `TransformPluginRegistry`-resolvable)
+- `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.metrics.v1` — Prometheus metrics collection; core Data Plane instrumentation, catalog identifier only (not `TransformPluginRegistry`-resolvable)
 
 - **Rationale**: Covers the most common outbound API authentication and observability patterns out of the box.
 - **Actors**: `cpt-cf-oagw-actor-platform-operator`

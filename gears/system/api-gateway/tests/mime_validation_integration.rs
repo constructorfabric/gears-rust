@@ -185,7 +185,7 @@ async fn test_middleware_rejects_disallowed_content_type() {
     assert_eq!(content_type(&response), PROBLEM_JSON);
 
     let problem = extract_problem(response).await;
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(problem.problem_type, INVALID_ARGUMENT_TYPE);
     let violations = problem
         .context
@@ -244,7 +244,7 @@ async fn test_middleware_rejects_missing_content_type() {
     assert_eq!(content_type(&response), PROBLEM_JSON);
 
     let problem = extract_problem(response).await;
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(problem.problem_type, INVALID_ARGUMENT_TYPE);
     let violations = problem
         .context

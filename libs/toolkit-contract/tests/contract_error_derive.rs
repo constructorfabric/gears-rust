@@ -45,7 +45,7 @@ fn to_problem_sets_extension_fields_and_category() {
         "got {}",
         problem.problem_type
     );
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(problem.title, "Failed precondition");
 }
 
@@ -66,7 +66,7 @@ fn to_problem_unit_variant_has_empty_data() {
     let err = BillingError::Maintenance;
     let problem: Problem = err.into();
     assert_eq!(problem.error_code.as_deref(), Some("MAINTENANCE"));
-    assert_eq!(problem.status, 503);
+    assert_eq!(problem.status, Some(503));
     assert!(problem.context["data"].is_object());
     assert_eq!(
         problem.context["data"].as_object().expect("object").len(),
@@ -100,7 +100,7 @@ fn try_from_problem_returns_envelope_for_unknown_code() {
     let mut problem = Problem {
         problem_type: "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~".into(),
         title: "Internal".into(),
-        status: 500,
+        status: Some(500),
         detail: "synthetic".into(),
         instance: None,
         trace_id: None,
@@ -124,7 +124,7 @@ fn try_from_problem_returns_envelope_when_data_field_missing() {
     let problem = Problem {
         problem_type: "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~".into(),
         title: "Failed precondition".into(),
-        status: 400,
+        status: Some(400),
         detail: "missing data payload".into(),
         instance: None,
         trace_id: None,
@@ -270,7 +270,7 @@ mod transport_fallback {
     fn non_problem_transport_error_routes_to_fallback() {
         let err: OrderError = TransportError::network("dns fail").into();
         match err {
-            OrderError::Unknown { problem } => assert!(problem.status >= 500),
+            OrderError::Unknown { problem } => assert!(problem.status >= Some(500)),
             other => panic!("expected fallback Unknown, got {other:?}"),
         }
     }

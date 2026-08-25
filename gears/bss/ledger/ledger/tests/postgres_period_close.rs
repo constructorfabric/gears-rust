@@ -12,7 +12,7 @@
 //! The seed/post harness is copied from `tests/postgres_posting.rs` (each
 //! integration test is its own binary, so the helpers can't be shared).
 //! Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_period_close -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_period_close -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

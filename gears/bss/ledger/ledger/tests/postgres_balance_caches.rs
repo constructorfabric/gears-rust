@@ -1,5 +1,5 @@
 //! Postgres-only integration tests for the balance-cache tables.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 //!
 //! Asserts the conditional no-negative CHECK rejects a negative `AR`
 //! `account_balance` row and allows a negative `tax_subbalance` (no

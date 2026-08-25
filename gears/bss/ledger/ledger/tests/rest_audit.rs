@@ -16,7 +16,7 @@
 //! caught the original cross-tenant BOLA. A real DB backs `ApiState`; path (2)/(3) return
 //! before the txn, path (1) opens a serializable txn the gateway rolls back.
 //!
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

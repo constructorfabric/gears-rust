@@ -2,7 +2,7 @@
 //! (wallet) slice: they drive the REAL `CreditApplicationService` (grant / apply)
 //! through the foundation `PostingService` against a testcontainer Postgres.
 //! Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_credit -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_credit -- --ignored`.
 //!
 //! The credit counterpart to `postgres_payments.rs`. `setup_seller` provisions
 //! the chart (CASH_CLEARING / UNALLOCATED / PSP_FEE_EXPENSE / AR + a stream-less

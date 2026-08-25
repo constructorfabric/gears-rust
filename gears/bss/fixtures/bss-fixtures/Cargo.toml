@@ -1,0 +1,38 @@
+[package]
+name = "cf-gears-bss-fixtures"
+edition.workspace = true
+license.workspace = true
+description = "The BSS joint golden conformance fixture corpus: loader and registry access. Contains no charge arithmetic by design — this is the only fixture crate a gear may take as a production dependency, which is what keeps pricing's no-charge-computation principle true."
+
+[lib]
+name = "bss_fixtures"
+
+[lints]
+workspace = true
+
+[features]
+# On by default so the corpus is testable and the generator works out of the box.
+# A **gear** takes this crate with `default-features = false`: the publish gate
+# asks the registry whether a kind is green, and nothing else — the loader, the
+# case model and `chrono` have no business in a production tree.
+default = ["corpus"]
+corpus = ["dep:chrono"]
+
+[dependencies]
+# Deserializes the corpus case files and `registry.toml`.
+serde = { workspace = true }
+# The corpus wire format.
+# **Named here rather than inherited** (2026-08-18, the squash-rebase onto
+# upstream/main). The workspace entry is `toml = "0.8"`, which is
+# `toolkit-contract-protogen`'s and predates nothing — `toml` was in neither
+# side's workspace table at the merge base, so this is an add/add: upstream took
+# 0.8 for its tool and this corpus was written against the 1.x API. Moving either
+# crate onto the other's major is a code change nobody has reviewed, so this one
+# states its own. The lockfile already resolves both.
+toml = "1"
+# Typed load errors that name the offending file.
+thiserror = { workspace = true }
+# UTC instants in proration and level cases (`period_start`, sample `at`, ...).
+# All corpus times are UTC; the design set makes that a constraint, not a
+# default. Optional: only the corpus half needs it.
+chrono = { workspace = true, features = ["serde"], optional = true }

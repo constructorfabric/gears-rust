@@ -43,21 +43,15 @@ impl ImageParser {
         Self
     }
 
-    /// Determine MIME type from file extension
+    /// Determine MIME type from file extension, restricted to the formats
+    /// this parser actually handles (the canonical table also carries
+    /// non-image extensions used by other backends).
     fn mime_type_from_extension(extension: &str) -> Option<&'static str> {
-        if extension.eq_ignore_ascii_case("png") {
-            return Some("image/png");
+        let extension = extension.to_lowercase();
+        if !SUPPORTED_EXTENSIONS.iter().any(|ext| *ext == extension) {
+            return None;
         }
-        if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
-            return Some("image/jpeg");
-        }
-        if extension.eq_ignore_ascii_case("webp") {
-            return Some("image/webp");
-        }
-        if extension.eq_ignore_ascii_case("gif") {
-            return Some("image/gif");
-        }
-        None
+        crate::domain::mime_table::mime_for_extension(&extension)
     }
 
     /// Determine MIME type from filename or provided content type
@@ -112,6 +106,7 @@ impl FileParserBackend for ImageParser {
     async fn parse_local_path(
         &self,
         path: &Path,
+        resolved_content_type: Option<&str>,
     ) -> Result<crate::domain::ir::ParsedDocument, DomainError> {
         // Check file size before reading
         let metadata = tokio::fs::metadata(path)
@@ -126,19 +121,27 @@ impl FileParserBackend for ImageParser {
             )));
         }
 
-        // Read file bytes
-        let bytes = tokio::fs::read(path)
-            .await
-            .map_err(|e| DomainError::io_error(format!("Failed to read image file: {e}")))?;
+        // The check above gives the precise "too large" message; this is what
+        // bounds the allocation, since metadata-then-read is not atomic.
+        let bytes = super::bounded_read::read_bounded(path, MAX_IMAGE_SIZE_BYTES).await?;
 
-        // Determine MIME type from extension
-        let extension = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| DomainError::unsupported_file_type("no extension"))?;
-
-        let mime_type = Self::mime_type_from_extension(extension)
-            .ok_or_else(|| DomainError::unsupported_file_type(extension))?;
+        // Prefer the resolved MIME, but require it to be an image type — the
+        // same guard `determine_mime_type` applies on the `parse_bytes` path. It
+        // cannot fire today; keeping both paths symmetric is what stops that
+        // from quietly becoming untrue.
+        let mime_type = match resolved_content_type {
+            Some(mime) if mime.starts_with("image/") => mime.to_owned(),
+            _ => {
+                let extension = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| DomainError::unsupported_file_type("no extension"))?;
+                Self::mime_type_from_extension(extension)
+                    .ok_or_else(|| DomainError::unsupported_file_type(extension))?
+                    .to_owned()
+            }
+        };
+        let mime_type = mime_type.as_str();
 
         // Build data URI
         let data_uri = Self::build_data_uri(mime_type, &bytes);

@@ -12,7 +12,7 @@
 //!   * `reidentify` without a reason is rejected `MISSING_INVESTIGATION_REASON`,
 //!     writing NO record.
 //!
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

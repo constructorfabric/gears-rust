@@ -1,0 +1,62 @@
+family     = "package"
+id         = "repeating-block-roundup"
+kind       = "evaluation"
+provenance = ["AC#60", "AC#88", "PRD §17.2"]
+
+# `package` is legal on `usage` rows only (`inst-mk-chargekind`, D-18), so `usage`
+# is the only honest chargeKind this case can carry - there is no reading of a
+# block-priced row that is not metered.
+#
+# CLOSED (was OPEN, for the corpus owner). As a `usage` row this snapshot did not
+# publish: `inst-pk-window` (D-58) requires `tierAggregationWindow` on every
+# `package` usage row, and this case stated none. The window is now authored, and
+# the earlier reluctance - "picking one is picking what the case means" - was
+# wrong on this row. It would be right if the case asserted a charge for a
+# *stretch of usage*, because 150 units in a month is 2 blocks under
+# `invoice_period` and 30 under a daily fold. It does not: every assertion below
+# supplies `q` directly, and `q` **is** the accumulated `used` however it
+# accumulated. `ceil(q / 1000) x 2500` is the same number under all four windows,
+# so `invoice_period` - the window the rest of the corpus counts against - states
+# what the row is without touching what the case asserts.
+#
+# The `meter` is authored for the same reason and settled the same way. A row
+# that prices in blocks is metered by definition, and `api.calls` is what the
+# `package` publish case (`supersession-continuity/package-size-change-rejected`)
+# prices, so the two `package` rows now name one meter. It reads directly
+# against `whole_unit`: a call is counted whole, which is what makes the block
+# boundaries below integers rather than a quantization artefact.
+
+[snapshot]
+model_kind              = "package"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "api.calls"
+package_size            = 1000
+package_price_minor     = 2500
+billing_granularity     = "whole_unit"
+tier_aggregation_window = "invoice_period"
+
+[[assert]]
+given  = { q = 0 }
+expect = { charge_minor = 0 }
+why    = "ceil(0/1000) is zero blocks, not one — no usage buys no block"
+
+[[assert]]
+given  = { q = 1 }
+expect = { charge_minor = 2500 }
+why    = "a partial block rounds up to one whole block"
+
+[[assert]]
+given  = { q = 1000 }
+expect = { charge_minor = 2500 }
+why    = "exactly one block; the boundary must not tip into two"
+
+[[assert]]
+given  = { q = 1001 }
+expect = { charge_minor = 5000 }
+why    = "ceil(1.001) is two blocks — a floor reading would halve this charge"
+
+[[assert]]
+given  = { q = 2000 }
+expect = { charge_minor = 5000 }
+why    = "two whole blocks; the second boundary behaves like the first"

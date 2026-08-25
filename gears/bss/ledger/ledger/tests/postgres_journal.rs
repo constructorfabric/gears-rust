@@ -1,5 +1,5 @@
 //! Postgres-only integration tests for the journal truth tables.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 //!
 //! Covers: (a) a balanced entry commits; (b) an unbalanced entry rolls
 //! back at COMMIT with `LEDGER_ENTRY_UNBALANCED`; (c) a zero-line header

@@ -8,7 +8,7 @@
 //! scans find them and `run()` completes.
 //!
 //! Ignored Docker tests run with
-//! `cargo test -p bss-ledger --lib 'infra::jobs::aged_alarms::tests' -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --lib 'infra::jobs::aged_alarms::tests' -- --ignored`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -483,7 +483,16 @@ async fn run_over_empty_ledger_completes() {
 }
 
 /// An aged `QUEUED` `PAYMENT_ALLOCATE` row is surfaced by the cross-tenant queue
-/// scan, and `run()` (which emits the alarm) completes `Ok`.
+/// scan, and `run()` over it completes `Ok`.
+///
+/// **The emission is not observed here, by any test in this file.** An alarm
+/// reaches `LedgerEventPublisher::emit_invariant_alarm`, and the publisher these
+/// cases hand the job is `noop()`, whose `metrics` is `None` — so the counter
+/// mirror never fires and nothing records the alarm itself. A `run()` that
+/// emitted nothing at all would pass every case in this file identically. What
+/// the scan assertions above prove is the detector; observing the alarm needs a
+/// publisher built with `LedgerEventPublisher::with_metrics` over a recording
+/// port.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn aged_queue_row_is_detected_and_run_completes() {
@@ -529,7 +538,8 @@ async fn aged_queue_row_is_detected_and_run_completes() {
     assert_eq!(aged[0].tenant_id, tenant);
     assert!(aged[0].age_secs >= 86_400);
 
-    // run() over the seeded ledger completes Ok (emits the Warn alarm).
+    // run() over the seeded ledger completes Ok. The Warn alarm it emits is not
+    // observed — see this case's doc.
     job.run()
         .await
         .expect("run must succeed with an aged queue row");
@@ -565,8 +575,12 @@ async fn aged_chargeback_queue_row_is_detected() {
 }
 
 /// Group F: an aged open `REFUND_CLEARING` balance is surfaced by the cross-tenant
-/// refund-clearing scan (8 days → Warn), and `run()` (which emits the alarm + the
-/// §9 gauges) completes `Ok`.
+/// refund-clearing scan (8 days → Warn), and `run()` over it completes `Ok`.
+/// The alarm is not observed —
+/// [`aged_queue_row_is_detected_and_run_completes`]'s doc says why — and neither
+/// are the §9 gauges, for the separate reason that they run off the job's own
+/// metrics sink, which `AgedAlarmJob::new` defaults to the no-op and only
+/// `with_metrics` replaces.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn aged_refund_clearing_is_detected_and_run_completes() {
@@ -769,8 +783,9 @@ async fn seed_unallocated_grain(
 /// the per-tenant DB scan `aged_unallocated_grains` — the read path that
 /// enumerates tenants from the cache, reads each tenant's journal entries +
 /// `UNALLOCATED` lines + cache, builds the `entry_id -> posted_at_utc` age map,
-/// and folds it through [`aged_grains`]. `run()` (which emits the `AGED_UNALLOCATED`
-/// Warn alarm) then completes `Ok`.
+/// and folds it through [`aged_grains`]. `run()` then completes `Ok`; the
+/// `AGED_UNALLOCATED` Warn alarm it emits is not observed —
+/// [`aged_queue_row_is_detected_and_run_completes`]'s doc says why.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn aged_unallocated_grain_is_detected_and_run_completes() {
@@ -806,7 +821,8 @@ async fn aged_unallocated_grain_is_detected_and_run_completes() {
         aged[0].age_secs
     );
 
-    // run() over the seeded ledger completes Ok (emits the AGED_UNALLOCATED Warn).
+    // run() over the seeded ledger completes Ok. The AGED_UNALLOCATED Warn it
+    // emits is not observed — see this case's doc.
     job.run()
         .await
         .expect("run must succeed with an aged unallocated grain");
@@ -876,9 +892,10 @@ async fn seed_tax_subbalance(
 /// coverage of its `is_beyond_filing_window` filter. A `tax_subbalance` that went
 /// negative in a CLOSED (prior) filing period is beyond its window and is flagged;
 /// an in-window (current-period) negative is a legitimate reversal and is NOT
-/// flagged; a non-negative prior-period grain is not flagged either. `run()` (which
-/// emits the `Critical` `NEGATIVE_TAX_SUBBALANCE` alarm per flagged grain) then
-/// completes `Ok`.
+/// flagged; a non-negative prior-period grain is not flagged either. `run()` then
+/// completes `Ok`; the `Critical` `NEGATIVE_TAX_SUBBALANCE` alarm it emits per
+/// flagged grain is not observed —
+/// [`aged_queue_row_is_detected_and_run_completes`]'s doc says why.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn negative_tax_subbalance_beyond_window_is_detected_and_run_completes() {
@@ -919,7 +936,8 @@ async fn negative_tax_subbalance_beyond_window_is_detected_and_run_completes() {
     assert_eq!(g.tax_filing_period, "200001");
     assert_eq!(g.balance_minor, -250);
 
-    // run() over the seeded ledger completes Ok (emits the Critical alarm).
+    // run() over the seeded ledger completes Ok. The Critical alarm it emits is
+    // not observed — see this case's doc.
     job.run()
         .await
         .expect("run must succeed with a negative-beyond-window tax sub-balance");

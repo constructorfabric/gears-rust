@@ -1,0 +1,11 @@
+suite: file-storage
+features:
+  - file-storage
+  - static-tenants
+  - static-authn
+  - static-authz
+launcher: e2e-launcher
+config_gears:
+  - file-storage
+sidecars:
+  - file-storage

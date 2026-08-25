@@ -2,7 +2,7 @@
 //! concurrent `ChargebackService::record_phase` posts on the SAME dispute
 //! serialize under `SERIALIZABLE` (caller-retry, decision O). Ignored by default;
 //! run with
-//! `cargo test -p bss-ledger --test postgres_chargeback_concurrency -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_chargeback_concurrency -- --ignored`.
 //!
 //! Covers: a racing pair recording the SAME `lost` phase (same
 //! `dispute_id:cycle:phase`) on one opened `CASH_HOLD` dispute must land EXACTLY

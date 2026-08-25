@@ -1,0 +1,13 @@
+suite: oagw
+features:
+  - oagw
+  - credstore
+  - static-credstore
+  - static-tenants
+  - static-authn
+  - static-authz
+launcher: e2e-launcher
+config_gears:
+  - oagw
+  - credstore
+  - static-credstore-plugin

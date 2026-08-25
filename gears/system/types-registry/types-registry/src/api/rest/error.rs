@@ -94,7 +94,7 @@ mod tests {
         let problem = problem_from(DomainError::not_found_by_id(gts_id!(
             "cf.core.events.test.v1~"
         )));
-        assert_eq!(problem.status, 404);
+        assert_eq!(problem.status, Some(404));
         // `instance` is filled by the canonical error middleware on the way
         // out — at the unit-test level no middleware is in scope.
         assert!(problem.instance.is_none());
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn test_domain_error_to_problem_not_found_by_uuid() {
         let problem = problem_from(DomainError::not_found_by_uuid(uuid::Uuid::nil()));
-        assert_eq!(problem.status, 404);
+        assert_eq!(problem.status, Some(404));
         assert!(
             problem
                 .detail
@@ -125,25 +125,25 @@ mod tests {
         let problem = problem_from(DomainError::already_exists(gts_id!(
             "cf.core.events.test.v1~"
         )));
-        assert_eq!(problem.status, 409);
+        assert_eq!(problem.status, Some(409));
     }
 
     #[test]
     fn test_domain_error_to_problem_invalid_gts_id() {
         let problem = problem_from(DomainError::invalid_gts_id("bad format"));
-        assert_eq!(problem.status, 400);
+        assert_eq!(problem.status, Some(400));
     }
 
     #[test]
     fn test_domain_error_to_problem_validation_failed() {
         let problem = problem_from(DomainError::validation_failed("schema invalid"));
-        assert_eq!(problem.status, 400);
+        assert_eq!(problem.status, Some(400));
     }
 
     #[test]
     fn test_domain_error_to_problem_not_in_ready_mode() {
         let problem = problem_from(DomainError::NotInReadyMode);
-        assert_eq!(problem.status, 503);
+        assert_eq!(problem.status, Some(503));
     }
 
     #[test]
@@ -156,18 +156,18 @@ mod tests {
         ]));
         // ReadyCommitFailed is only produced by post_init lifecycle and
         // never reaches a REST response; map opaquely to internal.
-        assert_eq!(problem.status, 500);
+        assert_eq!(problem.status, Some(500));
     }
 
     #[test]
     fn test_domain_error_to_problem_internal() {
         let problem = problem_from(DomainError::Internal(anyhow::anyhow!("test error")));
-        assert_eq!(problem.status, 500);
+        assert_eq!(problem.status, Some(500));
     }
 
     #[test]
     fn test_domain_error_to_problem_invalid_query() {
         let problem = problem_from(DomainError::invalid_query("bad pattern"));
-        assert_eq!(problem.status, 400);
+        assert_eq!(problem.status, Some(400));
     }
 }

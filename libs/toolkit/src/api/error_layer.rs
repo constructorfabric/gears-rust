@@ -128,7 +128,7 @@ mod tests {
 
         // Wire serialization shape — instance / trace_id are filled by middleware.
         let problem = Problem::from(canonical);
-        assert_eq!(problem.status, 400);
+        assert_eq!(problem.status, Some(400));
         assert!(problem.instance.is_none());
     }
 

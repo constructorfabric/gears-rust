@@ -1,7 +1,7 @@
 //! Postgres-only **concurrency** tests for the deferred-apply queue (Slice 2b,
 //! Phase 3, Group F): two appliers racing the SAME queued allocation must apply
 //! it EXACTLY ONCE. Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_queue_concurrency -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_queue_concurrency -- --ignored`.
 //!
 //! Run discipline (controller): testcontainer `#[ignore]` tests; run the bin
 //! sequentially (each test boots its own container).

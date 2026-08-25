@@ -3,7 +3,7 @@
 //! of the same key returns `Replay` with a populated `result_entry_id`; a
 //! `claim` with a different payload hash still returns the stored row (the
 //! caller maps the hash mismatch to `IDEMPOTENCY_PAYLOAD_CONFLICT`). Ignored
-//! by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,

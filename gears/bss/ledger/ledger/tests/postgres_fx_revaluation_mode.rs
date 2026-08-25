@@ -11,7 +11,7 @@
 //!   tenant's `ModeB`).
 //!
 //! Ignored by default (Docker/testcontainers); run with
-//! `cargo test -p bss-ledger --test postgres_fx_revaluation_mode -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_fx_revaluation_mode -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
