@@ -734,7 +734,7 @@ walkdir = "2.5"
 
 # GTS library.
 # Keep in sync with tools/dylint_lints/Cargo.toml.
-gts-id = "0.11.0"
+gts-id = "0.12.0"
 gts = "0.11.0"
 gts-macros = "0.11.0"
 
