@@ -36,6 +36,7 @@ pub mod error;
 pub mod gts;
 pub mod key;
 pub mod models;
+pub mod odata;
 pub mod precondition;
 
 pub use activation::{

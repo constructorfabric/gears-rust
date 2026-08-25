@@ -47,9 +47,20 @@ pub enum AuditScope {
 /// exact-match query — no prefix or wildcard search.
 #[must_use]
 pub fn format(key: &SettingKey, scope: AuditScope) -> String {
-    let mut out = String::with_capacity(PREFIX.len() + key.as_str().len() + 40);
+    format_raw(key.as_str(), scope)
+}
+
+/// The same formatter over an already-rendered identifier.
+///
+/// A category is audited under its own key rather than a setting key, and both
+/// must produce ids through this one function — DESIGN.md §4.2 requires the
+/// audit write and the history read to share a single formatter, and a second
+/// spelling would split a resource's history in half.
+#[must_use]
+pub fn format_raw(id: &str, scope: AuditScope) -> String {
+    let mut out = String::with_capacity(PREFIX.len() + id.len() + 40);
     out.push_str(PREFIX);
-    out.push_str(key.as_str());
+    out.push_str(id);
     out.push(SCOPE_SEPARATOR);
     match scope {
         AuditScope::Platform => out.push_str(PLATFORM_SCOPE),

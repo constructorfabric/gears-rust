@@ -20,3 +20,25 @@ pub const VALUE_TOO_LARGE: &str = "value_too_large";
 
 /// A mutating request omitted the mandatory `If-Match` header.
 pub const IF_MATCH_REQUIRED: &str = "if_match_required";
+
+/// A category key falls outside the 1..128 character bound.
+pub const CATEGORY_KEY_LENGTH: &str = "category_key_length";
+
+/// A category name falls outside the 1..256 character bound.
+pub const CATEGORY_NAME_LENGTH: &str = "category_name_length";
+
+/// A category description exceeds the 4096 character bound.
+pub const CATEGORY_DESCRIPTION_LENGTH: &str = "category_description_length";
+
+/// A caller tried to change a category `key`, which is immutable.
+pub const CATEGORY_KEY_IMMUTABLE: &str = "category_key_immutable";
+
+/// A category key contains the reserved `/` separator.
+pub const CATEGORY_KEY_RESERVED_SEPARATOR: &str = "category_key_reserved_separator";
+
+/// An `OData` expression referenced an unmapped field, used an unsupported
+/// operator, or carried a cursor that no longer decodes.
+pub const ODATA_QUERY: &str = "odata_query";
+
+/// A request used an `OData` option this resource does not implement.
+pub const ODATA_UNSUPPORTED_OPTION: &str = "odata_unsupported_option";

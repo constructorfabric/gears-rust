@@ -73,7 +73,13 @@ pub enum DomainError {
     /// "exists but forbidden" would let an unauthorized caller enumerate the
     /// settings tree by reading status codes.
     #[error("not authorized")]
-    Unauthorized,
+    Unauthorized {
+        /// The kind of resource the decision was made against — never the
+        /// caller's identifier for it. Two denials for different categories are
+        /// still byte-identical; only the resource *type* differs, and the URL
+        /// already reveals that.
+        resource: &'static str,
+    },
 
     /// No such resource. Renders as `404`.
     #[error("{resource} not found")]

@@ -3,3 +3,4 @@
 
 pub mod authz;
 pub mod precondition;
+pub mod rest;

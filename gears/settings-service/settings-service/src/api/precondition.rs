@@ -1,4 +1,5 @@
 // Created: 2026-08-12 by Constructor Tech
+// @cpt-dod:cpt-cf-settings-service-dod-category-management-concurrency:p1
 //! `If-Match` evaluation for conditional writes.
 //!
 //! Every mutating request against a versioned resource passes through here

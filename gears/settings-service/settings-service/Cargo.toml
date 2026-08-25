@@ -29,11 +29,17 @@ tracing = { workspace = true }
 inventory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+utoipa = { workspace = true }
 thiserror = { workspace = true }
 
 sea-orm = { workspace = true }
+toolkit-db-macros = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+time = { workspace = true }
 sea-orm-migration = { workspace = true }
 
+axum = { workspace = true }
+http = { workspace = true }
 toolkit = { workspace = true }
 toolkit-db = { workspace = true }
 toolkit-security = { workspace = true }

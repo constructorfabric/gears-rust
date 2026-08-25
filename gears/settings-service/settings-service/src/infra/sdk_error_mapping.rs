@@ -18,6 +18,37 @@ use crate::precondition;
 #[resource_error("gts.cf.toolkit.settings.declaration.v1~")]
 struct SettingsResource;
 
+/// Errors attributed to a category.
+#[resource_error("gts.cf.toolkit.settings.category.v1~")]
+struct CategoryResource;
+
+/// Errors attributed to a stored setting value.
+#[resource_error("gts.cf.toolkit.settings.value.v1~")]
+struct ValueResource;
+
+/// Build a denial attributed to the resource actually enforced.
+///
+/// The `#[resource_error]` macro fixes one type per scope, so a denial has to
+/// select the scope matching what the caller asked for — otherwise a category
+/// request is refused with the declaration type in its context, which is simply
+/// wrong metadata for anyone reading a log or an audit trail.
+fn permission_denied_for(resource: &'static str) -> CanonicalError {
+    const REASON: &str = "SETTING_NOT_ENTITLED";
+    if resource == settings_service_sdk::gts::CATEGORY_SCHEMA {
+        CategoryResource::permission_denied()
+            .with_reason(REASON)
+            .create()
+    } else if resource == settings_service_sdk::gts::VALUE_SCHEMA {
+        ValueResource::permission_denied()
+            .with_reason(REASON)
+            .create()
+    } else {
+        SettingsResource::permission_denied()
+            .with_reason(REASON)
+            .create()
+    }
+}
+
 impl From<DomainError> for CanonicalError {
     fn from(err: DomainError) -> Self {
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-problem-mapping:p1:inst-gf-problem-1
@@ -69,9 +100,7 @@ impl From<DomainError> for CanonicalError {
             // variant holds no identifier to leak, so a denial for a setting
             // that exists is byte-identical to one for a setting that does not.
             // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-problem-mapping:p1:inst-gf-problem-5
-            DomainError::Unauthorized => SettingsResource::permission_denied()
-                .with_reason("SETTING_NOT_ENTITLED")
-                .create(),
+            DomainError::Unauthorized { resource } => permission_denied_for(resource),
             // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-problem-mapping:p1:inst-gf-problem-5
 
             // 404 — names the kind of resource, never the caller's identifier.

@@ -24,7 +24,13 @@ fn the_harness_declares_its_migrations_in_order() {
         .iter()
         .map(|m| m.name().to_owned())
         .collect();
-    assert_eq!(names, vec!["m20260812_000001_initial".to_owned()]);
+    assert_eq!(
+        names,
+        vec![
+            "m20260812_000001_initial".to_owned(),
+            "m20260813_000001_categories".to_owned(),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -72,10 +78,9 @@ async fn applying_twice_is_a_no_op() {
 #[test]
 fn no_domain_table_is_created_here() {
     // DECOMPOSITION entry 2.1: "Migration harness and shared schema
-    // conventions; no domain tables in this feature." A table added here would
-    // arrive before the code that reads it, and outlive any decision to change
-    // its shape. This asserts the intent so that adding one is a deliberate
-    // choice against a stated rule rather than an oversight.
+    // conventions; no domain tables in this feature." Scoped to the foundation's
+    // own migration -- later migrations belong to the features that own their
+    // tables, and `categories` arrives with entry 2.2.
     let statements = format!("{:?}", DatabaseBackend::Postgres);
     let _ = statements;
     for table in [

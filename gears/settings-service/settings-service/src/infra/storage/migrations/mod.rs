@@ -14,6 +14,7 @@
 use sea_orm_migration::prelude::*;
 
 mod m20260812_000001_initial;
+mod m20260813_000001_categories;
 
 /// The gear's migrations, oldest first.
 pub struct Migrator;
@@ -21,7 +22,10 @@ pub struct Migrator;
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(m20260812_000001_initial::Migration)]
+        vec![
+            Box::new(m20260812_000001_initial::Migration),
+            Box::new(m20260813_000001_categories::Migration),
+        ]
     }
 }
 

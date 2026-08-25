@@ -16,7 +16,7 @@ fn key() -> SettingKey {
 
 fn record() -> AuditRecord {
     AuditRecord::new(
-        &key(),
+        key().as_str(),
         AuditScope::Platform,
         "admin@acme",
         "change",

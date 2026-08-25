@@ -22,10 +22,8 @@
 
 pub mod resource_id;
 
-use serde::{Deserialize, Serialize};
-use settings_service_sdk::SettingKey;
-
 pub use resource_id::AuditScope;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::error::DomainError;
 
@@ -98,14 +96,14 @@ impl AuditRecord {
     /// formed by the shared formatter.
     #[must_use]
     pub fn new(
-        key: &SettingKey,
+        resource: impl Into<String>,
         scope: AuditScope,
         actor: impl Into<String>,
         action: impl Into<String>,
         request_id: impl Into<String>,
     ) -> Self {
         Self {
-            resource: resource_id::format(key, scope),
+            resource: resource_id::format_raw(&resource.into(), scope),
             actor: actor.into(),
             action: action.into(),
             pre_image: None,

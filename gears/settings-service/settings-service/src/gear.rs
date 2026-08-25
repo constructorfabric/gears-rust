@@ -10,7 +10,8 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use sea_orm_migration::MigrationTrait;
-use toolkit::{DatabaseCapability, Gear, GearCtx};
+use toolkit::api::OpenApiRegistry;
+use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
 use toolkit_db::{DBProvider, DbError};
 use tracing::info;
 
@@ -20,11 +21,18 @@ use crate::config::SettingsServiceConfig;
 ///
 /// Holds what initialization resolves, so later phases can hang services off it
 /// without changing the startup contract.
-#[toolkit::gear(name = "settings-service", deps = [authz_resolver], capabilities = [db])]
+#[toolkit::gear(name = "settings-service", deps = [authz_resolver], capabilities = [db, rest])]
 pub struct SettingsService {
     config: OnceLock<Arc<SettingsServiceConfig>>,
     db: OnceLock<Arc<DBProvider<DbError>>>,
     enforcer: OnceLock<Arc<PolicyEnforcer>>,
+    categories: OnceLock<
+        Arc<
+            crate::domain::category::CategoryService<
+                crate::infra::storage::category_repo::CategoryRepo,
+            >,
+        >,
+    >,
 }
 
 impl Default for SettingsService {
@@ -33,6 +41,7 @@ impl Default for SettingsService {
             config: OnceLock::new(),
             db: OnceLock::new(),
             enforcer: OnceLock::new(),
+            categories: OnceLock::new(),
         }
     }
 }
@@ -115,11 +124,40 @@ impl Gear for SettingsService {
             .set(Arc::new(PolicyEnforcer::new(authz)))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
+        self.categories
+            .set(Arc::new(crate::domain::category::CategoryService::new(
+                crate::infra::storage::category_repo::CategoryRepo,
+                Arc::new(crate::infra::audit_emitter::TracingAuditEmitter),
+            )))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-9
         info!("Settings Service gear initialized");
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-9
 
         Ok(())
+    }
+}
+
+impl RestApiCapability for SettingsService {
+    fn register_rest(
+        &self,
+        _ctx: &GearCtx,
+        router: axum::Router,
+        openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<axum::Router> {
+        let service = self
+            .categories
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("category service not initialized"))?
+            .clone();
+        Ok(crate::api::rest::routes::register_routes(
+            router,
+            openapi,
+            service,
+            self.db()?,
+            self.enforcer()?,
+        ))
     }
 }
 
