@@ -190,7 +190,7 @@ impl From<ScopeError> for DomainError {
             // reaching either is a programmer error, like `Invalid`.
             err @ (ScopeError::UnresolvedScopeProperty { .. } | ScopeError::Pgq(_)) => {
                 tracing::error!("invalid scope: {err}");
-                DomainError::internal(err.to_string())
+                DomainError::internal(format!("invalid scope: {err}"))
             }
         }
     }
