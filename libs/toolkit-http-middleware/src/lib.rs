@@ -24,7 +24,7 @@
 pub mod auth;
 pub mod security;
 
-pub use auth::{PublicRoute, internal_auth_middleware, security_context_middleware};
+pub use auth::{AnonymousRoute, internal_auth_middleware, security_context_middleware};
 pub use security::{
     InternalTokenHttpError, SecurityContextHttpError, extract_bearer_http,
     extract_internal_token_http,

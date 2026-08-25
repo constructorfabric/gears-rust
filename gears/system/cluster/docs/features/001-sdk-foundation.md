@@ -34,7 +34,7 @@ Establishes the `cf-gears-cluster-sdk` crate (lib `cluster_sdk`) and the shared 
 
 ### 1.2 Purpose
 
-The four coordination primitives need a single, stable, serde-free, dyn-safe foundation so the public contract can evolve independently of any backend. This feature provides the cross-cutting types and helpers that the cache, leader-election, lock, and service-discovery features all depend on, and it removes magic-string profile names by construction.
+The three coordination primitives need a single, stable, serde-free, dyn-safe foundation so the public contract can evolve independently of any backend. This feature provides the cross-cutting types and helpers that the cache, leader-election, and lock features all depend on, and it removes magic-string profile names by construction.
 
 **Requirements**: `cpt-cf-clst-fr-validation-typed-profile`, `cpt-cf-clst-nfr-error-retryability`, `cpt-cf-clst-nfr-plugin-stability`
 
@@ -122,7 +122,7 @@ This feature realizes the in-scope design component `component-sdk` (foundation 
 
 ## 4. States (CDSL)
 
-Not applicable — the foundation defines cross-cutting types and helpers with no entity lifecycle. Entity state machines belong to the leader-election and service-discovery features.
+Not applicable — the foundation defines cross-cutting types and helpers with no entity lifecycle. Entity state machines belong to the leader-election feature.
 
 ## 5. Definitions of Done
 

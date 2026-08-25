@@ -18,6 +18,6 @@
 - *Expected:* no diagnostic is emitted.
 - *Done-when:* the `ui_test` compiles clean with an empty `.stderr`.
 
-> **Scope note:** the rule is initially scoped to the four cluster backend traits within
+> **Scope note:** the rule is initially scoped to the three cluster backend traits within
 > `try_lock`/`release` scopes; DB-transaction enforcement is a follow-up rule extension
 > (DESIGN §2.2). Fixtures should be added for that scope when it lands.

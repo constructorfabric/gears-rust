@@ -1,7 +1,7 @@
 extern crate toolkit_canonical_errors;
 
 use toolkit_canonical_errors::resource_error;
-use toolkit_canonical_errors::{CanonicalError, Problem};
+use toolkit_canonical_errors::{CanonicalError, Http, Problem};
 use toolkit_gts::{gts_id, gts_uri};
 
 const USER_RESOURCE: &str = gts_id!("cf.core.users.user.v1~");
@@ -24,10 +24,27 @@ fn problem_from_not_found_has_correct_fields() {
         gts_uri!("cf.core.errors.err.v1~cf.core.err.not_found.v1~")
     );
     assert_eq!(problem.title, "Not Found");
-    assert_eq!(problem.status, 404);
+    assert_eq!(problem.status, Some(404));
     assert_eq!(problem.detail, "Resource not found");
     assert_eq!(problem.context["resource_type"], USER_RESOURCE);
     assert_eq!(problem.context["resource_name"], "user-123");
+}
+
+#[test]
+fn problem_from_error_reflects_http_status_override() {
+    // Direct check of the CanonicalError -> Problem direction (as opposed to
+    // the round-trip tests below, which only verify it indirectly).
+    let err = R::not_found("Resource permanently removed")
+        .with_resource("user-123")
+        .with_override(Http::status_code(410))
+        .create();
+    let problem = Problem::from(err);
+    assert_eq!(problem.status, Some(410));
+    assert_eq!(
+        problem.problem_type,
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.not_found.v1~")
+    );
+    assert_eq!(problem.title, "Not Found");
 }
 
 #[test]
@@ -83,6 +100,10 @@ fn diagnostic_returns_none_for_other_categories() {
 // from_error_debug() — non-production path
 // =========================================================================
 
+// `from_error_debug` is gated behind the `debug-problem` feature, so the tests
+// that exercise it must be too — otherwise `cargo test` (default features) fails
+// to compile with an unresolved-method error.
+#[cfg(feature = "debug-problem")]
 #[test]
 fn from_error_debug_includes_description_for_internal() {
     let err = CanonicalError::internal("db pool exhausted").create();
@@ -90,6 +111,7 @@ fn from_error_debug_includes_description_for_internal() {
     assert_eq!(problem.context["description"], "db pool exhausted");
 }
 
+#[cfg(feature = "debug-problem")]
 #[test]
 fn from_error_debug_includes_description_for_unknown() {
     let err = TestR::unknown("unexpected upstream response").create();
@@ -114,6 +136,7 @@ fn from_error_does_not_include_description_for_unknown() {
     assert!(problem.context.get("description").is_none());
 }
 
+#[cfg(feature = "debug-problem")]
 #[test]
 fn from_error_debug_no_op_for_other_categories() {
     let err = TestR::not_found("gone").with_resource("x").create();
@@ -465,15 +488,62 @@ fn round_trip_data_loss() {
 }
 
 #[test]
+fn round_trip_preserves_http_status_override() {
+    let original = R::not_found("Resource permanently removed")
+        .with_resource("user-123")
+        .with_override(Http::status_code(410))
+        .create();
+    let restored = round_trip(original);
+    assert_eq!(restored.status_code(), 410);
+    assert_eq!(restored.http_status_override(), Some(410));
+    assert_eq!(
+        restored.gts_type(),
+        gts_id!("cf.core.errors.err.v1~cf.core.err.not_found.v1~")
+    );
+    assert_eq!(restored.title(), "Not Found");
+}
+
+#[test]
+fn round_trip_without_override_has_no_spurious_override() {
+    let original = R::not_found("Resource not found")
+        .with_resource("user-123")
+        .create();
+    let restored = round_trip(original);
+    assert_eq!(restored.status_code(), 404);
+    assert_eq!(restored.http_status_override(), None);
+}
+
+#[test]
+fn round_trip_normalizes_override_equal_to_category_default() {
+    // Known limitation (see DESIGN.md §2.2 "Transport Overrides"): an
+    // override whose value matches the category default is indistinguishable
+    // on the wire from "no override was set" — `status_code()` is correct
+    // either way, but `http_status_override()` loses its `Some(..)` state.
+    // Pinned here rather than fixed, since fixing it would require adding a
+    // dedicated `Problem` field, which the design deliberately avoids.
+    let original = R::not_found("Resource not found")
+        .with_resource("user-123")
+        .with_override(Http::status_code(404))
+        .create();
+    assert_eq!(original.http_status_override(), Some(404));
+
+    let restored = round_trip(original);
+    assert_eq!(restored.status_code(), 404);
+    assert_eq!(restored.http_status_override(), None);
+}
+
+#[test]
 fn try_from_unknown_problem_type_returns_error() {
     let problem = Problem {
         problem_type: FUTURE_PROBLEM_TYPE.to_owned(),
         title: "Future".to_owned(),
-        status: 599,
+        status: Some(599),
         detail: "Not in canonical taxonomy".to_owned(),
         instance: None,
         trace_id: None,
         context: serde_json::json!({}),
+        error_code: None,
+        error_domain: None,
     };
     let result = CanonicalError::try_from(problem);
     match result {
@@ -485,15 +555,81 @@ fn try_from_unknown_problem_type_returns_error() {
 }
 
 #[test]
+fn try_from_category_status_mismatch_returns_error() {
+    // invalid_argument's default is 400 (class 4xx); 500 is class 5xx.
+    let problem = Problem {
+        problem_type: gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~").to_owned(),
+        title: "Invalid Argument".to_owned(),
+        status: Some(500),
+        detail: "bad request".to_owned(),
+        instance: None,
+        trace_id: None,
+        context: serde_json::json!({"field_violations": []}),
+        error_code: None,
+        error_domain: None,
+    };
+    let result = CanonicalError::try_from(problem);
+    match result {
+        Err(ProblemConversionError::CategoryStatusMismatch { category, status }) => {
+            assert_eq!(category, "invalid_argument");
+            assert_eq!(status, 500);
+        }
+        other => panic!("expected CategoryStatusMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn try_from_zero_status_returns_error() {
+    let problem = Problem {
+        problem_type: gts_uri!("cf.core.errors.err.v1~cf.core.err.not_found.v1~").to_owned(),
+        title: "Not Found".to_owned(),
+        status: Some(0),
+        detail: "Resource not found".to_owned(),
+        instance: None,
+        trace_id: None,
+        context: serde_json::json!({}),
+        error_code: None,
+        error_domain: None,
+    };
+    let result = CanonicalError::try_from(problem);
+    match result {
+        Err(ProblemConversionError::InvalidStatus(0)) => {}
+        other => panic!("expected InvalidStatus(0), got {other:?}"),
+    }
+}
+
+#[test]
+fn try_from_out_of_range_status_returns_error() {
+    let problem = Problem {
+        problem_type: gts_uri!("cf.core.errors.err.v1~cf.core.err.not_found.v1~").to_owned(),
+        title: "Not Found".to_owned(),
+        status: Some(6000),
+        detail: "Resource not found".to_owned(),
+        instance: None,
+        trace_id: None,
+        context: serde_json::json!({}),
+        error_code: None,
+        error_domain: None,
+    };
+    let result = CanonicalError::try_from(problem);
+    match result {
+        Err(ProblemConversionError::InvalidStatus(6000)) => {}
+        other => panic!("expected InvalidStatus(6000), got {other:?}"),
+    }
+}
+
+#[test]
 fn try_from_unprefixed_problem_type_returns_error() {
     let problem = Problem {
         problem_type: "https://example.com/errors/foo".to_owned(),
         title: "Foo".to_owned(),
-        status: 500,
+        status: Some(500),
         detail: "non-gts URI".to_owned(),
         instance: None,
         trace_id: None,
         context: serde_json::json!({}),
+        error_code: None,
+        error_domain: None,
     };
     assert!(matches!(
         CanonicalError::try_from(problem),
@@ -510,11 +646,13 @@ fn try_from_malformed_context_returns_error() {
         problem_type: gts_uri!("cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~")
             .to_owned(),
         title: "Resource Exhausted".to_owned(),
-        status: 429,
+        status: Some(429),
         detail: "Rate limit exceeded".to_owned(),
         instance: None,
         trace_id: None,
         context: serde_json::json!({ "violations": 42 }),
+        error_code: None,
+        error_domain: None,
     };
     match CanonicalError::try_from(problem) {
         Err(ProblemConversionError::InvalidContext { category, .. }) => {

@@ -35,6 +35,9 @@ impl ExceptionQueueRepo {
     }
 
     /// Open a new exception row (caller mints the synthetic `exception_id`).
+    ///
+    /// # Errors
+    /// Returns [`RepoError::Db`] if scope validation or insertion fails.
     #[allow(
         clippy::too_many_arguments,
         reason = "an exception row carries its full identity at open time"
@@ -73,6 +76,9 @@ impl ExceptionQueueRepo {
 
     /// List OPEN close-blocking exceptions for a period (in-txn — the close gate
     /// input). `APPROVED_EXCEPTION` rows are not OPEN, so they are excluded.
+    ///
+    /// # Errors
+    /// Returns [`RepoError::Db`] if the scoped query fails.
     pub async fn list_open_in_txn(
         txn: &DbTx<'_>,
         scope: &AccessScope,
@@ -99,6 +105,9 @@ impl ExceptionQueueRepo {
     /// re-detects the same condition each scan, and an inline re-try repeats the same
     /// business key; without this they would pile up duplicate OPEN rows. In-txn so
     /// the check and the subsequent open share one snapshot.
+    ///
+    /// # Errors
+    /// Returns [`RepoError::Db`] if the scoped existence query fails.
     pub async fn exists_open_for_ref(
         txn: &DbTx<'_>,
         scope: &AccessScope,
@@ -124,6 +133,10 @@ impl ExceptionQueueRepo {
 
     /// List exceptions for the dashboard (out-of-txn), tenant-scoped, optionally
     /// filtered by status.
+    ///
+    /// # Errors
+    /// Returns [`DomainError::Internal`] if acquiring a connection or querying
+    /// the exception queue fails.
     pub async fn list(
         &self,
         scope: &AccessScope,
@@ -203,6 +216,9 @@ impl ExceptionQueueRepo {
     }
 
     /// Transition an exception to a terminal / ack status (in-txn).
+    ///
+    /// # Errors
+    /// Returns [`RepoError::Db`] if the scoped update fails.
     pub async fn resolve(
         txn: &DbTx<'_>,
         scope: &AccessScope,
@@ -234,6 +250,10 @@ impl ExceptionQueueRepo {
     /// Read one exception by id (out-of-txn, tenant-scoped) — the resolution
     /// endpoint's pre-read (validate the transition against the row's type/status).
     /// A foreign-owned id resolves to `None` (SQL-level BOLA, no existence leak).
+    ///
+    /// # Errors
+    /// Returns [`DomainError::Internal`] if acquiring a connection or querying
+    /// the exception fails.
     pub async fn read(
         &self,
         scope: &AccessScope,
@@ -261,6 +281,10 @@ impl ExceptionQueueRepo {
     /// Apply a resolution transition in its own transaction (the REST resolution
     /// endpoint's apply step). Thin wrapper over [`Self::resolve`] so the handler
     /// need not own a transaction.
+    ///
+    /// # Errors
+    /// Returns [`DomainError::Internal`] if the transaction or scoped update
+    /// fails.
     pub async fn resolve_one(
         &self,
         scope: &AccessScope,

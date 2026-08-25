@@ -10,6 +10,7 @@ use axum::response::Response;
 use http::StatusCode;
 use oagw_sdk::api::ErrorSource;
 use oagw_sdk::field;
+use toolkit_canonical_errors::ForeignPassthrough;
 use toolkit_security::SecurityContext;
 use tracing::Instrument;
 
@@ -276,12 +277,22 @@ pub async fn proxy_handler(
     // Stream the response body.
     let body = Body::from_stream(sdk_body.into_stream());
 
-    builder.body(body).map_err(|e| {
+    let mut response = builder.body(body).map_err(|e| {
         error_response(DomainError::DownstreamError {
             detail: format!("failed to build response: {e}"),
             instance: String::new(),
         })
-    })
+    })?;
+
+    // This is the Data Plane's own response (relayed from the real upstream,
+    // or synthesized by pingora itself) - never constructed via
+    // `CanonicalError`, regardless of `error_source`. `canonical_error_middleware`
+    // (layered on this gear's routes) must not rewrite or even read it: doing
+    // so would destroy the real error identity (including the
+    // `x-oagw-error-source` header just set above) and force full buffering
+    // of what is still a streamed body.
+    response.extensions_mut().insert(ForeignPassthrough);
+    Ok(response)
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ use crate::context::{
     Unimplemented, Unknown,
 };
 use crate::error::CanonicalError;
+use crate::transport::{TransportOverride, TransportOverrides};
 
 // ---------------------------------------------------------------------------
 // Resource markers
@@ -213,6 +214,7 @@ pub struct ResourceErrorBuilder<Resource, Context> {
     variant: ErrorVariant,
     resource: Resource,
     context: Context,
+    overrides: TransportOverrides,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +230,7 @@ impl ResourceErrorBuilder<ResourceMissing, NoContext> {
             variant: ErrorVariant::NotFound,
             resource: ResourceMissing,
             context: NoContext,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -239,6 +242,7 @@ impl ResourceErrorBuilder<ResourceMissing, NoContext> {
             variant: ErrorVariant::AlreadyExists,
             resource: ResourceMissing,
             context: NoContext,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -250,6 +254,7 @@ impl ResourceErrorBuilder<ResourceMissing, NoContext> {
             variant: ErrorVariant::DataLoss,
             resource: ResourceMissing,
             context: NoContext,
+            overrides: TransportOverrides::default(),
         }
     }
 }
@@ -263,6 +268,7 @@ impl ResourceErrorBuilder<ResourceOptional, NeedsReason> {
             variant: ErrorVariant::Aborted,
             resource: ResourceOptional,
             context: NeedsReason,
+            overrides: TransportOverrides::default(),
         }
     }
 }
@@ -276,6 +282,7 @@ impl ResourceErrorBuilder<ResourceOptional, NoContext> {
             variant: ErrorVariant::Unknown,
             resource: ResourceOptional,
             context: NoContext,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -287,6 +294,7 @@ impl ResourceErrorBuilder<ResourceOptional, NoContext> {
             variant: ErrorVariant::DeadlineExceeded,
             resource: ResourceOptional,
             context: NoContext,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -298,6 +306,7 @@ impl ResourceErrorBuilder<ResourceOptional, NoContext> {
             variant: ErrorVariant::Unimplemented,
             resource: ResourceOptional,
             context: NoContext,
+            overrides: TransportOverrides::default(),
         }
     }
 }
@@ -311,6 +320,7 @@ impl ResourceErrorBuilder<ResourceAbsent, NeedsReason> {
             variant: ErrorVariant::PermissionDenied,
             resource: ResourceAbsent,
             context: NeedsReason,
+            overrides: TransportOverrides::default(),
         }
     }
 }
@@ -324,6 +334,7 @@ impl ResourceErrorBuilder<ResourceAbsent, NoContext> {
             variant: ErrorVariant::Cancelled,
             resource: ResourceAbsent,
             context: NoContext,
+            overrides: TransportOverrides::default(),
         }
     }
 }
@@ -337,6 +348,7 @@ impl ResourceErrorBuilder<ResourceOptional, NeedsFieldViolation> {
             variant: ErrorVariant::InvalidArgument,
             resource: ResourceOptional,
             context: NeedsFieldViolation,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -348,6 +360,7 @@ impl ResourceErrorBuilder<ResourceOptional, NeedsFieldViolation> {
             variant: ErrorVariant::OutOfRange,
             resource: ResourceOptional,
             context: NeedsFieldViolation,
+            overrides: TransportOverrides::default(),
         }
     }
 }
@@ -361,6 +374,7 @@ impl ResourceErrorBuilder<ResourceOptional, NeedsQuotaViolation> {
             variant: ErrorVariant::ResourceExhausted,
             resource: ResourceOptional,
             context: NeedsQuotaViolation,
+            overrides: TransportOverrides::default(),
         }
     }
 }
@@ -374,6 +388,7 @@ impl ResourceErrorBuilder<ResourceOptional, NeedsPreconditionViolation> {
             variant: ErrorVariant::FailedPrecondition,
             resource: ResourceOptional,
             context: NeedsPreconditionViolation,
+            overrides: TransportOverrides::default(),
         }
     }
 }
@@ -394,6 +409,7 @@ impl<Context> ResourceErrorBuilder<ResourceMissing, Context> {
             variant: self.variant,
             resource: ResourceSet(resource.into()),
             context: self.context,
+            overrides: self.overrides,
         }
     }
 }
@@ -410,7 +426,26 @@ impl<Context> ResourceErrorBuilder<ResourceOptional, Context> {
             variant: self.variant,
             resource: ResourceSet(resource.into()),
             context: self.context,
+            overrides: self.overrides,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// with_override() — available at any point in the chain, any typestate
+// ---------------------------------------------------------------------------
+
+impl<Resource, Context> ResourceErrorBuilder<Resource, Context> {
+    /// Attach a transport-specific override (e.g. `Http::status_code(410)`)
+    /// to the error under construction. Does not change the error's
+    /// canonical category. Re-applying an override for the same transport
+    /// replaces the prior value; overrides for different transports are
+    /// independent.
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)] // owned value taken by design for fluent builder call sites (`.with_override(Http::status_code(410))`)
+    pub fn with_override(mut self, ov: TransportOverride) -> Self {
+        self.overrides.apply(&ov);
+        self
     }
 }
 
@@ -432,6 +467,7 @@ impl<Resource> ResourceErrorBuilder<Resource, NeedsFieldViolation> {
             variant: self.variant,
             resource: self.resource,
             context: HasFieldViolations(vec![FieldViolation::new(field, description, reason)]),
+            overrides: self.overrides,
         }
     }
 
@@ -447,6 +483,7 @@ impl<Resource> ResourceErrorBuilder<Resource, NeedsFieldViolation> {
             variant: self.variant,
             resource: self.resource,
             context: HasFormatMessage(msg),
+            overrides: self.overrides,
         }
     }
 
@@ -462,6 +499,7 @@ impl<Resource> ResourceErrorBuilder<Resource, NeedsFieldViolation> {
             variant: self.variant,
             resource: self.resource,
             context: HasConstraintMessage(msg),
+            overrides: self.overrides,
         }
     }
 }
@@ -503,6 +541,7 @@ impl<Resource> ResourceErrorBuilder<Resource, NeedsPreconditionViolation> {
                 subject,
                 description,
             )]),
+            overrides: self.overrides,
         }
     }
 }
@@ -539,6 +578,7 @@ impl<Resource> ResourceErrorBuilder<Resource, NeedsQuotaViolation> {
             variant: self.variant,
             resource: self.resource,
             context: HasQuotaViolations(vec![QuotaViolation::new(subject, description)]),
+            overrides: self.overrides,
         }
     }
 }
@@ -589,6 +629,7 @@ impl<Resource> ResourceErrorBuilder<Resource, NeedsReason> {
             variant: self.variant,
             resource: self.resource,
             context: HasReason(reason.into()),
+            overrides: self.overrides,
         }
     }
 }
@@ -606,6 +647,7 @@ impl CanonicalError {
             variant: ErrorVariant::Internal,
             resource: ResourceAbsent,
             context: NoContext,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -614,6 +656,7 @@ impl CanonicalError {
         ServiceUnavailableBuilder {
             retry_after_seconds: None,
             detail: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -625,6 +668,7 @@ impl CanonicalError {
             variant: ErrorVariant::Unauthenticated,
             resource: ResourceAbsent,
             context: NeedsReason,
+            overrides: TransportOverrides::default(),
         }
     }
 }
@@ -642,6 +686,7 @@ where
     pub fn create(self) -> CanonicalError {
         let resource_name = self.resource.resolve();
         let ctx_data = self.context.into_context_data();
+        let overrides = self.overrides;
 
         let err = match self.variant {
             ErrorVariant::NotFound => CanonicalError::__not_found(NotFound::new()),
@@ -699,11 +744,23 @@ where
             err = err.with_resource_type(rt);
         }
 
-        if let Some(rn) = resource_name {
+        let mut err = if let Some(rn) = resource_name {
             err.with_resource(rn)
         } else {
             err
+        };
+
+        *err.transport_overrides_mut() = overrides;
+
+        if let Some(status) = err.http_status_override() {
+            debug_assert!(
+                err.is_same_status_class(status),
+                "transport override status {status} is a different HTTP status class than category default {}",
+                err.default_http_status()
+            );
         }
+
+        err
     }
 }
 
@@ -714,6 +771,7 @@ where
 pub struct ServiceUnavailableBuilder {
     retry_after_seconds: Option<u64>,
     detail: Option<String>,
+    overrides: TransportOverrides,
 }
 
 impl ServiceUnavailableBuilder {
@@ -743,12 +801,34 @@ impl ServiceUnavailableBuilder {
         self
     }
 
+    /// Attach a transport-specific override (e.g. `Http::status_code(503)`).
+    /// Does not change the error's canonical category.
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)] // owned value taken by design for fluent builder call sites (`.with_override(Http::status_code(503))`)
+    pub fn with_override(mut self, ov: TransportOverride) -> Self {
+        self.overrides.apply(&ov);
+        self
+    }
+
     #[must_use]
     pub fn create(self) -> CanonicalError {
         let detail = self
             .detail
             .unwrap_or_else(|| "Service temporarily unavailable".to_owned());
-        CanonicalError::__service_unavailable(ServiceUnavailable::new(self.retry_after_seconds))
-            .with_detail(detail)
+        let mut err = CanonicalError::__service_unavailable(ServiceUnavailable::new(
+            self.retry_after_seconds,
+        ))
+        .with_detail(detail);
+        *err.transport_overrides_mut() = self.overrides;
+
+        if let Some(status) = err.http_status_override() {
+            debug_assert!(
+                err.is_same_status_class(status),
+                "transport override status {status} is a different HTTP status class than category default {}",
+                err.default_http_status()
+            );
+        }
+
+        err
     }
 }

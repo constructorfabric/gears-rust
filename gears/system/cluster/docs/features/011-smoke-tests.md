@@ -50,7 +50,6 @@ The contract must be provable without spinning up Postgres, Redis, or K8s, so ev
   - [x] `p2` - `cpt-cf-clst-feature-cache-primitive`
   - [x] `p2` - `cpt-cf-clst-feature-leader-election`
   - [x] `p2` - `cpt-cf-clst-feature-distributed-lock`
-  - [x] `p2` - `cpt-cf-clst-feature-service-discovery`
   - [x] `p2` - `cpt-cf-clst-feature-sdk-default-backends`
   - [x] `p2` - `cpt-cf-clst-feature-scoping-polyfill`
   - [x] `p2` - `cpt-cf-clst-feature-watch-auto-restart`
@@ -111,7 +110,7 @@ The smoke tests **MUST** verify per-primitive resolution succeeds against a boun
 
 - [x] `p1` - **ID**: `cpt-cf-clst-dod-smoke-tests-watch`
 
-The smoke tests **MUST** verify that all three watches surface event, lagged, reset, and closed signals, that per-key ordering is preserved, and that delivery is at most once.
+The smoke tests **MUST** verify that both watches surface event, lagged, reset, and closed signals, that per-key ordering is preserved, and that delivery is at most once.
 
 **Touches**:
 - Entities: smoke test suite
@@ -129,6 +128,6 @@ The smoke tests **MUST** verify CAS conflict surfacing, single-leader under mult
 
 - [x] The full smoke-test suite passes against the in-process stub backends with no external dependencies.
 - [x] Resolution succeeds for bound backends; capability mismatch fails startup with a specific error.
-- [x] All three watches surface event/lagged/reset/closed with preserved per-key ordering and at-most-once delivery.
+- [x] Both watches surface event/lagged/reset/closed with preserved per-key ordering and at-most-once delivery.
 - [x] CAS conflict, single-leader-under-contention, lock release-on-timeout, scoping, and the polyfill are each exercised.
 - [x] The stub backends are documented as contract fixtures, not production backends.

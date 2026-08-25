@@ -2,7 +2,7 @@
 //!
 //! Lives in `infra/` so the test code can import `sea_orm::DbErr`
 //! and `toolkit_db::DbError` directly — both forbidden inside `domain/`
-//! by Dylint rules. The tests pin the contract that
+//! by `cargo gears lint` rules. The tests pin the contract that
 //! `with_serializable_retry`'s post-retry classifier and
 //! `From<DbError> for DomainError` produce the right typed
 //! `DomainError` variants for each SQLSTATE / outage signal.

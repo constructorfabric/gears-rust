@@ -40,6 +40,7 @@ use sea_orm::{
     TryGetable,
 };
 
+use super::dialect::Dialect;
 use super::statements::OutboxStatements;
 use super::store::OutboxStore;
 #[cfg(test)]
@@ -310,7 +311,7 @@ pub(super) async fn dead_letter_replay(
     for &id in &dl_ids {
         claim_values.push(id.into());
     }
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         store.backend(),
         &claim_sql,
         claim_values,
@@ -340,8 +341,8 @@ pub(super) async fn dead_letter_resolve(
     let values: Vec<sea_orm::Value> = ids.iter().map(|&id| id.into()).collect();
     let stmt = Statement::from_sql_and_values(store.backend(), &sql, values);
     let result = match &runner {
-        SeaOrmRunner::Conn(c) => c.execute(stmt).await?,
-        SeaOrmRunner::Tx(t) => t.execute(stmt).await?,
+        SeaOrmRunner::Conn(c) => c.execute_raw(stmt).await?,
+        SeaOrmRunner::Tx(t) => t.execute_raw(stmt).await?,
     };
     Ok(result.rows_affected())
 }
@@ -369,8 +370,8 @@ pub(super) async fn dead_letter_reject(
     }
     let stmt = Statement::from_sql_and_values(store.backend(), &sql, values);
     let result = match &runner {
-        SeaOrmRunner::Conn(c) => c.execute(stmt).await?,
-        SeaOrmRunner::Tx(t) => t.execute(stmt).await?,
+        SeaOrmRunner::Conn(c) => c.execute_raw(stmt).await?,
+        SeaOrmRunner::Tx(t) => t.execute_raw(stmt).await?,
     };
     Ok(result.rows_affected())
 }
@@ -414,7 +415,7 @@ pub(super) async fn dead_letter_discard(
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
     let update_sql = build_batch_discard(&store, ids.len());
     let update_values: Vec<sea_orm::Value> = ids.iter().map(|&id| id.into()).collect();
-    txn.execute(Statement::from_sql_and_values(
+    txn.execute_raw(Statement::from_sql_and_values(
         store.backend(),
         &update_sql,
         update_values,
@@ -440,8 +441,8 @@ pub(super) async fn dead_letter_cleanup(
     let (sql, values) = build_delete_query(&store, scope);
     let stmt = Statement::from_sql_and_values(store.backend(), &sql, values);
     let result = match &runner {
-        SeaOrmRunner::Conn(c) => c.execute(stmt).await?,
-        SeaOrmRunner::Tx(t) => t.execute(stmt).await?,
+        SeaOrmRunner::Conn(c) => c.execute_raw(stmt).await?,
+        SeaOrmRunner::Tx(t) => t.execute_raw(stmt).await?,
     };
     Ok(result.rows_affected())
 }
@@ -598,7 +599,7 @@ fn build_replay_select(
 ) -> (String, Vec<sea_orm::Value>) {
     let mut qb = QueryBuilder::new(store.dead_letter_select_columns(), store.backend());
     apply_scope(&mut qb, store, scope);
-    let now_fn = db_now(store.backend());
+    let now_fn = db_now(store.dialect());
     qb.add_raw_condition(&format!(
         "(d.status = 'pending' OR (d.status = 'reprocessing' AND d.deadline < {now_fn}))"
     ));
@@ -626,21 +627,21 @@ fn build_replay_select(
 fn build_batch_claim(store: &OutboxStore<'_>, count: usize) -> String {
     let backend = store.backend();
     let is_mysql = backend == DbBackend::MySql;
-    let now_fn = db_now(backend);
+    let now_fn = db_now(store.dialect());
     let mut sql = format!(
         "UPDATE {} SET status = 'reprocessing', deadline = ",
         store.tables().dead_letters()
     );
-    match backend {
-        DbBackend::Postgres => {
+    match store.dialect() {
+        Dialect::Postgres => {
             #[allow(clippy::let_underscore_must_use)]
             let _ = write!(sql, "{now_fn} + $1 * INTERVAL '1 second'");
         }
-        DbBackend::MySql => {
+        Dialect::MySql => {
             #[allow(clippy::let_underscore_must_use)]
             let _ = write!(sql, "DATE_ADD({now_fn}, INTERVAL ? SECOND)");
         }
-        DbBackend::Sqlite => {
+        Dialect::Sqlite => {
             sql.push_str("datetime('now', '+' || $1 || ' seconds')");
         }
     }
@@ -664,7 +665,7 @@ fn build_batch_claim(store: &OutboxStore<'_>, count: usize) -> String {
 fn build_batch_resolve(store: &OutboxStore<'_>, count: usize) -> String {
     let backend = store.backend();
     let is_mysql = backend == DbBackend::MySql;
-    let now_fn = db_now(backend);
+    let now_fn = db_now(store.dialect());
     let mut sql = format!(
         "UPDATE {} SET status = 'resolved', completed_at = {now_fn}, deadline = NULL WHERE id IN (",
         store.tables().dead_letters()
@@ -688,7 +689,7 @@ fn build_batch_resolve(store: &OutboxStore<'_>, count: usize) -> String {
 fn build_batch_reject(store: &OutboxStore<'_>, count: usize) -> String {
     let backend = store.backend();
     let is_mysql = backend == DbBackend::MySql;
-    let now_fn = db_now(backend);
+    let now_fn = db_now(store.dialect());
     // First param is the reason string, then IDs
     let mut sql = format!(
         "UPDATE {} SET status = 'pending', attempts = attempts + 1, \
@@ -726,7 +727,7 @@ fn build_discard_select(
 fn build_batch_discard(store: &OutboxStore<'_>, count: usize) -> String {
     let backend = store.backend();
     let is_mysql = backend == DbBackend::MySql;
-    let now_fn = db_now(backend);
+    let now_fn = db_now(store.dialect());
     let mut sql = format!(
         "UPDATE {} SET status = 'discarded', completed_at = {now_fn} WHERE id IN (",
         store.tables().dead_letters()
@@ -746,11 +747,11 @@ fn build_batch_discard(store: &OutboxStore<'_>, count: usize) -> String {
     sql
 }
 
-fn db_now(backend: DbBackend) -> &'static str {
-    match backend {
-        DbBackend::Postgres => "now()",
-        DbBackend::MySql => "CURRENT_TIMESTAMP(6)",
-        DbBackend::Sqlite => "datetime('now')",
+fn db_now(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::Postgres => "now()",
+        Dialect::MySql => "CURRENT_TIMESTAMP(6)",
+        Dialect::Sqlite => "datetime('now')",
     }
 }
 

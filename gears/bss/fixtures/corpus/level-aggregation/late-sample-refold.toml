@@ -1,0 +1,61 @@
+family     = "level-aggregation"
+id         = "late-sample-refold"
+kind       = "evaluation"
+provenance = ["AC#60", "D-44", "T-D-17"]
+
+# The same window as `peak-granule-fold`, with one backfilled sample added in
+# hour 1. Only hour 1's fold moves: 20 becomes 25, so Q goes 90 -> 95. Hours 0
+# and 2 are untouched, which is what "a late sample re-folds only its granule"
+# means - and why the delta is a standard re-materialization rather than a
+# window-wide recompute.
+#
+# Under a hold the claim reads *per affected granule*: a backfilled sample in
+# granule N re-folds N through N+maxHold. Here every granule carries its own
+# sample, so the hold reaches nothing and exactly one fold moves.
+
+[snapshot]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "cloudlet.count"
+aggregation_function    = "peak"
+aggregation_granularity = "hour"
+max_hold_granules       = 1
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+
+  [[snapshot.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 3
+
+[runtime]
+window_start = "2026-01-01T00:00:00Z"
+window_end   = "2026-01-01T03:00:00Z"
+
+  [[runtime.samples]]
+  at    = "2026-01-01T00:00:00Z"
+  level = 10
+  [[runtime.samples]]
+  at    = "2026-01-01T00:20:00Z"
+  level = 30
+  [[runtime.samples]]
+  at    = "2026-01-01T00:40:00Z"
+  level = 20
+  [[runtime.samples]]
+  at    = "2026-01-01T01:10:00Z"
+  level = 5
+  [[runtime.samples]]
+  at    = "2026-01-01T01:30:00Z"
+  level = 15
+  [[runtime.samples]]
+  at    = "2026-01-01T01:45:00Z"
+  level = 25
+  [[runtime.samples]]
+  at    = "2026-01-01T02:00:00Z"
+  level = 40
+
+[[assert]]
+given  = { }
+expect = { folded_q = 95 }
+why    = "the backfilled 25 at 01:45 lifts hour 1's peak from the carried 20 to 25; hours 0 and 2 keep 30 and 40. Q = 30 + 25 + 40 = 95, a delta of exactly 5 against the base case"

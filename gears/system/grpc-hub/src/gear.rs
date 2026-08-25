@@ -521,10 +521,12 @@ impl GrpcHub {
                     .map(|i| i.service_name.to_owned())
                     .collect();
 
-                let info = cf_system_sdks::directory::RegisterInstanceInfo {
-                    gear: gear_data.gear_name.clone(),
-                    instance_id: instance_id.clone(),
-                    grpc_services: service_names
+                let info = cf_system_sdks::directory::RegisterInstanceInfo::new(
+                    gear_data.gear_name.clone(),
+                    instance_id.clone(),
+                )
+                .with_grpc_services(
+                    service_names
                         .iter()
                         .map(|n| {
                             (
@@ -533,10 +535,8 @@ impl GrpcHub {
                             )
                         })
                         .collect(),
-                    version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-                    rest_endpoint: None,
-                    openapi_spec: None,
-                };
+                )
+                .with_version(env!("CARGO_PKG_VERSION"));
 
                 directory.register_instance(info).await?;
                 tracing::info!(
@@ -1148,6 +1148,9 @@ mod tests {
                 &self,
                 _gear: &str,
             ) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
+                Ok(vec![])
+            }
+            async fn list_all_instances(&self) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
                 Ok(vec![])
             }
             async fn register_instance(&self, _info: RegisterInstanceInfo) -> anyhow::Result<()> {

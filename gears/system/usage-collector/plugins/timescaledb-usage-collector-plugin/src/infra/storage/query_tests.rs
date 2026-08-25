@@ -29,12 +29,15 @@ fn effective_page_size_allows_exactly_the_cap() {
 
 #[test]
 fn effective_page_size_floors_a_zero_top_to_one() {
-    // `$top=0` is a legal OData value the core gateway passes through
-    // unclamped. A resolved page size of 0 would drive `LIMIT 0+1 = 1`, fetch
-    // the look-ahead row, then `truncate(0)` — losing the page tail so
+    // A resolved page size of 0 would drive `LIMIT 0+1 = 1`, fetch the
+    // look-ahead row, then `truncate(0)` — losing the page tail so
     // `rows.last()` is `None` and the list path 500s with "non-empty page lost
-    // its tail". Floor to 1 (the smallest legal page) so both list paths stay
-    // sound regardless of a `$top=0` slipping past the gateway.
+    // its tail". The REST surface cannot deliver a 0 (the toolkit `OData`
+    // extractor rejects a zero page size — `$top=0` or `limit=0` — with
+    // `InvalidLimit`), but an in-process SDK caller builds its own
+    // `ODataQuery` and reaches neither that check nor the core gateway's
+    // `prepare_list_query`. Floor to 1 (the smallest legal page) so both
+    // list paths stay sound regardless.
     assert_eq!(effective_page_size(Some(0), DEFAULT), 1);
 }
 

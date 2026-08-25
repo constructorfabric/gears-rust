@@ -1,7 +1,7 @@
 //! Operator YAML schema for the cluster gear (DESIGN §3.4 / §3.11).
 //!
 //! [`ClusterConfig`] is the operator-facing contract: a map of named profiles,
-//! each binding the four coordination primitives to a backend `provider`. The
+//! each binding the three coordination primitives to a backend `provider`. The
 //! `cache` binding is the required anchor; the other three may be omitted to ride
 //! the SDK default backends over that profile's cache
 //! (`cpt-cf-clst-fr-routing-omit-default`), or bound to their own provider for
@@ -24,7 +24,7 @@ use serde::Deserialize;
 ///   profiles:
 ///     default:
 ///       cache: { provider: standalone }
-///       # leader_election / lock / service_discovery omitted → SDK defaults
+///       # leader_election / lock omitted → SDK defaults
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,15 +38,14 @@ pub struct ClusterConfig {
 
 /// The per-primitive backend bindings for one profile.
 ///
-/// `cache` is required (it is the omit-default anchor). Each of the other three
+/// `cache` is required (it is the omit-default anchor). Each of the other two
 /// primitives may be bound to its own provider or omitted; an omitted primitive
 /// is auto-filled with the SDK default backend over this profile's cache.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
     /// The cache backend — required. Serves as the anchor the SDK default
-    /// leader-election, lock, and service-discovery backends wrap when those
-    /// primitives are omitted.
+    /// leader-election and lock backends wrap when those primitives are omitted.
     pub cache: BackendBinding,
     /// An explicit leader-election backend. Omit to use the SDK default over the
     /// cache.
@@ -56,10 +55,6 @@ pub struct ProfileConfig {
     /// cache.
     #[serde(default)]
     pub lock: Option<BackendBinding>,
-    /// An explicit service-discovery backend. Omit to use the SDK default over the
-    /// cache.
-    #[serde(default)]
-    pub service_discovery: Option<BackendBinding>,
 }
 
 /// One primitive's binding to a backend `provider`, plus that provider's own

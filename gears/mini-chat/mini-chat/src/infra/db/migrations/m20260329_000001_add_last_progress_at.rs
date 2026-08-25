@@ -13,7 +13,7 @@ impl MigrationTrait for Migration {
         let sql = match backend {
             sea_orm::DatabaseBackend::Postgres => POSTGRES_UP,
             sea_orm::DatabaseBackend::Sqlite => SQLITE_UP,
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Migration("MySQL not supported for mini-chat".into()));
             }
         };

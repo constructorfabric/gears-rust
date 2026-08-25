@@ -1,8 +1,8 @@
 //! # Cluster SDK foundation
 //!
 //! `cluster_sdk` is the shared, serde-free, dyn-safe contract foundation every
-//! cluster coordination primitive (cache, leader election, distributed lock,
-//! service discovery) builds on. It provides the cross-cutting types and
+//! cluster coordination primitive (cache, leader election, distributed lock)
+//! builds on. It provides the cross-cutting types and
 //! helpers that let the public contract evolve independently of any backend:
 //!
 //! - [`ClusterError`] — the unified error model, plus [`ProviderErrorKind`]
@@ -22,11 +22,6 @@
     reason = "cache domain types intentionally share the `Cache*` prefix mandated by DESIGN §3.1"
 )]
 pub mod cache;
-#[allow(
-    clippy::module_name_repetitions,
-    reason = "service-discovery domain types intentionally share the `Service*`/`ServiceDiscovery*` prefix mandated by DESIGN §3.1"
-)]
-pub mod discovery;
 pub mod error;
 pub mod gts;
 #[allow(
@@ -51,13 +46,6 @@ pub use cache::{
     CacheWatch, CacheWatchEvent, CacheWatchSender, CacheWatchTrySendError, ClusterCacheBackend,
     ClusterCacheV1, PollingPrefixWatch, validate_cache_capabilities,
 };
-pub use discovery::{
-    DiscoveryFilter, InstanceState, MetaMatch, ServiceCommandReceiver, ServiceDiscoveryBackend,
-    ServiceDiscoveryCapability, ServiceDiscoveryFeatures, ServiceDiscoveryResolverBuilder,
-    ServiceDiscoveryV1, ServiceHandle, ServiceInstance, ServiceRegistration, ServiceRequest,
-    ServiceResponder, ServiceWatch, ServiceWatchEvent, ServiceWatchSender, StateFilter,
-    TopologyChange, validate_service_discovery_capabilities,
-};
 pub use error::{ClusterError, ProviderErrorKind};
 pub use gts::ClusterPluginSpecV1;
 pub use leader::{
@@ -74,13 +62,11 @@ pub use profile::{
     CLUSTER_NAME_RULE, ClusterProfile, is_valid_cluster_name, validate_cluster_name,
 };
 pub use provider::{
-    ClusterCacheProvider, ClusterLeaderElectionProvider, ClusterLockProvider,
-    ClusterServiceDiscoveryProvider, StopHook,
+    ClusterCacheProvider, ClusterLeaderElectionProvider, ClusterLockProvider, StopHook,
 };
 pub use registration::{
     deregister_cache_backend, deregister_leader_election_backend, deregister_lock_backend,
-    deregister_service_discovery_backend, register_cache_backend, register_leader_election_backend,
-    register_lock_backend, register_service_discovery_backend,
+    register_cache_backend, register_leader_election_backend, register_lock_backend,
 };
 pub use restart::{RestartableWatch, RestartingWatch, RetryPolicy};
 

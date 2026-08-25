@@ -1,0 +1,70 @@
+family     = "tier-boundary"
+id         = "graduated-included-allowance"
+kind       = "evaluation"
+provenance = ["inst-ac-band", "D-43", "D-45", "PRD §17.2"]
+
+# The one arithmetic in the allowance primitive that two gears can disagree
+# about silently, and until 2026-08-18 the corpus had no evaluation case for
+# `includedAllowance` at all - the field appeared in exactly one file, a publish
+# pair, so no authored expected amount existed anywhere.
+#
+# **An allowance compiles; it does not subtract from `Q`.** `inst-ac-band`:
+# prepend `[0, N) @ $0` and offset every authored bound by `+N`, so the authored
+# `[0, 1000)` becomes `[100, 1100)`. The rejected reading - deduct `N` from `Q`
+# and walk the authored ladder - agrees on every quantity below the first
+# authored bound and diverges above it, which is exactly the shape that ships.
+# At `q = 1200` the compile bills 1000 units at 5 and 100 at 3 = 5300; the
+# deduction reading bills 1100 at 5 = 5500. Both are defensible-sounding and
+# only one is the rule.
+#
+# The four quantities are the boundary set: below the allowance, exactly at it,
+# one over, and past the offset band edge where the two readings part.
+#
+# `rolloverPolicy = none` is the only policy that compiles into the row. A
+# `carry` allowance compiles into a plan-scoped grant row instead (D-129), which
+# no evaluator here has a notion of, so the oracle refuses it rather than
+# approximating - and a supersession that changes one is rejected, which is this
+# family's sibling `carry-allowance-change-rejected`.
+#
+# No `$0` first band is authored: the row would fail publish on
+# `ALLOWANCE_DOUBLE_FREE`, and `tests/corpus_snapshot_shape.rs` requires every
+# snapshot to describe a row the catalog would actually publish.
+
+[snapshot]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "api.calls"
+tier_aggregation_window = "invoice_period"
+billing_granularity     = "whole_unit"
+included_allowance      = { quantity = 100, rollover_policy = "none" }
+
+  [[snapshot.bands]]
+  from_qty = 0
+  to_qty   = 1000
+  unit_amount_minor = 5
+
+  [[snapshot.bands]]
+  from_qty = 1000
+  to_qty   = "open"
+  unit_amount_minor = 3
+
+[[assert]]
+given  = { q = 50 }
+expect = { charge_minor = 0 }
+why    = "inside the allowance: the compiled [0,100) band is $0 and nothing else is reached"
+
+[[assert]]
+given  = { q = 100 }
+expect = { charge_minor = 0 }
+why    = "exactly at the allowance; half-open [0,100) is consumed whole and the first paid band contributes nothing, the same boundary rule graduated-band-edge pins at 1000"
+
+[[assert]]
+given  = { q = 101 }
+expect = { charge_minor = 5 }
+why    = "the first billable unit, priced by the offset first authored band [100,1100) at 5"
+
+[[assert]]
+given  = { q = 1200 }
+expect = { charge_minor = 5300 }
+why    = "1000 units at 5 across the offset [100,1100) plus 100 at 3 above it — the deduct-from-Q reading would say 1100 at 5 = 5500, and this is the assertion that tells them apart"

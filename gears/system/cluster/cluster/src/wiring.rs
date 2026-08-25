@@ -6,15 +6,13 @@ use std::sync::Arc;
 
 use cluster_sdk::{
     ClusterCacheBackend, ClusterError, ClusterProfile, DistributedLockBackend,
-    LeaderElectionBackend, ServiceDiscoveryBackend, StopHook, deregister_cache_backend,
-    deregister_leader_election_backend, deregister_lock_backend,
-    deregister_service_discovery_backend, register_cache_backend, register_leader_election_backend,
-    register_lock_backend, register_service_discovery_backend,
+    LeaderElectionBackend, StopHook, deregister_cache_backend, deregister_leader_election_backend,
+    deregister_lock_backend, register_cache_backend, register_leader_election_backend,
+    register_lock_backend,
 };
 
 use crate::defaults::{
-    CacheBasedServiceDiscoveryBackend, CasBasedDistributedLockBackend,
-    CasBasedLeaderElectionBackend, ShutdownRevoke,
+    CasBasedDistributedLockBackend, CasBasedLeaderElectionBackend, ShutdownRevoke,
 };
 use toolkit::client_hub::ClientHub;
 
@@ -23,7 +21,7 @@ use crate::provider::ProviderRegistry;
 
 /// The per-primitive backend bindings for one profile.
 ///
-/// `cache` is required; each of the other three primitives may be bound to its
+/// `cache` is required; each of the other two primitives may be bound to its
 /// own backend (`cpt-cf-clst-fr-routing-per-primitive`) or left `None`, in which
 /// case [`ClusterWiringBuilder::build_and_start`] auto-fills it with the SDK
 /// default backend over `cache` (`cpt-cf-clst-fr-routing-omit-default`).
@@ -31,11 +29,10 @@ pub struct ProfileBackends {
     cache: Arc<dyn ClusterCacheBackend>,
     leader_election: Option<Arc<dyn LeaderElectionBackend>>,
     lock: Option<Arc<dyn DistributedLockBackend>>,
-    service_discovery: Option<Arc<dyn ServiceDiscoveryBackend>>,
 }
 
 impl ProfileBackends {
-    /// Binds a profile to `cache`, leaving the other three primitives to the SDK
+    /// Binds a profile to `cache`, leaving the other two primitives to the SDK
     /// defaults unless overridden with the `with_*` methods.
     #[must_use]
     pub fn new(cache: Arc<dyn ClusterCacheBackend>) -> Self {
@@ -43,7 +40,6 @@ impl ProfileBackends {
             cache,
             leader_election: None,
             lock: None,
-            service_discovery: None,
         }
     }
 
@@ -60,22 +56,14 @@ impl ProfileBackends {
         self.lock = Some(backend);
         self
     }
-
-    /// Binds a native service-discovery backend, overriding the SDK default.
-    #[must_use]
-    pub fn with_service_discovery(mut self, backend: Arc<dyn ServiceDiscoveryBackend>) -> Self {
-        self.service_discovery = Some(backend);
-        self
-    }
 }
 
-/// The four resolved backends for one profile, ready to register.
+/// The three resolved backends for one profile, ready to register.
 struct ResolvedProfile {
     name: String,
     cache: Arc<dyn ClusterCacheBackend>,
     leader_election: Arc<dyn LeaderElectionBackend>,
     lock: Arc<dyn DistributedLockBackend>,
-    service_discovery: Arc<dyn ServiceDiscoveryBackend>,
 }
 
 /// Entry point for wiring the cluster gear.
@@ -97,7 +85,7 @@ impl ClusterWiring {
 
     /// Builds the wiring from operator [`ClusterConfig`], instantiating each
     /// profile's cache backend through the matching provider in `providers` and
-    /// letting the omit-default auto-wrap supply the other three primitives.
+    /// letting the omit-default auto-wrap supply the other two primitives.
     ///
     /// Each provider's shutdown hook is owned by the returned [`ClusterHandle`]
     /// and awaited on [`stop`](ClusterHandle::stop).
@@ -118,7 +106,7 @@ impl ClusterWiring {
             let (cache, cache_stop) = build_cache_for_profile(name, profile, providers).await?;
             // Pushed immediately, so it matches the cache's actual start-order
             // position (first). `build_and_start` runs `stop_hooks` in reverse push
-            // order, so pushing here — before the leader/lock/sd hooks below — means
+            // order, so pushing here — before the leader/lock hooks below — means
             // the cache stops LAST, after every primitive layered on top of it for
             // this profile (true reverse-start order, DESIGN §3.7).
             builder = builder.on_stop(move || async move { cache_stop().await });
@@ -150,20 +138,6 @@ impl ClusterWiring {
                 })?;
                 let (backend, stop) = provider.build_lock(&binding.options).await?;
                 backends = backends.with_lock(backend);
-                builder = builder.on_stop(move || async move { stop().await });
-            }
-
-            if let Some(binding) = &profile.service_discovery {
-                let provider = providers
-                    .service_discovery_provider(&binding.provider)
-                    .ok_or_else(|| ClusterError::InvalidConfig {
-                        reason: format!(
-                            "profile `{name}`: unknown service_discovery provider `{}`",
-                            binding.provider
-                        ),
-                    })?;
-                let (backend, stop) = provider.build_service_discovery(&binding.options).await?;
-                backends = backends.with_service_discovery(backend);
                 builder = builder.on_stop(move || async move { stop().await });
             }
 
@@ -244,8 +218,8 @@ impl ClusterWiringBuilder {
     ///   name rule.
     pub fn build_and_start(self) -> Result<ClusterHandle, ClusterError> {
         // Phase 1 — resolve all backends (fallible) before touching the hub.
-        // Default leader-election, lock, and service-discovery backends the
-        // wiring itself creates expose a shutdown-revoke seam; collect them so
+        // Default leader-election and lock backends the wiring itself creates
+        // expose a shutdown-revoke seam; collect them so
         // `ClusterHandle::stop` can revoke in-flight coordination before shutdown
         // completes (DESIGN §3.13). Native (explicitly-bound) backends are not
         // revoked here — they manage shutdown through their own plugin stop hook.
@@ -300,24 +274,15 @@ fn resolve_profile_backends(
         revokers.push(Arc::clone(&default) as Arc<dyn ShutdownRevoke>);
         default as Arc<dyn DistributedLockBackend>
     };
-    let service_discovery: Arc<dyn ServiceDiscoveryBackend> =
-        if let Some(backend) = backends.service_discovery {
-            backend
-        } else {
-            let default = Arc::new(CacheBasedServiceDiscoveryBackend::new(Arc::clone(&cache)));
-            revokers.push(Arc::clone(&default) as Arc<dyn ShutdownRevoke>);
-            default as Arc<dyn ServiceDiscoveryBackend>
-        };
     Ok(ResolvedProfile {
         name,
         cache,
         leader_election,
         lock,
-        service_discovery,
     })
 }
 
-/// Registers `profile`'s four primitives in `hub`. On failure, deregisters
+/// Registers `profile`'s three primitives in `hub`. On failure, deregisters
 /// `profile` itself and every name in `registered` so the hub stays
 /// all-or-nothing, logs a warning naming the failed profile and rollback
 /// count, and returns the error. On success, logs registration and returns the
@@ -330,8 +295,7 @@ fn register_profile_or_rollback(
     let result = (|| {
         register_cache_backend(hub, &profile.name, profile.cache)?;
         register_leader_election_backend(hub, &profile.name, profile.leader_election)?;
-        register_lock_backend(hub, &profile.name, profile.lock)?;
-        register_service_discovery_backend(hub, &profile.name, profile.service_discovery)
+        register_lock_backend(hub, &profile.name, profile.lock)
     })();
     let Err(err) = result else {
         tracing::info!(profile = %profile.name, "cluster profile registered");
@@ -360,9 +324,8 @@ pub struct ClusterHandle {
     hub: Arc<ClientHub>,
     registered: Vec<String>,
     stop_hooks: Vec<StopHook>,
-    /// Shutdown-revoke seams for the wiring-created default leader-election,
-    /// lock, and service-discovery backends, revoked first on
-    /// [`stop`](ClusterHandle::stop).
+    /// Shutdown-revoke seams for the wiring-created default leader-election and
+    /// lock backends, revoked first on [`stop`](ClusterHandle::stop).
     revokers: Vec<Arc<dyn ShutdownRevoke>>,
     /// Set by [`stop`](ClusterHandle::stop) so the [`Drop`] guard can tell a
     /// graceful shutdown apart from a forgotten one (ADR-006 §Confirmation).
@@ -380,10 +343,9 @@ impl ClusterHandle {
     ///
     /// 1. **Revoke in-flight coordination first** (`cpt-cf-clst-fr-shutdown-revoke`):
     ///    every wiring-created default backend is revoked — an active leader
-    ///    observes `Status(Lost)` then `Closed(Shutdown)`, an in-flight blocking
-    ///    `lock()` waiter returns `Err(Shutdown)`, and an active service-discovery
-    ///    watch observes `Closed(Shutdown)` — before this returns, so no consumer
-    ///    can resume believing it still holds coordination state.
+    ///    observes `Status(Lost)` then `Closed(Shutdown)` and an in-flight
+    ///    blocking `lock()` waiter returns `Err(Shutdown)` — before this returns,
+    ///    so no consumer can resume believing it still holds coordination state.
     /// 2. Deregister every registered backend — so later resolves report
     ///    [`ClusterError::ProfileNotBound`].
     /// 3. Run the plugin shutdown hooks in reverse-start order (DESIGN §3.7: last
@@ -454,7 +416,7 @@ impl Drop for ClusterHandle {
     }
 }
 
-/// Deregisters all four primitives bound under `cluster:{name}`. Deregistration
+/// Deregisters all three primitives bound under `cluster:{name}`. Deregistration
 /// only fails on an invalid name, which cannot occur for a name that registered
 /// successfully, and deregistering an unbound primitive is a harmless no-op — so
 /// the presence reports are discarded.
@@ -462,7 +424,6 @@ fn deregister_profile(hub: &Arc<ClientHub>, name: &str) {
     deregister_cache_backend(hub, name).ok();
     deregister_leader_election_backend(hub, name).ok();
     deregister_lock_backend(hub, name).ok();
-    deregister_service_discovery_backend(hub, name).ok();
 }
 
 #[cfg(test)]

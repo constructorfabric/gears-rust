@@ -33,7 +33,7 @@ Four realistic approaches are available, ranging from "trait-first with code gen
 
 ## Decision Outcome
 
-Chosen option: **Option A — Contract trait as source of truth, with `#[toolkit_rest_contract]` macro generating clients for the common case and manual implementation explicitly supported as an escape hatch.**
+Chosen option: **Option A — Contract trait as source of truth, with `#[toolkit::rest_contract]` macro generating clients for the common case and manual implementation explicitly supported as an escape hatch.**
 
 The Rust trait is the authoritative definition of the domain contract. Consumers depend on the base trait (`Arc<dyn NotificationBackend>`). The macro reads the optional protocol projection trait (`NotificationBackendRest`) and generates a REST client that implements the base trait with HTTP dispatch. For cases the macro does not cover (complex path templates, query parameter composition, custom auth, bespoke retry), authors write the client by hand — the consumer interface is identical either way.
 
@@ -42,26 +42,26 @@ This option was chosen because it is the only one that satisfies all decision dr
 ### Consequences
 
 * All gear SDK crates define contracts as plain Rust traits with zero transport annotations
-* Protocol projections are separate traits annotated with `#[toolkit_rest_contract]` that extend the base via `: Base`
+* Protocol projections are separate traits annotated with `#[toolkit::rest_contract]` that extend the base via `: Base`
 * The `cf-toolkit-contract-macros` crate owns the proc macros and must be maintained for the platform's lifetime
 * The `cf-toolkit-contract-runtime` crate provides `ProblemDetails`, `ClientConfig`, SSE parser, retry helper — all dependencies of generated clients
 * OpenAPI specs are a **derived artifact** generated at runtime from the trait via `schemars`, not a hand-written source
 * Third-party implementors consume the generated OpenAPI spec at `/.well-known/openapi.json` to build clients in other languages
 * Manual client implementations must implement the same base trait; the consumer cannot tell the difference
 * The macro intentionally covers the common case only (POST + JSON, SSE via `#[streaming]`, retry via `#[retryable]`); complex REST semantics are handled by hand-written clients
-* Adding a gRPC projection is purely additive — new trait `*Grpc`, new macro `#[toolkit_grpc_contract]`, new generated client; the base trait and REST projection are untouched
+* Adding a gRPC projection is purely additive — new trait `*Grpc`, new macro `#[toolkit::grpc_contract]`, new generated client; the base trait and REST projection are untouched
 * Signature drift between base and projection is a compile error (`: Base` supertrait bound + redeclaration)
 * The evolution story relies on `#[non_exhaustive]` types and default trait methods — authors must discipline themselves to use both
 
 ### Confirmation
 
-The PoC at `striped-zebra-dev/toolkit-binding-poc` validates the approach end-to-end: `NotificationBackend` base trait + `NotificationBackendRest` projection with `#[toolkit_rest_contract]`, generated `NotificationBackendRestClient`, working OpenAPI spec, SSE streaming, round-trip error mapping. All 8 tests pass. `make demo` shows identical behavior via compile-time plugin and REST proxy.
+The PoC at `striped-zebra-dev/toolkit-binding-poc` validates the approach end-to-end: `NotificationBackend` base trait + `NotificationBackendRest` projection with `#[toolkit::rest_contract]`, generated `NotificationBackendRestClient`, working OpenAPI spec, SSE streaming, round-trip error mapping. All 8 tests pass. `make demo` shows identical behavior via compile-time plugin and REST proxy.
 
 ## Pros and Cons of the Options
 
 ### Option A: Contract Trait + Macro Generation + Manual Implementation Allowed
 
-The Rust trait is the source of truth. A proc macro (`#[toolkit_rest_contract]`) reads a protocol projection trait and generates a REST client. Authors can bypass the macro and write clients by hand when needed.
+The Rust trait is the source of truth. A proc macro (`#[toolkit::rest_contract]`) reads a protocol projection trait and generates a REST client. Authors can bypass the macro and write clients by hand when needed.
 
 **Advantages:**
 

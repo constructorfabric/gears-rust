@@ -24,13 +24,37 @@ pub enum Dialect {
 }
 
 impl From<DbBackend> for Dialect {
+    /// # Panics
+    ///
+    /// Panics if `backend` is not one of `Postgres`, `SQLite`, or `MySQL`.
+    /// `DbBackend` is `#[non_exhaustive]` as of `SeaORM` 2.0, so this arm exists
+    /// for forward compatibility only — it is unreachable with the variants
+    /// `SeaORM` defines today. This is the single point where a backend is
+    /// narrowed to a dialect, so every SQL builder downstream can match
+    /// `Dialect` exhaustively instead of guessing at an unknown backend and
+    /// emitting SQL that silently targets the wrong engine.
     fn from(backend: DbBackend) -> Self {
         match backend {
             DbBackend::Postgres => Self::Postgres,
             DbBackend::Sqlite => Self::Sqlite,
             DbBackend::MySql => Self::MySql,
+            other => unsupported_backend(other),
         }
     }
+}
+
+/// Diverging helper for the unreachable arm of [`Dialect::from`].
+///
+/// `coverage(off)` sits here rather than on `from` itself so the three real arms
+/// stay in the coverage numerator (they are exercised by `dialect_from_dbbackend`)
+/// while the unreachable panic body leaves the denominator. `DbBackend` has
+/// exactly three constructible variants, so no test can reach this.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn unsupported_backend(backend: DbBackend) -> ! {
+    panic!(
+        "toolkit-db outbox supports Postgres, SQLite and MySQL only; \
+         got unsupported database backend {backend:?}"
+    )
 }
 
 /// SQL for the vacuum's bounded-chunk cleanup operation.

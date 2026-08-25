@@ -231,6 +231,6 @@ All errors include `X-OAGW-Error-Source: gateway` header.
 
 ## Related ADRs
 
-- [ADR: Component Architecture](../docs/adr-component-architecture.md)
-- [ADR: Request Routing](../docs/adr-request-routing.md)
-- [ADR: Control Plane Caching](../docs/adr-data-plane-caching.md)
+- [ADR: Component Architecture](../../docs/ADR/0001-component-architecture.md)
+- [ADR: Request Routing](../../docs/ADR/0002-request-routing.md)
+- [ADR: Control Plane Caching](../../docs/ADR/0007-data-plane-caching.md)

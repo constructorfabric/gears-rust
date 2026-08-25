@@ -6,13 +6,13 @@
 //! so handler side-effects and cursor advance commit atomically.
 //!
 //! Run:
-//!   cargo run -p cf-gears-toolkit-db --example `outbox_transactional` --features sqlite,preview-outbox
+//!   cargo run -p cf-gears-toolkit-db --example `outbox_transactional` --features sqlite
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use sea_orm::ConnectionTrait;
+use sea_orm::DatabaseExecutor;
 use toolkit_db::outbox::{
     HandlerResult, Outbox, OutboxMessage, Partitions, TransactionalMessageHandler, WorkerTuning,
     outbox_migrations,
@@ -25,7 +25,7 @@ struct Processor {
 
 #[async_trait::async_trait]
 impl TransactionalMessageHandler for Processor {
-    async fn handle(&self, _txn: &dyn ConnectionTrait, msg: &OutboxMessage) -> HandlerResult {
+    async fn handle(&self, _txn: &DatabaseExecutor<'_>, msg: &OutboxMessage) -> HandlerResult {
         let payload = String::from_utf8_lossy(&msg.payload);
         println!("  processed seq={} payload={payload}", msg.seq);
         self.count.fetch_add(1, Ordering::Relaxed);

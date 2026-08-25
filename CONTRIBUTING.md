@@ -37,14 +37,25 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # Install required components
 rustup component add clippy rustfmt
 
-# Build the project
+# Build the whole-project example server release binary
 make build
 
-# Run tests
+# Run workspace tests
 make test
+
+# Run the local quality gate
+make check
 
 # Start the development server (SQLite quickstart)
 make quickstart
+
+# Run the default example server
+make run
+
+# Build, test, or run one gear scope
+make build GEAR=file-parser
+make test GEAR=file-parser
+make run GEAR=file-parser
 
 # Start the development server with the example users_info gear
 cargo run --bin cf-gears-example-server --features users-info-example -- --config config/quickstart.yaml run
@@ -89,6 +100,27 @@ Follow the coding standards and guidelines:
 
 Gear directories under `gears/` must use kebab-case (validated by `tools/scripts/validate_gear_names.py` and enforced in CI).
 
+#### Building, running, and testing one gear
+
+The Makefile supports an optional `GEAR=<name>` scope for common top-level commands. Without `GEAR`, commands run at the whole-project or workspace level.
+
+```bash
+make build                    # whole-project example server release binary
+make test                     # workspace tests
+make run                      # default example server
+make all                      # build + check + SQLite integration + local E2E + OpenAPI
+
+make build GEAR=file-parser   # cf-gears-file-parser plus its SDK crate
+make test GEAR=file-parser    # tests for cf-gears-file-parser plus its SDK crate
+make run GEAR=file-parser     # example server with only this gear feature set
+make e2e-local SUITE=file-parser
+make coverage GEAR=file-parser
+```
+
+By default, `GEAR=<name>` maps to package names `cf-gears-<name>` and `cf-gears-<name>-sdk`, and `make run GEAR=<name>` enables the gear feature together with the static local development system gears. Override `GEAR_PKG`, `GEAR_SDK_PKG`, `GEAR_FEATURES`, `GEAR_BUILD_ARGS`, `GEAR_TEST_ARGS`, or `GEAR_RUN_ARGS` for non-standard package names, extra features, or runtime arguments.
+
+Runtime configuration is YAML-driven: each gear reads its settings under `gears:<gear_name>:` with a `config` section and, when needed, a gear-owned `database` section. Cargo feature selection decides which gear code is compiled into the example server; YAML decides the runtime settings for the compiled-in gears.
+
 #### Gear dependencies and `cargo-shear`
 
 When a gear declares dependencies via `#[gear(deps = [...])]`, the dep entries are
@@ -103,8 +135,22 @@ dependency crates as unused.
 
 **When adding a new gear dependency**, add the crate name to the
 `[workspace.metadata.cargo-shear] ignored` list in the workspace `Cargo.toml`.
-Forgetting this will cause the `shear` CI job to fail with an error unrelated to
-your actual change.
+
+`cargo-shear` does not run on pull requests — the scan takes about an hour, so it
+runs once nightly (`.github/workflows/shear-nightly.yml`). Forgetting the `ignored`
+entry therefore breaks `main` after your PR merges rather than failing your PR. The
+nightly opens a tracking issue quoting the offending package and dependency, and
+closes it once a later run passes.
+
+Before merging a change that adds or removes dependencies, check it against
+cargo-shear. The cheapest route needs no local setup and uses the same pinned
+toolchain and cargo-shear version as CI: Actions → Unused Deps (nightly) → Run
+workflow → select your branch.
+
+To check offline instead, run `make shear`. It needs `cargo-shear` on your `PATH`
+(`make setup` installs it, pinned to the version CI uses) plus the nightly toolchain
+named by `RUST_NIGHTLY` in the Makefile, which rustup downloads on first use. Budget
+about an hour for the scan.
 
 Always include unit tests when introducing new code.
 
@@ -120,6 +166,11 @@ python tools/scripts/ci.py check # Windows
 # Run the full pipeline (includes build + e2e-local)
 make all # Linux/Mac
 python tools/scripts/ci.py all # Windows
+
+# Scope common Makefile targets to one gear when iterating locally
+make check GEAR=file-parser
+make test GEAR=file-parser
+make e2e-local SUITE=file-parser
 ```
 
 Note: CI workflows may not run for PRs that only touch `*.md` files or `docs/**` due to path filters.
@@ -136,7 +187,64 @@ make coverage-unit # Run only unit tests with code coverage
 make coverage-e2e-local # Run only e2e tests with code coverage
 ```
 
-### 2.5. Run Fuzzing Tests (Recommended)
+### 2.5. Architecture Lints
+
+Architecture lints enforce design boundaries at compile time (DTO placement, domain-layer isolation, contract-layer purity, versioned REST paths, etc.). The lint rules themselves live in the [`cargo-gears` CLI](https://github.com/constructorfabric/cargo-gears); this repository only configures which rules to run and their parameters.
+
+#### Running lints locally
+
+```bash
+# Run architecture lints (requires cargo-gears installed via `make setup`)
+make dylint
+
+# Equivalent direct invocation
+cargo gears lint --dylint
+```
+
+Architecture lints also run as part of `make safety` and in the CI pipeline.
+
+#### Configuration files
+
+| File | Purpose |
+|------|---------|
+| [`Gears.toml`](./Gears.toml) | Top-level manifest: enables/disables the dylint pass, lists rules to **skip** (pre-existing violations not yet fixed) |
+| [`dylint.toml`](./dylint.toml) | Rule-specific parameters: allow-lists, thresholds, path exclusions |
+
+#### Adopting a new lint rule in this repository
+
+When a new architecture lint is added to `cargo-gears`, the following steps bring it into `gears-rust`:
+
+1. **Update `cargo-gears`** — install the version that includes the new rule (`cargo install cargo-gears` or pin a specific version).
+2. **Run `make dylint`** — see if the new rule produces violations in the current codebase.
+3. **Fix or exclude** — either fix all violations, or (for large-scale migrations) add the rule to the `skip` list in `Gears.toml` and/or add path exclusions in `dylint.toml` while tracking the clean-up.
+4. **Commit configuration changes** — include `Gears.toml` / `dylint.toml` updates in your PR alongside any code fixes.
+
+> For instructions on **authoring** a new lint rule, see the [Adding a New Lint Rule](https://github.com/constructorfabric/cargo-gears/blob/main/crates/cargo-gears-lints/README.md#adding-a-new-lint-rule) guide in the `cargo-gears` repository.
+
+#### Example: skipping a rule with pre-existing violations
+
+In `Gears.toml`, add the rule ID to the `skip` list:
+
+```toml
+[apps.gears-rust.dev.lint.dylint]
+enabled = true
+skip = [
+    "de0504_client_versioning",   # not yet addressed
+    "de1101_tests_in_separate_files",  # migration in progress
+]
+```
+
+In `dylint.toml`, use `excluded_paths` for per-rule path-level granularity:
+
+```toml
+[cargo-gears-lints]
+excluded_paths = [
+    "libs/toolkit",
+    "gears/approval-service",
+]
+```
+
+### 2.6. Run Fuzzing Tests (Recommended)
 
 Before submitting changes to parsers or validation logic, run fuzzing:
 
@@ -169,7 +277,7 @@ export RUST_BACKTRACE=full
 ```
 
 
-### 2.6. Sign Your Commits (DCO)
+### 2.7. Sign Your Commits (DCO)
 
 This project uses the Developer Certificate of Origin (DCO) version 1.1.
 - The DCO text is included in `guidelines/DNA/DCO.txt` (Version 1.1). This is the current and widely adopted version; please keep it as 1.1.
@@ -189,7 +297,7 @@ git config --global format.signoff true
 ```
 
 
-### 2.7. Commit Changes
+### 2.8. Commit Changes
 
 Follow a structured commit message format:
 
@@ -247,7 +355,7 @@ New functionality development:
 - Prefer soft-deletion for entities; provide hard-deletion with retention routines
 - Include unit tests (and integration tests when relevant)
 
-### 2.8. Push and Create PR
+### 2.9. Push and Create PR
 
 ```bash
 git push origin feature/your-feature-name
@@ -293,7 +401,7 @@ Brief description of the changes made.
 Closes #issue_number
 ```
 
-### 2.9. Review Process
+### 2.10. Review Process
 
 1. **Automated checks** must pass (CI/CD pipeline)
 2. **At least one approval** from maintainer required
@@ -306,7 +414,7 @@ Merge Strategy:
 - **Rebase and merge** for simple fixes
 - **Merge commit** for release branches
 
-### 2.10. Local PR Review with Constructor Studio
+### 2.11. Local PR Review with Constructor Studio
 
 After pushing your PR and waiting for the cloud AI bots (CodeRabbit, Qodo, etc.) to complete their reviews, run a local Constructor Studio review to catch additional issues
 before requesting human review:

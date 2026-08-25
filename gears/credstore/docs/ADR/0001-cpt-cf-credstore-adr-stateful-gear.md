@@ -68,7 +68,7 @@ Chosen option: "Stateful gear, value-only backend". The gear owns the `credstore
 
 * `credstore_secrets` schema with partial unique indexes ships in `m0001_initial_schema`; repo tests exercise uniqueness, coexistence, and scope clamps against SQLite
 * Resolution is a single `resolve_for_get` query; the walk-up depth metric confirms no per-level backend calls
-* E2E suite (`testing/e2e/gears/credstore/`) verifies hierarchical inheritance, shadowing, isolation, and optimistic concurrency through the REST API
+* E2E suite (`testing/e2e/suites/credstore/`) verifies hierarchical inheritance, shadowing, isolation, and optimistic concurrency through the REST API
 
 ## Pros and Cons of the Options
 

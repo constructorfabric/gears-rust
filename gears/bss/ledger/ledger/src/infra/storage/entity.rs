@@ -1,4 +1,7 @@
-//! `SeaORM` entities for the bss-ledger gear (schema `bss`).
+//! SeaORM entities for the ledger-owned `bss` schema.
+//!
+//! Covers immutable journal truth, derived balance caches, workflow state,
+//! audit records, policies, periods, payments, recognition, and reconciliation.
 
 pub mod account_balance;
 pub mod ar_invoice_balance;

@@ -170,8 +170,6 @@ impl ClusterMetrics for AppMetrics {
             .or_default() += 1;
     }
 
-    fn discovery_op(&self, _op: &str, _result: &str) {}
-
     fn watch_reset(&self, primitive: &str) {
         *self
             .watch_resets
@@ -271,7 +269,7 @@ async fn main() -> Result<(), ClusterError> {
 
     // 2. Build the default lock + leader backends over the instrumented cache,
     //    each given the same provider label and sink via with_observability. (The
-    //    discovery default is wired the same way; omitted here to keep it short.)
+    //    lock default is wired the same way; omitted here to keep it short.)
     let leader = CasBasedLeaderElectionBackend::new(Arc::clone(&cache_backend))?
         .with_observability(PROVIDER, metrics.clone());
     let lock = CasBasedDistributedLockBackend::new(Arc::clone(&cache_backend))?

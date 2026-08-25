@@ -451,7 +451,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -595,7 +595,7 @@ async fn record_opened_cash_hold_returns_201() {
 
     // The dispute row was seeded with the chosen variant.
     let variant = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT variant FROM bss.ledger_dispute \
              WHERE tenant_id='{}' AND dispute_id='DSP-REST-1'",
             s.tenant
@@ -648,7 +648,7 @@ async fn record_into_foreign_tenant_is_denied_403() {
 
     // No dispute row was created for the foreign tenant.
     let count = raw
-        .query_one(pg(
+        .query_one_raw(pg(
             "SELECT COUNT(*) FROM bss.ledger_dispute WHERE dispute_id='DSP-FOREIGN'".to_owned(),
         ))
         .await
@@ -710,7 +710,7 @@ async fn out_of_order_won_returns_202_queued() {
 
     // Still queued, never posted: no dispute current-state row exists yet.
     let count = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT COUNT(*) FROM bss.ledger_dispute \
              WHERE tenant_id='{}' AND dispute_id='DSP-Q-REST'",
             s.tenant

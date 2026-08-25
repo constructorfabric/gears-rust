@@ -28,6 +28,9 @@ pub enum DomainError {
     #[error("Group not found: {id}")]
     GroupNotFound { id: uuid::Uuid },
 
+    #[error("Group already exists: {id}")]
+    GroupAlreadyExists { id: uuid::Uuid },
+
     #[error("Membership not found: {key}")]
     MembershipNotFound { key: String },
 
@@ -140,6 +143,11 @@ impl DomainError {
     #[must_use]
     pub fn group_not_found(id: uuid::Uuid) -> Self {
         Self::GroupNotFound { id }
+    }
+
+    #[must_use]
+    pub fn group_already_exists(id: uuid::Uuid) -> Self {
+        Self::GroupAlreadyExists { id }
     }
 
     pub fn membership_not_found(key: impl Into<String>) -> Self {

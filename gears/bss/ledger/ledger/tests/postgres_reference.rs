@@ -1,5 +1,5 @@
 //! Postgres-only integration tests for the idempotency + reference tables.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 //!
 //! Covers: (a) `idempotency_dedup` PK rejects a duplicate
 //! `(tenant, flow, business_id)`; (b) `currency_scale_registry` round-trips;
@@ -52,9 +52,9 @@ async fn idempotency_dedup_rejects_duplicate_key() {
         ))
     };
 
-    db.execute(insert("h1")).await.expect("first insert ok");
+    db.execute_raw(insert("h1")).await.expect("first insert ok");
     let err = db
-        .execute(insert("h2"))
+        .execute_raw(insert("h2"))
         .await
         .expect_err("duplicate (tenant, flow, business_id) must be rejected");
     assert!(
@@ -70,7 +70,7 @@ async fn currency_scale_registry_round_trips() {
     let (_c, db) = boot().await;
     let tenant_id = Uuid::new_v4();
 
-    db.execute(exec(format!(
+    db.execute_raw(exec(format!(
         "INSERT INTO bss.ledger_currency_scale_registry (tenant_id, currency, minor_units, source)
          VALUES ('{tenant_id}', 'USD', 2, 'ISO4217')"
     )))
@@ -78,7 +78,7 @@ async fn currency_scale_registry_round_trips() {
     .unwrap();
 
     let row = db
-        .query_one(exec(format!(
+        .query_one_raw(exec(format!(
             "SELECT minor_units FROM bss.ledger_currency_scale_registry
              WHERE tenant_id = '{tenant_id}' AND currency = 'USD'"
         )))
@@ -105,9 +105,9 @@ async fn tenant_account_coa_unique_rejects_duplicate() {
         ))
     };
 
-    db.execute(insert()).await.expect("first CoA row ok");
+    db.execute_raw(insert()).await.expect("first CoA row ok");
     let err = db
-        .execute(insert())
+        .execute_raw(insert())
         .await
         .expect_err("duplicate CoA grain must be rejected by the expression-unique index");
     assert!(

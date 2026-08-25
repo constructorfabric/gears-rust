@@ -19,7 +19,7 @@ use utoipa::openapi::{
     },
     request_body::RequestBodyBuilder,
     response::{ResponseBuilder, ResponsesBuilder},
-    schema::{ComponentsBuilder, ObjectBuilder, Schema, SchemaFormat, SchemaType},
+    schema::{ArrayBuilder, ComponentsBuilder, ObjectBuilder, Schema, SchemaFormat, SchemaType},
     security::{HttpAuthScheme, HttpBuilder, SecurityScheme},
     server::Server,
 };
@@ -65,6 +65,14 @@ pub trait OpenApiRegistry: Send + Sync {
 }
 
 /// Helper function to call `ensure_schema` with proper type information
+///
+/// # Panics
+/// Panics if `T` is a `Vec<_>`. utoipa names every `Vec<_>` `Vec`, so
+/// registering one as a component would collide with every other list
+/// response; use
+/// [`OperationBuilder::json_array_response_with_schema`](crate::api::operation_builder::OperationBuilder::json_array_response_with_schema)
+/// instead. Also panics if `T`'s name is already registered with a different
+/// definition (see `ensure_schema_raw`).
 pub fn ensure_schema<T: utoipa::ToSchema + utoipa::PartialSchema + 'static>(
     registry: &dyn OpenApiRegistry,
 ) -> String {
@@ -72,6 +80,19 @@ pub fn ensure_schema<T: utoipa::ToSchema + utoipa::PartialSchema + 'static>(
 
     // 1) Canonical component name for T as seen by utoipa
     let root_name = T::name().to_string();
+
+    // utoipa's default `ToSchema::name()` drops generic arguments, so every
+    // `Vec<_>` collapses to the single name `Vec` and distinct list responses
+    // clobber each other (or, since M-14, panic on collision). `Vec` is a std
+    // type, so `#[schema(as = "...")]` cannot rescue it — the caller has to use
+    // the array-aware builder instead. Guard only this one name: a legitimate
+    // user DTO could plausibly be called `Option`, `Page`, or `Map`.
+    assert!(
+        root_name != "Vec",
+        "ensure_schema::<Vec<_>>() would register the component name `Vec`, which every other \
+         Vec<T> also resolves to. Use `OperationBuilder::json_array_response_with_schema::<Item>()` \
+         to emit an inline array with only the item type named."
+    );
 
     // 2) Always insert T's own schema first (actual object, not a ref)
     //    This avoids self-referential components.
@@ -156,6 +177,17 @@ impl OpenApiRegistryImpl {
                 ext.insert("x-odata-orderby".to_owned(), value);
             }
 
+            // Visibility axis (`OperationSpec.exposed`): mark routes that are
+            // registered in the gateway for external access. The `GatewayProvider`
+            // reads this vendor extension to select which routes to reverse-proxy.
+            // The key is mirrored as a constant in `cf-gears-toolkit-gateway`.
+            if spec.exposed {
+                ext.insert(
+                    "x-toolkit-visibility".to_owned(),
+                    serde_json::Value::String("exposed".to_owned()),
+                );
+            }
+
             if !ext.is_empty() {
                 op = op.extensions(Some(ext));
             }
@@ -181,17 +213,34 @@ impl OpenApiRegistryImpl {
                     "boolean" => SchemaType::Type(utoipa::openapi::schema::Type::Boolean),
                     _ => SchemaType::Type(utoipa::openapi::schema::Type::String),
                 };
-                let schema = Schema::Object(ObjectBuilder::new().schema_type(schema_type).build());
+                let item_object = ObjectBuilder::new().schema_type(schema_type).build();
 
-                let param = ParameterBuilder::new()
+                let mut builder = ParameterBuilder::new()
                     .name(&p.name)
                     .parameter_in(in_)
                     .required(required)
-                    .description(p.description.clone())
-                    .schema(Some(schema))
-                    .build();
+                    .description(p.description.clone());
 
-                op = op.parameter(param);
+                if p.array {
+                    // `style: form, explode: true` is the repeated-key encoding
+                    // (`?tag=a&tag=b`). Spelling it out matters: the OpenAPI
+                    // default for a query array is `form` with `explode: true`,
+                    // but generators differ on whether they assume it, and the
+                    // wire format has to be unambiguous for a client written
+                    // against this spec to interoperate.
+                    builder = builder
+                        .style(Some(utoipa::openapi::path::ParameterStyle::Form))
+                        .explode(Some(true))
+                        .schema(Some(Schema::Array(
+                            utoipa::openapi::schema::ArrayBuilder::new()
+                                .items(item_object)
+                                .build(),
+                        )));
+                } else {
+                    builder = builder.schema(Some(Schema::Object(item_object)));
+                }
+
+                op = op.parameter(builder.build());
             }
 
             // Request body
@@ -221,26 +270,14 @@ impl OpenApiRegistryImpl {
                     || r.content_type == problem::APPLICATION_PROBLEM_JSON
                     || r.content_type == "text/event-stream";
                 let resp = if is_json_like {
-                    if let Some(name) = &r.schema_name {
-                        // Manually build content to preserve the correct content type
-                        let content = ContentBuilder::new()
-                            .schema(Some(RefOr::Ref(Ref::new(format!(
-                                "#/components/schemas/{name}"
-                            )))))
-                            .build();
-                        ResponseBuilder::new()
-                            .description(&r.description)
-                            .content(r.content_type, content)
-                            .build()
-                    } else {
-                        let content = ContentBuilder::new()
-                            .schema(Some(Schema::Object(ObjectBuilder::new().build())))
-                            .build();
-                        ResponseBuilder::new()
-                            .description(&r.description)
-                            .content(r.content_type, content)
-                            .build()
-                    }
+                    // Manually build content to preserve the correct content type
+                    let content = ContentBuilder::new()
+                        .schema(Some(build_response_schema(r.schema.as_ref())))
+                        .build();
+                    ResponseBuilder::new()
+                        .description(&r.description)
+                        .content(r.content_type, content)
+                        .build()
                 } else {
                     let schema = Schema::Object(
                         ObjectBuilder::new()
@@ -315,12 +352,24 @@ impl OpenApiRegistryImpl {
                 .collect::<Vec<_>>()
         });
 
-        let openapi = OpenApiBuilder::new()
+        let mut openapi = OpenApiBuilder::new()
             .info(openapi_info)
             .servers(servers)
             .paths(paths.build())
             .components(Some(components.build()))
             .build();
+
+        // Document-level vendor extension: this spec is generated from Rust
+        // contract traits + `schemars`/`utoipa` schemas, which cover a deliberate
+        // subset of REST (ADR-0002). It is the MINIMUM conformance contract —
+        // remote services may expose strictly more, never less. Downstream
+        // directory validators key their superset semantics off this marker.
+        let mut ext = utoipa::openapi::extensions::Extensions::default();
+        ext.insert(
+            "x-toolkit-spec-scope".to_owned(),
+            serde_json::json!("minimum-conformance"),
+        );
+        openapi.extensions = Some(ext);
 
         warn_dangling_refs_in_openapi(&openapi);
 
@@ -337,8 +386,24 @@ impl Default for OpenApiRegistryImpl {
 impl OpenApiRegistry for OpenApiRegistryImpl {
     fn register_operation(&self, spec: &operation_builder::OperationSpec) {
         let operation_key = format!("{}:{}", spec.method.as_str(), spec.path);
-        self.operation_specs
-            .insert(operation_key.clone(), spec.clone());
+        // Surface duplicate (method, path) registrations — e.g. a generated
+        // `register_<trait>_routes()` colliding with a hand-written route, or two
+        // SDKs registering the same path (M-13). Silently overwriting the earlier
+        // operation's OpenAPI spec is a hard-to-diagnose drift; the axum router
+        // itself will also panic on the duplicate route at bind time.
+        if let Some(prev) = self
+            .operation_specs
+            .insert(operation_key.clone(), spec.clone())
+            && prev.handler_id != spec.handler_id
+        {
+            tracing::warn!(
+                operation_key = %operation_key,
+                previous_handler = %prev.handler_id,
+                new_handler = %spec.handler_id,
+                "duplicate OpenAPI operation registration; the earlier operation spec was \
+                 overwritten - generated and manual routes must not share a (method, path)"
+            );
+        }
 
         tracing::debug!(
             handler_id = %spec.handler_id,
@@ -356,14 +421,28 @@ impl OpenApiRegistry for OpenApiRegistryImpl {
         let mut reg = (**current).clone();
 
         for (name, schema) in schemas {
-            // Conflict policy: identical → no-op; different → warn & override
+            // Conflict policy: identical → no-op; different → HARD ERROR. Two
+            // distinct types resolving to the same schema name (utoipa uses the
+            // bare type ident by default) would otherwise silently clobber each
+            // other in `components.schemas`, producing a spec where one type
+            // masquerades under another's name — a hard-to-diagnose wire
+            // mismatch. Fail fast at registration instead.
             if let Some(existing) = reg.get(&name) {
                 let a = serde_json::to_value(existing).ok();
                 let b = serde_json::to_value(&schema).ok();
                 if a == b {
                     continue; // Skip identical schemas
                 }
-                tracing::warn!(%name, "Schema content conflict; overriding with latest");
+                panic!(
+                    "OpenAPI schema name collision: `{name}` is registered with two different \
+                     definitions. Two distinct types share the same schema name — rename one, or \
+                     give it a distinct `#[schema(as = \"...\")]` alias. For a `Vec<T>` response \
+                     use `OperationBuilder::json_array_response_with_schema::<T>()`, which emits \
+                     an inline array instead of registering a component named `Vec`. \
+                     existing={}, new={}",
+                    a.map(|v| truncate_json(&v)).unwrap_or_default(),
+                    b.map(|v| truncate_json(&v)).unwrap_or_default(),
+                );
             }
             reg.insert(name, schema);
         }
@@ -374,6 +453,20 @@ impl OpenApiRegistry for OpenApiRegistryImpl {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+/// Render a JSON value to a compact, length-bounded string for diagnostics.
+/// Bounded by character count (char-boundary safe) rather than bytes.
+fn truncate_json(v: &serde_json::Value) -> String {
+    const MAX: usize = 200;
+    let s = v.to_string();
+    if s.chars().count() > MAX {
+        let mut out: String = s.chars().take(MAX).collect();
+        out.push('\u{2026}');
+        out
+    } else {
+        s
     }
 }
 
@@ -421,6 +514,30 @@ fn build_request_body_content(
                 .schema(Some(Schema::Object(ObjectBuilder::new().build())))
                 .build()
         }
+    }
+}
+
+/// Build the response body schema for a [`operation_builder::ResponseSchema`].
+///
+/// `None` — a JSON response with no declared schema — yields a free-form
+/// object, preserving the previous behaviour.
+fn build_response_schema(schema: Option<&operation_builder::ResponseSchema>) -> RefOr<Schema> {
+    match schema {
+        Some(operation_builder::ResponseSchema::Ref { schema_name }) => {
+            RefOr::Ref(Ref::from_schema_name(schema_name.clone()))
+        }
+        // Top-level arrays are emitted INLINE, with only the item type
+        // registered as a named component. Naming the array itself would use
+        // utoipa's `Vec` (generics are stripped from `ToSchema::name()`), so
+        // every list endpoint in the process would fight over one component.
+        Some(operation_builder::ResponseSchema::Array { items_schema_name }) => {
+            RefOr::T(Schema::Array(
+                ArrayBuilder::new()
+                    .items(RefOr::Ref(Ref::from_schema_name(items_schema_name.clone())))
+                    .build(),
+            ))
+        }
+        None => RefOr::T(Schema::Object(ObjectBuilder::new().build())),
     }
 }
 
@@ -494,9 +611,55 @@ fn collect_refs_from_json(value: &serde_json::Value, refs: &mut HashSet<String>)
 mod tests {
     use super::*;
     use crate::api::operation_builder::{
-        OperationSpec, ParamLocation, ParamSpec, ResponseSpec, VendorExtensions,
+        OperationSpec, ParamLocation, ParamSpec, ResponseSchema, ResponseSpec, VendorExtensions,
     };
     use http::Method;
+
+    /// Minimal `OperationSpec` carrying a single 200 response with `schema`.
+    fn spec_with_response(
+        path: &str,
+        handler: &str,
+        schema: Option<ResponseSchema>,
+    ) -> OperationSpec {
+        OperationSpec {
+            method: Method::GET,
+            path: path.to_owned(),
+            operation_id: Some(handler.to_owned()),
+            summary: None,
+            description: None,
+            tags: vec![],
+            params: vec![],
+            request_body: None,
+            responses: vec![ResponseSpec {
+                status: 200,
+                content_type: "application/json",
+                description: "OK".to_owned(),
+                schema,
+            }],
+            handler_id: handler.to_owned(),
+            authenticated: false,
+            exposed: false,
+            rate_limit: None,
+            allowed_request_content_types: None,
+            vendor_extensions: VendorExtensions::default(),
+            license_requirement: None,
+        }
+    }
+
+    /// The 200 response schema for `path`, as JSON.
+    fn response_schema_json(doc: &serde_json::Value, path: &str) -> serde_json::Value {
+        doc["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+            .clone()
+    }
+
+    fn test_info() -> OpenApiInfo {
+        OpenApiInfo {
+            title: "T".to_owned(),
+            version: "1".to_owned(),
+            description: None,
+            servers: Vec::new(),
+        }
+    }
 
     #[test]
     fn test_registry_creation() {
@@ -521,11 +684,11 @@ mod tests {
                 status: 200,
                 content_type: "application/json",
                 description: "Success".to_owned(),
-                schema_name: None,
+                schema: None,
             }],
             handler_id: "get_test".to_owned(),
             authenticated: false,
-            is_public: false,
+            exposed: false,
             rate_limit: None,
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
@@ -579,17 +742,18 @@ mod tests {
                 required: true,
                 description: Some("User ID".to_owned()),
                 param_type: "string".to_owned(),
+                array: false,
             }],
             request_body: None,
             responses: vec![ResponseSpec {
                 status: 200,
                 content_type: "application/json",
                 description: "User found".to_owned(),
-                schema_name: None,
+                schema: None,
             }],
             handler_id: "get_users_id".to_owned(),
             authenticated: false,
-            is_public: false,
+            exposed: false,
             rate_limit: None,
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
@@ -645,11 +809,11 @@ mod tests {
                 status: 200,
                 content_type: "application/json",
                 description: "Upload successful".to_owned(),
-                schema_name: None,
+                schema: None,
             }],
             handler_id: "post_upload".to_owned(),
             authenticated: false,
-            is_public: false,
+            exposed: false,
             rate_limit: None,
             allowed_request_content_types: Some(vec!["application/octet-stream"]),
             vendor_extensions: VendorExtensions::default(),
@@ -724,11 +888,11 @@ mod tests {
                 status: 200,
                 content_type: "application/json",
                 description: "OK".to_owned(),
-                schema_name: None,
+                schema: None,
             }],
             handler_id: "get_test".to_owned(),
             authenticated: false,
-            is_public: false,
+            exposed: false,
             rate_limit: None,
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
@@ -760,6 +924,61 @@ mod tests {
         let allowed_order = order_ext.get("allowedFields").unwrap().as_array().unwrap();
         assert!(allowed_order.iter().any(|v| v.as_str() == Some("name asc")));
         assert!(allowed_order.iter().any(|v| v.as_str() == Some("age desc")));
+    }
+
+    #[test]
+    fn test_public_operation_emits_visibility_extension() {
+        let registry = OpenApiRegistryImpl::new();
+        let public = OperationSpec {
+            method: Method::GET,
+            path: "/calc/v1/ping".to_owned(),
+            operation_id: Some("ping".to_owned()),
+            summary: Some("Ping".to_owned()),
+            description: None,
+            tags: vec![],
+            params: vec![],
+            request_body: None,
+            responses: vec![ResponseSpec {
+                status: 200,
+                content_type: "application/json",
+                description: "OK".to_owned(),
+                schema: None,
+            }],
+            handler_id: "get_ping".to_owned(),
+            authenticated: false,
+            exposed: true,
+            rate_limit: None,
+            allowed_request_content_types: None,
+            vendor_extensions: VendorExtensions::default(),
+            license_requirement: None,
+        };
+        // A second, internal operation must NOT carry the extension.
+        let mut internal = public.clone();
+        internal.path = "/calc/v1/internal".to_owned();
+        internal.handler_id = "get_internal".to_owned();
+        internal.operation_id = Some("internal".to_owned());
+        internal.exposed = false;
+
+        registry.register_operation(&public);
+        registry.register_operation(&internal);
+        let doc = registry.build_openapi(&OpenApiInfo::default()).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+        let paths = json.get("paths").unwrap();
+
+        let public_op = paths.get("/calc/v1/ping").unwrap().get("get").unwrap();
+        assert_eq!(
+            public_op
+                .get("x-toolkit-visibility")
+                .and_then(|v| v.as_str()),
+            Some("exposed"),
+            "public operation must advertise the gateway visibility extension"
+        );
+
+        let internal_op = paths.get("/calc/v1/internal").unwrap().get("get").unwrap();
+        assert!(
+            internal_op.get("x-toolkit-visibility").is_none(),
+            "non-public operation must not carry the visibility extension"
+        );
     }
 
     /// Helper: build a minimal `OpenAPI` doc with the given component schemas.
@@ -846,5 +1065,163 @@ mod tests {
         let openapi: OpenApi = serde_json::from_value(openapi_json).unwrap();
         let dangling = collect_all_dangling_refs_in_openapi(&openapi);
         assert_eq!(dangling, vec!["MissingDto".to_owned()]);
+    }
+
+    // --- array responses -------------------------------------------------
+    //
+    // A top-level array must be emitted inline, referencing the item type,
+    // and must NOT create a component of its own. utoipa names every `Vec<T>`
+    // `Vec`, so a named array component makes all list endpoints collide.
+
+    #[test]
+    fn array_response_emits_inline_array_referencing_item() {
+        let registry = OpenApiRegistryImpl::new();
+        registry.register_operation(&spec_with_response(
+            "/gears",
+            "list_gears",
+            Some(ResponseSchema::Array {
+                items_schema_name: "GearDto".to_owned(),
+            }),
+        ));
+
+        let doc = serde_json::to_value(registry.build_openapi(&test_info()).unwrap()).unwrap();
+        let schema = response_schema_json(&doc, "/gears");
+
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["items"]["$ref"], "#/components/schemas/GearDto");
+        // The array itself is not a component.
+        assert!(schema.get("$ref").is_none());
+        assert!(doc["components"]["schemas"].get("Vec").is_none());
+    }
+
+    #[test]
+    fn ref_response_still_emits_plain_ref() {
+        let registry = OpenApiRegistryImpl::new();
+        registry.register_operation(&spec_with_response(
+            "/gear",
+            "get_gear",
+            Some(ResponseSchema::Ref {
+                schema_name: "GearDto".to_owned(),
+            }),
+        ));
+
+        let doc = serde_json::to_value(registry.build_openapi(&test_info()).unwrap()).unwrap();
+        let schema = response_schema_json(&doc, "/gear");
+
+        assert_eq!(schema["$ref"], "#/components/schemas/GearDto");
+        assert!(schema.get("type").is_none());
+    }
+
+    #[test]
+    fn schemaless_json_response_still_emits_free_form_object() {
+        let registry = OpenApiRegistryImpl::new();
+        registry.register_operation(&spec_with_response("/any", "any_op", None));
+
+        let doc = serde_json::to_value(registry.build_openapi(&test_info()).unwrap()).unwrap();
+        let schema = response_schema_json(&doc, "/any");
+
+        assert!(schema.get("$ref").is_none());
+        assert_ne!(schema["type"], "array");
+    }
+
+    /// The regression this whole change exists for: two list endpoints
+    /// returning different item types used to both register a component named
+    /// `Vec`, silently clobbering each other (and, after M-14, panicking).
+    #[test]
+    fn two_distinct_array_responses_do_not_collide() {
+        #[derive(utoipa::ToSchema)]
+        #[allow(dead_code)]
+        struct AlphaDto {
+            alpha: String,
+        }
+        #[derive(utoipa::ToSchema)]
+        #[allow(dead_code)]
+        struct BetaDto {
+            beta: i32,
+        }
+
+        let registry = OpenApiRegistryImpl::new();
+        // Registering the ITEM types is what the array builder method does.
+        let a = ensure_schema::<AlphaDto>(&registry);
+        let b = ensure_schema::<BetaDto>(&registry);
+        assert_eq!((a.as_str(), b.as_str()), ("AlphaDto", "BetaDto"));
+
+        registry.register_operation(&spec_with_response(
+            "/alphas",
+            "list_alphas",
+            Some(ResponseSchema::Array {
+                items_schema_name: a,
+            }),
+        ));
+        registry.register_operation(&spec_with_response(
+            "/betas",
+            "list_betas",
+            Some(ResponseSchema::Array {
+                items_schema_name: b,
+            }),
+        ));
+
+        let openapi = registry.build_openapi(&test_info()).unwrap();
+        assert!(
+            collect_all_dangling_refs_in_openapi(&openapi).is_empty(),
+            "array item refs must point at registered components"
+        );
+
+        let doc = serde_json::to_value(&openapi).unwrap();
+        let schemas = &doc["components"]["schemas"];
+        assert!(schemas.get("AlphaDto").is_some());
+        assert!(schemas.get("BetaDto").is_some());
+        assert!(schemas.get("Vec").is_none());
+        assert_eq!(
+            response_schema_json(&doc, "/alphas")["items"]["$ref"],
+            "#/components/schemas/AlphaDto"
+        );
+        assert_eq!(
+            response_schema_json(&doc, "/betas")["items"]["$ref"],
+            "#/components/schemas/BetaDto"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "would register the component name `Vec`")]
+    fn ensure_schema_rejects_vec_directly() {
+        #[derive(utoipa::ToSchema)]
+        #[allow(dead_code)]
+        struct ItemDto {
+            x: u8,
+        }
+        let registry = OpenApiRegistryImpl::new();
+        let _ = ensure_schema::<Vec<ItemDto>>(&registry);
+    }
+
+    #[test]
+    #[should_panic(expected = "OpenAPI schema name collision")]
+    fn ensure_schema_raw_panics_on_conflicting_definition() {
+        let registry = OpenApiRegistryImpl::new();
+        registry.ensure_schema_raw(
+            "Dup",
+            vec![("Dup".to_owned(), RefOr::Ref(Ref::from_schema_name("First")))],
+        );
+        registry.ensure_schema_raw(
+            "Dup",
+            vec![(
+                "Dup".to_owned(),
+                RefOr::Ref(Ref::from_schema_name("Second")),
+            )],
+        );
+    }
+
+    #[test]
+    fn ensure_schema_raw_allows_identical_reregistration() {
+        let registry = OpenApiRegistryImpl::new();
+        let entry = || {
+            vec![(
+                "Same".to_owned(),
+                RefOr::Ref(Ref::from_schema_name("Target")),
+            )]
+        };
+        registry.ensure_schema_raw("Same", entry());
+        registry.ensure_schema_raw("Same", entry());
+        assert_eq!(registry.components_registry.load().len(), 1);
     }
 }

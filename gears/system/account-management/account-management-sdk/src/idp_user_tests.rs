@@ -78,6 +78,92 @@ fn user_operation_failure_metric_labels_are_stable() {
         IdpUserOperationFailure::Rejected { detail: "x".into() }.as_metric_label(),
         "rejected"
     );
+    assert_eq!(
+        IdpUserOperationFailure::FieldNotWritable {
+            fields: vec![IdpUserAttribute::Email],
+            detail: "x".into()
+        }
+        .as_metric_label(),
+        "field_not_writable"
+    );
+}
+
+/// The attribute tokens are a wire contract: they land in
+/// `field_violations[].field` and MUST equal the corresponding
+/// `UserUpdateRequest` JSON property name, because clients key
+/// form-field attribution off the string. A rename here silently
+/// breaks a consumer's field mapping, so the tokens are pinned.
+#[test]
+fn user_attribute_field_tokens_match_the_patch_property_names() {
+    for (attribute, expected) in [
+        (IdpUserAttribute::Username, "username"),
+        (IdpUserAttribute::Email, "email"),
+        (IdpUserAttribute::DisplayName, "display_name"),
+        (IdpUserAttribute::FirstName, "first_name"),
+        (IdpUserAttribute::LastName, "last_name"),
+    ] {
+        assert_eq!(attribute.as_field_token(), expected);
+        assert!(
+            !attribute.as_human_phrase().is_empty(),
+            "{expected}: every attribute needs a human phrase for the curated public detail"
+        );
+    }
+}
+
+/// `FieldNotWritable` carries its provider `detail` through the shared
+/// accessor like every other variant — AM's boundary digests it rather
+/// than echoing it, so the accessor MUST expose the raw string.
+#[test]
+fn field_not_writable_exposes_detail() {
+    let f = IdpUserOperationFailure::FieldNotWritable {
+        fields: vec![IdpUserAttribute::FirstName],
+        detail: "attribute is read-only (LDAP federated)".into(),
+    };
+    assert_eq!(f.detail(), "attribute is read-only (LDAP federated)");
+    assert_eq!(
+        f.to_string(),
+        "field_not_writable: attribute is read-only (LDAP federated)"
+    );
+}
+
+/// `FieldNotWritable` carries a *set*: a merge patch can touch several
+/// attributes and a read-only federated realm typically locks more than
+/// one, so the variant MUST be able to name them all in one failure
+/// rather than forcing a round-trip per attribute.
+#[test]
+fn field_not_writable_carries_every_refused_attribute() {
+    let f = IdpUserOperationFailure::FieldNotWritable {
+        fields: vec![
+            IdpUserAttribute::Email,
+            IdpUserAttribute::FirstName,
+            IdpUserAttribute::LastName,
+        ],
+        detail: "attributes are read-only (LDAP federated)".into(),
+    };
+    let IdpUserOperationFailure::FieldNotWritable { fields, .. } = &f else {
+        panic!("expected FieldNotWritable");
+    };
+    assert_eq!(
+        fields,
+        &[
+            IdpUserAttribute::Email,
+            IdpUserAttribute::FirstName,
+            IdpUserAttribute::LastName
+        ]
+    );
+    assert_eq!(f.as_metric_label(), "field_not_writable");
+}
+
+/// `IdpUserAttribute` is the key type providers use to hold their
+/// non-writable set, so it MUST be usable in a `HashSet` directly.
+#[test]
+fn user_attribute_is_hashable_for_provider_side_sets() {
+    let locked: std::collections::HashSet<IdpUserAttribute> =
+        [IdpUserAttribute::Email, IdpUserAttribute::Username]
+            .into_iter()
+            .collect();
+    assert!(locked.contains(&IdpUserAttribute::Email));
+    assert!(!locked.contains(&IdpUserAttribute::LastName));
 }
 
 #[test]

@@ -1,2 +1,22 @@
 [alias]
 xtask = "run --package xtask --"
+
+# PDFium is not a Cargo dependency and Cargo.lock cannot pin it.
+#
+# `kreuzberg`'s `bundled-pdfium` feature does not bundle anything: its build script curls
+# bblanchon/pdfium-binaries `releases/latest` and downloads that prebuilt libpdfium into
+# OUT_DIR, verifying nothing but the archive's gzip magic bytes. The lock file pins the
+# bindings (`kreuzberg-pdfium-render`), not the library behind them, so an upstream PDFium
+# release changes PDF text extraction with no diff anywhere in this repo. It also caches in
+# OUT_DIR, so only builds with a cold target/ pick up the drift — which is every e2e CI run.
+#
+# That is not hypothetical: PDFium 7988 (published 2026-08-03) changed the base direction
+# used when serializing bidirectional text, reversing word order on the Arabic and Hebrew
+# lines and breaking the file_parser golden-markdown e2e tests on every open branch at once.
+#
+# Keep this pinned. To bump it, change the version and regenerate the goldens with
+# testing/e2e/suites/file_parser/generate_file_parser_golden.py in the same commit.
+# Deliberately not `force = true`, so `PDFIUM_VERSION=7988 cargo build` still overrides it
+# for testing a bump. Bare build number — the build script prepends "chromium/".
+[env]
+PDFIUM_VERSION = "7961"

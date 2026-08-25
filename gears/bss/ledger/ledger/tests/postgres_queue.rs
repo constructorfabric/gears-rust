@@ -6,7 +6,7 @@
 //! cap-re-evaluation at apply (an over-cap queued allocation stays `QUEUED` +
 //! bumps attempts), and the cross-tenant sweep job (`QueueApplierJob`) as the
 //! restart/backstop path. Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_queue -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_queue -- --ignored`.
 //!
 //! Run discipline (controller): these are testcontainer `#[ignore]` tests; run
 //! the bin sequentially (each test boots its own container).
@@ -135,7 +135,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -213,7 +213,7 @@ async fn ar_invoice_balance(
     s: &Seller,
     invoice_id: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
@@ -224,7 +224,7 @@ async fn ar_invoice_balance(
 }
 
 async fn count_allocations(raw: &sea_orm::DatabaseConnection, s: &Seller, payment_id: &str) -> i64 {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT COUNT(*) FROM bss.ledger_payment_allocation \
          WHERE tenant_id='{}' AND payment_id='{}'",
         s.tenant, payment_id
@@ -242,7 +242,7 @@ async fn queue_status(
     s: &Seller,
     allocation_id: Uuid,
 ) -> Option<String> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT status FROM bss.ledger_pending_event_queue \
          WHERE tenant_id='{}' AND flow='PAYMENT_ALLOCATE' AND business_id='{allocation_id}'",
         s.tenant
@@ -259,7 +259,7 @@ async fn queue_row_count(
     s: &Seller,
     allocation_id: Uuid,
 ) -> i64 {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT COUNT(*) FROM bss.ledger_pending_event_queue \
          WHERE tenant_id='{}' AND flow='PAYMENT_ALLOCATE' AND business_id='{allocation_id}'",
         s.tenant
@@ -276,7 +276,7 @@ async fn queue_attempts(
     s: &Seller,
     allocation_id: Uuid,
 ) -> Option<i32> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT attempts FROM bss.ledger_pending_event_queue \
          WHERE tenant_id='{}' AND flow='PAYMENT_ALLOCATE' AND business_id='{allocation_id}'",
         s.tenant
@@ -294,7 +294,7 @@ async fn queue_apply_after(
     s: &Seller,
     allocation_id: Uuid,
 ) -> Option<DateTime<Utc>> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT apply_after FROM bss.ledger_pending_event_queue \
          WHERE tenant_id='{}' AND flow='PAYMENT_ALLOCATE' AND business_id='{allocation_id}'",
         s.tenant
@@ -312,7 +312,7 @@ async fn dedup_status(
     s: &Seller,
     allocation_id: Uuid,
 ) -> Option<(String, Option<Uuid>)> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT status, result_entry_id FROM bss.ledger_idempotency_dedup \
          WHERE tenant_id='{}' AND flow='PAYMENT_ALLOCATE' AND business_id='{allocation_id}'",
         s.tenant
@@ -861,7 +861,7 @@ async fn sweep_applies_seeded_settlement() {
     // `unallocated_balance` pool. Without `account_balance` the projector's
     // guarded no-negative pre-check on the aggregate drives it to -amount and the
     // row is (correctly) blocked instead of applied.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_account_balance \
             (tenant_id, account_id, currency, account_class, normal_side, balance_minor) \
          VALUES ('{}','{}','USD','UNALLOCATED','CR',1000)",
@@ -869,7 +869,7 @@ async fn sweep_applies_seeded_settlement() {
     )))
     .await
     .expect("seed unallocated account_balance");
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_unallocated_balance \
             (tenant_id, payer_tenant_id, account_id, currency, balance_minor) \
          VALUES ('{}','{}','{}','USD',1000)",

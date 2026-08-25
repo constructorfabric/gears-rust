@@ -35,9 +35,8 @@ The cluster abstraction must map cleanly to multiple backends while meeting real
 - **Event broker**: Up to 1000 subscriber leases per instance, renewed every few seconds. Multi-instance deployments multiply this — 10 instances = 10,000 concurrent leases.
 - **OAGW**: Distributed rate-limit counters (cache CAS) and a handful of configuration locks. Low lock count, high-frequency cache updates.
 - **Scheduler**: A single leader election per pool. One lock, but correctness-critical.
-- **Service discovery**: Dozens to hundreds of service registrations with periodic health updates.
 
-These workloads span four orders of magnitude in concurrency. A provider that handles 5 leader elections perfectly may collapse under 10,000 subscriber leases. We need to select and recommend providers based on real performance characteristics, not just API compatibility.
+These workloads span several orders of magnitude in concurrency. A provider that handles 5 leader elections perfectly may collapse under 10,000 subscriber leases. We need to select and recommend providers based on real performance characteristics, not just API compatibility.
 
 Additionally, the subscriber lease use case (1000 concurrent reservations per instance) reveals that the right primitive is `ClusterCache` (put_if_absent + TTL renewal), not `DistributedLock`. This reframing avoids the lock scalability problem entirely.
 
@@ -54,35 +53,34 @@ Additionally, the subscriber lease use case (1000 concurrent reservations per in
 
 1. **Redis** — high-throughput cache + locks, weak watch (keyspace notifications)
 2. **PostgreSQL** — zero-new-infra, moderate throughput, strong consistency via advisory locks
-3. **K8s API** — zero-new-infra on K8s, native leader election (Lease) and service discovery (Lease per instance — see ADR-008 for why Lease, not EndpointSlice), poor throughput ceiling
+3. **K8s API** — zero-new-infra on K8s, native leader election (Lease), poor throughput ceiling
 4. **NATS KV** — best-in-class watch, native CAS via revisions, adds infrastructure dependency
 5. **etcd (direct)** — purpose-built coordination, strong consistency, limited throughput
 
 ## Decision Outcome
 
-Adopt a **hybrid model** where each sub-capability routes to the best backend for the workload. No single backend is optimal across all four sub-capabilities and all workload scales. The recommended combinations are:
+Adopt a **hybrid model** where each sub-capability routes to the best backend for the workload. No single backend is optimal across all three sub-capabilities and all workload scales. The recommended combinations are:
 
-- **Dev / single-instance**: Standalone (all four, zero deps)
-- **Multi-instance, no K8s**: Postgres (cache + locks natively, election + discovery via SDK defaults)
-- **K8s, low-throughput**: K8s (Lease for election, Lease per instance for service discovery, CRD for cache)
-- **K8s + Redis (recommended production)**: Redis for cache + locks, K8s for election + service discovery
-- **Redis-only**: Redis for all four via SDK defaults
+- **Dev / single-instance**: Standalone (all three, zero deps)
+- **Multi-instance, no K8s**: Postgres (cache + locks natively, election via SDK default)
+- **K8s, low-throughput**: K8s (Lease for election, CRD for cache)
+- **K8s + Redis (recommended production)**: Redis for cache + locks, K8s for election
+- **Redis-only**: Redis for all three via SDK defaults
 
-Per-primitive resolution with typed profile markers and per-primitive `*Capability` requirements allows consumers to declare what they need at the resolver call site. The operator maps profiles to per-primitive backend bindings. Startup validation matches the bound backend's actual characteristics (declared via `consistency()` for cache and `features()` for all four primitives) against the consumer's declared capability requirements; mismatch fails startup. (Resolver shape and capability typing are covered in detail in ADR-007.)
+Per-primitive resolution with typed profile markers and per-primitive `*Capability` requirements allows consumers to declare what they need at the resolver call site. The operator maps profiles to per-primitive backend bindings. Startup validation matches the bound backend's actual characteristics (declared via `consistency()` for cache and `features()` for all three primitives) against the consumer's declared capability requirements; mismatch fails startup. (Resolver shape and capability typing are covered in detail in ADR-007.)
 
 The event broker's subscriber lease management uses `ClusterCacheV1` (not `DistributedLockV1`) — cache CAS is the higher-throughput primitive on every backend.
 
 ### Cache CAS as the unifying primitive
 
-The four primitives are not four independent contracts the platform binds to four independent backends. Cache CAS + watch is the *foundational* primitive — leader election, distributed locks, and service discovery can all be implemented on top of it. Concretely, the SDK ships three default backend implementations built solely on `Arc<dyn ClusterCacheBackend>`:
+The three primitives are not three independent contracts the platform binds to three independent backends. Cache CAS + watch is the *foundational* primitive — leader election and distributed locks can both be implemented on top of it. Concretely, the SDK ships two default backend implementations built solely on `Arc<dyn ClusterCacheBackend>`:
 
 - `CasBasedLeaderElectionBackend` — `put_if_absent(election_key, node_id, ttl)` for candidacy, `watch(election_key)` for status changes, background renewal at `ttl / (max_missed_renewals + 1)`, TTL expiry → `Status(Lost)` followed by auto-reenroll.
 - `CasBasedDistributedLockBackend` — `put_if_absent(lock_key, holder_id, ttl)` for `try_lock`, `watch(lock_key)` to notify blocked waiters on release, background TTL reaper, release via delete-if-still-holder using CAS.
-- `CacheBasedServiceDiscoveryBackend` — `put(svc/{name}/{instance_id}, metadata, ttl)` for registration, `watch_prefix(svc/{name}/)` for topology change events, background TTL renewal.
 
-This means a minimal plugin needs to implement only `ClusterCacheBackend` to deliver all four primitives. Native overrides exist for backends with purpose-built primitives (K8s Lease for elections; etcd's native Lock API), but they are never required. The wiring crate's omit-primitive auto-wrap behavior (covered in DESIGN §3.11) makes single-backend profiles a 1-line YAML config.
+This means a minimal plugin needs to implement only `ClusterCacheBackend` to deliver all three primitives. Native overrides exist for backends with purpose-built primitives (K8s Lease for elections; etcd's native Lock API), but they are never required. The wiring crate's omit-primitive auto-wrap behavior (covered in DESIGN §3.11) makes single-backend profiles a 1-line YAML config.
 
-This decision is what makes "per-primitive routing" a *configurable convenience* rather than a forced complexity tax. Operators with a single backend (Postgres-only, Redis-only) get all four primitives by binding `cache` and omitting the rest. Operators with mixed needs (Redis cache + K8s Lease elections) bind explicitly. Consumers see the same `*V1` facade in every case.
+This decision is what makes "per-primitive routing" a *configurable convenience* rather than a forced complexity tax. Operators with a single backend (Postgres-only, Redis-only) get all three primitives by binding `cache` and omitting the rest. Operators with mixed needs (Redis cache + K8s Lease elections) bind explicitly. Consumers see the same `*V1` facade in every case.
 
 ### Version-based vs value-based CAS
 
@@ -146,7 +144,6 @@ Trade-off: consumers must hold the version from `get()` if they want to write ba
 
 - Good, because zero new infrastructure when running on K8s
 - Good, because Lease API is purpose-built for leader election — battle-tested, used by K8s controllers
-- Good, because Lease-per-instance also models cluster's service discovery contract (heartbeat/TTL liveness + arbitrary metadata via annotations) without requiring CRD installation. ADR-008 explains why Lease-per-instance, NOT `EndpointSlice` — `EndpointSlice` is a probe-driven concept and cluster does not own probes.
 - Good, because resourceVersion is native CAS on every K8s object
 - Bad, because every operation traverses API server → etcd at 2-10ms — not suitable for high-throughput caching
 - Bad, because 1000 Lease objects renewed every 10s = 1000 PUTs/sec — consumes 20-33% of etcd write capacity, competes with K8s control-plane operations
@@ -199,14 +196,13 @@ This decision directly addresses the following requirements and design elements:
 - `cpt-cf-clst-fr-cache-storage` — Per-backend cache primitive realization (per-backend pros/cons inform plugin choice).
 - `cpt-cf-clst-fr-leader-elect` — Leader election via cache CAS + watch + TTL when bound to a Linearizable cache.
 - `cpt-cf-clst-fr-lock-acquire` — Lock primitive via cache CAS when bound to a Linearizable cache.
-- `cpt-cf-clst-fr-sd-register` — Service discovery via cache `put`/`watch_prefix`/TTL.
 - `cpt-cf-clst-fr-routing-per-primitive` — Per-primitive backend routing as operator config; recommended deployment combinations document acceptable shapes.
 - `cpt-cf-clst-nfr-leader-guarantee` — Per-backend safety analysis is the qualitative side; ADR-009 is the quantitative correctness counterpart.
 - `cpt-cf-clst-principle-cas-universal` (DESIGN §2.1) — Cache CAS as the foundational primitive that derives the other three.
 - `cpt-cf-clst-principle-per-primitive-routing` (DESIGN §2.1) — Operator-configurable per-primitive routing.
 - `cpt-cf-clst-principle-version-based-cas` (DESIGN §2.1) — `expected_version: u64` rather than expected-byte-value CAS.
 - `cpt-cf-clst-component-sdk` (DESIGN §3.2) — SDK ships default backend implementations built on `Arc<dyn ClusterCacheBackend>` per this ADR.
-- DESIGN §3.11 SDK Default Backends — concrete implementations (`CasBasedLeaderElectionBackend`, `CasBasedDistributedLockBackend`, `CacheBasedServiceDiscoveryBackend`).
+- DESIGN §3.11 SDK Default Backends — concrete implementations (`CasBasedLeaderElectionBackend`, `CasBasedDistributedLockBackend`).
 - DESIGN §4.1 Backend Feature Compatibility — per-backend matrix consistent with this ADR's per-backend pros/cons.
 - DESIGN §4.2 Recommended Deployment Combinations — operational guidance derived from this ADR's analysis.
 

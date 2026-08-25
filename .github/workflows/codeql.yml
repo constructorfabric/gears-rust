@@ -20,6 +20,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Local dev enables incremental compilation via [profile.dev]; CI does not want
+  # the extra codegen and disk churn.
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   # Gate: detect whether anything other than docs changed. Doc-only PRs skip the
   # expensive CodeQL steps below but the analyze job still runs and reports green,

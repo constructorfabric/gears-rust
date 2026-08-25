@@ -1,0 +1,27 @@
+[package]
+name = "cf-gears-toolkit-contract-protogen"
+version = "0.1.2"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Generate idiomatic .proto files from ToolKit ContractIr + JsonSchema"
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+name = "toolkit_contract_protogen"
+
+[lints]
+workspace = true
+
+[dependencies]
+toolkit-contract.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+heck.workspace = true
+thiserror.workspace = true

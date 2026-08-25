@@ -1,27 +1,30 @@
 # Created:  2026-04-19 by Virtuozzo
 # Updated:  2026-06-09 by Virtuozzo
 
+# NOTE: the aggregated, CI-verified schema for the whole platform is
+# docs/api/api.json (also served live by the api-gateway at {prefix}/docs).
+# Paths below are gear-relative: the gateway prepends its prefix_path (e.g. /cf).
 openapi: 3.1.0
 info:
   title: Account Management API
   version: 1.0.0
   description: |
     Account Management (AM) is the authoritative control-plane API for tenant
-    hierarchy, tenant mode transitions, delegated user lifecycle operations,
-    and extensible tenant metadata.
+    hierarchy, tenant mode transitions, delegated user and machine-identity
+    lifecycle operations, and extensible tenant metadata.
 
     This file is the authoritative machine-readable public contract for AM v1.
     PRD and DESIGN intentionally summarize behavior and refer here for wire
     shapes, field semantics, and HTTP-level error mapping.
 
     Versioning: breaking changes increment the major version embedded in the URL
-    path (`/api/account-management/v1/` → `/v2/`) and are coordinated with a
+    path (`/account-management/v1/` → `/account-management/v2/`) and are coordinated with a
     migration window per the Compatibility NFR in DESIGN.md. Additive changes
     within v1 do not rev the path.
 
     **Implementation status:** Tenant CRUD, tenant-metadata, IdP
-    user-ops, conversion-request, and identity (`GET /v1/me`) REST
-    surfaces are all published. The conversion family covers both sides
+    user-ops, service-account, conversion-request, and identity
+    (`GET /v1/me`) REST surfaces are all published. The conversion family covers both sides
     of the dual-consent pair (`/conversions` for the converting tenant;
     `/child-conversions` for the parent counterparty).
 
@@ -37,6 +40,12 @@ tags:
     description: Tenant-scoped extensible metadata and effective-value resolution.
   - name: users
     description: Tenant-scoped IdP user operations (provision, list, deprovision).
+  - name: service-accounts
+    description: |
+      Tenant-scoped machine identities (confidential OAuth 2.0
+      `client_credentials` clients) managed through the same IdP plugin
+      contract as users, on a distinct resource type so a grant over
+      users never confers machine-credential minting.
   - name: conversions
     description: |
       Managed / self-managed mode conversion request lifecycle. Both
@@ -57,7 +66,7 @@ security:
   - bearerAuth: []
 
 paths:
-  /api/account-management/v1/me:
+  /account-management/v1/me:
     get:
       operationId: getMe
       tags: [Identity]
@@ -80,7 +89,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants:
+  /account-management/v1/tenants:
     post:
       operationId: createTenant
       tags: [tenants]
@@ -112,7 +121,7 @@ paths:
         '5XX':
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}:
+  /account-management/v1/tenants/{tenant_id}:
     parameters:
       - $ref: '#/components/parameters/TenantId'
     get:
@@ -183,7 +192,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/suspend:
+  /account-management/v1/tenants/{tenant_id}/suspend:
     parameters:
       - $ref: '#/components/parameters/TenantId'
     post:
@@ -213,7 +222,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/unsuspend:
+  /account-management/v1/tenants/{tenant_id}/unsuspend:
     parameters:
       - $ref: '#/components/parameters/TenantId'
     post:
@@ -236,7 +245,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/children:
+  /account-management/v1/tenants/{tenant_id}/children:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/Limit'
@@ -265,7 +274,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/users:
+  /account-management/v1/tenants/{tenant_id}/users:
     parameters:
       - $ref: '#/components/parameters/TenantId'
     get:
@@ -274,16 +283,20 @@ paths:
       summary: List users provisioned in a tenant
       description: |
         Lists users provisioned in the tenant via the configured IdP plugin.
-        Supplying `user_id` turns the response into an authoritative existence
+        There is no per-user GET. A point lookup is
+        `?$filter=id eq <uuid>&limit=1`, which is an authoritative existence
         check — the page contains at most one element and an empty page is the
         canonical "user absent" signal (no 404). AM persists no local user
         state; every read is a pass-through to the IdP.
 
-        When `user_id` is supplied the server pins `top=1` and ignores any
-        client-provided `limit` / `cursor` — the filtered shape is an
-        existence check, not a paginated query.
+        With `id eq` the caller MUST supply `limit=1` and MUST NOT supply a
+        `cursor`; either violation is rejected with 400 rather than silently
+        corrected. `limit` is the page-size parameter — `$top` is not honoured
+        as a substitute. Filterable / sortable columns: `id`, `username`,
+        `email`, `display_name`, `first_name`, `last_name`.
       parameters:
-        - $ref: '#/components/parameters/UserIdFilter'
+        - $ref: '#/components/parameters/ODataFilter'
+        - $ref: '#/components/parameters/ODataOrderBy'
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
       responses:
@@ -321,7 +334,7 @@ paths:
         '5XX':
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/users/{user_id}:
+  /account-management/v1/tenants/{tenant_id}/users/{user_id}:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/UserId'
@@ -348,6 +361,19 @@ paths:
         (`code=already_exists`). Unsupported by a legacy provider surfaces as
         `code=idp_unsupported_operation` (501); IdP transport failure as
         `code=idp_unavailable` (503).
+
+        An attribute the IdP manages and does not allow AM to override — e.g.
+        federated from a read-only LDAP mapper, or marked non-writable in the
+        provider's user-profile configuration — is refused with
+        `code=validation` (400) whose `context.field_violations[0]` carries
+        `field` = the refused request property (`username`, `email`,
+        `display_name`, `first_name`, or `last_name`) and
+        `reason=IDP_MANAGED_FIELD`. Clients key form-field attribution off
+        `field` and disable exactly that input. Deliberately NOT a 403:
+        writability is a property of the provider's schema, identical for
+        every caller, so no additional grant would let the write succeed. The
+        refusal is scoped to attributes the patch actually touches — a patch
+        that omits a locked attribute still applies.
       requestBody:
         required: true
         content:
@@ -380,7 +406,174 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/conversions:
+  /account-management/v1/tenants/{tenant_id}/service-accounts:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    get:
+      operationId: listTenantServiceAccounts
+      tags: [service-accounts]
+      summary: List a tenant's service accounts
+      description: |
+        Lists the tenant's service accounts via the configured IdP plugin.
+        Never includes secrets. There is no per-account GET.
+
+        Unpaginated by contract: the IdP returns the tenant's whole collection
+        (provider quotas bound it). That is deliberate — this listing is also
+        the reconciliation path after an ambiguous provision, and "is my name
+        already live here?" must not become a multi-round-trip question with a
+        cursor to invalidate. Each entry echoes the caller-supplied `name`
+        verbatim, which is the only contractual bridge from a name you
+        submitted to the provider-assigned `client_id`; client-id formats are
+        provider conventions, never contract. AM persists no local account
+        state; every read is a pass-through to the IdP.
+      responses:
+        '200':
+          description: The tenant's service accounts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceAccountList'
+        default:
+          $ref: '#/components/responses/Problem'
+    post:
+      operationId: createTenantServiceAccount
+      tags: [service-accounts]
+      summary: Provision a service account in a tenant
+      description: |
+        Provisions a confidential `client_credentials` machine identity owned
+        by the tenant via the configured IdP plugin. AM persists no local
+        account state — the IdP is the source of truth.
+
+        Returns 201 with the credentials and a `Location` header addressing the
+        new account. The `client_secret` is returned EXACTLY ONCE — there is
+        no read-back endpoint anywhere in this API — and the response carries
+        `Cache-Control: no-store`, so persist it immediately: recovery from a
+        lost secret is `rotate-secret`, not a re-read.
+
+        `name` must be unique among the tenant's live accounts. A name
+        already in use is rejected with 400 and the existing account is never
+        resumed, revealed, or modified. Name charset, scope-allowlist
+        membership, and per-tenant quota are enforced by the provider (surfacing
+        as 400); AM additionally caps payload size.
+
+        A 409 whose `context.reason` is `AMBIGUOUS_OUTCOME` means the IdP
+        outcome is uncertain and an account MAY have been created. Do NOT
+        retry the same request — it would come back as a 400 name collision.
+        Instead list the tenant's accounts, match the `name` you submitted,
+        and either rotate that entry's secret or revoke it and provision again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServiceAccountCreateRequest'
+      responses:
+        '201':
+          description: |
+            Service account provisioned. Carries `Location` (the account's
+            address) and `Cache-Control: no-store`; the secret appears here and
+            nowhere else.
+          headers:
+            Location:
+              description: Address of the created service account.
+              schema:
+                type: string
+            Cache-Control:
+              description: Always `no-store` — the body carries a credential.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceAccountCredentials'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /account-management/v1/tenants/{tenant_id}/service-accounts/{client_id}/rotate-secret:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/ClientId'
+    post:
+      operationId: rotateTenantServiceAccountSecret
+      tags: [service-accounts]
+      summary: Rotate a service account's secret
+      description: |
+        Regenerates the account's `client_secret`; the previous one stops
+        working immediately. The account's identity — `client_id` and
+        `subject_id` — is unchanged.
+
+        Returns 200 with the new credentials, again EXACTLY ONCE and again with
+        `Cache-Control: no-store`. This is the recovery path for a lost secret.
+        It also re-keys an account left behind by an ambiguous provision without
+        deleting anything, but only one whose creation got far enough to be fully
+        provisioned: a half-created account cannot be repaired by a rotation,
+        because its originally requested scopes are not recoverable, so the
+        provider rejects it as invalid input (400) and the only recovery is
+        revoke-then-create.
+
+        A named action rather than a `PUT`/`PATCH` because it mints a new
+        credential and invalidates the old one, which no state-edit body shape
+        expresses honestly.
+
+        Unlike DELETE, an absent account is NOT folded into success: a
+        rotation that found nothing minted no credential, so it returns 404.
+        A `client_id` owned by a different tenant returns the same 404, so
+        rotation cannot be used to probe for other tenants' accounts.
+
+        Requires the `rotate_secret` permission, grantable independently of
+        `create` — re-keying an existing account need not imply the power to
+        mint new ones.
+      responses:
+        '200':
+          description: |
+            Secret rotated. Carries `Cache-Control: no-store`; the new secret
+            appears here and nowhere else.
+          headers:
+            Cache-Control:
+              description: Always `no-store` — the body carries a credential.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceAccountCredentials'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /account-management/v1/tenants/{tenant_id}/service-accounts/{client_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/ClientId'
+    delete:
+      operationId: revokeTenantServiceAccount
+      tags: [service-accounts]
+      summary: Revoke a service account
+      description: |
+        Deletes the service account via the configured IdP plugin; credentials
+        it holds stop working.
+
+        Idempotent: returns 204 whether the IdP removed the client or reported
+        it already absent, so a retried DELETE is safe. A `client_id` owned by a
+        different tenant returns the same 204 — revocation is never a probe for
+        accounts owned elsewhere. A clean provider failure is NOT folded into
+        success (503), and unsupported revocation surfaces as
+        `code=idp_unsupported_operation` (501) rather than a silent no-op.
+
+        After a revoke the freed `name` may be provisioned again — the
+        uniqueness invariant is over live accounts. Accounts are also
+        removed when their owning tenant is deprovisioned.
+
+        NOTE: this item path intentionally registers no `GET`. The plugin
+        contract exposes no by-id read, and RFC 9110 §10.2.2 has `Location`
+        *identify* the created resource without promising it is `GET`-able; the
+        collection listing covers reads.
+      responses:
+        '204':
+          description: Service account revoked (idempotent — same response on an already-absent account)
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /account-management/v1/tenants/{tenant_id}/conversions:
     parameters:
       - $ref: '#/components/parameters/TenantId'
     post:
@@ -444,7 +637,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/conversions/{request_id}:
+  /account-management/v1/tenants/{tenant_id}/conversions/{request_id}:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/RequestId'
@@ -499,7 +692,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/child-conversions:
+  /account-management/v1/tenants/{tenant_id}/child-conversions:
     parameters:
       - $ref: '#/components/parameters/TenantId'
     post:
@@ -563,7 +756,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/child-conversions/{request_id}:
+  /account-management/v1/tenants/{tenant_id}/child-conversions/{request_id}:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/RequestId'
@@ -612,7 +805,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/metadata:
+  /account-management/v1/tenants/{tenant_id}/metadata:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/Limit'
@@ -633,7 +826,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/metadata/{type_id}:
+  /account-management/v1/tenants/{tenant_id}/metadata/{type_id}:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/SchemaId'
@@ -687,7 +880,7 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  /api/account-management/v1/tenants/{tenant_id}/metadata/{type_id}/resolved:
+  /account-management/v1/tenants/{tenant_id}/metadata/{type_id}/resolved:
     parameters:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/SchemaId'
@@ -735,6 +928,17 @@ components:
         type: string
         format: uuid
         description: IdP-issued UUID user identifier.
+    ClientId:
+      name: client_id
+      in: path
+      required: true
+      schema:
+        type: string
+        description: |
+          Provider-assigned service-account client id. Opaque:
+          `svc-<tenant_id>-<name>` is a common provider convention, not a
+          format callers may rely on — correlate a name to its client id
+          through the collection listing instead.
     SchemaId:
       name: type_id
       in: path
@@ -742,14 +946,6 @@ components:
       schema:
         type: string
         description: Full chained GTS schema identifier.
-    UserIdFilter:
-      name: user_id
-      in: query
-      required: false
-      schema:
-        type: string
-        format: uuid
-        description: Optional UUID user identifier filter for point lookup behavior.
     Limit:
       name: limit
       in: query
@@ -1365,6 +1561,89 @@ components:
             $ref: '#/components/schemas/User'
         page_info:
           $ref: '#/components/schemas/PageInfo'
+
+    ServiceAccountCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: |
+            Short caller-chosen name, unique among the tenant's live
+            accounts. Echoed back verbatim on every listing entry so callers
+            correlate without parsing client ids. AM bounds the length; charset
+            and uniqueness are enforced by the provider.
+        scopes:
+          type: array
+          default: []
+          items:
+            type: string
+          description: Client scopes to attach; validated against the provider's allowlist.
+
+    ServiceAccountCredentials:
+      type: object
+      additionalProperties: false
+      required: [client_id, client_secret, token_url, subject_id]
+      description: |
+        Live credentials, returned only by provision and rotate-secret. No
+        endpoint reads an existing secret back.
+      properties:
+        client_id:
+          type: string
+          description: Provider-assigned client id, used to address rotate-secret and revoke. Opaque to callers.
+        client_secret:
+          type: string
+          description: |
+            The `client_credentials` secret. Returned exactly once; persist it
+            immediately. Responses carrying this field always set
+            `Cache-Control: no-store`.
+        token_url:
+          type: string
+          description: OAuth token endpoint for the `client_credentials` grant.
+        subject_id:
+          type: string
+          format: uuid
+          description: The account's subject id (`sub` of issued tokens) — use it for RBAC bindings.
+
+    ServiceAccount:
+      type: object
+      additionalProperties: false
+      required: [client_id, name, enabled, scopes]
+      description: A listing entry. Never carries a secret.
+      properties:
+        client_id:
+          type: string
+          description: Provider-assigned client id, used to address rotate-secret and revoke.
+        name:
+          type: string
+          description: |
+            The caller-supplied name this account was created with, reported
+            verbatim by the provider. This is how a caller correlates a name it
+            submitted with an opaque `client_id` — notably to reconcile a
+            provision that returned 409 `AMBIGUOUS_OUTCOME`.
+        enabled:
+          type: boolean
+          description: Whether the client can currently authenticate.
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Attached client scopes as reported by the IdP — includes realm-default scopes, not only the requested ones.
+
+    ServiceAccountList:
+      type: object
+      additionalProperties: false
+      required: [service_accounts]
+      description: |
+        Unpaginated collection — deliberately not a page envelope, since this
+        listing doubles as the ambiguous-outcome reconciliation path.
+      properties:
+        service_accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServiceAccount'
 
     TenantMetadataValue:
       description: |

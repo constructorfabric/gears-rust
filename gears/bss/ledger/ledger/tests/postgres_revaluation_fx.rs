@@ -66,7 +66,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -136,14 +136,14 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
             .unwrap();
     }
     // S5-F3: USD functional currency — activates the cross-currency FX path.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_calendar
            (tenant_id, legal_entity_id, fiscal_tz, granularity, fy_start_month, functional_currency)
          VALUES ('{tenant}','{tenant}','UTC','MONTH',1,'USD')"
     )))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{tenant}','{period_id}','UTC','OPEN')"
     )))
@@ -333,12 +333,12 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
     );
 
     // ── 4. Close the period, open the next ──────────────────────────────────────
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_fiscal_period SET status='CLOSED' WHERE tenant_id='{tenant}' AND period_id='{period_id}'"
     )))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{tenant}','{next_period}','UTC','OPEN')"
     )))
@@ -439,14 +439,14 @@ async fn revaluation_with_no_period_end_rate_is_fx_rate_unavailable() {
             .unwrap();
     }
     // USD-functional seller — activates the cross-currency FX revaluation path.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_calendar
            (tenant_id, legal_entity_id, fiscal_tz, granularity, fy_start_month, functional_currency)
          VALUES ('{tenant}','{tenant}','UTC','MONTH',1,'USD')"
     )))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{tenant}','{period_id}','UTC','OPEN')"
     )))

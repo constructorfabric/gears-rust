@@ -17,7 +17,7 @@ date: 2026-04-27
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
-  - [Option 1: Single root `Cluster` / `ClusterV1` trait with all four primitives](#option-1-single-root-cluster--clusterv1-trait-with-all-four-primitives)
+  - [Option 1: Single root `Cluster` / `ClusterV1` trait with all three primitives](#option-1-single-root-cluster--clusterv1-trait-with-all-three-primitives)
   - [Option 2: Trait with associated types for each primitive](#option-2-trait-with-associated-types-for-each-primitive)
   - [Option 3: Per-primitive trait, single trait surface (`ClusterCacheV1: Trait`)](#option-3-per-primitive-trait-single-trait-surface-clustercachev1-trait)
   - [Option 4: Per-primitive facade struct + per-primitive backend trait + per-primitive `*V1` versioning (CHOSEN)](#option-4-per-primitive-facade-struct--per-primitive-backend-trait--per-primitive-v1-versioning-chosen)
@@ -31,15 +31,15 @@ date: 2026-04-27
 
 ## Context and Problem Statement
 
-The cluster gearxposes four coordination primitives — distributed cache, leader election, distributed lock, service discovery — to every Gear. The shape of those four primitives in the Rust type system is the most consequential structural decision in the SDK: it determines what consumers hold, what plugins implement, how operator config maps to code, and what evolution looks like over time.
+The cluster gear exposes three coordination primitives — distributed cache, leader election, distributed lock — to every Gear. The shape of those three primitives in the Rust type system is the most consequential structural decision in the SDK: it determines what consumers hold, what plugins implement, how operator config maps to code, and what evolution looks like over time.
 
 Three sub-decisions are unavoidable and tightly coupled:
 
-1. **Is there a root `Cluster` (or `ClusterV1`) trait that bundles all four primitives, or four independent surfaces?** A root trait reads naturally as "the cluster" but forces every plugin to implement all four primitives even when one of them is a poor fit (e.g., a pure cache plugin must stub out leader election). It also couples the four primitives' versioning lifecycles — bumping any primitive bumps `Cluster` itself.
+1. **Is there a root `Cluster` (or `ClusterV1`) trait that bundles all three primitives, or three independent surfaces?** A root trait reads naturally as "the cluster" but forces every plugin to implement all three primitives even when one of them is a poor fit (e.g., a pure cache plugin must stub out leader election). It also couples the three primitives' versioning lifecycles — bumping any primitive bumps `Cluster` itself.
 
 2. **What do consumers hold, and what do plugins implement?** A single trait that both consumers depend on (`&dyn ClusterCache`) and plugins implement is convenient but pushes consumers onto the `dyn` surface for every method call, makes ergonomic improvements (inherent methods, type-state, builders) impossible without breaking plugin authors, and conflates two audiences with different needs.
 
-3. **How does each primitive evolve incompatibly?** If the cache primitive needs a breaking change but leader election does not, can it ship a `*V2` without forcing every plugin to migrate four primitives at once? The mechanism (separate `TypeKey` registration in ClientHub, per-crate file split, etc.) determines whether incompatible evolution is cheap or expensive.
+3. **How does each primitive evolve incompatibly?** If the cache primitive needs a breaking change but leader election does not, can it ship a `*V2` without forcing every plugin to migrate three primitives at once? The mechanism (separate `TypeKey` registration in ClientHub, per-crate file split, etc.) determines whether incompatible evolution is cheap or expensive.
 
 The facade-plus-backend-trait pattern with per-primitive versioning resolves all three. This ADR captures why these three sub-decisions are inseparable and why the alternatives — many of them ergonomic at first glance — fail under realistic evolution pressure.
 
@@ -54,7 +54,7 @@ The facade-plus-backend-trait pattern with per-primitive versioning resolves all
 
 ## Considered Options
 
-1. **Single root `Cluster` / `ClusterV1` trait with all four primitives** — one trait, plugins implement all four methods.
+1. **Single root `Cluster` / `ClusterV1` trait with all three primitives** — one trait, plugins implement all three methods.
 2. **Trait with associated types for each primitive** — `trait Cluster { type Cache: ...; type Leader: ...; ... }`.
 3. **Per-primitive trait, single trait surface** — `trait ClusterCacheV1 { ... }` is both what consumers depend on AND what plugins implement.
 4. **Per-primitive facade struct + per-primitive backend trait + per-primitive `*V1` versioning** — `ClusterCacheV1` (facade struct) wraps `Arc<dyn ClusterCacheBackend>`; consumers hold the facade, plugins impl the backend trait. (CHOSEN.)
@@ -66,22 +66,21 @@ The facade-plus-backend-trait pattern with per-primitive versioning resolves all
 
 Chosen option: **Option 4** — per-primitive facade struct + per-primitive backend trait, with per-primitive `*V1` versioning via separate ClientHub `TypeKey` registration.
 
-Concretely, the SDK exposes four pairs:
+Concretely, the SDK exposes three pairs:
 
 | Public-API facade (consumers hold) | Plugin-facing backend trait (plugins implement) |
 |---|---|
 | `ClusterCacheV1` (struct, cheap-clone, `Arc`-backed) | `ClusterCacheBackend` (`#[async_trait]`, dyn-compatible) |
 | `LeaderElectionV1` | `LeaderElectionBackend` |
 | `DistributedLockV1` | `DistributedLockBackend` |
-| `ServiceDiscoveryV1` | `ServiceDiscoveryBackend` |
 
 Each `*V1` is a struct with inherent async methods (`get`, `put`, `compare_and_swap`, `watch`, etc. on `ClusterCacheV1`) and inherent sync methods (`consistency()`, `features()`, `resolver(hub)`, `scoped(prefix)`). Internally it wraps `Arc<dyn _Backend>`. Cloning the facade is a single atomic increment.
 
-Plugins implement only the backend trait their plugin actually serves. A pure cache plugin implements `ClusterCacheBackend`; the SDK's omit-primitive auto-wrap (per ADR-001 / DESIGN §3.11) builds the other three from the cache backend.
+Plugins implement only the backend trait their plugin actually serves. A pure cache plugin implements `ClusterCacheBackend`; the SDK's omit-primitive auto-wrap (per ADR-001 / DESIGN §3.11) builds the other two from the cache backend.
 
 There is **no** root `Cluster` or `ClusterV1` trait. There is no facade struct that bundles "the cluster". Each primitive is registered independently in ClientHub under a per-primitive `TypeKey`, scoped by profile.
 
-Per-primitive versioning: when the cache primitive needs an incompatible change, the SDK ships `ClusterCacheV2` + `ClusterCacheBackendV2` alongside `*V1`. Both register in ClientHub under separate type keys. Consumers migrate at their own pace; plugins ship `V2` support when ready. Leader election, lock, and service discovery are unaffected.
+Per-primitive versioning: when the cache primitive needs an incompatible change, the SDK ships `ClusterCacheV2` + `ClusterCacheBackendV2` alongside `*V1`. Both register in ClientHub under separate type keys. Consumers migrate at their own pace; plugins ship `V2` support when ready. Leader election and lock are unaffected.
 
 ### Why three sub-decisions in one ADR
 
@@ -100,7 +99,7 @@ You cannot adopt one of the three and reject the others without losing the prope
 - **Inherent methods** on the facade let the SDK improve ergonomics (typed resolvers, scoping helpers, `Builder`-style configuration) without breaking plugin authors. The plugin contract (the backend trait) is small and stable; the consumer contract (the facade) can grow features.
 - **Per-primitive versioning** is a normal release operation. Adding `ClusterCacheV2` is a non-event for `LeaderElectionV1` plugins. The SDK ships a `V1` ↔ `V2` adapter when there's a path; otherwise consumers migrate on their own schedule.
 - **Two evolution lifecycles** (facade for consumers, backend trait for plugins) require discipline: every change must be classified as "consumer-facing" or "plugin-facing" or "both". This is the right friction — it forces clarity about what's actually breaking.
-- **No bundled `Cluster` accessor** means consumers wanting all four primitives resolve four times. The fluent resolver (per ADR-007) makes each resolution a one-liner; ergonomics are not the bottleneck.
+- **No bundled `Cluster` accessor** means consumers wanting all three primitives resolve three times. The fluent resolver (per ADR-007) makes each resolution a one-liner; ergonomics are not the bottleneck.
 - **ClientHub registration is per-primitive per profile**, not per-cluster. The wiring crate iterates the profile × primitive matrix and registers each `Arc<dyn _Backend>` independently. This is what makes mixed-backend profiles (Redis cache + K8s Lease elections) trivial.
 - **Dyn-compatibility** of the backend traits is enforced by compile-time assertions per trait. Any future change that breaks dyn-compatibility (e.g., adding a generic method, returning `impl Trait`) fails the build.
 
@@ -108,27 +107,26 @@ You cannot adopt one of the three and reject the others without losing the prope
 
 - Compile-time `_assert_dyn_compat(_: Arc<dyn _Backend>) {}` per backend trait. Build fails if dyn-compatibility breaks.
 - A consumer mock test holds `ClusterCacheV1` in a struct field and clones it across tasks; the test passes only if `ClusterCacheV1: Clone + Send + Sync + 'static`.
-- A plugin author test implements only `ClusterCacheBackend` and resolves all four primitives from the SDK defaults — passing demonstrates the cache-only-plugin path works end-to-end.
+- A plugin author test implements only `ClusterCacheBackend` and resolves all three primitives from the SDK defaults — passing demonstrates the cache-only-plugin path works end-to-end.
 - A future-version test stubs `ClusterCacheV2` registered side-by-side with `V1` under different type keys; both resolve without conflict.
 
 ## Pros and Cons of the Options
 
-### Option 1: Single root `Cluster` / `ClusterV1` trait with all four primitives
+### Option 1: Single root `Cluster` / `ClusterV1` trait with all three primitives
 
 ```rust
 trait Cluster {
     fn cache(&self) -> &dyn ClusterCache;
     fn leader_election(&self) -> &dyn LeaderElection;
     fn distributed_lock(&self) -> &dyn DistributedLock;
-    fn service_discovery(&self) -> &dyn ServiceDiscovery;
 }
 ```
 
 - Good, because consumers reference "the cluster" as a single object — feels natural for "this gear needs cluster".
-- Good, because the consumer-side type is one type, not four.
-- Bad, because every plugin implements all four primitives or panics. A cache-only plugin must stub `leader_election`, `distributed_lock`, `service_discovery` with "unsupported" returns — every consumer of those stubs hits runtime errors instead of startup-time validation.
+- Good, because the consumer-side type is one type, not three.
+- Bad, because every plugin implements all three primitives or panics. A cache-only plugin must stub `leader_election` and `distributed_lock` with "unsupported" returns — every consumer of those stubs hits runtime errors instead of startup-time validation.
 - Bad, because per-primitive versioning is impossible. Bumping `ClusterCache` forces `Cluster` to bump. Forcing `Cluster` to bump forces every plugin to acknowledge — even plugins that don't ship the cache primitive.
-- Bad, because the four primitives are not actually one bundled service. They have different consistency requirements, different backends, different lifecycle characteristics, different operator-side configuration. Bundling them in one trait is structural lying.
+- Bad, because the three primitives are not actually one bundled service. They have different consistency requirements, different backends, different lifecycle characteristics, different operator-side configuration. Bundling them in one trait is structural lying.
 - Bad, because mixed-backend profiles (Redis cache + K8s Lease elections) become awkward — there's no single object that owns both backends; you'd need a `HybridCluster` impl that routes per primitive, which is exactly the runtime compositor we explicitly rejected.
 
 ### Option 2: Trait with associated types for each primitive
@@ -138,7 +136,6 @@ trait Cluster {
     type Cache: ClusterCacheBackend;
     type Leader: LeaderElectionBackend;
     type Lock: DistributedLockBackend;
-    type ServiceDiscovery: ServiceDiscoveryBackend;
     fn cache(&self) -> &Self::Cache;
     // ...
 }
@@ -147,7 +144,7 @@ trait Cluster {
 - Good, because associated types push the primitive concrete types into the impl, not the trait.
 - Bad, because `dyn Cluster` is impossible — associated types make the trait non-dyn-compatible. Consumers must be generic over the cluster impl, which infects every cluster-using function with type parameters.
 - Bad, because per-primitive versioning still forces the root trait to bump (the associated types change shape).
-- Bad, because mixing backends in one cluster impl is now harder — the impl must name its concrete cache/leader/lock/discovery types statically. A wiring impl that wires Redis-cache + K8s-leader has to spell out the concrete types.
+- Bad, because mixing backends in one cluster impl is now harder — the impl must name its concrete cache/leader/lock types statically. A wiring impl that wires Redis-cache + K8s-leader has to spell out the concrete types.
 
 ### Option 3: Per-primitive trait, single trait surface (`ClusterCacheV1: Trait`)
 
@@ -198,20 +195,20 @@ pub trait ClusterCacheBackend: Send + Sync + 'static {
 - Good, because static methods (`resolver`) are inherent on the facade — no dyn-compat compromise on the backend trait.
 - Good, because dyn-compatibility is asserted at compile time per backend trait; any change breaking dyn-compat fails the build.
 - Good, because hot-path methods on the facade can inline-delegate to the backend, avoiding extra function-call overhead.
-- Bad, because consumers wanting all four primitives resolve four times. Mitigated by the fluent resolver (one-liner per primitive — see ADR-007).
-- Bad, because the SDK maintains both a facade and a backend trait per primitive — eight types instead of four. Worth it for the two evolution lifecycles.
-- Neutral, because the consumer-visible naming convention (`ClusterCacheV1` for the consumer surface, `ClusterCacheBackend` for plugins) is an explicit convention contributors must learn. Doc comments and consistent naming across the four primitives make it discoverable.
+- Bad, because consumers wanting all three primitives resolve three times. Mitigated by the fluent resolver (one-liner per primitive — see ADR-007).
+- Bad, because the SDK maintains both a facade and a backend trait per primitive — six types instead of three. Worth it for the two evolution lifecycles.
+- Neutral, because the consumer-visible naming convention (`ClusterCacheV1` for the consumer surface, `ClusterCacheBackend` for plugins) is an explicit convention contributors must learn. Doc comments and consistent naming across the three primitives make it discoverable.
 
 ### Option 5: Trait alias on nightly to bundle re-exports
 
 ```rust
 #![feature(trait_alias)]
-trait ClusterV1 = ClusterCacheV1 + LeaderElectionV1 + DistributedLockV1 + ServiceDiscoveryV1;
+trait ClusterV1 = ClusterCacheV1 + LeaderElectionV1 + DistributedLockV1;
 ```
 
-- Good, because consumers can write `&dyn ClusterV1` if they want all four primitives.
+- Good, because consumers can write `&dyn ClusterV1` if they want all three primitives.
 - Bad, because `trait_alias` is unstable on nightly indefinitely — the platform pins MSRV 1.92.0 stable.
-- Bad, because trait aliases compose by trait inheritance; plugins implementing the alias must implement all four constituent traits — same problem as Option 1.
+- Bad, because trait aliases compose by trait inheritance; plugins implementing the alias must implement all three constituent traits — same problem as Option 1.
 - Bad, because adoption requires nightly toolchain everywhere, which is a non-starter.
 
 ### Option 6: Gear-path versioning (`v1::ClusterCache`)
@@ -252,7 +249,7 @@ pub mod v2 { pub trait ClusterCache { ... } }
 - ADR-001 — backend compatibility and the cache-CAS-universal model. The SDK-default backend implementations are what makes "cache-only plugin is sufficient" workable.
 - ADR-006 — builder/handle lifecycle. Plugins are nested builder/handle pairs whose handle owns the plugin's `Arc<dyn _Backend>` registered in ClientHub.
 - ADR-007 — capability typing and typed profile resolution. The fluent resolver returns the per-primitive facade, completing the consumer-side ergonomic story.
-- DESIGN.md §1.1 (architectural vision), §2.1 (`facade-plus-backend-trait` principle), §3.1 (domain model with eight types: four facades + four backend traits), §3.2 (component model showing per-primitive ClientHub registration).
+- DESIGN.md §1.1 (architectural vision), §2.1 (`facade-plus-backend-trait` principle), §3.1 (domain model with six types: three facades + three backend traits), §3.2 (component model showing per-primitive ClientHub registration).
 
 ## Traceability
 
@@ -265,10 +262,10 @@ This decision directly addresses the following requirements and design elements:
 - `cpt-cf-clst-nfr-cross-backend-stability` — Plugin contract surface stays stable as consumer ergonomics evolve.
 - `cpt-cf-clst-nfr-plugin-stability` — Per-primitive `*V1` versioning lets plugins evolve incompatibly without coupled bumps.
 - `cpt-cf-clst-principle-facade-plus-backend-trait` (DESIGN §2.1) — Stated as a load-bearing design principle.
-- `cpt-cf-clst-component-sdk` (DESIGN §3.2) — SDK hosts the four facade structs + four backend traits.
+- `cpt-cf-clst-component-sdk` (DESIGN §3.2) — SDK hosts the three facade structs + three backend traits.
 - `cpt-cf-clst-component-wiring` (DESIGN §3.2) — Wiring registers `Arc<dyn _Backend>` per profile per primitive.
 - `cpt-cf-clst-component-plugins` (DESIGN §3.2) — Plugins implement only the backend traits they serve.
-- DESIGN §3.1 Domain Model — Eight type entries (four `*V1` facades + four `*Backend` traits) are the realization of this ADR.
+- DESIGN §3.1 Domain Model — Six type entries (three `*V1` facades + three `*Backend` traits) are the realization of this ADR.
 
 **Sibling ADRs:**
 

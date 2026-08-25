@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 // (overridable via the `GTS_ID_PREFIX` env var at build
 // time). Used to assemble the canonical error type id prefix without
 // hard-coding the literal prefix.
-use toolkit_gts::{GTS_ID_PREFIX, GTS_ID_URI_PREFIX, gts_uri};
+use toolkit_gts::{GTS_ID_PREFIX, GTS_ID_URI_PREFIX, gts_id, gts_uri};
 
 use crate::context::{
     Aborted, AlreadyExists, Cancelled, DataLoss, DeadlineExceeded, FailedPrecondition, Internal,
@@ -12,26 +12,199 @@ use crate::context::{
     Unauthenticated, Unimplemented, Unknown,
 };
 use crate::error::CanonicalError;
+use crate::transport::TransportOverrides;
 
 /// Media type for RFC 9457 `application/problem+json` responses.
 pub const APPLICATION_PROBLEM_JSON: &str = "application/problem+json";
 
 // ---------------------------------------------------------------------------
+// ProblemCategory — canonical-category selector for typed contract errors.
+// ---------------------------------------------------------------------------
+
+/// One of the 16 canonical AIP-193 categories. Mirrors [`CanonicalError`]
+/// variants for the purpose of building a [`Problem`] envelope from a
+/// typed contract error (PRD #1536 `#[derive(ContractError)]`) without
+/// requiring the SDK author to construct a full `CanonicalError`
+/// (which requires per-category context payloads).
+///
+/// HTTP status and GTS URI are determined entirely by the category; the
+/// contract error supplies `error_code` / `error_domain` extensions plus a
+/// JSON payload in `context["data"]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ProblemCategory {
+    Cancelled,
+    Unknown,
+    InvalidArgument,
+    DeadlineExceeded,
+    NotFound,
+    AlreadyExists,
+    PermissionDenied,
+    ResourceExhausted,
+    FailedPrecondition,
+    Aborted,
+    OutOfRange,
+    Unimplemented,
+    Internal,
+    ServiceUnavailable,
+    DataLoss,
+    Unauthenticated,
+}
+
+impl ProblemCategory {
+    /// GTS URI fragment (without the `gts://` scheme). Identical to the
+    /// fragment emitted by [`CanonicalError::gts_type`] for the matching
+    /// variant.
+    #[must_use]
+    pub fn gts_fragment(self) -> &'static str {
+        match self {
+            Self::Cancelled => gts_id!("cf.core.errors.err.v1~cf.core.err.cancelled.v1~"),
+            Self::Unknown => gts_id!("cf.core.errors.err.v1~cf.core.err.unknown.v1~"),
+            Self::InvalidArgument => {
+                gts_id!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~")
+            }
+            Self::DeadlineExceeded => {
+                gts_id!("cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1~")
+            }
+            Self::NotFound => gts_id!("cf.core.errors.err.v1~cf.core.err.not_found.v1~"),
+            Self::AlreadyExists => {
+                gts_id!("cf.core.errors.err.v1~cf.core.err.already_exists.v1~")
+            }
+            Self::PermissionDenied => {
+                gts_id!("cf.core.errors.err.v1~cf.core.err.permission_denied.v1~")
+            }
+            Self::ResourceExhausted => {
+                gts_id!("cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~")
+            }
+            Self::FailedPrecondition => {
+                gts_id!("cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~")
+            }
+            Self::Aborted => gts_id!("cf.core.errors.err.v1~cf.core.err.aborted.v1~"),
+            Self::OutOfRange => gts_id!("cf.core.errors.err.v1~cf.core.err.out_of_range.v1~"),
+            Self::Unimplemented => {
+                gts_id!("cf.core.errors.err.v1~cf.core.err.unimplemented.v1~")
+            }
+            Self::Internal => gts_id!("cf.core.errors.err.v1~cf.core.err.internal.v1~"),
+            Self::ServiceUnavailable => {
+                gts_id!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~")
+            }
+            Self::DataLoss => gts_id!("cf.core.errors.err.v1~cf.core.err.data_loss.v1~"),
+            Self::Unauthenticated => {
+                gts_id!("cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~")
+            }
+        }
+    }
+
+    /// HTTP status mapping per AIP-193 and gRPC↔HTTP conventions.
+    #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "each canonical category is mapped explicitly per AIP-193; collapsing arms whose codes happen to coincide today would silently hide a future schema mismatch."
+    )]
+    pub fn http_status(self) -> u16 {
+        match self {
+            Self::Cancelled => 499,
+            Self::Unknown => 500,
+            Self::InvalidArgument => 400,
+            Self::DeadlineExceeded => 504,
+            Self::NotFound => 404,
+            Self::AlreadyExists => 409,
+            Self::PermissionDenied => 403,
+            Self::ResourceExhausted => 429,
+            Self::FailedPrecondition => 400,
+            Self::Aborted => 409,
+            Self::OutOfRange => 400,
+            Self::Unimplemented => 501,
+            Self::Internal => 500,
+            Self::ServiceUnavailable => 503,
+            Self::DataLoss => 500,
+            Self::Unauthenticated => 401,
+        }
+    }
+
+    /// Human-readable title for the RFC 9457 envelope. Same string as
+    /// [`CanonicalError::title`] for the matching variant.
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Cancelled => "Cancelled",
+            Self::Unknown => "Unknown",
+            Self::InvalidArgument => "Invalid argument",
+            Self::DeadlineExceeded => "Deadline exceeded",
+            Self::NotFound => "Not found",
+            Self::AlreadyExists => "Already exists",
+            Self::PermissionDenied => "Permission denied",
+            Self::ResourceExhausted => "Resource exhausted",
+            Self::FailedPrecondition => "Failed precondition",
+            Self::Aborted => "Aborted",
+            Self::OutOfRange => "Out of range",
+            Self::Unimplemented => "Unimplemented",
+            Self::Internal => "Internal",
+            Self::ServiceUnavailable => "Service unavailable",
+            Self::DataLoss => "Data loss",
+            Self::Unauthenticated => "Unauthenticated",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Problem (RFC 9457)
 // ---------------------------------------------------------------------------
 
+/// RFC 9457 §3.1.1's own designated default for `type` when a Problem
+/// carries no more specific type than its HTTP status code.
+fn default_problem_type() -> String {
+    "about:blank".to_owned()
+}
+
+/// Deserialize default for `context` when a foreign peer's Problem omits it.
+/// `serde_json::Value`'s own `Default` is `Value::Null`, which is wrong here:
+/// `TryFrom<Problem>` dispatches a category's context type by deserializing
+/// this value, and context-free categories (`NotFoundV1 {}` and similar) fail
+/// to deserialize from `null` ("invalid type: null, expected struct") but
+/// succeed from an empty object - `{}` is the value that actually round-trips.
+fn default_context() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+/// RFC 9457 §3.1 makes every member but this struct's Rust type reflects
+/// optional on the wire; `status` is `Option<u16>` rather than a defaulted
+/// `u16` since a synthetic `0` would be an actively wrong status, not an
+/// honest "wasn't there" (same reasoning as `default_context`, below).
+/// Callers that have a real status to fall back to normalize `None` after
+/// parsing (`enrich_problem_response`, `map_http_error`); SSE has none and
+/// preserves the absence. `Serialize` is unaffected - `from_error` always
+/// populates every field, so wire output is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Problem {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_problem_type")]
     pub problem_type: String,
+    #[serde(default)]
     pub title: String,
-    pub status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default)]
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    #[serde(default = "default_context")]
     pub context: serde_json::Value,
+
+    /// Machine-readable identifier of the typed error variant inside its
+    /// domain. Set by [`#[derive(ContractError)]`] when a contract error
+    /// crosses the wire so PRD-conformant peers can reconstruct the
+    /// original Rust enum variant via `error_code` + `error_domain`.
+    /// `None` for canonical-category-only errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+
+    /// Namespace owning the `error_code`. Conventionally
+    /// `<service>.<version>` (e.g. `billing.v1`). `None` when no contract
+    /// error is in play.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_domain: Option<String>,
 }
 
 impl Problem {
@@ -62,12 +235,61 @@ impl Problem {
         Ok(Problem {
             problem_type,
             title,
-            status,
+            status: Some(status),
             detail,
             instance: None,
             trace_id: None,
             context,
+            error_code: None,
+            error_domain: None,
         })
+    }
+
+    /// Attach the `error_code` extension field (PRD #1536 contract-error
+    /// envelope). Returns `self` for chaining.
+    #[must_use]
+    pub fn with_error_code(mut self, code: impl Into<String>) -> Self {
+        self.error_code = Some(code.into());
+        self
+    }
+
+    /// Attach the `error_domain` extension field. Returns `self` for chaining.
+    #[must_use]
+    pub fn with_error_domain(mut self, domain: impl Into<String>) -> Self {
+        self.error_domain = Some(domain.into());
+        self
+    }
+
+    /// Build a [`Problem`] for a typed contract error (PRD #1536 envelope).
+    ///
+    /// `category` selects one of the 16 canonical AIP-193 categories; the
+    /// resulting `Problem` carries the matching GTS URI in `type`, the
+    /// canonical HTTP status, and the canonical title. `error_code` and
+    /// `error_domain` populate the PRD extension fields, and `data` is
+    /// placed at `context["data"]` to carry variant-specific payload.
+    ///
+    /// Used by `#[derive(ContractError)]` emit-paths; SDK authors rarely
+    /// call this directly.
+    pub fn contract_error(
+        category: ProblemCategory,
+        error_code: impl Into<String>,
+        error_domain: impl Into<String>,
+        detail: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        let mut context = serde_json::Map::new();
+        context.insert("data".to_owned(), data);
+        Problem {
+            problem_type: format!("gts://{}", category.gts_fragment()),
+            title: category.title().to_owned(),
+            status: Some(category.http_status()),
+            detail: detail.into(),
+            instance: None,
+            trace_id: None,
+            context: serde_json::Value::Object(context),
+            error_code: Some(error_code.into()),
+            error_domain: Some(error_domain.into()),
+        }
     }
 
     /// Convert a `CanonicalError` to a `Problem`, including the internal
@@ -81,9 +303,14 @@ impl Problem {
     /// In production, use [`from_error`](Self::from_error) instead — it
     /// never leaks the diagnostic string.
     ///
+    /// Available only when the `debug-problem` feature is enabled — intended for
+    /// local development. Enabling this in production leaks diagnostic detail
+    /// onto the wire.
+    ///
     /// # Errors
     ///
     /// Returns `serde_json::Error` if the context fails to serialize.
+    #[cfg(feature = "debug-problem")]
     pub fn from_error_debug(err: &CanonicalError) -> Result<Self, serde_json::Error> {
         let mut problem = Self::from_error(err)?;
 
@@ -130,9 +357,9 @@ fn serialize_context(err: &CanonicalError) -> Result<serde_json::Value, serde_js
     }
 }
 
-// `Problem.context` is `serde_json::Value`, so stringifying the serialization
-// error is the intended fallback here. The original CanonicalError is already
-// preserved in the other Problem fields.
+// `Problem.context` must be a JSON object per the OpenAPI schema, so we wrap
+// the serialization error in `{ "serialization_error": ... }`. The original
+// CanonicalError is already preserved in the other Problem fields.
 #[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<CanonicalError> for Problem {
     fn from(err: CanonicalError) -> Self {
@@ -141,11 +368,13 @@ impl From<CanonicalError> for Problem {
             Err(ser_err) => Problem {
                 problem_type: gts_uri!(err.gts_type()),
                 title: err.title().to_owned(),
-                status: err.status_code(),
+                status: Some(err.status_code()),
                 detail: err.detail().to_owned(),
                 instance: None,
                 trace_id: None,
-                context: serde_json::Value::String(ser_err.to_string()),
+                context: serde_json::json!({ "serialization_error": ser_err.to_string() }),
+                error_code: None,
+                error_domain: None,
             },
         }
     }
@@ -190,6 +419,21 @@ pub enum ProblemConversionError {
         #[source]
         source: serde_json::Error,
     },
+
+    /// The wire `status` is not a valid HTTP status code (RFC 9110: a
+    /// three-digit integer in the 100-599 range). Rejected here rather than
+    /// silently stored as an override, since `TryFrom<Problem>` is the
+    /// crate's one boundary for untrusted/out-of-process input.
+    #[error("invalid HTTP status in Problem: {0}")]
+    InvalidStatus(u16),
+
+    /// The wire `status` is syntactically valid but is in a different HTTP
+    /// status-code class than the matched category's default, e.g. an
+    /// `invalid_argument` (4xx) `Problem` carrying `status: 500`. Flipping
+    /// between client-fault and server-fault semantics changes client retry
+    /// behavior, so this is rejected rather than accepted as an override.
+    #[error("status {status} is a different HTTP status class than category {category}'s default")]
+    CategoryStatusMismatch { category: &'static str, status: u16 },
 }
 
 /// Prefix of every canonical GTS identifier. Stripped to expose the category
@@ -262,102 +506,118 @@ impl TryFrom<Problem> for CanonicalError {
         let (resource_type, resource_name) = extract_resource_fields(&problem.context);
         let ctx_value = problem.context;
 
-        let canonical = match category {
+        let mut canonical = match category {
             "cancelled" => Self::Cancelled {
                 ctx: deserialize_ctx::<Cancelled>("cancelled", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "unknown" => Self::Unknown {
                 ctx: deserialize_ctx::<Unknown>("unknown", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "invalid_argument" => Self::InvalidArgument {
                 ctx: deserialize_ctx::<InvalidArgument>("invalid_argument", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "deadline_exceeded" => Self::DeadlineExceeded {
                 ctx: deserialize_ctx::<DeadlineExceeded>("deadline_exceeded", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "not_found" => Self::NotFound {
                 ctx: deserialize_ctx::<NotFound>("not_found", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "already_exists" => Self::AlreadyExists {
                 ctx: deserialize_ctx::<AlreadyExists>("already_exists", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "permission_denied" => Self::PermissionDenied {
                 ctx: deserialize_ctx::<PermissionDenied>("permission_denied", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "resource_exhausted" => Self::ResourceExhausted {
                 ctx: deserialize_ctx::<ResourceExhausted>("resource_exhausted", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "failed_precondition" => Self::FailedPrecondition {
                 ctx: deserialize_ctx::<FailedPrecondition>("failed_precondition", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "aborted" => Self::Aborted {
                 ctx: deserialize_ctx::<Aborted>("aborted", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "out_of_range" => Self::OutOfRange {
                 ctx: deserialize_ctx::<OutOfRange>("out_of_range", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "unimplemented" => Self::Unimplemented {
                 ctx: deserialize_ctx::<Unimplemented>("unimplemented", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "internal" => Self::Internal {
                 // `Internal.description` is `#[serde(skip)]`; the wire
                 // never carries it, so it reconstructs as an empty string.
                 ctx: deserialize_ctx::<Internal>("internal", ctx_value)?,
                 detail,
+                overrides: TransportOverrides::default(),
             },
             "service_unavailable" => Self::ServiceUnavailable {
                 ctx: deserialize_ctx::<ServiceUnavailable>("service_unavailable", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "data_loss" => Self::DataLoss {
                 ctx: deserialize_ctx::<DataLoss>("data_loss", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             "unauthenticated" => Self::Unauthenticated {
                 ctx: deserialize_ctx::<Unauthenticated>("unauthenticated", ctx_value)?,
                 detail,
                 resource_type,
                 resource_name,
+                overrides: TransportOverrides::default(),
             },
             _ => {
                 return Err(ProblemConversionError::UnknownProblemType(
@@ -365,6 +625,29 @@ impl TryFrom<Problem> for CanonicalError {
                 ));
             }
         };
+
+        // A genuinely absent `status` isn't an error - `canonical` just
+        // keeps the category's own default status untouched.
+        if let Some(status) = problem.status {
+            if !(100..=599).contains(&status) {
+                return Err(ProblemConversionError::InvalidStatus(status));
+            }
+
+            if !canonical.is_same_status_class(status) {
+                return Err(ProblemConversionError::CategoryStatusMismatch {
+                    category: canonical.category_name(),
+                    status,
+                });
+            }
+
+            // Recover any transport override purely from the wire `status`
+            // — no additional field on `Problem` is needed since the
+            // category's default status is already known
+            // (`default_http_status`).
+            if status != canonical.default_http_status() {
+                canonical.transport_overrides_mut().http_status = Some(status);
+            }
+        }
 
         Ok(canonical)
     }
@@ -375,24 +658,46 @@ impl TryFrom<Problem> for CanonicalError {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "axum")]
+fn service_unavailable_retry_after_seconds(problem: &Problem) -> Option<u64> {
+    if category_from_problem_type(&problem.problem_type) != Some("service_unavailable") {
+        return None;
+    }
+
+    ServiceUnavailable::deserialize(&problem.context)
+        .ok()?
+        .retry_after_seconds
+}
+
+#[cfg(feature = "axum")]
 impl axum::response::IntoResponse for Problem {
     fn into_response(self) -> axum::response::Response {
         match serde_json::to_vec(&self) {
             Ok(body) => {
-                let status = http::StatusCode::from_u16(self.status)
+                let status = self
+                    .status
+                    .and_then(|s| http::StatusCode::from_u16(s).ok())
                     .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-                (
+                let retry_after_seconds = service_unavailable_retry_after_seconds(&self);
+                let mut response = (
                     status,
                     [(http::header::CONTENT_TYPE, APPLICATION_PROBLEM_JSON)],
                     body,
                 )
-                    .into_response()
+                    .into_response();
+
+                if let Some(seconds) = retry_after_seconds {
+                    response
+                        .headers_mut()
+                        .insert(http::header::RETRY_AFTER, http::HeaderValue::from(seconds));
+                }
+
+                response
             }
             Err(e) => {
                 tracing::error!(
                     error = %e,
                     problem_type = %self.problem_type,
-                    status = self.status,
+                    status = ?self.status,
                     "failed to serialize Problem; emitting fallback body",
                 );
                 let body = format!(
@@ -486,3 +791,8 @@ impl utoipa::ToSchema for Problem {
         std::borrow::Cow::Borrowed("Problem")
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "problem_tests.rs"]
+mod tests;

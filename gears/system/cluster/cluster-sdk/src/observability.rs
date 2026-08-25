@@ -66,16 +66,6 @@ pub mod spans {
     pub const LOCK_RENEW: &str = "cluster.lock.renew";
     /// Span covering `LockGuard::release`.
     pub const LOCK_RELEASE: &str = "cluster.lock.release";
-
-    // Service-discovery primitive.
-    /// Span covering `ServiceDiscoveryV1::register`.
-    pub const DISCOVERY_REGISTER: &str = "cluster.discovery.register";
-    /// Span covering `ServiceDiscoveryV1::discover`.
-    pub const DISCOVERY_DISCOVER: &str = "cluster.discovery.discover";
-    /// Span covering `ServiceDiscoveryV1::watch`.
-    pub const DISCOVERY_WATCH: &str = "cluster.discovery.watch";
-    /// Span covering `ServiceHandle::deregister`.
-    pub const DISCOVERY_DEREGISTER: &str = "cluster.discovery.deregister";
 }
 
 /// Prometheus metric names (underscored lowercase). Labels are restricted to
@@ -91,8 +81,6 @@ pub mod metrics {
     pub const LOCK_OP_DURATION_SECONDS: &str = "cluster_lock_op_duration_seconds";
     /// Counter of leadership transitions. Labels: `provider`, `transition`.
     pub const LEADER_TRANSITIONS_TOTAL: &str = "cluster_leader_transitions_total";
-    /// Counter of service-discovery operations. Labels: `provider`, `op`, `result`.
-    pub const DISCOVERY_OPS_TOTAL: &str = "cluster_discovery_ops_total";
     /// Counter of watch resets/resubscriptions. Labels: `provider`, `primitive`.
     pub const WATCH_RESETS_TOTAL: &str = "cluster_watch_resets_total";
     /// Counter of provider/backend errors. Labels: `provider`, `kind`.
@@ -126,7 +114,7 @@ pub mod fields {
         pub const TRANSITION: &str = "transition";
         /// The provider-error retryability class.
         pub const KIND: &str = "kind";
-        /// The primitive (e.g. `cache`, `lock`, `leader`, `discovery`).
+        /// The primitive (e.g. `cache`, `lock`, `leader`).
         pub const PRIMITIVE: &str = "primitive";
     }
 
@@ -142,8 +130,6 @@ pub mod fields {
         pub const LOCK: &str = "lock";
         /// An election name.
         pub const ELECTION: &str = "election";
-        /// A service instance ID.
-        pub const INSTANCE_ID: &str = "instance_id";
         /// The cluster profile.
         pub const PROFILE: &str = "profile";
     }
@@ -272,8 +258,6 @@ pub mod primitive {
     pub const LOCK: &str = "lock";
     /// The leader-election primitive.
     pub const LEADER: &str = "leader";
-    /// The service-discovery primitive.
-    pub const DISCOVERY: &str = "discovery";
 }
 
 /// The metrics sink the SDK instrumentation emits through.
@@ -308,9 +292,6 @@ pub trait ClusterMetrics: Send + Sync {
     /// [`transition`](self::transition) value. Backs
     /// [`metrics::LEADER_TRANSITIONS_TOTAL`].
     fn leader_transition(&self, transition: &str);
-    /// Records one service-discovery operation. Backs
-    /// [`metrics::DISCOVERY_OPS_TOTAL`].
-    fn discovery_op(&self, op: &str, result: &str);
     /// Records a watch reset/resubscription for `primitive` (a
     /// [`primitive`](self::primitive) value). Backs
     /// [`metrics::WATCH_RESETS_TOTAL`].
@@ -333,7 +314,6 @@ impl ClusterMetrics for NoopMetrics {
     fn lock_op(&self, _op: &str, _result: &str) {}
     fn lock_op_duration(&self, _op: &str, _seconds: f64) {}
     fn leader_transition(&self, _transition: &str) {}
-    fn discovery_op(&self, _op: &str, _result: &str) {}
     fn watch_reset(&self, _primitive: &str) {}
     fn provider_error(&self, _kind: &str) {}
 }

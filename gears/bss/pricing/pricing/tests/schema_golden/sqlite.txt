@@ -1,0 +1,1123 @@
+INDEX idx_pricing_approval_key_approval
+  ON pricing_approval_key
+  DDL CREATE INDEX idx_pricing_approval_key_approval ON pricing_approval_key (approval_id)
+INDEX idx_pricing_approval_subject
+  ON pricing_approval
+  DDL CREATE INDEX idx_pricing_approval_subject ON pricing_approval (tenant_id, state, subject_ref)
+INDEX idx_pricing_audit_log_recorded
+  ON pricing_audit_log
+  DDL CREATE INDEX idx_pricing_audit_log_recorded ON pricing_audit_log (tenant_id, recorded_at)
+INDEX idx_pricing_audit_log_subject
+  ON pricing_audit_log
+  DDL CREATE INDEX idx_pricing_audit_log_subject ON pricing_audit_log (tenant_id, subject_kind, subject_ref, recorded_at)
+INDEX idx_pricing_bulk_operation_live
+  ON pricing_bulk_operation
+  DDL CREATE INDEX idx_pricing_bulk_operation_live ON pricing_bulk_operation (tenant_id, state, submitted_at)
+INDEX idx_pricing_bulk_row_lock_operation
+  ON pricing_bulk_row_lock
+  DDL CREATE INDEX idx_pricing_bulk_row_lock_operation ON pricing_bulk_row_lock (tenant_id, bulk_operation_id)
+INDEX idx_pricing_bundle_component_plan
+  ON pricing_bundle_component
+  DDL CREATE INDEX idx_pricing_bundle_component_plan ON pricing_bundle_component (tenant_id, component_plan_id)
+INDEX idx_pricing_bundle_component_revision
+  ON pricing_bundle_component
+  DDL CREATE INDEX idx_pricing_bundle_component_revision ON pricing_bundle_component (tenant_id, bundle_id, plan_revision)
+INDEX idx_pricing_bundle_revshare_group_revision
+  ON pricing_bundle_revshare_group
+  DDL CREATE INDEX idx_pricing_bundle_revshare_group_revision ON pricing_bundle_revshare_group (tenant_id, bundle_id, plan_revision)
+INDEX idx_pricing_bundle_revshare_revision
+  ON pricing_bundle_revshare
+  DDL CREATE INDEX idx_pricing_bundle_revshare_revision ON pricing_bundle_revshare (tenant_id, bundle_id, plan_revision)
+INDEX idx_pricing_bundle_tenant
+  ON pricing_bundle
+  DDL CREATE INDEX idx_pricing_bundle_tenant ON pricing_bundle (tenant_id, bundle_id)
+INDEX idx_pricing_catalog_version_ref_version
+  ON pricing_catalog_version_ref
+  DDL CREATE INDEX idx_pricing_catalog_version_ref_version ON pricing_catalog_version_ref (tenant_id, catalog_version)
+INDEX idx_pricing_composite_meter_revision
+  ON pricing_composite_meter
+  DDL CREATE INDEX idx_pricing_composite_meter_revision ON pricing_composite_meter (tenant_id, plan_id, plan_revision)
+INDEX idx_pricing_group_membership_payer
+  ON pricing_group_membership
+  DDL CREATE INDEX idx_pricing_group_membership_payer ON pricing_group_membership (tenant_id, payer_tenant_id, effective_from)
+INDEX idx_pricing_group_membership_walk
+  ON pricing_group_membership
+  DDL CREATE INDEX idx_pricing_group_membership_walk ON pricing_group_membership (tenant_id, group_value, effective_from, membership_id)
+INDEX idx_pricing_idempotency_dedup_created
+  ON pricing_idempotency_dedup
+  DDL CREATE INDEX idx_pricing_idempotency_dedup_created ON pricing_idempotency_dedup (tenant_id, created_at_utc)
+INDEX idx_pricing_migration_due
+  ON pricing_migration
+  DDL CREATE INDEX idx_pricing_migration_due ON pricing_migration (state, effective_at)
+INDEX idx_pricing_migration_source
+  ON pricing_migration
+  DDL CREATE INDEX idx_pricing_migration_source ON pricing_migration (tenant_id, source_plan_id)
+INDEX idx_pricing_migration_target
+  ON pricing_migration
+  DDL CREATE INDEX idx_pricing_migration_target ON pricing_migration (tenant_id, target_plan_id)
+INDEX idx_pricing_operator_flag_by_flag
+  ON pricing_operator_flag
+  DDL CREATE INDEX idx_pricing_operator_flag_by_flag ON pricing_operator_flag (tenant_id, flag, set_at)
+INDEX idx_pricing_outbox_undrained
+  ON pricing_outbox
+  DDL CREATE INDEX idx_pricing_outbox_undrained ON pricing_outbox (tenant_id, aggregate_id, seq) WHERE published_at IS NULL
+INDEX idx_pricing_plan_addon_rule_revision
+  ON pricing_plan_addon_rule
+  DDL CREATE INDEX idx_pricing_plan_addon_rule_revision ON pricing_plan_addon_rule (tenant_id, plan_id, plan_revision)
+INDEX idx_pricing_plan_descriptor_set_revision
+  ON pricing_plan_descriptor_set
+  DDL CREATE INDEX idx_pricing_plan_descriptor_set_revision ON pricing_plan_descriptor_set (tenant_id, plan_id, plan_revision)
+INDEX idx_pricing_plan_period_floor_cap_revision
+  ON pricing_plan_period_floor_cap
+  DDL CREATE INDEX idx_pricing_plan_period_floor_cap_revision ON pricing_plan_period_floor_cap (tenant_id, plan_id, plan_revision)
+INDEX idx_pricing_plan_phase_revision
+  ON pricing_plan_phase
+  DDL CREATE INDEX idx_pricing_plan_phase_revision ON pricing_plan_phase (tenant_id, plan_id, plan_revision)
+INDEX idx_pricing_plan_tenant
+  ON pricing_plan
+  DDL CREATE INDEX idx_pricing_plan_tenant ON pricing_plan (tenant_id, plan_id, revision)
+INDEX idx_pricing_price_overlay_line_amount_tenant
+  ON pricing_price_overlay_line_amount
+  DDL CREATE INDEX idx_pricing_price_overlay_line_amount_tenant ON pricing_price_overlay_line_amount (tenant_id, line_id)
+INDEX idx_pricing_price_overlay_line_plan
+  ON pricing_price_overlay_line
+  DDL CREATE INDEX idx_pricing_price_overlay_line_plan ON pricing_price_overlay_line (tenant_id, plan_id)
+INDEX idx_pricing_price_overlay_line_revision
+  ON pricing_price_overlay_line
+  DDL CREATE INDEX idx_pricing_price_overlay_line_revision ON pricing_price_overlay_line (tenant_id, price_overlay_id, overlay_revision)
+INDEX idx_pricing_price_overlay_scope
+  ON pricing_price_overlay
+  DDL CREATE INDEX idx_pricing_price_overlay_scope ON pricing_price_overlay (tenant_id, scope_class, scope_value, lifecycle_state)
+INDEX idx_pricing_price_plan
+  ON pricing_price
+  DDL CREATE INDEX idx_pricing_price_plan ON pricing_price (tenant_id, plan_id, lifecycle_state)
+INDEX idx_pricing_price_supersedes
+  ON pricing_price
+  DDL CREATE INDEX idx_pricing_price_supersedes ON pricing_price (tenant_id, supersedes_price_id) WHERE supersedes_price_id IS NOT NULL
+INDEX idx_pricing_price_tier_band_price
+  ON pricing_price_tier_band
+  DDL CREATE INDEX idx_pricing_price_tier_band_price ON pricing_price_tier_band (tenant_id, price_id)
+INDEX idx_pricing_price_window_due
+  ON pricing_price_window
+  DDL CREATE INDEX idx_pricing_price_window_due ON pricing_price_window (state, effective_from)
+INDEX idx_pricing_price_window_price
+  ON pricing_price_window
+  DDL CREATE INDEX idx_pricing_price_window_price ON pricing_price_window (tenant_id, price_id)
+INDEX idx_pricing_read_model_resolve
+  ON pricing_read_model
+  DDL CREATE INDEX idx_pricing_read_model_resolve ON pricing_read_model (tenant_id, subject_kind, subject_ref, catalog_version DESC)
+INDEX idx_pricing_snapshot_provenance_plan
+  ON pricing_snapshot_provenance
+  DDL CREATE INDEX idx_pricing_snapshot_provenance_plan ON pricing_snapshot_provenance (tenant_id, source_plan_id)
+INDEX uq_pricing_approval_key_pending
+  ON pricing_approval_key
+  DDL CREATE UNIQUE INDEX uq_pricing_approval_key_pending ON pricing_approval_key (tenant_id, scope_key) WHERE state = 'submitted'
+INDEX uq_pricing_approval_policy_pending
+  ON pricing_approval
+  DDL CREATE UNIQUE INDEX uq_pricing_approval_policy_pending ON pricing_approval (tenant_id) WHERE subject_kind = 'policy' AND state = 'submitted'
+INDEX uq_pricing_bulk_operation_client_key
+  ON pricing_bulk_operation
+  DDL CREATE UNIQUE INDEX uq_pricing_bulk_operation_client_key ON pricing_bulk_operation (tenant_id, kind, client_key)
+INDEX uq_pricing_bundle_plan
+  ON pricing_bundle
+  DDL CREATE UNIQUE INDEX uq_pricing_bundle_plan ON pricing_bundle (tenant_id, plan_id)
+INDEX uq_pricing_composite_meter_output
+  ON pricing_composite_meter
+  DDL CREATE UNIQUE INDEX uq_pricing_composite_meter_output ON pricing_composite_meter (tenant_id, plan_id, plan_revision, output_unit)
+INDEX uq_pricing_outbox_dedup_key
+  ON pricing_outbox
+  DDL CREATE UNIQUE INDEX uq_pricing_outbox_dedup_key ON pricing_outbox (tenant_id, dedup_key)
+INDEX uq_pricing_outbox_sequence
+  ON pricing_outbox
+  DDL CREATE UNIQUE INDEX uq_pricing_outbox_sequence ON pricing_outbox (tenant_id, aggregate_id, seq)
+INDEX uq_pricing_plan_current
+  ON pricing_plan
+  DDL CREATE UNIQUE INDEX uq_pricing_plan_current ON pricing_plan (plan_id) WHERE lifecycle_state IN ('published','retired')
+INDEX uq_pricing_plan_open_draft
+  ON pricing_plan
+  DDL CREATE UNIQUE INDEX uq_pricing_plan_open_draft ON pricing_plan (plan_id) WHERE lifecycle_state = 'draft'
+INDEX uq_pricing_plan_phase_terminal
+  ON pricing_plan_phase
+  DDL CREATE UNIQUE INDEX uq_pricing_plan_phase_terminal ON pricing_plan_phase (plan_id, plan_revision) WHERE converts_to_phase_id IS NULL
+INDEX uq_pricing_price_meter_line_current
+  ON pricing_price
+  DDL CREATE UNIQUE INDEX uq_pricing_price_meter_line_current ON pricing_price (tenant_id, plan_id, currency, region, price_overlay, phase, price_eligibility, cohort, meter, dimension_key) WHERE lifecycle_state = 'published' AND meter IS NOT NULL
+INDEX uq_pricing_price_overlay_line_key
+  ON pricing_price_overlay_line
+  DDL CREATE UNIQUE INDEX uq_pricing_price_overlay_line_key ON pricing_price_overlay_line (price_overlay_id, overlay_revision, COALESCE(plan_id, '00000000-0000-0000-0000-000000000000'), COALESCE(target_sku, ''), COALESCE(cohort, ''))
+INDEX uq_pricing_price_overlay_open_draft
+  ON pricing_price_overlay
+  DDL CREATE UNIQUE INDEX uq_pricing_price_overlay_open_draft ON pricing_price_overlay (price_overlay_id) WHERE lifecycle_state = 'draft'
+INDEX uq_pricing_price_overlay_precedence
+  ON pricing_price_overlay
+  DDL CREATE UNIQUE INDEX uq_pricing_price_overlay_precedence ON pricing_price_overlay (tenant_id, scope_class, precedence) WHERE lifecycle_state = 'published'
+INDEX uq_pricing_price_scope_key_current
+  ON pricing_price
+  DDL CREATE UNIQUE INDEX uq_pricing_price_scope_key_current ON pricing_price (tenant_id, plan_id, currency, region, price_overlay, phase, price_eligibility, charge_kind, cohort, COALESCE(meter, ''), dimension_key) WHERE lifecycle_state = 'published'
+INDEX uq_pricing_price_scope_key_draft
+  ON pricing_price
+  DDL CREATE UNIQUE INDEX uq_pricing_price_scope_key_draft ON pricing_price (tenant_id, plan_id, currency, region, price_overlay, phase, price_eligibility, charge_kind, cohort, COALESCE(meter, ''), dimension_key) WHERE lifecycle_state = 'draft'
+INDEX uq_pricing_snapshot_provenance_subscription
+  ON pricing_snapshot_provenance
+  DDL CREATE UNIQUE INDEX uq_pricing_snapshot_provenance_subscription ON pricing_snapshot_provenance (tenant_id, subscription_ref)
+TABLE coord_leases
+  COLUMN attempts INTEGER NOT NULL DEFAULT 0 PK 0
+  COLUMN key TEXT NULL DEFAULT - PK 1
+  COLUMN locked_by TEXT NULL DEFAULT - PK 0
+  COLUMN locked_until TEXT NOT NULL DEFAULT '1970-01-01 00:00:00+00:00' PK 0
+TABLE pricing_approval
+  COLUMN approval_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN approver_principal TEXT NULL DEFAULT - PK 0
+  COLUMN content_hash BLOB NOT NULL DEFAULT - PK 0
+  COLUMN decided_at TEXT NULL DEFAULT - PK 0
+  COLUMN materiality TEXT NOT NULL DEFAULT - PK 0
+  COLUMN reason TEXT NULL DEFAULT - PK 0
+  COLUMN state TEXT NOT NULL DEFAULT - PK 0
+  COLUMN subject_kind TEXT NOT NULL DEFAULT - PK 0
+  COLUMN subject_ref TEXT NOT NULL DEFAULT - PK 0
+  COLUMN submitted_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN submitter_principal TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_approval_approver CHECK (state IN ('submitted','voided') OR approver_principal IS NOT NULL)
+  CONSTRAINT chk_pricing_approval_decided_at CHECK ((state = 'submitted') = (decided_at IS NULL))
+  CONSTRAINT chk_pricing_approval_distinct_principals CHECK (approver_principal IS NULL OR approver_principal <> submitter_principal)
+  CONSTRAINT chk_pricing_approval_reason CHECK (state <> 'rejected' OR reason IS NOT NULL)
+  CONSTRAINT chk_pricing_approval_state CHECK (state IN ('submitted','approved','rejected','voided'))
+  CONSTRAINT chk_pricing_approval_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership'))
+TABLE pricing_approval_key
+  COLUMN approval_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN scope_key TEXT NOT NULL DEFAULT - PK 2
+  COLUMN state TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_approval_key_state CHECK (state IN ('submitted','approved','rejected','voided'))
+TABLE pricing_approval_threshold
+  COLUMN absolute_minor bigint NULL DEFAULT - PK 0
+  COLUMN created_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN created_by TEXT NOT NULL DEFAULT - PK 0
+  COLUMN currency varchar(3) NOT NULL DEFAULT - PK 3
+  COLUMN effective_from TEXT NOT NULL DEFAULT - PK 0
+  COLUMN percent_bp INTEGER NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN version bigint NOT NULL DEFAULT - PK 2
+  CONSTRAINT chk_pricing_approval_threshold_absolute_non_negative CHECK (absolute_minor IS NULL OR absolute_minor >= 0)
+  CONSTRAINT chk_pricing_approval_threshold_basis CHECK ((absolute_minor IS NULL) <> (percent_bp IS NULL))
+  CONSTRAINT chk_pricing_approval_threshold_currency CHECK (length(currency) = 3)
+  CONSTRAINT chk_pricing_approval_threshold_percent_positive CHECK (percent_bp IS NULL OR percent_bp > 0)
+  CONSTRAINT chk_pricing_approval_threshold_version CHECK (version >= 0)
+TABLE pricing_approval_threshold_tombstone
+  COLUMN created_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN created_by TEXT NOT NULL DEFAULT - PK 0
+  COLUMN effective_from TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN version bigint NOT NULL DEFAULT - PK 2
+  CONSTRAINT chk_pricing_approval_threshold_tombstone_version CHECK (version >= 0)
+TABLE pricing_audit_log
+  COLUMN action TEXT NOT NULL DEFAULT - PK 0
+  COLUMN actor_principal_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN after_state TEXT NULL DEFAULT - PK 0
+  COLUMN approval_ref TEXT NULL DEFAULT - PK 0
+  COLUMN before_state TEXT NULL DEFAULT - PK 0
+  COLUMN chain_id TEXT NOT NULL DEFAULT - PK 2
+  COLUMN correlation_id TEXT NULL DEFAULT - PK 0
+  COLUMN entry_kind TEXT NOT NULL DEFAULT 'mutation' PK 0
+  COLUMN prev_hash BLOB NULL DEFAULT - PK 0
+  COLUMN recorded_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN row_hash BLOB NOT NULL DEFAULT - PK 0
+  COLUMN segment_heads TEXT NULL DEFAULT - PK 0
+  COLUMN seq bigint NOT NULL DEFAULT - PK 3
+  COLUMN subject_kind TEXT NOT NULL DEFAULT - PK 0
+  COLUMN subject_ref TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  CONSTRAINT chk_pricing_audit_log_action CHECK (action IN ('create','update','delete','abandon','publish','submit','approve','reject','withdraw','deny','retire','migrate'))
+  CONSTRAINT chk_pricing_audit_log_entry_kind CHECK (entry_kind IN ('mutation','rollup'))
+  CONSTRAINT chk_pricing_audit_log_rollup CHECK ((entry_kind = 'rollup') = (segment_heads IS NOT NULL))
+  CONSTRAINT chk_pricing_audit_log_seq CHECK (seq >= 0)
+  CONSTRAINT chk_pricing_audit_log_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership'))
+TABLE pricing_brand_taxonomy
+  COLUMN display_name TEXT NOT NULL DEFAULT - PK 0
+  COLUMN state TEXT NOT NULL DEFAULT 'active' PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN value TEXT NOT NULL DEFAULT - PK 2
+  CONSTRAINT chk_pricing_brand_taxonomy_state CHECK (state IN ('active', 'retired'))
+  CONSTRAINT chk_pricing_brand_taxonomy_value_present CHECK (length(trim(value, char(9,10,11,12,13,32))) > 0)
+TABLE pricing_bulk_operation
+  COLUMN client_key TEXT NOT NULL DEFAULT - PK 0
+  COLUMN completed_at TEXT NULL DEFAULT - PK 0
+  COLUMN kind TEXT NOT NULL DEFAULT - PK 0
+  COLUMN operation_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN report TEXT NOT NULL DEFAULT '{}' PK 0
+  COLUMN request_hash BLOB NOT NULL DEFAULT X'' PK 0
+  COLUMN state TEXT NOT NULL DEFAULT - PK 0
+  COLUMN submitted_at TEXT NOT NULL DEFAULT - PK 0
+  COLUMN submitted_by TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_bulk_operation_completed_at CHECK ((completed_at IS NOT NULL) = (state IN ('validation_failed', 'completed', 'completed_with_conflicts', 'rejected')))
+  CONSTRAINT chk_pricing_bulk_operation_import_never_awaits CHECK (NOT (kind = 'import' AND state = 'awaiting_approval'))
+  CONSTRAINT chk_pricing_bulk_operation_kind CHECK (kind IN ('import', 'repricing'))
+  CONSTRAINT chk_pricing_bulk_operation_state CHECK (state IN ('validating', 'validation_failed', 'awaiting_approval', 'committing', 'completed', 'completed_with_conflicts', 'rejected'))
+TABLE pricing_bulk_row_lock
+  COLUMN bulk_operation_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN locked_at TEXT NOT NULL DEFAULT - PK 0
+  COLUMN price_id TEXT NOT NULL DEFAULT - PK 2
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  CONSTRAINT fk_pricing_bulk_row_lock_operation FOREIGN KEY (bulk_operation_id)
+  CONSTRAINT fk_pricing_bulk_row_lock_price FOREIGN KEY (price_id)
+  FK bulk_operation_id -> pricing_bulk_operation.operation_id
+  FK price_id -> pricing_price.price_id
+TABLE pricing_bundle
+  COLUMN bundle_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN invoice_itemization TEXT NOT NULL DEFAULT - PK 0
+  COLUMN plan_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN price_basis TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_bundle_invoice_itemization CHECK (invoice_itemization IN ('aggregate', 'itemize'))
+  CONSTRAINT chk_pricing_bundle_price_basis CHECK (price_basis IN ('sum_of_parts', 'own_price'))
+TABLE pricing_bundle_component
+  COLUMN bundle_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN component_plan_id TEXT NOT NULL DEFAULT - PK 3
+  COLUMN included_sku_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN max_qty INT NULL DEFAULT - PK 0
+  COLUMN min_qty INT NULL DEFAULT - PK 0
+  COLUMN plan_revision bigint NOT NULL DEFAULT - PK 2
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_bundle_component_min_qty CHECK (min_qty IS NULL OR min_qty >= 0)
+  CONSTRAINT chk_pricing_bundle_component_qty_range CHECK (min_qty IS NULL OR max_qty IS NULL OR min_qty <= max_qty)
+  CONSTRAINT fk_pricing_bundle_component_bundle FOREIGN KEY (bundle_id)
+  FK bundle_id -> pricing_bundle.bundle_id
+TABLE pricing_bundle_revshare
+  COLUMN bundle_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN effective_share_bp INT NULL DEFAULT - PK 0
+  COLUMN party TEXT NOT NULL DEFAULT - PK 4
+  COLUMN plan_revision bigint NOT NULL DEFAULT - PK 2
+  COLUMN share_bp INT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN vendor_sku_id TEXT NOT NULL DEFAULT - PK 3
+  CONSTRAINT chk_pricing_bundle_revshare_effective_share_bp CHECK (effective_share_bp IS NULL OR (effective_share_bp >= 0 AND effective_share_bp <= 10000))
+  CONSTRAINT chk_pricing_bundle_revshare_party CHECK (length(trim(party, char(9,10,11,12,13,32))) > 0 AND trim(party, char(9,10,11,12,13,32)) <> 'platform')
+  CONSTRAINT chk_pricing_bundle_revshare_share_bp CHECK (share_bp >= 0 AND share_bp <= 10000)
+  CONSTRAINT fk_pricing_bundle_revshare_group FOREIGN KEY (bundle_id, plan_revision, vendor_sku_id)
+  FK bundle_id -> pricing_bundle_revshare_group.bundle_id
+  FK plan_revision -> pricing_bundle_revshare_group.plan_revision
+  FK vendor_sku_id -> pricing_bundle_revshare_group.vendor_sku_id
+TABLE pricing_bundle_revshare_group
+  COLUMN bundle_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN plan_revision bigint NOT NULL DEFAULT - PK 2
+  COLUMN platform_cut_bp INT NOT NULL DEFAULT - PK 0
+  COLUMN residual_absorber_party TEXT NOT NULL DEFAULT 'platform' PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN vendor_sku_id TEXT NOT NULL DEFAULT - PK 3
+  CONSTRAINT chk_pricing_bundle_revshare_group_absorber CHECK (residual_absorber_party = 'platform' OR (length(trim(residual_absorber_party, char(9,10,11,12,13,32))) > 0 AND trim(residual_absorber_party, char(9,10,11,12,13,32)) <> 'platform'))
+  CONSTRAINT chk_pricing_bundle_revshare_group_platform_cut_bp CHECK (platform_cut_bp >= 0 AND platform_cut_bp <= 10000)
+  CONSTRAINT fk_pricing_bundle_revshare_group_bundle FOREIGN KEY (bundle_id)
+  FK bundle_id -> pricing_bundle.bundle_id
+TABLE pricing_catalog_version_ref
+  COLUMN catalog_version bigint NULL DEFAULT - PK 0
+  COLUMN commit_observed_at TEXT NULL DEFAULT - PK 0
+  COLUMN committed_at TEXT NULL DEFAULT - PK 0
+  COLUMN pending_ref TEXT NOT NULL DEFAULT - PK 2
+  COLUMN requested_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN subject_effective_to TEXT NULL DEFAULT - PK 0
+  COLUMN subject_kind TEXT NOT NULL DEFAULT - PK 3
+  COLUMN subject_lifecycle_state TEXT NULL DEFAULT - PK 0
+  COLUMN subject_ref TEXT NOT NULL DEFAULT - PK 4
+  COLUMN subject_revision bigint NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  CONSTRAINT chk_pricing_catalog_version_ref_commit CHECK ((catalog_version IS NULL) = (committed_at IS NULL))
+  CONSTRAINT chk_pricing_catalog_version_ref_subject_kind CHECK (subject_kind IN ('plan','price_overlay','overlay_index','group_membership'))
+  CONSTRAINT chk_pricing_catalog_version_ref_subject_lifecycle CHECK (subject_lifecycle_state IS NULL OR subject_lifecycle_state IN ('published','retired'))
+  CONSTRAINT chk_pricing_catalog_version_ref_subject_revision CHECK (subject_revision IS NULL OR subject_revision >= 0)
+  CONSTRAINT chk_pricing_catalog_version_ref_version CHECK (catalog_version IS NULL OR catalog_version >= 0)
+TABLE pricing_composite_meter
+  COLUMN composite_id TEXT NOT NULL DEFAULT - PK 4
+  COLUMN constituent_units TEXT NOT NULL DEFAULT - PK 0
+  COLUMN formula TEXT NOT NULL DEFAULT - PK 0
+  COLUMN output_unit TEXT NOT NULL DEFAULT - PK 0
+  COLUMN plan_id TEXT NOT NULL DEFAULT - PK 2
+  COLUMN plan_revision bigint NOT NULL DEFAULT - PK 3
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  CONSTRAINT chk_pricing_composite_meter_output_unit CHECK (length(trim(output_unit, char(9,10,11,12,13,32))) > 0)
+  CONSTRAINT fk_pricing_composite_meter_revision FOREIGN KEY (plan_id, plan_revision)
+  FK plan_id -> pricing_plan.plan_id
+  FK plan_revision -> pricing_plan.revision
+TABLE pricing_customer_group_taxonomy
+  COLUMN display_name TEXT NOT NULL DEFAULT - PK 0
+  COLUMN state TEXT NOT NULL DEFAULT 'active' PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN value TEXT NOT NULL DEFAULT - PK 2
+  CONSTRAINT chk_pricing_customer_group_taxonomy_state CHECK (state IN ('active', 'retired'))
+  CONSTRAINT chk_pricing_customer_group_taxonomy_value_present CHECK (length(trim(value, char(9,10,11,12,13,32))) > 0)
+TABLE pricing_group_membership
+  COLUMN created_at_utc TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN created_by TEXT NOT NULL DEFAULT - PK 0
+  COLUMN effective_from TEXT NOT NULL DEFAULT - PK 0
+  COLUMN effective_to TEXT NULL DEFAULT - PK 0
+  COLUMN group_value TEXT NOT NULL DEFAULT - PK 0
+  COLUMN membership_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN payer_tenant_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN row_version bigint NOT NULL DEFAULT 0 PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_group_membership_group_value_present CHECK (length(trim(group_value, char(9,10,11,12,13,32))) > 0)
+  CONSTRAINT chk_pricing_group_membership_interval CHECK (effective_to IS NULL OR effective_to > effective_from)
+  CONSTRAINT chk_pricing_group_membership_row_version CHECK (row_version >= 0)
+TABLE pricing_idempotency_dedup
+  COLUMN client_key TEXT NOT NULL DEFAULT - PK 3
+  COLUMN created_at_utc TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN operation TEXT NOT NULL DEFAULT - PK 2
+  COLUMN request_hash BLOB NOT NULL DEFAULT - PK 0
+  COLUMN response_body TEXT NULL DEFAULT - PK 0
+  COLUMN response_status INTEGER NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  CONSTRAINT chk_pricing_idempotency_dedup_answered CHECK ((response_status IS NULL) = (response_body IS NULL))
+  CONSTRAINT chk_pricing_idempotency_dedup_status CHECK (response_status IS NULL OR response_status BETWEEN 100 AND 599)
+TABLE pricing_migration
+  COLUMN announced_at TEXT NOT NULL DEFAULT - PK 0
+  COLUMN cancelled_at TEXT NULL DEFAULT - PK 0
+  COLUMN completed_at TEXT NULL DEFAULT - PK 0
+  COLUMN completion_record TEXT NULL DEFAULT - PK 0
+  COLUMN created_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN created_by TEXT NOT NULL DEFAULT - PK 0
+  COLUMN delta_report TEXT NOT NULL DEFAULT - PK 0
+  COLUMN effective_at TEXT NOT NULL DEFAULT - PK 0
+  COLUMN exclusion_snapshot TEXT NULL DEFAULT - PK 0
+  COLUMN migration_id TEXT NOT NULL DEFAULT - PK 2
+  COLUMN scope TEXT NOT NULL DEFAULT - PK 0
+  COLUMN source_plan_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN source_revision INTEGER NOT NULL DEFAULT - PK 0
+  COLUMN started_at TEXT NULL DEFAULT - PK 0
+  COLUMN state TEXT NOT NULL DEFAULT - PK 0
+  COLUMN target_plan_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  CONSTRAINT chk_pricing_migration_announced_before_effective CHECK (announced_at <= effective_at)
+  CONSTRAINT chk_pricing_migration_cancelled_at CHECK ((state = 'cancelled') = (cancelled_at IS NOT NULL))
+  CONSTRAINT chk_pricing_migration_cancelled_order CHECK (cancelled_at IS NULL OR cancelled_at >= created_at)
+  CONSTRAINT chk_pricing_migration_completed_at CHECK ((state = 'completed') = (completed_at IS NOT NULL))
+  CONSTRAINT chk_pricing_migration_completed_order CHECK (completed_at IS NULL OR completed_at >= started_at)
+  CONSTRAINT chk_pricing_migration_distinct_plans CHECK (source_plan_id <> target_plan_id)
+  CONSTRAINT chk_pricing_migration_exclusion_snapshot CHECK ((started_at IS NOT NULL) = (exclusion_snapshot IS NOT NULL))
+  CONSTRAINT chk_pricing_migration_scheduled_unstarted CHECK (state <> 'scheduled' OR started_at IS NULL)
+  CONSTRAINT chk_pricing_migration_source_revision CHECK (source_revision >= 0)
+  CONSTRAINT chk_pricing_migration_started_order CHECK (started_at IS NULL OR started_at >= created_at)
+  CONSTRAINT chk_pricing_migration_started_required CHECK (state NOT IN ('in_progress','completed') OR started_at IS NOT NULL)
+  CONSTRAINT chk_pricing_migration_state CHECK (state IN ('scheduled','in_progress','completed','cancelled'))
+TABLE pricing_operator_flag
+  COLUMN detail TEXT NOT NULL DEFAULT '{}' PK 0
+  COLUMN flag TEXT NOT NULL DEFAULT - PK 3
+  COLUMN set_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN set_by TEXT NOT NULL DEFAULT - PK 0
+  COLUMN subject_ref TEXT NOT NULL DEFAULT - PK 2
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  CONSTRAINT chk_pricing_operator_flag_name CHECK (flag IN ( 'tier_divergent', 'grants_divergent', 'tax_readiness_divergent', 'meter_binding_divergent'))
+TABLE pricing_org_tier_taxonomy
+  COLUMN display_name TEXT NOT NULL DEFAULT - PK 0
+  COLUMN state TEXT NOT NULL DEFAULT 'active' PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN value TEXT NOT NULL DEFAULT - PK 2
+  CONSTRAINT chk_pricing_org_tier_taxonomy_state CHECK (state IN ('active', 'retired'))
+  CONSTRAINT chk_pricing_org_tier_taxonomy_value_present CHECK (length(trim(value, char(9,10,11,12,13,32))) > 0)
+TABLE pricing_outbox
+  COLUMN aggregate_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN correlation_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN dedup_key TEXT NOT NULL DEFAULT - PK 0
+  COLUMN enqueued_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN event_name TEXT NOT NULL DEFAULT - PK 0
+  COLUMN outbox_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN payload TEXT NOT NULL DEFAULT - PK 0
+  COLUMN published_at TEXT NULL DEFAULT - PK 0
+  COLUMN seq bigint NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_outbox_event_name CHECK (event_name IN ('PlanCreated','PlanUpdated','PlanPublished','PlanRetired', 'PlanMigrationScheduled','PlanPublishDegraded','BundleUpdated', 'PriceCreated','PriceUpdated','PriceWindowScheduled', 'PriceWindowActivated','PriceWindowExpired','PriceWindowCancelled', 'PriceOverlayPublished'))
+  CONSTRAINT chk_pricing_outbox_sequence CHECK (seq >= 0)
+TABLE pricing_partner_taxonomy
+  COLUMN display_name TEXT NOT NULL DEFAULT - PK 0
+  COLUMN state TEXT NOT NULL DEFAULT 'active' PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN value TEXT NOT NULL DEFAULT - PK 2
+  CONSTRAINT chk_pricing_partner_taxonomy_state CHECK (state IN ('active', 'retired'))
+  CONSTRAINT chk_pricing_partner_taxonomy_value_present CHECK (length(trim(value, char(9,10,11,12,13,32))) > 0)
+TABLE pricing_pin_frontier
+  COLUMN advanced_at TEXT NOT NULL DEFAULT - PK 0
+  COLUMN catalog_version bigint NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  CONSTRAINT chk_pricing_pin_frontier_version CHECK (catalog_version >= 0)
+TABLE pricing_plan
+  COLUMN allowed_change_targets TEXT NULL DEFAULT - PK 0
+  COLUMN available_from TEXT NULL DEFAULT - PK 0
+  COLUMN available_to TEXT NULL DEFAULT - PK 0
+  COLUMN billing_cycle TEXT NULL DEFAULT - PK 0
+  COLUMN cloned_from TEXT NULL DEFAULT - PK 0
+  COLUMN comparability_rank INTEGER NULL DEFAULT - PK 0
+  COLUMN created_at_utc TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN created_by TEXT NOT NULL DEFAULT - PK 0
+  COLUMN custom_interval_n INT NULL DEFAULT - PK 0
+  COLUMN custom_interval_unit TEXT NULL DEFAULT - PK 0
+  COLUMN entitlement_grants TEXT NULL DEFAULT - PK 0
+  COLUMN frequency TEXT NULL DEFAULT - PK 0
+  COLUMN invoice_grouping_key TEXT NULL DEFAULT - PK 0
+  COLUMN lifecycle_state TEXT NOT NULL DEFAULT - PK 0
+  COLUMN plan_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN plan_name TEXT NULL DEFAULT - PK 0
+  COLUMN plan_tier TEXT NULL DEFAULT - PK 0
+  COLUMN plan_tier_override boolean NOT NULL DEFAULT 0 PK 0
+  COLUMN purchase_max_qty bigint NULL DEFAULT - PK 0
+  COLUMN purchase_min_qty bigint NULL DEFAULT - PK 0
+  COLUMN revision bigint NOT NULL DEFAULT - PK 2
+  COLUMN row_version bigint NOT NULL DEFAULT 0 PK 0
+  COLUMN sku_id TEXT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN usage_counter_on_plan_change TEXT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_plan_availability CHECK (available_from IS NULL OR available_to IS NULL OR available_to > available_from)
+  CONSTRAINT chk_pricing_plan_billing_cycle CHECK (billing_cycle IS NULL OR billing_cycle IN ('one_time','recurring','usage','hybrid'))
+  CONSTRAINT chk_pricing_plan_custom_interval_n CHECK (custom_interval_n IS NULL OR custom_interval_n > 0)
+  CONSTRAINT chk_pricing_plan_custom_interval_pairing CHECK ((frequency IS NOT NULL AND frequency = 'custom_every_n') = (custom_interval_n IS NOT NULL AND custom_interval_unit IS NOT NULL))
+  CONSTRAINT chk_pricing_plan_custom_interval_unit CHECK (custom_interval_unit IS NULL OR custom_interval_unit IN ('days','months'))
+  CONSTRAINT chk_pricing_plan_frequency CHECK (frequency IS NULL OR frequency IN ('monthly','quarterly','semiannual','annual','custom_every_n'))
+  CONSTRAINT chk_pricing_plan_lifecycle_state CHECK (lifecycle_state IN ('draft','abandoned','published','superseded','retired'))
+  CONSTRAINT chk_pricing_plan_purchase_max_qty CHECK (purchase_max_qty IS NULL OR purchase_max_qty >= 0)
+  CONSTRAINT chk_pricing_plan_purchase_min_qty CHECK (purchase_min_qty IS NULL OR purchase_min_qty >= 0)
+  CONSTRAINT chk_pricing_plan_purchase_qty CHECK (purchase_min_qty IS NULL OR purchase_max_qty IS NULL OR purchase_min_qty <= purchase_max_qty)
+  CONSTRAINT chk_pricing_plan_revision CHECK (revision >= 0)
+  CONSTRAINT chk_pricing_plan_row_version CHECK (row_version >= 0)
+TABLE pricing_plan_addon_rule
+  COLUMN addon_sku_id TEXT NOT NULL DEFAULT - PK 3
+  COLUMN conflicts_with_addon_sku_id TEXT NOT NULL DEFAULT '[]' PK 0
+  COLUMN depends_on_addon_sku_id TEXT NOT NULL DEFAULT '[]' PK 0
+  COLUMN max_qty INT NULL DEFAULT - PK 0
+  COLUMN min_qty INT NULL DEFAULT - PK 0
+  COLUMN plan_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN plan_revision bigint NOT NULL DEFAULT - PK 2
+  COLUMN price_override_ref TEXT NULL DEFAULT - PK 0
+  COLUMN required boolean NOT NULL DEFAULT false PK 0
+  COLUMN step_qty INT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_plan_addon_rule_max_qty CHECK (max_qty IS NULL OR max_qty >= 0)
+  CONSTRAINT chk_pricing_plan_addon_rule_min_qty CHECK (min_qty IS NULL OR min_qty >= 0)
+  CONSTRAINT chk_pricing_plan_addon_rule_qty_range CHECK (min_qty IS NULL OR max_qty IS NULL OR min_qty <= max_qty)
+  CONSTRAINT chk_pricing_plan_addon_rule_required_max_qty CHECK (NOT required OR (max_qty IS NOT NULL AND max_qty >= 1))
+  CONSTRAINT chk_pricing_plan_addon_rule_step_qty CHECK (step_qty IS NULL OR step_qty > 0)
+  CONSTRAINT fk_pricing_plan_addon_rule_revision FOREIGN KEY (plan_id, plan_revision)
+  FK plan_id -> pricing_plan.plan_id
+  FK plan_revision -> pricing_plan.revision
+TABLE pricing_plan_descriptor_set
+  COLUMN additional_fields TEXT NOT NULL DEFAULT '{}' PK 0
+  COLUMN gl_code TEXT NULL DEFAULT - PK 0
+  COLUMN invoice_line_template TEXT NULL DEFAULT - PK 0
+  COLUMN itemization_rule TEXT NULL DEFAULT - PK 0
+  COLUMN plan_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN plan_revision bigint NOT NULL DEFAULT - PK 2
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT fk_pricing_plan_descriptor_set_revision FOREIGN KEY (plan_id, plan_revision)
+  FK plan_id -> pricing_plan.plan_id
+  FK plan_revision -> pricing_plan.revision
+TABLE pricing_plan_period_floor_cap
+  COLUMN cap_minor bigint NULL DEFAULT - PK 0
+  COLUMN currency TEXT NOT NULL DEFAULT - PK 3
+  COLUMN floor_minor bigint NULL DEFAULT - PK 0
+  COLUMN plan_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN plan_revision bigint NOT NULL DEFAULT - PK 2
+  COLUMN region TEXT NOT NULL DEFAULT - PK 4
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_plan_period_floor_cap_cap_positive CHECK (cap_minor IS NULL OR cap_minor > 0)
+  CONSTRAINT chk_pricing_plan_period_floor_cap_currency CHECK (length(currency) = 3)
+  CONSTRAINT chk_pricing_plan_period_floor_cap_floor_positive CHECK (floor_minor IS NULL OR floor_minor > 0)
+  CONSTRAINT chk_pricing_plan_period_floor_cap_ordered CHECK (floor_minor IS NULL OR cap_minor IS NULL OR floor_minor <= cap_minor)
+  CONSTRAINT chk_pricing_plan_period_floor_cap_present CHECK (floor_minor IS NOT NULL OR cap_minor IS NOT NULL)
+  CONSTRAINT fk_pricing_plan_period_floor_cap_revision FOREIGN KEY (plan_id, plan_revision)
+  FK plan_id -> pricing_plan.plan_id
+  FK plan_revision -> pricing_plan.revision
+TABLE pricing_plan_phase
+  COLUMN converts_to_phase_id TEXT NULL DEFAULT - PK 0
+  COLUMN display_trial_days INT NULL DEFAULT - PK 0
+  COLUMN kind TEXT NOT NULL DEFAULT - PK 0
+  COLUMN ordinal INT NOT NULL DEFAULT - PK 0
+  COLUMN phase_duration_days INT NULL DEFAULT - PK 0
+  COLUMN phase_id TEXT NOT NULL DEFAULT - PK 4
+  COLUMN plan_id TEXT NOT NULL DEFAULT - PK 2
+  COLUMN plan_revision bigint NOT NULL DEFAULT - PK 3
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  CONSTRAINT chk_pricing_plan_phase_display_trial_days CHECK (display_trial_days IS NULL OR display_trial_days = phase_duration_days)
+  CONSTRAINT chk_pricing_plan_phase_duration_non_negative CHECK (phase_duration_days IS NULL OR phase_duration_days >= 0)
+  CONSTRAINT chk_pricing_plan_phase_kind CHECK (kind IN ('trial','intro','evergreen'))
+  CONSTRAINT chk_pricing_plan_phase_trial_projection_non_negative CHECK (display_trial_days IS NULL OR display_trial_days >= 0)
+  CONSTRAINT fk_pricing_plan_phase_revision FOREIGN KEY (plan_id, plan_revision)
+  FK plan_id -> pricing_plan.plan_id
+  FK plan_revision -> pricing_plan.revision
+TABLE pricing_policy_object
+  COLUMN additional_required_descriptors TEXT NOT NULL DEFAULT '[]' PK 0
+  COLUMN default_rounding_policy_ref TEXT NULL DEFAULT - PK 0
+  COLUMN enforced_migration_notice_days INTEGER NOT NULL DEFAULT 60 PK 0
+  COLUMN max_custom_interval_days INTEGER NULL DEFAULT - PK 0
+  COLUMN max_custom_interval_months INTEGER NULL DEFAULT - PK 0
+  COLUMN max_price_rows_per_plan INTEGER NULL DEFAULT - PK 0
+  COLUMN max_tier_bands_per_row INTEGER NULL DEFAULT - PK 0
+  COLUMN tax_display_policy_mode TEXT NOT NULL DEFAULT 'fail_closed' PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN updated_at_utc TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN updated_by TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_policy_object_interval_days_cap CHECK (max_custom_interval_days IS NULL OR max_custom_interval_days > 0)
+  CONSTRAINT chk_pricing_policy_object_interval_months_cap CHECK (max_custom_interval_months IS NULL OR max_custom_interval_months > 0)
+  CONSTRAINT chk_pricing_policy_object_notice_floor CHECK (enforced_migration_notice_days >= 60)
+  CONSTRAINT chk_pricing_policy_object_price_row_cap CHECK (max_price_rows_per_plan IS NULL OR max_price_rows_per_plan > 0)
+  CONSTRAINT chk_pricing_policy_object_tax_display_policy CHECK (tax_display_policy_mode IN ('fail_closed', 'warn'))
+  CONSTRAINT chk_pricing_policy_object_tier_band_cap CHECK (max_tier_bands_per_row IS NULL OR max_tier_bands_per_row > 0)
+TABLE pricing_price
+  COLUMN aggregation_function TEXT NULL DEFAULT - PK 0
+  COLUMN aggregation_granularity TEXT NULL DEFAULT - PK 0
+  COLUMN amount_minor bigint NULL DEFAULT - PK 0
+  COLUMN anchor_day INTEGER NULL DEFAULT - PK 0
+  COLUMN billing_anchor_policy TEXT NULL DEFAULT - PK 0
+  COLUMN billing_granularity TEXT NULL DEFAULT - PK 0
+  COLUMN billing_timing TEXT NULL DEFAULT - PK 0
+  COLUMN charge_kind TEXT NOT NULL DEFAULT - PK 0
+  COLUMN cohort TEXT NOT NULL DEFAULT 'none' PK 0
+  COLUMN created_at_utc TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN created_by TEXT NOT NULL DEFAULT - PK 0
+  COLUMN credit_on_downgrade boolean NULL DEFAULT - PK 0
+  COLUMN currency varchar(3) NOT NULL DEFAULT - PK 0
+  COLUMN dimension_key TEXT NOT NULL DEFAULT '' PK 0
+  COLUMN discount_ref TEXT NULL DEFAULT - PK 0
+  COLUMN grandfather_until TEXT NULL DEFAULT - PK 0
+  COLUMN included_allowance TEXT NULL DEFAULT - PK 0
+  COLUMN lifecycle_state TEXT NOT NULL DEFAULT - PK 0
+  COLUMN manual_quantity bigint NULL DEFAULT - PK 0
+  COLUMN max_hold_granules bigint NULL DEFAULT - PK 0
+  COLUMN meter TEXT NULL DEFAULT - PK 0
+  COLUMN min_qty_purchase bigint NULL DEFAULT - PK 0
+  COLUMN min_qty_usage bigint NULL DEFAULT - PK 0
+  COLUMN min_qty_usage_fallback TEXT NULL DEFAULT - PK 0
+  COLUMN model_kind TEXT NULL DEFAULT - PK 0
+  COLUMN package_price_minor bigint NULL DEFAULT - PK 0
+  COLUMN package_size bigint NULL DEFAULT - PK 0
+  COLUMN phase TEXT NOT NULL DEFAULT - PK 0
+  COLUMN plan_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN price_eligibility TEXT NOT NULL DEFAULT 'all_subscriptions' PK 0
+  COLUMN price_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN price_overlay TEXT NOT NULL DEFAULT 'base' PK 0
+  COLUMN proration_basis TEXT NULL DEFAULT - PK 0
+  COLUMN quantity_source TEXT NULL DEFAULT - PK 0
+  COLUMN region TEXT NOT NULL DEFAULT - PK 0
+  COLUMN reservation_flavor TEXT NULL DEFAULT - PK 0
+  COLUMN reserved_rate_nano bigint NULL DEFAULT - PK 0
+  COLUMN resolved_rounding_policy TEXT NULL DEFAULT - PK 0
+  COLUMN resolved_tax_category TEXT NULL DEFAULT - PK 0
+  COLUMN rounding_policy_ref TEXT NULL DEFAULT - PK 0
+  COLUMN row_version bigint NOT NULL DEFAULT 0 PK 0
+  COLUMN supersedes_price_id TEXT NULL DEFAULT - PK 0
+  COLUMN tax_category_ref TEXT NULL DEFAULT - PK 0
+  COLUMN tax_inclusive boolean NOT NULL DEFAULT false PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tier_aggregation_window TEXT NULL DEFAULT - PK 0
+  COLUMN tier_qualification_window TEXT NULL DEFAULT - PK 0
+  COLUMN unit_rate_nano bigint NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_price_aggregation_function CHECK (aggregation_function IS NULL OR aggregation_function IN ('sum','peak','time_weighted'))
+  CONSTRAINT chk_pricing_price_aggregation_granularity CHECK (aggregation_granularity IS NULL OR aggregation_granularity IN ('hour','day'))
+  CONSTRAINT chk_pricing_price_amount_non_negative CHECK (amount_minor IS NULL OR amount_minor >= 0)
+  CONSTRAINT chk_pricing_price_billing_granularity CHECK (billing_granularity IS NULL OR billing_granularity IN ( 'per_second','per_minute','per_hour','per_day','whole_unit'))
+  CONSTRAINT chk_pricing_price_billing_timing CHECK (billing_timing IS NULL OR billing_timing IN ('advance','arrears'))
+  CONSTRAINT chk_pricing_price_charge_kind CHECK (charge_kind IN ('recurring','usage','one_time','one_time_setup'))
+  CONSTRAINT chk_pricing_price_cohort_eligibility CHECK ((cohort <> 'none') = (price_eligibility = 'existing_grandfathered'))
+  CONSTRAINT chk_pricing_price_eligibility CHECK (price_eligibility IN ( 'all_subscriptions','new_subscriptions_only','existing_grandfathered'))
+  CONSTRAINT chk_pricing_price_grandfather_until CHECK (grandfather_until IS NULL OR price_eligibility = 'existing_grandfathered')
+  CONSTRAINT chk_pricing_price_lifecycle_state CHECK (lifecycle_state IN ('draft','published','superseded'))
+  CONSTRAINT chk_pricing_price_manual_quantity CHECK (manual_quantity IS NULL OR manual_quantity >= 0)
+  CONSTRAINT chk_pricing_price_max_hold_granules CHECK (max_hold_granules IS NULL OR max_hold_granules >= 1)
+  CONSTRAINT chk_pricing_price_meter_no_separator CHECK (meter IS NULL OR meter NOT LIKE '%|%')
+  CONSTRAINT chk_pricing_price_min_qty_purchase CHECK (min_qty_purchase IS NULL OR min_qty_purchase >= 0)
+  CONSTRAINT chk_pricing_price_min_qty_usage CHECK (min_qty_usage IS NULL OR min_qty_usage >= 0)
+  CONSTRAINT chk_pricing_price_model_kind CHECK (model_kind IS NULL OR model_kind IN ('flat','per_unit','graduated','volume','package'))
+  CONSTRAINT chk_pricing_price_overlay CHECK (price_overlay = 'base')
+  CONSTRAINT chk_pricing_price_package_fields_kind CHECK ((package_size IS NULL AND package_price_minor IS NULL) OR (model_kind IS NOT NULL AND model_kind = 'package'))
+  CONSTRAINT chk_pricing_price_package_price CHECK (package_price_minor IS NULL OR package_price_minor >= 0)
+  CONSTRAINT chk_pricing_price_package_size CHECK (package_size IS NULL OR package_size > 0)
+  CONSTRAINT chk_pricing_price_quantity_source CHECK (quantity_source IS NULL OR quantity_source IN ('subscription_seat_count','manual'))
+  CONSTRAINT chk_pricing_price_region_no_separator CHECK (region NOT LIKE '%|%')
+  CONSTRAINT chk_pricing_price_reserved_rate_nano CHECK (reserved_rate_nano IS NULL OR reserved_rate_nano >= 0)
+  CONSTRAINT chk_pricing_price_row_version CHECK (row_version >= 0)
+  CONSTRAINT chk_pricing_price_tier_aggregation_window CHECK (tier_aggregation_window IS NULL OR tier_aggregation_window IN ( 'calendar_month','invoice_period','subscription_lifetime','per_event','per_hour'))
+  CONSTRAINT chk_pricing_price_tier_qualification_window CHECK (tier_qualification_window IS NULL OR tier_qualification_window IN ('current','trailing_period'))
+  CONSTRAINT chk_pricing_price_unit_rate_nano CHECK (unit_rate_nano IS NULL OR unit_rate_nano >= 0)
+TABLE pricing_price_overlay
+  COLUMN disclosure TEXT NOT NULL DEFAULT 'restricted' PK 0
+  COLUMN effective_from TEXT NULL DEFAULT - PK 0
+  COLUMN effective_to TEXT NULL DEFAULT - PK 0
+  COLUMN lifecycle_state TEXT NOT NULL DEFAULT - PK 0
+  COLUMN precedence INT NOT NULL DEFAULT - PK 0
+  COLUMN price_overlay_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN revision bigint NOT NULL DEFAULT - PK 2
+  COLUMN row_version bigint NOT NULL DEFAULT 0 PK 0
+  COLUMN scope_class TEXT NOT NULL DEFAULT - PK 0
+  COLUMN scope_value TEXT NOT NULL DEFAULT - PK 0
+  COLUMN target_ref TEXT NOT NULL DEFAULT '{}' PK 0
+  COLUMN tax_basis TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_price_overlay_disclosure CHECK (disclosure IN ('restricted', 'public'))
+  CONSTRAINT chk_pricing_price_overlay_interval CHECK (effective_from IS NULL OR effective_to IS NULL OR effective_to > effective_from)
+  CONSTRAINT chk_pricing_price_overlay_lifecycle_state CHECK (lifecycle_state IN ('draft', 'published', 'superseded', 'abandoned'))
+  CONSTRAINT chk_pricing_price_overlay_revision CHECK (revision >= 0)
+  CONSTRAINT chk_pricing_price_overlay_row_version CHECK (row_version >= 0)
+  CONSTRAINT chk_pricing_price_overlay_scope_class CHECK (scope_class IN ( 'partner', 'org_tier', 'brand', 'region', 'customer_group', 'global'))
+  CONSTRAINT chk_pricing_price_overlay_scope_value CHECK ((scope_class = 'global') = (length(scope_value) = 0))
+  CONSTRAINT chk_pricing_price_overlay_tax_basis CHECK (tax_basis IN ('inclusive', 'exclusive', 'delegated_tariffs'))
+TABLE pricing_price_overlay_line
+  COLUMN adjustment_kind TEXT NOT NULL DEFAULT - PK 0
+  COLUMN adjustment_value bigint NULL DEFAULT - PK 0
+  COLUMN cohort TEXT NULL DEFAULT - PK 0
+  COLUMN line_id TEXT NOT NULL DEFAULT - PK 3
+  COLUMN magnitude_kind TEXT NOT NULL DEFAULT - PK 0
+  COLUMN overlay_revision bigint NOT NULL DEFAULT - PK 2
+  COLUMN plan_id TEXT NULL DEFAULT - PK 0
+  COLUMN price_overlay_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN target_sku TEXT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  CONSTRAINT chk_pricing_price_overlay_line_adjustment_kind CHECK (adjustment_kind IN ('markup', 'discount', 'fixed'))
+  CONSTRAINT chk_pricing_price_overlay_line_cohort_needs_plan CHECK (cohort IS NULL OR plan_id IS NOT NULL)
+  CONSTRAINT chk_pricing_price_overlay_line_discount_ceiling CHECK (adjustment_kind <> 'discount' OR adjustment_value IS NULL OR adjustment_value <= 10000)
+  CONSTRAINT chk_pricing_price_overlay_line_fixed_is_amount CHECK (adjustment_kind <> 'fixed' OR magnitude_kind = 'amount')
+  CONSTRAINT chk_pricing_price_overlay_line_magnitude_kind CHECK (magnitude_kind IN ('percent_bp', 'amount'))
+  CONSTRAINT chk_pricing_price_overlay_line_magnitude_pairing CHECK ((magnitude_kind = 'percent_bp') = (adjustment_value IS NOT NULL))
+  CONSTRAINT chk_pricing_price_overlay_line_magnitude_positive CHECK (adjustment_value IS NULL OR adjustment_value > 0)
+  CONSTRAINT chk_pricing_price_overlay_line_plan_id_not_nil CHECK (plan_id IS NULL OR plan_id <> '00000000-0000-0000-0000-000000000000')
+  CONSTRAINT chk_pricing_price_overlay_line_sku_needs_plan CHECK (target_sku IS NULL OR plan_id IS NOT NULL)
+  CONSTRAINT chk_pricing_price_overlay_line_target_sku_present CHECK (target_sku IS NULL OR length(trim(target_sku, char(9,10,11,12,13,32))) > 0)
+  CONSTRAINT fk_pricing_price_overlay_line_overlay FOREIGN KEY (price_overlay_id, overlay_revision)
+  FK overlay_revision -> pricing_price_overlay.revision
+  FK price_overlay_id -> pricing_price_overlay.price_overlay_id
+TABLE pricing_price_overlay_line_amount
+  COLUMN currency TEXT NOT NULL DEFAULT - PK 4
+  COLUMN line_id TEXT NOT NULL DEFAULT - PK 3
+  COLUMN overlay_revision bigint NOT NULL DEFAULT - PK 2
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN value_minor bigint NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_price_overlay_line_amount_currency CHECK (length(currency) = 3)
+  CONSTRAINT chk_pricing_price_overlay_line_amount_value_minor CHECK (value_minor >= 0)
+  CONSTRAINT fk_pricing_price_overlay_line_amount_line FOREIGN KEY (tenant_id, overlay_revision, line_id)
+  FK line_id -> pricing_price_overlay_line.line_id
+  FK overlay_revision -> pricing_price_overlay_line.overlay_revision
+  FK tenant_id -> pricing_price_overlay_line.tenant_id
+TABLE pricing_price_tier_band
+  COLUMN band_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN from_qty bigint NOT NULL DEFAULT - PK 0
+  COLUMN price_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN to_qty bigint NULL DEFAULT - PK 0
+  COLUMN unit_price_nano bigint NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_price_tier_band_from_qty CHECK (from_qty >= 0)
+  CONSTRAINT chk_pricing_price_tier_band_unit_price CHECK (unit_price_nano >= 0)
+  CONSTRAINT chk_pricing_price_tier_band_width CHECK (to_qty IS NULL OR to_qty > from_qty)
+  CONSTRAINT fk_pricing_price_tier_band_price FOREIGN KEY (price_id)
+  CONSTRAINT uq_pricing_price_tier_band_lower_bound UNIQUE (price_id, from_qty)
+  FK price_id -> pricing_price.price_id
+TABLE pricing_price_window
+  COLUMN activated_at TEXT NULL DEFAULT - PK 0
+  COLUMN cancelled_at TEXT NULL DEFAULT - PK 0
+  COLUMN created_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN created_by TEXT NOT NULL DEFAULT - PK 0
+  COLUMN effective_from TEXT NOT NULL DEFAULT - PK 0
+  COLUMN effective_to TEXT NULL DEFAULT - PK 0
+  COLUMN expired_at TEXT NULL DEFAULT - PK 0
+  COLUMN mutation_seq INTEGER NOT NULL DEFAULT 0 PK 0
+  COLUMN price_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN reason_code TEXT NOT NULL DEFAULT - PK 0
+  COLUMN state TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN window_id TEXT NOT NULL DEFAULT - PK 1
+  CONSTRAINT chk_pricing_price_window_activated_at CHECK ((state IN ('active','expired')) = (activated_at IS NOT NULL))
+  CONSTRAINT chk_pricing_price_window_activation_order CHECK (activated_at IS NULL OR activated_at >= effective_from)
+  CONSTRAINT chk_pricing_price_window_cancelled_at CHECK ((state = 'cancelled') = (cancelled_at IS NOT NULL))
+  CONSTRAINT chk_pricing_price_window_expired_at CHECK ((state = 'expired') = (expired_at IS NOT NULL))
+  CONSTRAINT chk_pricing_price_window_expiry_order CHECK (expired_at IS NULL OR expired_at >= effective_to)
+  CONSTRAINT chk_pricing_price_window_interval CHECK (effective_to IS NULL OR effective_to > effective_from)
+  CONSTRAINT chk_pricing_price_window_mutation_seq CHECK (mutation_seq >= 0)
+  CONSTRAINT chk_pricing_price_window_open_ended CHECK (NOT (state = 'expired' AND effective_to IS NULL))
+  CONSTRAINT chk_pricing_price_window_reason_code CHECK (length(trim(reason_code)) > 0)
+  CONSTRAINT chk_pricing_price_window_state CHECK (state IN ('scheduled','active','expired','cancelled'))
+  CONSTRAINT fk_pricing_price_window_price FOREIGN KEY (price_id)
+  FK price_id -> pricing_price.price_id
+TABLE pricing_read_model
+  COLUMN catalog_version bigint NOT NULL DEFAULT - PK 2
+  COLUMN payload TEXT NOT NULL DEFAULT - PK 0
+  COLUMN projected_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN subject_kind TEXT NOT NULL DEFAULT - PK 3
+  COLUMN subject_ref TEXT NOT NULL DEFAULT - PK 4
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN warm_completed boolean NOT NULL DEFAULT false PK 0
+  COLUMN warm_completed_at TEXT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_read_model_catalog_version CHECK (catalog_version >= 0)
+  CONSTRAINT chk_pricing_read_model_subject_kind CHECK (subject_kind IN ('plan','price_overlay','overlay_index','group_membership'))
+  CONSTRAINT chk_pricing_read_model_warm_marker CHECK (warm_completed = (warm_completed_at IS NOT NULL))
+TABLE pricing_region_taxonomy
+  COLUMN display_name TEXT NOT NULL DEFAULT - PK 0
+  COLUMN state TEXT NOT NULL DEFAULT 'active' PK 0
+  COLUMN tax_category TEXT NULL DEFAULT - PK 0
+  COLUMN tax_rate_present boolean NOT NULL DEFAULT 0 PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN value TEXT NOT NULL DEFAULT - PK 2
+  CONSTRAINT chk_pricing_region_taxonomy_state CHECK (state IN ('active', 'retired'))
+  CONSTRAINT chk_pricing_region_taxonomy_value_present CHECK (length(trim(value, char(9,10,11,12,13,32))) > 0)
+TABLE pricing_repricing_journal
+  COLUMN applied_at TEXT NULL DEFAULT - PK 0
+  COLUMN applied_price_id TEXT NULL DEFAULT - PK 0
+  COLUMN failure_reason TEXT NULL DEFAULT - PK 0
+  COLUMN price_id TEXT NOT NULL DEFAULT - PK 2
+  COLUMN run_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN state TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_repricing_journal_applied CHECK ((applied_price_id IS NOT NULL) = (state = 'applied') AND (applied_at IS NOT NULL) = (state = 'applied'))
+  CONSTRAINT chk_pricing_repricing_journal_failed CHECK ((state = 'failed') = (failure_reason IS NOT NULL))
+  CONSTRAINT chk_pricing_repricing_journal_state CHECK (state IN ('pending', 'applied', 'failed'))
+  CONSTRAINT chk_pricing_repricing_journal_successor_is_new CHECK (applied_price_id IS NULL OR applied_price_id <> price_id)
+  CONSTRAINT fk_pricing_repricing_journal_applied_price FOREIGN KEY (applied_price_id)
+  CONSTRAINT fk_pricing_repricing_journal_price FOREIGN KEY (price_id)
+  CONSTRAINT fk_pricing_repricing_journal_run FOREIGN KEY (run_id)
+  FK applied_price_id -> pricing_price.price_id
+  FK price_id -> pricing_price.price_id
+  FK run_id -> pricing_bulk_operation.operation_id
+TABLE pricing_rounding_policy_taxonomy
+  COLUMN display_name TEXT NOT NULL DEFAULT - PK 0
+  COLUMN state TEXT NOT NULL DEFAULT 'active' PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN value TEXT NOT NULL DEFAULT - PK 2
+  CONSTRAINT chk_pricing_rounding_policy_taxonomy_state CHECK (state IN ('active', 'retired'))
+  CONSTRAINT chk_pricing_rounding_policy_taxonomy_value_present CHECK (length(trim(value, char(9,10,11,12,13,32))) > 0)
+TABLE pricing_snapshot_provenance
+  COLUMN acting_principal TEXT NOT NULL DEFAULT - PK 0
+  COLUMN created_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
+  COLUMN payload TEXT NOT NULL DEFAULT - PK 0
+  COLUMN provenance_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN resolved TEXT NOT NULL DEFAULT - PK 0
+  COLUMN snapshot_instant TEXT NOT NULL DEFAULT - PK 0
+  COLUMN source_plan_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN source_revision INTEGER NULL DEFAULT - PK 0
+  COLUMN subscription_ref TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN trigger_kind TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_snapshot_provenance_payload CHECK (json_valid(payload) AND json_type(payload) = 'object')
+  CONSTRAINT chk_pricing_snapshot_provenance_resolved CHECK (json_valid(resolved) AND json_type(resolved) = 'array' AND json_array_length(resolved) > 0)
+  CONSTRAINT chk_pricing_snapshot_provenance_revision CHECK (source_revision IS NULL OR source_revision >= 0)
+  CONSTRAINT chk_pricing_snapshot_provenance_trigger CHECK (trigger_kind IN ('migration', 'first_rating'))
+TRIGGER trg_pricing_approval_born_submitted
+  ON pricing_approval
+  DDL CREATE TRIGGER trg_pricing_approval_born_submitted BEFORE INSERT ON pricing_approval FOR EACH ROW WHEN NEW.state <> 'submitted' BEGIN SELECT RAISE(ABORT, 'pricing_approval: a record is born submitted'); END
+TRIGGER trg_pricing_approval_flip_whitelist
+  ON pricing_approval
+  DDL CREATE TRIGGER trg_pricing_approval_flip_whitelist BEFORE UPDATE ON pricing_approval FOR EACH ROW WHEN OLD.state = 'submitted' AND NEW.state NOT IN ('approved','rejected','voided') BEGIN SELECT RAISE(ABORT, 'pricing_approval: state transition is not a sanctioned flip'); END
+TRIGGER trg_pricing_approval_immutable_once_decided
+  ON pricing_approval
+  DDL CREATE TRIGGER trg_pricing_approval_immutable_once_decided BEFORE UPDATE ON pricing_approval FOR EACH ROW WHEN OLD.state <> 'submitted' BEGIN SELECT RAISE(ABORT, 'pricing_approval: a decided record is immutable'); END
+TRIGGER trg_pricing_approval_key_born_submitted
+  ON pricing_approval_key
+  DDL CREATE TRIGGER trg_pricing_approval_key_born_submitted BEFORE INSERT ON pricing_approval_key FOR EACH ROW WHEN NEW.state <> 'submitted' BEGIN SELECT RAISE(ABORT, 'pricing_approval_key: a register row is born submitted with its unit'); END
+TRIGGER trg_pricing_approval_key_born_under_a_pending_unit
+  ON pricing_approval_key
+  DDL CREATE TRIGGER trg_pricing_approval_key_born_under_a_pending_unit BEFORE INSERT ON pricing_approval_key FOR EACH ROW WHEN (SELECT state FROM pricing_approval WHERE approval_id = NEW.approval_id) IS NOT 'submitted' BEGIN SELECT RAISE(ABORT, 'pricing_approval_key: a register row is born with a pending unit; this approval is missing or already decided'); END
+TRIGGER trg_pricing_approval_key_follow_state
+  ON pricing_approval
+  DDL CREATE TRIGGER trg_pricing_approval_key_follow_state AFTER UPDATE OF state ON pricing_approval FOR EACH ROW WHEN NEW.state IS NOT OLD.state BEGIN UPDATE pricing_approval_key SET state = NEW.state WHERE approval_id = NEW.approval_id; END
+TRIGGER trg_pricing_approval_key_follows_its_unit
+  ON pricing_approval_key
+  DDL CREATE TRIGGER trg_pricing_approval_key_follows_its_unit BEFORE UPDATE OF state ON pricing_approval_key FOR EACH ROW WHEN NEW.state IS NOT (SELECT state FROM pricing_approval WHERE approval_id = NEW.approval_id) BEGIN SELECT RAISE(ABORT, 'pricing_approval_key: a register row follows its unit; its state cannot be moved on its own'); END
+TRIGGER trg_pricing_approval_key_follows_once
+  ON pricing_approval_key
+  DDL CREATE TRIGGER trg_pricing_approval_key_follows_once BEFORE UPDATE ON pricing_approval_key FOR EACH ROW WHEN OLD.state <> 'submitted' BEGIN SELECT RAISE(ABORT, 'pricing_approval_key: the register row already followed its unit once'); END
+TRIGGER trg_pricing_approval_key_no_delete
+  ON pricing_approval_key
+  DDL CREATE TRIGGER trg_pricing_approval_key_no_delete BEFORE DELETE ON pricing_approval_key FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_approval_key: DELETE of a held key is not permitted; the register is the record of what the unit held'); END
+TRIGGER trg_pricing_approval_key_pinned_columns
+  ON pricing_approval_key
+  DDL CREATE TRIGGER trg_pricing_approval_key_pinned_columns BEFORE UPDATE ON pricing_approval_key FOR EACH ROW WHEN (NEW.approval_id IS NOT OLD.approval_id OR NEW.tenant_id IS NOT OLD.tenant_id OR NEW.scope_key IS NOT OLD.scope_key) BEGIN SELECT RAISE(ABORT, 'pricing_approval_key: the register row is pinned; only state follows the unit'); END
+TRIGGER trg_pricing_approval_no_delete
+  ON pricing_approval
+  DDL CREATE TRIGGER trg_pricing_approval_no_delete BEFORE DELETE ON pricing_approval FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_approval: DELETE of an approval is not permitted; the record is the evidence'); END
+TRIGGER trg_pricing_approval_pinned_columns
+  ON pricing_approval
+  DDL CREATE TRIGGER trg_pricing_approval_pinned_columns BEFORE UPDATE ON pricing_approval FOR EACH ROW WHEN OLD.state = 'submitted' AND (NEW.approval_id IS NOT OLD.approval_id OR NEW.tenant_id IS NOT OLD.tenant_id OR NEW.subject_ref IS NOT OLD.subject_ref OR NEW.subject_kind IS NOT OLD.subject_kind OR NEW.content_hash IS NOT OLD.content_hash OR NEW.submitter_principal IS NOT OLD.submitter_principal OR NEW.materiality IS NOT OLD.materiality OR NEW.submitted_at IS NOT OLD.submitted_at) BEGIN SELECT RAISE(ABORT, 'pricing_approval: the approval is pinned; only the decision columns may move'); END
+TRIGGER trg_pricing_approval_threshold_no_delete
+  ON pricing_approval_threshold
+  DDL CREATE TRIGGER trg_pricing_approval_threshold_no_delete BEFORE DELETE ON pricing_approval_threshold FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_approval_threshold: DELETE of a threshold version is not permitted; a threshold policy is append-only history'); END
+TRIGGER trg_pricing_approval_threshold_no_update
+  ON pricing_approval_threshold
+  DDL CREATE TRIGGER trg_pricing_approval_threshold_no_update BEFORE UPDATE ON pricing_approval_threshold FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_approval_threshold: a threshold version is immutable; a correction is a new version, because an earlier version is what an approval pin covers'); END
+TRIGGER trg_pricing_approval_threshold_tombstone_no_delete
+  ON pricing_approval_threshold_tombstone
+  DDL CREATE TRIGGER trg_pricing_approval_threshold_tombstone_no_delete BEFORE DELETE ON pricing_approval_threshold_tombstone FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_approval_threshold_tombstone: DELETE of a threshold version is not permitted; a threshold policy is append-only history'); END
+TRIGGER trg_pricing_approval_threshold_tombstone_no_update
+  ON pricing_approval_threshold_tombstone
+  DDL CREATE TRIGGER trg_pricing_approval_threshold_tombstone_no_update BEFORE UPDATE ON pricing_approval_threshold_tombstone FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_approval_threshold_tombstone: a threshold version is immutable; a correction is a new version, because an earlier version is what an approval pin covers'); END
+TRIGGER trg_pricing_audit_log_no_delete
+  ON pricing_audit_log
+  DDL CREATE TRIGGER trg_pricing_audit_log_no_delete BEFORE DELETE ON pricing_audit_log FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_audit_log is append-only: DELETE is not permitted'); END
+TRIGGER trg_pricing_audit_log_no_update
+  ON pricing_audit_log
+  DDL CREATE TRIGGER trg_pricing_audit_log_no_update BEFORE UPDATE ON pricing_audit_log FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_audit_log is append-only: UPDATE is not permitted'); END
+TRIGGER trg_pricing_bulk_operation_born_validating
+  ON pricing_bulk_operation
+  DDL CREATE TRIGGER trg_pricing_bulk_operation_born_validating BEFORE INSERT ON pricing_bulk_operation FOR EACH ROW WHEN NEW.state <> 'validating' BEGIN SELECT RAISE(ABORT, 'pricing_bulk_operation: a run is born validating and in no other state'); END
+TRIGGER trg_pricing_bulk_operation_frozen_columns
+  ON pricing_bulk_operation
+  DDL CREATE TRIGGER trg_pricing_bulk_operation_frozen_columns BEFORE UPDATE ON pricing_bulk_operation FOR EACH ROW WHEN NEW.operation_id IS NOT OLD.operation_id OR NEW.tenant_id IS NOT OLD.tenant_id OR NEW.kind IS NOT OLD.kind OR NEW.client_key IS NOT OLD.client_key OR NEW.submitted_by IS NOT OLD.submitted_by OR NEW.submitted_at IS NOT OLD.submitted_at OR NEW.request_hash IS NOT OLD.request_hash BEGIN SELECT RAISE(ABORT, 'pricing_bulk_operation: the operation is frozen; only state, report and completed_at move'); END
+TRIGGER trg_pricing_bulk_operation_no_delete
+  ON pricing_bulk_operation
+  DDL CREATE TRIGGER trg_pricing_bulk_operation_no_delete BEFORE DELETE ON pricing_bulk_operation FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_bulk_operation: DELETE of an operation is not permitted; a run is a record, not a draft'); END
+TRIGGER trg_pricing_bulk_operation_transitions
+  ON pricing_bulk_operation
+  DDL CREATE TRIGGER trg_pricing_bulk_operation_transitions BEFORE UPDATE ON pricing_bulk_operation FOR EACH ROW WHEN NEW.state IS NOT OLD.state AND NOT ((OLD.state = 'validating' AND NEW.state IN ('validation_failed', 'awaiting_approval', 'committing')) OR (OLD.state = 'awaiting_approval' AND NEW.state = 'committing') OR (OLD.state = 'awaiting_approval' AND NEW.state = 'rejected') OR (OLD.state = 'committing' AND NEW.state IN ('completed', 'completed_with_conflicts'))) BEGIN SELECT RAISE(ABORT, 'pricing_bulk_operation: that state move is not an edge of the bulk state machine'); END
+TRIGGER trg_pricing_bulk_row_lock_no_update
+  ON pricing_bulk_row_lock
+  DDL CREATE TRIGGER trg_pricing_bulk_row_lock_no_update BEFORE UPDATE ON pricing_bulk_row_lock FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_bulk_row_lock: a lock is taken or released, never edited'); END
+TRIGGER trg_pricing_bulk_row_lock_only_while_committing
+  ON pricing_bulk_row_lock
+  DDL CREATE TRIGGER trg_pricing_bulk_row_lock_only_while_committing BEFORE INSERT ON pricing_bulk_row_lock FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_bulk_row_lock: the bulk lock takes effect only on entry to committing') WHERE EXISTS (SELECT 1 FROM pricing_bulk_operation WHERE operation_id = NEW.bulk_operation_id) AND NOT EXISTS (SELECT 1 FROM pricing_bulk_operation WHERE operation_id = NEW.bulk_operation_id AND state = 'committing'); END
+TRIGGER trg_pricing_bulk_row_lock_same_tenant_as_its_run
+  ON pricing_bulk_row_lock
+  DDL CREATE TRIGGER trg_pricing_bulk_row_lock_same_tenant_as_its_run BEFORE INSERT ON pricing_bulk_row_lock FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_bulk_row_lock: the operation belongs to another tenant and may not lock this row') WHERE EXISTS (SELECT 1 FROM pricing_bulk_operation WHERE operation_id = NEW.bulk_operation_id) AND NOT EXISTS (SELECT 1 FROM pricing_bulk_operation WHERE operation_id = NEW.bulk_operation_id AND tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_bundle_component_no_delete
+  ON pricing_bundle_component
+  DDL CREATE TRIGGER trg_pricing_bundle_component_no_delete BEFORE DELETE ON pricing_bundle_component FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_bundle_component: DELETE of a component under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_bundle b JOIN pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = OLD.bundle_id AND p.revision = OLD.plan_revision AND p.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_bundle_component_no_insert
+  ON pricing_bundle_component
+  DDL CREATE TRIGGER trg_pricing_bundle_component_no_insert BEFORE INSERT ON pricing_bundle_component FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_bundle_component: INSERT of a component under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_bundle b JOIN pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = NEW.bundle_id AND p.revision = NEW.plan_revision AND p.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_bundle_component_no_update
+  ON pricing_bundle_component
+  DDL CREATE TRIGGER trg_pricing_bundle_component_no_update BEFORE UPDATE ON pricing_bundle_component FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_bundle_component: UPDATE of a component under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_bundle b JOIN pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = OLD.bundle_id AND p.revision = OLD.plan_revision AND p.lifecycle_state = 'draft') OR NOT EXISTS (SELECT 1 FROM pricing_bundle b JOIN pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = NEW.bundle_id AND p.revision = NEW.plan_revision AND p.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_bundle_revshare_group_no_delete
+  ON pricing_bundle_revshare_group
+  DDL CREATE TRIGGER trg_pricing_bundle_revshare_group_no_delete BEFORE DELETE ON pricing_bundle_revshare_group FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_bundle_revshare_group: DELETE of a rev-share group under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_bundle b JOIN pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = OLD.bundle_id AND p.revision = OLD.plan_revision AND p.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_bundle_revshare_group_no_insert
+  ON pricing_bundle_revshare_group
+  DDL CREATE TRIGGER trg_pricing_bundle_revshare_group_no_insert BEFORE INSERT ON pricing_bundle_revshare_group FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_bundle_revshare_group: INSERT of a rev-share group under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_bundle b JOIN pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = NEW.bundle_id AND p.revision = NEW.plan_revision AND p.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_bundle_revshare_group_no_update
+  ON pricing_bundle_revshare_group
+  DDL CREATE TRIGGER trg_pricing_bundle_revshare_group_no_update BEFORE UPDATE ON pricing_bundle_revshare_group FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_bundle_revshare_group: UPDATE of a rev-share group under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_bundle b JOIN pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = OLD.bundle_id AND p.revision = OLD.plan_revision AND p.lifecycle_state = 'draft') OR NOT EXISTS (SELECT 1 FROM pricing_bundle b JOIN pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = NEW.bundle_id AND p.revision = NEW.plan_revision AND p.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_bundle_revshare_no_delete
+  ON pricing_bundle_revshare
+  DDL CREATE TRIGGER trg_pricing_bundle_revshare_no_delete BEFORE DELETE ON pricing_bundle_revshare FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_bundle_revshare: DELETE of a rev-share party under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_bundle b JOIN pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = OLD.bundle_id AND p.revision = OLD.plan_revision AND p.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_bundle_revshare_no_insert
+  ON pricing_bundle_revshare
+  DDL CREATE TRIGGER trg_pricing_bundle_revshare_no_insert BEFORE INSERT ON pricing_bundle_revshare FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_bundle_revshare: INSERT of a rev-share party under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_bundle b JOIN pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = NEW.bundle_id AND p.revision = NEW.plan_revision AND p.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_bundle_revshare_no_update
+  ON pricing_bundle_revshare
+  DDL CREATE TRIGGER trg_pricing_bundle_revshare_no_update BEFORE UPDATE ON pricing_bundle_revshare FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_bundle_revshare: UPDATE of a rev-share party under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_bundle b JOIN pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = OLD.bundle_id AND p.revision = OLD.plan_revision AND p.lifecycle_state = 'draft') OR NOT EXISTS (SELECT 1 FROM pricing_bundle b JOIN pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = NEW.bundle_id AND p.revision = NEW.plan_revision AND p.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_composite_meter_no_delete
+  ON pricing_composite_meter
+  DDL CREATE TRIGGER trg_pricing_composite_meter_no_delete BEFORE DELETE ON pricing_composite_meter FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_composite_meter: DELETE of a composite under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_composite_meter_no_insert
+  ON pricing_composite_meter
+  DDL CREATE TRIGGER trg_pricing_composite_meter_no_insert BEFORE INSERT ON pricing_composite_meter FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_composite_meter: INSERT of a composite under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_composite_meter_no_update
+  ON pricing_composite_meter
+  DDL CREATE TRIGGER trg_pricing_composite_meter_no_update BEFORE UPDATE ON pricing_composite_meter FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_composite_meter: UPDATE of a composite under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision AND lifecycle_state = 'draft') OR NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_composite_meter_same_tenant_as_its_revision_on_insert
+  ON pricing_composite_meter
+  DDL CREATE TRIGGER trg_pricing_composite_meter_same_tenant_as_its_revision_on_insert BEFORE INSERT ON pricing_composite_meter FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_composite_meter: the plan revision belongs to another tenant and may not hold this row') WHERE EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision) AND NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_composite_meter_same_tenant_as_its_revision_on_update
+  ON pricing_composite_meter
+  DDL CREATE TRIGGER trg_pricing_composite_meter_same_tenant_as_its_revision_on_update BEFORE UPDATE ON pricing_composite_meter FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_composite_meter: the plan revision belongs to another tenant and may not hold this row') WHERE EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision) AND NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_group_membership_no_overlap_insert
+  ON pricing_group_membership
+  DDL CREATE TRIGGER trg_pricing_group_membership_no_overlap_insert BEFORE INSERT ON pricing_group_membership FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_group_membership: interval overlaps an existing membership for this payer (D-09)') WHERE EXISTS (SELECT 1 FROM pricing_group_membership existing WHERE existing.tenant_id = NEW.tenant_id AND existing.payer_tenant_id = NEW.payer_tenant_id AND (existing.effective_to IS NULL OR NEW.effective_from < existing.effective_to) AND (NEW.effective_to IS NULL OR existing.effective_from < NEW.effective_to)); END
+TRIGGER trg_pricing_group_membership_no_overlap_update
+  ON pricing_group_membership
+  DDL CREATE TRIGGER trg_pricing_group_membership_no_overlap_update BEFORE UPDATE ON pricing_group_membership FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_group_membership: interval overlaps an existing membership for this payer (D-09)') WHERE EXISTS (SELECT 1 FROM pricing_group_membership existing WHERE existing.tenant_id = NEW.tenant_id AND existing.payer_tenant_id = NEW.payer_tenant_id AND existing.membership_id <> NEW.membership_id AND (existing.effective_to IS NULL OR NEW.effective_from < existing.effective_to) AND (NEW.effective_to IS NULL OR existing.effective_from < NEW.effective_to)); END
+TRIGGER trg_pricing_migration_exclusion_replay
+  ON pricing_migration
+  DDL CREATE TRIGGER trg_pricing_migration_exclusion_replay BEFORE UPDATE ON pricing_migration FOR EACH ROW WHEN OLD.state NOT IN ('completed','cancelled') AND OLD.exclusion_snapshot IS NOT NULL AND NEW.exclusion_snapshot IS NOT OLD.exclusion_snapshot BEGIN SELECT RAISE(ABORT, 'pricing_migration: the exclusion set is computed once and replayed verbatim; a recompute could differ from the set the executor already honoured'); END
+TRIGGER trg_pricing_migration_flip_whitelist
+  ON pricing_migration
+  DDL CREATE TRIGGER trg_pricing_migration_flip_whitelist BEFORE UPDATE ON pricing_migration FOR EACH ROW WHEN OLD.state NOT IN ('completed','cancelled') AND NEW.state IS NOT OLD.state AND NOT (OLD.state = 'scheduled' AND NEW.state IN ('in_progress','cancelled')) AND NOT (OLD.state = 'in_progress' AND NEW.state IN ('completed','cancelled')) BEGIN SELECT RAISE(ABORT, 'pricing_migration: state transition is not a sanctioned one'); END
+TRIGGER trg_pricing_migration_frozen_columns
+  ON pricing_migration
+  DDL CREATE TRIGGER trg_pricing_migration_frozen_columns BEFORE UPDATE ON pricing_migration FOR EACH ROW WHEN OLD.state NOT IN ('completed','cancelled') AND (NEW.migration_id IS NOT OLD.migration_id OR NEW.tenant_id IS NOT OLD.tenant_id OR NEW.source_plan_id IS NOT OLD.source_plan_id OR NEW.source_revision IS NOT OLD.source_revision OR NEW.target_plan_id IS NOT OLD.target_plan_id OR NEW.effective_at IS NOT OLD.effective_at OR NEW.announced_at IS NOT OLD.announced_at OR NEW.scope IS NOT OLD.scope OR NEW.delta_report IS NOT OLD.delta_report OR NEW.created_by IS NOT OLD.created_by OR NEW.created_at IS NOT OLD.created_at) BEGIN SELECT RAISE(ABORT, 'pricing_migration: the migration is bound to its source, target, effective date, scope and schedule-time delta report; only state, the execution records and the flip timestamps may move'); END
+TRIGGER trg_pricing_migration_immutable_history
+  ON pricing_migration
+  DDL CREATE TRIGGER trg_pricing_migration_immutable_history BEFORE UPDATE ON pricing_migration FOR EACH ROW WHEN OLD.state IN ('completed','cancelled') BEGIN SELECT RAISE(ABORT, 'pricing_migration: a completed or cancelled run is immutable history'); END
+TRIGGER trg_pricing_migration_no_delete
+  ON pricing_migration
+  DDL CREATE TRIGGER trg_pricing_migration_no_delete BEFORE DELETE ON pricing_migration FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_migration: DELETE of a migration is not permitted; cancel is a state, not a deletion, and an executor must be able to tell a cancelled run from an absent one'); END
+TRIGGER trg_pricing_plan_addon_rule_no_delete
+  ON pricing_plan_addon_rule
+  DDL CREATE TRIGGER trg_pricing_plan_addon_rule_no_delete BEFORE DELETE ON pricing_plan_addon_rule FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_addon_rule: DELETE of an add-on rule under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_plan_addon_rule_no_insert
+  ON pricing_plan_addon_rule
+  DDL CREATE TRIGGER trg_pricing_plan_addon_rule_no_insert BEFORE INSERT ON pricing_plan_addon_rule FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_addon_rule: INSERT of an add-on rule under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_plan_addon_rule_no_update
+  ON pricing_plan_addon_rule
+  DDL CREATE TRIGGER trg_pricing_plan_addon_rule_no_update BEFORE UPDATE ON pricing_plan_addon_rule FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_addon_rule: UPDATE of an add-on rule under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision AND lifecycle_state = 'draft') OR NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_plan_addon_rule_same_tenant_as_its_revision_on_insert
+  ON pricing_plan_addon_rule
+  DDL CREATE TRIGGER trg_pricing_plan_addon_rule_same_tenant_as_its_revision_on_insert BEFORE INSERT ON pricing_plan_addon_rule FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_addon_rule: the plan revision belongs to another tenant and may not hold this row') WHERE EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision) AND NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_plan_addon_rule_same_tenant_as_its_revision_on_update
+  ON pricing_plan_addon_rule
+  DDL CREATE TRIGGER trg_pricing_plan_addon_rule_same_tenant_as_its_revision_on_update BEFORE UPDATE ON pricing_plan_addon_rule FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_addon_rule: the plan revision belongs to another tenant and may not hold this row') WHERE EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision) AND NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_plan_descriptor_set_no_delete
+  ON pricing_plan_descriptor_set
+  DDL CREATE TRIGGER trg_pricing_plan_descriptor_set_no_delete BEFORE DELETE ON pricing_plan_descriptor_set FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_descriptor_set: DELETE of a descriptor set under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_plan_descriptor_set_no_insert
+  ON pricing_plan_descriptor_set
+  DDL CREATE TRIGGER trg_pricing_plan_descriptor_set_no_insert BEFORE INSERT ON pricing_plan_descriptor_set FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_descriptor_set: INSERT of a descriptor set under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_plan_descriptor_set_no_update
+  ON pricing_plan_descriptor_set
+  DDL CREATE TRIGGER trg_pricing_plan_descriptor_set_no_update BEFORE UPDATE ON pricing_plan_descriptor_set FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_descriptor_set: UPDATE of a descriptor set under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision AND lifecycle_state = 'draft') OR NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_plan_descriptor_set_same_tenant_as_its_revision_on_insert
+  ON pricing_plan_descriptor_set
+  DDL CREATE TRIGGER trg_pricing_plan_descriptor_set_same_tenant_as_its_revision_on_insert BEFORE INSERT ON pricing_plan_descriptor_set FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_descriptor_set: the plan revision belongs to another tenant and may not hold this row') WHERE EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision) AND NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_plan_descriptor_set_same_tenant_as_its_revision_on_update
+  ON pricing_plan_descriptor_set
+  DDL CREATE TRIGGER trg_pricing_plan_descriptor_set_same_tenant_as_its_revision_on_update BEFORE UPDATE ON pricing_plan_descriptor_set FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_descriptor_set: the plan revision belongs to another tenant and may not hold this row') WHERE EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision) AND NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_plan_draft_flip_whitelist
+  ON pricing_plan
+  DDL CREATE TRIGGER trg_pricing_plan_draft_flip_whitelist BEFORE UPDATE ON pricing_plan FOR EACH ROW WHEN OLD.lifecycle_state = 'draft' AND NEW.lifecycle_state NOT IN ('draft','published','abandoned') BEGIN SELECT RAISE(ABORT, 'pricing_plan: lifecycle_state transition is not a sanctioned flip'); END
+TRIGGER trg_pricing_plan_flip_whitelist
+  ON pricing_plan
+  DDL CREATE TRIGGER trg_pricing_plan_flip_whitelist BEFORE UPDATE ON pricing_plan FOR EACH ROW WHEN OLD.lifecycle_state <> 'draft' AND NOT (OLD.lifecycle_state = 'published' AND NEW.lifecycle_state IN ('superseded','retired')) BEGIN SELECT RAISE(ABORT, 'pricing_plan: lifecycle_state transition is not a sanctioned flip'); END
+TRIGGER trg_pricing_plan_frozen_columns
+  ON pricing_plan
+  DDL CREATE TRIGGER trg_pricing_plan_frozen_columns BEFORE UPDATE ON pricing_plan FOR EACH ROW WHEN OLD.lifecycle_state <> 'draft' AND (NEW.plan_id IS NOT OLD.plan_id OR NEW.revision IS NOT OLD.revision OR NEW.tenant_id IS NOT OLD.tenant_id OR NEW.sku_id IS NOT OLD.sku_id OR NEW.plan_tier IS NOT OLD.plan_tier OR NEW.billing_cycle IS NOT OLD.billing_cycle OR NEW.frequency IS NOT OLD.frequency OR NEW.custom_interval_n IS NOT OLD.custom_interval_n OR NEW.custom_interval_unit IS NOT OLD.custom_interval_unit OR NEW.plan_tier_override IS NOT OLD.plan_tier_override OR NEW.purchase_min_qty IS NOT OLD.purchase_min_qty OR NEW.purchase_max_qty IS NOT OLD.purchase_max_qty OR NEW.invoice_grouping_key IS NOT OLD.invoice_grouping_key OR NEW.available_from IS NOT OLD.available_from OR NEW.available_to IS NOT OLD.available_to OR NEW.created_by IS NOT OLD.created_by OR NEW.created_at_utc IS NOT OLD.created_at_utc OR NEW.allowed_change_targets IS NOT OLD.allowed_change_targets OR NEW.comparability_rank IS NOT OLD.comparability_rank OR NEW.usage_counter_on_plan_change IS NOT OLD.usage_counter_on_plan_change OR NEW.entitlement_grants IS NOT OLD.entitlement_grants OR NEW.cloned_from IS NOT OLD.cloned_from OR NEW.plan_name IS NOT OLD.plan_name OR NEW.row_version IS NOT OLD.row_version) BEGIN SELECT RAISE(ABORT, 'pricing_plan: revision is frozen; only a sanctioned lifecycle_state flip is permitted'); END
+TRIGGER trg_pricing_plan_no_delete
+  ON pricing_plan
+  DDL CREATE TRIGGER trg_pricing_plan_no_delete BEFORE DELETE ON pricing_plan FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan: DELETE of a revision is not permitted; a discarded draft revision is abandoned'); END
+TRIGGER trg_pricing_plan_period_floor_cap_no_delete
+  ON pricing_plan_period_floor_cap
+  DDL CREATE TRIGGER trg_pricing_plan_period_floor_cap_no_delete BEFORE DELETE ON pricing_plan_period_floor_cap FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_period_floor_cap: DELETE of a period bound under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_plan_period_floor_cap_no_insert
+  ON pricing_plan_period_floor_cap
+  DDL CREATE TRIGGER trg_pricing_plan_period_floor_cap_no_insert BEFORE INSERT ON pricing_plan_period_floor_cap FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_period_floor_cap: INSERT of a period bound under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_plan_period_floor_cap_no_update
+  ON pricing_plan_period_floor_cap
+  DDL CREATE TRIGGER trg_pricing_plan_period_floor_cap_no_update BEFORE UPDATE ON pricing_plan_period_floor_cap FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_period_floor_cap: UPDATE of a period bound under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision AND lifecycle_state = 'draft') OR NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_plan_period_floor_cap_same_tenant_as_its_revision_on_insert
+  ON pricing_plan_period_floor_cap
+  DDL CREATE TRIGGER trg_pricing_plan_period_floor_cap_same_tenant_as_its_revision_on_insert BEFORE INSERT ON pricing_plan_period_floor_cap FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_period_floor_cap: the plan revision belongs to another tenant and may not hold this row') WHERE EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision) AND NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_plan_period_floor_cap_same_tenant_as_its_revision_on_update
+  ON pricing_plan_period_floor_cap
+  DDL CREATE TRIGGER trg_pricing_plan_period_floor_cap_same_tenant_as_its_revision_on_update BEFORE UPDATE ON pricing_plan_period_floor_cap FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_period_floor_cap: the plan revision belongs to another tenant and may not hold this row') WHERE EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision) AND NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_plan_phase_no_delete
+  ON pricing_plan_phase
+  DDL CREATE TRIGGER trg_pricing_plan_phase_no_delete BEFORE DELETE ON pricing_plan_phase FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_phase: DELETE of a phase under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_plan_phase_no_insert
+  ON pricing_plan_phase
+  DDL CREATE TRIGGER trg_pricing_plan_phase_no_insert BEFORE INSERT ON pricing_plan_phase FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_phase: INSERT of a phase under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_plan_phase_no_update
+  ON pricing_plan_phase
+  DDL CREATE TRIGGER trg_pricing_plan_phase_no_update BEFORE UPDATE ON pricing_plan_phase FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_phase: UPDATE of a phase under a non-draft plan revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision AND lifecycle_state = 'draft') OR NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_plan_phase_same_tenant_as_its_revision_on_insert
+  ON pricing_plan_phase
+  DDL CREATE TRIGGER trg_pricing_plan_phase_same_tenant_as_its_revision_on_insert BEFORE INSERT ON pricing_plan_phase FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_phase: the plan revision belongs to another tenant and may not hold this row') WHERE EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision) AND NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_plan_phase_same_tenant_as_its_revision_on_update
+  ON pricing_plan_phase
+  DDL CREATE TRIGGER trg_pricing_plan_phase_same_tenant_as_its_revision_on_update BEFORE UPDATE ON pricing_plan_phase FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_plan_phase: the plan revision belongs to another tenant and may not hold this row') WHERE EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision) AND NOT EXISTS (SELECT 1 FROM pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision AND tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_price_draft_flip_whitelist
+  ON pricing_price
+  DDL CREATE TRIGGER trg_pricing_price_draft_flip_whitelist BEFORE UPDATE ON pricing_price FOR EACH ROW WHEN OLD.lifecycle_state = 'draft' AND NEW.lifecycle_state NOT IN ('draft','published') BEGIN SELECT RAISE(ABORT, 'pricing_price: lifecycle_state transition is not sanctioned'); END
+TRIGGER trg_pricing_price_flip_whitelist
+  ON pricing_price
+  DDL CREATE TRIGGER trg_pricing_price_flip_whitelist BEFORE UPDATE ON pricing_price FOR EACH ROW WHEN OLD.lifecycle_state <> 'draft' AND NEW.lifecycle_state IS NOT OLD.lifecycle_state AND NOT (OLD.lifecycle_state = 'published' AND NEW.lifecycle_state = 'superseded') BEGIN SELECT RAISE(ABORT, 'pricing_price: lifecycle_state transition is not sanctioned'); END
+TRIGGER trg_pricing_price_frozen_columns
+  ON pricing_price
+  DDL CREATE TRIGGER trg_pricing_price_frozen_columns BEFORE UPDATE ON pricing_price FOR EACH ROW WHEN OLD.lifecycle_state <> 'draft' AND (NEW.price_id IS NOT OLD.price_id OR NEW.tenant_id IS NOT OLD.tenant_id OR NEW.plan_id IS NOT OLD.plan_id OR NEW.currency IS NOT OLD.currency OR NEW.region IS NOT OLD.region OR NEW.price_overlay IS NOT OLD.price_overlay OR NEW.phase IS NOT OLD.phase OR NEW.price_eligibility IS NOT OLD.price_eligibility OR NEW.charge_kind IS NOT OLD.charge_kind OR NEW.cohort IS NOT OLD.cohort OR NEW.amount_minor IS NOT OLD.amount_minor OR NEW.unit_rate_nano IS NOT OLD.unit_rate_nano OR NEW.model_kind IS NOT OLD.model_kind OR NEW.tax_inclusive IS NOT OLD.tax_inclusive OR NEW.tax_category_ref IS NOT OLD.tax_category_ref OR NEW.resolved_tax_category IS NOT OLD.resolved_tax_category OR NEW.resolved_rounding_policy IS NOT OLD.resolved_rounding_policy OR NEW.billing_timing IS NOT OLD.billing_timing OR NEW.billing_anchor_policy IS NOT OLD.billing_anchor_policy OR NEW.anchor_day IS NOT OLD.anchor_day OR NEW.proration_basis IS NOT OLD.proration_basis OR NEW.credit_on_downgrade IS NOT OLD.credit_on_downgrade OR NEW.quantity_source IS NOT OLD.quantity_source OR NEW.manual_quantity IS NOT OLD.manual_quantity OR NEW.package_size IS NOT OLD.package_size OR NEW.package_price_minor IS NOT OLD.package_price_minor OR NEW.meter IS NOT OLD.meter OR NEW.dimension_key IS NOT OLD.dimension_key OR NEW.billing_granularity IS NOT OLD.billing_granularity OR NEW.aggregation_function IS NOT OLD.aggregation_function OR NEW.aggregation_granularity IS NOT OLD.aggregation_granularity OR NEW.tier_aggregation_window IS NOT OLD.tier_aggregation_window OR NEW.tier_qualification_window IS NOT OLD.tier_qualification_window OR NEW.max_hold_granules IS NOT OLD.max_hold_granules OR NEW.included_allowance IS NOT OLD.included_allowance OR NEW.reserved_rate_nano IS NOT OLD.reserved_rate_nano OR NEW.reservation_flavor IS NOT OLD.reservation_flavor OR NEW.min_qty_purchase IS NOT OLD.min_qty_purchase OR NEW.min_qty_usage IS NOT OLD.min_qty_usage OR NEW.min_qty_usage_fallback IS NOT OLD.min_qty_usage_fallback OR NEW.discount_ref IS NOT OLD.discount_ref OR NEW.rounding_policy_ref IS NOT OLD.rounding_policy_ref OR NEW.supersedes_price_id IS NOT OLD.supersedes_price_id OR NEW.created_by IS NOT OLD.created_by OR NEW.created_at_utc IS NOT OLD.created_at_utc OR NEW.row_version IS NOT OLD.row_version) BEGIN SELECT RAISE(ABORT, 'pricing_price: row is published; price, scope, model and entity-tag columns are immutable'); END
+TRIGGER trg_pricing_price_grandfather_monotonic
+  ON pricing_price
+  DDL CREATE TRIGGER trg_pricing_price_grandfather_monotonic BEFORE UPDATE ON pricing_price FOR EACH ROW WHEN OLD.lifecycle_state <> 'draft' AND NEW.grandfather_until IS NOT OLD.grandfather_until AND (NEW.grandfather_until IS NULL OR (OLD.grandfather_until IS NOT NULL AND NEW.grandfather_until > OLD.grandfather_until)) BEGIN SELECT RAISE(ABORT, 'pricing_price: grandfather_until may only be tightened, never loosened'); END
+TRIGGER trg_pricing_price_no_delete
+  ON pricing_price
+  DDL CREATE TRIGGER trg_pricing_price_no_delete BEFORE DELETE ON pricing_price FOR EACH ROW WHEN OLD.lifecycle_state <> 'draft' BEGIN SELECT RAISE(ABORT, 'pricing_price: DELETE of a non-draft row is not permitted'); END
+TRIGGER trg_pricing_price_overlay_draft_exit
+  ON pricing_price_overlay
+  DDL CREATE TRIGGER trg_pricing_price_overlay_draft_exit BEFORE UPDATE ON pricing_price_overlay FOR EACH ROW WHEN OLD.lifecycle_state = 'draft' AND NEW.lifecycle_state NOT IN ('draft', 'published', 'abandoned') BEGIN SELECT RAISE(ABORT, 'pricing_price_overlay: that lifecycle_state move is not a sanctioned flip'); END
+TRIGGER trg_pricing_price_overlay_frozen_columns
+  ON pricing_price_overlay
+  DDL CREATE TRIGGER trg_pricing_price_overlay_frozen_columns BEFORE UPDATE ON pricing_price_overlay FOR EACH ROW WHEN OLD.lifecycle_state <> 'draft' AND (NEW.price_overlay_id IS NOT OLD.price_overlay_id OR NEW.revision IS NOT OLD.revision OR NEW.tenant_id IS NOT OLD.tenant_id OR NEW.scope_class IS NOT OLD.scope_class OR NEW.scope_value IS NOT OLD.scope_value OR NEW.precedence IS NOT OLD.precedence OR NEW.effective_from IS NOT OLD.effective_from OR NEW.effective_to IS NOT OLD.effective_to OR NEW.tax_basis IS NOT OLD.tax_basis OR NEW.disclosure IS NOT OLD.disclosure OR NEW.target_ref IS NOT OLD.target_ref OR NEW.row_version IS NOT OLD.row_version) BEGIN SELECT RAISE(ABORT, 'pricing_price_overlay: the revision is frozen; only a sanctioned lifecycle_state flip is permitted'); END
+TRIGGER trg_pricing_price_overlay_frozen_flip
+  ON pricing_price_overlay
+  DDL CREATE TRIGGER trg_pricing_price_overlay_frozen_flip BEFORE UPDATE ON pricing_price_overlay FOR EACH ROW WHEN OLD.lifecycle_state <> 'draft' AND NEW.lifecycle_state IS NOT OLD.lifecycle_state AND NOT (OLD.lifecycle_state = 'published' AND NEW.lifecycle_state = 'superseded') BEGIN SELECT RAISE(ABORT, 'pricing_price_overlay: that lifecycle_state move is not a sanctioned flip'); END
+TRIGGER trg_pricing_price_overlay_line_amount_no_delete
+  ON pricing_price_overlay_line_amount
+  DDL CREATE TRIGGER trg_pricing_price_overlay_line_amount_no_delete BEFORE DELETE ON pricing_price_overlay_line_amount FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_overlay_line_amount: DELETE of a value under a non-draft overlay revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_price_overlay_line l JOIN pricing_price_overlay o ON o.price_overlay_id = l.price_overlay_id AND o.revision = l.overlay_revision WHERE l.line_id = OLD.line_id AND l.overlay_revision = OLD.overlay_revision AND l.tenant_id = OLD.tenant_id AND o.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_price_overlay_line_amount_no_insert
+  ON pricing_price_overlay_line_amount
+  DDL CREATE TRIGGER trg_pricing_price_overlay_line_amount_no_insert BEFORE INSERT ON pricing_price_overlay_line_amount FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_overlay_line_amount: INSERT of a value under a non-draft overlay revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_price_overlay_line l JOIN pricing_price_overlay o ON o.price_overlay_id = l.price_overlay_id AND o.revision = l.overlay_revision WHERE l.line_id = NEW.line_id AND l.overlay_revision = NEW.overlay_revision AND l.tenant_id = NEW.tenant_id AND o.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_price_overlay_line_amount_no_update
+  ON pricing_price_overlay_line_amount
+  DDL CREATE TRIGGER trg_pricing_price_overlay_line_amount_no_update BEFORE UPDATE ON pricing_price_overlay_line_amount FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_overlay_line_amount: UPDATE of a value under a non-draft overlay revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_price_overlay_line l JOIN pricing_price_overlay o ON o.price_overlay_id = l.price_overlay_id AND o.revision = l.overlay_revision WHERE l.line_id = OLD.line_id AND l.overlay_revision = OLD.overlay_revision AND l.tenant_id = OLD.tenant_id AND o.lifecycle_state = 'draft') OR NOT EXISTS (SELECT 1 FROM pricing_price_overlay_line l JOIN pricing_price_overlay o ON o.price_overlay_id = l.price_overlay_id AND o.revision = l.overlay_revision WHERE l.line_id = NEW.line_id AND l.overlay_revision = NEW.overlay_revision AND l.tenant_id = NEW.tenant_id AND o.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_price_overlay_line_no_delete
+  ON pricing_price_overlay_line
+  DDL CREATE TRIGGER trg_pricing_price_overlay_line_no_delete BEFORE DELETE ON pricing_price_overlay_line FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_overlay_line: DELETE of a line under a non-draft overlay revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_price_overlay o WHERE o.price_overlay_id = OLD.price_overlay_id AND o.revision = OLD.overlay_revision AND o.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_price_overlay_line_no_insert
+  ON pricing_price_overlay_line
+  DDL CREATE TRIGGER trg_pricing_price_overlay_line_no_insert BEFORE INSERT ON pricing_price_overlay_line FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_overlay_line: INSERT of a line under a non-draft overlay revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_price_overlay o WHERE o.price_overlay_id = NEW.price_overlay_id AND o.revision = NEW.overlay_revision AND o.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_price_overlay_line_no_update
+  ON pricing_price_overlay_line
+  DDL CREATE TRIGGER trg_pricing_price_overlay_line_no_update BEFORE UPDATE ON pricing_price_overlay_line FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_overlay_line: UPDATE of a line under a non-draft overlay revision is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_price_overlay o WHERE o.price_overlay_id = OLD.price_overlay_id AND o.revision = OLD.overlay_revision AND o.lifecycle_state = 'draft') OR NOT EXISTS (SELECT 1 FROM pricing_price_overlay o WHERE o.price_overlay_id = NEW.price_overlay_id AND o.revision = NEW.overlay_revision AND o.lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_price_overlay_line_same_tenant_as_its_revision_on_insert
+  ON pricing_price_overlay_line
+  DDL CREATE TRIGGER trg_pricing_price_overlay_line_same_tenant_as_its_revision_on_insert BEFORE INSERT ON pricing_price_overlay_line FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_overlay_line: the overlay revision belongs to another tenant and may not hold this line') WHERE EXISTS (SELECT 1 FROM pricing_price_overlay o WHERE o.price_overlay_id = NEW.price_overlay_id AND o.revision = NEW.overlay_revision) AND NOT EXISTS (SELECT 1 FROM pricing_price_overlay o WHERE o.price_overlay_id = NEW.price_overlay_id AND o.revision = NEW.overlay_revision AND o.tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_price_overlay_line_same_tenant_as_its_revision_on_update
+  ON pricing_price_overlay_line
+  DDL CREATE TRIGGER trg_pricing_price_overlay_line_same_tenant_as_its_revision_on_update BEFORE UPDATE ON pricing_price_overlay_line FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_overlay_line: the overlay revision belongs to another tenant and may not hold this line') WHERE EXISTS (SELECT 1 FROM pricing_price_overlay o WHERE o.price_overlay_id = NEW.price_overlay_id AND o.revision = NEW.overlay_revision) AND NOT EXISTS (SELECT 1 FROM pricing_price_overlay o WHERE o.price_overlay_id = NEW.price_overlay_id AND o.revision = NEW.overlay_revision AND o.tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_price_overlay_no_delete
+  ON pricing_price_overlay
+  DDL CREATE TRIGGER trg_pricing_price_overlay_no_delete BEFORE DELETE ON pricing_price_overlay FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_overlay: DELETE of a revision is not permitted; a discarded draft revision is abandoned'); END
+TRIGGER trg_pricing_price_tier_band_kind_insert
+  ON pricing_price_tier_band
+  DDL CREATE TRIGGER trg_pricing_price_tier_band_kind_insert BEFORE INSERT ON pricing_price_tier_band FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_tier_band: band rows are permitted only on a graduated or volume price row') WHERE NOT EXISTS (SELECT 1 FROM pricing_price WHERE price_id = NEW.price_id AND model_kind IN ('graduated','volume')); END
+TRIGGER trg_pricing_price_tier_band_kind_update
+  ON pricing_price_tier_band
+  DDL CREATE TRIGGER trg_pricing_price_tier_band_kind_update BEFORE UPDATE ON pricing_price_tier_band FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_tier_band: band rows are permitted only on a graduated or volume price row') WHERE NOT EXISTS (SELECT 1 FROM pricing_price WHERE price_id = NEW.price_id AND model_kind IN ('graduated','volume')); END
+TRIGGER trg_pricing_price_tier_band_no_delete
+  ON pricing_price_tier_band
+  DDL CREATE TRIGGER trg_pricing_price_tier_band_no_delete BEFORE DELETE ON pricing_price_tier_band FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_tier_band: DELETE of a band under a non-draft price row is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_price WHERE price_id = OLD.price_id AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_price_tier_band_no_insert
+  ON pricing_price_tier_band
+  DDL CREATE TRIGGER trg_pricing_price_tier_band_no_insert BEFORE INSERT ON pricing_price_tier_band FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_tier_band: INSERT of a band under a non-draft price row is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_price WHERE price_id = NEW.price_id AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_price_tier_band_no_update
+  ON pricing_price_tier_band
+  DDL CREATE TRIGGER trg_pricing_price_tier_band_no_update BEFORE UPDATE ON pricing_price_tier_band FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_tier_band: UPDATE of a band under a non-draft price row is not permitted') WHERE NOT EXISTS (SELECT 1 FROM pricing_price WHERE price_id = OLD.price_id AND lifecycle_state = 'draft') OR NOT EXISTS (SELECT 1 FROM pricing_price WHERE price_id = NEW.price_id AND lifecycle_state = 'draft'); END
+TRIGGER trg_pricing_price_tier_band_parent_kind
+  ON pricing_price
+  DDL CREATE TRIGGER trg_pricing_price_tier_band_parent_kind BEFORE UPDATE ON pricing_price FOR EACH ROW WHEN NEW.model_kind IS NULL OR NEW.model_kind NOT IN ('graduated','volume') BEGIN SELECT RAISE(ABORT, 'pricing_price_tier_band: a price row that still carries bands may not leave the graduated or volume kinds') WHERE EXISTS (SELECT 1 FROM pricing_price_tier_band WHERE price_id = OLD.price_id); END
+TRIGGER trg_pricing_price_window_act_sequence
+  ON pricing_price_window
+  DDL CREATE TRIGGER trg_pricing_price_window_act_sequence BEFORE UPDATE ON pricing_price_window FOR EACH ROW WHEN OLD.state NOT IN ('expired','cancelled') AND NEW.mutation_seq IS NOT OLD.mutation_seq AND NEW.mutation_seq <> OLD.mutation_seq + 1 BEGIN SELECT RAISE(ABORT, 'pricing_price_window: the act sequence moves by one act at a time; it names an act, and a name that can be reused or run backwards names nothing'); END
+TRIGGER trg_pricing_price_window_flip_whitelist
+  ON pricing_price_window
+  DDL CREATE TRIGGER trg_pricing_price_window_flip_whitelist BEFORE UPDATE ON pricing_price_window FOR EACH ROW WHEN OLD.state NOT IN ('expired','cancelled') AND NEW.state IS NOT OLD.state AND NOT (OLD.state = 'scheduled' AND NEW.state IN ('active','cancelled')) AND NOT (OLD.state = 'active' AND NEW.state = 'expired') BEGIN SELECT RAISE(ABORT, 'pricing_price_window: state transition is not a sanctioned one'); END
+TRIGGER trg_pricing_price_window_frozen_columns
+  ON pricing_price_window
+  DDL CREATE TRIGGER trg_pricing_price_window_frozen_columns BEFORE UPDATE ON pricing_price_window FOR EACH ROW WHEN OLD.state NOT IN ('expired','cancelled') AND (NEW.window_id IS NOT OLD.window_id OR NEW.tenant_id IS NOT OLD.tenant_id OR NEW.price_id IS NOT OLD.price_id OR NEW.effective_from IS NOT OLD.effective_from OR NEW.reason_code IS NOT OLD.reason_code OR NEW.created_by IS NOT OLD.created_by OR NEW.created_at IS NOT OLD.created_at) BEGIN SELECT RAISE(ABORT, 'pricing_price_window: the window is bound to its price row and its start; only state, effective_to and the flip timestamps may move'); END
+TRIGGER trg_pricing_price_window_future_end
+  ON pricing_price_window
+  DDL CREATE TRIGGER trg_pricing_price_window_future_end BEFORE UPDATE ON pricing_price_window FOR EACH ROW WHEN OLD.state NOT IN ('expired','cancelled') AND NEW.effective_to IS NOT OLD.effective_to AND ((NEW.effective_to IS NOT NULL AND datetime(NEW.effective_to) <= CURRENT_TIMESTAMP) OR (OLD.effective_to IS NOT NULL AND datetime(OLD.effective_to) <= CURRENT_TIMESTAMP)) BEGIN SELECT RAISE(ABORT, 'pricing_price_window: effective_to may only be moved while it is in the future, and only to a future instant'); END
+TRIGGER trg_pricing_price_window_immutable_history
+  ON pricing_price_window
+  DDL CREATE TRIGGER trg_pricing_price_window_immutable_history BEFORE UPDATE ON pricing_price_window FOR EACH ROW WHEN OLD.state IN ('expired','cancelled') BEGIN SELECT RAISE(ABORT, 'pricing_price_window: an expired or cancelled window is immutable history'); END
+TRIGGER trg_pricing_price_window_no_delete
+  ON pricing_price_window
+  DDL CREATE TRIGGER trg_pricing_price_window_no_delete BEFORE DELETE ON pricing_price_window FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_window: DELETE of a window is not permitted; cancel is a state, not a deletion'); END
+TRIGGER trg_pricing_price_window_no_overlap_insert
+  ON pricing_price_window
+  DDL CREATE TRIGGER trg_pricing_price_window_no_overlap_insert BEFORE INSERT ON pricing_price_window FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_window: interval overlaps an occupying window on this price row') WHERE NEW.state IN ('scheduled','active') AND EXISTS (SELECT 1 FROM pricing_price_window existing WHERE existing.tenant_id = NEW.tenant_id AND existing.price_id = NEW.price_id AND existing.state IN ('scheduled','active') AND (existing.effective_to IS NULL OR NEW.effective_from < existing.effective_to) AND (NEW.effective_to IS NULL OR existing.effective_from < NEW.effective_to)); END
+TRIGGER trg_pricing_price_window_no_overlap_update
+  ON pricing_price_window
+  DDL CREATE TRIGGER trg_pricing_price_window_no_overlap_update BEFORE UPDATE ON pricing_price_window FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_price_window: interval overlaps an occupying window on this price row') WHERE NEW.state IN ('scheduled','active') AND EXISTS (SELECT 1 FROM pricing_price_window existing WHERE existing.tenant_id = NEW.tenant_id AND existing.price_id = NEW.price_id AND existing.window_id <> NEW.window_id AND existing.state IN ('scheduled','active') AND (existing.effective_to IS NULL OR NEW.effective_from < existing.effective_to) AND (NEW.effective_to IS NULL OR existing.effective_from < NEW.effective_to)); END
+TRIGGER trg_pricing_repricing_journal_born_pending
+  ON pricing_repricing_journal
+  DDL CREATE TRIGGER trg_pricing_repricing_journal_born_pending BEFORE INSERT ON pricing_repricing_journal FOR EACH ROW WHEN NEW.state <> 'pending' BEGIN SELECT RAISE(ABORT, 'pricing_repricing_journal: a journal row is born pending and in no other state'); END
+TRIGGER trg_pricing_repricing_journal_decided_is_final
+  ON pricing_repricing_journal
+  DDL CREATE TRIGGER trg_pricing_repricing_journal_decided_is_final BEFORE UPDATE ON pricing_repricing_journal FOR EACH ROW WHEN OLD.state <> 'pending' BEGIN SELECT RAISE(ABORT, 'pricing_repricing_journal: the journal row is already decided, and a decided row never moves again'); END
+TRIGGER trg_pricing_repricing_journal_frozen_key
+  ON pricing_repricing_journal
+  DDL CREATE TRIGGER trg_pricing_repricing_journal_frozen_key BEFORE UPDATE ON pricing_repricing_journal FOR EACH ROW WHEN NEW.run_id IS NOT OLD.run_id OR NEW.price_id IS NOT OLD.price_id OR NEW.tenant_id IS NOT OLD.tenant_id BEGIN SELECT RAISE(ABORT, 'pricing_repricing_journal: the journal row is keyed and its key is frozen'); END
+TRIGGER trg_pricing_repricing_journal_no_delete
+  ON pricing_repricing_journal
+  DDL CREATE TRIGGER trg_pricing_repricing_journal_no_delete BEFORE DELETE ON pricing_repricing_journal FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_repricing_journal: DELETE of a journal row is not permitted; the journal is the idempotency spine and a missing row re-applies'); END
+TRIGGER trg_pricing_repricing_journal_only_under_a_repricing_run
+  ON pricing_repricing_journal
+  DDL CREATE TRIGGER trg_pricing_repricing_journal_only_under_a_repricing_run BEFORE INSERT ON pricing_repricing_journal FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_repricing_journal: only a repricing run journals per-row progress') WHERE EXISTS (SELECT 1 FROM pricing_bulk_operation WHERE operation_id = NEW.run_id) AND NOT EXISTS (SELECT 1 FROM pricing_bulk_operation WHERE operation_id = NEW.run_id AND kind = 'repricing'); END
+TRIGGER trg_pricing_repricing_journal_same_tenant_as_its_run
+  ON pricing_repricing_journal
+  DDL CREATE TRIGGER trg_pricing_repricing_journal_same_tenant_as_its_run BEFORE INSERT ON pricing_repricing_journal FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_repricing_journal: the run belongs to another tenant and may not journal this row') WHERE EXISTS (SELECT 1 FROM pricing_bulk_operation WHERE operation_id = NEW.run_id) AND NOT EXISTS (SELECT 1 FROM pricing_bulk_operation WHERE operation_id = NEW.run_id AND tenant_id = NEW.tenant_id); END
+TRIGGER trg_pricing_snapshot_provenance_no_delete
+  ON pricing_snapshot_provenance
+  DDL CREATE TRIGGER trg_pricing_snapshot_provenance_no_delete BEFORE DELETE ON pricing_snapshot_provenance FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_snapshot_provenance: DELETE of a migrated-origin record is not permitted; an auditor reconstructing a legacy charge needs it to still exist'); END
+TRIGGER trg_pricing_snapshot_provenance_no_update
+  ON pricing_snapshot_provenance
+  DDL CREATE TRIGGER trg_pricing_snapshot_provenance_no_update BEFORE UPDATE ON pricing_snapshot_provenance FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'pricing_snapshot_provenance: a migrated-origin snapshot is frozen; it resolves through no CatalogVersion, so this row is the only thing making it immutable'); END

@@ -128,6 +128,11 @@ impl From<DomainError> for CanonicalError {
             DomainError::DuplicateMembership { key, message } => {
                 RgError::already_exists(message).with_resource(key).create()
             }
+            DomainError::GroupAlreadyExists { id } => {
+                RgError::already_exists(format!("Resource group with id '{id}' already exists"))
+                    .with_resource(id.to_string())
+                    .create()
+            }
             DomainError::TenantRootAlreadyExists {
                 existing_root_id,
                 detail,

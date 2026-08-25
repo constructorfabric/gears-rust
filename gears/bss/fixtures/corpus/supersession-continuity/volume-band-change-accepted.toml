@@ -1,0 +1,78 @@
+family     = "supersession-continuity"
+id         = "volume-band-change-accepted"
+kind       = "publish"
+provenance = ["inst-tb-supersession-units", "inst-mk-chargekind", "inst-tb-window", "D-17", "D-82", "D-98"]
+
+# `volume`'s positive case, and the one that says the guard has a far side on the
+# formula where a reband is most visible.
+#
+# Until this case existed, everything the corpus asserted about publishing a
+# `volume` row was a **refusal**: `kind-flip-rejected` carries a `volume`
+# successor and expects `SUPERSESSION_UNIT_MISMATCH`, and it was the only publish
+# case any `volume` row appeared in. The registry's `publish` half is earned per
+# kind by a passing run, so `publish = true` for `volume` meant "the gear
+# reproduces one refusal" - a gear that rejected *every* `volume` supersession
+# would have earned the identical flag and opened the identical gate.
+#
+# What it pins is not "supersession allows a price change"; `price-change-accepted`
+# already says that, on `graduated`. It pins that the same answer holds where the
+# reasoning most plausibly breaks. Under Variant A the band holding `Q` sets one
+# rate for the **whole** `Q`, so moving a band bound re-prices the entire
+# continued counter - every unit accumulated before the supersession, not merely
+# the ones above the moved edge. That is the exact harm D-98 names when it
+# refuses a `graduated` to `volume` flip mid-window, and it is the reason a
+# reader could conclude that a `volume` row must be frozen once published.
+#
+# It is not. D-82 draws the line at what the counter is **denominated in, derived
+# from and priced by** - the meter, the dimension, the billable unit, the window
+# and the formula - and a band set is none of those: it is the price. A guard
+# that read "re-prices the accumulated Q" as its test would have caught this row,
+# and would have left the catalog unable to reprice a volume ladder without a
+# plan revision.
+#
+# Every unit/counter field is therefore **equal on both sides** - `meter`,
+# `billingGranularity`, `tierAggregationWindow`, and `model_kind` itself, which
+# is what keeps this case about the bands and not about the D-98 flip. The
+# quantities the two ladders price are deliberately different at both edges (the
+# cliff moves from 1000 to 2000 and both rates move), so a subject that compared
+# band **sets** for equality rather than the unit fields is red here.
+
+[predecessor]
+model_kind              = "volume"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "api.calls"
+billing_granularity     = "whole_unit"
+tier_aggregation_window = "invoice_period"
+
+  [[predecessor.bands]]
+  from_qty = 0
+  to_qty   = 1000
+  unit_amount_minor = 5
+
+  [[predecessor.bands]]
+  from_qty = 1000
+  to_qty   = "open"
+  unit_amount_minor = 3
+
+[successor]
+model_kind              = "volume"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "api.calls"
+billing_granularity     = "whole_unit"
+tier_aggregation_window = "invoice_period"
+
+  [[successor.bands]]
+  from_qty = 0
+  to_qty   = 2000
+  unit_amount_minor = 7
+
+  [[successor.bands]]
+  from_qty = 2000
+  to_qty   = "open"
+  unit_amount_minor = 4
+
+[[assert]]
+expect = { publish = "accepted" }
+why    = "the counter continues, and it continues meaning the same thing: same meter, same dimension, same billable unit, same window, same formula. Only the ladder moved, and a ladder is a price - even on Variant A, where the new rate applies to the whole continued Q rather than to the units above the moved edge. Rejecting this would make `volume` the one kind that cannot be repriced through the mechanism D-82 exists to permit, and it would leave the corpus with no evidence at all that a volume row can be published"

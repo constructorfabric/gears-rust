@@ -40,6 +40,7 @@ pub mod error;
 pub mod field;
 pub mod gts;
 pub mod idp;
+pub mod idp_service_account;
 pub mod idp_user;
 pub mod metadata;
 pub mod precondition;
@@ -50,18 +51,23 @@ pub mod tenant;
 pub use client::AccountManagementClient;
 pub use error::AccountManagementError;
 pub use gts::{
-    CONVERSION_REQUEST_RESOURCE_TYPE, IdpPluginSpecV1, TENANT_METADATA_RESOURCE_TYPE,
-    TENANT_RESOURCE_TYPE, USER_RESOURCE_TYPE,
+    CONVERSION_REQUEST_RESOURCE_TYPE, IdpPluginSpecV1, SERVICE_ACCOUNT_RESOURCE_TYPE,
+    TENANT_METADATA_RESOURCE_TYPE, TENANT_RESOURCE_TYPE, USER_RESOURCE_TYPE,
 };
 pub use idp::{
     IdpDeprovisionFailure, IdpDeprovisionTenantRequest, IdpPluginClient, IdpProvisionFailure,
     IdpProvisionResult, IdpProvisionTarget, IdpProvisionTenantRequest,
 };
+pub use idp_service_account::{
+    IdpListServiceAccountsRequest, IdpProvisionServiceAccountRequest,
+    IdpRevokeServiceAccountRequest, IdpRotateServiceAccountSecretRequest,
+    IdpServiceAccountCredentials, IdpServiceAccountFailure, IdpServiceAccountSummary,
+};
 pub use idp_user::{
     IdpDeprovisionUserRequest, IdpListUsersRequest, IdpNewUser, IdpProvisionUserRequest,
-    IdpTenantContext, IdpUpdateUserRequest, IdpUser, IdpUserDuplicateField, IdpUserFilterField,
-    IdpUserOperationFailure, IdpUserPagination, IdpUserPaginationError, IdpUserPatch, IdpUserQuery,
-    ListUsersQuery, NewUserPassword,
+    IdpTenantContext, IdpUpdateUserRequest, IdpUser, IdpUserAttribute, IdpUserDuplicateField,
+    IdpUserFilterField, IdpUserOperationFailure, IdpUserPagination, IdpUserPaginationError,
+    IdpUserPatch, IdpUserQuery, ListUsersQuery, NewUserPassword,
 };
 pub use metadata::{
     MetadataEntry, MetadataEntryFilterField, MetadataEntryQuery, UpsertMetadataRequest,

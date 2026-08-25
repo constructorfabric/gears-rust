@@ -434,7 +434,7 @@ async fn migrate_backend_verifies_multipart_composite_without_parts_rows() {
     // self-contained record).
     let conn = Database::connect(&dsn).await.expect("raw connect");
     let deleted = conn
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "DELETE FROM multipart_upload_parts".to_owned(),
         ))
@@ -449,7 +449,7 @@ async fn migrate_backend_verifies_multipart_composite_without_parts_rows() {
     // alongside the multipart-composite one; migrate_backend only operates on
     // non-versioned files (exactly one version), so drop the leftover pending
     // row, leaving just the completed multipart-composite version.
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "DELETE FROM file_versions WHERE status = 'pending'".to_owned(),
     ))

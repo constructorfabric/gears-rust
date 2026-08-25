@@ -6,18 +6,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cluster_sdk::{
     CacheCapability, CacheWatchEvent, ClusterCacheV1, ClusterError, ClusterProfile,
-    DiscoveryFilter, DistributedLockBackend, DistributedLockV1, ElectionConfig,
-    LeaderElectionBackend, LeaderElectionFeatures, LeaderElectionV1, LeaderStatus, LeaderWatch,
-    LeaderWatchEvent, LockFeatures, LockGuard, ServiceDiscoveryBackend, ServiceDiscoveryFeatures,
-    ServiceDiscoveryV1, ServiceHandle, ServiceInstance, ServiceRegistration, ServiceWatch,
-    ServiceWatchEvent,
+    DistributedLockBackend, DistributedLockV1, ElectionConfig, LeaderElectionBackend,
+    LeaderElectionFeatures, LeaderElectionV1, LeaderStatus, LeaderWatch, LeaderWatchEvent,
+    LockFeatures, LockGuard,
 };
 use standalone_cluster_plugin::StandaloneClusterPlugin;
 
-use crate::defaults::{
-    CacheBasedServiceDiscoveryBackend, CasBasedDistributedLockBackend,
-    CasBasedLeaderElectionBackend,
-};
+use crate::defaults::{CasBasedDistributedLockBackend, CasBasedLeaderElectionBackend};
 use toolkit::client_hub::ClientHub;
 use tracing_test::traced_test;
 
@@ -30,7 +25,7 @@ impl ClusterProfile for EventBroker {
 }
 
 #[tokio::test]
-async fn omit_default_registers_all_four_then_stop_unbinds() {
+async fn omit_default_registers_all_three_then_stop_unbinds() {
     let hub = Arc::new(ClientHub::new());
     let plugin = StandaloneClusterPlugin::builder()
         .build_and_start()
@@ -65,13 +60,6 @@ async fn omit_default_registers_all_four_then_stop_unbinds() {
             .resolve()
             .is_ok(),
         "omit-default lock resolves"
-    );
-    assert!(
-        ServiceDiscoveryV1::resolver(&hub)
-            .profile(EventBroker)
-            .resolve()
-            .is_ok(),
-        "omit-default service discovery resolves"
     );
 
     handle.stop().await;
@@ -133,7 +121,7 @@ async fn stop_revokes_an_active_leader_before_shutdown_completes() {
 }
 
 #[tokio::test]
-async fn stop_revokes_active_lock_sd_and_cache_watches_before_shutdown_completes() {
+async fn stop_revokes_active_lock_and_cache_watches_before_shutdown_completes() {
     let hub = Arc::new(ClientHub::new());
     let plugin = StandaloneClusterPlugin::builder()
         .build_and_start()
@@ -162,16 +150,6 @@ async fn stop_revokes_active_lock_sd_and_cache_watches_before_shutdown_completes
             .await
     });
 
-    // An active service-discovery watch.
-    let discovery = ServiceDiscoveryV1::resolver(&hub)
-        .profile(EventBroker)
-        .resolve()
-        .expect("service discovery resolves");
-    let mut sd_watch = discovery
-        .watch("delivery")
-        .await
-        .expect("sd watch establishes");
-
     // An active cache watch.
     let mut cache_watch = cache_backend
         .watch("k")
@@ -192,11 +170,6 @@ async fn stop_revokes_active_lock_sd_and_cache_watches_before_shutdown_completes
         matches!(joined, Err(ClusterError::Shutdown)),
         "an in-flight lock waiter must observe Shutdown on stop; got {joined:?}"
     );
-    // The service-discovery watch observes a terminal Closed(Shutdown).
-    assert!(matches!(
-        sd_watch.recv().await,
-        Some(ServiceWatchEvent::Closed(ClusterError::Shutdown))
-    ));
     // The cache watch observes a terminal Closed(Shutdown) via the plugin stop hook.
     assert!(matches!(
         cache_watch.recv().await,
@@ -263,37 +236,6 @@ impl DistributedLockBackend for MarkerLockBackend {
     }
 }
 
-struct MarkerServiceDiscoveryBackend {
-    inner: Arc<CacheBasedServiceDiscoveryBackend>,
-    calls: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl ServiceDiscoveryBackend for MarkerServiceDiscoveryBackend {
-    fn features(&self) -> ServiceDiscoveryFeatures {
-        self.inner.features()
-    }
-
-    async fn register(&self, reg: ServiceRegistration) -> Result<ServiceHandle, ClusterError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.register(reg).await
-    }
-
-    async fn discover(
-        &self,
-        name: &str,
-        filter: DiscoveryFilter,
-    ) -> Result<Vec<ServiceInstance>, ClusterError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.discover(name, filter).await
-    }
-
-    async fn watch(&self, name: &str) -> Result<ServiceWatch, ClusterError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.watch(name).await
-    }
-}
-
 /// Proves the explicitly-bound backends are the instances actually registered
 /// and invoked — not the SDK defaults `build_and_start` would otherwise
 /// auto-fill. Each primitive is bound to a marker that delegates to a real
@@ -310,7 +252,6 @@ async fn explicit_backends_override_defaults() {
     let cache = plugin.cache();
     let leader_calls = Arc::new(AtomicUsize::new(0));
     let lock_calls = Arc::new(AtomicUsize::new(0));
-    let discovery_calls = Arc::new(AtomicUsize::new(0));
 
     let leader = Arc::new(MarkerLeaderElectionBackend {
         inner: Arc::new(
@@ -326,14 +267,9 @@ async fn explicit_backends_override_defaults() {
         ),
         calls: Arc::clone(&lock_calls),
     });
-    let discovery = Arc::new(MarkerServiceDiscoveryBackend {
-        inner: Arc::new(CacheBasedServiceDiscoveryBackend::new(Arc::clone(&cache))),
-        calls: Arc::clone(&discovery_calls),
-    });
     let backends = ProfileBackends::new(cache)
         .with_leader_election(leader)
-        .with_lock(lock)
-        .with_service_discovery(discovery);
+        .with_lock(lock);
 
     let handle = ClusterWiring::builder(Arc::clone(&hub))
         .profile(EventBroker, backends)
@@ -365,19 +301,6 @@ async fn explicit_backends_override_defaults() {
         lock_calls.load(Ordering::SeqCst),
         1,
         "the explicitly-bound lock backend must receive the call, not an SDK default"
-    );
-
-    ServiceDiscoveryV1::resolver(&hub)
-        .profile(EventBroker)
-        .resolve()
-        .expect("service discovery resolves")
-        .watch("delivery")
-        .await
-        .expect("sd watch establishes");
-    assert_eq!(
-        discovery_calls.load(Ordering::SeqCst),
-        1,
-        "the explicitly-bound service-discovery backend must receive the call, not an SDK default"
     );
 
     handle.stop().await;

@@ -69,7 +69,7 @@ OperationBuilder::post("/users-info/v1/users")
 ```rust
 OperationBuilder::get("/users-info/v1/health")
     .operation_id("users_info.health")
-    .public()
+    .anonymous()
     .handler(handlers::health)
     .json_response_with_schema::<dto::HealthDto>(openapi, StatusCode::OK, "Health check")
     .register(router, openapi);

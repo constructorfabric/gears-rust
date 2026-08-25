@@ -47,7 +47,25 @@ pub(super) fn register_usage_record_routes(
 
     // @cpt-flow:cpt-cf-usage-collector-flow-usage-query-query-raw:p1
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-query-fr-query-raw:p1
-    router = OperationBuilder::get("/usage-collector/v1/records")
+    //
+    // DE0802 requires every `$`-prefixed `OData` parameter to be declared
+    // through `OperationBuilderODataExt`, so that the description and the
+    // schema come from one place and gears cannot drift apart on them.
+    // The trait offers `with_odata_filter`, `with_odata_orderby`, and
+    // `with_odata_select` — there is no `$top` method. #4422 bound `$top`
+    // on the wire (`ODataParams.limit` gained `#[serde(alias = "$top")]`)
+    // without adding one, so the rule has nothing to satisfy it with here.
+    //
+    // The choice is therefore between declaring `$top` by hand and leaving
+    // an accepted parameter out of the published document. Declaring it
+    // wins: an endpoint that honours a page-size spelling and does not
+    // document it is the drift `openapi_contract_tests` exists to stop.
+    // The `let` binding exists only to carry the attribute: attributes on
+    // expressions are unstable, and putting this on the function would
+    // exempt the other four routes registered here too. Drop both once
+    // the toolkit grows `with_odata_top()`.
+    #[allow(unknown_lints, de0802_use_odata_ext)]
+    let list_records_route = OperationBuilder::get("/usage-collector/v1/records")
         .operation_id("usage_collector.list_usage_records")
         .summary("List usage records")
         .description("Keyset-paginated raw read over the persisted usage records.")
@@ -58,10 +76,21 @@ pub(super) fn register_usage_record_routes(
             false,
             "Repeated metadata-filter entries; OR within a key, AND across keys",
         )
+        // Both page-size spellings are declared because the toolkit `OData`
+        // extractor binds `limit` with `#[serde(alias = "$top")]` and folds
+        // them onto one slot; publishing only one would under-report the
+        // accepted surface. Sending both in a single request is ambiguous
+        // and the extractor rejects it.
+        .query_param_typed(
+            "$top",
+            false,
+            "Page size, canonical OData spelling (rejected with 400 if above 1000)",
+            "integer",
+        )
         .query_param_typed(
             "limit",
             false,
-            "Page size hint (rejected with 400 if above 1000)",
+            "Page size hint, alias of `$top` (rejected with 400 if above 1000)",
             "integer",
         )
         .query_param("cursor", false, "Opaque CursorV1 continuation token")
@@ -75,12 +104,16 @@ pub(super) fn register_usage_record_routes(
             StatusCode::OK,
             "Usage records page",
         )
+        // No `.with_odata_select()`: nothing in this gear applies the
+        // projection. The handler returns whole `UsageRecordDto`s and the
+        // plugin selects a fixed column list, so declaring `$select` would
+        // advertise a parameter that is read and discarded.
         .with_odata_filter::<UsageRecordFilterField>()
         .with_odata_orderby::<UsageRecordFilterField>()
-        .with_odata_select()
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
+    router = list_records_route;
 
     // @cpt-flow:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-query-fr-query-aggregation:p1

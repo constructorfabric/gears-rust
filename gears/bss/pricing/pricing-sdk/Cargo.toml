@@ -1,0 +1,32 @@
+[package]
+name = "cf-gears-bss-pricing-sdk"
+edition.workspace = true
+license.workspace = true
+description = "BSS Plan & Price Modeling SDK: infrastructure-free contract for ClientHub consumers"
+
+[lib]
+name = "bss_pricing_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+# `DateTime<Utc>` on the pin frontier's `advanced_at`. No serde feature — this
+# contract crate carries no derives (the gear's REST DTOs own serde and map onto
+# these types), mirroring `bss-ledger-sdk`.
+chrono = { workspace = true }
+# Every trait surface returns `CanonicalError`, per ADR
+# `cpt-cf-errors-adr-sdk-canonical-projection`: the gear's single
+# `From<DomainError> for CanonicalError` ladder is the authoritative
+# classification, and the ports carry no second one.
+toolkit-canonical-errors = { workspace = true }
+# The two opt-in projections over that envelope. They exist because the gear
+# dispatches — an unwired registry is not an outage, and a registry's refusal is
+# not either — not because the contract needs them.
+thiserror = { workspace = true }
+toolkit-security = { workspace = true }
+# A registry SKU id, which a plan's `sku_id` binds to and which is a UUID
+# everywhere it appears. The contract carries the type rather than a `String`
+# so a caller cannot pass a code where an id belongs.
+uuid = { workspace = true }

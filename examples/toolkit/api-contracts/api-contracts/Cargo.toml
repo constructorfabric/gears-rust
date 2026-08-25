@@ -1,0 +1,64 @@
+[package]
+name = "cf-api-contracts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "api-contracts example module — PaymentApi with local and HTTP transport"
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+# OpenTelemetry in generated clients: W3C traceparent propagation + RED metrics.
+otel = ["api-contracts-sdk/otel"]
+grpc-client = [
+    "api-contracts-sdk/grpc-client",
+    "toolkit-contract/grpc-client",
+    "dep:tonic",
+    "dep:toolkit-transport-grpc",
+]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Neither side is optional. `rest-server` because `src/api/rest/` calls the
+# generated `register_payment_api_rest_routes()` unconditionally — this gear
+# exists to serve the contract, so a build without routes is meaningless.
+# `rest-client` because `tests/runtime_eventual_readiness.rs` uses
+# `#[toolkit::consumes]`, whose output names `PaymentApiRestResolvingClient`
+# unconditionally, and integration tests inherit the package feature table.
+api-contracts-sdk = { workspace = true, features = ["rest-client", "rest-server"] }
+toolkit-contract = { workspace = true, features = ["runtime-client", "rest-server"] }
+toolkit.workspace = true
+toolkit-macros.workspace = true
+toolkit-canonical-errors.workspace = true
+toolkit-security.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+async-stream = "0.3"
+axum.workspace = true
+http.workspace = true
+
+tonic = { workspace = true, features = ["transport"], optional = true }
+toolkit-transport-grpc = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+toolkit-http.workspace = true
+toolkit-canonical-errors.workspace = true
+secrecy.workspace = true
+mockall.workspace = true
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

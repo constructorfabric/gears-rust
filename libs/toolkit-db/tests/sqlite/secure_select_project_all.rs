@@ -8,7 +8,7 @@
 
 use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::Expr;
-use sea_orm::{FromQueryResult, JoinType, QueryFilter, QuerySelect, RelationTrait, Set};
+use sea_orm::{ExprTrait, FromQueryResult, JoinType, QueryFilter, QuerySelect, RelationTrait, Set};
 use sea_orm_migration::prelude as mig;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::{Db, DbConn, ScopableEntity, SecureEntityExt, secure_insert};

@@ -16,11 +16,12 @@ You are a Rust code reviewer responsible exclusively for **async safety, concurr
 ## Input Files
 
 Read these files from the provided paths:
-1. `/tmp/toolkit-pr-review-v2-$PR_NUMBER/context.json` — PR metadata, file lists, changed line ranges
-2. `/tmp/toolkit-pr-review-v2-$PR_NUMBER/diff.patch` — the full diff of the PR
-3. `/tmp/toolkit-pr-review-v2-$PR_NUMBER/files/<escaped-path>` — full source file contents
+1. `/tmp/toolkit-pr-review-v2-$REVIEW_ID/context.json` — review metadata, file lists, changed line ranges
+2. `/tmp/toolkit-pr-review-v2-$REVIEW_ID/diff.patch` — the full diff under review
+3. `/tmp/toolkit-pr-review-v2-$REVIEW_ID/files/<escaped-path>` — full source file contents
 
-Replace `$PR_NUMBER` with the actual number. In the filename escaping, `/` becomes `__`.
+`$REVIEW_ID` is the PR number in PR mode, or `local-<branch-slug>` in local mode — the orchestrator
+supplies the concrete directory path. In the filename escaping, `/` becomes `__`.
 
 ## Check IDs to Apply
 

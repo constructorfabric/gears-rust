@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
 use resource_group_sdk::models::{
-    CreateGroupRequest, ResourceGroup, ResourceGroupWithDepth, UpdateGroupRequest,
+    CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupWithDepth, UpdateGroupRequest,
 };
 use resource_group_sdk::{GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH};
 use toolkit_db::secure::{DBRunner, TxConfig};
@@ -544,16 +544,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         types_registry: &dyn types_registry_sdk::TypesRegistryClient,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
-        // Resolve type GTS path to surrogate ID; verify type exists
-        let type_id = type_repo
-            .resolve_id(tx, &req.code)
+        // One lookup for both the surrogate id and the type itself. Asking
+        // for them separately cost two `gts_type` SELECTs per create for the
+        // same row (RG-11).
+        let (type_model, rg_type) = type_repo
+            .find_by_code_with_model(tx, &req.code)
             .await?
             .ok_or_else(|| DomainError::type_not_found(&req.code))?;
-
-        let rg_type = type_repo
-            .find_by_code(tx, &req.code)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(&req.code))?;
+        let type_id = type_model.id;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
 
         // Validate metadata against GTS type schema (applies to both root and child groups)
@@ -651,7 +649,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
 
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-6
             // Insert group
-            let _model = group_repo
+            let model = group_repo
                 .insert(
                     tx,
                     group_id,
@@ -678,11 +676,19 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-8a
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-8
 
-            let sys = toolkit_security::AccessScope::allow_all();
-            group_repo
-                .find_by_id(tx, &sys, group_id)
-                .await?
-                .ok_or_else(|| DomainError::database("Insert succeeded but group not found"))
+            // The row the insert returned, not a re-read of it. Its type path
+            // is the code this request named -- `type_id` was resolved from
+            // it above -- so nothing here needs the database again (RG-08).
+            Ok(ResourceGroup {
+                id: model.id,
+                code: req.code.clone(),
+                name: model.name,
+                hierarchy: GroupHierarchy {
+                    parent_id: model.parent_id,
+                    tenant_id: model.tenant_id,
+                },
+                metadata: model.metadata,
+            })
         } else {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5a
@@ -715,7 +721,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5
 
             // Insert group
-            let _model = group_repo
+            let model = group_repo
                 .insert(
                     tx,
                     group_id,
@@ -730,11 +736,17 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // Insert closure: self-row only
             group_repo.insert_closure_self_row(tx, group_id).await?;
 
-            let sys = toolkit_security::AccessScope::allow_all();
-            group_repo
-                .find_by_id(tx, &sys, group_id)
-                .await?
-                .ok_or_else(|| DomainError::database("Insert succeeded but group not found"))
+            // As in the child branch: the inserted row, not a read of it.
+            Ok(ResourceGroup {
+                id: model.id,
+                code: req.code.clone(),
+                name: model.name,
+                hierarchy: GroupHierarchy {
+                    parent_id: model.parent_id,
+                    tenant_id: model.tenant_id,
+                },
+                metadata: model.metadata,
+            })
         }
     }
 
@@ -878,7 +890,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-5
         // Persist name/parent/metadata. `gts_type_id` is reused from the
         // existing row — type is immutable on update.
-        let _model = group_repo
+        let rows = group_repo
             .update(
                 tx,
                 group_id,
@@ -888,14 +900,31 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 req.metadata.as_ref(),
             )
             .await?;
+        // The pre-read above happened in this same transaction, so `id`
+        // vanishing between it and this UPDATE should be impossible -- but
+        // `update` returning `rows_affected` instead of `()` means this is no
+        // longer just an assumption to trust.
+        if rows == 0 {
+            return Err(DomainError::group_not_found(group_id));
+        }
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-5
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-6
-        let sys = toolkit_security::AccessScope::allow_all();
-        group_repo
-            .find_by_id(tx, &sys, group_id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))
+        // Assembled, not read back. Every field was either just written from
+        // this request or reused from `existing` because it is immutable, and
+        // the type path was resolved above -- so the row the database now
+        // holds is fully determined here. The read this replaces was the
+        // second one after the write, the first being inside `update` itself.
+        Ok(ResourceGroup {
+            id: group_id,
+            code: existing_type_path,
+            name: req.name.clone(),
+            hierarchy: GroupHierarchy {
+                parent_id: req.parent_id,
+                tenant_id: existing.tenant_id,
+            },
+            metadata: req.metadata.clone(),
+        })
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-6
     }
 
@@ -929,8 +958,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-8
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-9
         // Cycle detect, type compat, profile enforce, closure rebuild
-        Self::move_group_internal_impl(group_repo, tx, group_id, new_parent_id, &rg_type, profile)
-            .await?;
+        let new_parent = Self::move_group_internal_impl(
+            group_repo,
+            tx,
+            group_id,
+            new_parent_id,
+            &rg_type,
+            profile,
+        )
+        .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-9
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-8
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-7
@@ -942,27 +978,23 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // gear-wide invariant). Reject the move when the new parent lives
         // in a different tenant than the moved group; tenant-type roots have
         // `tenant_id == group_id`, so the equality check covers them too.
-        if let Some(new_parent_id) = new_parent_id {
-            let new_parent = group_repo
-                .find_model_by_id(tx, new_parent_id)
-                .await?
-                .ok_or_else(|| DomainError::group_not_found(new_parent_id))?;
-            if new_parent.tenant_id != existing.tenant_id {
-                // Generic message: do not interpolate tenant ids — the caller
-                // can't act on them legitimately, and disclosing the foreign
-                // tenant_id would leak ownership of `new_parent_id` across the
-                // tenant boundary.
-                return Err(DomainError::validation(format!(
-                    "Cannot move group {group_id} to a parent in a different tenant; \
-                     cross-tenant moves are not supported"
-                )));
-            }
+        if let Some(new_parent) = new_parent
+            && new_parent.tenant_id != existing.tenant_id
+        {
+            // Generic message: do not interpolate tenant ids — the caller
+            // can't act on them legitimately, and disclosing the foreign
+            // tenant_id would leak ownership of `new_parent_id` across the
+            // tenant boundary.
+            return Err(DomainError::validation(format!(
+                "Cannot move group {group_id} to a parent in a different tenant; \
+                 cross-tenant moves are not supported"
+            )));
         }
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-10
         // Update parent_id on the group. Type and tenant_id are immutable —
         // both reuse the existing row's values.
-        group_repo
+        let rows = group_repo
             .update(
                 tx,
                 group_id,
@@ -972,13 +1004,28 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 existing.metadata.as_ref(),
             )
             .await?;
+        // The pre-read above happened in this same transaction, so `id`
+        // vanishing between it and this UPDATE should be impossible -- but
+        // `update` returning `rows_affected` instead of `()` means this is no
+        // longer just an assumption to trust.
+        if rows == 0 {
+            return Err(DomainError::group_not_found(group_id));
+        }
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-10
 
-        let sys = toolkit_security::AccessScope::allow_all();
-        group_repo
-            .find_by_id(tx, &sys, group_id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))
+        // Assembled rather than read back, as in `update_group_inner`: a move
+        // writes exactly one column, and the rest of the row is `existing`
+        // unchanged.
+        Ok(ResourceGroup {
+            id: group_id,
+            code: type_path,
+            name: existing.name,
+            hierarchy: GroupHierarchy {
+                parent_id: new_parent_id,
+                tenant_id: existing.tenant_id,
+            },
+            metadata: existing.metadata,
+        })
     }
 
     /// Inner logic for `delete_group`, runs inside a SERIALIZABLE transaction.
@@ -997,10 +1044,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await?
             .ok_or_else(|| DomainError::group_not_found(group_id))?;
 
-        let _existing = group_repo
-            .find_model_by_id(tx, group_id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))?;
+        // The row was just read and its absence already answered; a second
+        // read of the same id added a round-trip inside the transaction and
+        // was discarded. The artifact declares one SELECT here, not two.
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-3
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-2
 
@@ -1067,6 +1113,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// Performs cycle detection, type compatibility checks, query profile
     /// enforcement, and closure table rebuild. Must be called within a
     /// SERIALIZABLE transaction.
+    ///
+    /// Returns the new parent's row when there is a new parent. It has to be
+    /// read here for the type-compatibility check, and the caller needs the
+    /// same row for the cross-tenant check -- handing it back keeps the move
+    /// path to the one parent read the artifact declares in step 3, instead
+    /// of two reads of the same id inside the same transaction.
     #[allow(clippy::cognitive_complexity)]
     async fn move_group_internal_impl(
         group_repo: &GR,
@@ -1075,7 +1127,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         new_parent_id: Option<Uuid>,
         rg_type: &resource_group_sdk::ResourceGroupType,
         profile: &QueryProfile,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Option<crate::infra::storage::entity::resource_group::Model>, DomainError> {
+        let mut new_parent_model: Option<crate::infra::storage::entity::resource_group::Model> =
+            None;
         if let Some(new_pid) = new_parent_id {
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-1
             // Cycle detection: self-parent check (covered by is_descendant via self-row)
@@ -1106,6 +1160,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     rg_type.code, parent_type_path
                 )));
             }
+            new_parent_model = Some(parent);
 
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-4
             // Cycle detection passed
@@ -1121,21 +1176,18 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             if let Some(max_depth) = profile.max_depth {
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 let parent_depth = group_repo.get_depth(conn, new_pid).await?;
-                // Check depth of deepest descendant of moved node
-                let subtree_descendants = group_repo.get_descendant_ids(conn, group_id).await?;
-                let mut max_subtree_depth = 0i32;
-                for desc_id in &subtree_descendants {
-                    // Internal depth within the subtree
-                    let is_desc_result = group_repo.is_descendant(conn, group_id, *desc_id).await?;
-                    if is_desc_result {
-                        // Get the depth of this descendant relative to the moved group
-                        // by looking at the closure table
-                        let depth = Self::get_relative_depth(conn, group_id, *desc_id).await?;
-                        if depth > max_subtree_depth {
-                            max_subtree_depth = depth;
-                        }
-                    }
-                }
+                // One query for the whole subtree. The rows already carry
+                // the depth relative to the moved group, and every id they
+                // contain is a descendant by construction -- so the previous
+                // `is_descendant` + `get_relative_depth` pair per row was
+                // re-asking the database what it had just returned.
+                let max_subtree_depth = group_repo
+                    .get_descendant_ids_with_depth(conn, group_id)
+                    .await?
+                    .into_iter()
+                    .map(|(_id, depth)| depth)
+                    .max()
+                    .unwrap_or(0);
                 let new_deepest = parent_depth + 1 + max_subtree_depth;
                 // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2b
@@ -1203,7 +1255,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .rebuild_subtree_closure(conn, group_id, new_parent_id)
             .await?;
 
-        Ok(())
+        Ok(new_parent_model)
     }
 
     /// Force-delete an entire subtree (group + descendants + memberships + closure).
@@ -1212,22 +1264,34 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         conn: &impl DBRunner,
         root_id: Uuid,
     ) -> Result<(), DomainError> {
-        // Get all descendants
-        let descendant_ids = group_repo.get_descendant_ids(conn, root_id).await?;
+        let descendants_with_depth = group_repo
+            .get_descendant_ids_with_depth(conn, root_id)
+            .await?;
 
-        // Delete in reverse order (leaves first)
-        let mut all_ids = vec![root_id];
-        all_ids.extend(descendant_ids);
+        let all_ids: Vec<Uuid> = std::iter::once(root_id)
+            .chain(descendants_with_depth.iter().map(|(id, _depth)| *id))
+            .collect();
 
-        // Delete memberships and closure rows for all nodes
-        for &gid in all_ids.iter().rev() {
-            group_repo.delete_memberships(conn, gid).await?;
-            group_repo.delete_all_closure_rows(conn, gid).await?;
+        // Memberships and closure rows have no FK ordering constraint among
+        // themselves, so both go in one statement for the whole subtree
+        // rather than two per node.
+        group_repo.delete_memberships_many(conn, &all_ids).await?;
+        group_repo
+            .delete_all_closure_rows_many(conn, &all_ids)
+            .await?;
+
+        // Group rows do have one: a parent cannot go before its children.
+        // Deleting depth level by depth level, deepest first, keeps that
+        // order while still batching each level into a single statement --
+        // so the statement count follows tree depth, not node count.
+        let mut ids_by_depth: std::collections::BTreeMap<i32, Vec<Uuid>> =
+            std::collections::BTreeMap::new();
+        ids_by_depth.entry(0).or_default().push(root_id);
+        for (id, depth) in descendants_with_depth {
+            ids_by_depth.entry(depth).or_default().push(id);
         }
-
-        // Delete group entities in reverse order (leaves first)
-        for &gid in all_ids.iter().rev() {
-            group_repo.delete_by_id(conn, gid).await?;
+        for ids in ids_by_depth.into_values().rev() {
+            group_repo.delete_by_id_many(conn, &ids).await?;
         }
 
         Ok(())
@@ -1249,34 +1313,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .all(conn)
             .await
             .map_err(|e| DomainError::database(e.to_string()))
-    }
-
-    /// Get relative depth between an ancestor and descendant via closure table.
-    async fn get_relative_depth(
-        conn: &impl DBRunner,
-        ancestor_id: Uuid,
-        descendant_id: Uuid,
-    ) -> Result<i32, DomainError> {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        use toolkit_db::secure::SecureEntityExt;
-
-        let scope = toolkit_security::AccessScope::allow_all();
-        let row = crate::infra::storage::entity::resource_group_closure::Entity::find()
-            .filter(
-                crate::infra::storage::entity::resource_group_closure::Column::AncestorId
-                    .eq(ancestor_id),
-            )
-            .filter(
-                crate::infra::storage::entity::resource_group_closure::Column::DescendantId
-                    .eq(descendant_id),
-            )
-            .secure()
-            .scope_with(&scope)
-            .one(conn)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        Ok(row.map_or(0, |r| r.depth))
     }
 
     /// Resolve a type ID to its GTS path.

@@ -136,7 +136,7 @@ CREATE TABLE IF NOT EXISTS files_custom_metadata (
 );
                 "
             }
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(
                     "file-storage migrations support Postgres and SQLite only".to_owned(),
                 ));
@@ -159,7 +159,7 @@ DROP TABLE IF EXISTS file_versions;
 DROP TABLE IF EXISTS files;
                 "
             }
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(
                     "file-storage migrations support Postgres and SQLite only".to_owned(),
                 ));

@@ -7,7 +7,7 @@
 //! Both queues process independently within the same `OutboxBuilder`.
 //!
 //! Run:
-//!   cargo run -p cf-gears-toolkit-db --example `outbox_batch_multi_queue` --features sqlite,preview-outbox
+//!   cargo run -p cf-gears-toolkit-db --example `outbox_batch_multi_queue` --features sqlite
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

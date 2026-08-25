@@ -1,8 +1,7 @@
 use crate::consumer::{
-    BatchHandlerOutcome, ConsumerBuffering, ConsumerBuilder, ConsumerCommitMode, ConsumerGroupRef,
-    ConsumerHandle, ConsumerHandler, ConsumerListenerSettings, ConsumerProfile, EventBatch,
-    EventTypeRef, Fallback, HandlerOutcome, InMemoryOffsetManager, RawEvent, SingleEventHandler,
-    TopicRef,
+    BatchHandlerOutcome, ConsumerBuffering, ConsumerBuilder, ConsumerGroupRef, ConsumerHandle,
+    ConsumerHandler, ConsumerListenerSettings, ConsumerProfile, EventBatch, EventTypeRef, Fallback,
+    HandlerOutcome, InMemoryOffsetManager, RawEvent, SingleEventHandler, TopicRef,
 };
 use crate::error::{ConsumerError, EventBrokerError};
 use std::time::Duration;
@@ -346,7 +345,9 @@ async fn wait_for_subscription_count(handle: &ConsumerHandle, expected: usize) {
 
 #[cfg(feature = "db")]
 mod tx_typestate {
+    #[cfg(feature = "test-util")]
     use std::sync::Arc;
+    #[cfg(feature = "test-util")]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
@@ -398,11 +399,13 @@ mod tx_typestate {
         }
     }
 
+    #[cfg(feature = "test-util")]
     #[derive(Clone, Default)]
     struct CountingTxOffsetManager {
         commits: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "test-util")]
     #[async_trait]
     impl OffsetStore for CountingTxOffsetManager {
         async fn load_position(
@@ -415,6 +418,7 @@ mod tx_typestate {
         }
     }
 
+    #[cfg(feature = "test-util")]
     #[async_trait]
     impl CommitOffsetInTx for CountingTxOffsetManager {
         async fn commit_in_tx<TX>(
@@ -433,6 +437,7 @@ mod tx_typestate {
         }
     }
 
+    #[cfg(feature = "test-util")]
     impl ConsumerOffsetManager for CountingTxOffsetManager {
         type BuilderState = WithTx<Self>;
 
@@ -441,8 +446,10 @@ mod tx_typestate {
         }
     }
 
+    #[cfg(feature = "test-util")]
     struct NoCommitTxHandler;
 
+    #[cfg(feature = "test-util")]
     #[async_trait]
     impl TxSingleEventHandler<CountingTxOffsetManager> for NoCommitTxHandler {
         async fn handle(
@@ -571,6 +578,7 @@ mod tx_typestate {
     #[tokio::test]
     async fn transactional_consumer_does_not_auto_commit_when_handler_omits_commit_in_tx() {
         use crate::EventBrokerApi;
+        use crate::consumer::ConsumerCommitMode;
         use crate::mock::stubs::test_ctx_for_tenant;
         use crate::mock::{MockBroker, MockBrokerHandle};
         use crate::models::Event;

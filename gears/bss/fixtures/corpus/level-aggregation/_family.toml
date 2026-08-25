@@ -1,0 +1,45 @@
+family     = "level-aggregation"
+role       = "publish"
+gates      = ["graduated", "per_unit"]
+provenance = ["AC#60", "D-44", "T-D-17", "D-77", "inst-la-fixture"]
+
+# This family gates publish, and it always did on paper. `inst-la-fixture`: the
+# `level-aggregation` variant is a registered `FixtureGate` variant, and publish
+# of any non-`sum` row without the green joint fixture is blocked
+# (`FIXTURE_MISSING`), "exactly like a `modelKind` variant". Recorded as
+# `role = "conformance"` it blocked nothing at all - the registry was keyed by
+# `modelKind` alone, so a `peak` row published on the strength of a `sum` row's
+# fixture and the four cases below gated nothing they describe.
+#
+# It gates the kinds the cases below actually fold, and nothing wider. That is
+# not a shorthand for "level rows": a non-`sum` `volume` or `package` row is
+# refused by name (`FIXTURE_MISSING`, variant `level_aggregation`) until a case
+# folds a level on one, which is what `inst-la-fixture` says and what
+# `GatedKindUncovered` would enforce if this list claimed more than the cases
+# cover.
+#
+# `per_unit` joined `graduated` on 2026-08-21, earned by `per-unit-granule-fold`.
+# The fold reads `aggregationFunction`, `aggregationGranularity`,
+# `maxHoldGranules` and the samples, and reads neither the bands nor the unit
+# rate - so a `per_unit` level row's `Q` is the same number, and the gate refusing
+# it was coverage that had never been authored rather than a rule.
+
+# Every case here is a whole authored row, and every *tiered* one is a
+# `graduated` usage row - so `inst-tb-window` requires `tierAggregationWindow`
+# on those, exactly as it does on the `supersession-continuity` pairs. Each
+# carries `invoice_period`, the window the rest of the corpus counts against.
+# `per-unit-granule-fold` carries none, and must not: the rule is about a tier
+# counter, and an untiered row has none to bound.
+#
+# It is authoring completeness, not arithmetic. These cases assert `folded_q` -
+# the output of the granule fold - and the fold is a function of the runtime
+# window, the samples, `aggregationFunction`, `aggregationGranularity` and
+# `max_hold_granules`. `tierAggregationWindow` bounds the *tier counter*, which
+# is downstream of the fold and which no assertion in this family reaches; the
+# bands are here so the row is a row, not because a band is exercised. So the
+# window cannot move a number, and it was still missing: nothing runs the
+# publish rules over an evaluation case, so four rows the catalog would have
+# refused sat here pinning the fold of a row that could not exist.
+#
+# `tests/corpus_snapshot_shape.rs` in the pricing gear is what now catches that
+# class, over every snapshot of every case.

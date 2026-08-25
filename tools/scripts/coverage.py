@@ -140,8 +140,7 @@ def ensure_coverage_disk_space():
         "Coverage builds large instrumented test binaries. Free space under the "
         "workspace volume, then retry. Common cleanup commands:\n"
         "  cargo llvm-cov clean --workspace\n"
-        "  cargo clean\n"
-        "  rm -rf tools/dylint_lints/target",
+        "  cargo clean",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -858,9 +857,14 @@ def run_e2e_tests(base_url, test_filter=None):
         sys.exit(1)
 
     # Build pytest command
-    pytest_cmd = [PYTHON, "-m", "pytest", "testing/e2e", "-vv"]
-    if test_filter:
-        pytest_cmd.extend(["-k", test_filter])
+    pytest_cmd = [PYTHON, "-m", "pytest"]
+    if test_filter and ("/" in test_filter or test_filter.startswith("testing")):
+        pytest_cmd.append(test_filter)
+    else:
+        pytest_cmd.append("testing/e2e")
+        if test_filter:
+            pytest_cmd.extend(["-k", test_filter])
+    pytest_cmd.append("-vv")
 
     return run_cmd_allow_fail(
         pytest_cmd,
@@ -1124,7 +1128,7 @@ def cmd_coverage_unit(args):
     """Generate coverage for unit tests only."""
     output_dir = COVERAGE_DIR / "unit"
     config_file = PROJECT_ROOT / args.config if args.config else None
-    test_filter = args.filter if hasattr(args, 'filter') else None
+    test_filter = args.package or args.filter if hasattr(args, 'filter') else args.package
     skip_build = args.skip_build if hasattr(args, 'skip_build') else False
     threshold = args.threshold if hasattr(args, 'threshold') else COVERAGE_THRESHOLD
 
@@ -1135,7 +1139,7 @@ def cmd_coverage_e2e(args):
     """Generate coverage for e2e tests only."""
     output_dir = COVERAGE_DIR / "e2e-local"
     config_file = args.config if args.config else "config/e2e-local.yaml"
-    test_filter = args.filter if hasattr(args, 'filter') else None
+    test_filter = args.e2e_target or args.filter if hasattr(args, 'filter') else args.e2e_target
     skip_build = args.skip_build if hasattr(args, 'skip_build') else False
     threshold = args.threshold if hasattr(args, 'threshold') else COVERAGE_THRESHOLD
 
@@ -1147,6 +1151,8 @@ def cmd_coverage_combined(args):
     output_dir = COVERAGE_DIR / "combined"
     config_file = args.config if args.config else "config/e2e-local.yaml"
     threshold = args.threshold if hasattr(args, 'threshold') else COVERAGE_THRESHOLD
+    package = args.package if hasattr(args, 'package') else None
+    e2e_target = args.e2e_target if hasattr(args, 'e2e_target') else None
     use_color = supports_color()  # Auto-detect color support
 
     # Clean previous coverage data
@@ -1163,9 +1169,12 @@ def cmd_coverage_combined(args):
 
     unit_cmd = [
         "cargo", "llvm-cov",
-        "--workspace",
     ]
-    append_local_coverage_features(unit_cmd)
+    if package:
+        unit_cmd.extend(["--package", package])
+    else:
+        unit_cmd.append("--workspace")
+    append_local_coverage_features(unit_cmd, include_server_features=package is None)
     unit_cmd.extend(["--no-report", "--"])
     for test_name in LOCAL_COVERAGE_SKIPPED_TESTS:
         unit_cmd.extend(["--skip", test_name])
@@ -1193,7 +1202,7 @@ def cmd_coverage_combined(args):
         wait_for_health(base_url, timeout_secs=60, log_path=log_file)
 
         # Run E2E tests
-        pytest_result = run_e2e_tests(base_url)
+        pytest_result = run_e2e_tests(base_url, e2e_target)
         pytest_rc = pytest_result.returncode
 
         if pytest_rc != 0:
@@ -1299,6 +1308,11 @@ Examples:
         default=None
     )
     p_unit.add_argument(
+        "--package",
+        help="Package name to collect unit coverage for (alias used by Makefile GEAR=)",
+        default=None
+    )
+    p_unit.add_argument(
         "--skip-build",
         action="store_true",
         help="Skip test execution, only generate reports from existing data"
@@ -1336,6 +1350,11 @@ Examples:
         default=None
     )
     p_e2e.add_argument(
+        "--e2e-target",
+        help="E2E target path to run (alias used by Makefile GEAR=)",
+        default=None
+    )
+    p_e2e.add_argument(
         "--skip-build",
         action="store_true",
         help="Skip test execution, only generate reports from existing data"
@@ -1370,6 +1389,16 @@ Examples:
         default=COVERAGE_THRESHOLD,
         help="Coverage threshold percentage for warnings (default: %s)" %
              COVERAGE_THRESHOLD
+    )
+    p_combined.add_argument(
+        "--package",
+        help="Package name to collect unit coverage for (alias used by Makefile GEAR=)",
+        default=None
+    )
+    p_combined.add_argument(
+        "--e2e-target",
+        help="E2E target path to run (alias used by Makefile GEAR=)",
+        default=None
     )
     p_combined.add_argument(
         "--skip-env-check",

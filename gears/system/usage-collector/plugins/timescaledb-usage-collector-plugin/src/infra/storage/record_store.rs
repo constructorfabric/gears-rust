@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use bigdecimal::BigDecimal;
 use rand::RngExt as _;
 use rust_decimal::Decimal;
+use sqlx::AssertSqlSafe;
 use sqlx::pool::PoolConnection;
 use sqlx::{Connection, PgPool, Postgres, Row};
 use time::OffsetDateTime;
@@ -219,7 +220,7 @@ impl PgRecordStore {
         let metadata = metadata_map_to_jsonb(&record.metadata);
         let is_compensation = record.corrects_id.is_some();
 
-        let inserted = sqlx::query_as::<_, UsageRecordRow>(&insert_sql)
+        let inserted = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(insert_sql))
             .bind(record.id)
             .bind(record.tenant_id)
             .bind(gts_id_str(&record.gts_id))
@@ -250,7 +251,7 @@ impl PgRecordStore {
             "SELECT {RECORD_COLUMNS} FROM usage_records \
              WHERE tenant_id = $1 AND gts_id = $2 AND idempotency_key = $3 AND created_at = $4"
         );
-        let stored = sqlx::query_as::<_, UsageRecordRow>(&select_sql)
+        let stored = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
             .bind(record.tenant_id)
             .bind(gts_id_str(&record.gts_id))
             .bind(record.idempotency_key.as_str())
@@ -374,7 +375,7 @@ impl PgRecordStore {
              RETURNING {RECORD_COLUMNS}"
         );
 
-        let rows = sqlx::query_as::<_, UsageRecordRow>(&sql)
+        let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql))
             .bind(&ids)
             .bind(&tenants)
             .bind(&gtss)
@@ -430,7 +431,7 @@ impl PgRecordStore {
                 FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::timestamptz[]) \
                   AS t(t1, t2, t3, t4))"
         );
-        let rows = sqlx::query_as::<_, UsageRecordRow>(&select_sql)
+        let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
             .bind(&tenants)
             .bind(&gtss)
             .bind(&keys)
@@ -994,7 +995,7 @@ impl RecordStore for PgRecordStore {
         // derivation closed that collision — see DESIGN.md §2.2.)
         let sql = format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = $1");
         let mut conn = self.timed_acquire().await?;
-        let row = sqlx::query_as::<_, UsageRecordRow>(&sql)
+        let row = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql))
             .bind(id)
             .fetch_optional(&mut *conn)
             .await
@@ -1110,7 +1111,8 @@ impl RecordStore for PgRecordStore {
             limit.saturating_add(1),
         );
 
-        let mut q = sqlx::query_as::<_, UsageRecordRow>(&sql).bind(gts_id_str(&gts_id));
+        let mut q =
+            sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql)).bind(gts_id_str(&gts_id));
         for b in &ctx.binds {
             q = bind_one(q, b);
         }
@@ -1284,7 +1286,7 @@ impl RecordStore for PgRecordStore {
             clauses.join(" AND "),
         );
 
-        let mut q = sqlx::query(&sql).bind(gts_id_str(&gts_id));
+        let mut q = sqlx::query(AssertSqlSafe(sql)).bind(gts_id_str(&gts_id));
         for b in &ctx.binds {
             q = bind_one_query(q, b);
         }

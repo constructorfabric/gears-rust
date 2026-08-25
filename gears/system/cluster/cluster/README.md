@@ -32,7 +32,7 @@ let handle = ClusterWiring::builder(hub)
     .profile(EventBroker, ProfileBackends::new(cache)) // omit-default: cache only
     .build_and_start()?;
 
-// Consumers resolve the four primitives for `EventBroker` via the SDK resolvers.
+// Consumers resolve the three primitives for `EventBroker` via the SDK resolvers.
 
 handle.stop().await; // deregisters all backends, then stops wired plugins
 # Ok(())

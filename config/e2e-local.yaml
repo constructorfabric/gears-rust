@@ -279,6 +279,20 @@ gears:
             # not check it are unaffected.
             subject_type: "gts.cf.core.security.subject_user.v1~"
             token_scopes: ["*"]
+        # A SECOND principal inside tenant A. Same tenant, different subject —
+        # which is the only shape that can exercise a two-person rule, because
+        # bss-pricing's `chk_pricing_approval_distinct_principals` compares
+        # principal IDENTITIES and everything else in this file is either the
+        # same subject or a different tenant. Without it the approval workflow's
+        # positive arm is unreachable end to end: the submitter's own approve is
+        # refused SELF_APPROVAL_FORBIDDEN, and tenant B cannot see the record at
+        # all. Additive — no existing token or test reads it.
+        - token: "e2e-token-tenant-a-reviewer"
+          identity:
+            subject_id: "44444444-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
         # Hierarchy tenant tokens — used by budget allocation e2e tests
         - token: "e2e-token-hierarchy-root"
           identity:
@@ -299,10 +313,18 @@ gears:
           identity:
             subject_id: "22222222-6a88-4768-9dfc-6bcd5187d9ed"
             subject_tenant_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            # As on tenant A: a real AuthN resolver always sets a subject_type,
+            # and the gears that check it (bss-ledger, bss-pricing) refuse a
+            # context without one with 401 - before their PEP gate. Without this
+            # line the cross-tenant isolation tests read as "not authenticated"
+            # rather than as "authenticated and out of scope", which is the one
+            # thing they exist to tell apart. Additive; gears that do not check
+            # it are unaffected.
+            subject_type: "gts.cf.core.security.subject_user.v1~"
             token_scopes: ["*"]
         # Nil-tenant token: static-authz denies requests with the nil UUID
         # tenant, producing a clean 403 Forbidden. Used by
-        # testing/e2e/gears/oagw/test_authz.py::test_proxy_authz_forbidden_nil_tenant
+        # testing/e2e/suites/oagw/test_authz.py::test_proxy_authz_forbidden_nil_tenant
         - token: "e2e-token-nil-tenant"
           identity:
             subject_id: "33333333-6a88-4768-9dfc-6bcd5187d9ed"
@@ -377,14 +399,70 @@ gears:
         # rather than silently shipping a half-wired stack.
         required: true
 
+  # FX rate-provider subsystem (plugin-based): the core `bss-rate-provider` gear
+  # discovers + composes source plugins; the ledger discovers the composite LAZILY
+  # from the types-registry each rate-sync tick (no deps edge). Compiled via the
+  # server `bss-rate-provider` feature. LEFT UNCONFIGURED here on purpose: an active
+  # ECB plugin makes the ledger's RateSyncJob fetch the LIVE ECB feed on its first
+  # tick (network egress in E2E). Enable in a deployment (or a gated FX E2E with a
+  # mock server) by uncommenting all sections; keep the vendors aligned across the
+  # core gear, the source plugins, and the ledger's `fx.provider_vendor`:
+  #
+  # bss-rate-provider:                 # core gear: discover source plugins + compose
+  #   config:
+  #     vendor: cf.bss                 # advertised to the ledger's fx.provider_vendor
+  #     source_vendor: cf.bss          # selects which source plugins to compose
+  # bss-rate-provider-ecb-plugin:      # ECB source plugin (primary; priority 100)
+  #   config:
+  #     id: ecb
+  #     vendor: cf.bss
+  #     priority: 100
+  #     base_url: "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+  # # bss-rate-provider-http-json-plugin: add later for a fallback REST feed.
+  #
+  # ...and the consumer side: the `bss-ledger` block below gains an `fx` stanza
+  # naming the vendor the core gear advertises. Spelled out rather than left to
+  # the defaults because all three strings are matched literally and nothing
+  # validates them at startup — a typo in any one of them surfaces only as a
+  # "no source plugins registered" error on the ledger's first rate-sync tick.
+  #
+  # bss-ledger:
+  #   config:
+  #     fx:
+  #       provider_vendor: cf.bss      # MUST equal the core gear's `vendor` above
+  #
   bss-ledger:
     # Gear-specific database (SQLite for E2E, like the other user gears; the
     # gear ships dual PG/SQLite migrations). No config block needed — the
     # defaults (events_enabled=false, seller_tenant_types=partner+platform)
-    # are correct for E2E.
+    # are correct for E2E. `fx.provider_vendor` also defaults to "cf.bss", the
+    # same default the core `bss-rate-provider` gear advertises as its `vendor`,
+    # so the commented FX example above lines up without further edits.
     database:
       server: "sqlite_users"
       file: "bss_ledger.db"
+
+  bss-pricing:
+    # Gear-specific database (SQLite for E2E, like the other user gears; the
+    # gear ships dual PG/SQLite migrations). No config block needed — the
+    # defaults are correct for E2E, including the in-repository path of the
+    # joint conformance-fixture registry. That registry's nine rows all carry
+    # `oracle = true` and `publish = true`, so the gate is OPEN for every model
+    # kind here — pricing's validator has earned the corpus's `publish` half.
+    # (This comment said the opposite until 2026-08-03; it had been stale since
+    # the registry was regenerated.) Since Slice 5 the publish endpoint exists
+    # and the open gate is load-bearing here: the e2e walk's pre-check passes
+    # rather than refusing FIXTURE_MISSING per model kind.
+    #
+    # The publish still cannot COMPLETE in this deployment, and the reason is a
+    # different one: there is no CatalogVersion registry gear in this
+    # repository, so the module boots with UnconfiguredCatalogVersionRegistryV1
+    # and the commit's version request fails closed (503). There is deliberately
+    # no config key that would supply a registry — a locally invented version
+    # would make this gear a second incrementer.
+    database:
+      server: "sqlite_users"
+      file: "bss_pricing.db"
 
   simple-user-settings:
     # Gear-specific database configuration

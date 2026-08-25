@@ -1,0 +1,158 @@
+[package]
+name = "cf-gears-bss-pricing"
+edition.workspace = true
+license.workspace = true
+description = "BSS Plan & Price Modeling gear: the catalog publish engine, Postgres persistence in the bss schema"
+
+[lib]
+name = "bss_pricing"
+
+[lints]
+workspace = true
+
+[features]
+# Exposes the in-memory metrics harness (`infra::metrics::test_harness`) for
+# asserting emitted OTel instruments. Gated so `opentelemetry_sdk` never ships
+# in the release artifact; auto-enabled for `cargo test` by the
+# self-referencing dev-dependency below. The sibling ledger's arrangement, and
+# RBAC's before it.
+test-support = ["dep:opentelemetry_sdk"]
+
+[dependencies]
+bss-pricing-sdk = { workspace = true }
+
+# The joint golden conformance corpus registry, read by `infra::fixture_gate`.
+# `default-features = false` on purpose: the loader, the case model and `chrono`
+# sit behind the `corpus` feature, and a gear asks the registry exactly one
+# question — is this `modelKind` green — so it has no business carrying the
+# ability to read twenty case files at runtime. The narrow surface is
+# `ModelKind` + `Registry` + `Registry::gate_open_for`.
+bss-fixtures = { workspace = true, default-features = false }
+
+# Shared BSS coordination primitive (`coord_leases` + `LeaseManager`). The
+# read-model warm re-drive is a singleton background job (design 3.8), so this
+# gear splices coord's migration into its own `Migrator` exactly as the sibling
+# ledger does for its recognition run.
+coord = { workspace = true }
+
+anyhow = { workspace = true }
+parking_lot = { workspace = true }
+async-trait = { workspace = true }
+# FIPS-validated SHA-256 for the idempotency request-payload digest (the same
+# provider the platform installs at bootstrap, exactly as the sibling ledger's
+# posting gate uses); no non-FIPS hasher enters the graph.
+aws-lc-rs = { workspace = true }
+# `DateTime<Utc>` for the `cohort` scope-key axis (the UTC cutover instant that
+# created a grandfathering generation) and the pin-frontier instant.
+chrono = { workspace = true }
+serde = { workspace = true }
+# Authz-label stub type-schemas registered at init (`authz::authz_label_type_schemas`).
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# OTel metrics seam (`infra::metrics`): literal Prometheus names, a no-op until
+# the host wires an exporter. `metrics` only — this gear emits no spans of its
+# own, and the workspace pin carries `trace` for the gears that do.
+opentelemetry = { workspace = true, features = ["metrics"] }
+# SDK only for the in-memory test harness, gated behind `test-support` via
+# `dep:opentelemetry_sdk` so it never enters the release graph.
+opentelemetry_sdk = { workspace = true, features = [
+  "metrics",
+  "testing",
+], optional = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+# `db` enables the `DatabaseCapability` trait (gated behind `toolkit/db`); the
+# REST API layer is not feature-gated, so `rest` needs no feature bump.
+toolkit = { workspace = true, features = ["db"] }
+toolkit-db = { workspace = true, features = ["pg", "sqlite"] }
+# `#[derive(Scopable)]` on the storage entities: the SecureORM tenant binding
+# every Foundation table carries.
+toolkit-db-macros = { workspace = true }
+# The entity models (`DeriveEntityModel`) and the raw-SQL `Statement` the
+# migrations execute; both Postgres and SQLite drivers, matching `toolkit-db`.
+sea-orm = { workspace = true, features = ["sqlx-postgres", "sqlx-sqlite"] }
+# `MigrationTrait` / `MigratorTrait` in the `DatabaseCapability` impl and the
+# Foundation migration chain.
+sea-orm-migration = { workspace = true }
+# The `stateful` lifecycle's ticker: `tokio::time::interval` +
+# `MissedTickBehavior::Delay` + the `biased` select the read-model warm sweep
+# runs under, and `tokio::spawn` for the task itself. A dev-dependency until the
+# sweep landed, because until then `serve` only parked on the token.
+tokio = { workspace = true, features = ["time", "macros", "rt"] }
+# `CancellationToken` for the `stateful` `serve` lifecycle.
+tokio-util = { workspace = true }
+
+# REST surface: the axum router the capability mounts.
+axum = { workspace = true }
+# The `Page<T>` + `PageInfo` list envelope D-125's cursor contract is served in,
+# shared with the sibling ledger's list surfaces rather than re-spelled here.
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+# The opaque pagination cursor's URL-safe base64 (D-125). The encoding is
+# declared once in `api::rest::cursor` and is a wire detail, never a stored one.
+base64 = { workspace = true }
+# `#[toolkit_macros::api_dto(...)]` expands to `#[derive(utoipa::ToSchema)]`, so
+# the crate has to be a direct dependency of every gear carrying REST DTOs.
+utoipa = { workspace = true }
+# Holds the per-process runtime populated in `init()`.
+arc-swap = { workspace = true }
+
+# Declared in `#[toolkit::gear(deps = [...])]`: the PEP the authoring surfaces
+# gate through, and the registry the AuthZ label type-schemas register with.
+# The gear implementations are referenced through the macro expansion only,
+# which is why both are in the workspace `cargo-shear` ignore list; the SDK
+# crates are the contracts `init()` resolves from `ClientHub`.
+authz-resolver = { workspace = true }
+authz-resolver-sdk = { workspace = true }
+types-registry = { workspace = true }
+types-registry-sdk = { workspace = true }
+# `SecurityContext` / `AccessScope` / `pep_properties` in the authz gate.
+toolkit-security = { workspace = true }
+# `AuthzPermissionV1` + `gts_instance!` for the permission catalog.
+toolkit-gts = { workspace = true }
+# `gts_instance!`'s expansion references the `gts` crate directly.
+gts = { workspace = true }
+# `#[domain_model]` marker on the domain types (enforced by dylint DE0309).
+toolkit-macros = { workspace = true }
+# Required as a direct dep by the `#[resource_error(...)]` macro expansion.
+toolkit-canonical-errors = { workspace = true }
+
+[dev-dependencies]
+# Re-imports the crate under test with `test-support` enabled so the metrics
+# harness is available to the in-file tests. Cargo unifies the lib-under-test
+# edge with this dev-dep edge into one `test-support = on` compilation.
+bss-pricing = { package = "cf-gears-bss-pricing", path = ".", features = ["test-support"] }
+
+# The corpus loader and case model, behind the `corpus` feature the production
+# dependency above deliberately leaves off. Only the example and the tests read
+# case files; the gear at runtime asks the registry one question and nothing
+# more, so `corpus` must never reach the normal dependency table.
+bss-fixtures = { workspace = true, features = ["corpus"] }
+# The conformance harness: the `PublishValidator` trait, the publish runner, and
+# the registry generator. A **dev-dependency only**, which is the corpus's stated
+# invariant — no evaluator may reach a gear even transitively. Example targets
+# compile with dev-dependencies, which is what lets `examples/regen_registry`
+# see both this crate and the gear's rules at once without either becoming a
+# production edge.
+bss-fixtures-conformance = { workspace = true }
+# Config tests assert the serde contract itself — defaults fill in, unknown keys
+# are denied — which is format-independent, so JSON stands in for the YAML the
+# platform parses at boot.
+serde_json = { workspace = true }
+# The Postgres testcontainers harness (`tests/postgres_*.rs`), adopted from the
+# sibling ledger rather than invented. Tests reach `testcontainers` items
+# through the `testcontainers_modules::testcontainers` re-export, so the bare
+# `testcontainers` crate is not a direct dep. It carries what the SQLite mirror
+# cannot: the chain executed on the backend it targets, and the concurrency
+# D-159 and D-135 describe — SQLite serializes writers, so it can neither
+# confirm nor refute a claim about two of them.
+testcontainers-modules = { workspace = true }
+toolkit = { workspace = true, features = ["db"] }
+# `tower::ServiceExt::oneshot` drives the REST router in `tests/rest_*.rs`
+# without binding a socket.
+tower = { workspace = true }
+# A capturing `Layer` for `api::rest::error_tests`. The `inst-rb-audit` deny
+# record is a side effect with no return value, so the only way to assert it is
+# to install a subscriber and read the event back; `tracing` alone offers no
+# capture. The shape is the one `gears/system/api-gateway/tests/access_log_tests.rs` uses.
+tracing-subscriber = { workspace = true }

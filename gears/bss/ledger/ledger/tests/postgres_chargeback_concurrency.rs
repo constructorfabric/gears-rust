@@ -2,7 +2,7 @@
 //! concurrent `ChargebackService::record_phase` posts on the SAME dispute
 //! serialize under `SERIALIZABLE` (caller-retry, decision O). Ignored by default;
 //! run with
-//! `cargo test -p bss-ledger --test postgres_chargeback_concurrency -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_chargeback_concurrency -- --ignored`.
 //!
 //! Covers: a racing pair recording the SAME `lost` phase (same
 //! `dispute_id:cycle:phase`) on one opened `CASH_HOLD` dispute must land EXACTLY
@@ -128,7 +128,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -222,7 +222,7 @@ async fn account_balance(
     s: &Seller,
     account: Uuid,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_account_balance \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         s.tenant, account
@@ -353,7 +353,7 @@ async fn concurrent_lost_on_one_dispute_claws_back_once() {
 
     // The dispute resolved to LOST (advanced once).
     let phase = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT last_phase FROM bss.ledger_dispute \
              WHERE tenant_id='{}' AND dispute_id='DSP-CC-1'",
             s.tenant
@@ -467,7 +467,7 @@ async fn concurrent_won_and_lost_resolves_one_outcome() {
     // hold is emptied once either way (won releases it, lost forfeits it).
     let winner_phase = if won.is_ok() { "WON" } else { "LOST" };
     let phase = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT last_phase FROM bss.ledger_dispute \
              WHERE tenant_id='{}' AND dispute_id='DSP-CC-2'",
             s.tenant

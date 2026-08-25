@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use account_management_sdk::TenantInfoFilterField;
 use bigdecimal::BigDecimal;
 use gts::GtsId;
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, Condition, EntityTrait, FromQueryResult, Order, QuerySelect, QueryTrait,
@@ -163,23 +164,21 @@ impl ODataFieldMapping<TenantInfoFilterField> for TenantODataMapper {
         field: TenantInfoFilterField,
     ) -> sea_orm::Value {
         match field {
-            TenantInfoFilterField::Id => sea_orm::Value::Uuid(Some(Box::new(model.id))),
-            TenantInfoFilterField::Name => {
-                sea_orm::Value::String(Some(Box::new(model.name.clone())))
-            }
+            TenantInfoFilterField::Id => sea_orm::Value::Uuid(Some(model.id)),
+            TenantInfoFilterField::Name => sea_orm::Value::String(Some(model.name.clone())),
             TenantInfoFilterField::Status => sea_orm::Value::SmallInt(Some(model.status)),
             // `TenantType` is filter-only (not orderable), so it never reaches
             // the cursor path; map it identically to the raw-UUID field for
             // exhaustiveness.
             TenantInfoFilterField::TenantTypeUuid | TenantInfoFilterField::TenantType => {
-                sea_orm::Value::Uuid(Some(Box::new(model.tenant_type_uuid)))
+                sea_orm::Value::Uuid(Some(model.tenant_type_uuid))
             }
             TenantInfoFilterField::SelfManaged => sea_orm::Value::Bool(Some(model.self_managed)),
             TenantInfoFilterField::CreatedAt => {
-                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.created_at)))
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(model.created_at))
             }
             TenantInfoFilterField::UpdatedAt => {
-                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.updated_at)))
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(model.updated_at))
             }
         }
     }

@@ -9,7 +9,6 @@
 use cluster_sdk::cache::{CacheWatch, CacheWatchEvent};
 use cluster_sdk::error::ClusterError;
 use cluster_sdk::leader::{LeaderStatus, LeaderWatch, LeaderWatchEvent};
-use cluster_sdk::{ServiceWatch, ServiceWatchEvent};
 
 /// SC-WLU-001: every watch event type carries exactly the four-variant union
 /// `{value, Lagged, Reset, Closed}`. This is a structural compile-time check:
@@ -38,26 +37,16 @@ pub async fn scenario_wlu_001() {
             _ => 4,
         };
     }
-    fn _check_service(e: &ServiceWatchEvent) {
-        let _ = match e {
-            ServiceWatchEvent::Change(_) => 0u8,
-            ServiceWatchEvent::Lagged { dropped: _ } => 1,
-            ServiceWatchEvent::Reset => 2,
-            ServiceWatchEvent::Closed(_) => 3,
-            _ => 4,
-        };
-    }
     // The check functions are intentionally dead — the value is in compilation.
     let _ = (
         _check_cache as fn(&CacheWatchEvent),
         _check_leader as fn(&LeaderWatchEvent),
-        _check_service as fn(&ServiceWatchEvent),
     );
 }
 
 /// SC-WLU-004: a terminal `Closed` event is final — no further events arrive on
 /// the stream after it. Transient blips are retried internally (no event emitted).
-/// Verified over all three watch types via their test-harness channels.
+/// Verified over both watch types via their test-harness channels.
 pub async fn scenario_wlu_004() {
     // CacheWatch
     {
@@ -104,29 +93,6 @@ pub async fn scenario_wlu_004() {
         assert!(
             matches!(next, LeaderWatchEvent::Closed(_)),
             "SC-WLU-004(leader): no further value events must arrive after terminal Closed, got {next:?}"
-        );
-    }
-
-    // ServiceWatch
-    {
-        let (tx, mut watch) = ServiceWatch::channel(8);
-        tx.send(ServiceWatchEvent::Closed(ClusterError::Shutdown))
-            .await
-            .ok();
-        let event = watch
-            .recv()
-            .await
-            .expect("SC-WLU-004(service): must receive Closed");
-        assert!(
-            matches!(event, ServiceWatchEvent::Closed(ClusterError::Shutdown)),
-            "SC-WLU-004(service): Closed must be surfaced verbatim, got {event:?}"
-        );
-        // Same bare-passthrough `recv` behavior as `CacheWatch` — drop the
-        // sender first or the channel never closes and this hangs forever.
-        drop(tx);
-        assert!(
-            watch.recv().await.is_none(),
-            "SC-WLU-004(service): no further events must arrive after terminal Closed"
         );
     }
 }

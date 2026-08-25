@@ -2,7 +2,7 @@
 //! Group D): `ChargebackService::record_phase` drives the dispute state machine
 //! (`opened → {won, lost}`) over the foundation engine, in both variants
 //! (`CASH_HOLD` / `AR_RECLASS`). Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_chargebacks -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_chargebacks -- --ignored`.
 //!
 //! Mirrors `postgres_payment_returns.rs` (boot, `setup_seller`, a `settle`
 //! helper) + `postgres_payments.rs` (`seed_ar_invoice`, the over-cap
@@ -161,7 +161,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -345,7 +345,7 @@ async fn account_balance(
     s: &Seller,
     account: Uuid,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_account_balance \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         s.tenant, account
@@ -360,7 +360,7 @@ async fn ar_invoice_balance(
     s: &Seller,
     invoice_id: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
@@ -375,7 +375,7 @@ async fn ar_disputed_minor(
     s: &Seller,
     invoice_id: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT disputed_minor FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
@@ -391,7 +391,7 @@ async fn dispute_row(
     s: &Seller,
     dispute_id: &str,
 ) -> Option<(String, String, i32)> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT variant, last_phase, cycle FROM bss.ledger_dispute \
          WHERE tenant_id='{}' AND dispute_id='{}'",
         s.tenant, dispute_id
@@ -417,7 +417,7 @@ async fn queue_status(
     phase: DisputePhase,
 ) -> Option<String> {
     let business_id = format!("{dispute_id}:{cycle}:{}", phase.as_str());
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT status FROM bss.ledger_pending_event_queue \
          WHERE tenant_id='{}' AND flow='CHARGEBACK' AND business_id='{business_id}'",
         s.tenant
@@ -1828,7 +1828,7 @@ async fn lost_cash_hold_on_refunded_payment_routes_to_exception() {
     // the settlement counter (the refund path's own write; seeded directly so this
     // test owns the dispute lifecycle, mirroring the counter-seed idiom). 600 + 0
     // <= 1000 still satisfies the money-out cap, so the seed itself is admissible.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_payment_settlement SET refunded_minor = 600 \
          WHERE tenant_id='{}' AND payment_id='PAY-CBR-1'",
         s.tenant

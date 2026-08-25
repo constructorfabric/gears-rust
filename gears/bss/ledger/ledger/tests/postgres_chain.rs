@@ -5,7 +5,7 @@
 //! links onto the first; N concurrent posts form a single linear chain. The
 //! append-only trigger negatives (a re-seal, a business-column UPDATE, and a
 //! DELETE) are exercised with raw SQL against a posted-and-sealed entry.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -44,7 +44,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 /// Hex string of a single-column, single-row SELECT (e.g. `encode(col,'hex')`),
 /// `None` when the row is absent or the value is NULL.
 async fn scalar_hex(conn: &DatabaseConnection, sql: &str) -> Option<String> {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.and_then(|r| r.try_get_by_index::<Option<String>>(0).unwrap())
 }
 
@@ -60,7 +60,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
 
 /// Count rows matching a bss-qualified predicate.
 async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.map_or(0, |r| r.try_get_by_index::<i64>(0).unwrap())
 }
 
@@ -108,7 +108,7 @@ async fn setup(
         .await
         .unwrap();
 
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{legal_entity}','{period_id}','UTC','OPEN')"
     )))
@@ -548,7 +548,7 @@ async fn tip_rollback_orphaning_sealed_rows_freezes_tenant() {
 
     // Roll the visible tip back to entry1: entry2 is now a sealed row NEWER than
     // the tip — orphaned, never reached by the tip-to-genesis walk.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.chain_state SET last_entry_id='{e1_id}', last_period_id='{}' \
          WHERE tenant_id='{}'",
         f.period_id, f.tenant
@@ -610,7 +610,7 @@ async fn verifier_freeze_writes_freeze_set_clear_audit_record() {
         .post(&ctx, &scope, e2, l2, None)
         .await
         .expect("post 2");
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.chain_state SET last_entry_id='{e1_id}', last_period_id='{}' \
          WHERE tenant_id='{}'",
         f.period_id, f.tenant
@@ -655,7 +655,7 @@ async fn verifier_freeze_writes_freeze_set_clear_audit_record() {
 
 /// Collect a single text column over many rows into a `Vec<String>`.
 async fn fetch_hex_set(conn: &DatabaseConnection, sql: &str) -> Vec<String> {
-    let rows = conn.query_all(pg(sql.to_owned())).await.unwrap();
+    let rows = conn.query_all_raw(pg(sql.to_owned())).await.unwrap();
     rows.into_iter()
         .map(|r| r.try_get_by_index::<String>(0).unwrap())
         .collect()
@@ -685,7 +685,7 @@ async fn append_only_trigger_rejects_reseal_update_and_delete() {
     // (a) Re-seal: a second from-non-NULL UPDATE of row_hash is rejected
     // (the row is already sealed).
     let reseal = raw
-        .execute(pg(format!(
+        .execute_raw(pg(format!(
             "UPDATE bss.ledger_journal_entry SET row_hash='\\x00' WHERE entry_id='{entry_id}'"
         )))
         .await;
@@ -697,7 +697,7 @@ async fn append_only_trigger_rejects_reseal_update_and_delete() {
 
     // (b) Business-column UPDATE is rejected (only chain columns may change).
     let biz = raw
-        .execute(pg(format!(
+        .execute_raw(pg(format!(
             "UPDATE bss.ledger_journal_entry SET origin='X' WHERE entry_id='{entry_id}'"
         )))
         .await;
@@ -711,7 +711,7 @@ async fn append_only_trigger_rejects_reseal_update_and_delete() {
 
     // (c) DELETE is rejected.
     let del = raw
-        .execute(pg(format!(
+        .execute_raw(pg(format!(
             "DELETE FROM bss.ledger_journal_entry WHERE entry_id='{entry_id}'"
         )))
         .await;
@@ -737,7 +737,7 @@ async fn frozen_scope_blocks_posting() {
     let ctx = SecurityContext::anonymous();
 
     // The integrity verifier froze this tenant tenant-wide (period_id='ALL').
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.scope_freeze (tenant_id, scope, period_id, reason, set_by) \
          VALUES ('{}','tenant','ALL','test','Verifier')",
         f.tenant
@@ -757,7 +757,7 @@ async fn frozen_scope_blocks_posting() {
     );
 
     // Clearing the freeze lets the same tenant post again (refs already seeded).
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.scope_freeze SET cleared_at = now(), cleared_by = 'Operator' \
          WHERE tenant_id = '{}' AND scope = 'tenant' AND period_id = 'ALL'",
         f.tenant
@@ -859,19 +859,19 @@ async fn verifier_freezes_tampered_chain() {
     // forbids any post-seal UPDATE, so disable it for the tamper and re-enable
     // it after (a real attacker with direct DB access; the chain re-walk is what
     // catches it). `deadbeef` x8 = 64 hex chars = a 32-byte hash.
-    raw.execute(pg(
+    raw.execute_raw(pg(
         "ALTER TABLE bss.ledger_journal_entry DISABLE TRIGGER trg_journal_entry_append_guard",
     ))
     .await
     .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_journal_entry \
          SET row_hash = decode('deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef','hex') \
          WHERE entry_id = '{first_id}'"
     )))
     .await
     .unwrap();
-    raw.execute(pg(
+    raw.execute_raw(pg(
         "ALTER TABLE bss.ledger_journal_entry ENABLE TRIGGER trg_journal_entry_append_guard",
     ))
     .await

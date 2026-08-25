@@ -1,0 +1,45 @@
+[package]
+name = "cf-api-contracts-consumer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "api-contracts example — consumer gear that resolves PaymentApi from another gear via ClientHub"
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+# OpenTelemetry in the resolved REST client: W3C traceparent propagation + RED
+# metrics (forwards `api-contracts-sdk/otel`).
+otel = ["api-contracts-sdk/otel"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# `rest-client` is not optional: `#[toolkit::consumes]` in `gear.rs` names
+# `PaymentApiRestResolvingClient` unconditionally, so the SDK must always
+# generate it.
+api-contracts-sdk = { workspace = true, features = ["rest-client"] }
+toolkit.workspace = true
+toolkit-canonical-errors.workspace = true
+toolkit-security.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The real provider gear, booted alongside this consumer in the composition test.
+cf-api-contracts = { path = "../api-contracts" }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+uuid.workspace = true
+parking_lot.workspace = true
+toolkit-http.workspace = true
+serde_json.workspace = true
+# Used by the OoP test's REST-only provider (PolicyStack behind PaymentLocalClient).
+toolkit-contract.workspace = true
+toolkit-canonical-errors.workspace = true

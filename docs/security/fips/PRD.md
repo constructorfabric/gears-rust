@@ -169,7 +169,7 @@ engineering.
   sides; cross-provider interop (corecrypto ↔ aws-lc-rs ↔ rustls-cng-crypto) is not in CI. Tracked as TODO-2.
 - **Native rustls-symcrypt migration on Windows.** SymCrypt is not currently CMVP-validated; migration is conditional on
   Microsoft obtaining a CMVP certificate. Tracked as TODO-3.
-- **`fips140=only`-style source-level enforcement.** A custom `dylint` rule that refuses `use md5;` / `use sha1;` at
+- **`fips140=only`-style source-level enforcement.** A custom architecture lint (via `cargo gears lint`) that refuses `use md5;` / `use sha1;` at
   module scope is deferred to Phase C of the dependency policy ([ADR 0005](adrs/0005-fips-dependency-policy.md)).
 
 ## 5. Functional Requirements

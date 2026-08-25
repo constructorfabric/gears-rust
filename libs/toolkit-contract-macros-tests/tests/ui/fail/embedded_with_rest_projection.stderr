@@ -1,0 +1,5 @@
+error: REST projection is not allowed for `Embedded` contracts; only `Api` and `Backend` are remote-capable (PRD #1536 D2/D6)
+  --> tests/ui/fail/embedded_with_rest_projection.rs:11:11
+   |
+11 | pub trait FooEmbeddedRest: FooEmbedded {
+   |           ^^^^^^^^^^^^^^^

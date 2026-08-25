@@ -332,8 +332,8 @@ External service call time is not included (varies by upstream).
 
 ## Related ADRs
 
-- [ADR: Component Architecture](../docs/adr-component-architecture.md)
-- [ADR: Request Routing](../docs/adr-request-routing.md)
-- [ADR: Control Plane Caching](../docs/adr-data-plane-caching.md)
-- [ADR: State Management](../docs/adr-state-management.md)
-- [ADR: Plugin System](../docs/adr-plugin-system.md)
+- [ADR: Component Architecture](../../docs/ADR/0001-component-architecture.md)
+- [ADR: Request Routing](../../docs/ADR/0002-request-routing.md)
+- [ADR: Control Plane Caching](../../docs/ADR/0007-data-plane-caching.md)
+- [ADR: State Management](../../docs/ADR/0008-state-management.md)
+- [ADR: Plugin System](../../docs/ADR/0003-plugin-system.md)

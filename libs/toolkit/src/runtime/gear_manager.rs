@@ -1,7 +1,7 @@
 //! Gear Manager - tracks and manages all live gear instances in the runtime
 
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -95,6 +95,9 @@ pub struct GearInstance {
     pub version: Option<String>,
     pub rest_endpoint: Option<Endpoint>,
     pub openapi_spec: Option<String>,
+    /// Stable addressing labels (k8s `matchLabels` style) advertised by this
+    /// instance, used for label-based instance selection.
+    pub labels: BTreeMap<String, String>,
     inner: Arc<parking_lot::RwLock<InstanceRuntimeState>>,
 }
 
@@ -108,6 +111,34 @@ impl Clone for GearInstance {
             version: self.version.clone(),
             rest_endpoint: self.rest_endpoint.clone(),
             openapi_spec: self.openapi_spec.clone(),
+            labels: self.labels.clone(),
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl GearInstance {
+    /// Build a new instance record using `other`'s metadata but preserving
+    /// `self`'s `inner` runtime-state lock. This makes re-registration atomic:
+    /// concurrent `update_heartbeat` calls continue to write to the same state
+    /// object instead of racing with a copied/swapped `InstanceRuntimeState`.
+    fn with_metadata_of(&self, other: &GearInstance) -> GearInstance {
+        GearInstance {
+            gear: other.gear.clone(),
+            instance_id: other.instance_id,
+            control: other.control.clone(),
+            grpc_services: other.grpc_services.clone(),
+            version: other.version.clone(),
+            rest_endpoint: other.rest_endpoint.clone(),
+            openapi_spec: other.openapi_spec.clone(),
+            // Empty incoming labels mean "keep the stored set", not "clear"; a
+            // non-empty set replaces it. See `RegisterInstanceInfo::with_labels`
+            // for why (self-heal / REST-augmentation re-registers omit labels).
+            labels: if other.labels.is_empty() {
+                self.labels.clone()
+            } else {
+                other.labels.clone()
+            },
             inner: Arc::clone(&self.inner),
         }
     }
@@ -123,6 +154,7 @@ impl GearInstance {
             version: None,
             rest_endpoint: None,
             openapi_spec: None,
+            labels: BTreeMap::new(),
             inner: Arc::new(parking_lot::RwLock::new(InstanceRuntimeState {
                 last_heartbeat: Instant::now(),
                 state: InstanceState::Registered,
@@ -152,6 +184,11 @@ impl GearInstance {
 
     pub fn with_openapi_spec(mut self, spec: impl Into<String>) -> Self {
         self.openapi_spec = Some(spec.into());
+        self
+    }
+
+    pub fn with_labels(mut self, labels: BTreeMap<String, String>) -> Self {
+        self.labels = labels;
         self
     }
 
@@ -208,6 +245,15 @@ impl GearManager {
     }
 
     /// Register or update a gear instance
+    ///
+    /// Re-registering an existing `instance_id` is an idempotent endpoint /
+    /// metadata refresh, NOT a liveness reset: the existing runtime state
+    /// (`last_heartbeat` + [`InstanceState`]) is carried over onto the new
+    /// record by preserving the same `Arc<RwLock<InstanceRuntimeState>>`.
+    /// Without this, a periodic self-heal re-registration (see
+    /// `oop_registration::presence_loop`) would knock a `Healthy` instance back
+    /// to `Registered`, dropping it out of gRPC round-robin until the next
+    /// heartbeat. It would also race with concurrent `update_heartbeat` calls.
     pub fn register_instance(&self, instance: Arc<GearInstance>) {
         let gear = instance.gear.clone();
         let mut vec = self.inner.entry(gear).or_default();
@@ -216,7 +262,7 @@ impl GearManager {
             .iter()
             .position(|i| i.instance_id == instance.instance_id)
         {
-            vec[pos] = instance;
+            vec[pos] = Arc::new(vec[pos].with_metadata_of(&instance));
         } else {
             vec.push(instance);
         }
@@ -338,6 +384,28 @@ impl GearManager {
         }
     }
 
+    /// From a candidate set, return the serving subset (`Healthy`/`Ready`); if
+    /// none are serving, return the whole set so resolution falls back to the
+    /// not-ready instances (`Registered`/`Quarantined`/`Draining`) rather than
+    /// failing closed. `context` names the pool for the cold-path `debug!`.
+    fn prefer_serving(candidates: Vec<Arc<GearInstance>>, context: &str) -> Vec<Arc<GearInstance>> {
+        let serving: Vec<Arc<GearInstance>> = candidates
+            .iter()
+            .filter(|inst| matches!(inst.state(), InstanceState::Healthy | InstanceState::Ready))
+            .cloned()
+            .collect();
+        if serving.is_empty() {
+            tracing::debug!(
+                context,
+                "no serving (Ready/Healthy) instance available; round-robining over the \
+                 not-ready set instead of returning None"
+            );
+            candidates
+        } else {
+            serving
+        }
+    }
+
     /// Pick an instance using round-robin selection, preferring healthy instances
     #[must_use]
     pub fn pick_instance_round_robin(&self, gear: &str) -> Option<Arc<GearInstance>> {
@@ -348,22 +416,8 @@ impl GearManager {
             return None;
         }
 
-        // Prefer healthy or ready instances
-        let healthy: Vec<_> = instances
-            .iter()
-            .filter(|inst| matches!(inst.state(), InstanceState::Healthy | InstanceState::Ready))
-            .cloned()
-            .collect();
-
-        let candidates: Vec<_> = if healthy.is_empty() {
-            instances.clone()
-        } else {
-            healthy
-        };
-
-        if candidates.is_empty() {
-            return None;
-        }
+        // Non-empty in => non-empty out, so `candidates` is guaranteed non-empty.
+        let candidates = Self::prefer_serving(instances.clone(), gear);
 
         let len = candidates.len();
         let mut counter = self.rr_counters.entry(gear.to_owned()).or_insert(0);
@@ -380,23 +434,25 @@ impl GearManager {
         &self,
         service_name: &str,
     ) -> Option<(String, Arc<GearInstance>, Endpoint)> {
-        // Collect all instances that provide this service
-        let mut candidates = Vec::new();
+        // Collect the `Arc` of every instance that provides this service, then
+        // apply the shared serving-preference fallback so gRPC resolution
+        // survives an all-not-ready gear instead of failing closed. Cloning an
+        // `Arc` is a refcount bump; the gear name and endpoint are cloned once,
+        // for the winner, after the index is chosen.
+        let mut providing: Vec<Arc<GearInstance>> = Vec::new();
         for entry in &self.inner {
-            let gear = entry.key().clone();
             for inst in entry.value() {
-                if let Some(ep) = inst.grpc_services.get(service_name) {
-                    let state = inst.state();
-                    if matches!(state, InstanceState::Healthy | InstanceState::Ready) {
-                        candidates.push((gear.clone(), inst.clone(), ep.clone()));
-                    }
+                if inst.grpc_services.contains_key(service_name) {
+                    providing.push(inst.clone());
                 }
             }
         }
 
-        if candidates.is_empty() {
+        if providing.is_empty() {
             return None;
         }
+
+        let mut candidates = Self::prefer_serving(providing, service_name);
 
         // Use a counter keyed by service name for round-robin
         let len = candidates.len();
@@ -405,7 +461,10 @@ impl GearManager {
         let idx = *counter % len;
         *counter = (*counter + 1) % len;
 
-        candidates.get(idx).cloned()
+        let inst = candidates.swap_remove(idx);
+        let endpoint = inst.grpc_services.get(service_name)?.clone();
+        let gear = inst.gear.clone();
+        Some((gear, inst, endpoint))
     }
 
     /// Resolve a REST endpoint for a gear using round-robin over instances that
@@ -426,18 +485,7 @@ impl GearManager {
             return None;
         }
 
-        // Prefer healthy/ready instances, otherwise fall back to any with REST.
-        let healthy: Vec<_> = with_rest
-            .iter()
-            .filter(|inst| matches!(inst.state(), InstanceState::Healthy | InstanceState::Ready))
-            .cloned()
-            .collect();
-
-        let candidates = if healthy.is_empty() {
-            with_rest
-        } else {
-            healthy
-        };
+        let candidates = Self::prefer_serving(with_rest, gear);
 
         let len = candidates.len();
         let rr_key = format!("rest:{gear}");
@@ -494,6 +542,57 @@ mod tests {
         assert_eq!(instances[0].version, Some("1.0.0".to_owned()));
     }
 
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn reregister_without_labels_preserves_stored_labels() {
+        let dir = GearManager::new();
+        let instance_id = Uuid::new_v4();
+
+        // Initial registration carries a shard label.
+        dir.register_instance(Arc::new(
+            GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "7")])),
+        ));
+
+        // A label-less re-registration (e.g. periodic self-heal / REST
+        // augmentation) must NOT wipe the stored labels.
+        dir.register_instance(Arc::new(
+            GearInstance::new("shard-gear", instance_id).with_version("2.0.0"),
+        ));
+
+        let registered = dir.instances_of("shard-gear");
+        assert_eq!(registered.len(), 1);
+        assert_eq!(
+            registered[0].labels.get("shard"),
+            Some(&"7".to_owned()),
+            "label-less re-registration must preserve stored labels"
+        );
+        assert_eq!(registered[0].version, Some("2.0.0".to_owned()));
+    }
+
+    #[test]
+    fn reregister_with_labels_replaces_stored_labels() {
+        let dir = GearManager::new();
+        let instance_id = Uuid::new_v4();
+
+        dir.register_instance(Arc::new(
+            GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "7")])),
+        ));
+        // An explicit non-empty set replaces the stored one wholesale.
+        dir.register_instance(Arc::new(
+            GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "8")])),
+        ));
+
+        let registered = dir.instances_of("shard-gear");
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].labels.get("shard"), Some(&"8".to_owned()));
+    }
+
     #[test]
     fn test_register_multiple_instances() {
         let dir = GearManager::new();
@@ -530,6 +629,90 @@ mod tests {
         let registered = dir.instances_of("test_gear");
         assert_eq!(registered.len(), 1, "Should not duplicate instance");
         assert_eq!(registered[0].version, Some("2.0.0".to_owned()));
+    }
+
+    #[test]
+    fn test_reregistration_preserves_liveness_state() {
+        let dir = GearManager::new();
+        let instance_id = Uuid::new_v4();
+
+        // Register, then heartbeat so the instance is Healthy (routable).
+        dir.register_instance(Arc::new(
+            GearInstance::new("test_gear", instance_id).with_version("1.0.0"),
+        ));
+        dir.update_heartbeat("test_gear", instance_id, Instant::now());
+        assert!(matches!(
+            dir.instances_of("test_gear")[0].state(),
+            InstanceState::Healthy
+        ));
+
+        // A periodic self-heal re-registration must NOT reset liveness back to
+        // Registered — otherwise the instance drops out of gRPC round-robin
+        // until the next heartbeat (the "split-brain" flap).
+        dir.register_instance(Arc::new(
+            GearInstance::new("test_gear", instance_id).with_version("2.0.0"),
+        ));
+
+        let instances = dir.instances_of("test_gear");
+        assert_eq!(instances.len(), 1);
+        assert!(
+            matches!(instances[0].state(), InstanceState::Healthy),
+            "re-registration must preserve the Healthy state"
+        );
+        assert_eq!(
+            instances[0].version,
+            Some("2.0.0".to_owned()),
+            "re-registration must still refresh metadata/endpoints"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_reregister_and_heartbeat_preserves_state() {
+        let dir = GearManager::new();
+        let instance_id = Uuid::new_v4();
+
+        let initial = Arc::new(GearInstance::new("test_gear", instance_id).with_version("1.0.0"));
+        dir.register_instance(initial);
+        dir.update_heartbeat("test_gear", instance_id, Instant::now());
+        assert!(matches!(
+            dir.instances_of("test_gear")[0].state(),
+            InstanceState::Healthy
+        ));
+
+        let start = Instant::now();
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for _ in 0..1000 {
+                    dir.update_heartbeat("test_gear", instance_id, Instant::now());
+                }
+            });
+            s.spawn(|| {
+                for i in 0..1000 {
+                    let version = if i % 2 == 0 { "2.0.0" } else { "3.0.0" };
+                    let reinst = Arc::new(
+                        GearInstance::new("test_gear", instance_id)
+                            .with_version(version)
+                            .with_rest_endpoint(Endpoint::http(
+                                "127.0.0.1",
+                                8000u16 + u16::try_from(i % 10).expect("i % 10 fits in u16"),
+                            )),
+                    );
+                    dir.register_instance(reinst);
+                }
+            });
+        });
+
+        let instances = dir.instances_of("test_gear");
+        assert_eq!(instances.len(), 1);
+        assert!(
+            matches!(instances[0].state(), InstanceState::Healthy),
+            "concurrent re-registration must not reset Healthy state"
+        );
+        assert!(
+            instances[0].last_heartbeat() >= start,
+            "concurrent re-registration must not lose heartbeat updates"
+        );
     }
 
     #[test]
@@ -856,6 +1039,33 @@ mod tests {
         assert_ne!(inst1.instance_id, inst2.instance_id);
         // Endpoints should differ
         assert_ne!(ep1, ep2);
+    }
+
+    #[test]
+    fn pick_service_falls_back_to_not_ready() {
+        // A gear whose only service-providing instance is not yet serving
+        // (Registered, no heartbeat) must still resolve, mirroring the REST and
+        // instance pickers' not-ready fallback rather than failing closed.
+        let dir = GearManager::new();
+        let id = Uuid::new_v4();
+        dir.register_instance(Arc::new(
+            GearInstance::new("worker", id)
+                .with_grpc_service("worker.Svc", Endpoint::http("127.0.0.1", 9000)),
+        ));
+        // No heartbeat: the instance stays Registered (not serving).
+        assert!(matches!(
+            dir.instances_of("worker")[0].state(),
+            InstanceState::Registered
+        ));
+
+        let picked = dir.pick_service_round_robin("worker.Svc");
+        assert!(
+            picked.is_some(),
+            "gRPC service resolution must fall back to the not-ready instance"
+        );
+        let (gear, _, ep) = picked.unwrap();
+        assert_eq!(gear, "worker");
+        assert_eq!(ep, Endpoint::http("127.0.0.1", 9000));
     }
 
     #[test]

@@ -1,0 +1,11 @@
+suite: credstore
+features:
+  - credstore
+  - static-credstore
+  - static-tenants
+  - static-authn
+  - static-authz
+launcher: e2e-launcher
+config_gears:
+  - credstore
+  - static-credstore-plugin

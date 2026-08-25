@@ -9,7 +9,9 @@
 //! # Features
 //! - `pg`, `mysql`, `sqlite`: enable `SQLx` backends
 //! - `sea-orm`: add `SeaORM` integration for type-safe operations
-//! - `preview-outbox`: enable the transactional outbox pipeline (experimental — API may change)
+//!
+//! The transactional outbox pipeline ([`outbox`]) is always available — it is no
+//! longer behind a preview feature flag.
 //!
 //! # New Architecture
 //! The crate now supports:
@@ -68,7 +70,7 @@
 )]
 
 // Re-export key types for public API
-pub use advisory_locks::{DbLockGuard, LockConfig};
+pub use advisory_locks::{DbLockError, DbLockGuard, LockConfig};
 
 // Re-export sea_orm_migration for gears that implement DatabaseCapability
 pub use sea_orm_migration;
@@ -81,10 +83,12 @@ pub mod manager;
 pub mod migration_runner;
 pub mod odata;
 pub mod options;
-
-#[cfg(feature = "preview-outbox")]
 pub mod outbox;
 pub mod secure;
+/// Test-only helpers for DB-behavior audits (SQL query recorder). Gated behind
+/// the `test-support` feature; never part of a production build.
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 mod db_provider;
 
@@ -123,6 +127,32 @@ pub async fn connect_db(dsn: &str, opts: ConnectOpts) -> Result<Db> {
 /// Returns `DbError` if configuration is invalid or connection fails.
 pub async fn build_db(cfg: DbConnConfig, global: Option<&GlobalDatabaseConfig>) -> Result<Db> {
     let handle = options::build_db_handle(cfg, global).await?;
+    Ok(Db::new(handle))
+}
+
+/// **Test-only**: connect and attach a `SeaORM` metric callback before the
+/// connection is wrapped into `Db`.
+///
+/// `Db`/`DBProvider` never expose the inner `SeaORM` connection, and
+/// `SeaORM` captures the callback by value at connect time, so it can't be
+/// attached later. Lets suites like `QueryRecorder` observe every statement.
+///
+/// Gated behind the `test-support` feature; never used by production code.
+///
+/// # Errors
+///
+/// Returns `DbError` under the same conditions as [`connect_db`].
+#[cfg(feature = "test-support")]
+pub async fn connect_db_with_metric_callback<F>(
+    dsn: &str,
+    opts: ConnectOpts,
+    callback: F,
+) -> Result<Db>
+where
+    F: Fn(&sea_orm::metric::Info<'_>) + Send + Sync + 'static,
+{
+    let mut handle = DbHandle::connect(dsn, opts).await?;
+    handle.set_metric_callback_for_testing(callback);
     Ok(Db::new(handle))
 }
 
@@ -268,6 +298,11 @@ pub enum DbEngine {
 
 /// Connection options.
 /// Extended to cover common sqlx pool knobs; each driver applies the subset it supports.
+///
+/// Not `#[non_exhaustive]` because both first-party tests and downstream callers construct it
+/// with struct-literal + `..Default::default()`. Adding a public field (e.g. `lock_keepalive`)
+/// is therefore a source-breaking change for any caller using an exhaustive struct literal;
+/// such additions are called out in the crate semver note and ride the coordinated major/minor bump.
 #[derive(Clone, Debug)]
 pub struct ConnectOpts {
     /// Maximum number of connections in the pool.
@@ -284,6 +319,10 @@ pub struct ConnectOpts {
     pub test_before_acquire: bool,
     /// For `SQLite` file DSNs, create parent directories if missing.
     pub create_sqlite_dirs: bool,
+    /// Keepalive ping interval for the dedicated advisory-lock session (PG/MySQL only).
+    ///
+    /// `None` uses [`advisory_locks::DEFAULT_LOCK_KEEPALIVE`].
+    pub lock_keepalive: Option<Duration>,
 }
 impl Default for ConnectOpts {
     fn default() -> Self {
@@ -296,6 +335,7 @@ impl Default for ConnectOpts {
             test_before_acquire: false,
 
             create_sqlite_dirs: true,
+            lock_keepalive: None,
         }
     }
 }
@@ -306,6 +346,7 @@ pub(crate) struct DbHandle {
     engine: DbEngine,
     dsn: String,
     sea: DatabaseConnection,
+    locks: advisory_locks::LockManager,
 }
 
 #[cfg(feature = "sqlite")]
@@ -341,16 +382,27 @@ impl DbHandle {
     /// Returns an error if the connection fails or the DSN is invalid.
     pub(crate) async fn connect(dsn: &str, opts: ConnectOpts) -> Result<Self> {
         let engine = Self::detect(dsn)?;
+        #[cfg(any(feature = "pg", feature = "mysql"))]
+        let lock_keepalive = opts
+            .lock_keepalive
+            .unwrap_or(advisory_locks::DEFAULT_LOCK_KEEPALIVE);
         match engine {
             #[cfg(feature = "pg")]
             DbEngine::Postgres => {
                 let o = PgPoolOptions::new().apply(&opts);
                 let pool = o.connect(dsn).await?;
+                let database_scope = advisory_locks::database_scope_from_dsn(dsn);
+                let locks = advisory_locks::LockManager::postgres_lazy_dsn(
+                    dsn,
+                    database_scope,
+                    lock_keepalive,
+                )?;
                 let sea = SqlxPostgresConnector::from_sqlx_postgres_pool(pool);
                 Ok(Self {
                     engine,
                     dsn: dsn.to_owned(),
                     sea,
+                    locks,
                 })
             }
             #[cfg(not(feature = "pg"))]
@@ -359,11 +411,18 @@ impl DbHandle {
             DbEngine::MySql => {
                 let o = MySqlPoolOptions::new().apply(&opts);
                 let pool = o.connect(dsn).await?;
+                let database_scope = advisory_locks::database_scope_from_dsn(dsn);
+                let locks = advisory_locks::LockManager::mysql_lazy_dsn(
+                    dsn,
+                    database_scope,
+                    lock_keepalive,
+                )?;
                 let sea = SqlxMySqlConnector::from_sqlx_mysql_pool(pool);
                 Ok(Self {
                     engine,
                     dsn: dsn.to_owned(),
                     sea,
+                    locks,
                 })
             }
             #[cfg(not(feature = "mysql"))]
@@ -437,12 +496,15 @@ impl DbHandle {
                 }
 
                 let pool = o.connect_with(conn_opts).await?;
+                let database_scope = advisory_locks::database_scope_from_dsn(&clean_dsn);
+                let locks = advisory_locks::LockManager::file(database_scope);
                 let sea = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
 
                 Ok(Self {
                     engine,
                     dsn: clean_dsn,
                     sea,
+                    locks,
                 })
             }
             #[cfg(not(feature = "sqlite"))]
@@ -504,8 +566,7 @@ impl DbHandle {
     /// # Errors
     /// Returns an error if the lock cannot be acquired.
     pub async fn lock(&self, gear: &str, key: &str) -> Result<DbLockGuard> {
-        let lock_manager = advisory_locks::LockManager::new(self.dsn.clone());
-        let guard = lock_manager.lock(gear, key).await?;
+        let guard = self.locks.lock(gear, key).await?;
         Ok(guard)
     }
 
@@ -519,13 +580,23 @@ impl DbHandle {
         key: &str,
         config: LockConfig,
     ) -> Result<Option<DbLockGuard>> {
-        let lock_manager = advisory_locks::LockManager::new(self.dsn.clone());
-        let res = lock_manager.try_lock(gear, key, config).await?;
+        let res = self.locks.try_lock(gear, key, config).await?;
         Ok(res)
     }
 
     // NOTE: We intentionally do not expose raw SQL transactions from `DbHandle`.
     // Use `SecureConn::transaction` for application-level atomic operations.
+
+    /// **Test-only**: attach a `SeaORM` metric callback to the underlying
+    /// connection. See [`connect_db_with_metric_callback`] for why this must
+    /// run before the handle is wrapped into `Db`.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_metric_callback_for_testing<F>(&mut self, callback: F)
+    where
+        F: Fn(&sea_orm::metric::Info<'_>) + Send + Sync + 'static,
+    {
+        self.sea.set_metric_callback(callback);
+    }
 }
 
 // ===================== tests =====================
@@ -598,7 +669,7 @@ mod tests {
             .await?;
 
         // Deterministic unlock to avoid races with async Drop cleanup
-        guard1.release().await;
+        guard1.release().await?;
         let _guard4 = db.lock("test_gear", &format!("{test_id}_key1")).await?;
         Ok(())
     }

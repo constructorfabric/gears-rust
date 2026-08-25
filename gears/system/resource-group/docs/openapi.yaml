@@ -1,6 +1,9 @@
 # Created: 2026-03-06 by Constructor Tech
 # Updated: 2026-04-07 by Constructor Tech
 
+# NOTE: the aggregated, CI-verified schema for the whole platform is
+# docs/api/api.json (also served live by the api-gateway at {prefix}/docs).
+# Paths below are gear-relative: the gateway prepends its prefix_path (e.g. /cf).
 openapi: 3.1.0
 info:
   title: Resource Group API
@@ -56,7 +59,7 @@ paths:
 
   # ── Types ──────────────────────────────────────────────────────────
 
-  /api/types-registry/v1/types:
+  /types-registry/v1/types:
     get:
       operationId: listTypes
       tags: [types]
@@ -397,7 +400,7 @@ paths:
                       custom_domain: { type: string, format: hostname }
                       barrier: { type: boolean, default: false }
 
-  /api/types-registry/v1/types/{schema_id}:
+  /types-registry/v1/types/{code}:
     parameters:
       - $ref: '#/components/parameters/TypeSchemaId'
     get:
@@ -499,7 +502,7 @@ paths:
 
   # ── Groups ─────────────────────────────────────────────────────────
 
-  /api/resource-group/v1/groups:
+  /resource-group/v1/groups:
     get:
       operationId: listGroups
       tags: [groups]
@@ -507,8 +510,9 @@ paths:
       description: |
         Returns paginated resource groups.
 
-        For hierarchy traversal (ancestors, descendants, depth),
-        use the dedicated `/{group_id}/hierarchy` endpoint.
+        For hierarchy traversal (ancestors, descendants, depth), use the
+        dedicated `/{group_id}/descendants` and `/{group_id}/ancestors`
+        endpoints.
 
         - `$filter`: `type` (eq, ne, in), `hierarchy/parent_id` (eq, ne, in), `tenant_id` (eq, ne, in), `id` (eq, ne, in), `name` (eq, ne, in)
         - `limit`: page size (1..200), default 25
@@ -740,7 +744,7 @@ paths:
                     detail: "Setting parent_id would create a cycle in the hierarchy"
                     trace_id: 01HXYZRGCYCLE
 
-  /api/resource-group/v1/groups/{group_id}:
+  /resource-group/v1/groups/{group_id}:
     parameters:
       - $ref: '#/components/parameters/GroupId'
     get:
@@ -813,19 +817,18 @@ paths:
         '204':
           description: Group deleted
 
-  /api/resource-group/v1/groups/{group_id}/hierarchy:
+  /resource-group/v1/groups/{group_id}/descendants:
     parameters:
       - $ref: '#/components/parameters/GroupId'
     get:
-      operationId: listGroupHierarchy
+      operationId: getGroupDescendants
       tags: [groups]
-      summary: Traverse hierarchy from a reference group
+      summary: Get group descendants
       description: |
-        Returns groups related to the reference group `{group_id}`.
-        `depth` is **relative** to the reference group:
+        Returns descendants of the reference group `{group_id}` (depth >= 0)
+        with OData filtering. `depth` is **relative** to the reference group:
         - `depth = 0` — the reference group itself
         - `depth > 0` — descendants
-        - `depth < 0` — ancestors
 
         - `$filter`: `depth` (eq, ne, gt, ge, lt, le), `type` (eq, ne, in)
         - `limit`: page size (1..200), default 25
@@ -840,7 +843,7 @@ paths:
         - $ref: '#/components/parameters/Cursor'
       responses:
         '200':
-          description: Paginated groups with relative depth
+          description: Paginated descendants with relative depth
           content:
             application/json:
               schema:
@@ -907,11 +910,43 @@ paths:
                         metadata:
                           barrier: true
                     page_info:
-                      next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
+                      next_cursor: null
                       limit: 25
 
+  /resource-group/v1/groups/{group_id}/ancestors:
+    parameters:
+      - $ref: '#/components/parameters/GroupId'
+    get:
+      operationId: getGroupAncestors
+      tags: [groups]
+      summary: Get group ancestors
+      description: |
+        Returns ancestors of the reference group `{group_id}` (depth <= 0)
+        with OData filtering. `depth` is **relative** to the reference group:
+        - `depth = 0` — the reference group itself
+        - `depth < 0` — ancestors
+
+        - `$filter`: `depth` (eq, ne, gt, ge, lt, le), `type` (eq, ne, in)
+        - `limit`: page size (1..200), default 25
+        - `cursor`: opaque token for pagination
+      x-odata-filter:
+        supported_fields:
+          depth: [eq, ne, gt, ge, lt, le]
+          type: [eq, ne, in]
+      parameters:
+        - $ref: '#/components/parameters/ODataFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Paginated ancestors with relative depth
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupHierarchyPage'
+              examples:
                 ancestors-of-B3:
-                  summary: "$filter=depth ge -10 and depth le -1 — ancestors of B3"
+                  summary: "Ancestors of B3"
                   value:
                     items:
                       - id: 11111111-1111-1111-1111-111111111111
@@ -930,45 +965,10 @@ paths:
                           category: "finance"
                           short_description: "Mega Department"
                     page_info:
-                      next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
+                      next_cursor: null
                       limit: 25
 
-                full-range-D2:
-                  summary: "Ancestors + self + descendants of D2"
-                  value:
-                    items:
-                      - id: 11111111-1111-1111-1111-111111111111
-                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                        name: T1
-                        parent_id: null
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        depth: -1
-                      - id: 22222222-2222-2222-2222-222222222222
-                        type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                        name: D2
-                        parent_id: 11111111-1111-1111-1111-111111111111
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        depth: 0
-                        metadata:
-                          category: "finance"
-                          short_description: "Mega Department"
-                      - id: 33333333-3333-3333-3333-333333333333
-                        type: "gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~"
-                        name: B3
-                        parent_id: 22222222-2222-2222-2222-222222222222
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        depth: 1
-                        metadata:
-                          location: "Building A, Floor 3"
-                    page_info:
-                      next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
-                      limit: 25
-        '404':
-          $ref: '#/components/responses/NotFound'
-
-  # ── Memberships ────────────────────────────────────────────────────
-
-  /api/resource-group/v1/memberships:
+  /resource-group/v1/memberships:
     get:
       operationId: listMemberships
       tags: [memberships]
@@ -1007,7 +1007,7 @@ paths:
                   next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
                   limit: 25
 
-  /api/resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id}:
+  /resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id}:
     parameters:
       - $ref: '#/components/parameters/MembershipGroupId'
       - $ref: '#/components/parameters/MembershipResourceType'
@@ -1050,7 +1050,7 @@ components:
       example: 22222222-2222-2222-2222-222222222222
 
     TypeSchemaId:
-      name: schema_id
+      name: code
       in: path
       required: true
       description: "GTS type path (`$id` value without `gts://` prefix)."
@@ -1209,7 +1209,7 @@ components:
           $ref: '#/components/schemas/PageInfo'
 
     GroupHierarchyItem:
-      description: "Group with relative `depth` from reference group. Returned only by the hierarchy endpoint."
+      description: "Group with relative `depth` from reference group. Returned only by the descendants/ancestors endpoints."
       allOf:
         - $ref: '#/components/schemas/Group'
         - type: object

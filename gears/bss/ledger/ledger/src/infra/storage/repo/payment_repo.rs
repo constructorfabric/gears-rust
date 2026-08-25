@@ -19,6 +19,7 @@
 
 use bss_ledger_sdk::SourceDocType;
 use chrono::{DateTime, Utc};
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, DbErr, EntityTrait, Order};
 use toolkit_db::secure::{

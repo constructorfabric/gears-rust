@@ -1,7 +1,16 @@
-//! Input validation and safety limits for `OData` parsing
+//! Opt-in input validation and safety limits for `OData` parsing
 //!
-//! This gear enforces sane caps to prevent abuse and resource exhaustion:
-//! - Maximum `$top` value
+//! [`ODataLimits`] is a caller-driven validator, **not** an ambient policy: a
+//! caller constructs it and invokes the `validate_*` helpers itself. Nothing
+//! in the `toolkit::api::odata` extractor constructs or applies it, so the
+//! defaults below are a suggested starting point, not caps the platform
+//! enforces on your behalf. The caps that do apply to every request are the
+//! extractor's own budgets (`MAX_FILTER_LEN`, `MAX_ORDERBY_LEN`,
+//! `MAX_SELECT_LEN`, … in `toolkit::api::odata`); page size is capped
+//! per-endpoint by the owning handler.
+//!
+//! Covers:
+//! - Maximum page size (`$top`, also spelled `limit` on the wire)
 //! - Maximum number of `$orderby` fields
 //! - Maximum filter expression length
 //! - Cursor integrity checks (HMAC signing)
@@ -12,7 +21,9 @@ use crate::Error;
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct ODataLimits {
-    /// Maximum value for $top (default: 1000)
+    /// Maximum value for the page size `$top` / `limit` (default: 1000).
+    /// Applied only through [`ODataLimits::validate_top`] — see the module
+    /// docs.
     pub max_top: usize,
     /// Maximum number of fields in $orderby (default: 5)
     pub max_orderby_fields: usize,
@@ -42,7 +53,7 @@ impl ODataLimits {
         Self::default()
     }
 
-    /// Set maximum $top value
+    /// Set maximum page size (`$top` / `limit`)
     pub fn with_max_top(mut self, max_top: usize) -> Self {
         self.max_top = max_top;
         self
@@ -67,10 +78,10 @@ impl ODataLimits {
         self
     }
 
-    /// Validate a $top value against limits.
+    /// Validate a page size (`$top` / `limit`) against [`Self::max_top`].
     ///
     /// # Errors
-    /// Returns `Error::InvalidLimit` if the top value exceeds the maximum allowed.
+    /// Returns `Error::InvalidLimit` if the page size exceeds the maximum allowed.
     pub fn validate_top(&self, top: usize) -> Result<(), Error> {
         if top > self.max_top {
             return Err(Error::InvalidLimit);

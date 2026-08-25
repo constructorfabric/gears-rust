@@ -10,7 +10,7 @@
 
 **SC-OBS-001 — spans emitted with catalogued names & attributes** · L2 · ☐
 - *Intent:* every facade operation produces its named span so traces are consistent across backends.
-- *Steps:* with a capturing tracing subscriber, drive each operation (e.g. `cache.get`, `leader.elect`, `lock.try_lock`, `discovery.register`).
+- *Steps:* with a capturing tracing subscriber, drive each operation (e.g. `cache.get`, `leader.elect`, `lock.try_lock`).
 - *Expected:* a span named per the catalog (e.g. `cluster.cache.get`) carrying the specified attributes (`provider`, `key`/`election`/`lock`/`name`, …).
 - *Done-when:* asserts span name and required attributes for each catalogued operation.
 

@@ -33,6 +33,7 @@
 
 use bss_ledger_sdk::{AccountClass, Side, SourceDocType};
 use chrono::{DateTime, Utc};
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, DbErr, EntityTrait};
 use toolkit_db::secure::{
@@ -218,7 +219,9 @@ impl AdjustmentRepo {
             };
             total = total.saturating_add(signed);
         }
-        Ok(total.max(0))
+        // `Ord::max` spelled explicitly: `ExprTrait` is in scope in this module
+        // for the query builders and also provides a `max`.
+        Ok(Ord::max(total, 0))
     }
 
     /// `true` iff a **posted invoice** exists for `(tenant, origin_invoice_id)` —
@@ -294,7 +297,7 @@ impl AdjustmentRepo {
             .map_err(|e| RepoError::Db(format!("read open AR for invoice: {e}")))?;
         let mut total: i64 = 0;
         for r in rows {
-            total = total.saturating_add(r.balance_minor.max(0));
+            total = total.saturating_add(Ord::max(r.balance_minor, 0));
         }
         Ok(total)
     }
@@ -380,8 +383,7 @@ impl AdjustmentRepo {
             Expr::col((
                 invoice_exposure::Entity,
                 invoice_exposure::Column::OriginalTotalMinor,
-            ))
-            .into(),
+            )),
         )
         .map_err(|e| RepoError::Db(format!("invoice_exposure on_conflict: {e}")))?;
 

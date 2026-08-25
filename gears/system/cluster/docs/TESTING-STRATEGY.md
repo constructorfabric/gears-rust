@@ -125,7 +125,6 @@ contract — independent of *which* backend:
 pub fn cache_conformance_suite(factory: impl Fn() -> Arc<dyn ClusterCacheBackend>);
 pub fn leader_conformance_suite(factory: impl Fn() -> Arc<dyn LeaderElectionBackend>);
 pub fn lock_conformance_suite(factory: impl Fn() -> Arc<dyn DistributedLockBackend>);
-pub fn sd_conformance_suite(factory: impl Fn() -> Arc<dyn ServiceDiscoveryBackend>);
 ```
 
 Every plugin's integration tests then reduce to ~10 lines: build the backend, hand it
@@ -152,8 +151,6 @@ each maps to an `SC-*` row in the [scenario catalog](./scenarios/README.md)):
 - TTL expiry removes the entry and emits an `Expired` notification.
 - Per-key watch ordering preserved; delivery at-most-once
   (`cpt-cf-clst-nfr-watch-delivery`).
-- Default `DiscoveryFilter` returns enabled-only; metadata predicates AND-combine;
-  result ordering is unspecified (suite must NOT assume order).
 - Scoping round-trip: `scoped(p)` write/read strips back to the bare key/name.
 
 **Model-based / property variants.** Where practical, pair example-based tests with
@@ -179,7 +176,6 @@ gears/system/cluster/cluster-conformance/
     cache.rs                # SC-CACHE-* scenarios + run_cache_conformance(factory)
     leader.rs               # SC-LEAD-*   scenarios + run_leader_conformance(factory)
     lock.rs                 # SC-LOCK-*   scenarios + run_lock_conformance(factory)
-    discovery.rs            # SC-DISC-*   scenarios + run_discovery_conformance(factory)
     model.rs                # (later) proptest HashMap reference model for CAS/version
 ```
 
@@ -215,9 +211,9 @@ hand it to `run_*_conformance`. Open question on the async-runtime entry shape (
 
 The `cluster` gear itself is the one exception that proves this composition works at
 all (`SC-ROUTE-001`/`002`): since it can't depend on `cluster-conformance` without
-creating a plugin-facing dependency problem, it proves the "cache-only in, all four
+creating a plugin-facing dependency problem, it proves the "cache-only in, all three
 primitives out" guarantee with its own bespoke tests
-(`cluster/src/defaults/{leader,lock,discovery}_tests.rs`) rather than by calling
+(`cluster/src/defaults/{leader,lock}_tests.rs`) rather than by calling
 `run_*_conformance` — see [scenarios/routing.md](./scenarios/routing.md).
 
 ## 5. Layer 3 — Per-Backend Integration (testcontainers)
@@ -261,7 +257,7 @@ stubs and full distributed testing — it tests the watch lifecycle and coordina
 - **Toxiproxy** (`toxiproxy-rust`, or via testcontainers) sits between the plugin and
   a real backend container and injects latency, bandwidth caps, connection drops, and
   partial partitions. This is the fastest path to exercising:
-  - `CacheWatchEvent` / `LeaderWatchEvent` / `ServiceWatchEvent` `Lagged` / `Reset` /
+  - `CacheWatchEvent` / `LeaderWatchEvent` `Lagged` / `Reset` /
     `Closed` signals against a real connection (`cpt-cf-clst-fr-watch-lifecycle-signals`).
   - The `RestartingWatch` auto-restart combinator's backoff + retryability
     classification (`cpt-cf-clst-fr-watch-auto-restart`) — verify retryable kinds
@@ -298,7 +294,7 @@ typically run nightly alongside the L3 containers.
 | Tool | Buys | Target |
 |---|---|---|
 | **`loom`** | Exhaustive interleaving check of concurrent code | SDK default backends + standalone plugin: `AtomicU64` version source, watch fan-out, TTL reaper vs. renewal races, the `shutdown_observed` `AtomicBool` (DESIGN §3.7) |
-| **`proptest`** | Property / model-based testing | CAS & version invariants, scoping round-trips, `DiscoveryFilter` AND-semantics — folded into the §4 suite |
+| **`proptest`** | Property / model-based testing | CAS & version invariants, scoping round-trips — folded into the §4 suite |
 | **`cargo-mutants`** | Mutation testing — proves tests fail when logic breaks | SDK default backends, capability-validation logic (coverage % lies; mutants don't) |
 | **`ui_test` (dylint)** | Lint fires on violations, no false positives | The no-remote-I/O-in-critical-section rule (`cpt-cf-clst-nfr-bounded-critical-section`) — needs positive/negative fixtures or it silently rots |
 | **`miri`** | UB / leak detection | SDK unit tests; cheap insurance for any `unsafe`/FFI in plugins |

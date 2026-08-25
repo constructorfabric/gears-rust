@@ -102,8 +102,16 @@ impl From<Error> for CanonicalError {
                 )
                 .create(),
 
+            // Keyed to the canonical `OData` spelling. `toolkit::api::odata`
+            // binds page size from either `$top` or `limit` (one slot, two
+            // accepted names), so the violation names `$top` and the
+            // description names both.
             InvalidLimit => OdataError::invalid_argument()
-                .with_field_violation("$top", "Invalid limit parameter", "INVALID_LIMIT")
+                .with_field_violation(
+                    "$top",
+                    "Invalid page size parameter ($top, alias limit)",
+                    "INVALID_LIMIT",
+                )
                 .create(),
 
             // Surface both halves of the conflict so a client filtering by
@@ -179,7 +187,7 @@ mod tests {
     #[test]
     fn invalid_filter_populates_field_violation() {
         let p = wire(Error::InvalidFilter("malformed".into()));
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert!(p.problem_type.contains("invalid_argument"));
         assert_eq!(resource_type(&p), ODATA_RESOURCE_TYPE);
         let violations = field_violations(&p);
@@ -195,7 +203,7 @@ mod tests {
     #[test]
     fn invalid_orderby_field_populates_field_violation() {
         let p = wire(Error::InvalidOrderByField("unknown".into()));
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(resource_type(&p), ODATA_RESOURCE_TYPE);
         let violations = field_violations(&p);
         assert_eq!(violations.len(), 1);
@@ -205,7 +213,7 @@ mod tests {
     #[test]
     fn cursor_invalid_base64_populates_field_violation() {
         let p = wire(Error::CursorInvalidBase64);
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(resource_type(&p), ODATA_RESOURCE_TYPE);
         let violations = field_violations(&p);
         assert_eq!(violations.len(), 1);
@@ -215,7 +223,7 @@ mod tests {
     #[test]
     fn order_with_cursor_emits_two_violations() {
         let p = wire(Error::OrderWithCursor);
-        assert_eq!(p.status, 400);
+        assert_eq!(p.status, Some(400));
         assert_eq!(resource_type(&p), ODATA_RESOURCE_TYPE);
         let violations = field_violations(&p);
         assert_eq!(
@@ -267,7 +275,7 @@ mod tests {
             CanonicalError::from(Error::Db("connection refused: 127.0.0.1:5432".into()));
         // Wire side: opaque internal envelope.
         let p = Problem::from(canonical.clone());
-        assert_eq!(p.status, 500);
+        assert_eq!(p.status, Some(500));
         assert!(p.problem_type.contains("internal"));
         // The wire `detail` is the canonical fixed string — never the raw msg.
         assert!(!p.detail.contains("127.0.0.1"));

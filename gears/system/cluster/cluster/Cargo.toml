@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-cluster"
-version = "0.1.2"
+version = "0.2.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -15,8 +15,24 @@ metadata.docs.rs.all-features = true
 [lib]
 name = "cluster"
 
+# `testcontainers`/`testcontainers-modules` are declared as optional entries
+# under `[dependencies]` (Cargo does not allow optional `[dev-dependencies]`)
+# purely so the `integration` feature array can name them; every reference lives
+# in `tests/`, so the feature has no effect on this gear's compiled artifact.
+# cargo-shear's "misplaced optional dependency" heuristic flags that placement —
+# it is required here, not accidental.
+[package.metadata.cargo-shear]
+ignored = ["testcontainers", "testcontainers-modules"]
+
 [lints]
 workspace = true
+
+[features]
+# Gates the Docker-backed mixed-backend routing test
+# (`tests/mixed_backend_integration.rs`), mirroring the Postgres plugin's own
+# `integration` feature so a default `cargo test` never requires a Docker
+# daemon. Run with `cargo test -p cf-gears-cluster --features integration`.
+integration = ["dep:testcontainers", "dep:testcontainers-modules"]
 
 [dependencies]
 cluster-sdk = { workspace = true }
@@ -28,9 +44,13 @@ tokio = { workspace = true, features = ["macros"] }
 tokio-util = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 rand = { workspace = true }
-cf-gears-standalone-cluster-plugin = { path = "../plugins/standalone-cluster-plugin", version = "0.1.2" }
+cf-gears-standalone-cluster-plugin = { path = "../plugins/standalone-cluster-plugin", version = "0.2.1" }
+cf-postgres-cluster-plugin = { path = "../plugins/postgres-cluster-plugin", version = "0.3.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Optional, test-only — see the `[features]` and `cargo-shear` notes above.
+testcontainers = { workspace = true, optional = true }
+testcontainers-modules = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

@@ -87,15 +87,12 @@ async fn test_db_phase_with_manager_succeeds() {
         cancel_clone.cancel();
     });
 
-    let opts = RunOptions {
-        gears_cfg: Arc::new(DbTestConfigProvider::new().with_db_config("test_db_gear")),
-        db: DbOptions::Manager(create_test_db_manager()),
-        shutdown: ShutdownOptions::Token(cancel),
-        clients: Vec::new(),
-        instance_id: Uuid::new_v4(),
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts = RunOptions::new(
+        Arc::new(DbTestConfigProvider::new().with_db_config("test_db_gear")),
+        DbOptions::Manager(create_test_db_manager()),
+        ShutdownOptions::Token(cancel),
+        Uuid::new_v4(),
+    );
 
     let result = timeout(Duration::from_millis(500), run(opts)).await;
     assert!(result.is_ok(), "DB phase should complete");
@@ -118,15 +115,12 @@ async fn test_db_phase_without_config_skips_migration() {
         cancel_clone.cancel();
     });
 
-    let opts = RunOptions {
-        gears_cfg: Arc::new(DbTestConfigProvider::new()), // No DB config for any gear
-        db: DbOptions::Manager(create_test_db_manager()),
-        shutdown: ShutdownOptions::Token(cancel),
-        clients: Vec::new(),
-        instance_id: Uuid::new_v4(),
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts = RunOptions::new(
+        Arc::new(DbTestConfigProvider::new()), // No DB config for any gear
+        DbOptions::Manager(create_test_db_manager()),
+        ShutdownOptions::Token(cancel),
+        Uuid::new_v4(),
+    );
 
     let result = timeout(Duration::from_millis(500), run(opts)).await;
     assert!(result.is_ok(), "Should handle missing DB config gracefully");
@@ -149,15 +143,12 @@ async fn test_db_phase_with_none_option() {
         cancel_clone.cancel();
     });
 
-    let opts = RunOptions {
-        gears_cfg: Arc::new(DbTestConfigProvider::new()),
-        db: DbOptions::None,
-        shutdown: ShutdownOptions::Token(cancel),
-        clients: Vec::new(),
-        instance_id: Uuid::new_v4(),
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts = RunOptions::new(
+        Arc::new(DbTestConfigProvider::new()),
+        DbOptions::None,
+        ShutdownOptions::Token(cancel),
+        Uuid::new_v4(),
+    );
 
     let result = timeout(Duration::from_millis(500), run(opts)).await;
     assert!(result.is_ok(), "Should complete with DbOptions::None");
@@ -202,15 +193,12 @@ async fn test_db_phase_error_propagation() {
         return;
     }
 
-    let opts = RunOptions {
-        gears_cfg: Arc::new(DbTestConfigProvider::new().with_db_config("test_gear")),
-        db: DbOptions::Manager(Arc::new(db_manager_result.unwrap())),
-        shutdown: ShutdownOptions::Token(cancel),
-        clients: Vec::new(),
-        instance_id: Uuid::new_v4(),
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts = RunOptions::new(
+        Arc::new(DbTestConfigProvider::new().with_db_config("test_gear")),
+        DbOptions::Manager(Arc::new(db_manager_result.unwrap())),
+        ShutdownOptions::Token(cancel),
+        Uuid::new_v4(),
+    );
 
     // Run should either succeed (if no gears try to use bad config)
     // or fail gracefully
@@ -229,15 +217,12 @@ async fn test_db_phase_completes_before_init() {
         cancel_clone.cancel();
     });
 
-    let opts = RunOptions {
-        gears_cfg: Arc::new(DbTestConfigProvider::new().with_db_config("test_db_gear")),
-        db: DbOptions::Manager(create_test_db_manager()),
-        shutdown: ShutdownOptions::Token(cancel),
-        clients: Vec::new(),
-        instance_id: Uuid::new_v4(),
-        oop: None,
-        shutdown_deadline: None,
-    };
+    let opts = RunOptions::new(
+        Arc::new(DbTestConfigProvider::new().with_db_config("test_db_gear")),
+        DbOptions::Manager(create_test_db_manager()),
+        ShutdownOptions::Token(cancel),
+        Uuid::new_v4(),
+    );
 
     let start = std::time::Instant::now();
     let result = timeout(Duration::from_millis(500), run(opts)).await;

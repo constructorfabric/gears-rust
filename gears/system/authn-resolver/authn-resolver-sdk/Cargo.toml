@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-authn-resolver-sdk"
-version = "0.3.21"
+version = "0.3.29"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -32,3 +32,6 @@ toolkit-gts = { workspace = true }
 # ToolKit dependencies
 toolkit = { workspace = true }
 toolkit-security = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

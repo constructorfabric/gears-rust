@@ -13,7 +13,7 @@ use toolkit_gts::gts_id;
 
 use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, UnsupportedResource};
 
 /// Run a `DomainError` through the single canonical ladder.
 fn round_trip(d: DomainError) -> CanonicalError {
@@ -205,6 +205,88 @@ fn user_not_found_maps_to_not_found_404_with_user_resource() {
 }
 
 #[test]
+fn service_account_not_found_maps_to_not_found_404_with_its_own_resource_type() {
+    // A machine identity must not surface under the *user* resource
+    // type: a client keys "can I grant this?" off `resource_type`, and
+    // collapsing the two would advertise credential minting as user
+    // management. The `client_id` rides `resource_name`.
+    let client_id = "svc-abc";
+    let canonical = round_trip(DomainError::ServiceAccountNotFound {
+        detail: "service account not found in tenant".to_owned(),
+        resource: client_id.to_owned(),
+    });
+    assert_eq!(canonical.status_code(), 404);
+    assert_eq!(canonical.resource_name(), Some(client_id));
+    assert_eq!(
+        canonical.resource_type(),
+        Some(account_management_sdk::gts::SERVICE_ACCOUNT_RESOURCE_TYPE)
+    );
+    assert!(
+        matches!(canonical, CanonicalError::NotFound { .. }),
+        "ServiceAccountNotFound MUST surface as the NotFound variant"
+    );
+}
+
+#[test]
+fn service_account_invalid_input_maps_to_400_attributed_to_the_request() {
+    // The adapter's own field attribution is untrusted text and was
+    // dropped at the domain boundary, so the violation names `request`
+    // as a whole rather than a field the provider chose.
+    let canonical = round_trip(DomainError::ServiceAccountInvalidInput {
+        detail: crate::domain::idp::SA_INVALID_INPUT_MESSAGE.to_owned(),
+    });
+    assert_eq!(canonical.status_code(), 400);
+    assert_eq!(
+        canonical.resource_type(),
+        Some(account_management_sdk::gts::SERVICE_ACCOUNT_RESOURCE_TYPE)
+    );
+    let CanonicalError::InvalidArgument { ctx, .. } = canonical else {
+        panic!("expected CanonicalError::InvalidArgument");
+    };
+    let InvalidArgument::FieldViolations { field_violations } = ctx else {
+        panic!("expected InvalidArgument::FieldViolations ctx");
+    };
+    assert_eq!(field_violations.len(), 1);
+    assert_eq!(
+        field_violations[0].field,
+        account_management_sdk::field::REQUEST_FIELD
+    );
+    assert_eq!(
+        field_violations[0].reason,
+        account_management_sdk::field::IDP_INVALID_INPUT
+    );
+}
+
+/// The ambiguous outcome is 409 with its own reason, not the 503 a clean
+/// failure gets: retrying the same request would collide with the
+/// account the uncertain call may have created, so the envelope must
+/// say "reconcile", not "retry".
+#[test]
+fn service_account_ambiguous_maps_to_409_aborted_with_ambiguous_reason() {
+    let canonical = round_trip(DomainError::ServiceAccountAmbiguous {
+        detail: crate::domain::idp::SA_AMBIGUOUS_MESSAGE.to_owned(),
+    });
+    assert_eq!(canonical.status_code(), 409);
+    assert_eq!(
+        canonical.resource_type(),
+        Some(account_management_sdk::gts::SERVICE_ACCOUNT_RESOURCE_TYPE)
+    );
+    assert!(
+        matches!(canonical, CanonicalError::Aborted { .. }),
+        "ServiceAccountAmbiguous MUST surface as Aborted, not ServiceUnavailable"
+    );
+    let rendered = format!("{canonical:?}");
+    assert!(
+        rendered.contains(account_management_sdk::reason::aborted::AMBIGUOUS_OUTCOME),
+        "expected the AMBIGUOUS_OUTCOME reason token: {rendered}"
+    );
+    assert!(
+        rendered.contains("reconcile"),
+        "the detail must steer the caller to reconcile: {rendered}"
+    );
+}
+
+#[test]
 fn conversion_request_not_found_maps_to_not_found_404() {
     // Pins the wire shape for conversion-request lookups that miss
     // their target (`cancel` / `reject` / `approve` / `get`).
@@ -335,6 +417,143 @@ fn idp_password_policy_maps_to_400_with_password_field_violation() {
     assert_eq!(
         field_violations[0].reason,
         account_management_sdk::field::PASSWORD_POLICY
+    );
+}
+
+/// An `IdP`-managed attribute reject lands on 400 `invalid_argument`
+/// carrying the *patched property's own name* as
+/// `field_violations[].field` plus the `IDP_MANAGED_FIELD` reason, so a
+/// client can disable exactly that form input. Every
+/// [`account_management_sdk::IdpUserAttribute`] is exercised: the field
+/// token MUST equal the `UserUpdateRequest` JSON property name, because
+/// clients key form-field attribution off that string.
+///
+/// The `description` is pinned to the exact curated sentence, not merely
+/// checked non-empty: the typed-attribute design exists so the public
+/// wording lives in one place and cannot drift, which only holds if the
+/// wording is asserted somewhere.
+#[test]
+fn idp_field_not_writable_maps_to_400_with_the_patched_field_violation() {
+    for (attribute, expected_field, expected_description) in [
+        (
+            account_management_sdk::IdpUserAttribute::Username,
+            "username",
+            "the username is managed by the identity provider and cannot be changed through this API",
+        ),
+        (
+            account_management_sdk::IdpUserAttribute::Email,
+            "email",
+            "the email address is managed by the identity provider and cannot be changed through this API",
+        ),
+        (
+            account_management_sdk::IdpUserAttribute::DisplayName,
+            "display_name",
+            "the display name is managed by the identity provider and cannot be changed through this API",
+        ),
+        (
+            account_management_sdk::IdpUserAttribute::FirstName,
+            "first_name",
+            "the first name is managed by the identity provider and cannot be changed through this API",
+        ),
+        (
+            account_management_sdk::IdpUserAttribute::LastName,
+            "last_name",
+            "the last name is managed by the identity provider and cannot be changed through this API",
+        ),
+    ] {
+        let canonical = round_trip(DomainError::IdpFieldNotWritable {
+            fields: vec![attribute],
+        });
+        assert_eq!(
+            canonical.status_code(),
+            400,
+            "{expected_field}: writability is a field capability, not an authz decision -- \
+             it MUST NOT surface as 403"
+        );
+        assert_eq!(
+            canonical.resource_type(),
+            Some(account_management_sdk::gts::USER_RESOURCE_TYPE)
+        );
+        let CanonicalError::InvalidArgument { ctx, .. } = canonical else {
+            panic!("{expected_field}: expected CanonicalError::InvalidArgument");
+        };
+        let InvalidArgument::FieldViolations { field_violations } = ctx else {
+            panic!("{expected_field}: expected InvalidArgument::FieldViolations ctx");
+        };
+        assert_eq!(field_violations.len(), 1);
+        assert_eq!(
+            field_violations[0].field, expected_field,
+            "field token MUST match the UserUpdateRequest property name"
+        );
+        assert_eq!(
+            field_violations[0].reason,
+            account_management_sdk::field::IDP_MANAGED_FIELD
+        );
+        assert_eq!(
+            field_violations[0].description, expected_description,
+            "{expected_field}: the curated public wording is a contract -- it lives in exactly \
+             one place and MUST NOT drift"
+        );
+    }
+}
+
+/// A patch touching several locked attributes yields one violation per
+/// refused attribute in a single envelope, so the client learns the whole
+/// refused set from one round-trip instead of discovering it field by
+/// field. Repeats a provider may send collapse to one violation each.
+#[test]
+fn idp_field_not_writable_emits_one_violation_per_refused_attribute() {
+    let canonical = round_trip(DomainError::IdpFieldNotWritable {
+        fields: vec![
+            account_management_sdk::IdpUserAttribute::Email,
+            account_management_sdk::IdpUserAttribute::FirstName,
+            account_management_sdk::IdpUserAttribute::LastName,
+            account_management_sdk::IdpUserAttribute::Email,
+        ],
+    });
+    assert_eq!(canonical.status_code(), 400);
+    let CanonicalError::InvalidArgument { ctx, .. } = canonical else {
+        panic!("expected CanonicalError::InvalidArgument");
+    };
+    let InvalidArgument::FieldViolations { field_violations } = ctx else {
+        panic!("expected InvalidArgument::FieldViolations ctx");
+    };
+    let fields: Vec<&str> = field_violations.iter().map(|v| v.field.as_str()).collect();
+    assert_eq!(
+        fields,
+        ["email", "first_name", "last_name"],
+        "every refused attribute MUST get its own violation, de-duplicated"
+    );
+    assert!(
+        field_violations
+            .iter()
+            .all(|v| v.reason == account_management_sdk::field::IDP_MANAGED_FIELD),
+        "every violation in the set carries the IDP_MANAGED_FIELD reason"
+    );
+}
+
+/// An empty refused set is a provider contract violation. A 400 whose
+/// `field_violations[]` is empty attributes the refusal to nothing, so
+/// the mapping degrades to the generic `request` / `VALIDATION` pair
+/// rather than emitting an unattributable `IDP_MANAGED_FIELD`.
+#[test]
+fn idp_field_not_writable_with_no_attributes_degrades_to_the_generic_violation() {
+    let canonical = round_trip(DomainError::IdpFieldNotWritable { fields: Vec::new() });
+    assert_eq!(canonical.status_code(), 400);
+    let CanonicalError::InvalidArgument { ctx, .. } = canonical else {
+        panic!("expected CanonicalError::InvalidArgument");
+    };
+    let InvalidArgument::FieldViolations { field_violations } = ctx else {
+        panic!("expected InvalidArgument::FieldViolations ctx");
+    };
+    assert_eq!(field_violations.len(), 1);
+    assert_eq!(
+        field_violations[0].field,
+        account_management_sdk::field::REQUEST_FIELD
+    );
+    assert_eq!(
+        field_violations[0].reason,
+        account_management_sdk::field::VALIDATION
     );
 }
 
@@ -592,16 +811,54 @@ fn idp_unavailable_maps_to_503_without_retry_after() {
 // Unimplemented (HTTP 501)
 // ---------------------------------------------------------------------------
 
+/// A 501 must name the surface the caller actually addressed.
+///
+/// All three halves of `IdpPluginClient` collapse into one `DomainError`
+/// variant, so the boundary picks `resource_type` from the variant's
+/// `resource` discriminator. Asserting only the status code — which is
+/// identical for all three — is what previously allowed every 501 to claim
+/// `resource_type = tenant`, including on the machine-identity surface.
 #[test]
-fn unsupported_operation_maps_to_501() {
+fn unsupported_operation_maps_to_501_naming_the_addressed_resource() {
+    for (resource, expected) in [
+        (
+            UnsupportedResource::Tenant,
+            account_management_sdk::gts::TENANT_RESOURCE_TYPE,
+        ),
+        (
+            UnsupportedResource::User,
+            account_management_sdk::gts::USER_RESOURCE_TYPE,
+        ),
+        (
+            UnsupportedResource::ServiceAccount,
+            account_management_sdk::gts::SERVICE_ACCOUNT_RESOURCE_TYPE,
+        ),
+    ] {
+        let canonical = round_trip(DomainError::UnsupportedOperation {
+            detail: "vendor x lacks profile-edit".to_owned(),
+            resource,
+        });
+        assert_eq!(canonical.status_code(), 501, "{resource:?} must be 501");
+        assert_eq!(
+            canonical.resource_type(),
+            Some(expected),
+            "{resource:?} must carry its own resource_type, not another surface's"
+        );
+    }
+}
+
+#[test]
+fn service_account_unsupported_uses_the_fixed_am_owned_detail() {
     let canonical = round_trip(DomainError::UnsupportedOperation {
-        detail: "vendor x lacks profile-edit".to_owned(),
+        detail: "provider detail must not reach the wire".to_owned(),
+        resource: UnsupportedResource::ServiceAccount,
     });
-    assert_eq!(canonical.status_code(), 501);
+
     assert_eq!(
-        canonical.resource_type(),
-        Some(account_management_sdk::gts::TENANT_RESOURCE_TYPE)
+        canonical.detail(),
+        crate::domain::idp::SA_UNSUPPORTED_MESSAGE
     );
+    assert!(!canonical.detail().contains("provider detail"));
 }
 
 // ---------------------------------------------------------------------------

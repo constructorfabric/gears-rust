@@ -12,7 +12,7 @@
 //! The seed/post harness is copied from `tests/postgres_posting.rs` (each
 //! integration test is its own binary, so the helpers can't be shared).
 //! Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_period_close -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_period_close -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -57,7 +57,7 @@ async fn period_status(
     period_id: &str,
 ) -> String {
     let row = db
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT status FROM bss.ledger_fiscal_period \
              WHERE tenant_id='{tenant}' AND legal_entity_id='{legal_entity}' \
                AND period_id='{period_id}'"
@@ -112,7 +112,7 @@ async fn setup(
         .await
         .unwrap();
 
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{tenant}','{legal_entity}','{period_id}','UTC','OPEN')"
     )))
@@ -261,7 +261,7 @@ async fn close_blocked_by_tieout_variance() {
     let (raw, provider, f) = setup_with_one_balanced_post(&url).await;
 
     // Drift one cached grain so the pre-close tie-out fails.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_account_balance SET balance_minor = balance_minor + 1 \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         f.tenant, f.ar_account
@@ -383,7 +383,7 @@ async fn close_blocked_by_open_exception() {
     let (raw, provider, f) = setup_with_one_balanced_post(&url).await;
 
     // Seed one OPEN close-blocking exception bound to the period.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_exception_queue \
          (tenant_id, exception_id, exception_type, business_ref, status, period_id, opened_at) \
          VALUES ('{}','{}','RECON_MISMATCH','inv-x','OPEN','{}', now())",
@@ -419,7 +419,7 @@ async fn close_blocked_by_open_exception() {
 
     // The blocked close records `period_close = CLOSING` + the reasons (dashboard).
     let close_status: String = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT status FROM bss.ledger_period_close \
              WHERE tenant_id='{}' AND legal_entity_id='{}' AND period_id='{}'",
             f.tenant, f.legal_entity, f.period_id
@@ -448,7 +448,7 @@ async fn close_blocked_by_due_recognition_segment() {
     let (raw, provider, f) = setup_with_one_balanced_post(&url).await;
 
     // Seed one due-but-not-DONE recognition segment in the closing period.
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_recognition_segment \
          (tenant_id, schedule_id, segment_no, period_id, amount_minor, status) \
          VALUES ('{}','SCH-D',1,'{}',1000,'PENDING')",
@@ -530,7 +530,7 @@ async fn reopen_after_close_flips_to_open_and_records_reopened() {
         "reopen flips the fiscal period back to OPEN"
     );
     let close_status: String = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT status FROM bss.ledger_period_close \
              WHERE tenant_id='{}' AND legal_entity_id='{}' AND period_id='{}'",
             f.tenant, f.legal_entity, f.period_id

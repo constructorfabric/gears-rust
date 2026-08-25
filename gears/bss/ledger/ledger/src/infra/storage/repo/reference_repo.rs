@@ -85,6 +85,10 @@ impl ReferenceRepo {
     }
 
     /// Read a currency-scale row under the supplied scope.
+    ///
+    /// # Errors
+    /// Returns [`RepoError::Db`] if acquiring a connection or reading the scale
+    /// row fails.
     pub async fn find_currency_scale(
         &self,
         scope: &AccessScope,
@@ -116,6 +120,10 @@ impl ReferenceRepo {
     }
 
     /// Insert a chart-of-accounts row.
+    ///
+    /// # Errors
+    /// Returns [`RepoError::Db`] if acquiring a connection or performing the
+    /// scoped insert fails.
     pub async fn insert_account(&self, row: AccountRow) -> Result<(), RepoError> {
         let conn = self
             .db
@@ -171,6 +179,11 @@ impl ReferenceRepo {
         Ok(row.is_some_and(|m| m.locked))
     }
 
+    /// Read a chart-of-accounts row by id under the supplied scope.
+    ///
+    /// # Errors
+    /// Returns [`RepoError::Db`] if acquiring a connection or reading the
+    /// account row fails.
     pub async fn find_account(
         &self,
         scope: &AccessScope,

@@ -11,7 +11,7 @@
 //!    with `PolicyVersionViolation`.
 //!
 //! Mirrors `postgres_chain.rs` / `postgres_invoice_post.rs`. Ignored by default;
-//! run with `cargo test -p bss-ledger -- --ignored`.
+//! run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -114,7 +114,7 @@ async fn setup(
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         f.tenant, f.tenant, f.period_id

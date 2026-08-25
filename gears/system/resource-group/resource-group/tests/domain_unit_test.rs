@@ -487,6 +487,14 @@ fn domain_error_group_not_found_format() {
 }
 
 #[test]
+fn domain_error_group_already_exists_format() {
+    let id = uuid::Uuid::now_v7();
+    let err = DomainError::group_already_exists(id);
+    assert!(matches!(err, DomainError::GroupAlreadyExists { .. }));
+    assert!(err.to_string().contains(&id.to_string()));
+}
+
+#[test]
 fn domain_error_cycle_detected_format() {
     let err = DomainError::cycle_detected("A -> B -> A");
     assert!(matches!(err, DomainError::CycleDetected { .. }));
@@ -609,6 +617,16 @@ fn domain_to_sdk_type_already_exists() {
 }
 
 #[test]
+fn domain_to_sdk_group_already_exists() {
+    use resource_group_sdk::ResourceGroupError;
+    let id = uuid::Uuid::now_v7();
+    match project(DomainError::group_already_exists(id)) {
+        ResourceGroupError::AlreadyExists { name, .. } => assert_eq!(name, id.to_string()),
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
+}
+
+#[test]
 fn domain_to_sdk_validation() {
     use resource_group_sdk::ResourceGroupError;
     // Generic validation maps to a `Format` InvalidArgument — no field
@@ -688,7 +706,7 @@ fn domain_to_sdk_membership_not_found() {
 fn domain_to_problem_membership_not_found_is_404() {
     let domain = DomainError::membership_not_found("(gid, type, rid)");
     let problem = wire(domain);
-    assert_eq!(problem.status, 404);
+    assert_eq!(problem.status, Some(404));
     assert_eq!(problem.problem_type, NOT_FOUND_TYPE);
     assert_eq!(problem.context["resource_type"], RG_GTS);
     assert_eq!(problem.context["resource_name"], "(gid, type, rid)");
@@ -714,7 +732,7 @@ fn domain_to_sdk_access_denied_maps_to_permission_denied() {
 fn domain_to_problem_type_not_found_is_404() {
     let domain = DomainError::type_not_found("my.code");
     let problem = wire(domain);
-    assert_eq!(problem.status, 404);
+    assert_eq!(problem.status, Some(404));
     assert_eq!(problem.problem_type, NOT_FOUND_TYPE);
     assert_eq!(problem.context["resource_type"], RG_GTS);
     assert_eq!(problem.context["resource_name"], "my.code");
@@ -724,17 +742,27 @@ fn domain_to_problem_type_not_found_is_404() {
 fn domain_to_problem_type_already_exists_is_409() {
     let domain = DomainError::type_already_exists("dup");
     let problem = wire(domain);
-    assert_eq!(problem.status, 409);
+    assert_eq!(problem.status, Some(409));
     assert_eq!(problem.problem_type, ALREADY_EXISTS_TYPE);
     assert_eq!(problem.context["resource_type"], RG_GTS);
     assert_eq!(problem.context["resource_name"], "dup");
 }
 
 #[test]
+fn domain_to_problem_group_already_exists_is_409() {
+    let id = uuid::Uuid::now_v7();
+    let problem = wire(DomainError::group_already_exists(id));
+    assert_eq!(problem.status, Some(409));
+    assert_eq!(problem.problem_type, ALREADY_EXISTS_TYPE);
+    assert_eq!(problem.context["resource_type"], RG_GTS);
+    assert_eq!(problem.context["resource_name"], id.to_string());
+}
+
+#[test]
 fn domain_to_problem_validation_is_400() {
     let domain = DomainError::validation("bad");
     let problem = wire(domain);
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(problem.problem_type, INVALID_ARGUMENT_TYPE);
     assert_eq!(problem.context["resource_type"], RG_GTS);
     // Format variant — message lands in `context.format`, no field_violations.
@@ -753,7 +781,7 @@ fn domain_to_problem_group_not_found_is_404() {
     let id = uuid::Uuid::now_v7();
     let domain = DomainError::group_not_found(id);
     let problem = wire(domain);
-    assert_eq!(problem.status, 404);
+    assert_eq!(problem.status, Some(404));
     assert_eq!(problem.problem_type, NOT_FOUND_TYPE);
     assert_eq!(problem.context["resource_type"], RG_GTS);
     assert_eq!(problem.context["resource_name"], id.to_string());
@@ -764,7 +792,7 @@ fn domain_to_problem_cycle_detected_is_400() {
     // ⚠ wire change accepted in the migration plan: 409 → 400.
     let domain = DomainError::cycle_detected("cycle");
     let problem = wire(domain);
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(problem.problem_type, FAILED_PRECONDITION_TYPE);
     let v = problem
         .context
@@ -781,7 +809,7 @@ fn domain_to_problem_limit_violation_is_400() {
     // ⚠ wire change accepted in the migration plan: 409 → 400.
     let domain = DomainError::limit_violation("too deep");
     let problem = wire(domain);
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(problem.problem_type, FAILED_PRECONDITION_TYPE);
     let v = problem
         .context
@@ -797,7 +825,7 @@ fn domain_to_problem_limit_violation_is_400() {
 fn domain_to_problem_invalid_parent_type_is_400() {
     let domain = DomainError::invalid_parent_type("mismatch");
     let problem = wire(domain);
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(problem.problem_type, INVALID_ARGUMENT_TYPE);
     assert_eq!(problem.context["resource_type"], RG_GTS);
     let v = problem
@@ -815,7 +843,7 @@ fn domain_to_problem_conflict_active_refs_is_400() {
     // ⚠ wire change accepted in the migration plan: 409 → 400.
     let domain = DomainError::conflict_active_references("children exist");
     let problem = wire(domain);
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(problem.problem_type, FAILED_PRECONDITION_TYPE);
     let v = problem
         .context
@@ -832,7 +860,7 @@ fn domain_to_problem_allowed_parent_types_violation_is_400() {
     // ⚠ wire change accepted in the migration plan: 409 → 400.
     let domain = DomainError::allowed_parent_types_violation("violation");
     let problem = wire(domain);
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(problem.problem_type, FAILED_PRECONDITION_TYPE);
     let v = problem
         .context
@@ -849,7 +877,7 @@ fn domain_to_problem_tenant_incompatibility_is_400() {
     // ⚠ wire change accepted in the migration plan: 409 → 400.
     let domain = DomainError::tenant_incompatibility("wrong tenant");
     let problem = wire(domain);
-    assert_eq!(problem.status, 400);
+    assert_eq!(problem.status, Some(400));
     assert_eq!(problem.problem_type, FAILED_PRECONDITION_TYPE);
     let v = problem
         .context
@@ -867,7 +895,7 @@ fn domain_to_problem_access_denied_is_403() {
         message: "denied".to_owned(),
     };
     let problem = wire(domain);
-    assert_eq!(problem.status, 403);
+    assert_eq!(problem.status, Some(403));
     assert_eq!(problem.problem_type, PERMISSION_DENIED_TYPE);
     assert_eq!(problem.context["resource_type"], RG_GTS);
     assert_eq!(problem.context["reason"], "ACCESS_DENIED");
@@ -894,7 +922,7 @@ fn domain_to_problem_database_is_500() {
     );
 
     let problem = Problem::from(canonical);
-    assert_eq!(problem.status, 500);
+    assert_eq!(problem.status, Some(500));
     assert_eq!(problem.problem_type, INTERNAL_TYPE);
     // Internal must NOT carry a per-error `resource_type` — it's a
     // resource-absent category.
@@ -920,7 +948,7 @@ fn domain_to_problem_internal_error_is_500() {
         "Internal carries diagnostic"
     );
     let problem = Problem::from(canonical);
-    assert_eq!(problem.status, 500);
+    assert_eq!(problem.status, Some(500));
     assert_eq!(problem.problem_type, INTERNAL_TYPE);
     assert!(problem.context.get("resource_type").is_none());
 }
@@ -932,7 +960,7 @@ fn domain_to_problem_duplicate_membership_is_409() {
         "Membership already exists: (g1, type_id=42, r1)",
     );
     let problem = wire(domain);
-    assert_eq!(problem.status, 409);
+    assert_eq!(problem.status, Some(409));
     assert_eq!(problem.problem_type, ALREADY_EXISTS_TYPE);
     assert_eq!(problem.context["resource_type"], RG_GTS);
     assert_eq!(problem.context["resource_name"], "(g1, type_id=42, r1)");
@@ -945,7 +973,7 @@ fn domain_to_problem_conflict_is_409() {
     // `aborted` with reason="CONFLICT" rather than `already_exists`.
     let domain = DomainError::conflict("dup");
     let problem = wire(domain);
-    assert_eq!(problem.status, 409);
+    assert_eq!(problem.status, Some(409));
     assert_eq!(
         problem.problem_type,
         gts_uri!("cf.core.errors.err.v1~cf.core.err.aborted.v1~")
@@ -963,7 +991,7 @@ fn domain_to_problem_tenant_root_already_exists_is_409() {
         "Cannot create tenant-type root 'foo'",
     );
     let problem = wire(domain);
-    assert_eq!(problem.status, 409);
+    assert_eq!(problem.status, Some(409));
     assert_eq!(problem.problem_type, ALREADY_EXISTS_TYPE);
     assert_eq!(problem.context["resource_type"], RG_GTS);
     assert_eq!(

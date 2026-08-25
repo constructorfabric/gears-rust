@@ -33,7 +33,7 @@ async fn migrated_db() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("connect in-memory sqlite");
-    db.execute(stmt(&db, "PRAGMA foreign_keys = ON;"))
+    db.execute_raw(stmt(&db, "PRAGMA foreign_keys = ON;"))
         .await
         .expect("enable foreign keys");
     Migrator::up(&db, None).await.expect("apply P1 migration");
@@ -41,7 +41,7 @@ async fn migrated_db() -> DatabaseConnection {
 }
 
 async fn insert_file(db: &DatabaseConnection, file_id: &str) {
-    db.execute(stmt(
+    db.execute_raw(stmt(
         db,
         format!(
             "INSERT INTO files (file_id, tenant_id, owner_kind, owner_id, name, gts_file_type) \
@@ -53,7 +53,7 @@ async fn insert_file(db: &DatabaseConnection, file_id: &str) {
 }
 
 async fn insert_version(db: &DatabaseConnection, file_id: &str, version_id: &str, is_current: u8) {
-    db.execute(stmt(
+    db.execute_raw(stmt(
         db,
         format!(
             "INSERT INTO file_versions \
@@ -66,7 +66,7 @@ async fn insert_version(db: &DatabaseConnection, file_id: &str, version_id: &str
 }
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
-    db.query_one(stmt(db, sql))
+    db.query_one_raw(stmt(db, sql))
         .await
         .expect("count query")
         .expect("one row")
@@ -81,7 +81,7 @@ async fn migration_creates_all_three_tables() {
     let db = migrated_db().await;
     for table in ["files", "file_versions", "files_custom_metadata"] {
         let probe = db
-            .execute(stmt(&db, format!("SELECT * FROM {table} LIMIT 0")))
+            .execute_raw(stmt(&db, format!("SELECT * FROM {table} LIMIT 0")))
             .await;
         assert!(
             probe.is_ok(),
@@ -95,11 +95,15 @@ async fn migration_up_down_up_roundtrip() {
     let db = migrated_db().await;
 
     Migrator::down(&db, None).await.expect("roll back");
-    let gone = db.execute(stmt(&db, "SELECT * FROM files LIMIT 0")).await;
+    let gone = db
+        .execute_raw(stmt(&db, "SELECT * FROM files LIMIT 0"))
+        .await;
     assert!(gone.is_err(), "files must be dropped by down(): {gone:?}");
 
     Migrator::up(&db, None).await.expect("re-apply");
-    let back = db.execute(stmt(&db, "SELECT * FROM files LIMIT 0")).await;
+    let back = db
+        .execute_raw(stmt(&db, "SELECT * FROM files LIMIT 0"))
+        .await;
     assert!(back.is_ok(), "files must exist again after re-up: {back:?}");
 }
 
@@ -108,7 +112,7 @@ async fn migration_up_down_up_roundtrip() {
 #[tokio::test]
 async fn files_accepts_user_and_app_owner_kinds() {
     let db = migrated_db().await;
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         format!(
             "INSERT INTO files (file_id, tenant_id, owner_kind, owner_id, name, gts_file_type) \
@@ -125,7 +129,7 @@ async fn files_accepts_user_and_app_owner_kinds() {
 async fn files_rejects_invalid_owner_kind() {
     let db = migrated_db().await;
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO files (file_id, tenant_id, owner_kind, owner_id, name, gts_file_type) \
@@ -143,7 +147,7 @@ async fn files_rejects_invalid_owner_kind() {
 async fn files_rejects_negative_meta_version() {
     let db = migrated_db().await;
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO files (file_id, tenant_id, owner_kind, owner_id, name, gts_file_type, meta_version) \
@@ -189,7 +193,7 @@ async fn file_versions_rejects_negative_size() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_value, backend_id, backend_path) \
@@ -205,7 +209,7 @@ async fn file_versions_rejects_unknown_status() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_value, status, backend_id, backend_path) \
@@ -222,7 +226,7 @@ async fn file_versions_rejects_non_sha256_algorithm_in_p1() {
     insert_file(&db, FILE).await;
     // BLAKE3 is only widened in by the P2 migration; P1 is locked to SHA-256.
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_algorithm, hash_value, backend_id, backend_path) \
@@ -241,7 +245,7 @@ async fn file_versions_rejects_wrong_hash_length() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_value, backend_id, backend_path) \
@@ -263,7 +267,7 @@ async fn file_versions_allows_only_one_current_per_file() {
     insert_file(&db, FILE).await;
     insert_version(&db, FILE, "00000000-0000-0000-0000-0000000000d1", 1).await;
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_value, is_current, backend_id, backend_path) \
@@ -314,7 +318,7 @@ async fn file_versions_allows_current_per_distinct_file() {
 async fn custom_metadata_rejects_duplicate_key_per_file() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         format!(
             "INSERT INTO files_custom_metadata (file_id, key, value) VALUES ('{FILE}', 'tag', 'a')"
@@ -323,7 +327,7 @@ async fn custom_metadata_rejects_duplicate_key_per_file() {
     .await
     .expect("first key insert");
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!("INSERT INTO files_custom_metadata (file_id, key, value) VALUES ('{FILE}', 'tag', 'b')"),
         ))
@@ -348,7 +352,7 @@ async fn custom_metadata_rejects_duplicate_key_per_file() {
 async fn idempotency_keys_request_hash_column_exists_with_default() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         format!(
             "INSERT INTO idempotency_keys \
@@ -362,7 +366,7 @@ async fn idempotency_keys_request_hash_column_exists_with_default() {
     .expect("insert idempotency row omitting request_hash must succeed");
 
     let hash_len = db
-        .query_one(stmt(
+        .query_one_raw(stmt(
             &db,
             format!(
                 "SELECT LENGTH(request_hash) AS c FROM idempotency_keys \
@@ -396,7 +400,7 @@ async fn idempotency_keys_request_hash_column_exists_with_default() {
 async fn policies_unique_index_rejects_duplicate_scope_tuple() {
     let db = migrated_db().await;
     let owner2 = "00000000-0000-0000-0000-0000000000b2";
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         format!(
             "INSERT INTO policies (policy_id, tenant_id, scope, scope_owner_id, body) \
@@ -407,7 +411,7 @@ async fn policies_unique_index_rejects_duplicate_scope_tuple() {
     .expect("first user-scope policy insert");
 
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO policies (policy_id, tenant_id, scope, scope_owner_id, body) \
@@ -430,7 +434,7 @@ async fn policies_unique_index_rejects_duplicate_scope_tuple() {
 #[tokio::test]
 async fn policies_unique_index_rejects_duplicate_tenant_scope() {
     let db = migrated_db().await;
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         format!(
             "INSERT INTO policies (policy_id, tenant_id, scope, scope_owner_id, body) \
@@ -441,7 +445,7 @@ async fn policies_unique_index_rejects_duplicate_tenant_scope() {
     .expect("first tenant-scope policy insert");
 
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO policies (policy_id, tenant_id, scope, scope_owner_id, body) \
@@ -464,7 +468,7 @@ async fn policies_unique_index_rejects_duplicate_tenant_scope() {
 async fn policies_unique_index_allows_distinct_scopes() {
     let db = migrated_db().await;
     let tenant2 = "00000000-0000-0000-0000-0000000000a2";
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         format!(
             "INSERT INTO policies (policy_id, tenant_id, scope, scope_owner_id, body) VALUES \
@@ -513,7 +517,7 @@ async fn policies_unique_migration_dedups_preexisting_duplicates() {
     // Two duplicate rows for the same (tenant_id, 'user', scope_owner_id)
     // tuple -- exactly what the pre-2.4 upsert race could produce. `newer`
     // has a later `updated_at` and must be the row that survives dedup.
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         format!(
             "INSERT INTO policies (policy_id, tenant_id, scope, scope_owner_id, body, updated_at) \
@@ -522,7 +526,7 @@ async fn policies_unique_migration_dedups_preexisting_duplicates() {
     ))
     .await
     .expect("insert older duplicate user-scope policy");
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         format!(
             "INSERT INTO policies (policy_id, tenant_id, scope, scope_owner_id, body, updated_at) \
@@ -536,7 +540,7 @@ async fn policies_unique_migration_dedups_preexisting_duplicates() {
     // exercise the second dedup pass / second partial index.
     let tenant_older = "00000000-0000-0000-0000-0000000000e3";
     let tenant_newer = "00000000-0000-0000-0000-0000000000e4";
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         format!(
             "INSERT INTO policies (policy_id, tenant_id, scope, scope_owner_id, body, updated_at) \
@@ -545,7 +549,7 @@ async fn policies_unique_migration_dedups_preexisting_duplicates() {
     ))
     .await
     .expect("insert older duplicate tenant-scope policy");
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         format!(
             "INSERT INTO policies (policy_id, tenant_id, scope, scope_owner_id, body, updated_at) \
@@ -632,7 +636,7 @@ async fn policies_unique_migration_dedups_preexisting_duplicates() {
     // The partial unique indexes must now be live: a fresh duplicate insert
     // is rejected.
     let dup_res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO policies (policy_id, tenant_id, scope, scope_owner_id, body) \
@@ -653,7 +657,7 @@ async fn deleting_file_cascades_to_versions_and_metadata() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;
     insert_version(&db, FILE, "00000000-0000-0000-0000-0000000000d1", 1).await;
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         format!(
             "INSERT INTO files_custom_metadata (file_id, key, value) VALUES ('{FILE}', 'tag', 'a')"
@@ -662,7 +666,7 @@ async fn deleting_file_cascades_to_versions_and_metadata() {
     .await
     .expect("insert metadata");
 
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         format!("DELETE FROM files WHERE file_id = '{FILE}'"),
     ))
@@ -695,7 +699,7 @@ async fn content_hash_modes_backfill_existing_rows_to_whole_sha256() {
     insert_version(&db, FILE, VERSION, 1).await;
 
     let row = db
-        .query_one(stmt(
+        .query_one_raw(stmt(
             &db,
             format!(
                 "SELECT hash_mode AS m, \
@@ -736,7 +740,7 @@ async fn content_hash_modes_rejects_multipart_without_part_count() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO file_versions \
@@ -760,7 +764,7 @@ async fn content_hash_modes_rejects_whole_with_part_count() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO file_versions \
@@ -783,7 +787,7 @@ async fn content_hash_modes_rejects_unknown_hash_mode() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO file_versions \
@@ -807,7 +811,7 @@ async fn content_hash_modes_leaves_hash_algorithm_check_intact() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;
     let res = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             format!(
                 "INSERT INTO file_versions \

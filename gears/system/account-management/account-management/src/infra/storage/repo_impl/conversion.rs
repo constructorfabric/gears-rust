@@ -286,13 +286,9 @@ impl ODataFieldMapping<ConversionRequestFilterField> for ConversionRequestODataM
         field: ConversionRequestFilterField,
     ) -> sea_orm::Value {
         match field {
-            ConversionRequestFilterField::Id => sea_orm::Value::Uuid(Some(Box::new(model.id))),
-            ConversionRequestFilterField::TenantId => {
-                sea_orm::Value::Uuid(Some(Box::new(model.tenant_id)))
-            }
-            ConversionRequestFilterField::ParentId => {
-                sea_orm::Value::Uuid(model.parent_id.map(Box::new))
-            }
+            ConversionRequestFilterField::Id => sea_orm::Value::Uuid(Some(model.id)),
+            ConversionRequestFilterField::TenantId => sea_orm::Value::Uuid(Some(model.tenant_id)),
+            ConversionRequestFilterField::ParentId => sea_orm::Value::Uuid(model.parent_id),
             ConversionRequestFilterField::Status => sea_orm::Value::SmallInt(Some(model.status)),
             ConversionRequestFilterField::TargetMode => {
                 sea_orm::Value::SmallInt(Some(model.target_mode))
@@ -301,16 +297,16 @@ impl ODataFieldMapping<ConversionRequestFilterField> for ConversionRequestODataM
                 sea_orm::Value::SmallInt(Some(model.initiator_side))
             }
             ConversionRequestFilterField::RequestedBy => {
-                sea_orm::Value::Uuid(Some(Box::new(model.requested_by)))
+                sea_orm::Value::Uuid(Some(model.requested_by))
             }
             ConversionRequestFilterField::CreatedAt => {
-                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.requested_at)))
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(model.requested_at))
             }
             ConversionRequestFilterField::ExpiresAt => {
-                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.expires_at)))
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(model.expires_at))
             }
             ConversionRequestFilterField::UpdatedAt => {
-                sea_orm::Value::TimeDateTimeWithTimeZone(model.resolved_at.map(Box::new))
+                sea_orm::Value::TimeDateTimeWithTimeZone(model.resolved_at)
             }
         }
     }

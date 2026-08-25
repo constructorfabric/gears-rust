@@ -61,13 +61,17 @@ fn reject_non_odata_params_passes_odata_only_keys() {
     // The full set of `OData` keys AM listing endpoints accept must
     // pass the gate; a regression that accidentally narrowed the
     // allow-shape would trip here.
+    //
+    // This gate polices the non-`$` namespace only, so it is not the
+    // place that refuses unsupported system query options: `$skip` and
+    // `$count` pass here and are rejected downstream by the extractor
+    // (`toolkit::api::odata::ACCEPTED_SYSTEM_QUERY_OPTIONS`).
     let mut q = HashMap::new();
     q.insert("$filter".to_owned(), "status eq 'approved'".to_owned());
     q.insert("$orderby".to_owned(), "created_at desc".to_owned());
     q.insert("$top".to_owned(), "10".to_owned());
-    q.insert("$skip".to_owned(), "20".to_owned());
+    q.insert("$skiptoken".to_owned(), "opaque-cursor".to_owned());
     q.insert("$select".to_owned(), "id,status".to_owned());
-    q.insert("$count".to_owned(), "true".to_owned());
     reject_non_odata_params(&q).expect("OData-only query must pass");
 }
 

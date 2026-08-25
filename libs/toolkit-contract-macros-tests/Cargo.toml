@@ -1,0 +1,30 @@
+[package]
+name = "cf-gears-toolkit-contract-macros-tests"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "UI tests for toolkit-contract-macros (not published)"
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The crates under test
+toolkit-contract = { workspace = true, features = ["rest-client"] }
+toolkit-contract-macros = { workspace = true }
+
+# Test framework
+trybuild = { workspace = true }
+
+# Required by UI test cases
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["full"] }
+thiserror = { workspace = true }
+toolkit-security = { workspace = true }
+secrecy = { workspace = true }
+uuid = { workspace = true }

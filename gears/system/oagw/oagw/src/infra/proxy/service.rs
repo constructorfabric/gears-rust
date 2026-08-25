@@ -70,10 +70,8 @@ pub struct DataPlaneServiceImpl {
     max_body_size: usize,
     /// Idle timeout for WebSocket connections (no data in either direction).
     websocket_idle_timeout: Duration,
-    /// Timeout for the WebSocket Close frame handshake.
+    /// Bound on announcing Close 1001 and half-closing each leg at teardown.
     websocket_close_timeout: Duration,
-    /// Optional max WebSocket frame payload size (Close 1009 on exceed).
-    websocket_max_frame_size: Option<usize>,
     /// Idle timeout for SSE streaming connections (no data from upstream).
     streaming_idle_timeout: Duration,
     /// Operational metrics port (OTel-backed in production).
@@ -115,7 +113,6 @@ impl DataPlaneServiceImpl {
             max_body_size: MAX_BODY_SIZE,
             websocket_idle_timeout: Duration::from_secs(300),
             websocket_close_timeout: Duration::from_secs(5),
-            websocket_max_frame_size: None,
             streaming_idle_timeout: Duration::from_secs(300),
             metrics,
         }
@@ -149,17 +146,10 @@ impl DataPlaneServiceImpl {
         self
     }
 
-    /// Override the WebSocket Close frame handshake timeout.
+    /// Override the timeout for announcing a gateway-originated close.
     #[must_use]
     pub fn with_websocket_close_timeout(mut self, timeout: Duration) -> Self {
         self.websocket_close_timeout = timeout;
-        self
-    }
-
-    /// Override the maximum WebSocket frame payload size.
-    #[must_use]
-    pub fn with_websocket_max_frame_size(mut self, size: Option<usize>) -> Self {
-        self.websocket_max_frame_size = size;
         self
     }
 
@@ -997,7 +987,6 @@ impl DataPlaneServiceImpl {
                     leftover,
                     idle_timeout: self.websocket_idle_timeout,
                     close_timeout: self.websocket_close_timeout,
-                    max_frame_size: self.websocket_max_frame_size,
                     shutdown_rx: self.shutdown_rx.clone(),
                     metrics: Some(self.metrics.clone()),
                     host: pipeline.host.to_string(),

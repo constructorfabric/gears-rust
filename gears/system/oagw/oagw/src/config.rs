@@ -35,16 +35,11 @@ pub struct OagwConfig {
     /// will be torn down. Must be > 0. Default: 300 (5 minutes).
     #[serde(default = "default_websocket_idle_timeout_secs")]
     pub websocket_idle_timeout_secs: u64,
-    /// Timeout in seconds for the WebSocket Close frame handshake.
-    /// After sending or forwarding a Close frame, the gateway waits this long
-    /// for the Close response before force-closing. Must be > 0. Default: 5.
+    /// Timeout in seconds for announcing a gateway-originated WebSocket close.
+    /// On idle timeout or shutdown the gateway gives each leg this long to
+    /// accept Close 1001 and half-close. Must be > 0. Default: 5.
     #[serde(default = "default_websocket_close_timeout_secs")]
     pub websocket_close_timeout_secs: u64,
-    /// Optional maximum WebSocket frame payload size in bytes.
-    /// Frames exceeding this limit trigger Close frame 1009 (Message Too Big).
-    /// Default: None (pass-through, no limit enforced).
-    #[serde(default)]
-    pub websocket_max_frame_size_bytes: Option<usize>,
     /// Idle timeout in seconds for SSE streaming connections.
     /// A connection with no data received from upstream for this duration
     /// will be closed. Must be > 0. Default: 300 (5 minutes).
@@ -106,7 +101,6 @@ impl Default for OagwConfig {
             token_cache_capacity: default_token_cache_capacity(),
             websocket_idle_timeout_secs: default_websocket_idle_timeout_secs(),
             websocket_close_timeout_secs: default_websocket_close_timeout_secs(),
-            websocket_max_frame_size_bytes: None,
             streaming_idle_timeout_secs: default_streaming_idle_timeout_secs(),
             protocol_cache_ttl_secs: default_protocol_cache_ttl_secs(),
             management_api_enabled: true,
@@ -185,7 +179,6 @@ pub struct RuntimeConfig {
     pub max_body_size_bytes: usize,
     pub websocket_idle_timeout_secs: u64,
     pub websocket_close_timeout_secs: u64,
-    pub websocket_max_frame_size_bytes: Option<usize>,
     pub streaming_idle_timeout_secs: u64,
     pub management_api_enabled: bool,
 }
@@ -196,7 +189,6 @@ impl From<&OagwConfig> for RuntimeConfig {
             max_body_size_bytes: cfg.max_body_size_bytes,
             websocket_idle_timeout_secs: cfg.websocket_idle_timeout_secs,
             websocket_close_timeout_secs: cfg.websocket_close_timeout_secs,
-            websocket_max_frame_size_bytes: cfg.websocket_max_frame_size_bytes,
             streaming_idle_timeout_secs: cfg.streaming_idle_timeout_secs,
             management_api_enabled: cfg.management_api_enabled,
         }
@@ -243,10 +235,6 @@ impl fmt::Debug for OagwConfig {
             .field(
                 "websocket_close_timeout_secs",
                 &self.websocket_close_timeout_secs,
-            )
-            .field(
-                "websocket_max_frame_size_bytes",
-                &self.websocket_max_frame_size_bytes,
             )
             .field(
                 "streaming_idle_timeout_secs",

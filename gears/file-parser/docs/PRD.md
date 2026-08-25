@@ -86,10 +86,8 @@ The previous implementation had four separate format-specific plugins (`HtmlPars
 
 **ID**: `fdd-file-parser-actor-api-user`
 
-<!-- fdd-id-content -->
 **Role**: End user or developer who uploads documents and receives parsed content or Markdown.
 **Needs**: Upload a document via REST, receive structured text content or Markdown in the response.
-<!-- fdd-id-content -->
 
 ### 2.2 System Actors
 
@@ -97,10 +95,8 @@ The previous implementation had four separate format-specific plugins (`HtmlPars
 
 **ID**: `fdd-file-parser-actor-consumer`
 
-<!-- fdd-id-content -->
 **Role**: Internal platform gear (e.g., Chat Engine) that calls File Parser programmatically as part of a document-processing workflow.
 **Needs**: Reliable structured content extraction from files on the server filesystem (`parse-local`) or from binary payloads.
-<!-- fdd-id-content -->
 
 ## 3. Operational Concept & Environment
 
@@ -137,21 +133,14 @@ The gear requires an `allowed_local_base_dir` config entry to be set at startup.
 
 - [ ] `p1` - **ID**: `cpt-cf-file-parser-fr-upload`
 
-**ID**: [ ] `p1` `fdd-file-parser-fr-upload-v1`
-
-<!-- fdd-id-content -->
 System SHALL support binary file upload (`application/octet-stream` with `?filename=` query param) and multipart form upload (field name `file`). Both SHALL support optional Markdown rendering. System SHALL enforce a configurable maximum file size (default 100 MB); requests exceeding the limit SHALL be rejected with HTTP 413.
 
 **Actors**: `fdd-file-parser-actor-api-user`
-<!-- fdd-id-content -->
 
 ### Format Support
 
 - [ ] `p1` - **ID**: `cpt-cf-file-parser-fr-formats`
 
-**ID**: [ ] `p1` `fdd-file-parser-fr-formats-v1`
-
-<!-- fdd-id-content -->
 The gateway SHALL route each request to the first registered plugin that claims the file's extension. Requests for extensions not claimed by any plugin SHALL be rejected with HTTP 400. Supported extensions are determined by the installed plugins; the gateway has no hardcoded format list.
 
 Currently registered plugins (in priority order):
@@ -169,55 +158,38 @@ Currently registered plugins (in priority order):
 - PPTX tables: structured `Table` blocks are not produced; table cell content is extracted as paragraphs.
 
 **Actors**: `fdd-file-parser-actor-api-user`
-<!-- fdd-id-content -->
 
 ### Plugin Extensibility
 
 - [ ] `p2` - **ID**: `cpt-cf-file-parser-fr-plugin-extensibility`
 
-**ID**: [ ] `p2` `fdd-file-parser-fr-plugin-extensibility-v1`
-
-<!-- fdd-id-content -->
 The system SHALL support registration of additional parser plugins without requiring changes to the REST API or the gateway. A new plugin SHALL only need to implement the `FileParserBackend` trait and be added to the plugin registry in `src/gear.rs`. The new plugin's extensions SHALL automatically appear in the `/info` response and be routable via `/upload` and `/parse-local`.
 
 **Actors**: `fdd-file-parser-actor-consumer`
-<!-- fdd-id-content -->
 
 ### Content Extraction
 
 - [ ] `p1` - **ID**: `cpt-cf-file-parser-fr-extraction`
 
-**ID**: [ ] `p1` `fdd-file-parser-fr-extraction-v1`
-
-<!-- fdd-id-content -->
 System SHALL extract text content and preserve document structure (headings, paragraphs, lists, tables, code blocks, quotes, page breaks). Inline text annotations (bold, italic, underline, strikethrough, code, hyperlinks) SHALL be preserved in the parsed output.
 
 **Actors**: `fdd-file-parser-actor-api-user`
-<!-- fdd-id-content -->
 
 ### Markdown Rendering
 
 - [ ] `p1` - **ID**: `cpt-cf-file-parser-fr-markdown`
 
-**ID**: [ ] `p1` `fdd-file-parser-fr-markdown-v1`
-
-<!-- fdd-id-content -->
 System SHALL convert the extracted document structure to Markdown format, preserving headings, lists, formatting, tables, and code blocks. Markdown output SHALL be available both as a field in the JSON response (`?render_markdown=true`) and as a streaming `text/markdown` response from the dedicated `/markdown` endpoints.
 
 **Actors**: `fdd-file-parser-actor-api-user`
-<!-- fdd-id-content -->
 
 ### Local Path Security
 
 - [ ] `p1` - **ID**: `cpt-cf-file-parser-fr-local-path-security`
 
-**ID**: [ ] `p1` `fdd-file-parser-fr-local-path-security-v1`
-
-<!-- fdd-id-content -->
 System SHALL reject local file paths containing `..` traversal components. System SHALL require a mandatory `allowed_local_base_dir` configuration; the gear SHALL fail to start if this field is missing or the path cannot be resolved. System SHALL canonicalize the requested path (resolving symlinks) and reject paths that do not fall under the base directory. Rejected requests SHALL return HTTP 403 and be logged at `warn` level.
 
 **Actors**: `fdd-file-parser-actor-api-user`, `fdd-file-parser-actor-consumer`
-<!-- fdd-id-content -->
 
 ## 6. Non-Functional Requirements
 
@@ -225,31 +197,19 @@ System SHALL reject local file paths containing `..` traversal components. Syste
 
 - [ ] `p1` - **ID**: `cpt-cf-file-parser-nfr-response-time`
 
-**ID**: [ ] `p1` `fdd-file-parser-nfr-response-time-v1`
-
-<!-- fdd-id-content -->
 System SHALL respond in < 5 s for documents < 10 MB and < 30 s for documents up to the configured size limit.
-<!-- fdd-id-content -->
 
 ### Scalability
 
 - [ ] `p1` - **ID**: `cpt-cf-file-parser-nfr-concurrency`
 
-**ID**: [ ] `p1` `fdd-file-parser-nfr-concurrency-v1`
-
-<!-- fdd-id-content -->
 System SHALL support 100 concurrent parsing requests.
-<!-- fdd-id-content -->
 
 ### Reliability
 
 - [ ] `p1` - **ID**: `cpt-cf-file-parser-nfr-availability`
 
-**ID**: [ ] `p1` `fdd-file-parser-nfr-availability-v1`
-
-<!-- fdd-id-content -->
 System SHALL maintain 99.9% uptime SLA.
-<!-- fdd-id-content -->
 
 ### 6.1 NFR Exclusions
 
@@ -279,27 +239,23 @@ No external service contracts. The gear depends only on in-process Rust librarie
 
 ### UC-001: Upload and Parse Document
 
-**ID**: [ ] `p1` `fdd-file-parser-usecase-upload-parse-v1`
+- [ ] `p1` - **ID**: `fdd-file-parser-usecase-upload-parse-v1`
 
-<!-- fdd-id-content -->
 User uploads a document in a supported format and receives parsed content as structured blocks and optional Markdown.
 
 **Actors**: `fdd-file-parser-actor-api-user`
 **Preconditions**: Document is in a format claimed by a registered plugin and does not exceed the configured size limit.
 **Postconditions**: Structured blocks (headings, paragraphs, tables, etc.) returned in JSON or Markdown.
-<!-- fdd-id-content -->
 
 ### UC-002: Parse Local File
 
-**ID**: [ ] `p1` `fdd-file-parser-usecase-local-parse-v1`
+- [ ] `p1` - **ID**: `fdd-file-parser-usecase-local-parse-v1`
 
-<!-- fdd-id-content -->
 Consumer gear requests parsing of a file already present on the server filesystem.
 
 **Actors**: `fdd-file-parser-actor-consumer`
 **Preconditions**: File exists under `allowed_local_base_dir` and has an extension claimed by a registered plugin.
 **Postconditions**: Structured content returned; path traversal attempts rejected with HTTP 403.
-<!-- fdd-id-content -->
 
 ## 9. Acceptance Criteria
 

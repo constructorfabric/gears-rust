@@ -16,7 +16,7 @@ impl MigrationTrait for CreateProducerRegistrationSchema {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let conn = manager.get_connection();
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             backend,
             match backend {
                 DatabaseBackend::Postgres => {
@@ -52,6 +52,11 @@ impl MigrationTrait for CreateProducerRegistrationSchema {
                         updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
                     )"
                 }
+                other => {
+                    return Err(DbErr::Custom(format!(
+                        "producer registration schema has no DDL for database backend {other:?}"
+                    )));
+                }
             },
         ))
         .await?;
@@ -63,7 +68,7 @@ impl MigrationTrait for CreateProducerRegistrationSchema {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let conn = manager.get_connection();
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             backend,
             "DROP TABLE IF EXISTS event_broker_producer_registrations",
         ))

@@ -875,6 +875,93 @@ pub enum IdpUserOperationFailure {
     /// user is a `404`, not a silent no-op. AM maps this to the
     /// canonical `not_found` envelope.
     NotFound { detail: String },
+    /// Provider refused to write every attribute in `fields` because
+    /// they are IdP-managed and not overridable through AM -- e.g. the
+    /// realm federates them from a read-only LDAP mapper, or the
+    /// provider's user-profile configuration marks them non-writable.
+    ///
+    /// Distinct from [`Self::UnsupportedOperation`] (the provider does
+    /// not implement `update_user` *at all*, HTTP 501) and from
+    /// [`Self::Rejected`] (the value was bad, not the field). This is a
+    /// per-field capability fact, identical for every caller, so it is
+    /// NOT a permission decision -- AM maps it to the canonical
+    /// validation envelope carrying one structured
+    /// `<field>` / `IDP_MANAGED_FIELD` field-violation per entry (HTTP
+    /// 400) so a client can attribute the refusal to the exact inputs
+    /// and disable them.
+    ///
+    /// `fields` is a *set*, not a single attribute: a merge patch can
+    /// touch five attributes at once and a read-only federated realm
+    /// typically locks several of them, so a provider MUST report every
+    /// refused attribute the patch touched in one failure rather than
+    /// making the client discover them one round-trip at a time.
+    /// Providers MUST NOT emit an empty `fields` -- a refusal with
+    /// nothing to attribute it to is an unclassified rejection and
+    /// belongs in [`Self::Rejected`]; AM degrades an empty set to the
+    /// generic validation envelope.
+    FieldNotWritable {
+        /// The refused attributes. Non-empty; order is not significant
+        /// and duplicates are ignored by AM's boundary.
+        fields: Vec<IdpUserAttribute>,
+        detail: String,
+    },
+}
+
+/// A writable user profile attribute, used to attribute an
+/// [`IdpUserOperationFailure::FieldNotWritable`] refusal to the exact
+/// request field. `#[non_exhaustive]`: the writable surface grows with
+/// [`crate::IdpUserPatch`] without a breaking SDK release.
+///
+/// `password` is deliberately absent: a provider refusing a credential
+/// write reports it through [`IdpUserOperationFailure::PasswordPolicy`],
+/// which already owns the `password` / `PASSWORD_POLICY` tokens.
+///
+/// `Hash` is part of the contract: providers hold their non-writable
+/// attributes as a set, so a `HashSet<IdpUserAttribute>` is the natural
+/// shape on the implementing side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum IdpUserAttribute {
+    /// The login identifier (`username`).
+    Username,
+    /// The email address (`email`).
+    Email,
+    /// The display name (`display_name`).
+    DisplayName,
+    /// The given name (`first_name`).
+    FirstName,
+    /// The family name (`last_name`).
+    LastName,
+}
+
+impl IdpUserAttribute {
+    /// Stable wire token for canonical `field_violations[].field`.
+    /// MUST match the corresponding `UserUpdateRequest` JSON property
+    /// name -- clients key form-field attribution off this string.
+    #[must_use]
+    pub const fn as_field_token(self) -> &'static str {
+        match self {
+            Self::Username => "username",
+            Self::Email => "email",
+            Self::DisplayName => "display_name",
+            Self::FirstName => "first_name",
+            Self::LastName => "last_name",
+        }
+    }
+
+    /// Human phrase for curated public error details ("the {phrase} is
+    /// managed by the identity provider..."). Centralised here so AM's
+    /// canonical boundary and its tests cannot drift.
+    #[must_use]
+    pub const fn as_human_phrase(self) -> &'static str {
+        match self {
+            Self::Username => "username",
+            Self::Email => "email address",
+            Self::DisplayName => "display name",
+            Self::FirstName => "first name",
+            Self::LastName => "last name",
+        }
+    }
 }
 
 /// Which unique user attribute an [`IdpUserOperationFailure::DuplicateUser`]
@@ -940,6 +1027,7 @@ impl IdpUserOperationFailure {
             Self::DuplicateUser { .. } => "duplicate_user",
             Self::PasswordPolicy { .. } => "password_policy",
             Self::NotFound { .. } => "not_found",
+            Self::FieldNotWritable { .. } => "field_not_writable",
         }
     }
 
@@ -955,7 +1043,8 @@ impl IdpUserOperationFailure {
             | Self::Rejected { detail }
             | Self::DuplicateUser { detail, .. }
             | Self::PasswordPolicy { detail }
-            | Self::NotFound { detail } => detail,
+            | Self::NotFound { detail }
+            | Self::FieldNotWritable { detail, .. } => detail,
         }
     }
 }

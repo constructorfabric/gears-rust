@@ -31,7 +31,7 @@ async fn my_backend_is_conformant() {
 
 Cache-only plugins get the other three primitives for free by feeding their cache
 through the `cluster` gear's `CasBased*` / `CacheBased*` defaults, then running
-`run_leader_conformance` / `run_lock_conformance` / `run_discovery_conformance` over
+`run_leader_conformance` / `run_lock_conformance` over
 the result — see the rustdoc on [`run_leader_conformance`](src/leader.rs). This crate
 doesn't wire that composition itself (it deliberately has no dependency on `cluster`,
 even for its own tests — see [routing.md](../docs/scenarios/routing.md)'s ownership
@@ -45,7 +45,6 @@ note); a plugin or the `cluster` gear does the wiring and calls in.
 | `cache.rs` | `SC-CACHE-*` scenarios + `run_cache_conformance` |
 | `leader.rs` | `SC-LEAD-*` scenarios + `run_leader_conformance` |
 | `lock.rs` | `SC-LOCK-*` scenarios + `run_lock_conformance` |
-| `discovery.rs` | `SC-DISC-*` scenarios + `run_discovery_conformance` |
 | `model.rs` | reference-model replay engine (`replay_against_model`) for CAS/version invariants; the `proptest` strategy driving it lives in `tests/model.rs` |
 
 ## Capability gating

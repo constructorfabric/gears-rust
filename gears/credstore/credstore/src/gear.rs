@@ -1,3 +1,8 @@
+//! `ToolKit` gear declaration, dependency wiring, and managed lifecycle.
+//!
+//! Initialization builds the domain service, registers its SDK client and REST
+//! routes, and the stateful lifecycle runs recovery and fence-backfill sweeps.
+
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 

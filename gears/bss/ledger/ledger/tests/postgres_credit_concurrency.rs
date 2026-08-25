@@ -4,7 +4,7 @@
 //! sub-grain no-negative CHECK (`chk_reusable_credit_subbalance_no_negative`) is
 //! the backstop that bounds total draw-down at the funded amount. Ignored by
 //! default; run with
-//! `cargo test -p bss-ledger --test postgres_credit_concurrency -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_credit_concurrency -- --ignored`.
 //!
 //! Covers: (1) two concurrent `apply_credit`s draining ONE wallet never overspend
 //! it — the wallet never goes negative and the total drawn never exceeds the
@@ -130,7 +130,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -230,7 +230,7 @@ async fn fund_wallet(
 /// Read one wallet sub-grain's `balance_minor` from the projector cache (the
 /// concurrency invariant surface). `0` when the row is absent.
 async fn wallet_subgrain(raw: &sea_orm::DatabaseConnection, s: &Seller, event_type: &str) -> i64 {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_reusable_credit_subbalance \
          WHERE tenant_id='{}' AND payer_tenant_id='{}' AND currency='USD' \
          AND credit_grant_event_type='{}'",
@@ -246,7 +246,7 @@ async fn ar_invoice_balance(
     s: &Seller,
     invoice_id: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id

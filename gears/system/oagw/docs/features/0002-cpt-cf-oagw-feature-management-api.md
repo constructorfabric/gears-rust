@@ -326,18 +326,18 @@ Alias behavior is determined entirely by endpoint type. Hostname-based endpoints
 **Update path** (`enforce_alias_update_with` / `enforce_alias_update_derived` — when endpoints change):
 1. [x] - `p1` - Determine old and new endpoint derivability - `inst-alias-upd-1`
 2. [x] - `p1` - **IF** new endpoints are hostname-based (derivable) - `inst-alias-upd-2`
-   1. [x] - `p1` - Recompute alias from new endpoints; reject user-provided alias if different - `inst-alias-upd-2a`
-3. [x] - `p1` - **IF** old derivable → new non-derivable (derivable→non-derivable transition) - `inst-alias-upd-3`
-   1. [x] - `p1` - **IF** no explicit alias provided - `inst-alias-upd-3a`
-      1. [x] - `p1` - **RETURN** 400 Validation: "explicit alias is required for IP-based or heterogeneous-host endpoints" - `inst-alias-upd-3a1`
-   2. [x] - `p1` - **RETURN** normalized user alias - `inst-alias-upd-3b`
+   1. [x] - `p1` - Recompute alias from new endpoints; **IF** it differs from the existing alias **RETURN** 400 Validation ("endpoint change would alter the alias ...; delete and re-create the upstream instead"); otherwise retain it and reject any user-provided alias that differs from the derived value - `inst-alias-upd-2a`
+3. [x] - `p1` - **IF** old derivable → new non-derivable (hostname → IP transition) - `inst-alias-upd-3`
+   1. [x] - `p1` - Always **REJECT** — a hostname-derived alias must not point at raw IPs - `inst-alias-upd-3a`
+      1. [x] - `p1` - **RETURN** 400 Validation: "cannot change hostname-based endpoints to IP-based; delete and re-create the upstream instead" - `inst-alias-upd-3a1`
+   2. [x] - `p1` - An explicit alias does **not** bypass this rejection - `inst-alias-upd-3b`
 4. [x] - `p1` - **IF** IP → IP (no transition) - `inst-alias-upd-4`
-   1. [x] - `p1` - Retain existing alias unless user provides a new one - `inst-alias-upd-4a`
+   1. [x] - `p1` - Retain existing alias; a user-provided alias that differs from it is **rejected** (400 Validation, delete and re-create) — only an exact match is tolerated - `inst-alias-upd-4a`
 
 **Alias-only update path** (endpoints unchanged, alias field provided):
-1. [x] - `p1` - **IF** endpoints are hostname-based (derivable) AND normalized alias differs from derived value - `inst-alias-only-1`
-   1. [x] - `p1` - **RETURN** 400 Validation: "alias cannot be overridden for hostname-based endpoints" - `inst-alias-only-1a`
-2. [x] - `p1` - **ELSE** (IP-based or exact-match with derived): normalize, validate, and accept - `inst-alias-only-2`
+1. [x] - `p1` - **IF** the normalized alias differs from the existing alias (applies to both hostname- and IP-based upstreams) - `inst-alias-only-1`
+   1. [x] - `p1` - **RETURN** 400 Validation: "alias cannot be changed from '{existing}' to '{new}'; delete and re-create the upstream instead" - `inst-alias-only-1a`
+2. [x] - `p1` - **ELSE** (exact match with existing alias): tolerate as a no-op - `inst-alias-only-2`
 
 **Derivation rules** (`compute_derived_alias`):
 - Single hostname, standard port → hostname (e.g., `api.openai.com`)

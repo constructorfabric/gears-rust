@@ -1,4 +1,4 @@
-//! credstore SDK — public API traits, models, errors, GTS schema, secret types.
+#![doc = include_str!("../README.md")]
 pub mod api;
 pub mod error;
 pub mod gts;

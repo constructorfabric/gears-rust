@@ -1,0 +1,47 @@
+family     = "supersession-continuity"
+id         = "meter-change-rejected"
+kind       = "publish"
+provenance = ["inst-tb-supersession-units", "D-22", "D-82"]
+
+# `meter` is two of the four components of the counter's own key. A successor
+# that moved it does not inherit the continued counter at all - it silently
+# reads a **different** one, which is the failure mode a supersession exists to
+# make impossible: the customer's accumulated `Q` vanishes and the new ladder
+# starts from zero mid-period, at a rate the first band prices.
+#
+# The gear's own unit tests have covered the rule since it was written. This
+# case exists because the corpus is what earns the `publish` flag, and until
+# 2026-08-18 no pair in it ever moved `meter` or `dimensionKey` - so a gear that
+# deleted both comparisons would still have earned `publish = true` for every
+# kind and opened every variant of the gate. Seed is not coverage: the field was
+# on 20 of 29 snapshots and varied in none of them.
+
+[predecessor]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "storage.gb"
+billing_granularity     = "per_day"
+tier_aggregation_window = "invoice_period"
+
+  [[predecessor.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 5
+
+[successor]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "egress.gb"
+billing_granularity     = "per_day"
+tier_aggregation_window = "invoice_period"
+
+  [[successor.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 5
+
+[[assert]]
+expect = { publish = "rejected", error_code = "SUPERSESSION_UNIT_MISMATCH" }
+why    = "the successor meters a different quantity, so there is no continued counter to inherit - the accumulated Q belongs to storage.gb and the new row would read egress.gb from zero"

@@ -3,9 +3,9 @@
 //! `standalone_cluster_plugin` is the in-process, zero-infrastructure backend for
 //! the cluster gear — the default for developer laptops and unit/integration
 //! tests (PRD §3.1, DESIGN §3.11). It implements the cache primitive natively
-//! over an in-memory store and derives leader election, distributed lock, and
-//! service discovery from the SDK's cache-based default backends, so a single
-//! process gets all four cluster primitives with no external dependencies.
+//! over an in-memory store and derives leader election and distributed lock
+//! from the SDK's cache-based default backends, so a single process gets all
+//! three cluster primitives with no external dependencies.
 //!
 //! ## Lifecycle (outbox-style builder/handle, DESIGN §3.7)
 //!
@@ -19,7 +19,7 @@
 //!
 //! let handle = StandaloneClusterPlugin::builder().build_and_start()?;
 //! // Hand the cache backend to the wiring crate / register it in the ClientHub —
-//! // it derives leader election, lock, and service discovery via the SDK default
+//! // it derives leader election and lock via the SDK default
 //! // backends (DESIGN §3.11).
 //! let _cache = handle.cache();
 //! // On graceful shutdown:
@@ -34,9 +34,9 @@
 //!
 //! ## Status
 //!
-//! The cache is native. Leader election, lock, and service discovery currently
+//! The cache is native. Leader election and lock currently
 //! ride the SDK default backends (`CasBased*` / `CacheBased*`) over the native
-//! cache — the "implement cache only, get all four" guarantee (PRD
+//! cache — the "implement cache only, get all three" guarantee (PRD
 //! §5.5, DESIGN §3.11). Native implementations of those three (the DESIGN §3.11
 //! end state) are a follow-up optimization.
 

@@ -270,6 +270,10 @@ impl TieOutJob {
     /// transaction so these reads join close's snapshot — a concurrent post
     /// then conflicts (SSI), forcing close to retry and re-tie-out instead of
     /// certifying a period an in-flight entry is landing in.
+    ///
+    /// # Errors
+    /// Returns an error if any scoped ledger table cannot be read from the
+    /// supplied runner.
     pub async fn tie_out_on<R: DBRunner>(
         &self,
         runner: &R,

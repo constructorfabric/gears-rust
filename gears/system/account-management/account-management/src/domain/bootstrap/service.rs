@@ -51,7 +51,7 @@ use account_management_sdk::{
 use serde_json::Value;
 
 use crate::domain::bootstrap::config::BootstrapConfig;
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, UnsupportedResource};
 use crate::domain::metrics::{AM_BOOTSTRAP_LIFECYCLE, MetricKind, emit_metric};
 use crate::domain::system_actor::for_bootstrap;
 use crate::domain::tenant::TenantContext;
@@ -1336,7 +1336,10 @@ impl<R: TenantRepo> BootstrapService<R> {
             }
             IdpProvisionFailure::UnsupportedOperation { detail } => {
                 self.compensate(scope, root_id, "unsupported").await;
-                DomainError::UnsupportedOperation { detail }
+                DomainError::UnsupportedOperation {
+                    detail,
+                    resource: UnsupportedResource::Tenant,
+                }
             }
             IdpProvisionFailure::InvalidInput { detail, field } => {
                 // Bootstrap-path symmetry with the steady-state saga

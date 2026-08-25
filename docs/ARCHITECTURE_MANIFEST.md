@@ -52,13 +52,13 @@ The architecture makes the insecure path harder than the secure one. Gear develo
 
 #### 3.1.2. Architecture enforced at compile time
 
-Constructor Fabric Gears treats custom static analysis as a core architectural mechanism, not a best-effort coding aid. Architectural boundaries, API conventions, GTS usage rules, and security restrictions are enforced during builds through repository-specific Dylint rules.
+Constructor Fabric Gears treats custom static analysis as a core architectural mechanism, not a best-effort coding aid. Architectural boundaries, API conventions, GTS usage rules, and security restrictions are enforced during builds through custom architecture lints shipped in the `cargo-gears` CLI.
 
-**How.** The workspace includes `tools/dylint_lints/`, a dedicated Dylint suite that checks contract-layer purity, DTO placement and schema derives, domain-layer isolation, direct SQL restrictions, versioned REST paths, mandatory `OperationBuilder` metadata, OData extension usage, GTS identifier correctness, and other cross-cutting rules. These lints run alongside the normal Rust toolchain and CI checks, which means architectural violations fail fast before review or runtime.
+**How.** The `cargo-gears` CLI (`cargo gears lint`) ships a dedicated lint suite that checks contract-layer purity, DTO placement and schema derives, domain-layer isolation, direct SQL restrictions, versioned REST paths, mandatory `OperationBuilder` metadata, OData extension usage, GTS identifier correctness, and other cross-cutting rules. These lints run alongside the normal Rust toolchain and CI checks, which means architectural violations fail fast before review or runtime.
 
 This is a shift-left quality mechanism: the repository pushes correctness, consistency, and architecture conformance into compile-time and CI-time validation rather than relying only on code review.
 
-**Why.** In a large modular platform, architecture decays quickly if it lives only in markdown. Dylint makes the desired structure executable and keeps both human contributors and AI-assisted changes inside the intended design envelope.
+**Why.** In a large modular platform, architecture decays quickly if it lives only in markdown. Custom architecture lints make the desired structure executable and keep both human contributors and AI-assisted changes inside the intended design envelope.
 
 ### 3.2. Three-tier gear hierarchy
 
@@ -74,7 +74,7 @@ See: [GEARS.md](GEARS.md)
 
 Constructor Fabric Gears follows a DDD-light structure in which domain logic is kept free from transport and infrastructure details, while REST/gRPC adapters and infra layers handle boundary-specific concerns.
 
-**How.** The standard gear layout separates SDK contracts, gear bootstrap, domain logic, API adapters, and infrastructure. Domain types and services live under `domain/`, REST DTOs and route wiring stay in API-facing layers, and persistence/integration logic stays in infra. This boundary is reinforced not only by structure but also by custom Dylints and the `#[domain_model]` macro requirement for domain-layer types that are visible beyond their module (strictly module-private helper types are exempt; their fields are still checked for infrastructure leakage by the domain-layer Dylints).
+**How.** The standard gear layout separates SDK contracts, gear bootstrap, domain logic, API adapters, and infrastructure. Domain types and services live under `domain/`, REST DTOs and route wiring stay in API-facing layers, and persistence/integration logic stays in infra. This boundary is reinforced not only by structure but also by custom architecture lints (via `cargo gears lint`) and the `#[domain_model]` macro requirement for domain-layer types that are visible beyond their module (strictly module-private helper types are exempt; their fields are still checked for infrastructure leakage by the domain-layer architecture lints).
 
 **Why.** Business logic stays easier to test, reuse, and evolve because it is not entangled with HTTP, database, or framework details. At the same time, adapter code remains explicit about where transport translation and persistence concerns begin.
 
@@ -132,7 +132,7 @@ Constructor Fabric Gears separates service logic from service packaging. Gear lo
 
 Constructor Fabric Gears does not treat HTTP shape, query conventions, and API description as local stylistic choices. Gears follow one API style built around versioned paths, typed route registration, shared middleware, OpenAPI generation, and standard query patterns such as OData for filtering and ordering.
 
-**How.** `OperationBuilder` is the authoritative route-registration mechanism in ToolKit. A route declares method, versioned path, auth posture, license posture, request schema, response schema, tags, summary, and registered error responses in one place. `OpenApiRegistry` collects these declarations into the generated `/openapi.json`. For query shape, ToolKit exposes OData helpers such as `with_odata_filter`, `with_odata_orderby`, and `with_odata_select`, and workspace Dylints enforce that REST endpoints use the standardized extension methods rather than ad-hoc query conventions.
+**How.** `OperationBuilder` is the authoritative route-registration mechanism in ToolKit. A route declares method, versioned path, auth posture, license posture, request schema, response schema, tags, summary, and registered error responses in one place. `OpenApiRegistry` collects these declarations into the generated `/openapi.json`. For query shape, ToolKit exposes OData helpers such as `with_odata_filter`, `with_odata_orderby`, and `with_odata_select`, and custom architecture lints enforce that REST endpoints use the standardized extension methods rather than ad-hoc query conventions.
 
 This produces one recognizable API dialect across gears:
 
@@ -222,7 +222,7 @@ Rust is a strong fit for CF/Gears implementation because this repository is buil
   - Libraries such as ToolKit, security layers, transport layers, and registries benefit from predictable performance and explicit interfaces.
 
 - **Static analysis as part of architecture**
-  - Rust's ecosystem, combined with Clippy and custom Dylints, allows many project rules to become enforceable at build time.
+  - Rust's ecosystem, combined with Clippy and custom architecture lints, allows many project rules to become enforceable at build time.
 
 - **Operational efficiency**
   - A low-footprint runtime makes it practical to run realistic local/edge systems, end-to-end tests, and service combinations without depending on heavyweight environments.
@@ -414,7 +414,7 @@ Security in Constructor Fabric Gears spans the language choice, gear boundaries,
   - `credstore` (`gears/credstore/`) and secrecy-aware types are present for secret handling.
 
 - [x] **Static and CI security gates**
-  - Clippy, custom Dylints, `cargo-deny`, CodeQL, fuzzing, and related scanners are part of the repo.
+  - Clippy, custom architecture lints (via `cargo gears lint`), `cargo-deny`, CodeQL, fuzzing, and related scanners are part of the CI pipeline.
 
 ### 10.2 Tenant Data Model
 
@@ -473,7 +473,7 @@ See more details in: [arch/authorization/DESIGN.md](arch/authorization/DESIGN.md
 - [x] `OpenApiRegistry` and `OperationBuilder` are implemented in ToolKit.
 - [x] `/openapi.json` and `/docs` are served by the API gateway.
 - [x] OData extensions are implemented in `OperationBuilder` for standardized `$filter`, `$select`, and `$orderby` support.
-- [x] Workspace Dylints enforce versioned endpoints and standardized OData extension usage.
+- [x] Custom architecture lints enforce versioned endpoints and standardized OData extension usage.
 
 The important architectural point is that OpenAPI is generated from the same Rust route declarations that wire the running service. Constructor Fabric Gears does not maintain a separate hand-authored HTTP contract description.
 
@@ -482,7 +482,7 @@ The important architectural point is that OpenAPI is generated from the same Rus
 - [x] GTS schemas can be generated directly from Rust types
 - [x] Plugin specifications already use this pattern in SDK crates such as `authn-resolver-sdk` and `mini-chat-sdk`.
 - [x] Generated GTS JSON Schemas are intended for registration in the Types Registry.
-- [x] GTS-specific Dylints validate identifier correctness and prevent unsupported schema-generation patterns such as `schema_for!` on GTS structs.
+- [x] GTS-specific architecture lints validate identifier correctness and prevent unsupported schema-generation patterns such as `schema_for!` on GTS structs.
 
 This is the non-HTTP counterpart to OpenAPI generation. OpenAPI describes REST endpoints; GTS-generated JSON Schema describes platform contracts and typed data beyond REST, including plugin specs, events, and other globally identified contracts. Together they let Constructor Fabric Gears derive both API and non-API contracts from Rust source rather than duplicating schemas manually.
 

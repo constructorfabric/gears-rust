@@ -112,7 +112,7 @@ enum WatchBehavior {
 }
 
 /// A functional in-memory cache backend for default-backend unit tests.
-pub(super) struct MemoryCache {
+pub struct MemoryCache {
     inner: Mutex<Inner>,
     consistency: CacheConsistency,
     prefix_watch: bool,
@@ -136,8 +136,8 @@ impl MemoryCache {
 
     /// A linearizable cache that declares no native prefix watch, so
     /// `watch_prefix` returns [`ClusterError::Unsupported`] — for the
-    /// service-discovery degradation path.
-    pub(super) fn linearizable_without_prefix_watch() -> Arc<Self> {
+    /// prefix-watch degradation path.
+    pub fn linearizable_without_prefix_watch() -> Arc<Self> {
         Self::spawn(CacheConsistency::Linearizable, false)
     }
 
@@ -160,18 +160,6 @@ impl MemoryCache {
             CacheConsistency::Linearizable,
             true,
             WatchBehavior::Rotating,
-        )
-    }
-
-    /// A linearizable cache with no prefix watch whose `watch_prefix` suspends
-    /// once before returning `Unsupported`, so two concurrent `register`s
-    /// interleave deterministically at the maintainer-startup await.
-    pub(super) fn linearizable_without_prefix_watch_slow() -> Arc<Self> {
-        Self::spawn_full(
-            CacheConsistency::Linearizable,
-            false,
-            WatchBehavior::Normal,
-            true,
         )
     }
 

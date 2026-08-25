@@ -25,6 +25,11 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Local dev enables incremental compilation via [profile.dev]; CI does not want
+  # the extra codegen and disk churn.
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   validate_artifacts:
     name: Validate CFS Artifacts
@@ -43,7 +48,7 @@ jobs:
           submodules: recursive
 
       - name: Setup Python
-        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.1
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
 

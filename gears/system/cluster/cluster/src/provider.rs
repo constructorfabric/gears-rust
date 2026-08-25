@@ -14,19 +14,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cluster_sdk::{
-    ClusterCacheProvider, ClusterLeaderElectionProvider, ClusterLockProvider,
-    ClusterServiceDiscoveryProvider,
-};
+use cluster_sdk::{ClusterCacheProvider, ClusterLeaderElectionProvider, ClusterLockProvider};
 
-/// Name → provider lookup for all four primitives, assembled once at startup and
+/// Name → provider lookup for all three primitives, assembled once at startup and
 /// passed to [`ClusterWiring::from_config`](crate::ClusterWiring::from_config).
 #[derive(Default)]
 pub struct ProviderRegistry {
     cache: HashMap<&'static str, Arc<dyn ClusterCacheProvider>>,
     leader_election: HashMap<&'static str, Arc<dyn ClusterLeaderElectionProvider>>,
     lock: HashMap<&'static str, Arc<dyn ClusterLockProvider>>,
-    service_discovery: HashMap<&'static str, Arc<dyn ClusterServiceDiscoveryProvider>>,
 }
 
 impl ProviderRegistry {
@@ -63,17 +59,6 @@ impl ProviderRegistry {
         self
     }
 
-    /// Registers a service-discovery provider. A later registration for the same
-    /// name replaces the earlier one.
-    #[must_use]
-    pub fn with_service_discovery_provider(
-        mut self,
-        provider: Arc<dyn ClusterServiceDiscoveryProvider>,
-    ) -> Self {
-        self.service_discovery.insert(provider.provider(), provider);
-        self
-    }
-
     pub(crate) fn cache_provider(&self, name: &str) -> Option<&Arc<dyn ClusterCacheProvider>> {
         self.cache.get(name)
     }
@@ -87,12 +72,5 @@ impl ProviderRegistry {
 
     pub(crate) fn lock_provider(&self, name: &str) -> Option<&Arc<dyn ClusterLockProvider>> {
         self.lock.get(name)
-    }
-
-    pub(crate) fn service_discovery_provider(
-        &self,
-        name: &str,
-    ) -> Option<&Arc<dyn ClusterServiceDiscoveryProvider>> {
-        self.service_discovery.get(name)
     }
 }

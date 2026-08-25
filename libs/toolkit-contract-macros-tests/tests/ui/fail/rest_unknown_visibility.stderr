@@ -1,0 +1,5 @@
+error: unknown visibility `everywhere`; expected "exposed" or "internal"
+  --> tests/ui/fail/rest_unknown_visibility.rs:11:58
+   |
+11 | #[rest_contract(base_path = "/api/demo/v1", visibility = "everywhere")]
+   |                                                          ^^^^^^^^^^^^

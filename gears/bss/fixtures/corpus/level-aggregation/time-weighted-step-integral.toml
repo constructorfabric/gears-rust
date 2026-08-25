@@ -1,0 +1,43 @@
+family     = "level-aggregation"
+id         = "time-weighted-step-integral"
+kind       = "evaluation"
+provenance = ["AC#60", "D-44", "T-D-17", "D-77"]
+
+# `time_weighted` folds each granule to the step-integral of the level. The
+# billable unit is level x granule duration - GB-hours here, which is why D-77
+# pins `hour` to `per_hour`: at any other pairing the band edge moves.
+
+[snapshot]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "storage.gb"
+aggregation_function    = "time_weighted"
+aggregation_granularity = "hour"
+max_hold_granules       = 1
+billing_granularity     = "per_hour"
+tier_aggregation_window = "invoice_period"
+
+  [[snapshot.bands]]
+  from_qty = 0
+  to_qty   = "open"
+  unit_amount_minor = 2
+
+[runtime]
+window_start = "2026-01-01T00:00:00Z"
+window_end   = "2026-01-01T02:00:00Z"
+
+  [[runtime.samples]]
+  at    = "2026-01-01T00:00:00Z"
+  level = 10
+  [[runtime.samples]]
+  at    = "2026-01-01T00:30:00Z"
+  level = 20
+  [[runtime.samples]]
+  at    = "2026-01-01T01:00:00Z"
+  level = 8
+
+[[assert]]
+given  = { }
+expect = { folded_q = 23 }
+why    = "hour 0 holds 10 for half an hour then 20 for half: (10*1800 + 20*1800)/3600 = 15 GB-h. Hour 1 holds 8 throughout: 8. Q = 15 + 8 = 23. A peak fold over the same samples would have said 20 + 8 = 28"

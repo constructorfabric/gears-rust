@@ -19,7 +19,7 @@ Use this when changing build tooling, CI, linting, releases, or dependency polic
 ## Tooling
 - Use `Makefile` targets as the main local automation surface. Evidence: `Makefile:120-173`, `Makefile:218-320`
 - Preserve fast PR Clippy and deeper validation split. Evidence: `Makefile:224-246`
-- Keep custom Dylint rules aligned with architecture categories. Evidence: `tools/dylint_lints/README.md:16-70`
+- Keep custom architecture lints aligned with architecture categories. Run via `cargo gears lint` (lints live in the `cargo-gears` CLI tool).
 
 ## CI and Releases
 - Preserve cross-OS test matrix and DB integration jobs. Evidence: `.github/workflows/ci.yml:85-220`

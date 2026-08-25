@@ -9,7 +9,7 @@ date: 2026-04-10
 
 ## Context and Problem Statement
 
-ADR-0001 chose the Rust trait as the contract source of truth, with `#[toolkit_rest_contract]` generating clients and OpenAPI specs via `schemars`. This decision inherits a structural limitation: a Rust trait signature plus `schemars`-derived JSON schemas cannot faithfully express the full REST surface. The generator cannot represent union request bodies (oneOf/anyOf with discriminators), content-type negotiation (e.g., `application/vnd.foo+json`), multiple response schemas per status code, non-body content (multipart, form, octet-stream), path parameters with regex/range validation, response headers, custom security schemes, complex query parameter serialization (arrays, deep objects), or responses that vary by input.
+ADR-0001 chose the Rust trait as the contract source of truth, with `#[toolkit::rest_contract]` generating clients and OpenAPI specs via `schemars`. This decision inherits a structural limitation: a Rust trait signature plus `schemars`-derived JSON schemas cannot faithfully express the full REST surface. The generator cannot represent union request bodies (oneOf/anyOf with discriminators), content-type negotiation (e.g., `application/vnd.foo+json`), multiple response schemas per status code, non-body content (multipart, form, octet-stream), path parameters with regex/range validation, response headers, custom security schemes, deeply-nested query objects, or responses that vary by input.
 
 Option D (IDL-first) was rejected in ADR-0001 because no IDL captures REST and gRPC faithfully at once. The trait-first approach has a symmetric problem: Rust traits plus `schemars` cannot faithfully express everything REST permits. If the generated spec is treated as the authoritative specification for third-party implementors, two failure modes appear:
 
@@ -32,23 +32,23 @@ This ADR defines the role of the generated spec and the policy for everything it
 ## Considered Options
 
 * **Option A**: Narrow but honest — generator covers the common case, manual implementation fills the gaps, generated OpenAPI is declared the minimum conformance contract (current design)
-* **Option B**: Aggressive annotation vocabulary — extend `#[toolkit_rest_contract]` with `#[content_type]`, `#[response_header]`, `#[multipart]`, `#[response(status=404, schema=…)]`, `#[path(pattern="…")]`, and similar attributes until the macro covers ~95% of REST
+* **Option B**: Aggressive annotation vocabulary — extend `#[toolkit::rest_contract]` with `#[content_type]`, `#[response_header]`, `#[multipart]`, `#[response(status=404, schema=…)]`, `#[path(pattern="…")]`, and similar attributes until the macro covers ~95% of REST
 * **Option C**: OpenAPI-first with augmentation — hand-write the spec, generate Rust types from it
 * **Option D**: Dual source — authors write both the Rust trait and the OpenAPI YAML, CI verifies they agree
 
 ## Decision Outcome
 
-Chosen option: **Option A — Narrow but honest.** The `#[toolkit_rest_contract]` macro covers a deliberate subset of REST, the generated OpenAPI spec is documented as the **minimum conformance contract** (services may offer strictly more, never strictly less), and anything outside the subset is handled by manual implementation — authors write `impl Base for MyCustomRestClient` with full HTTP control, and the consumer interface (`Arc<dyn Base>`) is identical to the macro-generated case.
+Chosen option: **Option A — Narrow but honest.** The `#[toolkit::rest_contract]` macro covers a deliberate subset of REST, the generated OpenAPI spec is documented as the **minimum conformance contract** (services may offer strictly more, never strictly less), and anything outside the subset is handled by manual implementation — authors write `impl Base for MyCustomRestClient` with full HTTP control, and the consumer interface (`Arc<dyn Base>`) is identical to the macro-generated case.
 
 Option B was rejected because the attribute vocabulary required to cover 95% of REST approaches the complexity of a bespoke IDL embedded in Rust attribute syntax, reintroducing the "lowest common denominator" problem ADR-0001 used to reject IDL-first. Option C was rejected for the same reasons as ADR-0001 Option C. Option D was rejected because dual sources drift in practice regardless of CI discipline, and because it forces every author to learn two authoring surfaces.
 
 ### Phase 1 scope — what the macro generates
 
-The `#[toolkit_rest_contract]` macro supports:
+The `#[toolkit::rest_contract]` macro supports:
 
 * `POST`, `GET`, `DELETE` with a single JSON request body (where applicable)
-* Path parameter extraction via the future `#[path]` annotation on method arguments
-* Query parameter serialization via the future `#[query]` annotation (scalar and flat-struct forms only)
+* Path parameter extraction, bound by convention from the `{placeholder}` names in the path template (the `#[path]` annotation this ADR anticipated was never built)
+* Query parameter serialization for a single struct deriving `QueryParams`, covering scalar, `Option<scalar>`, and `Vec<scalar>` fields (see the amendment below)
 * A single success response schema per method, derived from the `Ok` type of the method's `Result<T, E>`
 * Error responses in RFC 9457 Problem Details form with `error_code` + `error_domain` extensions (see ADR-0001 in the errors directory)
 * Server-sent events via `#[streaming]`, rendered as `text/event-stream` in the OpenAPI spec
@@ -64,6 +64,43 @@ The `#[toolkit_rest_contract]` macro supports:
 * Custom security schemes in the OpenAPI spec (authentication is carried by `SecurityContext` as the first method argument — see DESIGN)
 * Webhooks (modelled as separate push contracts, not as REST callbacks)
 * Hypermedia / HATEOAS link generation
+
+### Amendment: repeated query parameters are now in scope
+
+This ADR originally scoped out "complex query parameter serialization (arrays,
+deep objects)" wholesale. **Arrays are now supported**; deep objects remain out
+of scope.
+
+The distinction turned out to be load-bearing rather than cosmetic. The
+original design let the client and server pick their own query codecs — the
+client hand-rolled a query string, the server decoded with `serde_urlencoded`
+via `axum::extract::Query` — and nothing reconciled them. That is what made
+arrays "complex": a `Vec<T>` went out as repeated keys, which `serde_urlencoded`
+cannot collect into a sequence, so the request 400'd. Once both ends share one
+codec (`serde_html_form`), a repeated key round-trips and the array case stops
+being special.
+
+In scope as of the `QueryParams` work:
+
+* one query parameter per method, a struct deriving
+  `toolkit_contract::QueryParams`;
+* fields that are scalars, `Option<scalar>`, or `Vec<scalar>`, where the leaf
+  type implements `QueryScalar`;
+* `Vec` fields rendered in the spec as `type: array` with
+  `style: form, explode: true` — the repeated-key form the client emits.
+
+Still out of scope, and now rejected at compile time rather than failing at
+runtime:
+
+* **nested objects in a query struct** — a query string is a flat key/value
+  list and cannot represent them unambiguously. The `QueryScalar` bound is what
+  enforces this;
+* **a bare scalar query parameter** on a generated route — a query string
+  deserializes as a map at the top level, so `Query<u64>` can never decode.
+  Authors wrap it in a struct. A `#[server_manual]` method may still take a
+  scalar, since the author owns the decoder.
+
+Both remain reachable through the escape hatch below.
 
 ### Escape hatch
 

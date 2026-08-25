@@ -8,7 +8,15 @@
 mod api;
 #[cfg(feature = "grpc")]
 mod grpc;
+pub mod labels;
 
-pub use api::{DirectoryClient, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo};
+pub use api::{
+    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, GrpcServiceInfo, InstanceState,
+    LabelSelector, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
+};
 #[cfg(feature = "grpc")]
 pub use grpc::*;
+pub use labels::{
+    LabelValidationError, MAX_LABEL_KEY_LEN, MAX_LABEL_VALUE_LEN, MAX_LABELS, validate_labels,
+    validate_selector,
+};

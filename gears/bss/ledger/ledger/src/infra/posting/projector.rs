@@ -22,6 +22,7 @@ use std::collections::HashMap;
 
 use bss_ledger_sdk::{AccountClass, Side};
 use chrono::{DateTime, NaiveDate, Utc};
+use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter};
 use toolkit_db::secure::{AccessScope, DbTx, SecureEntityExt, SecureInsertExt, SecureOnConflict};

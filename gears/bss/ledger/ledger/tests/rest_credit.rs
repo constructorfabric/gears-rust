@@ -486,7 +486,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -957,7 +957,7 @@ async fn cross_tenant_target_is_forbidden_403() {
 
     // No wallet sub-grain was created for the foreign tenant.
     let foreign_subgrain = raw
-        .query_one(pg(format!(
+        .query_one_raw(pg(format!(
             "SELECT balance_minor FROM bss.ledger_reusable_credit_subbalance \
              WHERE tenant_id='{foreign}'"
         )))

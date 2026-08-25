@@ -30,7 +30,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 | Architecture overview | [x] `p1` | [docs/ARCHITECTURE_MANIFEST.md](./ARCHITECTURE_MANIFEST.md), [docs/GEARS.md ](./GEARS.md ) | Add “current vs target” split blocks |
 | System diagrams | [x] `p1` | [docs/img/](./img), [docs/ARCHITECTURE_MANIFEST.md](./ARCHITECTURE_MANIFEST.md), [docs/GEARS.md ](./GEARS.md ) | Add ownership + update cadence per diagram |
 | Component responsibilities | [x] `p1` | [docs/GEARS.md ](./GEARS.md ), [docs/toolkit_unified_system/README.md](./toolkit_unified_system/README.md) | Add per-gear responsibility cards |
-| Gear boundaries | [x] `p1` | [docs/GEARS.md ](./GEARS.md ), [docs/toolkit_unified_system/](./toolkit_unified_system/README.md), [tools/dylint_lints/README.md](../tools/dylint_lints/README.md) | Expand lint coverage for boundary rules |
+| Gear boundaries | [x] `p1` | [docs/GEARS.md ](./GEARS.md ), [docs/toolkit_unified_system/](./toolkit_unified_system/README.md), `cargo gears lint` | Expand lint coverage for boundary rules |
 | Technology choices | [x] `p1` | [README.md](../README.md), [docs/ARCHITECTURE_MANIFEST.md](./ARCHITECTURE_MANIFEST.md), [guidelines/DEPENDENCIES.md](../guidelines/DEPENDENCIES.md) | Add technology decision registry page |
 | Data flow | [x] `p2` | [docs/GEARS.md ](./GEARS.md ) and [docs/spec-templates/gears-sdlc/DESIGN/template.md](./spec-templates/gears-sdlc/DESIGN/template.md) | Add dedicated sequence-diagram doc set |
 
@@ -40,7 +40,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 |---|---|---|---|
 | Repository structure | [x] `p1` | [README.md](../README.md), [docs/ARCHITECTURE_MANIFEST.md](./ARCHITECTURE_MANIFEST.md), [docs/toolkit_unified_system/](./toolkit_unified_system/README.md) | Keep in sync with workspace changes |
 | Folder conventions | [x] `p1` | [docs/toolkit_unified_system/](./toolkit_unified_system/README.md) | Add root-level `REPO_STRUCTURE.md` |
-| Naming conventions | [x] `p1` | [docs/toolkit_unified_system/](./toolkit_unified_system/README.md), [tools/scripts/validate_gear_names.py](../tools/scripts/validate_gear_names.py), [tools/dylint_lints/](../tools/dylint_lints) | Expand naming rules beyond gears |
+| Naming conventions | [x] `p1` | [docs/toolkit_unified_system/](./toolkit_unified_system/README.md), [tools/scripts/validate_gear_names.py](../tools/scripts/validate_gear_names.py), `cargo gears lint` | Expand naming rules beyond gears |
 | Code organization rules | [x] `p1` | [docs/toolkit_unified_system/](./toolkit_unified_system/README.md), [docs/toolkit_unified_system/README.md](./toolkit_unified_system/README.md) | Add short “golden-path skeleton” page |
 | Dependency policies | [x] `p1` | [guidelines/DEPENDENCIES.md](../guidelines/DEPENDENCIES.md), [docs/security/SECURITY.md](./security/SECURITY.md) | Add explicit approval policy for new deps |
 | File naming rules | [x] `p2` | [docs/spec-templates/README.md](./spec-templates/README.md) (ADR/feature naming), gear file layout in [docs/toolkit_unified_system/](./toolkit_unified_system/README.md) | Add global naming matrix |
@@ -50,11 +50,11 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 | Item | Status / Phase / ID | Implemented (where) | Planned |
 |---|---|---|---|
 | Coding standards | [x] `p1` | [guidelines/README.md](../guidelines/README.md), [CONTRIBUTING.md](../CONTRIBUTING.md) | Add short one-page standards index |
-| Style guide | [x] `p1` | clippy rules in [clippy.toml](../clippy.toml) and [Cargo.toml](../Cargo.toml), `cargo fmt` in [Makefile](../Makefile), dylint rules in [tools/dylint_lints/README.md](../tools/dylint_lints/README.md) | Expand language-agnostic style section |
-| Lint rules | [x] `p1` | [tools/dylint_lints/README.md](../tools/dylint_lints/README.md), [Makefile](../Makefile), [tools/scripts/ci.py](../tools/scripts/ci.py) | Add lint policy matrix by layer |
+| Style guide | [x] `p1` | clippy rules in [clippy.toml](../clippy.toml) and [Cargo.toml](../Cargo.toml), `cargo fmt` in [Makefile](../Makefile), architecture lint rules via `cargo gears lint` | Expand language-agnostic style section |
+| Lint rules | [x] `p1` | `cargo gears lint` (in `cargo-gears` CLI), [Makefile](../Makefile), [tools/scripts/ci.py](../tools/scripts/ci.py) | Add lint policy matrix by layer |
 | Formatting rules | [x] `p1` | [Makefile](../Makefile), [tools/scripts/ci.py](../tools/scripts/ci.py) | Add editor setup snippets |
 | Documentation standards | [x] `p1` | [docs/spec-templates/README.md](./spec-templates/README.md), [docs/checklists/README.md](./checklists/README.md) | Add docs style/lint enforcement rules |
-| Static analysis rules | [x] `p2` | [docs/security/SECURITY.md](./security/SECURITY.md), [tools/dylint_lints/](../tools/dylint_lints), [.github/workflows/codeql.yml](../.github/workflows/codeql.yml) | Add local static-analysis quickstart |
+| Static analysis rules | [x] `p2` | [docs/security/SECURITY.md](./security/SECURITY.md), `cargo gears lint`, [.github/workflows/codeql.yml](../.github/workflows/codeql.yml) | Add local static-analysis quickstart |
 | Code complexity rules | [x] `p2` | Clippy `cognitive_complexity` (threshold: 20) in workspace [Cargo.toml](../Cargo.toml), [clippy.toml](../clippy.toml) | Add per-gear complexity budget |
 | Commenting rules | [ ] `p3` | Partial conventions in existing guidelines | Add explicit comment policy document |
 | README standards | [ ] `p3` | Implicit via gear QUICKSTART guidance in [docs/toolkit_unified_system/](./toolkit_unified_system/README.md) | Add README template + required sections |
@@ -120,7 +120,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 | Integration testing rules | [x] `p1` | [CONTRIBUTING.md](../CONTRIBUTING.md), `ci.py all` flow | Add integration test standards page |
 | End-to-end testing rules | [x] `p1` | [README.md](../README.md), [tools/scripts/ci.py](../tools/scripts/ci.py), `.github/workflows/e2e.yml` | Add e2e flakiness policy |
 | Coverage expectations | [x] `p1` | [README.md](../README.md), [CONTRIBUTING.md](../CONTRIBUTING.md), [Makefile](../Makefile) | Enforce threshold gates in CI |
-| Test structure | [x] `p2` | [docs/toolkit_unified_system/](./toolkit_unified_system/README.md), [tools/dylint_lints/AGENTS.md](../tools/dylint_lints/AGENTS.md) | Add repository-wide test taxonomy |
+| Test structure | [x] `p2` | [docs/toolkit_unified_system/](./toolkit_unified_system/README.md), architecture lints via `cargo gears lint` | Add repository-wide test taxonomy |
 | Test data management | [ ] `p3` | Not centralized | Add test-fixture lifecycle guide |
 
 ## 11) Debugging, Logging & Observability
@@ -145,7 +145,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 | Dependency security rules | [x] `p1` | [docs/security/SECURITY.md](./security/SECURITY.md), [Makefile](../Makefile), `cargo deny` | Add allow/deny decision log |
 | Vulnerability response | [x] `p1` | [SECURITY.md](../SECURITY.md) | Add incident severity matrix |
 | Secure ORM tenant scoping | [x] `p2` | [docs/security/SECURITY.md](./security/SECURITY.md), [docs/toolkit_unified_system/06_authn_authz_secure_orm.md](./toolkit_unified_system/06_authn_authz_secure_orm.md) | Add security-context propagation verification checks |
-| Static security linting (Clippy + Dylint) | [x] `p2` | [docs/security/SECURITY.md](./security/SECURITY.md), [tools/dylint_lints/README.md](../tools/dylint_lints/README.md), [clippy.toml](../clippy.toml) | Expand security-focused lint set |
+| Static security linting (Clippy + architecture lints) | [x] `p2` | [docs/security/SECURITY.md](./security/SECURITY.md), `cargo gears lint`, [clippy.toml](../clippy.toml) | Expand security-focused lint set |
 | Secrets handling | [x] `p2` | [docs/security/SECURITY.md](./security/SECURITY.md), [docs/pr-review/README.md](./pr-review/README.md) token guidance | Add repository-wide secrets policy doc |
 | Data protection rules | [x] `p2` | [docs/security/SECURITY.md](./security/SECURITY.md), secure ORM docs | Add data classification policy |
 | Access policies | [x] `p2` | [docs/security/SECURITY.md](./security/SECURITY.md), auth architecture docs | Add policy authoring guide |
@@ -202,8 +202,8 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 | Code templates | [x] `p2` | [docs/toolkit_unified_system/](./toolkit_unified_system/README.md) gear skeletons/patterns | Add dedicated starter templates folder |
 | PR templates | [x] `p2` | [CONTRIBUTING.md](../CONTRIBUTING.md) PR description template, [docs/pr-review/code-review-template.md](./pr-review/code-review-template.md) | Add `.github/PULL_REQUEST_TEMPLATE.md` |
 | Reference implementations | [x] `p2` | [examples/toolkit](../examples/toolkit), [docs/toolkit_unified_system/](./toolkit_unified_system/README.md) | Curate “golden reference gears” list |
-| Good examples | [x] `p2` | Lint/gear examples in [tools/dylint_lints/README.md](../tools/dylint_lints/README.md), [examples/](../examples) | Add explicit tagged good examples index |
-| Bad examples | [x] `p2` | Dylint bad patterns in [tools/dylint_lints/README.md](../tools/dylint_lints/README.md) + UI tests | Add cross-domain anti-pattern examples |
+| Good examples | [x] `p2` | Lint/gear examples in `cargo gears lint` rules, [examples/](../examples) | Add explicit tagged good examples index |
+| Bad examples | [x] `p2` | Architecture lint bad patterns + UI tests (in `cargo-gears` CLI) | Add cross-domain anti-pattern examples |
 | Release checklist | [ ] `p3` | Partial in [docs/RELEASING.md](./RELEASING.md) | Add explicit release checklist doc |
 | Debug checklist | [ ] `p3` | Not formalized | Add debug triage checklist |
 | Issue templates | [ ] `p3` | Not found in `.github` | Add GitHub issue templates |
@@ -213,12 +213,12 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 | Item | Status / Phase / ID | Implemented (where) | Planned |
 |---|---|---|---|
 | API guidelines | [x] `p1` | [guidelines/README.md](../guidelines/README.md), [docs/toolkit_unified_system/](./toolkit_unified_system/README.md), ToolKit docs | Add API design quick-reference |
-| API versioning | [x] `p1` | Dylint DE0801 in [tools/dylint_lints/README.md](../tools/dylint_lints/README.md), [CONTRIBUTING.md](../CONTRIBUTING.md) | Add auto-check for docs/version sync |
-| Contract rules | [x] `p1` | Dylint DE01xx/DE02xx/DE03xx in [tools/dylint_lints/README.md](../tools/dylint_lints/README.md) | Expand contract lint set |
+| API versioning | [x] `p1` | Architecture lint DE0801 (via `cargo gears lint`), [CONTRIBUTING.md](../CONTRIBUTING.md) | Add auto-check for docs/version sync |
+| Contract rules | [x] `p1` | Architecture lints DE01xx/DE02xx/DE03xx (via `cargo gears lint`) | Expand contract lint set |
 | Error handling standards | [x] `p1` | [docs/toolkit_unified_system/05_errors_rfc9457.md](./toolkit_unified_system/05_errors_rfc9457.md), [docs/toolkit_unified_system/](./toolkit_unified_system/README.md) | Add repository-wide error taxonomy |
 | Configuration management | [x] `p1` | [README.md](../README.md) config section, [docs/toolkit_unified_system/](./toolkit_unified_system/README.md) | Add config schema validation policy |
 | Data model conventions | [x] `p2` | [docs/toolkit_unified_system/](./toolkit_unified_system/README.md), [docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md](./toolkit_unified_system/02_gear_layout_and_sdk_pattern.md) | Add canonical model naming matrix |
-| Schema rules | [x] `p2` | GTS + OData + OpenAPI references in ToolKit docs and dylint DE09xx | Add schema compatibility checklist |
+| Schema rules | [x] `p2` | GTS + OData + OpenAPI references in ToolKit docs and architecture lints DE09xx | Add schema compatibility checklist |
 | Migration rules | [x] `p2` | Secure ORM and gear infra patterns in ToolKit docs + [docs/toolkit_unified_system/](./toolkit_unified_system/README.md) | Add explicit DB migration policy doc |
 | Environment configs | [x] `p2` | [README.md](../README.md) env overrides, [docs/TRACING_SETUP.md](./TRACING_SETUP.md) | Add per-environment config matrix |
 | Feature flags | [ ] `p3` | Mentioned as target in architecture docs | Add standard feature-flag framework |
@@ -249,8 +249,8 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 | Decision records (ADR) | [x] `p1` | [docs/spec-templates/gears-sdlc/ADR/template.md](./spec-templates/gears-sdlc/ADR/template.md), [docs/adrs/](./adrs) | Add ADR index by domain |
 | Design documents | [x] `p1` | [docs/spec-templates/gears-sdlc/DESIGN/template.md](./spec-templates/gears-sdlc/DESIGN/template.md), gear docs | Add quality gates for design docs |
 | Common workflows | [x] `p2` | [Makefile](../Makefile), [tools/scripts/ci.py](../tools/scripts/ci.py), [docs/pr-review/README.md](./pr-review/README.md) | Add workflow cookbook |
-| Anti-patterns | [x] `p2` | [docs/checklists/](./checklists), [tools/dylint_lints/README.md](../tools/dylint_lints/README.md) | Add unified anti-pattern catalog |
-| Common mistakes | [x] `p2` | [tools/dylint_lints/AGENTS.md](../tools/dylint_lints/AGENTS.md) pitfalls, checklists | Add “top mistakes” short guide |
+| Anti-patterns | [x] `p2` | [docs/checklists/](./checklists), [architecture lints via cargo gears lint | Add unified anti-pattern catalog |
+| Common mistakes | [x] `p2` | [architecture lint rules and checklists (in cargo-gears CLI) | Add “top mistakes” short guide |
 | Support / escalation paths | [x] `p2` | [SECURITY.md](../SECURITY.md), [CONTRIBUTING.md](../CONTRIBUTING.md) | Add general (non-security) escalation flow |
 | Proposal process | [x] `p2` | Spec-driven flow in [docs/spec-templates/README.md](./spec-templates/README.md) | Add formal RFC/proposal workflow |
 | Glossary | [ ] `p3` | Not centralized | Add glossary document |

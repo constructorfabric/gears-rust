@@ -1,0 +1,4 @@
+family     = "per-unit"
+role       = "publish"
+gates      = ["per_unit"]
+provenance = ["AC#60", "PRD §17.2"]

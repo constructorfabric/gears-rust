@@ -153,7 +153,6 @@ impl Gear for OutboundApiGatewayGear {
             .with_allow_http_upstream(cfg.allow_http_upstream)
             .with_websocket_idle_timeout(Duration::from_secs(cfg.websocket_idle_timeout_secs))
             .with_websocket_close_timeout(Duration::from_secs(cfg.websocket_close_timeout_secs))
-            .with_websocket_max_frame_size(cfg.websocket_max_frame_size_bytes)
             .with_streaming_idle_timeout(Duration::from_secs(cfg.streaming_idle_timeout_secs)),
         );
 

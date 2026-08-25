@@ -1,7 +1,7 @@
 [package]
 name = "cf-gears-usage-collector"
 description = "usage-collector gateway module"
-version = "0.2.2"
+version = "0.2.9"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -72,3 +72,10 @@ tokio = { workspace = true, features = ["test-util"] }
 # the gear never constructs an exporter at runtime (ToolKit owns it).
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 toolkit-gts = { workspace = true }
+# Test-only: parses `docs/usage-collector-v1.yaml` for the OpenAPI contract
+# conformance test.
+serde-saphyr = { workspace = true }
+# Test-only: `ServiceExt::oneshot` drives one request through the assembled
+# `Router` so `register_routes`' `Extension<Arc<Service>>` layer — invisible
+# to the OpenAPI registry — is pinned by dispatch.
+tower = { workspace = true }

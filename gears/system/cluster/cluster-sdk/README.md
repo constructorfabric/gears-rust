@@ -2,7 +2,7 @@
 
 `cf-gears-cluster-sdk` (lib `cluster_sdk`) is the shared, serde-free, dyn-safe
 contract foundation that every cluster coordination primitive — cache, leader
-election, distributed lock, and service discovery — builds on.
+election, and distributed lock — builds on.
 
 ## Overview
 

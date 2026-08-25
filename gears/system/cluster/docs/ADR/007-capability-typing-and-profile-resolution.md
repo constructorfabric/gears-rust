@@ -40,7 +40,7 @@ This requires three things:
 2. **A binding mechanism for selecting the right backend.** How does the consumer name which operator-configured profile to use?
 3. **A validation moment that fails loudly.** When does the SDK check requirements against the backend's actual characteristics, and how does it surface mismatches?
 
-An earlier iteration of the design used a single bundled `CapabilityClass { Standalone, Durable, InMemory, Coordination }` enum to express requirements across all four primitives at once. This collapsed three orthogonal axes — topology (single-node vs multi-node), persistence (volatile vs durable), and consistency (eventual vs linearizable) — into one fuzzy ordering. A `Coordination`-class consumer "obviously needs more than `Durable`," but is `Durable` weaker than or stronger than `InMemory`? The bundling forced false comparisons across axes that should be evaluated independently, and a primitive-agnostic enum could not express "this primitive needs linearizable, but that one is fine with eventually consistent."
+An earlier iteration of the design used a single bundled `CapabilityClass { Standalone, Durable, InMemory, Coordination }` enum to express requirements across all three primitives at once. This collapsed three orthogonal axes — topology (single-node vs multi-node), persistence (volatile vs durable), and consistency (eventual vs linearizable) — into one fuzzy ordering. A `Coordination`-class consumer "obviously needs more than `Durable`," but is `Durable` weaker than or stronger than `InMemory`? The bundling forced false comparisons across axes that should be evaluated independently, and a primitive-agnostic enum could not express "this primitive needs linearizable, but that one is fine with eventually consistent."
 
 For profile binding, an obvious choice is `String` profile names. The cluster picks up `profile: "event-broker"` and resolves accordingly. This works mechanically but spreads profile strings across every consumer call site, makes refactor-renames a sprawling find-and-replace, and provides no compile-time guarantee that two crates using the same profile spell it the same way.
 
@@ -57,7 +57,7 @@ Both problems share a root cause: under-typed APIs leak structural decisions int
 
 ## Considered Options
 
-1. **Bundled `CapabilityClass { Standalone, Durable, InMemory, Coordination }`** — one enum across all four primitives.
+1. **Bundled `CapabilityClass { Standalone, Durable, InMemory, Coordination }`** — one enum across all three primitives.
 2. **Struct-of-options requirements** — `Requirements { linearizable: bool, prefix_watch: bool, ... }` per primitive.
 3. **No validation** — declare nothing; rely on plugin opt-in to advertise their characteristics.
 4. **String profile names** — profile binding via `String`, no marker trait.
@@ -87,11 +87,6 @@ pub enum LeaderElectionCapability {
 pub enum LockCapability {
     Linearizable,
 }
-
-#[non_exhaustive]
-pub enum ServiceDiscoveryCapability {
-    MetadataFiltering,
-}
 ```
 
 Each variant maps to a concrete characteristic check:
@@ -102,7 +97,6 @@ Each variant maps to a concrete characteristic check:
 | `CacheCapability::PrefixWatch` | `ClusterCacheBackend::features()` | `.prefix_watch == true` |
 | `LeaderElectionCapability::Linearizable` | `LeaderElectionBackend::features()` | `.linearizable == true` |
 | `LockCapability::Linearizable` | `DistributedLockBackend::features()` | `.linearizable == true` |
-| `ServiceDiscoveryCapability::MetadataFiltering` | `ServiceDiscoveryBackend::features()` | `.metadata_pushdown == true` |
 
 `#[non_exhaustive]` on every enum lets the SDK add new capabilities without breaking consumers. Consumers that match on capability values must include a wildcard arm; in practice, consumers always pass a literal variant, never match against one.
 
@@ -178,7 +172,7 @@ impl<'a> CacheResolverBuilder<'a> {
 }
 ```
 
-Equivalent builders exist for `LeaderElectionV1`, `DistributedLockV1`, `ServiceDiscoveryV1`. Each returns its own per-primitive facade, takes its own per-primitive `*Capability` enum, and validates against its own per-primitive characteristic check. A cache resolver builder will not even type-check if you call `.require(MetadataFiltering)` — wrong enum.
+Equivalent builders exist for `LeaderElectionV1` and `DistributedLockV1`. Each returns its own per-primitive facade, takes its own per-primitive `*Capability` enum, and validates against its own per-primitive characteristic check. A cache resolver builder will not even type-check if you call `.require(LockCapability::Linearizable)` — wrong enum.
 
 ### Capability-mismatch fails startup
 
@@ -190,7 +184,7 @@ The error error-naming is deliberately precise — `ProfileNotSpecified` (you fo
 
 ### Consequences
 
-- **A cache resolver cannot accept a service-discovery capability.** The compiler rejects `CacheResolverBuilder::require(ServiceDiscoveryCapability::MetadataFiltering)` because the builder's `require` takes `CacheCapability`. Type errors at the call site are unmistakable.
+- **A cache resolver cannot accept a lock capability.** The compiler rejects `CacheResolverBuilder::require(LockCapability::Linearizable)` because the builder's `require` takes `CacheCapability`. Type errors at the call site are unmistakable.
 - **Profile names live in one place.** Refactoring a profile name is one `const NAME` edit. No find-and-replace across the consumer crate.
 - **Compile-time profile typing.** Two crates that both consume profile `"event-broker"` either share a `ClusterProfile` ZST (in a shared crate) or each defines its own. The latter is fine — they happen to name the same string. No cross-crate string mismatch is possible because the resolver matches on `P::NAME` only, not on the ZST identity.
 - **Capability validation is one function call per requirement.** The validation logic is per-primitive but trivial: match the capability variant, check the backend method, return `Err` if mismatched. No reflection, no schema introspection.
@@ -200,7 +194,7 @@ The error error-naming is deliberately precise — `ProfileNotSpecified` (you fo
 
 ### Confirmation
 
-- A compile-fail test attempts `ClusterCacheV1::resolver(&hub).require(ServiceDiscoveryCapability::MetadataFiltering)` and verifies it fails to compile (wrong capability type for the cache builder).
+- A compile-fail test attempts `ClusterCacheV1::resolver(&hub).require(LockCapability::Linearizable)` and verifies it fails to compile (wrong capability type for the cache builder).
 - A unit test resolves with no `.profile(...)` call and asserts `Err(ClusterError::ProfileNotSpecified)`.
 - A unit test resolves a profile that has no binding registered in ClientHub and asserts `Err(ClusterError::ProfileNotBound { profile: "event-broker" })`.
 - An integration test against a stub `ClusterCacheBackend` declaring `consistency() == EventuallyConsistent` resolves with `.require(CacheCapability::Linearizable)` and asserts `Err(ClusterError::CapabilityNotMet { primitive: "cache", capability: "Linearizable", provider: "MemCacheBackend" })`.
@@ -212,7 +206,7 @@ The error error-naming is deliberately precise — `ProfileNotSpecified` (you fo
 
 - Good, because one enum is fewer types to learn.
 - Bad, because it collapses three orthogonal axes into one fuzzy ordering. `Coordination` is "stronger than" `Durable` for what reason? `InMemory` excludes `Durable` — but does it exclude `Coordination`? Each comparison requires a paragraph of explanation.
-- Bad, because a primitive-agnostic enum cannot express per-primitive requirements. A consumer that needs linearizable cache but is fine with eventually consistent service discovery cannot say so.
+- Bad, because a primitive-agnostic enum cannot express per-primitive requirements. A consumer that needs a linearizable lock but is fine with an eventually-consistent cache cannot say so.
 - Bad, because adding new requirements means adding new variants to the same enum, mixing axes further. After a year, the enum has 12 variants and operators have to memorize the partial ordering between them.
 - Bad, because the validation logic is forced into a `match`-and-priority-comparison shape that is hard to maintain and harder to test exhaustively.
 - Neutral, because some consumers don't care about the distinctions and would happily use a single class — but those consumers can use Option 5's per-primitive enums with zero requirements (`.resolve()` without any `.require(...)`) and get the same simplicity.
@@ -258,13 +252,13 @@ ClusterCacheV1::resolver(&hub).profile("event-broker").require(...)
 
 ### Option 5: Per-primitive `*Capability` enums + typed `ClusterProfile` marker (CHOSEN)
 
-- Good, because per-primitive types make wrong-axis errors compile failures (a cache resolver cannot accept a service-discovery capability).
+- Good, because per-primitive types make wrong-axis errors compile failures (a cache resolver cannot accept a lock capability).
 - Good, because each capability variant maps to a concrete backend characteristic check — no fuzzy tiering.
 - Good, because `#[non_exhaustive]` lets the SDK add capabilities without breaking consumers.
 - Good, because the typed profile marker keeps profile strings to one place per consumer crate.
 - Good, because the fluent builder reads naturally at the call site (`.profile(P).require(Cap).resolve()`) and produces actionable error messages on mismatch.
 - Good, because the resolver shape composes cleanly with the per-primitive facade pattern (per ADR-005) — each builder returns the matching `*V1`.
-- Bad, because four `*Capability` enums and four resolver builders are more types than one bundled enum and one resolver. Worth it for the type-safety guarantees.
+- Bad, because three `*Capability` enums and three resolver builders are more types than one bundled enum and one resolver. Worth it for the type-safety guarantees.
 - Bad, because consumer crates must define a `ClusterProfile` ZST per profile they use. One impl per profile per consumer crate — a small ceremony, paid once per consumer.
 - Neutral, because the trade-off (more types, stronger guarantees) is the same shape we chose in ADR-005 (more types per primitive, two evolution lifecycles). Consistent design philosophy.
 
@@ -282,7 +276,7 @@ ClusterCacheV1::resolver(&hub).profile("event-broker").require(...)
 
 **References:**
 
-- ADR-001 — backend compatibility. The cache `consistency()`, leader-election `features().linearizable`, lock `features().linearizable`, and service-discovery `features().metadata_pushdown` checks reference the per-backend characteristics this ADR validates against.
+- ADR-001 — backend compatibility. The cache `consistency()`, leader-election `features().linearizable`, and lock `features().linearizable` checks reference the per-backend characteristics this ADR validates against.
 - ADR-005 — facade + backend trait pattern. The fluent resolver returns the per-primitive facade; without per-primitive facades, the resolver couldn't express per-primitive return types.
 - ADR-006 — builder/handle lifecycle. The resolver is invoked from inside the consumer's `RunnableCapability::start()`, which is what makes capability validation a startup check.
 - DESIGN.md §3.6 (resolution pattern), §3.10 (capability validation).

@@ -118,21 +118,22 @@ Included in `oagw` crate (`infra/plugin/`):
 **Auth Plugins**:
 
 - `ApiKeyAuthPlugin`: API key injection (header/query)
-- `BasicAuthPlugin`: HTTP Basic authentication
-- `BearerTokenAuthPlugin`: Bearer token injection
-- `OAuth2ClientCredPlugin`: OAuth2 client credentials flow
+- `NoopAuthPlugin`: No authentication
+- `OAuth2ClientCredAuthPlugin`: OAuth2 client credentials flow (registered twice — `Form` and `Basic` client-auth-method variants — see [ADR: OAuth2 Client Credentials Auth Plugin](./0016-oauth2-client-credentials-auth-plugin.md))
+
+`cf.core.oagw.basic.v1` and `cf.core.oagw.bearer.v1` are reserved GTS identifiers cataloged in the types-registry with no backing `AuthPlugin` implementation in `infra/plugin/`.
 
 **Guard Plugins**:
 
-- `TimeoutGuardPlugin`: Request timeout enforcement
-- `CorsGuardPlugin`: CORS preflight validation
-- `RateLimitGuardPlugin`: Rate limiting (token bucket)
+- `RequiredHeadersGuardPlugin`: Required header enforcement (request/response)
+
+Request timeout and CORS are core Data Plane logic, not `GuardPlugin` trait implementations in `infra/plugin/` — see [ADR: CORS](./0006-cors.md). Their GTS identifiers (`cf.core.oagw.timeout.v1`, `cf.core.oagw.cors.v1`) exist for types-registry cataloging only and are not resolvable via `GuardPluginRegistry`.
 
 **Transform Plugins**:
 
-- `LoggingTransformPlugin`: Request/response logging
-- `MetricsTransformPlugin`: Prometheus metrics collection
 - `RequestIdTransformPlugin`: X-Request-ID propagation
+
+Request/response logging and Prometheus metrics collection are core Data Plane instrumentation (`infra/metrics.rs`, `tracing`), not `TransformPlugin` trait implementations. Their GTS identifiers (`cf.core.oagw.logging.v1`, `cf.core.oagw.metrics.v1`) exist for types-registry cataloging only and are not resolvable via `TransformPluginRegistry`.
 
 ### External Plugins
 

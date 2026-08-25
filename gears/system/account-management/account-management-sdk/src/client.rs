@@ -1,8 +1,8 @@
 //! Public inter-gear client trait for the Account Management gear.
 //!
-//! [`AccountManagementClient`] is the single seam other gears /
-//! plugins / the AM REST handler call into to drive AM's tenant and
-//! user surfaces. Consumers obtain it from `ClientHub`:
+//! [`AccountManagementClient`] is the single seam other gears and
+//! plugins call into to drive AM's tenant, user, service-account, and
+//! metadata surfaces. Consumers obtain it from `ClientHub`:
 //!
 //! ```ignore
 //! let client = ctx.client_hub().get::<dyn AccountManagementClient>()?;
@@ -60,6 +60,7 @@ use uuid::Uuid;
 
 use toolkit_canonical_errors::CanonicalError;
 
+use crate::idp_service_account::{IdpServiceAccountCredentials, IdpServiceAccountSummary};
 use crate::idp_user::{IdpNewUser, IdpUser, IdpUserPatch, ListUsersQuery};
 use crate::metadata::{MetadataEntry, UpsertMetadataRequest};
 use crate::tenant::{CreateTenantRequest, Tenant, UpdateTenantRequest};
@@ -385,6 +386,67 @@ pub trait AccountManagementClient: Send + Sync + 'static {
         user_id: Uuid,
         patch: IdpUserPatch,
     ) -> Result<IdpUser, CanonicalError>;
+
+    // -----------------------------------------------------------------
+    // Service accounts — PEP-gated inside the impl by `ServiceAccountService`
+    // -----------------------------------------------------------------
+
+    // @cpt-begin:cpt-cf-account-management-dod-service-accounts-contract-trait-surface:p1:inst-dod-sa-am-client-trait-surface
+    /// Create a tenant-scoped machine identity and return its credentials.
+    /// The client secret is returned only by this operation and
+    /// [`Self::rotate_service_account_secret`]; callers must persist it
+    /// immediately because AM provides no credential read-back method.
+    ///
+    /// # Errors
+    ///
+    /// * `PermissionDenied` — the caller cannot create service accounts
+    ///   for `tenant_id`.
+    /// * `NotFound` — the tenant is absent or outside the caller's scope.
+    /// * `InvalidArgument` — the tenant is inactive, AM boundary validation
+    ///   failed, or the provider rejected the requested name/scopes.
+    /// * `Aborted` — creation may have landed at the provider; reconcile by
+    ///   calling [`Self::list_service_accounts`] rather than blindly retrying.
+    /// * `Unimplemented` — the configured `IdP` does not support service accounts.
+    /// * `ServiceUnavailable` — a clean provider or platform dependency failure.
+    async fn create_service_account(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        name: String,
+        scopes: Vec<String>,
+    ) -> Result<IdpServiceAccountCredentials, CanonicalError>;
+
+    /// List every service account owned by `tenant_id`. The entries never
+    /// contain credentials; `name` is the correlation key for reconciling an
+    /// ambiguous create.
+    async fn list_service_accounts(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+    ) -> Result<Vec<IdpServiceAccountSummary>, CanonicalError>;
+
+    /// Generate and return a new secret for the tenant-owned `client_id`.
+    /// The old secret is invalid after a successful return. An absent or
+    /// foreign account returns `NotFound`; an uncertain mutation returns
+    /// `Aborted` and must not be blindly retried.
+    async fn rotate_service_account_secret(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        client_id: &str,
+    ) -> Result<IdpServiceAccountCredentials, CanonicalError>;
+
+    /// Revoke the tenant-owned `client_id`. Account absence is folded into
+    /// success, making repeated revocation idempotent. Tenant absence still
+    /// returns `NotFound`, and an uncertain provider mutation returns
+    /// `Aborted` rather than simulated success.
+    async fn revoke_service_account(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        client_id: &str,
+    ) -> Result<(), CanonicalError>;
+    // @cpt-end:cpt-cf-account-management-dod-service-accounts-contract-trait-surface:p1:inst-dod-sa-am-client-trait-surface
 
     // -----------------------------------------------------------------
     // Tenant metadata — PEP-gated inside the impl by `MetadataService::authorize`

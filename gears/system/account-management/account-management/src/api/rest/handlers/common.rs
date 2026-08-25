@@ -20,8 +20,8 @@ pub(super) fn clamp_listing_top(mut query: ODataQuery, max_top: u32) -> ODataQue
 /// Reject any query parameter that does not start with `$`.
 ///
 /// AM list endpoints use `OData` as the single filter / ordering /
-/// pagination surface (`$filter`, `$orderby`, `$top`, `$skip`,
-/// `$select`, `$count`). Without this guard, Axum silently drops
+/// pagination surface (`$filter`, `$orderby`, `$select`, `$top`,
+/// `$skiptoken`). Without this guard, Axum silently drops
 /// query keys that no extractor claimed — a caller writing in a
 /// generic-REST convention like `?status=approved` would receive
 /// HTTP 200 with the **unfiltered** result set and assume the filter
@@ -35,9 +35,10 @@ pub(super) fn clamp_listing_top(mut query: ODataQuery, max_top: u32) -> ODataQue
 /// envelope.
 ///
 /// `$`-prefixed keys are intentionally out of scope: the `OData`
-/// extractor parses them and rejects unknown ones (`$filtre` etc.)
-/// through its own `Validation` path. This check is the seam for
-/// non-`OData` accidents only.
+/// extractor binds the options in
+/// `toolkit::api::odata::ACCEPTED_SYSTEM_QUERY_OPTIONS` and rejects
+/// every other `$` key (`$skip`, `$count`, `$filtre`) with its own
+/// `400`. This check is the seam for non-`OData` accidents only.
 pub(super) fn reject_non_odata_params(query: &HashMap<String, String>) -> Result<(), DomainError> {
     if let Some(unknown) = query.keys().find(|k| !k.starts_with('$')) {
         return Err(DomainError::Validation {

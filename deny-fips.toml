@@ -1,6 +1,6 @@
 # cargo-deny configuration enforced **only** when building with
 # `--features fips`. Run via `make fips-policy` (or
-# `cargo deny check bans --config deny-fips.toml`).
+# `cargo deny --config deny-fips.toml check bans`).
 #
 # This file extends `deny.toml` with stricter dependency-graph rules that
 # encode our FIPS 140-3 boundary policy:

@@ -61,22 +61,36 @@ existing `deps` metadata for readiness gating.
 * Liveness returns `200 OK` as soon as the HTTP server is listening (process is alive, not deadlocked).
 * **Readiness has four states** mapped to the gear lifecycle:
     - **Starting** → `503` with body `{"state":"starting","unresolved_deps":[...]}`. Returned until all `deps` are
-      resolved AND every registered custom check returns `Ready`.
+      resolved AND the gear's registered healthcheck reports it can serve (`Healthy`/`Degraded`).
     - **Ready** → `200` with body `{"state":"ready"}`. Gear is fully serving traffic.
-    - **Degraded** → `200` with body `{"state":"degraded","reasons":[...]}`. At least one custom check returned
-      `Degraded` (e.g. Redis down, but cache fallback is acceptable). Still serves traffic — operators read the body to
-      decide whether to page.
+    - **Degraded** → `200` with body `{"state":"degraded"}`. The gear's healthcheck returned
+      `Degraded` (e.g. Redis down, but cache fallback is acceptable). Still serves traffic; operators read `/health`
+      for the per-component report to decide whether to page.
     - **Draining** → `503` with body `{"state":"draining"}`. Set by the SIGTERM handler before deregistering from
       DirectoryService, so kubernetes / gateway upstream removes the instance from LB pools while in-flight requests
-      complete (see DESIGN.md § Drain order).
-* Gears MAY register custom readiness checks via `ctx.runtime().register_readiness_check(name, impl ReadinessCheck)`.
-  Checks are polled on every `/readyz` request with 1s cache; `NotReady` from any check forces `Starting` state.
-* Gears with no `deps` and no custom checks (e.g., Flight Control itself, types-registry) become ready immediately
+      complete (see `cpt-cf-component-oop-bootstrap`).
+    - The body carries a boolean `ready` mirror (`true` for `ready`/`degraded`) so clients need not know
+      the `state → status` mapping. `unresolved_deps` is omitted when empty.
+    - A separate `/health` endpoint returns the full `health` report (aggregate `status` + per-component detail,
+      identical to the in-process `api-gateway` `/health` body). `/readyz` uses this report internally to determine
+      readiness, but does not echo it in its response body.
+    - **Registration status is not a readiness signal.** Self-registration is a background retry loop; transient
+      DirectoryService or network failures must not pull a healthy pod out of rotation. Directory visibility is
+      tracked by heartbeats, logs, and metrics (and can be exposed as a `/health` component), not by the readiness
+      probe.
+* Readiness reuses the framework's standard healthcheck mechanism: a gear returns one composite `Healthcheck` from
+  `RestApiCapability::healthcheck()` and it is honored identically in-process (`api-gateway`) and OoP. The OoP bootstrap
+  aggregates these in a shared `RestHealthcheckRegistry`, evaluated on every `/readyz` and `/health` request (checks run
+  concurrently, timeout-bounded, panic-isolated, cached to avoid storm; per-check timeout configurable via
+  `oop_http.healthcheck_timeout_ms`). `Unhealthy` from the check forces `Starting`/`503`; `Degraded` stays `200`.
+  The full per-component health report is returned by `/health`; `/readyz` only uses the aggregate status internally.
+* Gears with no `deps` and no healthcheck (e.g., Flight Control itself, types-registry) become ready immediately
   after `start()`.
-* **Use `startupProbe` for slow-bootstrapping gears.** k8s `startupProbe` runs before liveness/readiness and has its
-  own (typically longer) failure budget. A gear that needs ≥30s to warm caches or fetch initial state from a remote
-  source MUST declare a `startupProbe` in its Helm chart pointing at `/readyz` with `failureThreshold` sized to its
-  worst-case bootstrap time. Without `startupProbe`, the liveness budget would force k8s to kill the pod mid-bootstrap.
+* **`startupProbe` is an optional safety-net.** The framework serves `/healthz` as soon as the listener binds —
+  *before* the gear's `start()` phase (see `cpt-cf-component-oop-bootstrap`) — so a slow bootstrap no longer trips the
+  liveness budget and a `startupProbe` is **not** required. Gears with very long bootstraps MAY still declare one
+  (pointing at `/readyz`) to defer liveness/readiness evaluation and suppress not-ready noise during a known startup
+  window.
 * The Helm chart library (`toolkit-common`) configures `livenessProbe`, `readinessProbe`, and a conservative
   `startupProbe` (failureThreshold=30, periodSeconds=5 → 150s bootstrap budget) by default; gears tune
   `startupProbe.failureThreshold` per their `deps` count and external-resource expectations. No init containers are
@@ -157,6 +171,7 @@ The OoP bootstrap (`toolkit::bootstrap::oop`) gains these framework-managed beha
 │  1. Start HTTP server (Axum)                             │
 │     └─ /healthz → 200 (immediate)                        │
 │     └─ /readyz  → 503 until deps resolved                │
+│     └─ /health  → full healthcheck report                │
 │     └─ /openapi.json → gear's OpenAPI spec               │
 │     └─ /{gear-routes} → gear's OperationBuilder routes   │
 │                                                          │
@@ -182,43 +197,45 @@ The OoP bootstrap (`toolkit::bootstrap::oop`) gains these framework-managed beha
 
 **`/healthz` (liveness)**:
 
-```json
-{
-  "status": "alive"
-}
+```
+ok
 ```
 
-Always 200 once HTTP server is up.
+Always `200 OK` with the plain body `ok` once the HTTP server is listening.
 
-**`/readyz` (readiness)** — not ready:
-
-```json
-{
-  "status": "starting",
-  "deps": {
-    "authn-resolver": "waiting",
-    "types-registry": "resolved"
-  },
-  "registered": false
-}
-```
-
-Returns 503.
-
-**`/readyz` (readiness)** — ready:
+**`/readyz` (readiness)** — not ready (`503`):
 
 ```json
 {
-  "status": "ready",
-  "deps": {
-    "authn-resolver": "resolved",
-    "types-registry": "resolved"
-  },
-  "registered": true
+  "state": "starting",
+  "ready": false,
+  "unresolved_deps": ["authn-resolver"]
 }
 ```
 
-Returns 200.
+The `503` status comes from `ready: false`.
+
+**`/readyz` (readiness)** — ready (`200`):
+
+```json
+{
+  "state": "ready",
+  "ready": true
+}
+```
+
+`unresolved_deps` is omitted from the body when empty.
+
+**`/health` (diagnostics)** — healthy (`200`):
+
+```json
+{
+  "status": "healthy",
+  "components": []
+}
+```
+
+`/health` returns the full per-component `HealthcheckReport` (same body as `api-gateway` `/health`). `Unhealthy` returns `503`; `Healthy` and `Degraded` return `200`.
 
 ### Interaction with Existing `deps` Macro
 

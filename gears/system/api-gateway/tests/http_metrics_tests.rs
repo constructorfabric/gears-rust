@@ -154,7 +154,7 @@ async fn metrics_capture_successful_request() -> Result<()> {
     let router = OperationBuilder::get("/tests/v1/items")
         .operation_id("test:list-items")
         .summary("List items")
-        .public()
+        .anonymous()
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::get(ok_handler))
         .register(Router::new(), &api);
@@ -211,7 +211,7 @@ async fn metrics_capture_mime_rejection() -> Result<()> {
     let router = builder
         .operation_id("test:create-item")
         .summary("Create item")
-        .public()
+        .anonymous()
         .allow_content_types(&["application/json"])
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::post(ok_handler))
@@ -279,7 +279,7 @@ async fn metrics_capture_rate_limit() -> Result<()> {
     let router = builder
         .operation_id("test:limited")
         .summary("Rate-limited endpoint")
-        .public()
+        .anonymous()
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::get(ok_handler))
         .register(Router::new(), &api);
@@ -343,7 +343,7 @@ async fn metrics_route_attribute_uses_template() -> Result<()> {
     let router = OperationBuilder::get("/tests/v1/items/{id}")
         .operation_id("test:get-item")
         .summary("Get item")
-        .public()
+        .anonymous()
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::get(ok_handler))
         .register(Router::new(), &api);
@@ -399,7 +399,7 @@ async fn metrics_unmatched_route() -> Result<()> {
     let router = OperationBuilder::get("/tests/v1/items")
         .operation_id("test:list-items")
         .summary("List items")
-        .public()
+        .anonymous()
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::get(ok_handler))
         .register(Router::new(), &api);
@@ -469,7 +469,7 @@ async fn metrics_prefix_applied_to_instrument_names() -> Result<()> {
     let router = OperationBuilder::get("/tests/v1/items")
         .operation_id("test:list-items")
         .summary("List items")
-        .public()
+        .anonymous()
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::get(ok_handler))
         .register(Router::new(), &api);

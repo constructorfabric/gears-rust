@@ -40,6 +40,5 @@ pub use wiring::{ClusterHandle, ClusterWiring, ClusterWiringBuilder, ProfileBack
 // Re-exported for convenience: plugins implement these from the SDK, but the
 // config-driven wiring API surfaces them here too.
 pub use cluster_sdk::{
-    ClusterCacheProvider, ClusterLeaderElectionProvider, ClusterLockProvider,
-    ClusterServiceDiscoveryProvider, StopHook,
+    ClusterCacheProvider, ClusterLeaderElectionProvider, ClusterLockProvider, StopHook,
 };

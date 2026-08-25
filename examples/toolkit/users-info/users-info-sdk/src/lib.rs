@@ -62,7 +62,8 @@ pub mod odata;
 // Re-export main types at crate root for convenience
 #[cfg(feature = "odata")]
 pub use client::{
-    AddressesStreamingClientV1, CitiesStreamingClientV1, UsersInfoClientV1, UsersStreamingClientV1,
+    AddressesStreamingClientV1, CitiesStreamingClientV1, UsersInfoClientV1, UsersInfoStream,
+    UsersStreamingClientV1,
 };
 pub use gts::{ADDRESS_RESOURCE_TYPE, CITY_RESOURCE_TYPE, USER_RESOURCE_TYPE};
 pub use models::{

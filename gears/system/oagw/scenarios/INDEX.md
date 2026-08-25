@@ -328,6 +328,14 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 - **Scenario**: [positive-14.2-auth-injected-during-handshake.md](protocols/websocket/positive-14.2-auth-injected-during-handshake.md)
 - **Mechanism**: Upstream sees auth header on upgrade request. Subsequent WS frames forwarded unchanged.
 
+#### Frame relayed intact when split across multiple reads
+- **Scenario**: [positive-14.6-frame-relayed-intact-across-split-reads.md](protocols/websocket/positive-14.6-frame-relayed-intact-across-split-reads.md)
+- **Mechanism**: Header and payload sent as separate writes. Upstream receives byte-identical frame — relay never needs a whole frame at once.
+
+#### Fragmented message of any size relayed without a cap
+- **Scenario**: [positive-14.7-fragmented-message-relayed-without-size-limit.md](protocols/websocket/positive-14.7-fragmented-message-relayed-without-size-limit.md)
+- **Mechanism**: Large multi-fragment message relayed in full. No Close 1009 — there is no per-frame or per-message size limit to configure.
+
 ---
 
 ### gRPC
@@ -725,6 +733,10 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 #### WS connection idle timeout enforced
 - **Scenario**: [negative-14.4-ws-connection-idle-timeout-enforced.md](protocols/websocket/negative-14.4-ws-connection-idle-timeout-enforced.md)
 - **What happens**: Idle connection closed after configured timeout.
+
+#### Stalled caller does not block upstream's graceful close
+- **Scenario**: [negative-14.5-stalled-caller-does-not-block-upstream-close.md](protocols/websocket/negative-14.5-stalled-caller-does-not-block-upstream-close.md)
+- **What happens**: Caller stops reading; upstream still gets Close 1001 and a half-close within the close timeout. Each side's announcement has its own grace budget.
 
 ---
 

@@ -1,5 +1,4 @@
-//! BSS Billing Ledger gear.
-
+#![doc = include_str!("../README.md")]
 // Tracked lint-debt (CI green without risky refactors of financial logic).
 // The workspace lint bar (`pedantic` + many restriction lints, all `deny`)
 // flags a set of lints in this crate that are either DOMAIN-INHERENT or purely
@@ -30,19 +29,12 @@
     clippy::let_underscore_must_use
 )]
 
-#[doc(hidden)]
 pub mod api;
-#[doc(hidden)]
 pub mod authz;
-#[doc(hidden)]
 pub mod config;
-#[doc(hidden)]
 pub mod domain;
-#[doc(hidden)]
 pub mod gts;
-#[doc(hidden)]
 pub mod infra;
-#[doc(hidden)]
 pub mod module;
 /// `OData` filter-field enums for the row-collection list endpoints
 /// (`accounts` / `journal-lines` / `balances`).

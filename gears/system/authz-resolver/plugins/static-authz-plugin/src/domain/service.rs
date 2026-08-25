@@ -12,7 +12,8 @@ use uuid::Uuid;
 /// Static `AuthZ` resolver service.
 ///
 /// - Returns `decision: true` with an `in` predicate on `pep_properties::OWNER_TENANT_ID`
-///   scoped to the context tenant from the request (for all operations including CREATE).
+///   scoped to the context tenant from the request (for all operations including CREATE),
+///   when the PEP declares that property in `context.supported_properties`.
 /// - Additionally emits parallel `InTenantSubtree(<prop>, tid)` constraints (one per
 ///   tenant-shaped supported property) when the PEP advertises
 ///   [`Capability::TenantHierarchy`]. This lets entities whose `Scopable` declaration
@@ -26,7 +27,12 @@ use uuid::Uuid;
 ///   property doesn't resolve to a column on the entity being queried -- so the
 ///   addition is invisible to PEPs that don't advertise the capability and to entities
 ///   that don't expose the property.
-/// - Denies access (`decision: false`) when no valid tenant can be resolved.
+/// - Emits an empty constraint set when the PEP declares none of the properties above.
+///   The PEP compiler turns that into `allow_all()`, or a deny under
+///   `require_constraints` -- this service does not repeat that matrix. Such a permit
+///   means "no row filter", never "the caller owns this row".
+/// - Denies access (`decision: false`) when no valid tenant can be resolved, before any
+///   constraint is built.
 #[domain_model]
 #[derive(Default)]
 pub struct Service;
@@ -73,14 +79,22 @@ impl Service {
             };
         }
 
-        // Baseline OWNER_TENANT_ID clamp -- the universal shape every PEP can bind
-        // when its entity declares `tenant_col`.
-        let mut constraints = vec![Constraint {
-            predicates: vec![Predicate::In(InPredicate::new(
-                pep_properties::OWNER_TENANT_ID,
-                [tid],
-            ))],
-        }];
+        // Baseline OWNER_TENANT_ID clamp -- the universal shape a PEP binds when its
+        // entity declares `tenant_col`. Emitted only when the PEP declares that property:
+        // the compiler fails any constraint naming something outside
+        // `context.supported_properties` (`authz-resolver-sdk/src/pep/compiler.rs`), so an
+        // undeclared clamp is dead on arrival -- and as the only constraint it failed the
+        // whole set (`AllConstraintsFailed`, a deny), losing every request for a
+        // platform-global resource that declares no property at all.
+        let mut constraints = Vec::new();
+        if supports_property(request, pep_properties::OWNER_TENANT_ID) {
+            constraints.push(Constraint {
+                predicates: vec![Predicate::In(InPredicate::new(
+                    pep_properties::OWNER_TENANT_ID,
+                    [tid],
+                ))],
+            });
+        }
 
         // Closes the gap from `gears-rust#1813` (plugin half) for the dev stack:
         // PEPs that advertise `Capability::TenantHierarchy` get an
@@ -114,6 +128,23 @@ impl Service {
                     });
                 }
             }
+        }
+
+        // No constraint means the PEP declared none of the properties above. The compiler
+        // owns what that means -- `allow_all()`, or a deny under `require_constraints`
+        // (`compiler.rs` Step 1, pinned by the composition tests) -- so there is no deny of
+        // our own here. That Step 1 returns without logging, hence the warn.
+        //
+        // Do not narrow the required case with `resource.properties[OWNER_TENANT_ID]`
+        // instead: this plugin has no tenant tree, so it cannot tell an ancestor from a
+        // stranger, and an equality check denies the ancestor-tenant requests the AM e2e
+        // suites exercise.
+        if constraints.is_empty() && request.context.require_constraints {
+            tracing::warn!(
+                resource_type = %request.resource.resource_type,
+                "static-authz: PEP requires constraints but declares none of the properties \
+                 this plugin constrains -- the PEP compiler will fail this closed",
+            );
         }
 
         EvaluationResponse {

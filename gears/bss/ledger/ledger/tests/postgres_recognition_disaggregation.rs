@@ -59,7 +59,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -106,7 +106,7 @@ fn account(
 }
 
 async fn open_period(raw: &DatabaseConnection, s: &Seller, period_id: &str) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{period_id}','UTC','OPEN')",
         s.tenant, s.tenant
@@ -119,7 +119,7 @@ async fn open_period(raw: &DatabaseConnection, s: &Seller, period_id: &str) {
 /// [`open_period`]; this flips one to CLOSED so an E-2 missed-close is observable:
 /// `fiscal_period` is mutable, unlike the append-only journal).
 async fn close_period(raw: &DatabaseConnection, s: &Seller, period_id: &str) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_fiscal_period SET status='CLOSED' \
          WHERE tenant_id='{}' AND period_id='{period_id}'",
         s.tenant

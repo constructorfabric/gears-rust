@@ -1,4 +1,8 @@
-//! Infrastructure layer.
+//! Infrastructure adapters and application-service orchestration.
+//!
+//! Implements persistence, posting workflows, authorization adapters, event and
+//! metrics emission, audit controls, background jobs, and the concrete services
+//! that connect the pure domain to ToolKit capabilities.
 
 pub mod adjustment;
 pub mod annotation;

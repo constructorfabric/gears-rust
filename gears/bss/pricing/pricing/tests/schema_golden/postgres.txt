@@ -1,0 +1,842 @@
+COLUMN bss.coord_leases attempts integer NOT NULL DEFAULT 0
+COLUMN bss.coord_leases key text NOT NULL DEFAULT -
+COLUMN bss.coord_leases locked_by uuid NULL DEFAULT -
+COLUMN bss.coord_leases locked_until timestamp with time zone NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamp with time zone
+COLUMN bss.pricing_approval approval_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_approval approver_principal uuid NULL DEFAULT -
+COLUMN bss.pricing_approval content_hash bytea NOT NULL DEFAULT -
+COLUMN bss.pricing_approval decided_at timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_approval materiality jsonb NOT NULL DEFAULT -
+COLUMN bss.pricing_approval reason text NULL DEFAULT -
+COLUMN bss.pricing_approval state text NOT NULL DEFAULT -
+COLUMN bss.pricing_approval subject_kind text NOT NULL DEFAULT -
+COLUMN bss.pricing_approval subject_ref text NOT NULL DEFAULT -
+COLUMN bss.pricing_approval submitted_at timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_approval submitter_principal uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_approval tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_approval_key approval_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_approval_key scope_key text NOT NULL DEFAULT -
+COLUMN bss.pricing_approval_key state text NOT NULL DEFAULT -
+COLUMN bss.pricing_approval_key tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_approval_threshold absolute_minor bigint NULL DEFAULT -
+COLUMN bss.pricing_approval_threshold created_at timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_approval_threshold created_by uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_approval_threshold currency character varying(3) NOT NULL DEFAULT -
+COLUMN bss.pricing_approval_threshold effective_from timestamp with time zone NOT NULL DEFAULT -
+COLUMN bss.pricing_approval_threshold percent_bp integer NULL DEFAULT -
+COLUMN bss.pricing_approval_threshold tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_approval_threshold version bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_approval_threshold_tombstone created_at timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_approval_threshold_tombstone created_by uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_approval_threshold_tombstone effective_from timestamp with time zone NOT NULL DEFAULT -
+COLUMN bss.pricing_approval_threshold_tombstone tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_approval_threshold_tombstone version bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_audit_log action text NOT NULL DEFAULT -
+COLUMN bss.pricing_audit_log actor_principal_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_audit_log after_state jsonb NULL DEFAULT -
+COLUMN bss.pricing_audit_log approval_ref uuid NULL DEFAULT -
+COLUMN bss.pricing_audit_log before_state jsonb NULL DEFAULT -
+COLUMN bss.pricing_audit_log chain_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_audit_log correlation_id uuid NULL DEFAULT -
+COLUMN bss.pricing_audit_log entry_kind text NOT NULL DEFAULT 'mutation'::text
+COLUMN bss.pricing_audit_log prev_hash bytea NULL DEFAULT -
+COLUMN bss.pricing_audit_log recorded_at timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_audit_log row_hash bytea NOT NULL DEFAULT -
+COLUMN bss.pricing_audit_log segment_heads jsonb NULL DEFAULT -
+COLUMN bss.pricing_audit_log seq bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_audit_log subject_kind text NOT NULL DEFAULT -
+COLUMN bss.pricing_audit_log subject_ref text NOT NULL DEFAULT -
+COLUMN bss.pricing_audit_log tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_brand_taxonomy display_name text NOT NULL DEFAULT -
+COLUMN bss.pricing_brand_taxonomy state text NOT NULL DEFAULT 'active'::text
+COLUMN bss.pricing_brand_taxonomy tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_brand_taxonomy value text NOT NULL DEFAULT -
+COLUMN bss.pricing_bulk_operation client_key text NOT NULL DEFAULT -
+COLUMN bss.pricing_bulk_operation completed_at timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_bulk_operation kind text NOT NULL DEFAULT -
+COLUMN bss.pricing_bulk_operation operation_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bulk_operation report jsonb NOT NULL DEFAULT '{}'::jsonb
+COLUMN bss.pricing_bulk_operation request_hash bytea NOT NULL DEFAULT '\x'::bytea
+COLUMN bss.pricing_bulk_operation state text NOT NULL DEFAULT -
+COLUMN bss.pricing_bulk_operation submitted_at timestamp with time zone NOT NULL DEFAULT -
+COLUMN bss.pricing_bulk_operation submitted_by uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bulk_operation tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bulk_row_lock bulk_operation_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bulk_row_lock locked_at timestamp with time zone NOT NULL DEFAULT -
+COLUMN bss.pricing_bulk_row_lock price_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bulk_row_lock tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle bundle_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle invoice_itemization text NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle plan_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle price_basis text NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_component bundle_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_component component_plan_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_component included_sku_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_component max_qty integer NULL DEFAULT -
+COLUMN bss.pricing_bundle_component min_qty integer NULL DEFAULT -
+COLUMN bss.pricing_bundle_component plan_revision bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_component tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_revshare bundle_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_revshare effective_share_bp integer NULL DEFAULT -
+COLUMN bss.pricing_bundle_revshare party text NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_revshare plan_revision bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_revshare share_bp integer NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_revshare tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_revshare vendor_sku_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_revshare_group bundle_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_revshare_group plan_revision bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_revshare_group platform_cut_bp integer NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_revshare_group residual_absorber_party text NOT NULL DEFAULT 'platform'::text
+COLUMN bss.pricing_bundle_revshare_group tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_bundle_revshare_group vendor_sku_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_catalog_version_ref catalog_version bigint NULL DEFAULT -
+COLUMN bss.pricing_catalog_version_ref commit_observed_at timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_catalog_version_ref committed_at timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_catalog_version_ref pending_ref text NOT NULL DEFAULT -
+COLUMN bss.pricing_catalog_version_ref requested_at timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_catalog_version_ref subject_effective_to timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_catalog_version_ref subject_kind text NOT NULL DEFAULT -
+COLUMN bss.pricing_catalog_version_ref subject_lifecycle_state text NULL DEFAULT -
+COLUMN bss.pricing_catalog_version_ref subject_ref text NOT NULL DEFAULT -
+COLUMN bss.pricing_catalog_version_ref subject_revision bigint NULL DEFAULT -
+COLUMN bss.pricing_catalog_version_ref tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_composite_meter composite_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_composite_meter constituent_units jsonb NOT NULL DEFAULT -
+COLUMN bss.pricing_composite_meter formula jsonb NOT NULL DEFAULT -
+COLUMN bss.pricing_composite_meter output_unit text NOT NULL DEFAULT -
+COLUMN bss.pricing_composite_meter plan_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_composite_meter plan_revision bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_composite_meter tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_customer_group_taxonomy display_name text NOT NULL DEFAULT -
+COLUMN bss.pricing_customer_group_taxonomy state text NOT NULL DEFAULT 'active'::text
+COLUMN bss.pricing_customer_group_taxonomy tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_customer_group_taxonomy value text NOT NULL DEFAULT -
+COLUMN bss.pricing_group_membership created_at_utc timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_group_membership created_by uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_group_membership effective_from timestamp with time zone NOT NULL DEFAULT -
+COLUMN bss.pricing_group_membership effective_to timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_group_membership group_value text NOT NULL DEFAULT -
+COLUMN bss.pricing_group_membership membership_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_group_membership payer_tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_group_membership row_version bigint NOT NULL DEFAULT 0
+COLUMN bss.pricing_group_membership tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_idempotency_dedup client_key text NOT NULL DEFAULT -
+COLUMN bss.pricing_idempotency_dedup created_at_utc timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_idempotency_dedup operation text NOT NULL DEFAULT -
+COLUMN bss.pricing_idempotency_dedup request_hash bytea NOT NULL DEFAULT -
+COLUMN bss.pricing_idempotency_dedup response_body jsonb NULL DEFAULT -
+COLUMN bss.pricing_idempotency_dedup response_status integer NULL DEFAULT -
+COLUMN bss.pricing_idempotency_dedup tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_migration announced_at timestamp with time zone NOT NULL DEFAULT -
+COLUMN bss.pricing_migration cancelled_at timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_migration completed_at timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_migration completion_record jsonb NULL DEFAULT -
+COLUMN bss.pricing_migration created_at timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_migration created_by uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_migration delta_report jsonb NOT NULL DEFAULT -
+COLUMN bss.pricing_migration effective_at timestamp with time zone NOT NULL DEFAULT -
+COLUMN bss.pricing_migration exclusion_snapshot jsonb NULL DEFAULT -
+COLUMN bss.pricing_migration migration_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_migration scope jsonb NOT NULL DEFAULT -
+COLUMN bss.pricing_migration source_plan_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_migration source_revision bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_migration started_at timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_migration state text NOT NULL DEFAULT -
+COLUMN bss.pricing_migration target_plan_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_migration tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_operator_flag detail jsonb NOT NULL DEFAULT '{}'::jsonb
+COLUMN bss.pricing_operator_flag flag text NOT NULL DEFAULT -
+COLUMN bss.pricing_operator_flag set_at timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_operator_flag set_by uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_operator_flag subject_ref text NOT NULL DEFAULT -
+COLUMN bss.pricing_operator_flag tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_org_tier_taxonomy display_name text NOT NULL DEFAULT -
+COLUMN bss.pricing_org_tier_taxonomy state text NOT NULL DEFAULT 'active'::text
+COLUMN bss.pricing_org_tier_taxonomy tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_org_tier_taxonomy value text NOT NULL DEFAULT -
+COLUMN bss.pricing_outbox aggregate_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_outbox correlation_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_outbox dedup_key text NOT NULL DEFAULT -
+COLUMN bss.pricing_outbox enqueued_at timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_outbox event_name text NOT NULL DEFAULT -
+COLUMN bss.pricing_outbox outbox_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_outbox payload jsonb NOT NULL DEFAULT -
+COLUMN bss.pricing_outbox published_at timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_outbox seq bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_outbox tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_partner_taxonomy display_name text NOT NULL DEFAULT -
+COLUMN bss.pricing_partner_taxonomy state text NOT NULL DEFAULT 'active'::text
+COLUMN bss.pricing_partner_taxonomy tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_partner_taxonomy value text NOT NULL DEFAULT -
+COLUMN bss.pricing_pin_frontier advanced_at timestamp with time zone NOT NULL DEFAULT -
+COLUMN bss.pricing_pin_frontier catalog_version bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_pin_frontier tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan allowed_change_targets jsonb NULL DEFAULT -
+COLUMN bss.pricing_plan available_from timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_plan available_to timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_plan billing_cycle text NULL DEFAULT -
+COLUMN bss.pricing_plan cloned_from uuid NULL DEFAULT -
+COLUMN bss.pricing_plan comparability_rank integer NULL DEFAULT -
+COLUMN bss.pricing_plan created_at_utc timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_plan created_by uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan custom_interval_n integer NULL DEFAULT -
+COLUMN bss.pricing_plan custom_interval_unit text NULL DEFAULT -
+COLUMN bss.pricing_plan entitlement_grants jsonb NULL DEFAULT -
+COLUMN bss.pricing_plan frequency text NULL DEFAULT -
+COLUMN bss.pricing_plan invoice_grouping_key text NULL DEFAULT -
+COLUMN bss.pricing_plan lifecycle_state text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan plan_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan plan_name text NULL DEFAULT -
+COLUMN bss.pricing_plan plan_tier text NULL DEFAULT -
+COLUMN bss.pricing_plan plan_tier_override boolean NOT NULL DEFAULT false
+COLUMN bss.pricing_plan purchase_max_qty bigint NULL DEFAULT -
+COLUMN bss.pricing_plan purchase_min_qty bigint NULL DEFAULT -
+COLUMN bss.pricing_plan revision bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_plan row_version bigint NOT NULL DEFAULT 0
+COLUMN bss.pricing_plan sku_id uuid NULL DEFAULT -
+COLUMN bss.pricing_plan tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan usage_counter_on_plan_change text NULL DEFAULT -
+COLUMN bss.pricing_plan_addon_rule addon_sku_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_addon_rule conflicts_with_addon_sku_id jsonb NOT NULL DEFAULT '[]'::jsonb
+COLUMN bss.pricing_plan_addon_rule depends_on_addon_sku_id jsonb NOT NULL DEFAULT '[]'::jsonb
+COLUMN bss.pricing_plan_addon_rule max_qty integer NULL DEFAULT -
+COLUMN bss.pricing_plan_addon_rule min_qty integer NULL DEFAULT -
+COLUMN bss.pricing_plan_addon_rule plan_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_addon_rule plan_revision bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_addon_rule price_override_ref uuid NULL DEFAULT -
+COLUMN bss.pricing_plan_addon_rule required boolean NOT NULL DEFAULT false
+COLUMN bss.pricing_plan_addon_rule step_qty integer NULL DEFAULT -
+COLUMN bss.pricing_plan_addon_rule tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_descriptor_set additional_fields jsonb NOT NULL DEFAULT '{}'::jsonb
+COLUMN bss.pricing_plan_descriptor_set gl_code text NULL DEFAULT -
+COLUMN bss.pricing_plan_descriptor_set invoice_line_template text NULL DEFAULT -
+COLUMN bss.pricing_plan_descriptor_set itemization_rule text NULL DEFAULT -
+COLUMN bss.pricing_plan_descriptor_set plan_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_descriptor_set plan_revision bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_descriptor_set tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_period_floor_cap cap_minor bigint NULL DEFAULT -
+COLUMN bss.pricing_plan_period_floor_cap currency text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_period_floor_cap floor_minor bigint NULL DEFAULT -
+COLUMN bss.pricing_plan_period_floor_cap plan_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_period_floor_cap plan_revision bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_period_floor_cap region text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_period_floor_cap tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_phase converts_to_phase_id uuid NULL DEFAULT -
+COLUMN bss.pricing_plan_phase display_trial_days integer NULL DEFAULT -
+COLUMN bss.pricing_plan_phase kind text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_phase ordinal integer NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_phase phase_duration_days integer NULL DEFAULT -
+COLUMN bss.pricing_plan_phase phase_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_phase plan_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_phase plan_revision bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_phase tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_policy_object additional_required_descriptors jsonb NOT NULL DEFAULT '[]'::jsonb
+COLUMN bss.pricing_policy_object default_rounding_policy_ref text NULL DEFAULT -
+COLUMN bss.pricing_policy_object enforced_migration_notice_days integer NOT NULL DEFAULT 60
+COLUMN bss.pricing_policy_object max_custom_interval_days integer NULL DEFAULT -
+COLUMN bss.pricing_policy_object max_custom_interval_months integer NULL DEFAULT -
+COLUMN bss.pricing_policy_object max_price_rows_per_plan integer NULL DEFAULT -
+COLUMN bss.pricing_policy_object max_tier_bands_per_row integer NULL DEFAULT -
+COLUMN bss.pricing_policy_object tax_display_policy_mode text NOT NULL DEFAULT 'fail_closed'::text
+COLUMN bss.pricing_policy_object tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_policy_object updated_at_utc timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_policy_object updated_by uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price aggregation_function text NULL DEFAULT -
+COLUMN bss.pricing_price aggregation_granularity text NULL DEFAULT -
+COLUMN bss.pricing_price amount_minor bigint NULL DEFAULT -
+COLUMN bss.pricing_price anchor_day integer NULL DEFAULT -
+COLUMN bss.pricing_price billing_anchor_policy text NULL DEFAULT -
+COLUMN bss.pricing_price billing_granularity text NULL DEFAULT -
+COLUMN bss.pricing_price billing_timing text NULL DEFAULT -
+COLUMN bss.pricing_price charge_kind text NOT NULL DEFAULT -
+COLUMN bss.pricing_price cohort text NOT NULL DEFAULT 'none'::text
+COLUMN bss.pricing_price created_at_utc timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_price created_by uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price credit_on_downgrade boolean NULL DEFAULT -
+COLUMN bss.pricing_price currency character varying(3) NOT NULL DEFAULT -
+COLUMN bss.pricing_price dimension_key text NOT NULL DEFAULT ''::text
+COLUMN bss.pricing_price discount_ref text NULL DEFAULT -
+COLUMN bss.pricing_price grandfather_until timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_price included_allowance jsonb NULL DEFAULT -
+COLUMN bss.pricing_price lifecycle_state text NOT NULL DEFAULT -
+COLUMN bss.pricing_price manual_quantity bigint NULL DEFAULT -
+COLUMN bss.pricing_price max_hold_granules bigint NULL DEFAULT -
+COLUMN bss.pricing_price meter text NULL DEFAULT -
+COLUMN bss.pricing_price min_qty_purchase bigint NULL DEFAULT -
+COLUMN bss.pricing_price min_qty_usage bigint NULL DEFAULT -
+COLUMN bss.pricing_price min_qty_usage_fallback text NULL DEFAULT -
+COLUMN bss.pricing_price model_kind text NULL DEFAULT -
+COLUMN bss.pricing_price package_price_minor bigint NULL DEFAULT -
+COLUMN bss.pricing_price package_size bigint NULL DEFAULT -
+COLUMN bss.pricing_price phase uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price plan_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price price_eligibility text NOT NULL DEFAULT 'all_subscriptions'::text
+COLUMN bss.pricing_price price_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price price_overlay text NOT NULL DEFAULT 'base'::text
+COLUMN bss.pricing_price proration_basis text NULL DEFAULT -
+COLUMN bss.pricing_price quantity_source text NULL DEFAULT -
+COLUMN bss.pricing_price region text NOT NULL DEFAULT -
+COLUMN bss.pricing_price reservation_flavor text NULL DEFAULT -
+COLUMN bss.pricing_price reserved_rate_nano bigint NULL DEFAULT -
+COLUMN bss.pricing_price resolved_rounding_policy text NULL DEFAULT -
+COLUMN bss.pricing_price resolved_tax_category text NULL DEFAULT -
+COLUMN bss.pricing_price rounding_policy_ref text NULL DEFAULT -
+COLUMN bss.pricing_price row_version bigint NOT NULL DEFAULT 0
+COLUMN bss.pricing_price supersedes_price_id uuid NULL DEFAULT -
+COLUMN bss.pricing_price tax_category_ref text NULL DEFAULT -
+COLUMN bss.pricing_price tax_inclusive boolean NOT NULL DEFAULT false
+COLUMN bss.pricing_price tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price tier_aggregation_window text NULL DEFAULT -
+COLUMN bss.pricing_price tier_qualification_window text NULL DEFAULT -
+COLUMN bss.pricing_price unit_rate_nano bigint NULL DEFAULT -
+COLUMN bss.pricing_price_overlay disclosure text NOT NULL DEFAULT 'restricted'::text
+COLUMN bss.pricing_price_overlay effective_from timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_price_overlay effective_to timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_price_overlay lifecycle_state text NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay precedence integer NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay price_overlay_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay revision bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay row_version bigint NOT NULL DEFAULT 0
+COLUMN bss.pricing_price_overlay scope_class text NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay scope_value text NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay target_ref jsonb NOT NULL DEFAULT '{}'::jsonb
+COLUMN bss.pricing_price_overlay tax_basis text NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line adjustment_kind text NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line adjustment_value bigint NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line cohort timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line line_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line magnitude_kind text NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line overlay_revision bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line plan_id uuid NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line price_overlay_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line target_sku text NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line_amount currency text NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line_amount line_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line_amount overlay_revision bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line_amount tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price_overlay_line_amount value_minor bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_price_tier_band band_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price_tier_band from_qty bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_price_tier_band price_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price_tier_band tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price_tier_band to_qty bigint NULL DEFAULT -
+COLUMN bss.pricing_price_tier_band unit_price_nano bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_price_window activated_at timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_price_window cancelled_at timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_price_window created_at timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_price_window created_by uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price_window effective_from timestamp with time zone NOT NULL DEFAULT -
+COLUMN bss.pricing_price_window effective_to timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_price_window expired_at timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_price_window mutation_seq bigint NOT NULL DEFAULT 0
+COLUMN bss.pricing_price_window price_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price_window reason_code text NOT NULL DEFAULT -
+COLUMN bss.pricing_price_window state text NOT NULL DEFAULT -
+COLUMN bss.pricing_price_window tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price_window window_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_read_model catalog_version bigint NOT NULL DEFAULT -
+COLUMN bss.pricing_read_model payload jsonb NOT NULL DEFAULT -
+COLUMN bss.pricing_read_model projected_at timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_read_model subject_kind text NOT NULL DEFAULT -
+COLUMN bss.pricing_read_model subject_ref text NOT NULL DEFAULT -
+COLUMN bss.pricing_read_model tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_read_model warm_completed boolean NOT NULL DEFAULT false
+COLUMN bss.pricing_read_model warm_completed_at timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_region_taxonomy display_name text NOT NULL DEFAULT -
+COLUMN bss.pricing_region_taxonomy state text NOT NULL DEFAULT 'active'::text
+COLUMN bss.pricing_region_taxonomy tax_category text NULL DEFAULT -
+COLUMN bss.pricing_region_taxonomy tax_rate_present boolean NOT NULL DEFAULT false
+COLUMN bss.pricing_region_taxonomy tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_region_taxonomy value text NOT NULL DEFAULT -
+COLUMN bss.pricing_repricing_journal applied_at timestamp with time zone NULL DEFAULT -
+COLUMN bss.pricing_repricing_journal applied_price_id uuid NULL DEFAULT -
+COLUMN bss.pricing_repricing_journal failure_reason text NULL DEFAULT -
+COLUMN bss.pricing_repricing_journal price_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_repricing_journal run_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_repricing_journal state text NOT NULL DEFAULT -
+COLUMN bss.pricing_repricing_journal tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_rounding_policy_taxonomy display_name text NOT NULL DEFAULT -
+COLUMN bss.pricing_rounding_policy_taxonomy state text NOT NULL DEFAULT 'active'::text
+COLUMN bss.pricing_rounding_policy_taxonomy tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_rounding_policy_taxonomy value text NOT NULL DEFAULT -
+COLUMN bss.pricing_snapshot_provenance acting_principal uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_snapshot_provenance created_at timestamp with time zone NOT NULL DEFAULT now()
+COLUMN bss.pricing_snapshot_provenance payload jsonb NOT NULL DEFAULT -
+COLUMN bss.pricing_snapshot_provenance provenance_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_snapshot_provenance resolved jsonb NOT NULL DEFAULT -
+COLUMN bss.pricing_snapshot_provenance snapshot_instant timestamp with time zone NOT NULL DEFAULT -
+COLUMN bss.pricing_snapshot_provenance source_plan_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_snapshot_provenance source_revision bigint NULL DEFAULT -
+COLUMN bss.pricing_snapshot_provenance subscription_ref uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_snapshot_provenance tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_snapshot_provenance trigger_kind text NOT NULL DEFAULT -
+CONSTRAINT bss.coord_leases coord_leases_pkey PRIMARY KEY (key)
+CONSTRAINT bss.pricing_approval chk_pricing_approval_approver CHECK (((state = ANY (ARRAY['submitted'::text, 'voided'::text])) OR (approver_principal IS NOT NULL)))
+CONSTRAINT bss.pricing_approval chk_pricing_approval_decided_at CHECK (((state = 'submitted'::text) = (decided_at IS NULL)))
+CONSTRAINT bss.pricing_approval chk_pricing_approval_distinct_principals CHECK (((approver_principal IS NULL) OR (approver_principal <> submitter_principal)))
+CONSTRAINT bss.pricing_approval chk_pricing_approval_reason CHECK (((state <> 'rejected'::text) OR (reason IS NOT NULL)))
+CONSTRAINT bss.pricing_approval chk_pricing_approval_state CHECK ((state = ANY (ARRAY['submitted'::text, 'approved'::text, 'rejected'::text, 'voided'::text])))
+CONSTRAINT bss.pricing_approval chk_pricing_approval_subject_kind CHECK ((subject_kind = ANY (ARRAY['plan_revision'::text, 'price_unit'::text, 'window'::text, 'policy'::text, 'overlay'::text, 'bulk_operation'::text, 'membership'::text])))
+CONSTRAINT bss.pricing_approval pricing_approval_pkey PRIMARY KEY (approval_id)
+CONSTRAINT bss.pricing_approval_key chk_pricing_approval_key_state CHECK ((state = ANY (ARRAY['submitted'::text, 'approved'::text, 'rejected'::text, 'voided'::text])))
+CONSTRAINT bss.pricing_approval_key pricing_approval_key_pkey PRIMARY KEY (approval_id, scope_key)
+CONSTRAINT bss.pricing_approval_threshold chk_pricing_approval_threshold_absolute_non_negative CHECK (((absolute_minor IS NULL) OR (absolute_minor >= 0)))
+CONSTRAINT bss.pricing_approval_threshold chk_pricing_approval_threshold_basis CHECK (((absolute_minor IS NULL) <> (percent_bp IS NULL)))
+CONSTRAINT bss.pricing_approval_threshold chk_pricing_approval_threshold_currency CHECK ((length((currency)::text) = 3))
+CONSTRAINT bss.pricing_approval_threshold chk_pricing_approval_threshold_percent_positive CHECK (((percent_bp IS NULL) OR (percent_bp > 0)))
+CONSTRAINT bss.pricing_approval_threshold chk_pricing_approval_threshold_version CHECK ((version >= 0))
+CONSTRAINT bss.pricing_approval_threshold pricing_approval_threshold_pkey PRIMARY KEY (tenant_id, version, currency)
+CONSTRAINT bss.pricing_approval_threshold_tombstone chk_pricing_approval_threshold_tombstone_version CHECK ((version >= 0))
+CONSTRAINT bss.pricing_approval_threshold_tombstone pricing_approval_threshold_tombstone_pkey PRIMARY KEY (tenant_id, version)
+CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_action CHECK ((action = ANY (ARRAY['create'::text, 'update'::text, 'delete'::text, 'abandon'::text, 'publish'::text, 'submit'::text, 'approve'::text, 'reject'::text, 'withdraw'::text, 'deny'::text, 'retire'::text, 'migrate'::text])))
+CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_entry_kind CHECK ((entry_kind = ANY (ARRAY['mutation'::text, 'rollup'::text])))
+CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_rollup CHECK (((entry_kind = 'rollup'::text) = (segment_heads IS NOT NULL)))
+CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_seq CHECK ((seq >= 0))
+CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_subject_kind CHECK ((subject_kind = ANY (ARRAY['plan_revision'::text, 'price_unit'::text, 'window'::text, 'policy'::text, 'overlay'::text, 'bulk_operation'::text, 'membership'::text])))
+CONSTRAINT bss.pricing_audit_log pricing_audit_log_pkey PRIMARY KEY (tenant_id, chain_id, seq)
+CONSTRAINT bss.pricing_brand_taxonomy chk_pricing_brand_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
+CONSTRAINT bss.pricing_brand_taxonomy chk_pricing_brand_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_brand_taxonomy pricing_brand_taxonomy_pkey PRIMARY KEY (tenant_id, value)
+CONSTRAINT bss.pricing_bulk_operation chk_pricing_bulk_operation_completed_at CHECK (((completed_at IS NOT NULL) = (state = ANY (ARRAY['validation_failed'::text, 'completed'::text, 'completed_with_conflicts'::text, 'rejected'::text]))))
+CONSTRAINT bss.pricing_bulk_operation chk_pricing_bulk_operation_import_never_awaits CHECK ((NOT ((kind = 'import'::text) AND (state = 'awaiting_approval'::text))))
+CONSTRAINT bss.pricing_bulk_operation chk_pricing_bulk_operation_kind CHECK ((kind = ANY (ARRAY['import'::text, 'repricing'::text])))
+CONSTRAINT bss.pricing_bulk_operation chk_pricing_bulk_operation_state CHECK ((state = ANY (ARRAY['validating'::text, 'validation_failed'::text, 'awaiting_approval'::text, 'committing'::text, 'completed'::text, 'completed_with_conflicts'::text, 'rejected'::text])))
+CONSTRAINT bss.pricing_bulk_operation pricing_bulk_operation_pkey PRIMARY KEY (operation_id)
+CONSTRAINT bss.pricing_bulk_row_lock fk_pricing_bulk_row_lock_operation FOREIGN KEY (bulk_operation_id) REFERENCES bss.pricing_bulk_operation(operation_id)
+CONSTRAINT bss.pricing_bulk_row_lock fk_pricing_bulk_row_lock_price FOREIGN KEY (price_id) REFERENCES bss.pricing_price(price_id)
+CONSTRAINT bss.pricing_bulk_row_lock pricing_bulk_row_lock_pkey PRIMARY KEY (tenant_id, price_id)
+CONSTRAINT bss.pricing_bundle chk_pricing_bundle_invoice_itemization CHECK ((invoice_itemization = ANY (ARRAY['aggregate'::text, 'itemize'::text])))
+CONSTRAINT bss.pricing_bundle chk_pricing_bundle_price_basis CHECK ((price_basis = ANY (ARRAY['sum_of_parts'::text, 'own_price'::text])))
+CONSTRAINT bss.pricing_bundle pricing_bundle_pkey PRIMARY KEY (bundle_id)
+CONSTRAINT bss.pricing_bundle_component chk_pricing_bundle_component_min_qty CHECK (((min_qty IS NULL) OR (min_qty >= 0)))
+CONSTRAINT bss.pricing_bundle_component chk_pricing_bundle_component_qty_range CHECK (((min_qty IS NULL) OR (max_qty IS NULL) OR (min_qty <= max_qty)))
+CONSTRAINT bss.pricing_bundle_component fk_pricing_bundle_component_bundle FOREIGN KEY (bundle_id) REFERENCES bss.pricing_bundle(bundle_id)
+CONSTRAINT bss.pricing_bundle_component pricing_bundle_component_pkey PRIMARY KEY (bundle_id, plan_revision, component_plan_id)
+CONSTRAINT bss.pricing_bundle_revshare chk_pricing_bundle_revshare_effective_share_bp CHECK (((effective_share_bp IS NULL) OR ((effective_share_bp >= 0) AND (effective_share_bp <= 10000))))
+CONSTRAINT bss.pricing_bundle_revshare chk_pricing_bundle_revshare_party CHECK (((length(btrim(party, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0) AND (btrim(party, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32))) <> 'platform'::text)))
+CONSTRAINT bss.pricing_bundle_revshare chk_pricing_bundle_revshare_share_bp CHECK (((share_bp >= 0) AND (share_bp <= 10000)))
+CONSTRAINT bss.pricing_bundle_revshare fk_pricing_bundle_revshare_group FOREIGN KEY (bundle_id, plan_revision, vendor_sku_id) REFERENCES bss.pricing_bundle_revshare_group(bundle_id, plan_revision, vendor_sku_id)
+CONSTRAINT bss.pricing_bundle_revshare pricing_bundle_revshare_pkey PRIMARY KEY (bundle_id, plan_revision, vendor_sku_id, party)
+CONSTRAINT bss.pricing_bundle_revshare_group chk_pricing_bundle_revshare_group_absorber CHECK (((residual_absorber_party = 'platform'::text) OR ((length(btrim(residual_absorber_party, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0) AND (btrim(residual_absorber_party, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32))) <> 'platform'::text))))
+CONSTRAINT bss.pricing_bundle_revshare_group chk_pricing_bundle_revshare_group_platform_cut_bp CHECK (((platform_cut_bp >= 0) AND (platform_cut_bp <= 10000)))
+CONSTRAINT bss.pricing_bundle_revshare_group fk_pricing_bundle_revshare_group_bundle FOREIGN KEY (bundle_id) REFERENCES bss.pricing_bundle(bundle_id)
+CONSTRAINT bss.pricing_bundle_revshare_group pricing_bundle_revshare_group_pkey PRIMARY KEY (bundle_id, plan_revision, vendor_sku_id)
+CONSTRAINT bss.pricing_catalog_version_ref chk_pricing_catalog_version_ref_commit CHECK (((catalog_version IS NULL) = (committed_at IS NULL)))
+CONSTRAINT bss.pricing_catalog_version_ref chk_pricing_catalog_version_ref_subject_kind CHECK ((subject_kind = ANY (ARRAY['plan'::text, 'price_overlay'::text, 'overlay_index'::text, 'group_membership'::text])))
+CONSTRAINT bss.pricing_catalog_version_ref chk_pricing_catalog_version_ref_subject_lifecycle CHECK (((subject_lifecycle_state IS NULL) OR (subject_lifecycle_state = ANY (ARRAY['published'::text, 'retired'::text]))))
+CONSTRAINT bss.pricing_catalog_version_ref chk_pricing_catalog_version_ref_subject_revision CHECK (((subject_revision IS NULL) OR (subject_revision >= 0)))
+CONSTRAINT bss.pricing_catalog_version_ref chk_pricing_catalog_version_ref_version CHECK (((catalog_version IS NULL) OR (catalog_version >= 0)))
+CONSTRAINT bss.pricing_catalog_version_ref pricing_catalog_version_ref_pkey PRIMARY KEY (tenant_id, pending_ref, subject_kind, subject_ref)
+CONSTRAINT bss.pricing_composite_meter chk_pricing_composite_meter_output_unit CHECK ((length(btrim(output_unit, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_composite_meter fk_pricing_composite_meter_revision FOREIGN KEY (plan_id, plan_revision) REFERENCES bss.pricing_plan(plan_id, revision)
+CONSTRAINT bss.pricing_composite_meter pricing_composite_meter_pkey PRIMARY KEY (tenant_id, plan_id, plan_revision, composite_id)
+CONSTRAINT bss.pricing_customer_group_taxonomy chk_pricing_customer_group_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
+CONSTRAINT bss.pricing_customer_group_taxonomy chk_pricing_customer_group_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_customer_group_taxonomy pricing_customer_group_taxonomy_pkey PRIMARY KEY (tenant_id, value)
+CONSTRAINT bss.pricing_group_membership chk_pricing_group_membership_group_value_present CHECK ((length(btrim(group_value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_group_membership chk_pricing_group_membership_interval CHECK (((effective_to IS NULL) OR (effective_to > effective_from)))
+CONSTRAINT bss.pricing_group_membership chk_pricing_group_membership_row_version CHECK ((row_version >= 0))
+CONSTRAINT bss.pricing_group_membership excl_pricing_group_membership_no_overlap EXCLUDE USING gist (tenant_id WITH =, payer_tenant_id WITH =, tstzrange(effective_from, effective_to, '[)'::text) WITH &&)
+CONSTRAINT bss.pricing_group_membership pricing_group_membership_pkey PRIMARY KEY (membership_id)
+CONSTRAINT bss.pricing_idempotency_dedup chk_pricing_idempotency_dedup_answered CHECK (((response_status IS NULL) = (response_body IS NULL)))
+CONSTRAINT bss.pricing_idempotency_dedup chk_pricing_idempotency_dedup_status CHECK (((response_status IS NULL) OR ((response_status >= 100) AND (response_status <= 599))))
+CONSTRAINT bss.pricing_idempotency_dedup pricing_idempotency_dedup_pkey PRIMARY KEY (tenant_id, operation, client_key)
+CONSTRAINT bss.pricing_migration chk_pricing_migration_announced_before_effective CHECK ((announced_at <= effective_at))
+CONSTRAINT bss.pricing_migration chk_pricing_migration_cancelled_at CHECK (((state = 'cancelled'::text) = (cancelled_at IS NOT NULL)))
+CONSTRAINT bss.pricing_migration chk_pricing_migration_cancelled_order CHECK (((cancelled_at IS NULL) OR (cancelled_at >= created_at)))
+CONSTRAINT bss.pricing_migration chk_pricing_migration_completed_at CHECK (((state = 'completed'::text) = (completed_at IS NOT NULL)))
+CONSTRAINT bss.pricing_migration chk_pricing_migration_completed_order CHECK (((completed_at IS NULL) OR (completed_at >= started_at)))
+CONSTRAINT bss.pricing_migration chk_pricing_migration_distinct_plans CHECK ((source_plan_id <> target_plan_id))
+CONSTRAINT bss.pricing_migration chk_pricing_migration_exclusion_snapshot CHECK (((started_at IS NOT NULL) = (exclusion_snapshot IS NOT NULL)))
+CONSTRAINT bss.pricing_migration chk_pricing_migration_scheduled_unstarted CHECK (((state <> 'scheduled'::text) OR (started_at IS NULL)))
+CONSTRAINT bss.pricing_migration chk_pricing_migration_source_revision CHECK ((source_revision >= 0))
+CONSTRAINT bss.pricing_migration chk_pricing_migration_started_order CHECK (((started_at IS NULL) OR (started_at >= created_at)))
+CONSTRAINT bss.pricing_migration chk_pricing_migration_started_required CHECK (((state <> ALL (ARRAY['in_progress'::text, 'completed'::text])) OR (started_at IS NOT NULL)))
+CONSTRAINT bss.pricing_migration chk_pricing_migration_state CHECK ((state = ANY (ARRAY['scheduled'::text, 'in_progress'::text, 'completed'::text, 'cancelled'::text])))
+CONSTRAINT bss.pricing_migration pricing_migration_pkey PRIMARY KEY (tenant_id, migration_id)
+CONSTRAINT bss.pricing_operator_flag chk_pricing_operator_flag_name CHECK ((flag = ANY (ARRAY['tier_divergent'::text, 'grants_divergent'::text, 'tax_readiness_divergent'::text, 'meter_binding_divergent'::text])))
+CONSTRAINT bss.pricing_operator_flag pricing_operator_flag_pkey PRIMARY KEY (tenant_id, subject_ref, flag)
+CONSTRAINT bss.pricing_org_tier_taxonomy chk_pricing_org_tier_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
+CONSTRAINT bss.pricing_org_tier_taxonomy chk_pricing_org_tier_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_org_tier_taxonomy pricing_org_tier_taxonomy_pkey PRIMARY KEY (tenant_id, value)
+CONSTRAINT bss.pricing_outbox chk_pricing_outbox_event_name CHECK ((event_name = ANY (ARRAY['PlanCreated'::text, 'PlanUpdated'::text, 'PlanPublished'::text, 'PlanRetired'::text, 'PlanMigrationScheduled'::text, 'PlanPublishDegraded'::text, 'BundleUpdated'::text, 'PriceCreated'::text, 'PriceUpdated'::text, 'PriceWindowScheduled'::text, 'PriceWindowActivated'::text, 'PriceWindowExpired'::text, 'PriceWindowCancelled'::text, 'PriceOverlayPublished'::text])))
+CONSTRAINT bss.pricing_outbox chk_pricing_outbox_sequence CHECK ((seq >= 0))
+CONSTRAINT bss.pricing_outbox pricing_outbox_pkey PRIMARY KEY (outbox_id)
+CONSTRAINT bss.pricing_partner_taxonomy chk_pricing_partner_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
+CONSTRAINT bss.pricing_partner_taxonomy chk_pricing_partner_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_partner_taxonomy pricing_partner_taxonomy_pkey PRIMARY KEY (tenant_id, value)
+CONSTRAINT bss.pricing_pin_frontier chk_pricing_pin_frontier_version CHECK ((catalog_version >= 0))
+CONSTRAINT bss.pricing_pin_frontier pricing_pin_frontier_pkey PRIMARY KEY (tenant_id)
+CONSTRAINT bss.pricing_plan chk_pricing_plan_availability CHECK (((available_from IS NULL) OR (available_to IS NULL) OR (available_to > available_from)))
+CONSTRAINT bss.pricing_plan chk_pricing_plan_billing_cycle CHECK (((billing_cycle IS NULL) OR (billing_cycle = ANY (ARRAY['one_time'::text, 'recurring'::text, 'usage'::text, 'hybrid'::text]))))
+CONSTRAINT bss.pricing_plan chk_pricing_plan_custom_interval_n CHECK (((custom_interval_n IS NULL) OR (custom_interval_n > 0)))
+CONSTRAINT bss.pricing_plan chk_pricing_plan_custom_interval_pairing CHECK ((((frequency IS NOT NULL) AND (frequency = 'custom_every_n'::text)) = ((custom_interval_n IS NOT NULL) AND (custom_interval_unit IS NOT NULL))))
+CONSTRAINT bss.pricing_plan chk_pricing_plan_custom_interval_unit CHECK (((custom_interval_unit IS NULL) OR (custom_interval_unit = ANY (ARRAY['days'::text, 'months'::text]))))
+CONSTRAINT bss.pricing_plan chk_pricing_plan_frequency CHECK (((frequency IS NULL) OR (frequency = ANY (ARRAY['monthly'::text, 'quarterly'::text, 'semiannual'::text, 'annual'::text, 'custom_every_n'::text]))))
+CONSTRAINT bss.pricing_plan chk_pricing_plan_lifecycle_state CHECK ((lifecycle_state = ANY (ARRAY['draft'::text, 'abandoned'::text, 'published'::text, 'superseded'::text, 'retired'::text])))
+CONSTRAINT bss.pricing_plan chk_pricing_plan_purchase_max_qty CHECK (((purchase_max_qty IS NULL) OR (purchase_max_qty >= 0)))
+CONSTRAINT bss.pricing_plan chk_pricing_plan_purchase_min_qty CHECK (((purchase_min_qty IS NULL) OR (purchase_min_qty >= 0)))
+CONSTRAINT bss.pricing_plan chk_pricing_plan_purchase_qty CHECK (((purchase_min_qty IS NULL) OR (purchase_max_qty IS NULL) OR (purchase_min_qty <= purchase_max_qty)))
+CONSTRAINT bss.pricing_plan chk_pricing_plan_revision CHECK ((revision >= 0))
+CONSTRAINT bss.pricing_plan chk_pricing_plan_row_version CHECK ((row_version >= 0))
+CONSTRAINT bss.pricing_plan pricing_plan_pkey PRIMARY KEY (plan_id, revision)
+CONSTRAINT bss.pricing_plan_addon_rule chk_pricing_plan_addon_rule_max_qty CHECK (((max_qty IS NULL) OR (max_qty >= 0)))
+CONSTRAINT bss.pricing_plan_addon_rule chk_pricing_plan_addon_rule_min_qty CHECK (((min_qty IS NULL) OR (min_qty >= 0)))
+CONSTRAINT bss.pricing_plan_addon_rule chk_pricing_plan_addon_rule_qty_range CHECK (((min_qty IS NULL) OR (max_qty IS NULL) OR (min_qty <= max_qty)))
+CONSTRAINT bss.pricing_plan_addon_rule chk_pricing_plan_addon_rule_required_max_qty CHECK (((NOT required) OR ((max_qty IS NOT NULL) AND (max_qty >= 1))))
+CONSTRAINT bss.pricing_plan_addon_rule chk_pricing_plan_addon_rule_step_qty CHECK (((step_qty IS NULL) OR (step_qty > 0)))
+CONSTRAINT bss.pricing_plan_addon_rule fk_pricing_plan_addon_rule_revision FOREIGN KEY (plan_id, plan_revision) REFERENCES bss.pricing_plan(plan_id, revision)
+CONSTRAINT bss.pricing_plan_addon_rule pricing_plan_addon_rule_pkey PRIMARY KEY (plan_id, plan_revision, addon_sku_id)
+CONSTRAINT bss.pricing_plan_descriptor_set fk_pricing_plan_descriptor_set_revision FOREIGN KEY (plan_id, plan_revision) REFERENCES bss.pricing_plan(plan_id, revision)
+CONSTRAINT bss.pricing_plan_descriptor_set pricing_plan_descriptor_set_pkey PRIMARY KEY (plan_id, plan_revision)
+CONSTRAINT bss.pricing_plan_period_floor_cap chk_pricing_plan_period_floor_cap_cap_positive CHECK (((cap_minor IS NULL) OR (cap_minor > 0)))
+CONSTRAINT bss.pricing_plan_period_floor_cap chk_pricing_plan_period_floor_cap_currency CHECK ((length(currency) = 3))
+CONSTRAINT bss.pricing_plan_period_floor_cap chk_pricing_plan_period_floor_cap_floor_positive CHECK (((floor_minor IS NULL) OR (floor_minor > 0)))
+CONSTRAINT bss.pricing_plan_period_floor_cap chk_pricing_plan_period_floor_cap_ordered CHECK (((floor_minor IS NULL) OR (cap_minor IS NULL) OR (floor_minor <= cap_minor)))
+CONSTRAINT bss.pricing_plan_period_floor_cap chk_pricing_plan_period_floor_cap_present CHECK (((floor_minor IS NOT NULL) OR (cap_minor IS NOT NULL)))
+CONSTRAINT bss.pricing_plan_period_floor_cap fk_pricing_plan_period_floor_cap_revision FOREIGN KEY (plan_id, plan_revision) REFERENCES bss.pricing_plan(plan_id, revision)
+CONSTRAINT bss.pricing_plan_period_floor_cap pricing_plan_period_floor_cap_pkey PRIMARY KEY (plan_id, plan_revision, currency, region)
+CONSTRAINT bss.pricing_plan_phase chk_pricing_plan_phase_display_trial_days CHECK (((display_trial_days IS NULL) OR (display_trial_days = phase_duration_days)))
+CONSTRAINT bss.pricing_plan_phase chk_pricing_plan_phase_duration_non_negative CHECK (((phase_duration_days IS NULL) OR (phase_duration_days >= 0)))
+CONSTRAINT bss.pricing_plan_phase chk_pricing_plan_phase_kind CHECK ((kind = ANY (ARRAY['trial'::text, 'intro'::text, 'evergreen'::text])))
+CONSTRAINT bss.pricing_plan_phase chk_pricing_plan_phase_trial_projection_non_negative CHECK (((display_trial_days IS NULL) OR (display_trial_days >= 0)))
+CONSTRAINT bss.pricing_plan_phase fk_pricing_plan_phase_revision FOREIGN KEY (plan_id, plan_revision) REFERENCES bss.pricing_plan(plan_id, revision)
+CONSTRAINT bss.pricing_plan_phase pricing_plan_phase_pkey PRIMARY KEY (tenant_id, plan_id, plan_revision, phase_id)
+CONSTRAINT bss.pricing_policy_object chk_pricing_policy_object_interval_days_cap CHECK (((max_custom_interval_days IS NULL) OR (max_custom_interval_days > 0)))
+CONSTRAINT bss.pricing_policy_object chk_pricing_policy_object_interval_months_cap CHECK (((max_custom_interval_months IS NULL) OR (max_custom_interval_months > 0)))
+CONSTRAINT bss.pricing_policy_object chk_pricing_policy_object_notice_floor CHECK ((enforced_migration_notice_days >= 60))
+CONSTRAINT bss.pricing_policy_object chk_pricing_policy_object_price_row_cap CHECK (((max_price_rows_per_plan IS NULL) OR (max_price_rows_per_plan > 0)))
+CONSTRAINT bss.pricing_policy_object chk_pricing_policy_object_tax_display_policy CHECK ((tax_display_policy_mode = ANY (ARRAY['fail_closed'::text, 'warn'::text])))
+CONSTRAINT bss.pricing_policy_object chk_pricing_policy_object_tier_band_cap CHECK (((max_tier_bands_per_row IS NULL) OR (max_tier_bands_per_row > 0)))
+CONSTRAINT bss.pricing_policy_object pricing_policy_object_pkey PRIMARY KEY (tenant_id)
+CONSTRAINT bss.pricing_price chk_pricing_price_aggregation_function CHECK (((aggregation_function IS NULL) OR (aggregation_function = ANY (ARRAY['sum'::text, 'peak'::text, 'time_weighted'::text]))))
+CONSTRAINT bss.pricing_price chk_pricing_price_aggregation_granularity CHECK (((aggregation_granularity IS NULL) OR (aggregation_granularity = ANY (ARRAY['hour'::text, 'day'::text]))))
+CONSTRAINT bss.pricing_price chk_pricing_price_amount_non_negative CHECK (((amount_minor IS NULL) OR (amount_minor >= 0)))
+CONSTRAINT bss.pricing_price chk_pricing_price_billing_granularity CHECK (((billing_granularity IS NULL) OR (billing_granularity = ANY (ARRAY['per_second'::text, 'per_minute'::text, 'per_hour'::text, 'per_day'::text, 'whole_unit'::text]))))
+CONSTRAINT bss.pricing_price chk_pricing_price_billing_timing CHECK (((billing_timing IS NULL) OR (billing_timing = ANY (ARRAY['advance'::text, 'arrears'::text]))))
+CONSTRAINT bss.pricing_price chk_pricing_price_charge_kind CHECK ((charge_kind = ANY (ARRAY['recurring'::text, 'usage'::text, 'one_time'::text, 'one_time_setup'::text])))
+CONSTRAINT bss.pricing_price chk_pricing_price_cohort_eligibility CHECK (((cohort <> 'none'::text) = (price_eligibility = 'existing_grandfathered'::text)))
+CONSTRAINT bss.pricing_price chk_pricing_price_eligibility CHECK ((price_eligibility = ANY (ARRAY['all_subscriptions'::text, 'new_subscriptions_only'::text, 'existing_grandfathered'::text])))
+CONSTRAINT bss.pricing_price chk_pricing_price_grandfather_until CHECK (((grandfather_until IS NULL) OR (price_eligibility = 'existing_grandfathered'::text)))
+CONSTRAINT bss.pricing_price chk_pricing_price_lifecycle_state CHECK ((lifecycle_state = ANY (ARRAY['draft'::text, 'published'::text, 'superseded'::text])))
+CONSTRAINT bss.pricing_price chk_pricing_price_manual_quantity CHECK (((manual_quantity IS NULL) OR (manual_quantity >= 0)))
+CONSTRAINT bss.pricing_price chk_pricing_price_max_hold_granules CHECK (((max_hold_granules IS NULL) OR (max_hold_granules >= 1)))
+CONSTRAINT bss.pricing_price chk_pricing_price_meter_no_separator CHECK (((meter IS NULL) OR (meter !~~ '%|%'::text)))
+CONSTRAINT bss.pricing_price chk_pricing_price_min_qty_purchase CHECK (((min_qty_purchase IS NULL) OR (min_qty_purchase >= 0)))
+CONSTRAINT bss.pricing_price chk_pricing_price_min_qty_usage CHECK (((min_qty_usage IS NULL) OR (min_qty_usage >= 0)))
+CONSTRAINT bss.pricing_price chk_pricing_price_model_kind CHECK (((model_kind IS NULL) OR (model_kind = ANY (ARRAY['flat'::text, 'per_unit'::text, 'graduated'::text, 'volume'::text, 'package'::text]))))
+CONSTRAINT bss.pricing_price chk_pricing_price_overlay CHECK ((price_overlay = 'base'::text))
+CONSTRAINT bss.pricing_price chk_pricing_price_package_fields_kind CHECK ((((package_size IS NULL) AND (package_price_minor IS NULL)) OR ((model_kind IS NOT NULL) AND (model_kind = 'package'::text))))
+CONSTRAINT bss.pricing_price chk_pricing_price_package_price CHECK (((package_price_minor IS NULL) OR (package_price_minor >= 0)))
+CONSTRAINT bss.pricing_price chk_pricing_price_package_size CHECK (((package_size IS NULL) OR (package_size > 0)))
+CONSTRAINT bss.pricing_price chk_pricing_price_quantity_source CHECK (((quantity_source IS NULL) OR (quantity_source = ANY (ARRAY['subscription_seat_count'::text, 'manual'::text]))))
+CONSTRAINT bss.pricing_price chk_pricing_price_region_no_separator CHECK ((region !~~ '%|%'::text))
+CONSTRAINT bss.pricing_price chk_pricing_price_reserved_rate_nano CHECK (((reserved_rate_nano IS NULL) OR (reserved_rate_nano >= 0)))
+CONSTRAINT bss.pricing_price chk_pricing_price_row_version CHECK ((row_version >= 0))
+CONSTRAINT bss.pricing_price chk_pricing_price_tier_aggregation_window CHECK (((tier_aggregation_window IS NULL) OR (tier_aggregation_window = ANY (ARRAY['calendar_month'::text, 'invoice_period'::text, 'subscription_lifetime'::text, 'per_event'::text, 'per_hour'::text]))))
+CONSTRAINT bss.pricing_price chk_pricing_price_tier_qualification_window CHECK (((tier_qualification_window IS NULL) OR (tier_qualification_window = ANY (ARRAY['current'::text, 'trailing_period'::text]))))
+CONSTRAINT bss.pricing_price chk_pricing_price_unit_rate_nano CHECK (((unit_rate_nano IS NULL) OR (unit_rate_nano >= 0)))
+CONSTRAINT bss.pricing_price pricing_price_pkey PRIMARY KEY (price_id)
+CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_disclosure CHECK ((disclosure = ANY (ARRAY['restricted'::text, 'public'::text])))
+CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_interval CHECK (((effective_from IS NULL) OR (effective_to IS NULL) OR (effective_to > effective_from)))
+CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_lifecycle_state CHECK ((lifecycle_state = ANY (ARRAY['draft'::text, 'published'::text, 'superseded'::text, 'abandoned'::text])))
+CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_revision CHECK ((revision >= 0))
+CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_row_version CHECK ((row_version >= 0))
+CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_scope_class CHECK ((scope_class = ANY (ARRAY['partner'::text, 'org_tier'::text, 'brand'::text, 'region'::text, 'customer_group'::text, 'global'::text])))
+CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_scope_value CHECK (((scope_class = 'global'::text) = (length(scope_value) = 0)))
+CONSTRAINT bss.pricing_price_overlay chk_pricing_price_overlay_tax_basis CHECK ((tax_basis = ANY (ARRAY['inclusive'::text, 'exclusive'::text, 'delegated_tariffs'::text])))
+CONSTRAINT bss.pricing_price_overlay pricing_price_overlay_pkey PRIMARY KEY (price_overlay_id, revision)
+CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_adjustment_kind CHECK ((adjustment_kind = ANY (ARRAY['markup'::text, 'discount'::text, 'fixed'::text])))
+CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_cohort_needs_plan CHECK (((cohort IS NULL) OR (plan_id IS NOT NULL)))
+CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_discount_ceiling CHECK (((adjustment_kind <> 'discount'::text) OR (adjustment_value IS NULL) OR (adjustment_value <= 10000)))
+CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_fixed_is_amount CHECK (((adjustment_kind <> 'fixed'::text) OR (magnitude_kind = 'amount'::text)))
+CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_magnitude_kind CHECK ((magnitude_kind = ANY (ARRAY['percent_bp'::text, 'amount'::text])))
+CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_magnitude_pairing CHECK (((magnitude_kind = 'percent_bp'::text) = (adjustment_value IS NOT NULL)))
+CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_magnitude_positive CHECK (((adjustment_value IS NULL) OR (adjustment_value > 0)))
+CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_plan_id_not_nil CHECK (((plan_id IS NULL) OR (plan_id <> '00000000-0000-0000-0000-000000000000'::uuid)))
+CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_sku_needs_plan CHECK (((target_sku IS NULL) OR (plan_id IS NOT NULL)))
+CONSTRAINT bss.pricing_price_overlay_line chk_pricing_price_overlay_line_target_sku_present CHECK (((target_sku IS NULL) OR (length(btrim(target_sku, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0)))
+CONSTRAINT bss.pricing_price_overlay_line fk_pricing_price_overlay_line_overlay FOREIGN KEY (price_overlay_id, overlay_revision) REFERENCES bss.pricing_price_overlay(price_overlay_id, revision)
+CONSTRAINT bss.pricing_price_overlay_line pricing_price_overlay_line_pkey PRIMARY KEY (tenant_id, overlay_revision, line_id)
+CONSTRAINT bss.pricing_price_overlay_line_amount chk_pricing_price_overlay_line_amount_currency CHECK ((length(currency) = 3))
+CONSTRAINT bss.pricing_price_overlay_line_amount chk_pricing_price_overlay_line_amount_value_minor CHECK ((value_minor >= 0))
+CONSTRAINT bss.pricing_price_overlay_line_amount fk_pricing_price_overlay_line_amount_line FOREIGN KEY (tenant_id, overlay_revision, line_id) REFERENCES bss.pricing_price_overlay_line(tenant_id, overlay_revision, line_id)
+CONSTRAINT bss.pricing_price_overlay_line_amount pricing_price_overlay_line_amount_pkey PRIMARY KEY (tenant_id, overlay_revision, line_id, currency)
+CONSTRAINT bss.pricing_price_tier_band chk_pricing_price_tier_band_from_qty CHECK ((from_qty >= 0))
+CONSTRAINT bss.pricing_price_tier_band chk_pricing_price_tier_band_unit_price CHECK ((unit_price_nano >= 0))
+CONSTRAINT bss.pricing_price_tier_band chk_pricing_price_tier_band_width CHECK (((to_qty IS NULL) OR (to_qty > from_qty)))
+CONSTRAINT bss.pricing_price_tier_band fk_pricing_price_tier_band_price FOREIGN KEY (price_id) REFERENCES bss.pricing_price(price_id)
+CONSTRAINT bss.pricing_price_tier_band pricing_price_tier_band_pkey PRIMARY KEY (band_id)
+CONSTRAINT bss.pricing_price_tier_band uq_pricing_price_tier_band_lower_bound UNIQUE (price_id, from_qty)
+CONSTRAINT bss.pricing_price_window chk_pricing_price_window_activated_at CHECK (((state = ANY (ARRAY['active'::text, 'expired'::text])) = (activated_at IS NOT NULL)))
+CONSTRAINT bss.pricing_price_window chk_pricing_price_window_activation_order CHECK (((activated_at IS NULL) OR (activated_at >= effective_from)))
+CONSTRAINT bss.pricing_price_window chk_pricing_price_window_cancelled_at CHECK (((state = 'cancelled'::text) = (cancelled_at IS NOT NULL)))
+CONSTRAINT bss.pricing_price_window chk_pricing_price_window_expired_at CHECK (((state = 'expired'::text) = (expired_at IS NOT NULL)))
+CONSTRAINT bss.pricing_price_window chk_pricing_price_window_expiry_order CHECK (((expired_at IS NULL) OR (expired_at >= effective_to)))
+CONSTRAINT bss.pricing_price_window chk_pricing_price_window_interval CHECK (((effective_to IS NULL) OR (effective_to > effective_from)))
+CONSTRAINT bss.pricing_price_window chk_pricing_price_window_mutation_seq CHECK ((mutation_seq >= 0))
+CONSTRAINT bss.pricing_price_window chk_pricing_price_window_open_ended CHECK ((NOT ((state = 'expired'::text) AND (effective_to IS NULL))))
+CONSTRAINT bss.pricing_price_window chk_pricing_price_window_reason_code CHECK ((length(btrim(reason_code)) > 0))
+CONSTRAINT bss.pricing_price_window chk_pricing_price_window_state CHECK ((state = ANY (ARRAY['scheduled'::text, 'active'::text, 'expired'::text, 'cancelled'::text])))
+CONSTRAINT bss.pricing_price_window excl_pricing_price_window_no_overlap EXCLUDE USING gist (tenant_id WITH =, price_id WITH =, tstzrange(effective_from, effective_to, '[)'::text) WITH &&) WHERE ((state = ANY (ARRAY['scheduled'::text, 'active'::text])))
+CONSTRAINT bss.pricing_price_window fk_pricing_price_window_price FOREIGN KEY (price_id) REFERENCES bss.pricing_price(price_id)
+CONSTRAINT bss.pricing_price_window pricing_price_window_pkey PRIMARY KEY (window_id)
+CONSTRAINT bss.pricing_read_model chk_pricing_read_model_catalog_version CHECK ((catalog_version >= 0))
+CONSTRAINT bss.pricing_read_model chk_pricing_read_model_subject_kind CHECK ((subject_kind = ANY (ARRAY['plan'::text, 'price_overlay'::text, 'overlay_index'::text, 'group_membership'::text])))
+CONSTRAINT bss.pricing_read_model chk_pricing_read_model_warm_marker CHECK ((warm_completed = (warm_completed_at IS NOT NULL)))
+CONSTRAINT bss.pricing_read_model pricing_read_model_pkey PRIMARY KEY (tenant_id, catalog_version, subject_kind, subject_ref)
+CONSTRAINT bss.pricing_region_taxonomy chk_pricing_region_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
+CONSTRAINT bss.pricing_region_taxonomy chk_pricing_region_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_region_taxonomy pricing_region_taxonomy_pkey PRIMARY KEY (tenant_id, value)
+CONSTRAINT bss.pricing_repricing_journal chk_pricing_repricing_journal_applied CHECK ((((applied_price_id IS NOT NULL) = (state = 'applied'::text)) AND ((applied_at IS NOT NULL) = (state = 'applied'::text))))
+CONSTRAINT bss.pricing_repricing_journal chk_pricing_repricing_journal_failed CHECK (((state = 'failed'::text) = (failure_reason IS NOT NULL)))
+CONSTRAINT bss.pricing_repricing_journal chk_pricing_repricing_journal_state CHECK ((state = ANY (ARRAY['pending'::text, 'applied'::text, 'failed'::text])))
+CONSTRAINT bss.pricing_repricing_journal chk_pricing_repricing_journal_successor_is_new CHECK (((applied_price_id IS NULL) OR (applied_price_id <> price_id)))
+CONSTRAINT bss.pricing_repricing_journal fk_pricing_repricing_journal_applied_price FOREIGN KEY (applied_price_id) REFERENCES bss.pricing_price(price_id)
+CONSTRAINT bss.pricing_repricing_journal fk_pricing_repricing_journal_price FOREIGN KEY (price_id) REFERENCES bss.pricing_price(price_id)
+CONSTRAINT bss.pricing_repricing_journal fk_pricing_repricing_journal_run FOREIGN KEY (run_id) REFERENCES bss.pricing_bulk_operation(operation_id)
+CONSTRAINT bss.pricing_repricing_journal pricing_repricing_journal_pkey PRIMARY KEY (run_id, price_id)
+CONSTRAINT bss.pricing_rounding_policy_taxonomy chk_pricing_rounding_policy_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
+CONSTRAINT bss.pricing_rounding_policy_taxonomy chk_pricing_rounding_policy_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_rounding_policy_taxonomy pricing_rounding_policy_taxonomy_pkey PRIMARY KEY (tenant_id, value)
+CONSTRAINT bss.pricing_snapshot_provenance chk_pricing_snapshot_provenance_payload CHECK ((jsonb_typeof(payload) = 'object'::text))
+CONSTRAINT bss.pricing_snapshot_provenance chk_pricing_snapshot_provenance_resolved CHECK (((jsonb_typeof(resolved) = 'array'::text) AND (jsonb_array_length(resolved) > 0)))
+CONSTRAINT bss.pricing_snapshot_provenance chk_pricing_snapshot_provenance_revision CHECK (((source_revision IS NULL) OR (source_revision >= 0)))
+CONSTRAINT bss.pricing_snapshot_provenance chk_pricing_snapshot_provenance_trigger CHECK ((trigger_kind = ANY (ARRAY['migration'::text, 'first_rating'::text])))
+CONSTRAINT bss.pricing_snapshot_provenance pricing_snapshot_provenance_pkey PRIMARY KEY (provenance_id)
+INDEX bss coord_leases_pkey CREATE UNIQUE INDEX coord_leases_pkey ON bss.coord_leases USING btree (key)
+INDEX bss excl_pricing_group_membership_no_overlap CREATE INDEX excl_pricing_group_membership_no_overlap ON bss.pricing_group_membership USING gist (tenant_id, payer_tenant_id, tstzrange(effective_from, effective_to, '[)'::text))
+INDEX bss excl_pricing_price_window_no_overlap CREATE INDEX excl_pricing_price_window_no_overlap ON bss.pricing_price_window USING gist (tenant_id, price_id, tstzrange(effective_from, effective_to, '[)'::text)) WHERE (state = ANY (ARRAY['scheduled'::text, 'active'::text]))
+INDEX bss idx_pricing_approval_key_approval CREATE INDEX idx_pricing_approval_key_approval ON bss.pricing_approval_key USING btree (approval_id)
+INDEX bss idx_pricing_approval_subject CREATE INDEX idx_pricing_approval_subject ON bss.pricing_approval USING btree (tenant_id, state, subject_ref)
+INDEX bss idx_pricing_audit_log_recorded CREATE INDEX idx_pricing_audit_log_recorded ON bss.pricing_audit_log USING btree (tenant_id, recorded_at)
+INDEX bss idx_pricing_audit_log_subject CREATE INDEX idx_pricing_audit_log_subject ON bss.pricing_audit_log USING btree (tenant_id, subject_kind, subject_ref, recorded_at)
+INDEX bss idx_pricing_bulk_operation_live CREATE INDEX idx_pricing_bulk_operation_live ON bss.pricing_bulk_operation USING btree (tenant_id, state, submitted_at)
+INDEX bss idx_pricing_bulk_row_lock_operation CREATE INDEX idx_pricing_bulk_row_lock_operation ON bss.pricing_bulk_row_lock USING btree (tenant_id, bulk_operation_id)
+INDEX bss idx_pricing_bundle_component_plan CREATE INDEX idx_pricing_bundle_component_plan ON bss.pricing_bundle_component USING btree (tenant_id, component_plan_id)
+INDEX bss idx_pricing_bundle_component_revision CREATE INDEX idx_pricing_bundle_component_revision ON bss.pricing_bundle_component USING btree (tenant_id, bundle_id, plan_revision)
+INDEX bss idx_pricing_bundle_revshare_group_revision CREATE INDEX idx_pricing_bundle_revshare_group_revision ON bss.pricing_bundle_revshare_group USING btree (tenant_id, bundle_id, plan_revision)
+INDEX bss idx_pricing_bundle_revshare_revision CREATE INDEX idx_pricing_bundle_revshare_revision ON bss.pricing_bundle_revshare USING btree (tenant_id, bundle_id, plan_revision)
+INDEX bss idx_pricing_bundle_tenant CREATE INDEX idx_pricing_bundle_tenant ON bss.pricing_bundle USING btree (tenant_id, bundle_id)
+INDEX bss idx_pricing_catalog_version_ref_version CREATE INDEX idx_pricing_catalog_version_ref_version ON bss.pricing_catalog_version_ref USING btree (tenant_id, catalog_version)
+INDEX bss idx_pricing_composite_meter_revision CREATE INDEX idx_pricing_composite_meter_revision ON bss.pricing_composite_meter USING btree (tenant_id, plan_id, plan_revision)
+INDEX bss idx_pricing_group_membership_payer CREATE INDEX idx_pricing_group_membership_payer ON bss.pricing_group_membership USING btree (tenant_id, payer_tenant_id, effective_from)
+INDEX bss idx_pricing_group_membership_walk CREATE INDEX idx_pricing_group_membership_walk ON bss.pricing_group_membership USING btree (tenant_id, group_value, effective_from, membership_id)
+INDEX bss idx_pricing_idempotency_dedup_created CREATE INDEX idx_pricing_idempotency_dedup_created ON bss.pricing_idempotency_dedup USING btree (tenant_id, created_at_utc)
+INDEX bss idx_pricing_migration_due CREATE INDEX idx_pricing_migration_due ON bss.pricing_migration USING btree (state, effective_at)
+INDEX bss idx_pricing_migration_source CREATE INDEX idx_pricing_migration_source ON bss.pricing_migration USING btree (tenant_id, source_plan_id)
+INDEX bss idx_pricing_migration_target CREATE INDEX idx_pricing_migration_target ON bss.pricing_migration USING btree (tenant_id, target_plan_id)
+INDEX bss idx_pricing_operator_flag_by_flag CREATE INDEX idx_pricing_operator_flag_by_flag ON bss.pricing_operator_flag USING btree (tenant_id, flag, set_at)
+INDEX bss idx_pricing_outbox_undrained CREATE INDEX idx_pricing_outbox_undrained ON bss.pricing_outbox USING btree (tenant_id, aggregate_id, seq) WHERE (published_at IS NULL)
+INDEX bss idx_pricing_plan_addon_rule_revision CREATE INDEX idx_pricing_plan_addon_rule_revision ON bss.pricing_plan_addon_rule USING btree (tenant_id, plan_id, plan_revision)
+INDEX bss idx_pricing_plan_descriptor_set_revision CREATE INDEX idx_pricing_plan_descriptor_set_revision ON bss.pricing_plan_descriptor_set USING btree (tenant_id, plan_id, plan_revision)
+INDEX bss idx_pricing_plan_period_floor_cap_revision CREATE INDEX idx_pricing_plan_period_floor_cap_revision ON bss.pricing_plan_period_floor_cap USING btree (tenant_id, plan_id, plan_revision)
+INDEX bss idx_pricing_plan_phase_revision CREATE INDEX idx_pricing_plan_phase_revision ON bss.pricing_plan_phase USING btree (tenant_id, plan_id, plan_revision)
+INDEX bss idx_pricing_plan_tenant CREATE INDEX idx_pricing_plan_tenant ON bss.pricing_plan USING btree (tenant_id, plan_id, revision)
+INDEX bss idx_pricing_price_overlay_line_amount_tenant CREATE INDEX idx_pricing_price_overlay_line_amount_tenant ON bss.pricing_price_overlay_line_amount USING btree (tenant_id, line_id)
+INDEX bss idx_pricing_price_overlay_line_plan CREATE INDEX idx_pricing_price_overlay_line_plan ON bss.pricing_price_overlay_line USING btree (tenant_id, plan_id)
+INDEX bss idx_pricing_price_overlay_line_revision CREATE INDEX idx_pricing_price_overlay_line_revision ON bss.pricing_price_overlay_line USING btree (tenant_id, price_overlay_id, overlay_revision)
+INDEX bss idx_pricing_price_overlay_scope CREATE INDEX idx_pricing_price_overlay_scope ON bss.pricing_price_overlay USING btree (tenant_id, scope_class, scope_value, lifecycle_state)
+INDEX bss idx_pricing_price_plan CREATE INDEX idx_pricing_price_plan ON bss.pricing_price USING btree (tenant_id, plan_id, lifecycle_state)
+INDEX bss idx_pricing_price_supersedes CREATE INDEX idx_pricing_price_supersedes ON bss.pricing_price USING btree (tenant_id, supersedes_price_id) WHERE (supersedes_price_id IS NOT NULL)
+INDEX bss idx_pricing_price_tier_band_price CREATE INDEX idx_pricing_price_tier_band_price ON bss.pricing_price_tier_band USING btree (tenant_id, price_id)
+INDEX bss idx_pricing_price_window_due CREATE INDEX idx_pricing_price_window_due ON bss.pricing_price_window USING btree (state, effective_from)
+INDEX bss idx_pricing_price_window_price CREATE INDEX idx_pricing_price_window_price ON bss.pricing_price_window USING btree (tenant_id, price_id)
+INDEX bss idx_pricing_read_model_resolve CREATE INDEX idx_pricing_read_model_resolve ON bss.pricing_read_model USING btree (tenant_id, subject_kind, subject_ref, catalog_version DESC)
+INDEX bss idx_pricing_snapshot_provenance_plan CREATE INDEX idx_pricing_snapshot_provenance_plan ON bss.pricing_snapshot_provenance USING btree (tenant_id, source_plan_id)
+INDEX bss pricing_approval_key_pkey CREATE UNIQUE INDEX pricing_approval_key_pkey ON bss.pricing_approval_key USING btree (approval_id, scope_key)
+INDEX bss pricing_approval_pkey CREATE UNIQUE INDEX pricing_approval_pkey ON bss.pricing_approval USING btree (approval_id)
+INDEX bss pricing_approval_threshold_pkey CREATE UNIQUE INDEX pricing_approval_threshold_pkey ON bss.pricing_approval_threshold USING btree (tenant_id, version, currency)
+INDEX bss pricing_approval_threshold_tombstone_pkey CREATE UNIQUE INDEX pricing_approval_threshold_tombstone_pkey ON bss.pricing_approval_threshold_tombstone USING btree (tenant_id, version)
+INDEX bss pricing_audit_log_pkey CREATE UNIQUE INDEX pricing_audit_log_pkey ON bss.pricing_audit_log USING btree (tenant_id, chain_id, seq)
+INDEX bss pricing_brand_taxonomy_pkey CREATE UNIQUE INDEX pricing_brand_taxonomy_pkey ON bss.pricing_brand_taxonomy USING btree (tenant_id, value)
+INDEX bss pricing_bulk_operation_pkey CREATE UNIQUE INDEX pricing_bulk_operation_pkey ON bss.pricing_bulk_operation USING btree (operation_id)
+INDEX bss pricing_bulk_row_lock_pkey CREATE UNIQUE INDEX pricing_bulk_row_lock_pkey ON bss.pricing_bulk_row_lock USING btree (tenant_id, price_id)
+INDEX bss pricing_bundle_component_pkey CREATE UNIQUE INDEX pricing_bundle_component_pkey ON bss.pricing_bundle_component USING btree (bundle_id, plan_revision, component_plan_id)
+INDEX bss pricing_bundle_pkey CREATE UNIQUE INDEX pricing_bundle_pkey ON bss.pricing_bundle USING btree (bundle_id)
+INDEX bss pricing_bundle_revshare_group_pkey CREATE UNIQUE INDEX pricing_bundle_revshare_group_pkey ON bss.pricing_bundle_revshare_group USING btree (bundle_id, plan_revision, vendor_sku_id)
+INDEX bss pricing_bundle_revshare_pkey CREATE UNIQUE INDEX pricing_bundle_revshare_pkey ON bss.pricing_bundle_revshare USING btree (bundle_id, plan_revision, vendor_sku_id, party)
+INDEX bss pricing_catalog_version_ref_pkey CREATE UNIQUE INDEX pricing_catalog_version_ref_pkey ON bss.pricing_catalog_version_ref USING btree (tenant_id, pending_ref, subject_kind, subject_ref)
+INDEX bss pricing_composite_meter_pkey CREATE UNIQUE INDEX pricing_composite_meter_pkey ON bss.pricing_composite_meter USING btree (tenant_id, plan_id, plan_revision, composite_id)
+INDEX bss pricing_customer_group_taxonomy_pkey CREATE UNIQUE INDEX pricing_customer_group_taxonomy_pkey ON bss.pricing_customer_group_taxonomy USING btree (tenant_id, value)
+INDEX bss pricing_group_membership_pkey CREATE UNIQUE INDEX pricing_group_membership_pkey ON bss.pricing_group_membership USING btree (membership_id)
+INDEX bss pricing_idempotency_dedup_pkey CREATE UNIQUE INDEX pricing_idempotency_dedup_pkey ON bss.pricing_idempotency_dedup USING btree (tenant_id, operation, client_key)
+INDEX bss pricing_migration_pkey CREATE UNIQUE INDEX pricing_migration_pkey ON bss.pricing_migration USING btree (tenant_id, migration_id)
+INDEX bss pricing_operator_flag_pkey CREATE UNIQUE INDEX pricing_operator_flag_pkey ON bss.pricing_operator_flag USING btree (tenant_id, subject_ref, flag)
+INDEX bss pricing_org_tier_taxonomy_pkey CREATE UNIQUE INDEX pricing_org_tier_taxonomy_pkey ON bss.pricing_org_tier_taxonomy USING btree (tenant_id, value)
+INDEX bss pricing_outbox_pkey CREATE UNIQUE INDEX pricing_outbox_pkey ON bss.pricing_outbox USING btree (outbox_id)
+INDEX bss pricing_partner_taxonomy_pkey CREATE UNIQUE INDEX pricing_partner_taxonomy_pkey ON bss.pricing_partner_taxonomy USING btree (tenant_id, value)
+INDEX bss pricing_pin_frontier_pkey CREATE UNIQUE INDEX pricing_pin_frontier_pkey ON bss.pricing_pin_frontier USING btree (tenant_id)
+INDEX bss pricing_plan_addon_rule_pkey CREATE UNIQUE INDEX pricing_plan_addon_rule_pkey ON bss.pricing_plan_addon_rule USING btree (plan_id, plan_revision, addon_sku_id)
+INDEX bss pricing_plan_descriptor_set_pkey CREATE UNIQUE INDEX pricing_plan_descriptor_set_pkey ON bss.pricing_plan_descriptor_set USING btree (plan_id, plan_revision)
+INDEX bss pricing_plan_period_floor_cap_pkey CREATE UNIQUE INDEX pricing_plan_period_floor_cap_pkey ON bss.pricing_plan_period_floor_cap USING btree (plan_id, plan_revision, currency, region)
+INDEX bss pricing_plan_phase_pkey CREATE UNIQUE INDEX pricing_plan_phase_pkey ON bss.pricing_plan_phase USING btree (tenant_id, plan_id, plan_revision, phase_id)
+INDEX bss pricing_plan_pkey CREATE UNIQUE INDEX pricing_plan_pkey ON bss.pricing_plan USING btree (plan_id, revision)
+INDEX bss pricing_policy_object_pkey CREATE UNIQUE INDEX pricing_policy_object_pkey ON bss.pricing_policy_object USING btree (tenant_id)
+INDEX bss pricing_price_overlay_line_amount_pkey CREATE UNIQUE INDEX pricing_price_overlay_line_amount_pkey ON bss.pricing_price_overlay_line_amount USING btree (tenant_id, overlay_revision, line_id, currency)
+INDEX bss pricing_price_overlay_line_pkey CREATE UNIQUE INDEX pricing_price_overlay_line_pkey ON bss.pricing_price_overlay_line USING btree (tenant_id, overlay_revision, line_id)
+INDEX bss pricing_price_overlay_pkey CREATE UNIQUE INDEX pricing_price_overlay_pkey ON bss.pricing_price_overlay USING btree (price_overlay_id, revision)
+INDEX bss pricing_price_pkey CREATE UNIQUE INDEX pricing_price_pkey ON bss.pricing_price USING btree (price_id)
+INDEX bss pricing_price_tier_band_pkey CREATE UNIQUE INDEX pricing_price_tier_band_pkey ON bss.pricing_price_tier_band USING btree (band_id)
+INDEX bss pricing_price_window_pkey CREATE UNIQUE INDEX pricing_price_window_pkey ON bss.pricing_price_window USING btree (window_id)
+INDEX bss pricing_read_model_pkey CREATE UNIQUE INDEX pricing_read_model_pkey ON bss.pricing_read_model USING btree (tenant_id, catalog_version, subject_kind, subject_ref)
+INDEX bss pricing_region_taxonomy_pkey CREATE UNIQUE INDEX pricing_region_taxonomy_pkey ON bss.pricing_region_taxonomy USING btree (tenant_id, value)
+INDEX bss pricing_repricing_journal_pkey CREATE UNIQUE INDEX pricing_repricing_journal_pkey ON bss.pricing_repricing_journal USING btree (run_id, price_id)
+INDEX bss pricing_rounding_policy_taxonomy_pkey CREATE UNIQUE INDEX pricing_rounding_policy_taxonomy_pkey ON bss.pricing_rounding_policy_taxonomy USING btree (tenant_id, value)
+INDEX bss pricing_snapshot_provenance_pkey CREATE UNIQUE INDEX pricing_snapshot_provenance_pkey ON bss.pricing_snapshot_provenance USING btree (provenance_id)
+INDEX bss uq_pricing_approval_key_pending CREATE UNIQUE INDEX uq_pricing_approval_key_pending ON bss.pricing_approval_key USING btree (tenant_id, scope_key) WHERE (state = 'submitted'::text)
+INDEX bss uq_pricing_approval_policy_pending CREATE UNIQUE INDEX uq_pricing_approval_policy_pending ON bss.pricing_approval USING btree (tenant_id) WHERE ((subject_kind = 'policy'::text) AND (state = 'submitted'::text))
+INDEX bss uq_pricing_bulk_operation_client_key CREATE UNIQUE INDEX uq_pricing_bulk_operation_client_key ON bss.pricing_bulk_operation USING btree (tenant_id, kind, client_key)
+INDEX bss uq_pricing_bundle_plan CREATE UNIQUE INDEX uq_pricing_bundle_plan ON bss.pricing_bundle USING btree (tenant_id, plan_id)
+INDEX bss uq_pricing_composite_meter_output CREATE UNIQUE INDEX uq_pricing_composite_meter_output ON bss.pricing_composite_meter USING btree (tenant_id, plan_id, plan_revision, output_unit)
+INDEX bss uq_pricing_outbox_dedup_key CREATE UNIQUE INDEX uq_pricing_outbox_dedup_key ON bss.pricing_outbox USING btree (tenant_id, dedup_key)
+INDEX bss uq_pricing_outbox_sequence CREATE UNIQUE INDEX uq_pricing_outbox_sequence ON bss.pricing_outbox USING btree (tenant_id, aggregate_id, seq)
+INDEX bss uq_pricing_plan_current CREATE UNIQUE INDEX uq_pricing_plan_current ON bss.pricing_plan USING btree (plan_id) WHERE (lifecycle_state = ANY (ARRAY['published'::text, 'retired'::text]))
+INDEX bss uq_pricing_plan_open_draft CREATE UNIQUE INDEX uq_pricing_plan_open_draft ON bss.pricing_plan USING btree (plan_id) WHERE (lifecycle_state = 'draft'::text)
+INDEX bss uq_pricing_plan_phase_terminal CREATE UNIQUE INDEX uq_pricing_plan_phase_terminal ON bss.pricing_plan_phase USING btree (plan_id, plan_revision) WHERE (converts_to_phase_id IS NULL)
+INDEX bss uq_pricing_price_meter_line_current CREATE UNIQUE INDEX uq_pricing_price_meter_line_current ON bss.pricing_price USING btree (tenant_id, plan_id, currency, region, price_overlay, phase, price_eligibility, cohort, meter, dimension_key) WHERE ((lifecycle_state = 'published'::text) AND (meter IS NOT NULL))
+INDEX bss uq_pricing_price_overlay_line_key CREATE UNIQUE INDEX uq_pricing_price_overlay_line_key ON bss.pricing_price_overlay_line USING btree (price_overlay_id, overlay_revision, COALESCE(plan_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(target_sku, ''::text), COALESCE(cohort, '-infinity'::timestamp with time zone))
+INDEX bss uq_pricing_price_overlay_open_draft CREATE UNIQUE INDEX uq_pricing_price_overlay_open_draft ON bss.pricing_price_overlay USING btree (price_overlay_id) WHERE (lifecycle_state = 'draft'::text)
+INDEX bss uq_pricing_price_overlay_precedence CREATE UNIQUE INDEX uq_pricing_price_overlay_precedence ON bss.pricing_price_overlay USING btree (tenant_id, scope_class, precedence) WHERE (lifecycle_state = 'published'::text)
+INDEX bss uq_pricing_price_scope_key_current CREATE UNIQUE INDEX uq_pricing_price_scope_key_current ON bss.pricing_price USING btree (tenant_id, plan_id, currency, region, price_overlay, phase, price_eligibility, charge_kind, cohort, COALESCE(meter, ''::text), dimension_key) WHERE (lifecycle_state = 'published'::text)
+INDEX bss uq_pricing_price_scope_key_draft CREATE UNIQUE INDEX uq_pricing_price_scope_key_draft ON bss.pricing_price USING btree (tenant_id, plan_id, currency, region, price_overlay, phase, price_eligibility, charge_kind, cohort, COALESCE(meter, ''::text), dimension_key) WHERE (lifecycle_state = 'draft'::text)
+INDEX bss uq_pricing_price_tier_band_lower_bound CREATE UNIQUE INDEX uq_pricing_price_tier_band_lower_bound ON bss.pricing_price_tier_band USING btree (price_id, from_qty)
+INDEX bss uq_pricing_snapshot_provenance_subscription CREATE UNIQUE INDEX uq_pricing_snapshot_provenance_subscription ON bss.pricing_snapshot_provenance USING btree (tenant_id, subscription_ref)
+TRIGGER bss.pricing_approval trg_pricing_approval_append_only CREATE TRIGGER trg_pricing_approval_append_only BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_approval FOR EACH ROW EXECUTE FUNCTION bss.pricing_approval_append_only()
+TRIGGER bss.pricing_approval trg_pricing_approval_key_follow_state CREATE TRIGGER trg_pricing_approval_key_follow_state AFTER UPDATE ON bss.pricing_approval FOR EACH ROW EXECUTE FUNCTION bss.pricing_approval_key_follow_state()
+TRIGGER bss.pricing_approval_key trg_pricing_approval_key_append_only CREATE TRIGGER trg_pricing_approval_key_append_only BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_approval_key FOR EACH ROW EXECUTE FUNCTION bss.pricing_approval_key_append_only()
+TRIGGER bss.pricing_approval_threshold trg_pricing_approval_threshold_no_delete CREATE TRIGGER trg_pricing_approval_threshold_no_delete BEFORE DELETE ON bss.pricing_approval_threshold FOR EACH ROW EXECUTE FUNCTION bss.pricing_approval_threshold_no_delete()
+TRIGGER bss.pricing_approval_threshold trg_pricing_approval_threshold_no_update CREATE TRIGGER trg_pricing_approval_threshold_no_update BEFORE UPDATE ON bss.pricing_approval_threshold FOR EACH ROW EXECUTE FUNCTION bss.pricing_approval_threshold_no_update()
+TRIGGER bss.pricing_approval_threshold_tombstone trg_pricing_approval_threshold_tombstone_no_delete CREATE TRIGGER trg_pricing_approval_threshold_tombstone_no_delete BEFORE DELETE ON bss.pricing_approval_threshold_tombstone FOR EACH ROW EXECUTE FUNCTION bss.pricing_approval_threshold_tombstone_no_delete()
+TRIGGER bss.pricing_approval_threshold_tombstone trg_pricing_approval_threshold_tombstone_no_update CREATE TRIGGER trg_pricing_approval_threshold_tombstone_no_update BEFORE UPDATE ON bss.pricing_approval_threshold_tombstone FOR EACH ROW EXECUTE FUNCTION bss.pricing_approval_threshold_tombstone_no_update()
+TRIGGER bss.pricing_audit_log trg_pricing_audit_log_append_only CREATE TRIGGER trg_pricing_audit_log_append_only BEFORE DELETE OR UPDATE ON bss.pricing_audit_log FOR EACH ROW EXECUTE FUNCTION bss.pricing_audit_log_append_only()
+TRIGGER bss.pricing_bulk_operation trg_pricing_bulk_operation_transitions CREATE TRIGGER trg_pricing_bulk_operation_transitions BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_bulk_operation FOR EACH ROW EXECUTE FUNCTION bss.pricing_bulk_operation_transitions()
+TRIGGER bss.pricing_bulk_row_lock trg_pricing_bulk_row_lock_custody CREATE TRIGGER trg_pricing_bulk_row_lock_custody BEFORE INSERT OR UPDATE ON bss.pricing_bulk_row_lock FOR EACH ROW EXECUTE FUNCTION bss.pricing_bulk_row_lock_custody()
+TRIGGER bss.pricing_bundle_component trg_pricing_bundle_component_append_only CREATE TRIGGER trg_pricing_bundle_component_append_only BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_bundle_component FOR EACH ROW EXECUTE FUNCTION bss.pricing_bundle_component_append_only()
+TRIGGER bss.pricing_bundle_revshare trg_pricing_bundle_revshare_append_only CREATE TRIGGER trg_pricing_bundle_revshare_append_only BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_bundle_revshare FOR EACH ROW EXECUTE FUNCTION bss.pricing_bundle_revshare_append_only()
+TRIGGER bss.pricing_bundle_revshare_group trg_pricing_bundle_revshare_group_append_only CREATE TRIGGER trg_pricing_bundle_revshare_group_append_only BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_bundle_revshare_group FOR EACH ROW EXECUTE FUNCTION bss.pricing_bundle_revshare_group_append_only()
+TRIGGER bss.pricing_composite_meter trg_pricing_composite_meter_append_only CREATE TRIGGER trg_pricing_composite_meter_append_only BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_composite_meter FOR EACH ROW EXECUTE FUNCTION bss.pricing_composite_meter_append_only()
+TRIGGER bss.pricing_migration trg_pricing_migration_append_only CREATE TRIGGER trg_pricing_migration_append_only BEFORE DELETE OR UPDATE ON bss.pricing_migration FOR EACH ROW EXECUTE FUNCTION bss.pricing_migration_append_only()
+TRIGGER bss.pricing_plan trg_pricing_plan_append_only CREATE TRIGGER trg_pricing_plan_append_only BEFORE DELETE OR UPDATE ON bss.pricing_plan FOR EACH ROW EXECUTE FUNCTION bss.pricing_plan_append_only()
+TRIGGER bss.pricing_plan_addon_rule trg_pricing_plan_addon_rule_append_only CREATE TRIGGER trg_pricing_plan_addon_rule_append_only BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_plan_addon_rule FOR EACH ROW EXECUTE FUNCTION bss.pricing_plan_addon_rule_append_only()
+TRIGGER bss.pricing_plan_descriptor_set trg_pricing_plan_descriptor_set_append_only CREATE TRIGGER trg_pricing_plan_descriptor_set_append_only BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_plan_descriptor_set FOR EACH ROW EXECUTE FUNCTION bss.pricing_plan_descriptor_set_append_only()
+TRIGGER bss.pricing_plan_period_floor_cap trg_pricing_plan_period_floor_cap_append_only CREATE TRIGGER trg_pricing_plan_period_floor_cap_append_only BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_plan_period_floor_cap FOR EACH ROW EXECUTE FUNCTION bss.pricing_plan_period_floor_cap_append_only()
+TRIGGER bss.pricing_plan_phase trg_pricing_plan_phase_append_only CREATE TRIGGER trg_pricing_plan_phase_append_only BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_plan_phase FOR EACH ROW EXECUTE FUNCTION bss.pricing_plan_phase_append_only()
+TRIGGER bss.pricing_price trg_pricing_price_append_only CREATE TRIGGER trg_pricing_price_append_only BEFORE DELETE OR UPDATE ON bss.pricing_price FOR EACH ROW EXECUTE FUNCTION bss.pricing_price_append_only()
+TRIGGER bss.pricing_price trg_pricing_price_tier_band_parent_kind CREATE TRIGGER trg_pricing_price_tier_band_parent_kind BEFORE UPDATE ON bss.pricing_price FOR EACH ROW EXECUTE FUNCTION bss.pricing_price_tier_band_parent_kind()
+TRIGGER bss.pricing_price_overlay trg_pricing_price_overlay_append_only CREATE TRIGGER trg_pricing_price_overlay_append_only BEFORE DELETE OR UPDATE ON bss.pricing_price_overlay FOR EACH ROW EXECUTE FUNCTION bss.pricing_price_overlay_append_only()
+TRIGGER bss.pricing_price_overlay_line trg_pricing_price_overlay_line_append_only CREATE TRIGGER trg_pricing_price_overlay_line_append_only BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_price_overlay_line FOR EACH ROW EXECUTE FUNCTION bss.pricing_price_overlay_line_append_only()
+TRIGGER bss.pricing_price_overlay_line_amount trg_pricing_price_overlay_line_amount_append_only CREATE TRIGGER trg_pricing_price_overlay_line_amount_append_only BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_price_overlay_line_amount FOR EACH ROW EXECUTE FUNCTION bss.pricing_price_overlay_line_amount_append_only()
+TRIGGER bss.pricing_price_tier_band trg_pricing_price_tier_band_append_only CREATE TRIGGER trg_pricing_price_tier_band_append_only BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_price_tier_band FOR EACH ROW EXECUTE FUNCTION bss.pricing_price_tier_band_append_only()
+TRIGGER bss.pricing_price_tier_band trg_pricing_price_tier_band_kind CREATE TRIGGER trg_pricing_price_tier_band_kind BEFORE INSERT OR UPDATE ON bss.pricing_price_tier_band FOR EACH ROW EXECUTE FUNCTION bss.pricing_price_tier_band_kind()
+TRIGGER bss.pricing_price_window trg_pricing_price_window_append_only CREATE TRIGGER trg_pricing_price_window_append_only BEFORE DELETE OR UPDATE ON bss.pricing_price_window FOR EACH ROW EXECUTE FUNCTION bss.pricing_price_window_append_only()
+TRIGGER bss.pricing_repricing_journal trg_pricing_repricing_journal_progress CREATE TRIGGER trg_pricing_repricing_journal_progress BEFORE INSERT OR DELETE OR UPDATE ON bss.pricing_repricing_journal FOR EACH ROW EXECUTE FUNCTION bss.pricing_repricing_journal_progress()
+TRIGGER bss.pricing_snapshot_provenance trg_pricing_snapshot_provenance_frozen CREATE TRIGGER trg_pricing_snapshot_provenance_frozen BEFORE DELETE OR UPDATE ON bss.pricing_snapshot_provenance FOR EACH ROW EXECUTE FUNCTION bss.pricing_snapshot_provenance_frozen()
+FUNCTION bss pricing_approval_append_only CREATE OR REPLACE FUNCTION bss.pricing_approval_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN -- Born `submitted` or not born. Tested first because it is the only -- branch with no OLD row to read, and because every branch below is -- written about a record that started pending. IF TG_OP = 'INSERT' THEN IF NEW.state <> 'submitted' THEN RAISE EXCEPTION 'pricing_approval: approval % arrives %; a record is born submitted', NEW.approval_id, NEW.state; END IF; RETURN NEW; END IF; IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'pricing_approval: DELETE of approval % is not permitted; the record is the evidence', OLD.approval_id; END IF; IF OLD.state <> 'submitted' THEN RAISE EXCEPTION 'pricing_approval: approval % is %; a decided record is immutable', OLD.approval_id, OLD.state; END IF; -- The submitted plane pins everything the decision does not touch. -- `content_hash` is the TOCTOU guard itself; re-pinning it in place -- would launder the very mutation the guard exists to catch. IF NEW.approval_id IS DISTINCT FROM OLD.approval_id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR NEW.subject_ref IS DISTINCT FROM OLD.subject_ref OR NEW.subject_kind IS DISTINCT FROM OLD.subject_kind OR NEW.content_hash IS DISTINCT FROM OLD.content_hash OR NEW.submitter_principal IS DISTINCT FROM OLD.submitter_principal OR NEW.materiality IS DISTINCT FROM OLD.materiality OR NEW.submitted_at IS DISTINCT FROM OLD.submitted_at THEN RAISE EXCEPTION 'pricing_approval: approval % is pinned; only the decision columns may move', OLD.approval_id; END IF; IF NEW.state NOT IN ('approved','rejected','voided') THEN RAISE EXCEPTION 'pricing_approval: state % -> % is not a sanctioned flip', OLD.state, NEW.state; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_approval_key_append_only CREATE OR REPLACE FUNCTION bss.pricing_approval_key_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'pricing_approval_key: DELETE of key % held by approval % is not permitted; the register is the record of what the unit held', OLD.scope_key, OLD.approval_id; END IF; IF TG_OP = 'INSERT' THEN IF NEW.state <> 'submitted' THEN RAISE EXCEPTION 'pricing_approval_key: key % arrives %; a register row is born submitted with its unit', NEW.scope_key, NEW.state; END IF; -- **And it is born with a unit that is pending.** The foreign key and -- the parent-state check in one clause, because the failure they close -- is one failure: a row born under a unit that is missing or already -- decided holds its key **forever** - `follow_state` fires only -- `AFTER UPDATE` and the parent refuses every UPDATE once decided, so -- nothing can ever move it, and `find_pending_key_holder` answers -- `CorruptRow` (a 500) rather than a refusal an operator can act on. IF (SELECT state FROM bss.pricing_approval WHERE approval_id = NEW.approval_id) IS DISTINCT FROM 'submitted' THEN RAISE EXCEPTION 'pricing_approval_key: approval % is not a pending unit; a register row is born with one', NEW.approval_id; END IF; RETURN NEW; END IF; -- Only `state` moves, and only off `submitted`. Everything else is what -- the unit held, which is not editable after the fact. IF NEW.approval_id IS DISTINCT FROM OLD.approval_id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR NEW.scope_key IS DISTINCT FROM OLD.scope_key THEN RAISE EXCEPTION 'pricing_approval_key: the register row of approval % is pinned; only state follows the unit', OLD.approval_id; END IF; IF OLD.state <> 'submitted' THEN RAISE EXCEPTION 'pricing_approval_key: the register row of approval % is already %; it follows its unit once', OLD.approval_id, OLD.state; END IF; -- **The direction whitelist**: the state a register row moves to is the -- state its unit is *in*, so the only statement that can move it is the -- one the parent's own transition makes. See the module doc.
+          IF NEW.state IS DISTINCT FROM
+             (SELECT state FROM bss.pricing_approval WHERE approval_id = NEW.approval_id) THEN
+            RAISE EXCEPTION
+              'pricing_approval_key: approval % is %; a register row follows its unit and cannot be moved to % on its own',
+              NEW.approval_id,
+              (SELECT state FROM bss.pricing_approval WHERE approval_id = NEW.approval_id),
+              NEW.state;
+          END IF;
+
+          RETURN NEW;
+        END;
+     $function$
+
+FUNCTION bss pricing_approval_key_follow_state CREATE OR REPLACE FUNCTION bss.pricing_approval_key_follow_state() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN IF NEW.state IS DISTINCT FROM OLD.state THEN UPDATE bss.pricing_approval_key SET state = NEW.state WHERE approval_id = NEW.approval_id; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_approval_threshold_no_delete CREATE OR REPLACE FUNCTION bss.pricing_approval_threshold_no_delete() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN RAISE EXCEPTION 'pricing_approval_threshold: DELETE of tenant % version % is not permitted; a threshold policy is append-only history', OLD.tenant_id, OLD.version; END; $function$
+FUNCTION bss pricing_approval_threshold_no_update CREATE OR REPLACE FUNCTION bss.pricing_approval_threshold_no_update() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN RAISE EXCEPTION 'pricing_approval_threshold: version % is immutable; a correction is a new version, because an earlier version is what an approval pin covers', OLD.version; END; $function$
+FUNCTION bss pricing_approval_threshold_tombstone_no_delete CREATE OR REPLACE FUNCTION bss.pricing_approval_threshold_tombstone_no_delete() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN RAISE EXCEPTION 'pricing_approval_threshold_tombstone: DELETE of tenant % version % is not permitted; a threshold policy is append-only history', OLD.tenant_id, OLD.version; END; $function$
+FUNCTION bss pricing_approval_threshold_tombstone_no_update CREATE OR REPLACE FUNCTION bss.pricing_approval_threshold_tombstone_no_update() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN RAISE EXCEPTION 'pricing_approval_threshold_tombstone: version % is immutable; a correction is a new version, because an earlier version is what an approval pin covers', OLD.version; END; $function$
+FUNCTION bss pricing_audit_log_append_only CREATE OR REPLACE FUNCTION bss.pricing_audit_log_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN RAISE EXCEPTION 'pricing_audit_log is append-only: % is not permitted', TG_OP; END; $function$
+FUNCTION bss pricing_bulk_operation_transitions CREATE OR REPLACE FUNCTION bss.pricing_bulk_operation_transitions() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN -- **A run is born `validating` and in no other state.** -4 names it the -- initial state, and without this arm the whole machine is a rule about -- UPDATE with a row free to be born `committing` -- past the approval -- gate transitions 2 and 3 exist to impose - or born terminal, -- reporting outcomes for rows it never committed. `pricing_approval` -- carries the same arm for the same reason, in the same words. IF TG_OP = 'INSERT' THEN IF NEW.state <> 'validating' THEN RAISE EXCEPTION 'pricing_bulk_operation: a run is born validating, not %', NEW.state; END IF; RETURN NEW; END IF; IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'pricing_bulk_operation: DELETE of operation % is not permitted; a run is a record, not a draft', OLD.operation_id; END IF; -- Identity and provenance are frozen; only the run's progress moves.
+          IF NEW.operation_id IS DISTINCT FROM OLD.operation_id
+          OR NEW.tenant_id    IS DISTINCT FROM OLD.tenant_id
+          OR NEW.kind         IS DISTINCT FROM OLD.kind
+          OR NEW.client_key   IS DISTINCT FROM OLD.client_key
+          OR NEW.submitted_by IS DISTINCT FROM OLD.submitted_by
+          OR NEW.submitted_at IS DISTINCT FROM OLD.submitted_at
+          OR NEW.request_hash IS DISTINCT FROM OLD.request_hash THEN
+            RAISE EXCEPTION
+              'pricing_bulk_operation: operation % is frozen; only state, report and completed_at move',
+              OLD.operation_id;
+          END IF;
+
+          IF NEW.state = OLD.state THEN
+            RETURN NEW;
+          END IF;
+
+          -- Section 4's edges, and nothing else. IF NOT ((OLD.state = 'validating' AND NEW.state IN ('validation_failed', 'awaiting_approval', 'committing')) OR (OLD.state = 'awaiting_approval' AND NEW.state = 'committing') OR (OLD.state = 'awaiting_approval' AND NEW.state = 'rejected') OR (OLD.state = 'committing' AND NEW.state IN ('completed', 'completed_with_conflicts'))) THEN RAISE EXCEPTION 'pricing_bulk_operation: state % -> % is not an edge of the bulk state machine', OLD.state, NEW.state; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_bulk_row_lock_custody CREATE OR REPLACE FUNCTION bss.pricing_bulk_row_lock_custody() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE run_tenant uuid; run_state text; BEGIN IF TG_OP = 'UPDATE' THEN RAISE EXCEPTION 'pricing_bulk_row_lock: a lock is taken or released, never edited; operation % may not inherit the lock on price %', NEW.bulk_operation_id, OLD.price_id; END IF; SELECT tenant_id, state INTO run_tenant, run_state FROM bss.pricing_bulk_operation WHERE operation_id = NEW.bulk_operation_id; -- No such run: the foreign key is the accurate refusal and this -- trigger has no opinion. Deferring keeps the key **observable** -- -- a BEFORE trigger answers ahead of it -- and stops the tenant arm -- below reporting a tenancy fault for a run that does not exist, -- which would send a reader looking for a bug that is not there. IF NOT FOUND THEN RETURN NEW; END IF; -- The run exists; this proves it is the locking tenant's own.
+          IF run_tenant IS DISTINCT FROM NEW.tenant_id THEN
+            RAISE EXCEPTION
+              'pricing_bulk_row_lock: operation % belongs to another tenant and may not lock this row',
+              NEW.bulk_operation_id;
+          END IF;
+
+          IF run_state <> 'committing' THEN
+            RAISE EXCEPTION
+              'pricing_bulk_row_lock: operation % is %, and the bulk lock takes effect only on entry to committing',
+              NEW.bulk_operation_id, run_state;
+          END IF;
+
+          RETURN NEW;
+        END;
+     $function$
+
+FUNCTION bss pricing_bundle_component_append_only CREATE OR REPLACE FUNCTION bss.pricing_bundle_component_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE parent_state text; BEGIN IF TG_OP <> 'INSERT' THEN SELECT p.lifecycle_state INTO parent_state FROM bss.pricing_bundle b JOIN bss.pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = OLD.bundle_id AND p.revision = OLD.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_bundle_component: % of a component under a non-draft plan revision is not permitted (state %)', TG_OP, coalesce(parent_state, 'missing'); END IF; END IF; IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; SELECT p.lifecycle_state INTO parent_state FROM bss.pricing_bundle b JOIN bss.pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = NEW.bundle_id AND p.revision = NEW.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_bundle_component: % of a component under a non-draft plan revision is not permitted (state %)', TG_OP, coalesce(parent_state, 'missing'); END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_bundle_revshare_append_only CREATE OR REPLACE FUNCTION bss.pricing_bundle_revshare_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE parent_state text; BEGIN IF TG_OP <> 'INSERT' THEN SELECT p.lifecycle_state INTO parent_state FROM bss.pricing_bundle b JOIN bss.pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = OLD.bundle_id AND p.revision = OLD.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_bundle_revshare: % of a rev-share party under a non-draft plan revision is not permitted (state %)', TG_OP, coalesce(parent_state, 'missing'); END IF; END IF; IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; SELECT p.lifecycle_state INTO parent_state FROM bss.pricing_bundle b JOIN bss.pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = NEW.bundle_id AND p.revision = NEW.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_bundle_revshare: % of a rev-share party under a non-draft plan revision is not permitted (state %)', TG_OP, coalesce(parent_state, 'missing'); END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_bundle_revshare_group_append_only CREATE OR REPLACE FUNCTION bss.pricing_bundle_revshare_group_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE parent_state text; BEGIN IF TG_OP <> 'INSERT' THEN SELECT p.lifecycle_state INTO parent_state FROM bss.pricing_bundle b JOIN bss.pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = OLD.bundle_id AND p.revision = OLD.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_bundle_revshare_group: % of a rev-share group under a non-draft plan revision is not permitted (state %)', TG_OP, coalesce(parent_state, 'missing'); END IF; END IF; IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; SELECT p.lifecycle_state INTO parent_state FROM bss.pricing_bundle b JOIN bss.pricing_plan p ON p.plan_id = b.plan_id WHERE b.bundle_id = NEW.bundle_id AND p.revision = NEW.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_bundle_revshare_group: % of a rev-share group under a non-draft plan revision is not permitted (state %)', TG_OP, coalesce(parent_state, 'missing'); END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_composite_meter_append_only CREATE OR REPLACE FUNCTION bss.pricing_composite_meter_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE parent_state text; parent_tenant uuid; BEGIN IF TG_OP <> 'INSERT' THEN SELECT lifecycle_state INTO parent_state FROM bss.pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_composite_meter: % of a composite under a % plan revision is not permitted', TG_OP, coalesce(parent_state, 'missing'); END IF; END IF; IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; SELECT lifecycle_state, tenant_id INTO parent_state, parent_tenant FROM bss.pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_composite_meter: % of a composite under a % plan revision is not permitted', TG_OP, coalesce(parent_state, 'missing'); END IF; -- `fk_pricing_composite_meter_revision` covers `(plan_id, plan_revision)` alone, so -- without this arm a row could carry a tenant its own parent revision -- does not belong to: invisible to every scoped reader, and frozen with -- the revision it was written under. The state arm above has already -- refused a parent that does not exist, so a foreign tenant is the only -- thing left for this one to find. IF parent_tenant IS DISTINCT FROM NEW.tenant_id THEN RAISE EXCEPTION 'pricing_composite_meter: plan revision %/% belongs to another tenant and may not hold this row', NEW.plan_id, NEW.plan_revision; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_migration_append_only CREATE OR REPLACE FUNCTION bss.pricing_migration_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'pricing_migration: DELETE of migration % is not permitted; cancel is a state, not a deletion, and an executor must be able to tell a cancelled run from an absent one', OLD.migration_id; END IF; IF OLD.state IN ('completed','cancelled') THEN RAISE EXCEPTION 'pricing_migration: migration % is %; a completed or cancelled run is immutable history', OLD.migration_id, OLD.state; END IF; IF NEW.migration_id IS DISTINCT FROM OLD.migration_id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR NEW.source_plan_id IS DISTINCT FROM OLD.source_plan_id OR NEW.source_revision IS DISTINCT FROM OLD.source_revision OR NEW.target_plan_id IS DISTINCT FROM OLD.target_plan_id OR NEW.effective_at IS DISTINCT FROM OLD.effective_at OR NEW.announced_at IS DISTINCT FROM OLD.announced_at OR NEW.scope IS DISTINCT FROM OLD.scope OR NEW.delta_report IS DISTINCT FROM OLD.delta_report OR NEW.created_by IS DISTINCT FROM OLD.created_by OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN RAISE EXCEPTION 'pricing_migration: migration % is bound to its source, target, effective date, scope and schedule-time delta report; only state, the execution records and the flip timestamps may move', OLD.migration_id; END IF; IF NEW.state IS DISTINCT FROM OLD.state AND NOT (OLD.state = 'scheduled' AND NEW.state IN ('in_progress','cancelled')) AND NOT (OLD.state = 'in_progress' AND NEW.state IN ('completed','cancelled')) THEN RAISE EXCEPTION 'pricing_migration: state % -> % is not a sanctioned transition', OLD.state, NEW.state; END IF; -- D-65's replay half: once persisted, the exclusion set an executor was
+          -- handed is what every repeat call must be answered with.
+          IF OLD.exclusion_snapshot IS NOT NULL
+             AND NEW.exclusion_snapshot IS DISTINCT FROM OLD.exclusion_snapshot THEN
+            RAISE EXCEPTION
+              'pricing_migration: the exclusion set of migration % is computed once and replayed verbatim; a recompute could differ from the set the executor already honoured',
+              OLD.migration_id;
+          END IF;
+
+          RETURN NEW;
+        END;
+     $function$
+
+FUNCTION bss pricing_plan_addon_rule_append_only CREATE OR REPLACE FUNCTION bss.pricing_plan_addon_rule_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE parent_state text; parent_tenant uuid; BEGIN IF TG_OP <> 'INSERT' THEN SELECT lifecycle_state INTO parent_state FROM bss.pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_plan_addon_rule: % of an add-on rule under a % plan revision is not permitted', TG_OP, coalesce(parent_state, 'missing'); END IF; END IF; IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; SELECT lifecycle_state, tenant_id INTO parent_state, parent_tenant FROM bss.pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_plan_addon_rule: % of an add-on rule under a % plan revision is not permitted', TG_OP, coalesce(parent_state, 'missing'); END IF; -- `fk_pricing_plan_addon_rule_revision` covers `(plan_id, plan_revision)` alone, so -- without this arm a row could carry a tenant its own parent revision -- does not belong to: invisible to every scoped reader, and frozen with -- the revision it was written under. The state arm above has already -- refused a parent that does not exist, so a foreign tenant is the only -- thing left for this one to find. IF parent_tenant IS DISTINCT FROM NEW.tenant_id THEN RAISE EXCEPTION 'pricing_plan_addon_rule: plan revision %/% belongs to another tenant and may not hold this row', NEW.plan_id, NEW.plan_revision; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_plan_append_only CREATE OR REPLACE FUNCTION bss.pricing_plan_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'pricing_plan: DELETE of revision % of plan % is not permitted; a discarded draft revision is abandoned', OLD.revision, OLD.plan_id; END IF; -- The draft plane is where content moves, so its columns are -- unguarded - but its **exits** are not. A draft leaves by publishing -- or by being abandoned, and `NEW = draft` is the ordinary edit. -- Without the check a hand-run flip could mint a `retired` row that -- never published - one that satisfies the current-revision partial -- UNIQUE and is what the projector then sources a plan subject from. -- Membership is tested rather than change: a -- `NEW IS DISTINCT FROM OLD` conjunct would let the SQLite mirror -- accept a no-op UPDATE this branch refuses, and a backend divergence -- is worse than the hole it would close. IF OLD.lifecycle_state = 'draft' THEN IF NEW.lifecycle_state NOT IN ('draft','published','abandoned') THEN RAISE EXCEPTION 'pricing_plan: lifecycle_state % -> % is not a sanctioned flip', OLD.lifecycle_state, NEW.lifecycle_state; END IF; RETURN NEW; END IF; -- Past here the row is published, superseded, retired or abandoned. -- Once abandoned it is a tombstone: frozen in content by the whitelist -- below and left by no flip, so the number it consumed can never be -- attached to a different shape. IF NEW.plan_id IS DISTINCT FROM OLD.plan_id OR NEW.revision IS DISTINCT FROM OLD.revision OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR NEW.sku_id IS DISTINCT FROM OLD.sku_id OR NEW.plan_tier IS DISTINCT FROM OLD.plan_tier OR NEW.billing_cycle IS DISTINCT FROM OLD.billing_cycle OR NEW.frequency IS DISTINCT FROM OLD.frequency OR NEW.custom_interval_n IS DISTINCT FROM OLD.custom_interval_n OR NEW.custom_interval_unit IS DISTINCT FROM OLD.custom_interval_unit OR NEW.plan_tier_override IS DISTINCT FROM OLD.plan_tier_override OR NEW.purchase_min_qty IS DISTINCT FROM OLD.purchase_min_qty OR NEW.purchase_max_qty IS DISTINCT FROM OLD.purchase_max_qty OR NEW.invoice_grouping_key IS DISTINCT FROM OLD.invoice_grouping_key OR NEW.available_from IS DISTINCT FROM OLD.available_from OR NEW.available_to IS DISTINCT FROM OLD.available_to OR NEW.created_by IS DISTINCT FROM OLD.created_by OR NEW.created_at_utc IS DISTINCT FROM OLD.created_at_utc OR NEW.allowed_change_targets IS DISTINCT FROM OLD.allowed_change_targets OR NEW.comparability_rank IS DISTINCT FROM OLD.comparability_rank OR NEW.usage_counter_on_plan_change IS DISTINCT FROM OLD.usage_counter_on_plan_change OR NEW.entitlement_grants IS DISTINCT FROM OLD.entitlement_grants OR NEW.cloned_from IS DISTINCT FROM OLD.cloned_from OR NEW.plan_name IS DISTINCT FROM OLD.plan_name OR NEW.row_version IS DISTINCT FROM OLD.row_version THEN RAISE EXCEPTION 'pricing_plan: revision % of plan % is frozen; only a sanctioned lifecycle_state flip is permitted', OLD.revision, OLD.plan_id; END IF; IF NOT (OLD.lifecycle_state = 'published' AND NEW.lifecycle_state IN ('superseded','retired')) THEN RAISE EXCEPTION 'pricing_plan: lifecycle_state % -> % is not a sanctioned flip', OLD.lifecycle_state, NEW.lifecycle_state; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_plan_descriptor_set_append_only CREATE OR REPLACE FUNCTION bss.pricing_plan_descriptor_set_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE parent_state text; parent_tenant uuid; BEGIN IF TG_OP <> 'INSERT' THEN SELECT lifecycle_state INTO parent_state FROM bss.pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_plan_descriptor_set: % of a descriptor set under a % plan revision is not permitted', TG_OP, coalesce(parent_state, 'missing'); END IF; END IF; IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; SELECT lifecycle_state, tenant_id INTO parent_state, parent_tenant FROM bss.pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_plan_descriptor_set: % of a descriptor set under a % plan revision is not permitted', TG_OP, coalesce(parent_state, 'missing'); END IF; -- `fk_pricing_plan_descriptor_set_revision` covers `(plan_id, plan_revision)` alone, so -- without this arm a row could carry a tenant its own parent revision -- does not belong to: invisible to every scoped reader, and frozen with -- the revision it was written under. The state arm above has already -- refused a parent that does not exist, so a foreign tenant is the only -- thing left for this one to find. IF parent_tenant IS DISTINCT FROM NEW.tenant_id THEN RAISE EXCEPTION 'pricing_plan_descriptor_set: plan revision %/% belongs to another tenant and may not hold this row', NEW.plan_id, NEW.plan_revision; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_plan_period_floor_cap_append_only CREATE OR REPLACE FUNCTION bss.pricing_plan_period_floor_cap_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE parent_state text; parent_tenant uuid; BEGIN IF TG_OP <> 'INSERT' THEN SELECT lifecycle_state INTO parent_state FROM bss.pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_plan_period_floor_cap: % of a period bound under a % plan revision is not permitted', TG_OP, coalesce(parent_state, 'missing'); END IF; END IF; IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; SELECT lifecycle_state, tenant_id INTO parent_state, parent_tenant FROM bss.pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_plan_period_floor_cap: % of a period bound under a % plan revision is not permitted', TG_OP, coalesce(parent_state, 'missing'); END IF; -- `fk_pricing_plan_period_floor_cap_revision` covers `(plan_id, plan_revision)` alone, so -- without this arm a row could carry a tenant its own parent revision -- does not belong to: invisible to every scoped reader, and frozen with -- the revision it was written under. The state arm above has already -- refused a parent that does not exist, so a foreign tenant is the only -- thing left for this one to find. IF parent_tenant IS DISTINCT FROM NEW.tenant_id THEN RAISE EXCEPTION 'pricing_plan_period_floor_cap: plan revision %/% belongs to another tenant and may not hold this row', NEW.plan_id, NEW.plan_revision; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_plan_phase_append_only CREATE OR REPLACE FUNCTION bss.pricing_plan_phase_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE parent_state text; parent_tenant uuid; BEGIN IF TG_OP <> 'INSERT' THEN SELECT lifecycle_state INTO parent_state FROM bss.pricing_plan WHERE plan_id = OLD.plan_id AND revision = OLD.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_plan_phase: % of a phase under a % plan revision is not permitted', TG_OP, coalesce(parent_state, 'missing'); END IF; END IF; IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; SELECT lifecycle_state, tenant_id INTO parent_state, parent_tenant FROM bss.pricing_plan WHERE plan_id = NEW.plan_id AND revision = NEW.plan_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_plan_phase: % of a phase under a % plan revision is not permitted', TG_OP, coalesce(parent_state, 'missing'); END IF; -- `fk_pricing_plan_phase_revision` covers `(plan_id, plan_revision)` alone, so -- without this arm a row could carry a tenant its own parent revision -- does not belong to: invisible to every scoped reader, and frozen with -- the revision it was written under. The state arm above has already -- refused a parent that does not exist, so a foreign tenant is the only -- thing left for this one to find. IF parent_tenant IS DISTINCT FROM NEW.tenant_id THEN RAISE EXCEPTION 'pricing_plan_phase: plan revision %/% belongs to another tenant and may not hold this row', NEW.plan_id, NEW.plan_revision; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_price_append_only CREATE OR REPLACE FUNCTION bss.pricing_price_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN IF TG_OP = 'DELETE' THEN IF OLD.lifecycle_state <> 'draft' THEN RAISE EXCEPTION 'pricing_price: DELETE of a % row is not permitted', OLD.lifecycle_state; END IF; RETURN OLD; END IF; IF OLD.lifecycle_state = 'draft' THEN IF NEW.lifecycle_state NOT IN ('draft', 'published') THEN RAISE EXCEPTION 'pricing_price: lifecycle_state draft -> % is not a sanctioned transition', NEW.lifecycle_state; END IF; RETURN NEW; END IF; IF NEW.price_id IS DISTINCT FROM OLD.price_id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR NEW.plan_id IS DISTINCT FROM OLD.plan_id OR NEW.currency IS DISTINCT FROM OLD.currency OR NEW.region IS DISTINCT FROM OLD.region OR NEW.price_overlay IS DISTINCT FROM OLD.price_overlay OR NEW.phase IS DISTINCT FROM OLD.phase OR NEW.price_eligibility IS DISTINCT FROM OLD.price_eligibility OR NEW.charge_kind IS DISTINCT FROM OLD.charge_kind OR NEW.cohort IS DISTINCT FROM OLD.cohort OR NEW.amount_minor IS DISTINCT FROM OLD.amount_minor OR NEW.unit_rate_nano IS DISTINCT FROM OLD.unit_rate_nano OR NEW.model_kind IS DISTINCT FROM OLD.model_kind OR NEW.tax_inclusive IS DISTINCT FROM OLD.tax_inclusive OR NEW.tax_category_ref IS DISTINCT FROM OLD.tax_category_ref OR NEW.resolved_tax_category IS DISTINCT FROM OLD.resolved_tax_category OR NEW.resolved_rounding_policy IS DISTINCT FROM OLD.resolved_rounding_policy OR NEW.billing_timing IS DISTINCT FROM OLD.billing_timing OR NEW.billing_anchor_policy IS DISTINCT FROM OLD.billing_anchor_policy OR NEW.anchor_day IS DISTINCT FROM OLD.anchor_day OR NEW.proration_basis IS DISTINCT FROM OLD.proration_basis OR NEW.credit_on_downgrade IS DISTINCT FROM OLD.credit_on_downgrade OR NEW.quantity_source IS DISTINCT FROM OLD.quantity_source OR NEW.manual_quantity IS DISTINCT FROM OLD.manual_quantity OR NEW.package_size IS DISTINCT FROM OLD.package_size OR NEW.package_price_minor IS DISTINCT FROM OLD.package_price_minor OR NEW.meter IS DISTINCT FROM OLD.meter OR NEW.dimension_key IS DISTINCT FROM OLD.dimension_key OR NEW.billing_granularity IS DISTINCT FROM OLD.billing_granularity OR NEW.aggregation_function IS DISTINCT FROM OLD.aggregation_function OR NEW.aggregation_granularity IS DISTINCT FROM OLD.aggregation_granularity OR NEW.tier_aggregation_window IS DISTINCT FROM OLD.tier_aggregation_window OR NEW.tier_qualification_window IS DISTINCT FROM OLD.tier_qualification_window OR NEW.max_hold_granules IS DISTINCT FROM OLD.max_hold_granules OR NEW.included_allowance IS DISTINCT FROM OLD.included_allowance OR NEW.reserved_rate_nano IS DISTINCT FROM OLD.reserved_rate_nano OR NEW.reservation_flavor IS DISTINCT FROM OLD.reservation_flavor OR NEW.min_qty_purchase IS DISTINCT FROM OLD.min_qty_purchase OR NEW.min_qty_usage IS DISTINCT FROM OLD.min_qty_usage OR NEW.min_qty_usage_fallback IS DISTINCT FROM OLD.min_qty_usage_fallback OR NEW.discount_ref IS DISTINCT FROM OLD.discount_ref OR NEW.rounding_policy_ref IS DISTINCT FROM OLD.rounding_policy_ref OR NEW.supersedes_price_id IS DISTINCT FROM OLD.supersedes_price_id OR NEW.created_by IS DISTINCT FROM OLD.created_by OR NEW.created_at_utc IS DISTINCT FROM OLD.created_at_utc OR NEW.row_version IS DISTINCT FROM OLD.row_version THEN RAISE EXCEPTION 'pricing_price: row % is published; price, scope, model and entity-tag columns are immutable', OLD.price_id; END IF; IF NEW.lifecycle_state IS DISTINCT FROM OLD.lifecycle_state AND NOT (OLD.lifecycle_state = 'published' AND NEW.lifecycle_state = 'superseded') THEN RAISE EXCEPTION 'pricing_price: lifecycle_state % -> % is not a sanctioned transition', OLD.lifecycle_state, NEW.lifecycle_state; END IF; IF NEW.grandfather_until IS DISTINCT FROM OLD.grandfather_until AND (NEW.grandfather_until IS NULL OR (OLD.grandfather_until IS NOT NULL AND NEW.grandfather_until > OLD.grandfather_until)) THEN RAISE EXCEPTION 'pricing_price: grandfather_until may only be tightened, never loosened (row %)', OLD.price_id; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_price_overlay_append_only CREATE OR REPLACE FUNCTION bss.pricing_price_overlay_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'pricing_price_overlay: DELETE of revision % of overlay % is not permitted; a discarded draft revision is abandoned', OLD.revision, OLD.price_overlay_id; END IF; -- The draft plane is where content moves, so its columns are -- unguarded - but its exits are not. A draft leaves by publishing or by -- being abandoned (D-231), and by nothing else; `draft -> superseded` -- would mint a superseded row that never published, which the projector -- would then source from. IF OLD.lifecycle_state = 'draft' THEN IF NEW.lifecycle_state NOT IN ('draft', 'published', 'abandoned') THEN RAISE EXCEPTION 'pricing_price_overlay: lifecycle_state % -> % is not a sanctioned flip', OLD.lifecycle_state, NEW.lifecycle_state; END IF; RETURN NEW; END IF; -- Past here the row is published, superseded or abandoned. Once -- abandoned it is a tombstone: frozen in content by the whitelist below -- and left by no flip, so the number it consumed can never be attached -- to a different shape. IF NEW.price_overlay_id IS DISTINCT FROM OLD.price_overlay_id OR NEW.revision IS DISTINCT FROM OLD.revision OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR NEW.scope_class IS DISTINCT FROM OLD.scope_class OR NEW.scope_value IS DISTINCT FROM OLD.scope_value OR NEW.precedence IS DISTINCT FROM OLD.precedence OR NEW.effective_from IS DISTINCT FROM OLD.effective_from OR NEW.effective_to IS DISTINCT FROM OLD.effective_to OR NEW.tax_basis IS DISTINCT FROM OLD.tax_basis OR NEW.disclosure IS DISTINCT FROM OLD.disclosure OR NEW.target_ref IS DISTINCT FROM OLD.target_ref OR NEW.row_version IS DISTINCT FROM OLD.row_version THEN RAISE EXCEPTION 'pricing_price_overlay: revision % of overlay % is frozen; only a sanctioned lifecycle_state flip is permitted', OLD.revision, OLD.price_overlay_id; END IF; IF NEW.lifecycle_state IS DISTINCT FROM OLD.lifecycle_state AND NOT (OLD.lifecycle_state = 'published' AND NEW.lifecycle_state = 'superseded') THEN RAISE EXCEPTION 'pricing_price_overlay: lifecycle_state % -> % is not a sanctioned flip', OLD.lifecycle_state, NEW.lifecycle_state; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_price_overlay_line_amount_append_only CREATE OR REPLACE FUNCTION bss.pricing_price_overlay_line_amount_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE parent_state text; BEGIN IF TG_OP <> 'INSERT' THEN SELECT o.lifecycle_state INTO parent_state FROM bss.pricing_price_overlay_line l JOIN bss.pricing_price_overlay o ON o.price_overlay_id = l.price_overlay_id AND o.revision = l.overlay_revision WHERE l.line_id = OLD.line_id AND l.overlay_revision = OLD.overlay_revision AND l.tenant_id = OLD.tenant_id; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_price_overlay_line_amount: % of a value under a non-draft overlay revision is not permitted (state %)', TG_OP, coalesce(parent_state, 'missing'); END IF; END IF; IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; SELECT o.lifecycle_state INTO parent_state FROM bss.pricing_price_overlay_line l JOIN bss.pricing_price_overlay o ON o.price_overlay_id = l.price_overlay_id AND o.revision = l.overlay_revision WHERE l.line_id = NEW.line_id AND l.overlay_revision = NEW.overlay_revision AND l.tenant_id = NEW.tenant_id; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_price_overlay_line_amount: % of a value under a non-draft overlay revision is not permitted (state %)', TG_OP, coalesce(parent_state, 'missing'); END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_price_overlay_line_append_only CREATE OR REPLACE FUNCTION bss.pricing_price_overlay_line_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE parent_state text; parent_tenant uuid; BEGIN IF TG_OP <> 'INSERT' THEN SELECT o.lifecycle_state INTO parent_state FROM bss.pricing_price_overlay o WHERE o.price_overlay_id = OLD.price_overlay_id AND o.revision = OLD.overlay_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_price_overlay_line: % of a line under a non-draft overlay revision is not permitted (state %)', TG_OP, coalesce(parent_state, 'missing'); END IF; END IF; IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; SELECT o.lifecycle_state, o.tenant_id INTO parent_state, parent_tenant FROM bss.pricing_price_overlay o WHERE o.price_overlay_id = NEW.price_overlay_id AND o.revision = NEW.overlay_revision; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_price_overlay_line: % of a line under a non-draft overlay revision is not permitted (state %)', TG_OP, coalesce(parent_state, 'missing'); END IF; -- `fk_pricing_price_overlay_line_overlay` covers -- `(price_overlay_id, overlay_revision)` alone, so without this arm a line -- could carry a tenant its own parent overlay does not belong to: -- invisible to every scoped reader, and frozen with the revision it was -- written under. The state arm above has already refused a parent that -- does not exist, so a foreign tenant is the only thing left for this one -- to find. IF parent_tenant IS DISTINCT FROM NEW.tenant_id THEN RAISE EXCEPTION 'pricing_price_overlay_line: overlay revision %/% belongs to another tenant and may not hold this line', NEW.price_overlay_id, NEW.overlay_revision; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_price_tier_band_append_only CREATE OR REPLACE FUNCTION bss.pricing_price_tier_band_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE parent_state text; BEGIN IF TG_OP <> 'INSERT' THEN SELECT lifecycle_state INTO parent_state FROM bss.pricing_price WHERE price_id = OLD.price_id; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_price_tier_band: % of a band under a % price row is not permitted', TG_OP, coalesce(parent_state, 'missing'); END IF; END IF; IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; SELECT lifecycle_state INTO parent_state FROM bss.pricing_price WHERE price_id = NEW.price_id; IF parent_state IS DISTINCT FROM 'draft' THEN RAISE EXCEPTION 'pricing_price_tier_band: % of a band under a % price row is not permitted', TG_OP, coalesce(parent_state, 'missing'); END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_price_tier_band_kind CREATE OR REPLACE FUNCTION bss.pricing_price_tier_band_kind() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE parent_kind text; BEGIN SELECT model_kind INTO parent_kind FROM bss.pricing_price WHERE price_id = NEW.price_id; IF parent_kind IS NULL OR parent_kind NOT IN ('graduated','volume') THEN RAISE EXCEPTION 'pricing_price_tier_band: band rows are forbidden on a % price row', coalesce(parent_kind, 'kindless'); END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_price_tier_band_parent_kind CREATE OR REPLACE FUNCTION bss.pricing_price_tier_band_parent_kind() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN IF NEW.model_kind IS NULL OR NEW.model_kind NOT IN ('graduated','volume') THEN IF EXISTS (SELECT 1 FROM bss.pricing_price_tier_band WHERE price_id = OLD.price_id) THEN RAISE EXCEPTION 'pricing_price_tier_band: price row % still carries bands and may not become a % row', OLD.price_id, coalesce(NEW.model_kind, 'kindless'); END IF; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_price_window_append_only CREATE OR REPLACE FUNCTION bss.pricing_price_window_append_only() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'pricing_price_window: DELETE of window % is not permitted; cancel is a state, not a deletion', OLD.window_id; END IF; IF OLD.state IN ('expired','cancelled') THEN RAISE EXCEPTION 'pricing_price_window: window % is %; an expired or cancelled window is immutable history', OLD.window_id, OLD.state; END IF; IF NEW.window_id IS DISTINCT FROM OLD.window_id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR NEW.price_id IS DISTINCT FROM OLD.price_id OR NEW.effective_from IS DISTINCT FROM OLD.effective_from OR NEW.reason_code IS DISTINCT FROM OLD.reason_code OR NEW.created_by IS DISTINCT FROM OLD.created_by OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN RAISE EXCEPTION 'pricing_price_window: window % is bound to its price row and its start; only state, effective_to and the flip timestamps may move', OLD.window_id; END IF; IF NEW.state IS DISTINCT FROM OLD.state AND NOT (OLD.state = 'scheduled' AND NEW.state IN ('active','cancelled')) AND NOT (OLD.state = 'active' AND NEW.state = 'expired') THEN RAISE EXCEPTION 'pricing_price_window: state % -> % is not a sanctioned transition', OLD.state, NEW.state; END IF; IF NEW.effective_to IS DISTINCT FROM OLD.effective_to AND ((NEW.effective_to IS NOT NULL AND NEW.effective_to <= now()) OR (OLD.effective_to IS NOT NULL AND OLD.effective_to <= now())) THEN RAISE EXCEPTION 'pricing_price_window: the effective_to of window % may only be moved while it is in the future, and only to a future instant', OLD.window_id; END IF; IF NEW.mutation_seq IS DISTINCT FROM OLD.mutation_seq AND NEW.mutation_seq <> OLD.mutation_seq + 1 THEN RAISE EXCEPTION 'pricing_price_window: the act sequence of window % moves by one act at a time, from % - it names an act and a name that can be reused or run backwards names nothing', OLD.window_id, OLD.mutation_seq; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_repricing_journal_progress CREATE OR REPLACE FUNCTION bss.pricing_repricing_journal_progress() RETURNS trigger LANGUAGE plpgsql AS $function$ DECLARE run_kind text; run_tenant uuid; BEGIN -- Born pending. A row born `applied` is a row the re-drive skips, so -- the price is never touched and nothing anywhere disagrees -- the -- one failure this table exists to make impossible. IF TG_OP = 'INSERT' THEN IF NEW.state <> 'pending' THEN RAISE EXCEPTION 'pricing_repricing_journal: a journal row is born pending, not %', NEW.state; END IF; -- The journal is mass repricing's spine. A bulk import's per-row -- outcomes live in the operation's own report (inst-bi-commit,
+            -- inst-bk-idem) and nothing drives an import through this table, so a
+            -- row here under an import is a record no code will ever complete.
+            SELECT kind, tenant_id INTO run_kind, run_tenant
+              FROM bss.pricing_bulk_operation
+             WHERE operation_id = NEW.run_id;
+            -- No such run: the foreign key is the accurate refusal and these arms
+            -- have no opinion. Deferring keeps the key **observable** -- a BEFORE
+            -- trigger answers ahead of it -- and stops them reporting a kind or a
+            -- tenancy fault for a run that does not exist.
+            IF FOUND AND run_kind <> 'repricing' THEN
+              RAISE EXCEPTION
+                'pricing_repricing_journal: operation % is a %, and only a repricing run journals per-row progress',
+                NEW.run_id, run_kind;
+            END IF;
+            -- The run exists; this proves the journal row is its own tenant's. -- `fk_pricing_repricing_journal_run` covers the operation id alone, -- so without this arm one tenant's run could journal a row carrying
+            -- another tenant's id -- invisible to the scoped reader whose -- completion predicate is that no `pending` rows remain. -- `pricing_bulk_row_lock` carries the same arm out of the same lookup. IF FOUND AND run_tenant IS DISTINCT FROM NEW.tenant_id THEN RAISE EXCEPTION 'pricing_repricing_journal: operation % belongs to another tenant and may not journal this row', NEW.run_id; END IF; RETURN NEW; END IF; IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'pricing_repricing_journal: DELETE of the row for price % of run % is not permitted; the journal is the idempotency spine and a missing row re-applies', OLD.price_id, OLD.run_id; END IF; -- The key and its tenant are what the row is about. IF NEW.run_id IS DISTINCT FROM OLD.run_id OR NEW.price_id IS DISTINCT FROM OLD.price_id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN RAISE EXCEPTION 'pricing_repricing_journal: the row for price % of run % is keyed and its key is frozen', OLD.price_id, OLD.run_id; END IF; -- Decided is final, outcome columns included. IF OLD.state <> 'pending' THEN RAISE EXCEPTION 'pricing_repricing_journal: the row for price % of run % is already %, and a decided row never moves again', OLD.price_id, OLD.run_id, OLD.state; END IF; RETURN NEW; END; $function$
+FUNCTION bss pricing_snapshot_provenance_frozen CREATE OR REPLACE FUNCTION bss.pricing_snapshot_provenance_frozen() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'pricing_snapshot_provenance: DELETE of the migrated-origin record of subscription % is not permitted; an auditor reconstructing a legacy charge needs it to still exist', OLD.subscription_ref; END IF; RAISE EXCEPTION 'pricing_snapshot_provenance: the migrated-origin snapshot of subscription % is frozen; it resolves through no CatalogVersion, so this row is the only thing making it immutable', OLD.subscription_ref; END; $function$
+EXTENSION btree_gist

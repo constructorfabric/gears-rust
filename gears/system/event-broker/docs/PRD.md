@@ -117,7 +117,7 @@ Today a module needing these properties must either bring up an external broker 
 | FilterContext | Per-engine declaration of which event fields are visible to filter expressions. CEL engine v1 exposes the read-side event (`event.v1.schema.json` with `readOnly` fields populated; `writeOnly` `meta` stripped). |
 | Offset | Backend-assigned, monotonic-per-`(topic, partition)` ordering key. Consumer-visible; the only sequence consumers paginate by. |
 | Storage Backend | Pluggable persistence layer for events. Discovered via GTS instance registration and resolved via ClientHub. Built-in implementations: memory, postgres. Backend owns retention, compaction, and offset assignment. |
-| Cluster Module | The platform-level `modules/system/cluster` system module providing KV-with-TTL, leader election, distributed locks, and service discovery. Consumed by the broker for coordination. |
+| Cluster Module | The platform-level `modules/system/cluster` system module providing KV-with-TTL, leader election, and distributed locks. Consumed by the broker for coordination. |
 | GTS | Global Type System — the platform's schema and instance registration system used for type identification, validation, and pattern matching in authorization. |
 
 ### 1.5 Domain Model
@@ -194,7 +194,7 @@ Subscription *  ──*  Partition       (a subscription is assigned partitions 
 
 **ID**: `cpt-cf-evbk-actor-cluster`
 
-- **Role**: Provides `ClusterCacheV1` (KV with TTL, CAS, watch), `LeaderElectionV1`, `DistributedLockV1`, and `ServiceDiscoveryV1`. The broker uses these primitives for subscription / group state caching, group-rebalance locks, Reaper singleton election, and shard discovery / liveness.
+- **Role**: Provides `ClusterCacheV1` (KV with TTL, CAS, watch), `LeaderElectionV1`, and `DistributedLockV1`. The broker uses these primitives for subscription / group state caching, group-rebalance locks, and Reaper singleton election. Shard discovery / liveness is **not** a cluster-gear capability — it resolves through `DirectoryService` (ADR-0009 instance-addressable discovery).
 
 #### `authz-resolver`
 
@@ -244,7 +244,7 @@ The Event Broker follows standard Gears module conventions. Module-specific depl
 - Per-(resource, action) authorization via the `authz-resolver` framework (4 resource types × 3 actions: `produce`, `consume`, `define`).
 - Persistent consumer-group registry (`evbk_consumer_group`) with two exclusive provisioning paths (anonymous via REST, named via `types_registry`).
 - Per-event size limit (64 KiB combined headers + payload); per-batch limit (100 events / 1 MiB).
-- Cluster-mode failover with service-discovery as source of truth for delivery-shard liveness.
+- Cluster-mode failover with `DirectoryService` as source of truth for delivery-shard liveness.
 - Standalone and cluster deployment topologies; hetero and sharded ingest routing modes.
 - RFC 9457 Problem Details for all error responses with stable GTS type identifiers.
 
@@ -514,7 +514,7 @@ Maximum consumer groups owned per delivery instance: 1000 (default, configurable
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-nfr-failover-bound`
 
-Convergence on a delivery instance's death (cluster-mode failover) MUST be bounded by the platform `cluster` module's service-discovery heartbeat-loss detection — typically 10–30 seconds.
+Convergence on a delivery instance's death (cluster-mode failover) MUST be bounded by `DirectoryService`'s instance heartbeat-loss detection. **The 10–30 second figure previously stated here was the cluster gear's service-discovery TTL; that primitive has been removed and the equivalent bound for `DirectoryService` needs confirming by the broker team before this requirement is treated as sized.**
 
 #### Throughput Efficiency
 
@@ -683,7 +683,7 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 | Dependency | Description | Criticality |
 |------------|-------------|-------------|
 | `toolkit-db` outbox | Transactional outbox foundation for both producer SDK and ingest pipeline (`cpt-cf-evbk-actor-modkit-db`). | p1 |
-| `cluster` system module | KV-with-TTL, leader election, distributed locks, service discovery (`ClusterCacheV1`, `LeaderElectionV1`, `DistributedLockV1`, `ServiceDiscoveryV1`) — `cpt-cf-evbk-actor-cluster`. | p1 |
+| `cluster` system module | KV-with-TTL, leader election, distributed locks (`ClusterCacheV1`, `LeaderElectionV1`, `DistributedLockV1`) — `cpt-cf-evbk-actor-cluster`. | p1 |
 | `authz-resolver` | `PolicyEnforcer` PEP for all authorization decisions (`cpt-cf-evbk-actor-authz-resolver`). | p1 |
 | `tenant-resolver` | Tenant identity, hierarchy resolution, `ROOT_TENANT_ID` (`cpt-cf-evbk-actor-tenant-resolver`). | p1 |
 | `types-registry` | GTS schema and instance registration; named consumer-group provisioning at startup (`cpt-cf-evbk-actor-types-registry`). | p1 |
@@ -692,7 +692,7 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 
 ## 11. Assumptions
 
-- The platform's `cluster` system module is operational and provides KV-with-TTL, leader election, distributed locks, and service discovery primitives (verified during design).
+- The platform's `cluster` system module is operational and provides KV-with-TTL, leader election, and distributed lock primitives (verified during design).
 - Consumers and producers are responsible for idempotent processing at their layer — the broker's at-least-once contract presumes this.
 - `types_registry` is operational at broker startup so named consumer groups can be upserted on launch.
 - Storage backend instances bound to topics remain operational; backend-failure backpressure is post-MVP.

@@ -26,7 +26,7 @@ async fn db_with_offsets_table() -> (sea_orm::DatabaseConnection, toolkit_db::Db
     let seq = DB_SEQ.fetch_add(1, Ordering::Relaxed);
     let dsn = format!("sqlite:file:evbk_offsets_{seq}?mode=memory&cache=shared");
     let raw = Database::connect(&dsn).await.expect("raw sqlite connect");
-    raw.execute(Statement::from_string(
+    raw.execute_raw(Statement::from_string(
         raw.get_database_backend(),
         LOCAL_DB_OFFSET_STORE_MIGRATION_SQL.to_owned(),
     ))

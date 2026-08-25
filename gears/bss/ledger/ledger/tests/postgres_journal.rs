@@ -1,5 +1,5 @@
 //! Postgres-only integration tests for the journal truth tables.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 //!
 //! Covers: (a) a balanced entry commits; (b) an unbalanced entry rolls
 //! back at COMMIT with `LEDGER_ENTRY_UNBALANCED`; (c) a zero-line header
@@ -69,7 +69,7 @@ async fn insert_entry(
     period_id: &str,
     currency: &str,
 ) {
-    txn.execute(exec(format!(
+    txn.execute_raw(exec(format!(
         "INSERT INTO bss.ledger_journal_entry
             (entry_id, tenant_id, legal_entity_id, period_id, entry_currency,
              source_doc_type, source_business_id, posted_at_utc, effective_at,
@@ -93,7 +93,7 @@ async fn insert_line(
     amount: i64,
     currency: &str,
 ) {
-    txn.execute(exec(format!(
+    txn.execute_raw(exec(format!(
         "INSERT INTO bss.ledger_journal_line
             (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id,
              account_class, side, amount_minor, currency, currency_scale, mapping_status)
@@ -117,7 +117,7 @@ async fn insert_line_payer(
     amount: i64,
     currency: &str,
 ) {
-    txn.execute(exec(format!(
+    txn.execute_raw(exec(format!(
         "INSERT INTO bss.ledger_journal_line
             (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id,
              account_class, side, amount_minor, currency, currency_scale, mapping_status)
@@ -163,7 +163,7 @@ async fn balanced_entry_commits() {
     txn.commit().await.expect("balanced entry must commit");
 
     let row = db
-        .query_one(exec(format!(
+        .query_one_raw(exec(format!(
             "SELECT created_seq FROM bss.ledger_journal_entry WHERE entry_id = '{entry_id}'"
         )))
         .await
@@ -217,7 +217,7 @@ async fn unbalanced_entry_rolls_back_at_commit() {
     );
 
     let row = db
-        .query_one(exec(format!(
+        .query_one_raw(exec(format!(
             "SELECT entry_id FROM bss.ledger_journal_entry WHERE entry_id = '{entry_id}'"
         )))
         .await
@@ -272,7 +272,7 @@ async fn append_only_rejects_update_and_delete() {
     txn.commit().await.unwrap();
 
     let upd = db
-        .execute(exec(format!(
+        .execute_raw(exec(format!(
             "UPDATE bss.ledger_journal_line SET amount_minor = 5 WHERE line_id = '{line_id}'"
         )))
         .await
@@ -280,7 +280,7 @@ async fn append_only_rejects_update_and_delete() {
     assert!(upd.to_string().contains("append-only"), "unexpected: {upd}");
 
     let del = db
-        .execute(exec(format!(
+        .execute_raw(exec(format!(
             "DELETE FROM bss.ledger_journal_line WHERE line_id = '{line_id}'"
         )))
         .await
@@ -319,7 +319,7 @@ async fn mixed_payer_entry_rolls_back_at_commit() {
     );
 
     let row = db
-        .query_one(exec(format!(
+        .query_one_raw(exec(format!(
             "SELECT entry_id FROM bss.ledger_journal_entry WHERE entry_id = '{entry_id}'"
         )))
         .await
@@ -494,7 +494,7 @@ async fn setup_posted_invoice(url: &str) -> (DatabaseConnection, DBProvider<DbEr
         })
         .await
         .unwrap();
-    raw.execute(Statement::from_string(
+    raw.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
         format!(
             "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)

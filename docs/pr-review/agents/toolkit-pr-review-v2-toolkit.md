@@ -20,11 +20,12 @@ This agent is **gated**: return `[]` immediately if `toolkit_owned_files` is emp
 ## Input Files
 
 Read these files from the provided paths:
-1. `/tmp/toolkit-pr-review-v2-$PR_NUMBER/context.json` — PR metadata, file lists, changed line ranges
-2. `/tmp/toolkit-pr-review-v2-$PR_NUMBER/diff.patch` — the full diff of the PR
-3. `/tmp/toolkit-pr-review-v2-$PR_NUMBER/files/<escaped-path>` — full source file contents
+1. `/tmp/toolkit-pr-review-v2-$REVIEW_ID/context.json` — review metadata, file lists, changed line ranges
+2. `/tmp/toolkit-pr-review-v2-$REVIEW_ID/diff.patch` — the full diff under review
+3. `/tmp/toolkit-pr-review-v2-$REVIEW_ID/files/<escaped-path>` — full source file contents
 
-Replace `$PR_NUMBER` with the actual number. In the filename escaping, `/` becomes `__`.
+`$REVIEW_ID` is the PR number in PR mode, or `local-<branch-slug>` in local mode — the orchestrator
+supplies the concrete directory path. In the filename escaping, `/` becomes `__`.
 
 ## Gating Rule
 
@@ -44,7 +45,7 @@ Apply **only** to files listed in `toolkit_owned_files`, and apply **only** thes
 
 4. **TOOLKIT-REST-001** — All REST endpoints must use `OperationBuilder` to define routes, handlers, and metadata. Check that endpoint definitions use the OperationBuilder pattern, not manual route registration.
 
-5. **TOOLKIT-REST-002** — Every endpoint handler must declare authentication requirements explicitly via `.authenticated()` or `.public()`. Check that the OperationBuilder call includes one of these methods.
+5. **TOOLKIT-REST-002** — Every endpoint handler must declare authentication requirements explicitly via `.authenticated()` or `.anonymous()`. Check that the OperationBuilder call includes one of these methods.
 
 6. **TOOLKIT-REST-003** — `SecurityContext` must be passed via Axum extension only, never as a parameter or global. Check that SecurityContext is extracted from the extension, not passed directly.
 

@@ -9,6 +9,11 @@ use toolkit_odata::{CursorV1, Error as ODataError, ODataOrderBy, OrderKey, SortD
 pub use toolkit_odata::ODataQuery;
 // CursorV1 is available through the private import above for internal use
 
+/// Wire binding for the `OData` query-parameter family.
+///
+/// This struct is the single place where `OData` query parameters are bound
+/// off the URL: `toolkit-odata` operates on already-parsed values and does no
+/// HTTP query parsing of its own.
 #[derive(Deserialize, Default)]
 pub struct ODataParams {
     #[serde(rename = "$filter")]
@@ -17,9 +22,65 @@ pub struct ODataParams {
     pub orderby: Option<String>,
     #[serde(rename = "$select")]
     pub select: Option<String>,
+    /// Page size. Accepted as `limit` or as the canonical `OData` spelling
+    /// `$top` (OASIS `OData` 4.01 Part 2: URL Conventions, §5.1.6 "System
+    /// Query Options $top and $skip") — both spellings fold onto this one
+    /// slot, so a gear needs no per-endpoint handling to honor either.
+    ///
+    /// Sending both in one request is ambiguous and is rejected with
+    /// `400 InvalidArgument` (serde reports the second spelling as a
+    /// duplicate field).
+    #[serde(alias = "$top")]
     pub limit: Option<u64>,
+    /// Opaque keyset token from the previous page's `next_cursor`. Accepted
+    /// as `cursor` or as `$skiptoken`, `OData`'s opaque continuation token
+    /// for server-driven paging; both spellings fold onto this one slot.
+    ///
+    /// This is the platform's only pagination continuation. `$skip` — offset
+    /// paging — is not supported and is rejected; see
+    /// [`ACCEPTED_SYSTEM_QUERY_OPTIONS`].
+    #[serde(alias = "$skiptoken")]
     pub cursor: Option<String>,
 }
+
+/// `OData` system query options this extractor binds, in the exact spelling
+/// that binds.
+///
+/// Any other `$`-prefixed query key is rejected rather than ignored. OASIS
+/// `OData` 4.01 Part 1: Protocol, §6.1 "Query Option Extensibility": a
+/// service "MUST fail any request that contains unsupported `OData` query
+/// options defined in the version of this specification supported by the
+/// service", and SHOULD fail any option it does not understand. §6.1 also
+/// reserves the `$` prefix for `OData`, so unprefixed keys stay out of
+/// scope — those belong to the handler's own params struct, and policing
+/// them is each gear's business.
+pub const ACCEPTED_SYSTEM_QUERY_OPTIONS: [&str; 5] =
+    ["$filter", "$orderby", "$select", "$top", "$skiptoken"];
+
+/// Every system query option `OData` 4.01 defines, whether or not this
+/// platform binds it (OASIS `OData` 4.01 Part 2: URL Conventions, §§5.1.2 —
+/// 5.1.12).
+///
+/// Splits the two ways a `$` key can be refused: one of these is
+/// *unsupported* and may become supported later, while a `$` key outside
+/// this set is *unknown* — which is what a typo like `$filtre` should hear.
+const ODATA_SYSTEM_QUERY_OPTIONS: [&str; 12] = [
+    "$filter",
+    "$expand",
+    "$select",
+    "$orderby",
+    "$top",
+    "$skip",
+    "$count",
+    "$search",
+    "$format",
+    "$compute",
+    "$index",
+    "$schemaversion",
+];
+
+/// Reason code carried by every unsupported-option violation.
+const UNSUPPORTED_QUERY_PARAM: &str = "UNSUPPORTED_QUERY_PARAM";
 
 pub const MAX_FILTER_LEN: usize = 8 * 1024;
 pub const MAX_NODES: usize = 2000;
@@ -164,8 +225,104 @@ fn query_params_invalid_arg(detail: impl Into<String>) -> CanonicalError {
         .create()
 }
 
+/// Replacement hint appended to the violation description, so a caller who
+/// sent a plausible option learns what to send instead of only that the
+/// option is refused.
+fn unsupported_option_hint(option: &str) -> &'static str {
+    match option {
+        "$skip" => {
+            "this platform pages by cursor, not by offset: send the previous \
+             page's `next_cursor` as `$skiptoken` (alias `cursor`)"
+        }
+        "$count" => {
+            "a page carries no total: `PageInfo` is \
+             `{next_cursor, prev_cursor, limit}`"
+        }
+        "$format" => {
+            "responses are JSON: negotiate the media type with the `Accept` \
+             header"
+        }
+        _ => "not implemented by this platform",
+    }
+}
+
+/// Describe one rejected `$`-prefixed query key.
+fn unsupported_option_detail(option: &str) -> String {
+    let canonical = option.to_ascii_lowercase();
+    if ACCEPTED_SYSTEM_QUERY_OPTIONS.contains(&canonical.as_str()) {
+        // The option is supported, the spelling is not: binding is
+        // case-sensitive, so honoring `$Top` would take a second code path.
+        // Say which spelling binds instead of dropping the request.
+        return format!("`{option}` binds only as `{canonical}`");
+    }
+    if ODATA_SYSTEM_QUERY_OPTIONS.contains(&canonical.as_str()) {
+        return format!(
+            "unsupported OData system query option `{option}`; {}",
+            unsupported_option_hint(&canonical)
+        );
+    }
+    format!(
+        "unknown query option `{option}`; the `$` prefix is reserved for \
+         OData system query options"
+    )
+}
+
+/// Reject every `$`-prefixed query key this extractor does not bind.
+///
+/// Required by OASIS `OData` 4.01 Part 1: Protocol, §6.1 "Query Option
+/// Extensibility" — see [`ACCEPTED_SYSTEM_QUERY_OPTIONS`]. Without this,
+/// axum drops unclaimed query keys and the caller gets `200` with a result
+/// set that ignored what they asked for: `?$skip=20` re-reads page one,
+/// `?$filtre=…` returns the whole unfiltered collection.
+///
+/// Every offending option is reported in one response so a caller fixes
+/// them in one round trip.
+///
+/// # Errors
+/// Returns a canonical `InvalidArgument` (`400`) carrying one
+/// `UNSUPPORTED_QUERY_PARAM` field violation per offending key, in wire
+/// order.
+#[allow(clippy::result_large_err)]
+fn reject_unsupported_system_query_options(
+    pairs: &[(String, String)],
+) -> Result<(), CanonicalError> {
+    // Deduplicated in wire order: a repeated option is one mistake to fix,
+    // and the offender list is bounded by the query string, so a linear
+    // `contains` is cheaper than a set.
+    let mut offending: Vec<&str> = Vec::new();
+    for key in pairs.iter().map(|(key, _)| key.as_str()) {
+        if key.starts_with('$')
+            && !ACCEPTED_SYSTEM_QUERY_OPTIONS.contains(&key)
+            && !offending.contains(&key)
+        {
+            offending.push(key);
+        }
+    }
+
+    let mut offenders = offending.into_iter();
+    let Some(first) = offenders.next() else {
+        return Ok(());
+    };
+
+    let mut violations = OdataError::invalid_argument().with_field_violation(
+        first,
+        unsupported_option_detail(first),
+        UNSUPPORTED_QUERY_PARAM,
+    );
+    for option in offenders {
+        violations = violations.with_field_violation(
+            option,
+            unsupported_option_detail(option),
+            UNSUPPORTED_QUERY_PARAM,
+        );
+    }
+
+    Err(violations.create())
+}
+
 /// Extract and validate full `OData` query from request parts.
-/// - Parses $filter, $orderby, limit, cursor
+/// - Rejects any `$`-prefixed key outside [`ACCEPTED_SYSTEM_QUERY_OPTIONS`]
+/// - Parses $filter, $orderby, $top / limit, $skiptoken / cursor
 /// - Enforces budgets and validates formats
 /// - Returns unified `ODataQuery`
 ///
@@ -181,6 +338,15 @@ pub async fn extract_odata_query<S>(
 where
     S: Send + Sync,
 {
+    // Runs before any value parsing: a request naming an option this
+    // extractor does not bind is malformed whatever the other values say.
+    // Deserializing the raw pairs first keeps percent-decoding identical to
+    // what `Query::<ODataParams>` binds below.
+    let Query(pairs) = Query::<Vec<(String, String)>>::from_request_parts(parts, state)
+        .await
+        .map_err(|e| query_params_invalid_arg(format!("Invalid query parameters: {e}")))?;
+    reject_unsupported_system_query_options(&pairs)?;
+
     let Query(params) = Query::<ODataParams>::from_request_parts(parts, state)
         .await
         .map_err(|e| query_params_invalid_arg(format!("Invalid query parameters: {e}")))?;

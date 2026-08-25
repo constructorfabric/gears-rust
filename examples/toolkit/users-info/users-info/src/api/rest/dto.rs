@@ -5,8 +5,13 @@ use users_info_sdk::{Address, City, NewAddress, NewCity, NewUser, User, UserFull
 use uuid::Uuid;
 
 /// REST DTO for user representation with serde/utoipa
+///
+/// Aliased in the `OpenAPI` components as `UsersInfoUserDto`: the
+/// account-management gear ships an unrelated `UserDto` and both are mounted in
+/// the same server, so the bare ident would collide in `components.schemas`.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request, response)]
+#[schema(as = UsersInfoUserDto)]
 pub struct UserDto {
     pub id: Uuid,
     pub tenant_id: Uuid,

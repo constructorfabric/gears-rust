@@ -55,7 +55,7 @@ fn stmt(db: &DatabaseConnection, sql: impl Into<String>) -> Statement {
 /// touch them — that is the whole point of test (1) below.
 async fn seed_tenant_and_pending_conversion(db: &DatabaseConnection) {
     let tenant_type_uuid = Uuid::nil();
-    db.execute(stmt(
+    db.execute_raw(stmt(
         db,
         format!(
             "INSERT INTO tenants (id, parent_id, name, status, self_managed, \
@@ -66,7 +66,7 @@ async fn seed_tenant_and_pending_conversion(db: &DatabaseConnection) {
     .await
     .expect("seed tenant");
 
-    db.execute(stmt(
+    db.execute_raw(stmt(
         db,
         format!(
             "INSERT INTO conversion_requests \
@@ -102,7 +102,7 @@ async fn m0006_up_preserves_existing_conversion_rows() {
     // Sanity check: the row is there and the audit-comment columns
     // are NOT yet on the schema. Probing one of them MUST fail.
     let probe = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             "SELECT requested_comment FROM conversion_requests LIMIT 0",
         ))
@@ -116,7 +116,7 @@ async fn m0006_up_preserves_existing_conversion_rows() {
     Migrator::up(&db, None).await.expect("apply m0006");
 
     let row = db
-        .query_one(stmt(
+        .query_one_raw(stmt(
             &db,
             format!(
                 "SELECT id, tenant_id, child_tenant_name, initiator_side, \
@@ -184,7 +184,7 @@ async fn m0006_up_down_up_roundtrip_preserves_audit_columns() {
     Migrator::up(&db, None).await.expect("initial up");
 
     // Audit columns are on the schema.
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         "SELECT requested_comment, approved_comment, cancelled_comment, \
          rejected_comment FROM conversion_requests LIMIT 0",
@@ -203,7 +203,7 @@ async fn m0006_up_down_up_roundtrip_preserves_audit_columns() {
         .expect("down to pre-m0006");
 
     let probe = db
-        .execute(stmt(
+        .execute_raw(stmt(
             &db,
             "SELECT requested_comment FROM conversion_requests LIMIT 0",
         ))
@@ -222,7 +222,7 @@ async fn m0006_up_down_up_roundtrip_preserves_audit_columns() {
     // the audit-comment column to confirm the CHECK constraint
     // accepts an in-range value end-to-end through the round trip.
     seed_tenant_and_pending_conversion(&db).await;
-    db.execute(stmt(
+    db.execute_raw(stmt(
         &db,
         format!(
             "UPDATE conversion_requests SET requested_comment = 'why' \
@@ -232,7 +232,7 @@ async fn m0006_up_down_up_roundtrip_preserves_audit_columns() {
     .await
     .expect("write requested_comment after roundtrip");
     let row = db
-        .query_one(stmt(
+        .query_one_raw(stmt(
             &db,
             format!(
                 "SELECT requested_comment FROM conversion_requests \

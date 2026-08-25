@@ -11,7 +11,6 @@ use crate::cache::{
     CacheConsistency, CacheEntry, CacheEvent, CacheFeatures, CacheWatch, CacheWatchEvent,
     CacheWatchSender, ClusterCacheBackend, ClusterCacheV1,
 };
-use crate::discovery::{ServiceWatch, ServiceWatchEvent};
 use crate::error::{ClusterError, ProviderErrorKind};
 use crate::leader::{LeaderStatus, LeaderWatch, LeaderWatchEvent};
 use crate::observability::ClusterMetrics;
@@ -29,7 +28,6 @@ impl ClusterMetrics for ResetRecorder {
     fn lock_op(&self, _op: &str, _result: &str) {}
     fn lock_op_duration(&self, _op: &str, _seconds: f64) {}
     fn leader_transition(&self, _transition: &str) {}
-    fn discovery_op(&self, _op: &str, _result: &str) {}
     fn watch_reset(&self, primitive: &str) {
         self.resets.lock().expect("lock").push(primitive.to_owned());
     }
@@ -113,7 +111,6 @@ const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<super::RestartingWatch<CacheWatch>>();
     assert_send::<super::RestartingWatch<LeaderWatch>>();
-    assert_send::<super::RestartingWatch<ServiceWatch>>();
 };
 
 #[tokio::test(start_paused = true)]
@@ -516,37 +513,6 @@ async fn failed_resubscribe_retries_until_success() {
     assert!(matches!(
         restarting.recv().await,
         Some(CacheWatchEvent::Event(CacheEvent::Deleted { .. }))
-    ));
-}
-
-#[tokio::test(start_paused = true)]
-async fn service_watch_auto_restart_reconnects() {
-    let (fresh_tx, fresh_watch) = ServiceWatch::channel(8);
-    let (tx, mut watch) = ServiceWatch::channel(8);
-    let slot = Arc::new(std::sync::Mutex::new(Some(fresh_watch)));
-    watch.set_resubscribe(move || {
-        let slot = Arc::clone(&slot);
-        Box::pin(async move {
-            slot.lock()
-                .expect("slot")
-                .take()
-                .ok_or(ClusterError::Shutdown)
-        })
-    });
-    let mut restarting = watch.auto_restart(RetryPolicy::default());
-    tx.send(ServiceWatchEvent::Closed(retryable_close()))
-        .await
-        .expect("send");
-    drop(tx);
-
-    assert!(matches!(
-        restarting.recv().await,
-        Some(ServiceWatchEvent::Reset)
-    ));
-    fresh_tx.send(ServiceWatchEvent::Reset).await.expect("send");
-    assert!(matches!(
-        restarting.recv().await,
-        Some(ServiceWatchEvent::Reset)
     ));
 }
 

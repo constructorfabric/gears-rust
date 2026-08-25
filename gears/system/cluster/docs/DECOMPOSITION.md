@@ -10,14 +10,13 @@
   - [2.2 Distributed Cache Primitive ✅ HIGH](#22-distributed-cache-primitive--high)
   - [2.3 Leader Election Primitive ✅ MEDIUM](#23-leader-election-primitive--medium)
   - [2.4 Distributed Lock Primitive ✅ MEDIUM](#24-distributed-lock-primitive--medium)
-  - [2.5 Service Discovery Primitive ✅ MEDIUM](#25-service-discovery-primitive--medium)
-  - [2.6 SDK Default Backends ✅ LOW](#26-sdk-default-backends--low)
-  - [2.7 Per-primitive Scoping & Prefix-Watch Polyfill ✅ LOW](#27-per-primitive-scoping--prefix-watch-polyfill--low)
-  - [2.8 Watch Auto-Restart Combinator ✅ LOW](#28-watch-auto-restart-combinator--low)
-  - [2.9 Registration Helpers, GTS Spec & Observability Contract ✅ MEDIUM](#29-registration-helpers-gts-spec--observability-contract--medium)
-  - [2.10 Lock-Misuse Lint (no-remote-in-critical-section) ✅ LOW](#210-lock-misuse-lint-no-remote-in-critical-section--low)
-  - [2.11 Smoke Tests (in-process stub backends) ✅ MEDIUM](#211-smoke-tests-in-process-stub-backends--medium)
-  - [2.12 Showcase Examples & Traceability Audit ✅ LOW](#212-showcase-examples--traceability-audit--low)
+  - [2.5 SDK Default Backends ✅ LOW](#25-sdk-default-backends--low)
+  - [2.6 Per-primitive Scoping & Prefix-Watch Polyfill ✅ LOW](#26-per-primitive-scoping--prefix-watch-polyfill--low)
+  - [2.7 Watch Auto-Restart Combinator ✅ LOW](#27-watch-auto-restart-combinator--low)
+  - [2.8 Registration Helpers, GTS Spec & Observability Contract ✅ MEDIUM](#28-registration-helpers-gts-spec--observability-contract--medium)
+  - [2.9 Lock-Misuse Lint (no-remote-in-critical-section) ✅ LOW](#210-lock-misuse-lint-no-remote-in-critical-section--low)
+  - [2.10 Smoke Tests (in-process stub backends) ✅ MEDIUM](#211-smoke-tests-in-process-stub-backends--medium)
+  - [2.11 Showcase Examples & Traceability Audit ✅ LOW](#212-showcase-examples--traceability-audit--low)
 - [3. Feature Dependencies](#3-feature-dependencies)
 
 <!-- /toc -->
@@ -29,7 +28,7 @@ This decomposition breaks the **cluster SDK contract** (`cf-gears-cluster-sdk`, 
 **Decomposition Strategy**:
 
 - Features are grouped by functional cohesion — one feature per coordination primitive, plus foundation, cross-cutting, and verification features.
-- Dependencies are minimized: the three primitive features (leader election, distributed lock, service discovery) depend only on the foundation and cache features and are mutually independent (parallelizable).
+- Dependencies are minimized: the two primitive features (leader election, distributed lock) depend only on the foundation and cache features and are mutually independent (parallelizable).
 - Each design element (requirement, principle, constraint, component, sequence) in scope is assigned to exactly one feature; the cache primitive carries the shared cross-primitive contracts (watch-union shape, capability validation) because it is the first concrete facade-plus-backend pair and the foundation the others build on.
 - 100% coverage of in-scope design elements is verified; out-of-scope elements are enumerated below with rationale.
 
@@ -50,7 +49,7 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 
 - [x] `p1` - **ID**: `cpt-cf-clst-feature-sdk-foundation`
 
-- **Purpose**: Establish the `cf-gears-cluster-sdk` crate, wire it into the workspace, and build the shared contract foundation every primitive depends on: the unified error model, programmatic retryability classification, the typed profile marker, profile-scope and name-validation helpers, and the dyn-compatibility assertion harness. This is the bedrock that lets the four primitives evolve on a stable, serde-free, dyn-safe contract.
+- **Purpose**: Establish the `cf-gears-cluster-sdk` crate, wire it into the workspace, and build the shared contract foundation every primitive depends on: the unified error model, programmatic retryability classification, the typed profile marker, profile-scope and name-validation helpers, and the dyn-compatibility assertion harness. This is the bedrock that lets the three primitives evolve on a stable, serde-free, dyn-safe contract.
 
 - **Depends On**: None
 
@@ -96,7 +95,7 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 
 - [x] `p1` - **ID**: `cpt-cf-clst-feature-cache-primitive`
 
-- **Purpose**: Deliver the cache primitive — the universal CAS building block on which leader election, locks, and service discovery are built. Defines versioned key-value storage, atomic conditional operations, TTL, and reactive key/prefix notifications, plus the canonical watch-union event shape and the per-primitive fluent resolver with capability validation that every other primitive reuses.
+- **Purpose**: Deliver the cache primitive — the universal CAS building block on which leader election and locks are built. Defines versioned key-value storage, atomic conditional operations, TTL, and reactive key/prefix notifications, plus the canonical watch-union event shape and the per-primitive fluent resolver with capability validation that every other primitive reuses.
 
 - **Depends On**: `cpt-cf-clst-feature-sdk-foundation`
 
@@ -233,65 +232,17 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 
 - **Data**: None — no persistent schema (see DESIGN §3.14).
 
-### 2.5 [Service Discovery Primitive](features/005-service-discovery.md) ✅ MEDIUM
-
-- [x] `p2` - **ID**: `cpt-cf-clst-feature-service-discovery`
-
-- **Purpose**: Provide instance registration with metadata, a single extensible discovery filter (state + AND-conjoined metadata predicates, enabled-only default), an unfiltered topology watch with lifecycle signals, and a module-declared serving-intent signal (`InstanceState`) that is explicitly intent, not health observation.
-
-- **Depends On**: `cpt-cf-clst-feature-sdk-foundation`, `cpt-cf-clst-feature-cache-primitive`
-
-- **Scope**:
-  - `ServiceDiscoveryBackend` trait and `ServiceDiscoveryV1` facade (register/discover/watch; resolver/scoped).
-  - `ServiceRegistration`, `ServiceInstance`, `InstanceState` (Enabled/Disabled — intent, not health), `MetaMatch`, `DiscoveryFilter` (default enabled-only), `StateFilter`, `TopologyChange`, `ServiceWatch`, `ServiceWatchEvent` union, `ServiceHandle` (deregister/update_metadata/set_state; no-op Drop), `ServiceDiscoveryCapability`, `ServiceDiscoveryFeatures`.
-  - `ServiceDiscoveryResolverBuilder` and `validate_service_discovery_capabilities`; per-trait dyn-compat assertion.
-
-- **Out of scope**:
-  - The cache-based default service-discovery backend (separate SDK-default-backends feature).
-  - Metadata-key namespacing exclusion enforcement in scoping wrappers (handled in the scoping feature).
-  - External health probing / liveness observation (out of scope per PRD §4.2).
-
-- **Requirements Covered**:
-
-  - [x] `p2` - `cpt-cf-clst-fr-sd-register`
-  - [x] `p2` - `cpt-cf-clst-fr-sd-discover`
-  - [x] `p2` - `cpt-cf-clst-fr-sd-watch`
-  - [x] `p2` - `cpt-cf-clst-fr-sd-state`
-
-- **Domain Model Entities**:
-  - ServiceDiscoveryV1
-  - ServiceDiscoveryBackend
-  - ServiceRegistration
-  - ServiceInstance
-  - InstanceState
-  - MetaMatch
-  - DiscoveryFilter
-  - StateFilter
-  - TopologyChange
-  - ServiceWatch
-  - ServiceWatchEvent
-  - ServiceHandle
-  - ServiceDiscoveryCapability
-  - ServiceDiscoveryFeatures
-
-- **API**:
-  - Rust: `ServiceDiscoveryV1::resolver(hub)...resolve()`; `register/discover/watch`; `ServiceHandle::{deregister,update_metadata,set_state}`.
-
-- **Sequences**: None net-new (reuses `cpt-cf-clst-seq-per-primitive-resolution`).
-
-- **Data**: None — no persistent schema (see DESIGN §3.14).
-
-### 2.6 [SDK Default Backends](features/006-sdk-default-backends.md) ✅ LOW
+### 2.5 [SDK Default Backends](features/006-sdk-default-backends.md) ✅ LOW
 
 - [x] `p3` - **ID**: `cpt-cf-clst-feature-sdk-default-backends`
 
-- **Purpose**: Ship the "implement cache only → get all four primitives" guarantee. Provides CAS-based default implementations of leader election, distributed lock, and service discovery built entirely on `Arc<dyn ClusterCacheBackend>`, with the safety constructor pair that rejects eventually-consistent caches by default for the consistency-sensitive primitives.
+- **Purpose**: Ship the "implement cache only → get all three primitives" guarantee. Provides CAS-based default implementations of leader election and distributed lock built entirely on `Arc<dyn ClusterCacheBackend>`, with the safety constructor pair that rejects eventually-consistent caches by default.
 
-- **Depends On**: `cpt-cf-clst-feature-cache-primitive`, `cpt-cf-clst-feature-leader-election`, `cpt-cf-clst-feature-distributed-lock`, `cpt-cf-clst-feature-service-discovery`
+- **Depends On**: `cpt-cf-clst-feature-cache-primitive`, `cpt-cf-clst-feature-leader-election`, `cpt-cf-clst-feature-distributed-lock`
 
 - **Scope**:
-  - `CasBasedLeaderElectionBackend`, `CasBasedDistributedLockBackend`, `CacheBasedServiceDiscoveryBackend`.
-  - Constructor pair on the two consistency-sensitive backends: `new()` rejects `EventuallyConsistent` → `InvalidConfig`; `new_allow_weak_consistency()` always succeeds + warn-log. Service discovery uses a single `new()`.
+  - `CasBasedLeaderElectionBackend`, `CasBasedDistributedLockBackend`.
+  - Constructor pair on both backends: `new()` rejects `EventuallyConsistent` → `InvalidConfig`; `new_allow_weak_consistency()` always succeeds + warn-log.
 
 - **Out of scope**:
   - The wiring-crate omit-primitive auto-wrap selection logic (follow-up).
@@ -305,26 +256,24 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 - **Domain Model Entities**:
   - CasBasedLeaderElectionBackend
   - CasBasedDistributedLockBackend
-  - CacheBasedServiceDiscoveryBackend
 
 - **API**:
-  - Rust: `CasBasedLeaderElectionBackend::{new,new_allow_weak_consistency}`; `CasBasedDistributedLockBackend::{new,new_allow_weak_consistency}`; `CacheBasedServiceDiscoveryBackend::new`.
+  - Rust: `CasBasedLeaderElectionBackend::{new,new_allow_weak_consistency}`; `CasBasedDistributedLockBackend::{new,new_allow_weak_consistency}`.
 
 - **Sequences**: None net-new.
 
 - **Data**: None — no persistent schema (see DESIGN §3.14).
 
-### 2.7 [Per-primitive Scoping & Prefix-Watch Polyfill](features/007-scoping-polyfill.md) ✅ LOW
+### 2.6 [Per-primitive Scoping & Prefix-Watch Polyfill](features/007-scoping-polyfill.md) ✅ LOW
 
 - [x] `p3` - **ID**: `cpt-cf-clst-feature-scoping-polyfill`
 
-- **Purpose**: Let consumers carve composable sub-namespaces inside any primitive without manual prefixing, and synthesize prefix-watch semantics on backends that lack native support. Scoping applies to coordination names only; service-discovery metadata keys/values pass through unchanged.
+- **Purpose**: Let consumers carve composable sub-namespaces inside any primitive without manual prefixing, and synthesize prefix-watch semantics on backends that lack native support.
 
-- **Depends On**: `cpt-cf-clst-feature-cache-primitive`, `cpt-cf-clst-feature-leader-election`, `cpt-cf-clst-feature-distributed-lock`, `cpt-cf-clst-feature-service-discovery`
+- **Depends On**: `cpt-cf-clst-feature-cache-primitive`, `cpt-cf-clst-feature-leader-election`, `cpt-cf-clst-feature-distributed-lock`
 
 - **Scope**:
-  - `ScopedCacheBackend`, `ScopedLeaderElectionBackend`, `ScopedDistributedLockBackend`, `ScopedServiceDiscoveryBackend` delegating wrappers (prefix on write, strip on read; composable).
-  - Service-discovery scoping applies to `name` only — metadata keys/values are never renamed.
+  - `ScopedCacheBackend`, `ScopedLeaderElectionBackend`, `ScopedDistributedLockBackend` delegating wrappers (prefix on write, strip on read; composable).
   - `PollingPrefixWatch::spawn(...)` synthesizing `watch_prefix` on backends declaring `prefix_watch == false`.
 
 - **Out of scope**:
@@ -333,13 +282,11 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 - **Requirements Covered**:
 
   - [x] `p3` - `cpt-cf-clst-fr-namespacing-scoped`
-  - [x] `p3` - `cpt-cf-clst-fr-namespacing-sd-metadata-unscoped`
 
 - **Domain Model Entities**:
   - ScopedCacheBackend
   - ScopedLeaderElectionBackend
   - ScopedDistributedLockBackend
-  - ScopedServiceDiscoveryBackend
   - PollingPrefixWatch
 
 - **API**:
@@ -349,17 +296,17 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 
 - **Data**: None — no persistent schema (see DESIGN §3.14).
 
-### 2.8 [Watch Auto-Restart Combinator](features/008-watch-auto-restart.md) ✅ LOW
+### 2.7 [Watch Auto-Restart Combinator](features/008-watch-auto-restart.md) ✅ LOW
 
 - [x] `p3` - **ID**: `cpt-cf-clst-feature-watch-auto-restart`
 
 - **Purpose**: Ship one canonical, opt-in watch-restart combinator for all three watch types so consumers do not each reinvent reconnect loops with inconsistent backoff and retryability classification. Turns retryable terminal closes into transparent reconnection with backoff, synthesizes `Reset` on resubscribe, and propagates non-retryable closes unchanged.
 
-- **Depends On**: `cpt-cf-clst-feature-cache-primitive`, `cpt-cf-clst-feature-leader-election`, `cpt-cf-clst-feature-service-discovery`
+- **Depends On**: `cpt-cf-clst-feature-cache-primitive`, `cpt-cf-clst-feature-leader-election`
 
 - **Scope**:
   - `RetryPolicy` (initial/max backoff, jitter, optional retry cap; `default()` = 1s→30s, full jitter, no cap).
-  - `RestartingWatch<W>` for `CacheWatch`/`LeaderWatch`/`ServiceWatch` via `*Watch::auto_restart(policy)`; retryability read from `ProviderErrorKind` per the DESIGN §3.9 table.
+  - `RestartingWatch<W>` for `CacheWatch`/`LeaderWatch` via `*Watch::auto_restart(policy)`; retryability read from `ProviderErrorKind` per the DESIGN §3.9 table.
 
 - **Out of scope**:
   - The raw watch event types themselves (defined in the per-primitive features).
@@ -379,13 +326,13 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 
 - **Data**: None — no persistent schema (see DESIGN §3.14).
 
-### 2.9 [Registration Helpers, GTS Spec & Observability Contract](features/009-registration-observability.md) ✅ MEDIUM
+### 2.8 [Registration Helpers, GTS Spec & Observability Contract](features/009-registration-observability.md) ✅ MEDIUM
 
 - [x] `p2` - **ID**: `cpt-cf-clst-feature-registration-observability`
 
 - **Purpose**: Provide the ClientHub registration/deregistration helpers (per profile per primitive) that the cluster gear's wiring (`ClusterWiring`, brought into this change per the scope note above) composes, the GTS plugin-spec scaffolding that lets follow-up plugins register and be discovered, and the versioned observability naming contract (span/metric/log names plus the cardinality rule) that every follow-up plugin must emit against.
 
-- **Depends On**: `cpt-cf-clst-feature-cache-primitive`, `cpt-cf-clst-feature-leader-election`, `cpt-cf-clst-feature-distributed-lock`, `cpt-cf-clst-feature-service-discovery`
+- **Depends On**: `cpt-cf-clst-feature-cache-primitive`, `cpt-cf-clst-feature-leader-election`, `cpt-cf-clst-feature-distributed-lock`
 
 - **Scope**:
   - `register_*_backend` / `deregister_*_backend` ClientHub helpers (scoped via `profile_scope`).
@@ -419,17 +366,17 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 
 - **Data**: None — no persistent schema (see DESIGN §3.14).
 
-### 2.10 [Lock-Misuse Lint (no-remote-in-critical-section)](features/010-lock-lint.md) ✅ LOW
+### 2.9 [Lock-Misuse Lint (no-remote-in-critical-section)](features/010-lock-lint.md) ✅ LOW
 
 - [x] `p3` - **ID**: `cpt-cf-clst-feature-lock-lint`
 
-- **Purpose**: Make the no-remote-I/O-in-critical-section rule enforceable rather than aspirational, via a workspace dylint rule that flags cross-instance remote calls inside a cluster lock's critical section at compile time. Sequenced after the lock primitive so the lint has real `try_lock`/`release` scopes to target.
+- **Purpose**: Make the no-remote-I/O-in-critical-section rule enforceable rather than aspirational, via a workspace architecture lint rule (via `cargo gears lint`) that flags cross-instance remote calls inside a cluster lock's critical section at compile time. Sequenced after the lock primitive so the lint has real `try_lock`/`release` scopes to target.
 
 - **Depends On**: `cpt-cf-clst-feature-distributed-lock`
 
 - **Scope**:
-  - New dylint crate under `tools/dylint_lints/` (e.g. `de14_cluster/de14XX_no_remote_in_critical_section/`); added to that workspace's members; modeled on the existing `de0707_drop_zeroize` lint.
-  - Lint scope restricted to the four cluster backend traits within `try_lock`/`release` scopes (DB-tx enforcement is a follow-up rule extension).
+  - New architecture lint rule in the `cargo-gears` CLI (e.g. `de14_cluster/de14XX_no_remote_in_critical_section/`); modeled on the existing `de0707_drop_zeroize` lint.
+  - Lint scope restricted to the three cluster backend traits within `try_lock`/`release` scopes (DB-tx enforcement is a follow-up rule extension).
 
 - **Out of scope**:
   - DB-transaction critical-section enforcement (follow-up rule extension).
@@ -444,7 +391,7 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
   - [x] `p3` - `cpt-cf-clst-constraint-no-remote-in-critical-section`
 
 - **Domain Model Entities**:
-  - None (workspace dylint crate; no domain entities).
+  - None (architecture lint rule; no domain entities).
 
 - **API**:
   - Lint: `DE14XX_NO_REMOTE_IN_CRITICAL_SECTION` (Deny).
@@ -453,13 +400,13 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 
 - **Data**: None — no persistent schema (see DESIGN §3.14).
 
-### 2.11 [Smoke Tests (in-process stub backends)](features/011-smoke-tests.md) ✅ MEDIUM
+### 2.10 [Smoke Tests (in-process stub backends)](features/011-smoke-tests.md) ✅ MEDIUM
 
 - [x] `p2` - **ID**: `cpt-cf-clst-feature-smoke-tests`
 
 - **Purpose**: Verify the SDK contract end-to-end against minimal in-process stub backends with no external infrastructure — exercising resolution, capability-mismatch failure, every watch lifecycle variant, CAS conflict, single-leader-under-contention, lock release-on-timeout, scoping, and the polyfill. Establishes the cross-backend behavioral baseline.
 
-- **Depends On**: `cpt-cf-clst-feature-cache-primitive`, `cpt-cf-clst-feature-leader-election`, `cpt-cf-clst-feature-distributed-lock`, `cpt-cf-clst-feature-service-discovery`, `cpt-cf-clst-feature-sdk-default-backends`, `cpt-cf-clst-feature-scoping-polyfill`, `cpt-cf-clst-feature-watch-auto-restart`
+- **Depends On**: `cpt-cf-clst-feature-cache-primitive`, `cpt-cf-clst-feature-leader-election`, `cpt-cf-clst-feature-distributed-lock`, `cpt-cf-clst-feature-sdk-default-backends`, `cpt-cf-clst-feature-scoping-polyfill`, `cpt-cf-clst-feature-watch-auto-restart`
 
 - **Scope**:
   - Minimal in-process `MemCacheBackend` and sibling stubs (explicitly NOT production backends).
@@ -483,7 +430,7 @@ The remaining out-of-scope elements (lifecycle wiring, standalone and external p
 
 - **Data**: None — no persistent schema (see DESIGN §3.14).
 
-### 2.12 [Showcase Examples & Traceability Audit](features/012-showcase-audit.md) ✅ LOW
+### 2.11 [Showcase Examples & Traceability Audit](features/012-showcase-audit.md) ✅ LOW
 
 - [x] `p4` - **ID**: `cpt-cf-clst-feature-showcase-audit`
 
@@ -520,18 +467,17 @@ cpt-cf-clst-feature-sdk-foundation
 cpt-cf-clst-feature-cache-primitive
     ├─→ cpt-cf-clst-feature-leader-election
     ├─→ cpt-cf-clst-feature-distributed-lock
-    ├─→ cpt-cf-clst-feature-service-discovery
     └─→ cpt-cf-clst-feature-scoping-polyfill
             │
-   (leader + lock + service-discovery)
+   (leader + lock)
             ├─→ cpt-cf-clst-feature-sdk-default-backends
             ├─→ cpt-cf-clst-feature-registration-observability
-            └─→ cpt-cf-clst-feature-watch-auto-restart   (cache + leader + service-discovery)
+            └─→ cpt-cf-clst-feature-watch-auto-restart   (cache + leader)
 
 cpt-cf-clst-feature-distributed-lock
     └─→ cpt-cf-clst-feature-lock-lint
 
-(default-backends + scoping-polyfill + watch-auto-restart + the four primitives)
+(default-backends + scoping-polyfill + watch-auto-restart + the three primitives)
     └─→ cpt-cf-clst-feature-smoke-tests
             └─→ cpt-cf-clst-feature-showcase-audit
                     (also depends on registration-observability)
@@ -540,11 +486,11 @@ cpt-cf-clst-feature-distributed-lock
 **Dependency Rationale**:
 
 - `cpt-cf-clst-feature-cache-primitive` requires `cpt-cf-clst-feature-sdk-foundation`: the cache facade, resolver, and watch types are built on the shared error model, profile marker, and dyn-compat harness.
-- `cpt-cf-clst-feature-leader-election`, `cpt-cf-clst-feature-distributed-lock`, and `cpt-cf-clst-feature-service-discovery` each require the foundation and the cache primitive (they reuse the watch-union shape, resolver pattern, and capability-validation mechanism), and are mutually independent — they can be developed in parallel.
+- `cpt-cf-clst-feature-leader-election` and `cpt-cf-clst-feature-distributed-lock` each require the foundation and the cache primitive (they reuse the watch-union shape, resolver pattern, and capability-validation mechanism), and are mutually independent — they can be developed in parallel.
 - `cpt-cf-clst-feature-scoping-polyfill` requires the cache primitive (and the other primitive facades it wraps): scoping wrappers and the prefix-watch polyfill delegate to the primitive backends.
-- `cpt-cf-clst-feature-sdk-default-backends` requires the cache primitive plus all three other primitive traits: the CAS/cache-based defaults implement those traits over `Arc<dyn ClusterCacheBackend>`.
-- `cpt-cf-clst-feature-watch-auto-restart` requires the cache, leader-election, and service-discovery features: the combinator wraps their watch types.
-- `cpt-cf-clst-feature-registration-observability` requires all four primitive traits: the register/deregister helpers and observability names are keyed per primitive.
+- `cpt-cf-clst-feature-sdk-default-backends` requires the cache primitive plus both other primitive traits: the CAS/cache-based defaults implement those traits over `Arc<dyn ClusterCacheBackend>`.
+- `cpt-cf-clst-feature-watch-auto-restart` requires the cache and leader-election features: the combinator wraps their watch types.
+- `cpt-cf-clst-feature-registration-observability` requires all three primitive traits: the register/deregister helpers and observability names are keyed per primitive.
 - `cpt-cf-clst-feature-lock-lint` requires `cpt-cf-clst-feature-distributed-lock`: the lint targets `try_lock`/`release` scopes that only exist once the lock primitive lands.
 - `cpt-cf-clst-feature-smoke-tests` requires the primitives plus default backends, scoping/polyfill, and the auto-restart combinator: the stubs exercise the full contract surface.
 - `cpt-cf-clst-feature-showcase-audit` depends on the verified contract (smoke tests) plus default backends, scoping, auto-restart, and registration/observability: examples consume the complete public surface and the audit verifies end-to-end traceability.

@@ -15,7 +15,7 @@
 //!   the migrations, so runtime DML still resolves them in `bss`.
 //!
 //! Ignored by default (Docker/testcontainers); run with
-//! `cargo test -p bss-ledger --test postgres_migration_idempotency -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_migration_idempotency -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -42,7 +42,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 /// `SELECT count(*) ...` -> the `i64` count.
 async fn count(db: &DatabaseConnection, sql: impl Into<String>) -> i64 {
     let row = db
-        .query_one(pg(sql))
+        .query_one_raw(pg(sql))
         .await
         .unwrap()
         .expect("count query must return a row");
@@ -207,7 +207,7 @@ async fn payment_tables_created_on_up_and_dropped_on_down() {
         "ledger_payment_allocation_refund",
     ] {
         let err = db
-            .query_one(pg(format!("SELECT count(*) AS count FROM bss.{table}")))
+            .query_one_raw(pg(format!("SELECT count(*) AS count FROM bss.{table}")))
             .await
             .expect_err("table must be absent after down");
         assert!(
@@ -258,7 +258,7 @@ async fn pending_event_queue_created_on_up_and_dropped_on_down() {
         .await
         .expect("down reverses the last 38 migrations (to before the queue)");
     let err = db
-        .query_one(pg(
+        .query_one_raw(pg(
             "SELECT count(*) AS count FROM bss.ledger_pending_event_queue",
         ))
         .await

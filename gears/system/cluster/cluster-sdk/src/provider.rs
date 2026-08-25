@@ -5,15 +5,14 @@
 //! (`cf-gears-cluster`) collects providers into a [`ProviderRegistry`] and
 //! dispatches each profile's per-primitive binding against it.
 //!
-//! All four provider traits live in the SDK so plugins implement them while
+//! All three provider traits live in the SDK so plugins implement them while
 //! depending only on `cluster-sdk`, never on the wiring crate. Options arrive as
 //! a raw `serde_json::Map` (the wiring strips the framing `provider` and
 //! `secret_ref` keys before the call), keeping the SDK free of any config schema.
 //!
 //! **Omit-default shorthand**: a profile that omits a primitive gets the SDK
 //! default backend over the cache (`CasBasedLeaderElectionBackend`,
-//! `CasBasedDistributedLockBackend`, `CacheBasedServiceDiscoveryBackend`). An
-//! explicit binding always wins.
+//! `CasBasedDistributedLockBackend`). An explicit binding always wins.
 //!
 //! **Non-cache providers do not receive the cache backend.** If a plugin natively
 //! implements leader election (e.g. K8s Lease) it builds that backend from its own
@@ -27,7 +26,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::cache::ClusterCacheBackend;
-use crate::discovery::ServiceDiscoveryBackend;
 use crate::error::ClusterError;
 use crate::leader::LeaderElectionBackend;
 use crate::lock::DistributedLockBackend;
@@ -39,8 +37,8 @@ pub type StopHook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>>
 /// Builds the cache backend for one provider.
 ///
 /// The cache backend is the foundational primitive; the wiring auto-wraps it with
-/// the SDK-default leader-election, lock, and service-discovery backends for any
-/// primitive the operator leaves unbound.
+/// the SDK-default leader-election and lock backends for any primitive the
+/// operator leaves unbound.
 ///
 /// # Options contract
 /// `options` is the flattened, provider-specific subset of one operator backend
@@ -124,29 +122,4 @@ pub trait ClusterLockProvider: Send + Sync {
         &self,
         options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(Arc<dyn DistributedLockBackend>, StopHook), ClusterError>;
-}
-
-/// Builds a native service-discovery backend for one provider.
-///
-/// Implement this for plugins whose backend has a purpose-built service-discovery
-/// primitive (e.g. K8s Lease-per-instance). Plugins that only implement cache
-/// leave service discovery to the SDK default (`CacheBasedServiceDiscoveryBackend`
-/// over their cache).
-///
-/// # Errors
-/// Returns [`ClusterError::InvalidConfig`] if `options` are invalid.
-#[async_trait]
-pub trait ClusterServiceDiscoveryProvider: Send + Sync {
-    /// The stable provider name matched against the operator config's `provider`
-    /// field for the `service_discovery` primitive binding.
-    fn provider(&self) -> &'static str;
-
-    /// Builds and starts the service-discovery backend.
-    ///
-    /// # Errors
-    /// Returns [`ClusterError::InvalidConfig`] if `options` are invalid.
-    async fn build_service_discovery(
-        &self,
-        options: &serde_json::Map<String, serde_json::Value>,
-    ) -> Result<(Arc<dyn ServiceDiscoveryBackend>, StopHook), ClusterError>;
 }

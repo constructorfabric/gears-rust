@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         verbose: 0,
         print_config: false,
         heartbeat_interval_secs: 5,
+        version: None,
     };
 
     run_oop_with_options(opts).await
@@ -84,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
 | `verbose` | Log verbosity (0=default, 1=info, 2=debug, 3=trace) |
 | `print_config` | Print effective config and exit |
 | `heartbeat_interval_secs` | Heartbeat interval (default: 5) |
+| `version` | Gear version used for `DirectoryService` registration and the generated `OpenAPI` spec version; `None` means no explicit version |
 
 ## OoP Lifecycle
 

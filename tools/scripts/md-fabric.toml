@@ -118,10 +118,6 @@ pattern = "tools/**/*.md"
 id      = "libs"
 pattern = "libs/**/*.md"
 
-[[categories.buckets]]
-id      = "tools/dylint_lints"
-pattern = "tools/dylint_lints/**/*.md"
-
 # ── Gears ───────────────────────────────────────────────────────────────────
 
 [[categories]]

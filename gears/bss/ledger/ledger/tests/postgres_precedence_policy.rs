@@ -12,7 +12,7 @@
 //!   (latest `effective_from <= now`) is the one chosen.
 //!
 //! Ignored by default (Docker/testcontainers); run with
-//! `cargo test -p bss-ledger --test postgres_precedence_policy -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_precedence_policy -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -124,7 +124,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -202,7 +202,7 @@ async fn seed_policy(
     strategy: &str,
     effective_from: DateTime<Utc>,
 ) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_tenant_precedence_policy
             (tenant_id, version, effective_from, strategy, created_at_utc)
          VALUES ('{}', {version}, '{}', '{strategy}', '{}')",
@@ -219,7 +219,7 @@ async fn ar_invoice_balance(
     s: &Seller,
     invoice_id: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
@@ -237,7 +237,7 @@ async fn allocation_policy_refs(
     payment_id: &str,
 ) -> Vec<String> {
     let rows = raw
-        .query_all(pg(format!(
+        .query_all_raw(pg(format!(
             "SELECT DISTINCT precedence_policy_ref FROM bss.ledger_payment_allocation \
              WHERE tenant_id='{}' AND payment_id='{}' ORDER BY precedence_policy_ref",
             s.tenant, payment_id

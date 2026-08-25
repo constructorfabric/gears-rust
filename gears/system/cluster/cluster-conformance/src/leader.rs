@@ -8,9 +8,12 @@
 //! ```no_run
 //! # use std::sync::Arc;
 //! # use cluster_sdk::LeaderElectionBackend;
-//! # use cluster_conformance::run_leader_conformance;
-//! # async fn run(make_backend: impl Fn() -> Arc<dyn LeaderElectionBackend>) {
-//! run_leader_conformance(make_backend).await;
+//! # use cluster_conformance::{run_leader_conformance, ScenarioBackend, TimeControl};
+//! # async fn run<Fut>(make_backend: impl Fn() -> Fut)
+//! # where Fut: std::future::Future<Output = ScenarioBackend<dyn LeaderElectionBackend>> {
+//! // `TimeControl::Virtual` for in-memory fixtures; `TimeControl::Real` for a
+//! // backend over a real connection pool (see `cluster_conformance::time`).
+//! run_leader_conformance(make_backend, TimeControl::Virtual).await;
 //! # }
 //! ```
 //!
@@ -26,24 +29,55 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cluster_sdk::error::ClusterError;
-use cluster_sdk::leader::{
-    ElectionConfig, LeaderElectionBackend, LeaderStatus, LeaderWatch, LeaderWatchEvent,
-};
+use std::future::Future;
 
-/// Runs every implemented L2 leader-election scenario against a fresh backend
-/// from `make`. `SC-LEAD-002` is asserted only when the backend declares
-/// `linearizable`; weaker backends skip the single-leader guarantee.
-pub async fn run_leader_conformance<F>(make: F)
+use cluster_sdk::leader::{ElectionConfig, LeaderElectionBackend, LeaderStatus, LeaderWatch};
+
+use crate::factory::{ScenarioBackend, run_scenario};
+use crate::time::TimeControl;
+use crate::watch_poll::poll_watch;
+
+/// Yields spent letting the runtime settle after a virtual-clock `advance`, so
+/// the sweeper, the renewal task and the watch forwarder have all been polled
+/// before a scenario scans the watch stream. Not an event bound: nothing is
+/// consumed from the watch here.
+const SETTLE_YIELDS: usize = 64;
+
+/// Event bound for `SC-LEAD-006`'s scan for `Status(Lost)`. Wider than the
+/// shared default because a deliberately-missed renewal is preceded by whatever
+/// renewal traffic the fast-forward already queued.
+const LOSS_SCAN_EVENTS: usize = 256;
+
+/// Renewal intervals `SC-LEAD-003` holds leadership across; enough for the
+/// auto-renewal task to have fired repeatedly rather than once.
+const RENEWAL_INTERVALS: usize = 5;
+
+/// Runs every implemented L2 leader-election scenario, each against a fresh
+/// backend built by the async factory `make` and torn down afterward (see
+/// [`ScenarioBackend`]). `SC-LEAD-002` is asserted only when the backend
+/// declares `linearizable`; weaker backends skip the single-leader guarantee.
+///
+/// `time` selects the clock model. `SC-LEAD-006` runs **only** under
+/// [`TimeControl::Virtual`]: it asserts a *transient* `Status(Lost)` re-enrols,
+/// which it induces by fast-forwarding virtual time so a lease renewal *misses*.
+/// A healthy real backend never misses a renewal by merely waiting, so under
+/// [`TimeControl::Real`] there would be no `Lost` to observe and the scenario
+/// would hang — inducing a real loss is fault-injection territory (L4). It is
+/// therefore skipped under `Real` rather than run against a real backend.
+pub async fn run_leader_conformance<F, Fut>(make: F, time: TimeControl)
 where
-    F: Fn() -> Arc<dyn LeaderElectionBackend>,
+    F: Fn() -> Fut,
+    Fut: Future<Output = ScenarioBackend<dyn LeaderElectionBackend>>,
 {
-    scenario_lead_001(make()).await;
-    scenario_lead_002(make()).await;
-    scenario_lead_003(make()).await;
-    scenario_lead_004(make()).await;
-    scenario_lead_005(make()).await;
-    scenario_lead_006(make()).await;
-    scenario_lead_007(make()).await;
+    run_scenario(make(), scenario_lead_001).await;
+    run_scenario(make(), scenario_lead_002).await;
+    run_scenario(make(), |b| scenario_lead_003(b, time)).await;
+    run_scenario(make(), scenario_lead_004).await;
+    run_scenario(make(), scenario_lead_005).await;
+    if time == TimeControl::Virtual {
+        run_scenario(make(), scenario_lead_006).await;
+    }
+    run_scenario(make(), scenario_lead_007).await;
 }
 
 /// SC-LEAD-001: a single candidate becomes `Leader`.
@@ -110,30 +144,27 @@ pub async fn scenario_lead_007(_backend: Arc<dyn LeaderElectionBackend>) {
 
 /// SC-LEAD-003: the elected leader's claim auto-renews without any consumer
 /// action; the status stays `Leader` across multiple renewal intervals.
-pub async fn scenario_lead_003(backend: Arc<dyn LeaderElectionBackend>) {
-    tokio::time::pause();
+pub async fn scenario_lead_003(backend: Arc<dyn LeaderElectionBackend>, time: TimeControl) {
+    time.begin();
     // Short TTL so renewals fire quickly under controlled time.
     // max_missed_renewals=2 → renewal_interval = ttl / 3 ≈ 100 ms.
     let config = ElectionConfig::new(Duration::from_millis(300), 2).expect("valid config");
     let mut watch = backend.elect_with_config("e", config).await.expect("elect");
     // Wait until we hold leadership.
-    loop {
-        match watch.changed().await {
-            LeaderWatchEvent::Status(LeaderStatus::Leader) => break,
-            LeaderWatchEvent::Closed(err) => panic!("SC-LEAD-003: watch closed: {err}"),
-            _ => {}
-        }
-    }
-    // Advance across 5 renewal intervals; after each yield the renewal task runs.
-    for _ in 0..5 {
-        tokio::time::advance(Duration::from_millis(100)).await;
-        tokio::task::yield_now().await;
+    assert!(
+        wait_for_leader(&mut watch).await,
+        "SC-LEAD-003: the sole contender must be elected leader"
+    );
+    // Elapse across 5 renewal intervals; the renewal task keeps the lease alive,
+    // so a healthy backend (real or fixture) never loses leadership.
+    for _ in 0..RENEWAL_INTERVALS {
+        time.elapse(Duration::from_millis(100)).await;
         assert!(
             watch.is_leader(),
             "SC-LEAD-003: auto-renewal must keep status Leader across renewal intervals"
         );
     }
-    tokio::time::resume();
+    time.end();
 }
 
 /// SC-LEAD-004: graceful `resign()` releases the claim; a waiting follower is
@@ -142,13 +173,10 @@ pub async fn scenario_lead_004(backend: Arc<dyn LeaderElectionBackend>) {
     let mut a = backend.elect("e").await.expect("elect a");
     let mut b = backend.elect("e").await.expect("elect b");
     // Drive A to Leader.
-    loop {
-        match a.changed().await {
-            LeaderWatchEvent::Status(LeaderStatus::Leader) => break,
-            LeaderWatchEvent::Closed(err) => panic!("SC-LEAD-004: a closed: {err}"),
-            _ => {}
-        }
-    }
+    assert!(
+        wait_for_leader(&mut a).await,
+        "SC-LEAD-004: the first contender must be elected leader"
+    );
     a.resign().await.expect("SC-LEAD-004: resign must succeed");
     assert!(
         wait_for_leader(&mut b).await,
@@ -161,26 +189,20 @@ pub async fn scenario_lead_004(backend: Arc<dyn LeaderElectionBackend>) {
 pub async fn scenario_lead_005(backend: Arc<dyn LeaderElectionBackend>) {
     let mut watch = backend.elect("e").await.expect("elect");
     // After any Status event the cached snapshot must agree.
-    for _ in 0..64 {
-        match watch.changed().await {
-            LeaderWatchEvent::Status(s) => {
-                assert_eq!(
-                    watch.status(),
-                    s,
-                    "SC-LEAD-005: status() must equal the last Status event"
-                );
-                assert_eq!(
-                    watch.is_leader(),
-                    matches!(s, LeaderStatus::Leader),
-                    "SC-LEAD-005: is_leader() must agree with the last Status event"
-                );
-                return;
-            }
-            LeaderWatchEvent::Closed(err) => panic!("SC-LEAD-005: watch closed: {err}"),
-            _ => {}
-        }
-    }
-    panic!("SC-LEAD-005: no Status event observed within the bound");
+    let observed = poll_watch(&mut watch)
+        .first()
+        .await
+        .expect_match("SC-LEAD-005: no Status event observed");
+    assert_eq!(
+        watch.status(),
+        observed,
+        "SC-LEAD-005: status() must equal the last Status event"
+    );
+    assert_eq!(
+        watch.is_leader(),
+        matches!(observed, LeaderStatus::Leader),
+        "SC-LEAD-005: is_leader() must agree with the last Status event"
+    );
 }
 
 /// SC-LEAD-006: `Status(Lost)` is transient — the watch auto-reenrols and
@@ -191,66 +213,48 @@ pub async fn scenario_lead_006(backend: Arc<dyn LeaderElectionBackend>) {
     // Very short TTL with one allowed missed renewal so loss fires quickly.
     let config = ElectionConfig::new(Duration::from_millis(100), 1).expect("valid config");
     let mut watch = backend.elect_with_config("e", config).await.expect("elect");
-    loop {
-        match watch.changed().await {
-            LeaderWatchEvent::Status(LeaderStatus::Leader) => break,
-            LeaderWatchEvent::Closed(err) => panic!("SC-LEAD-006: watch closed: {err}"),
-            _ => {}
-        }
-    }
+    assert!(
+        wait_for_leader(&mut watch).await,
+        "SC-LEAD-006: the sole contender must be elected leader"
+    );
     // Advance past the full TTL so the renewal misses its window. After
-    // `advance`, timer futures wake up but tasks still need to be polled;
-    // 64 yields lets the sweeper, the renewal task, and the watch forwarder
-    // all process their events before we scan the watch stream.
+    // `advance`, timer futures wake up but tasks still need to be polled; the
+    // yields let the sweeper, the renewal task, and the watch forwarder all
+    // process their events before we scan the watch stream.
     tokio::time::advance(Duration::from_millis(500)).await;
-    for _ in 0..64 {
+    for _ in 0..SETTLE_YIELDS {
         tokio::task::yield_now().await;
     }
 
-    let mut saw_lost = false;
-    for _ in 0..256 {
-        match watch.changed().await {
-            LeaderWatchEvent::Status(LeaderStatus::Lost) => {
-                saw_lost = true;
-            }
-            LeaderWatchEvent::Status(_) if saw_lost => {
-                // Re-enrolled on the same watch — scenario passes.
-                tokio::time::resume();
-                return;
-            }
-            LeaderWatchEvent::Closed(err) => panic!("SC-LEAD-006: watch closed: {err}"),
-            _ => {}
-        }
-    }
-    tokio::time::resume();
-    panic!(
+    // Two phases, so the *order* is asserted: the loss must be observed first,
+    // and only then does any further status prove the watch re-enrolled itself.
+    // A repeated `Lost` counts — the original loop accepted that too.
+    assert!(
+        poll_watch(&mut watch)
+            .max_skipped(LOSS_SCAN_EVENTS)
+            .until(|status| matches!(status, LeaderStatus::Lost))
+            .await,
+        "SC-LEAD-006: a missed renewal must surface as Status(Lost)"
+    );
+    assert!(
+        poll_watch(&mut watch).first().await.is_match(),
         "SC-LEAD-006: watch must re-enrol after Lost without the consumer calling elect() again"
     );
+    tokio::time::resume();
 }
 
-/// Polls `watch.changed()` up to 64 times, returning `true` if a `Leader`
-/// status is observed.
+/// Resolves `true` once the watch reports `Leader`, within the shared poll
+/// bounds (see [`crate::watch_poll`]).
 async fn wait_for_leader(watch: &mut LeaderWatch) -> bool {
-    for _ in 0..64 {
-        match watch.changed().await {
-            LeaderWatchEvent::Status(LeaderStatus::Leader) => return true,
-            LeaderWatchEvent::Closed(_) => return false,
-            _ => {}
-        }
-    }
-    false
+    poll_watch(watch)
+        .until(|status| matches!(status, LeaderStatus::Leader))
+        .await
 }
 
 /// Awaits the watch's first leadership status, skipping non-status signals.
 async fn first_status(watch: &mut LeaderWatch) -> LeaderStatus {
-    for _ in 0..64 {
-        match watch.changed().await {
-            LeaderWatchEvent::Status(status) => return status,
-            LeaderWatchEvent::Closed(err) => {
-                panic!("watch closed before reporting status: {err}")
-            }
-            _ => {}
-        }
-    }
-    panic!("watch produced no Status event within the bound");
+    poll_watch(watch)
+        .first()
+        .await
+        .expect_match("watch produced no Status event")
 }

@@ -1,4 +1,4 @@
-use sea_orm::{ColumnTrait, Condition, EntityTrait, sea_query::Expr};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, sea_query::Expr};
 
 use crate::secure::{AccessScope, ScopableEntity};
 use toolkit_security::pep_properties;

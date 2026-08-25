@@ -175,7 +175,7 @@ CREATE INDEX IF NOT EXISTS idx_rgm_gts_type_resource
     ON resource_group_membership (gts_type_id, resource_id);
                 "
             }
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Migration(
                     "Only PostgreSQL and SQLite are supported".to_owned(),
                 ));

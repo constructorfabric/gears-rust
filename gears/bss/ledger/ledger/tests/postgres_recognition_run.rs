@@ -70,7 +70,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
-    conn.query_one(pg(sql.to_owned()))
+    conn.query_one_raw(pg(sql.to_owned()))
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
@@ -120,7 +120,7 @@ fn account(
 /// Open one more fiscal period for the seller (so a release into a later period
 /// passes the foundation OPEN-period gate).
 async fn open_period(raw: &DatabaseConnection, s: &Seller, period_id: &str) {
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{period_id}','UTC','OPEN')",
         s.tenant, s.tenant
@@ -279,7 +279,7 @@ async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64>
 
 /// The schedule_id of the (single) ACTIVE schedule for an invoice.
 async fn schedule_id(raw: &DatabaseConnection, s: &Seller, invoice_id: &str) -> String {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT schedule_id FROM bss.ledger_recognition_schedule \
          WHERE tenant_id='{}' AND source_invoice_id='{invoice_id}'",
         s.tenant
@@ -308,7 +308,7 @@ async fn schedule_status_of(
     s: &Seller,
     schedule: &str,
 ) -> Option<String> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT status FROM bss.ledger_recognition_schedule \
          WHERE tenant_id='{}' AND schedule_id='{schedule}'",
         s.tenant
@@ -344,7 +344,7 @@ async fn segment_status(
     schedule: &str,
     segment_no: i32,
 ) -> Option<String> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT status FROM bss.ledger_recognition_segment \
          WHERE tenant_id='{}' AND schedule_id='{schedule}' AND segment_no={segment_no}",
         s.tenant

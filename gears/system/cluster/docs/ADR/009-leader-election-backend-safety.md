@@ -20,7 +20,6 @@ date: 2026-04-27
   - [Why opt-in exists at all (evolution from the original "no bypass" stance)](#why-opt-in-exists-at-all-evolution-from-the-original-no-bypass-stance)
   - [Recommended deployments](#recommended-deployments)
   - [Lock backend follows the same rule](#lock-backend-follows-the-same-rule)
-  - [Service-discovery backend does NOT follow the same rule](#service-discovery-backend-does-not-follow-the-same-rule)
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
@@ -173,12 +172,6 @@ For **dev / testing**: standalone is trivially correct (single instance); for mu
 ### Lock backend follows the same rule
 
 `CasBasedDistributedLockBackend` has identical safety requirements: split-brain on a lock has the same correctness consequences as split-brain on a leader (two holders, neither knowing about the other). The same constructor pair applies — `new(cache)` rejects `EventuallyConsistent`; `new_allow_weak_consistency(cache)` opts in with a warning. `LockCapability::Linearizable` is the consumer-side requirement.
-
-### Service-discovery backend does NOT follow the same rule
-
-`CacheBasedServiceDiscoveryBackend` has weaker correctness requirements. Stale instance entries during cache failover are recoverable by clients retrying — a discoverer that gets a stale instance set re-discovers when the watch reset arrives, and consumers tolerate transient routing errors. The SDK default for service discovery does NOT require linearizable cache; the constructor is single-form (`new(cache)`) and accepts `EventuallyConsistent` without opt-in.
-
-This asymmetry is intentional: leader election and locks have at-most-one semantics where dual occupancy is a correctness bug; service discovery has set-membership semantics where transient inaccuracy degrades into retry, not corruption. Documenting the distinction explicitly prevents the (incorrect) instinct to treat all three SDK defaults the same way.
 
 ### Consequences
 

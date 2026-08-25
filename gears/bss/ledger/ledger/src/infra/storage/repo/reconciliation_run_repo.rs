@@ -29,6 +29,9 @@ impl ReconciliationRunRepo {
     }
 
     /// Create a RUNNING reconciliation-run row.
+    ///
+    /// # Errors
+    /// Returns [`RepoError::Db`] if scope validation or insertion fails.
     pub async fn start(
         txn: &DbTx<'_>,
         scope: &AccessScope,
@@ -60,6 +63,9 @@ impl ReconciliationRunRepo {
     }
 
     /// Finalize a run with its variance result.
+    ///
+    /// # Errors
+    /// Returns [`RepoError::Db`] if the scoped update fails.
     #[allow(
         clippy::too_many_arguments,
         reason = "a finalized run records its full variance result in one write"
@@ -104,6 +110,10 @@ impl ReconciliationRunRepo {
     }
 
     /// Read a run (out-of-txn). SQL-level BOLA: a foreign tenant yields no row.
+    ///
+    /// # Errors
+    /// Returns [`DomainError::Internal`] if acquiring a connection or reading
+    /// the run fails.
     pub async fn read(
         &self,
         scope: &AccessScope,

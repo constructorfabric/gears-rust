@@ -78,14 +78,13 @@ No gear-specific environment constraints. The canonical error system runs within
 - Round-trip serialization/deserialization (server → wire → SDK)
 - Public vs private detail isolation (client-facing context vs server-side logging with trace_id)
 - Migration of all existing gears to the new error system
-- Dylint-level rules enforcement
+- `cargo gears lint`-level rules enforcement
 
 ### 4.2 Out of Scope
 
 - gRPC transport mapping — future work
 - SSE error event format — future work
 - W3C trace ID extraction — separate workstream
-- Error middleware catch-all — depends on foundation phase
 - Error extensibility rules (custom gear-specific error types beyond the 16 categories) — future work
 
 ## 5. Functional Requirements
@@ -127,6 +126,15 @@ Every error response MUST include a trace ID for request correlation.
 
 - **Rationale**: Trace IDs enable end-to-end debugging across gears and support integration.
 - **Actors**: `cpt-cf-errors-actor-api-consumer`, `cpt-cf-errors-actor-gear-developer`
+
+#### Error Middleware Catch-All
+
+- [ ] `p1` - **ID**: `cpt-cf-errors-fr-middleware-catchall`
+
+The system MUST guarantee every HTTP error response is a syntactically valid RFC 9457 `Problem`, even when the originating failure was never explicitly typed as `CanonicalError` (an axum extractor rejection, a tower-layer short-circuit, or any other pre-handler failure). Where the failure's shape is known ahead of time, the response MUST also carry the precise canonical category and a machine-readable reason code; where it is not, a minimal `Problem` using RFC 9457's `about:blank` convention is sufficient.
+
+- **Rationale**: Without this guarantee, a client cannot reliably parse every error response as `Problem` JSON — some failures (extraction rejections, tower-layer short-circuits) bypass every handler-level `CanonicalError` conversion and previously rendered as plain text.
+- **Actors**: `cpt-cf-errors-actor-gear-developer`, `cpt-cf-errors-actor-api-consumer`
 
 #### Public vs Private Detail Isolation
 
@@ -295,7 +303,7 @@ Error construction MUST be O(1) enum + struct allocation with no heap allocation
 - [ ] No error reaches API consumers outside the canonical vocabulary
 - [ ] Production error responses for `internal`/`unknown` contain no stack traces, query text, or file paths
 - [ ] Every error response includes a trace ID
-- [ ] Dylint static analysis rules enforce correct error construction patterns (no bypassing canonical errors)
+- [ ] `cargo gears lint` static analysis rules enforce correct error construction patterns (no bypassing canonical errors)
 - [ ] `CanonicalError` variants cannot be constructed directly from outside the crate (`#[non_exhaustive]` on variants, `pub(crate)` internal constructors)
 
 ## 10. Dependencies
@@ -319,7 +327,7 @@ Error construction MUST be O(1) enum + struct allocation with no heap allocation
 |------|--------|------------|
 | CI schema checks become maintenance burden | Devs skip updates, reducing trust | One check per category; auto-generate from error definitions |
 | 16 categories insufficient long-term | Ad-hoc types outside canonical set | Additive categories (minor version bump) |
-| LLM agents bypass compile checks | Contract violated despite CI gates | Dylint lint rules (`dylint_lints/`) that enforce canonical error construction patterns |
+| LLM agents bypass compile checks | Contract violated despite CI gates | Architecture lint rules (via `cargo gears lint`) that enforce canonical error construction patterns |
 
 ## 13. Open Questions
 

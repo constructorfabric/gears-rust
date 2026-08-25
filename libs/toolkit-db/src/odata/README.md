@@ -141,12 +141,17 @@ From `toolkit_db::odata` (re-exported from core):
 
 Run tests:
 ```bash
-cargo test -p toolkit-db --features sea-orm,sqlite
+cargo nextest run -p cf-gears-toolkit-db --features sqlite,integration
 ```
 
 Build library:
 ```bash
-cargo build -p toolkit-db --features sea-orm,sqlite
+cargo build -p cf-gears-toolkit-db --features sqlite
+```
+
+Or via the Makefile shortcuts, which also cover Postgres and MySQL:
+```bash
+make test-sqlite   # make test-pg / make test-mysql / make test-db
 ```
 
 ## Future Enhancements

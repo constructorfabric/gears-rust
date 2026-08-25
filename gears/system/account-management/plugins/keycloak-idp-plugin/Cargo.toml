@@ -1,0 +1,73 @@
+[package]
+name = "cf-gears-keycloak-idp-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Keycloak IdP plugin for Account Management - tenant, user, and machine-identity lifecycle over the Keycloak admin API"
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["constructorfabric", "cf-gears", "keycloak"]
+categories = ["authentication"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "keycloak_idp_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+toolkit.workspace = true
+toolkit-macros.workspace = true
+toolkit-gts.workspace = true
+toolkit-security.workspace = true
+toolkit-odata.workspace = true
+account-management-sdk.workspace = true
+credstore-sdk = { workspace = true }
+types-registry-sdk.workspace = true
+# Full gear crates for the `deps = [types_registry, credstore]` gear-macro arg
+# (force-linked via the macro's `::types_registry` / `::credstore` re-exports).
+types-registry = { workspace = true }
+credstore = { workspace = true }
+reqwest = { workspace = true, features = ["form", "json", "rustls"] }
+serde.workspace = true
+serde_json.workspace = true
+humantime-serde.workspace = true
+secrecy.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry = { workspace = true, features = ["metrics"] }
+opentelemetry_sdk = { workspace = true, features = ["trace"] }
+dashmap.workspace = true
+# guidelines/DEPENDENCIES.md: parking_lot for synchronous locks.
+parking_lot.workspace = true
+uuid.workspace = true
+url = { workspace = true, features = ["serde"] }
+percent-encoding.workspace = true
+base64.workspace = true
+regex.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true, features = ["registry"] }
+serde-saphyr = { workspace = true }
+wiremock.workspace = true
+temp-env = { workspace = true }
+gts.workspace = true
+# Self-signed CA generation for `tls_ca_bundle_ref` factory tests.
+# The cert is never used over the wire — we only need a syntactically-valid
+# PEM so reqwest's `ClientBuilder::add_root_certificate` accepts it.
+rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
+# The remaining direct test imports (account-management-sdk, credstore-sdk,
+# toolkit-security, toolkit-odata, openbao-credstore-gateway, reqwest,
+# async-trait, serde_json, uuid, url) are pulled in transitively via
+# `[dependencies]` above and so do not need to be re-declared here.
+
+[features]
+default = []

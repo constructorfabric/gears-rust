@@ -1,0 +1,50 @@
+family     = "supersession-continuity"
+id         = "flat-price-change-accepted"
+kind       = "publish"
+provenance = ["inst-tb-supersession-units", "inst-mk-chargekind", "inst-mk-forbidden", "D-18", "D-82", "D-127"]
+
+# The guard's own scope, stated on the simplest row there is.
+#
+# `inst-tb-supersession-units` binds a **usage row** landing on an occupied
+# published canonical scope key, and it binds it for one reason: the tier counter
+# `Q` continues across the supersession, so what `Q` is denominated in, derived
+# from and priced by must not move under it. A `flat` row has no such counter to
+# protect. `inst-mk-chargekind` (D-18) makes `flat` legal on **non-usage** rows
+# only - `flat` on a usage row is `MODEL_KIND_CHARGEKIND_MISMATCH`, because the
+# plain untiered metered rate is `per_unit` - so there is no `flat` row anywhere
+# in the catalog that meters anything.
+#
+# There are therefore no unit fields on either side to compare: `inst-mk-forbidden`
+# makes `tierAggregationWindow` and `billingGranularity` usage-row-only, so a
+# `flat` row carrying either fails publish on its own shape, before any pair is
+# considered. The whole of what a `flat` supersession changes is its amount.
+#
+# This is what the case pins, and it pins it against over-reach. A guard written
+# against the *pair* rather than against the *usage row* would look at two rows
+# whose `model_kind`, `meter` (absent), `dimensionKey` (absent) and windows
+# (absent) all match and still have to decide what to do with the one field that
+# moved - and the plain reading of "the successor MUST carry the predecessor's
+# fields unchanged" catches `amount_minor` if the scope clause is dropped. A
+# catalog that could not reprice a flat recurring charge without a plan revision
+# has lost the mechanism for the most common price change there is.
+#
+# `flat` also has no other publish case, and the registry's `publish` half is
+# earned per kind by a passing run - so without this case the `flat` gate could
+# never open at all. That is the same hole `inst-fx-gate` had before `flat`
+# joined the fixture families, one layer down.
+
+[predecessor]
+model_kind   = "flat"
+charge_kind  = "recurring"
+currency     = "USD"
+amount_minor = 9900
+
+[successor]
+model_kind   = "flat"
+charge_kind  = "recurring"
+currency     = "USD"
+amount_minor = 12900
+
+[[assert]]
+expect = { publish = "accepted" }
+why    = "a flat row is never a usage row, so no counter continues into the successor and no field is denominated in anything. The amount is the only lever it has, and a guard that blocked it would make supersession unusable for the simplest row in the catalog - the price change would have to route through plan revisioning, which is the outcome D-82 was careful not to cause"

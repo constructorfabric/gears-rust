@@ -71,24 +71,22 @@ impl ODataFieldMapping<AccountInfoFilterField> for AccountInfoODataMapper {
         field: AccountInfoFilterField,
     ) -> sea_orm::Value {
         match field {
-            AccountInfoFilterField::AccountId => {
-                sea_orm::Value::Uuid(Some(Box::new(model.account_id)))
-            }
+            AccountInfoFilterField::AccountId => sea_orm::Value::Uuid(Some(model.account_id)),
             AccountInfoFilterField::AccountClass => {
-                sea_orm::Value::String(Some(Box::new(model.account_class.clone())))
+                sea_orm::Value::String(Some(model.account_class.clone()))
             }
             AccountInfoFilterField::Currency => {
-                sea_orm::Value::String(Some(Box::new(model.currency.clone())))
+                sea_orm::Value::String(Some(model.currency.clone()))
             }
             // `revenue_stream` is nullable; a `None` cursor value round-trips as
             // a typed NULL (the keyset never seeks past a NULL on the default
             // `account_id` order, so this is belt-and-braces).
             AccountInfoFilterField::RevenueStream => match &model.revenue_stream {
-                Some(s) => sea_orm::Value::String(Some(Box::new(s.clone()))),
+                Some(s) => sea_orm::Value::String(Some(s.clone())),
                 None => sea_orm::Value::String(None),
             },
             AccountInfoFilterField::LifecycleState => {
-                sea_orm::Value::String(Some(Box::new(model.lifecycle_state.clone())))
+                sea_orm::Value::String(Some(model.lifecycle_state.clone()))
             }
         }
     }
@@ -121,18 +119,18 @@ impl ODataFieldMapping<JournalLineFilterField> for JournalLineODataMapper {
         field: JournalLineFilterField,
     ) -> sea_orm::Value {
         match field {
-            JournalLineFilterField::LineId => sea_orm::Value::Uuid(Some(Box::new(model.line_id))),
+            JournalLineFilterField::LineId => sea_orm::Value::Uuid(Some(model.line_id)),
             JournalLineFilterField::PayerTenantId => {
-                sea_orm::Value::Uuid(Some(Box::new(model.payer_tenant_id)))
+                sea_orm::Value::Uuid(Some(model.payer_tenant_id))
             }
             JournalLineFilterField::AccountClass => {
-                sea_orm::Value::String(Some(Box::new(model.account_class.clone())))
+                sea_orm::Value::String(Some(model.account_class.clone()))
             }
             JournalLineFilterField::PeriodId => {
-                sea_orm::Value::String(Some(Box::new(model.period_id.clone())))
+                sea_orm::Value::String(Some(model.period_id.clone()))
             }
             JournalLineFilterField::InvoiceId => match &model.invoice_id {
-                Some(s) => sea_orm::Value::String(Some(Box::new(s.clone()))),
+                Some(s) => sea_orm::Value::String(Some(s.clone())),
                 None => sea_orm::Value::String(None),
             },
         }
@@ -169,17 +167,15 @@ impl ODataFieldMapping<JournalEntryFilterField> for JournalEntryODataMapper {
         field: JournalEntryFilterField,
     ) -> sea_orm::Value {
         match field {
-            JournalEntryFilterField::EntryId => {
-                sea_orm::Value::Uuid(Some(Box::new(model.entry_id)))
-            }
+            JournalEntryFilterField::EntryId => sea_orm::Value::Uuid(Some(model.entry_id)),
             JournalEntryFilterField::SourceDocType => {
-                sea_orm::Value::String(Some(Box::new(model.source_doc_type.clone())))
+                sea_orm::Value::String(Some(model.source_doc_type.clone()))
             }
             JournalEntryFilterField::SourceBusinessId => {
-                sea_orm::Value::String(Some(Box::new(model.source_business_id.clone())))
+                sea_orm::Value::String(Some(model.source_business_id.clone()))
             }
             JournalEntryFilterField::PeriodId => {
-                sea_orm::Value::String(Some(Box::new(model.period_id.clone())))
+                sea_orm::Value::String(Some(model.period_id.clone()))
             }
         }
     }
@@ -207,13 +203,11 @@ impl ODataFieldMapping<BalanceFilterField> for BalanceODataMapper {
 
     fn extract_cursor_value(model: &BalanceModel, field: BalanceFilterField) -> sea_orm::Value {
         match field {
-            BalanceFilterField::AccountId => sea_orm::Value::Uuid(Some(Box::new(model.account_id))),
+            BalanceFilterField::AccountId => sea_orm::Value::Uuid(Some(model.account_id)),
             BalanceFilterField::AccountClass => {
-                sea_orm::Value::String(Some(Box::new(model.account_class.clone())))
+                sea_orm::Value::String(Some(model.account_class.clone()))
             }
-            BalanceFilterField::Currency => {
-                sea_orm::Value::String(Some(Box::new(model.currency.clone())))
-            }
+            BalanceFilterField::Currency => sea_orm::Value::String(Some(model.currency.clone())),
         }
     }
 }
@@ -245,27 +239,21 @@ impl ODataFieldMapping<RefundFilterField> for RefundODataMapper {
 
     fn extract_cursor_value(model: &RefundModel, field: RefundFilterField) -> sea_orm::Value {
         match field {
-            RefundFilterField::RefundId => {
-                sea_orm::Value::String(Some(Box::new(model.refund_id.clone())))
-            }
-            RefundFilterField::PaymentId => {
-                sea_orm::Value::String(Some(Box::new(model.payment_id.clone())))
-            }
+            RefundFilterField::RefundId => sea_orm::Value::String(Some(model.refund_id.clone())),
+            RefundFilterField::PaymentId => sea_orm::Value::String(Some(model.payment_id.clone())),
             RefundFilterField::PspRefundId => {
-                sea_orm::Value::String(Some(Box::new(model.psp_refund_id.clone())))
+                sea_orm::Value::String(Some(model.psp_refund_id.clone()))
             }
-            RefundFilterField::Phase => sea_orm::Value::String(Some(Box::new(model.phase.clone()))),
-            RefundFilterField::Pattern => {
-                sea_orm::Value::String(Some(Box::new(model.pattern.clone())))
-            }
+            RefundFilterField::Phase => sea_orm::Value::String(Some(model.phase.clone())),
+            RefundFilterField::Pattern => sea_orm::Value::String(Some(model.pattern.clone())),
             RefundFilterField::ClearingState => {
-                sea_orm::Value::String(Some(Box::new(model.clearing_state.clone())))
+                sea_orm::Value::String(Some(model.clearing_state.clone()))
             }
             // `invoice_id` is nullable (Pattern A has none); a `None` cursor value
             // round-trips as a typed NULL (the keyset never seeks past a NULL on
             // the default `refund_id` order, so this is belt-and-braces).
             RefundFilterField::InvoiceId => match &model.invoice_id {
-                Some(s) => sea_orm::Value::String(Some(Box::new(s.clone()))),
+                Some(s) => sea_orm::Value::String(Some(s.clone())),
                 None => sea_orm::Value::String(None),
             },
         }
@@ -302,16 +290,16 @@ impl ODataFieldMapping<CreditNoteFilterField> for CreditNoteODataMapper {
     ) -> sea_orm::Value {
         match field {
             CreditNoteFilterField::CreditNoteId => {
-                sea_orm::Value::String(Some(Box::new(model.credit_note_id.clone())))
+                sea_orm::Value::String(Some(model.credit_note_id.clone()))
             }
             CreditNoteFilterField::OriginInvoiceId => {
-                sea_orm::Value::String(Some(Box::new(model.origin_invoice_id.clone())))
+                sea_orm::Value::String(Some(model.origin_invoice_id.clone()))
             }
             CreditNoteFilterField::RevenueStream => {
-                sea_orm::Value::String(Some(Box::new(model.revenue_stream.clone())))
+                sea_orm::Value::String(Some(model.revenue_stream.clone()))
             }
             CreditNoteFilterField::ReasonCode => {
-                sea_orm::Value::String(Some(Box::new(model.reason_code.clone())))
+                sea_orm::Value::String(Some(model.reason_code.clone()))
             }
         }
     }
@@ -341,10 +329,10 @@ impl ODataFieldMapping<DebitNoteFilterField> for DebitNoteODataMapper {
     fn extract_cursor_value(model: &DebitNoteModel, field: DebitNoteFilterField) -> sea_orm::Value {
         match field {
             DebitNoteFilterField::DebitNoteId => {
-                sea_orm::Value::String(Some(Box::new(model.debit_note_id.clone())))
+                sea_orm::Value::String(Some(model.debit_note_id.clone()))
             }
             DebitNoteFilterField::OriginInvoiceId => {
-                sea_orm::Value::String(Some(Box::new(model.origin_invoice_id.clone())))
+                sea_orm::Value::String(Some(model.origin_invoice_id.clone()))
             }
         }
     }
@@ -375,18 +363,10 @@ impl ODataFieldMapping<DisputeFilterField> for DisputeODataMapper {
 
     fn extract_cursor_value(model: &DisputeModel, field: DisputeFilterField) -> sea_orm::Value {
         match field {
-            DisputeFilterField::DisputeId => {
-                sea_orm::Value::String(Some(Box::new(model.dispute_id.clone())))
-            }
-            DisputeFilterField::PaymentId => {
-                sea_orm::Value::String(Some(Box::new(model.payment_id.clone())))
-            }
-            DisputeFilterField::LastPhase => {
-                sea_orm::Value::String(Some(Box::new(model.last_phase.clone())))
-            }
-            DisputeFilterField::Variant => {
-                sea_orm::Value::String(Some(Box::new(model.variant.clone())))
-            }
+            DisputeFilterField::DisputeId => sea_orm::Value::String(Some(model.dispute_id.clone())),
+            DisputeFilterField::PaymentId => sea_orm::Value::String(Some(model.payment_id.clone())),
+            DisputeFilterField::LastPhase => sea_orm::Value::String(Some(model.last_phase.clone())),
+            DisputeFilterField::Variant => sea_orm::Value::String(Some(model.variant.clone())),
         }
     }
 }
@@ -419,13 +399,11 @@ impl ODataFieldMapping<RecognitionRunFilterField> for RecognitionRunODataMapper 
         field: RecognitionRunFilterField,
     ) -> sea_orm::Value {
         match field {
-            RecognitionRunFilterField::RunId => sea_orm::Value::Uuid(Some(Box::new(model.run_id))),
+            RecognitionRunFilterField::RunId => sea_orm::Value::Uuid(Some(model.run_id)),
             RecognitionRunFilterField::PeriodId => {
-                sea_orm::Value::String(Some(Box::new(model.period_id.clone())))
+                sea_orm::Value::String(Some(model.period_id.clone()))
             }
-            RecognitionRunFilterField::Status => {
-                sea_orm::Value::String(Some(Box::new(model.status.clone())))
-            }
+            RecognitionRunFilterField::Status => sea_orm::Value::String(Some(model.status.clone())),
         }
     }
 }
@@ -458,24 +436,20 @@ impl ODataFieldMapping<ExceptionFilterField> for ExceptionODataMapper {
 
     fn extract_cursor_value(model: &ExceptionModel, field: ExceptionFilterField) -> sea_orm::Value {
         match field {
-            ExceptionFilterField::ExceptionId => {
-                sea_orm::Value::Uuid(Some(Box::new(model.exception_id)))
-            }
+            ExceptionFilterField::ExceptionId => sea_orm::Value::Uuid(Some(model.exception_id)),
             ExceptionFilterField::ExceptionType => {
-                sea_orm::Value::String(Some(Box::new(model.exception_type.clone())))
+                sea_orm::Value::String(Some(model.exception_type.clone()))
             }
-            ExceptionFilterField::Status => {
-                sea_orm::Value::String(Some(Box::new(model.status.clone())))
-            }
+            ExceptionFilterField::Status => sea_orm::Value::String(Some(model.status.clone())),
             ExceptionFilterField::BusinessRef => {
-                sea_orm::Value::String(Some(Box::new(model.business_ref.clone())))
+                sea_orm::Value::String(Some(model.business_ref.clone()))
             }
             // `period_id` is nullable (a non-period exception has none); a `None`
             // cursor value round-trips as a typed NULL (the keyset never seeks past
             // a NULL on the default `exception_id` order, so this is
             // belt-and-braces).
             ExceptionFilterField::PeriodId => match &model.period_id {
-                Some(s) => sea_orm::Value::String(Some(Box::new(s.clone()))),
+                Some(s) => sea_orm::Value::String(Some(s.clone())),
                 None => sea_orm::Value::String(None),
             },
         }

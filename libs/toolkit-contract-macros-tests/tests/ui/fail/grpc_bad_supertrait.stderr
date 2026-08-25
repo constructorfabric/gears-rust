@@ -1,0 +1,5 @@
+error: gRPC projection is not allowed for `Embedded` contracts; only `Api` and `Backend` are remote-capable (PRD #1536 D2/D6)
+  --> tests/ui/fail/grpc_bad_supertrait.rs:16:11
+   |
+16 | pub trait FooEmbeddedGrpc: FooEmbedded {
+   |           ^^^^^^^^^^^^^^^

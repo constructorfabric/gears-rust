@@ -9,18 +9,44 @@ rust-version = "1.95.0"
 readme = "README.md"
 
 [profile.dev]
-incremental = false
-codegen-units = 16
+# Incremental is for local dev cycles. CI workflows set CARGO_INCREMENTAL=0 in
+# their env, which overrides this (the env var wins in both directions).
+incremental = true
+debug = "line-tables-only" # line tables for backtraces without full debuginfo bloat
 
 [profile.test]
-incremental = false
-codegen-units = 16
+incremental = true # same rationale as [profile.dev] above
 debug = "line-tables-only" # to minimize build sizes in gitworkflows
 
 [profile.release]
 codegen-units = 1
 panic = "unwind"
 debug = "line-tables-only"
+
+# Dependencies usually don't need debuginfo. See the Cargo guide:
+# https://doc.rust-lang.org/cargo/guide/build-performance.html#reduce-amount-of-generated-debug-information
+# When you do need it, use the `debugging` profile below.
+[profile.dev.package."*"]
+debug = false
+
+# Redundant in practice — dependencies of a test build use the dev profile, so the
+# override above already covers them. Kept for symmetry with the dev/test pair.
+[profile.test.package."*"]
+debug = false
+
+# Escape hatch: `cargo build --profile debugging` gives full debuginfo for the
+# workspace and its dependencies. Builds into target/debugging/, safe to delete.
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+[profile.debugging.package."*"]
+debug = true
+
+# Build scripts and the proc-macro copies rustc loads during macro expansion are
+# governed by build-override, not by the package overrides above.
+[profile.debugging.build-override]
+debug = true
 
 [workspace]
 members = [
@@ -39,6 +65,8 @@ members = [
     "libs/toolkit-gts-macros",
     "libs/toolkit-http",
     "libs/toolkit-http-middleware",
+    "libs/toolkit-gateway",
+    "libs/toolkit-k8s-auth",
     "libs/toolkit-sdk",
     "libs/toolkit-odata-macros",
     "libs/toolkit-security",
@@ -49,22 +77,29 @@ members = [
     "libs/toolkit-utils",
     "libs/rustls-corecrypto-provider",
     "libs/rustls-fips-shim",
+    "libs/toolkit-contract",
+    "libs/toolkit-contract-macros",
+    "libs/toolkit-contract-macros-tests",
+    "libs/toolkit-contract-protogen",
     "libs/system-sdks",
     "libs/system-sdks/sdks/directory",
     "gears/credstore/credstore-sdk",
     "gears/credstore/credstore",
     "gears/credstore/plugins/static-credstore-plugin",
-    "gears/file-parser",
+    "gears/file-parser/file-parser-sdk",
+    "gears/file-parser/file-parser",
     "gears/file-storage/file-storage-sdk",
     "gears/file-storage/file-storage",
     "gears/system/account-management/account-management",
     "gears/system/account-management/account-management-sdk",
     "gears/system/account-management/plugins/static-idp-plugin",
+    "gears/system/account-management/plugins/keycloak-idp-plugin",
     "gears/system/api-gateway",
     "gears/system/cluster/cluster",
     "gears/system/cluster/cluster-sdk",
     "gears/system/cluster/cluster-conformance",
     "gears/system/cluster/plugins/standalone-cluster-plugin",
+    "gears/system/cluster/plugins/postgres-cluster-plugin",
     "gears/system/grpc-hub",
     "gears/system/nodes-registry/nodes-registry",
     "gears/system/nodes-registry/nodes-registry-sdk",
@@ -104,20 +139,29 @@ members = [
     "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin",
     "gears/mini-chat/mini-chat-sdk",
     "gears/mini-chat/mini-chat",
+    "examples/toolkit/api-contracts/api-contracts-sdk",
+    "examples/toolkit/api-contracts/api-contracts",
+    "examples/toolkit/api-contracts/api-contracts-consumer",
     "gears/chat-engine/chat-engine-sdk",
     "gears/chat-engine/chat-engine",
     "gears/model-registry/model-registry-sdk",
     "gears/llm-gateway/llm-gateway-sdk",
     "gears/bss/ledger/ledger",
     "gears/bss/ledger/ledger-sdk",
+    "gears/bss/pricing/pricing",
+    "gears/bss/pricing/pricing-sdk",
+    "gears/bss/rate-provider/rate-provider-sdk",
+    "gears/bss/rate-provider/rate-provider",
+    "gears/bss/rate-provider/plugins/ecb-plugin",
+    "gears/bss/rate-provider/plugins/http-json-plugin",
     "gears/bss/libs/coord",
+    "gears/bss/fixtures/bss-fixtures",
+    "gears/bss/fixtures/bss-fixtures-conformance",
     "gears/system/event-broker/event-broker-sdk",
+    "gears/system/event-broker/event-broker",
 ]
 exclude = ["tools/fuzz"]
 resolver = "3"
-
-# Note: dylint_lints is a separate workspace for custom linters
-# See tools/dylint_lints/README.md for usage instructions
 
 [workspace.lints.rust]
 deprecated = "warn"
@@ -245,25 +289,28 @@ verbose_file_reads = "deny"
 
 [workspace.dependencies]
 # libs
-toolkit = { package = "cf-gears-toolkit", version = "0.6.16", path = "libs/toolkit" }
-toolkit-http = { package = "cf-gears-toolkit-http", version = "0.6.9", path = "libs/toolkit-http" }
-toolkit-auth = { package = "cf-gears-toolkit-auth", version = "0.7.3", path = "libs/toolkit-auth" }
-toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", version = "0.7.5", path = "libs/toolkit-canonical-errors" }
+toolkit = { package = "cf-gears-toolkit", version = "0.7.0", path = "libs/toolkit" }
+toolkit-http = { package = "cf-gears-toolkit-http", version = "0.6.13", path = "libs/toolkit-http" }
+toolkit-http-middleware = { package = "cf-gears-toolkit-http-middleware", version = "0.2.3", path = "libs/toolkit-http-middleware" }
+toolkit-gateway = { package = "cf-gears-toolkit-gateway", version = "0.2.2", path = "libs/toolkit-gateway" }
+toolkit-k8s-auth = { package = "cf-gears-toolkit-k8s-auth", version = "0.1.1", path = "libs/toolkit-k8s-auth" }
+toolkit-auth = { package = "cf-gears-toolkit-auth", version = "0.7.6", path = "libs/toolkit-auth" }
+toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", version = "0.9.2", path = "libs/toolkit-canonical-errors" }
 toolkit-canonical-errors-macro = { package = "cf-gears-toolkit-canonical-errors-macro", version = "0.6.2", path = "libs/toolkit-canonical-errors-macro" }
-toolkit-db = { package = "cf-gears-toolkit-db", version = "0.10.0", path = "libs/toolkit-db" }
+toolkit-db = { package = "cf-gears-toolkit-db", version = "0.13.0", path = "libs/toolkit-db" }
 toolkit-db-macros = { package = "cf-gears-toolkit-db-macros", version = "0.6.4", path = "libs/toolkit-db-macros" }
-toolkit-gts = { package = "cf-gears-toolkit-gts", version = "0.1.3", path = "libs/toolkit-gts" }
+toolkit-gts = { package = "cf-gears-toolkit-gts", version = "0.1.4", path = "libs/toolkit-gts" }
 toolkit-gts-macros = { package = "cf-gears-toolkit-gts-macros", version = "0.1.3", path = "libs/toolkit-gts-macros" }
-toolkit-macros = { package = "cf-gears-toolkit-macros", version = "0.6.4", path = "libs/toolkit-macros" }
+toolkit-macros = { package = "cf-gears-toolkit-macros", version = "0.6.5", path = "libs/toolkit-macros" }
 toolkit-node-info = { package = "cf-gears-toolkit-node-info", version = "0.6.5", path = "libs/toolkit-node-info" }
-toolkit-odata = { package = "cf-gears-toolkit-odata", version = "0.8.3", path = "libs/toolkit-odata" }
-toolkit-odata-macros = { package = "cf-gears-toolkit-odata-macros", version = "0.6.8", path = "libs/toolkit-odata-macros" }
-toolkit-sdk = { package = "cf-gears-toolkit-sdk", version = "0.7.1", path = "libs/toolkit-sdk" }
-toolkit-security = { package = "cf-gears-toolkit-security", version = "0.7.3", path = "libs/toolkit-security" }
+toolkit-odata = { package = "cf-gears-toolkit-odata", version = "0.9.4", path = "libs/toolkit-odata" }
+toolkit-odata-macros = { package = "cf-gears-toolkit-odata-macros", version = "0.6.12", path = "libs/toolkit-odata-macros" }
+toolkit-sdk = { package = "cf-gears-toolkit-sdk", version = "0.7.7", path = "libs/toolkit-sdk" }
+toolkit-security = { package = "cf-gears-toolkit-security", version = "0.8.0", path = "libs/toolkit-security" }
 toolkit-stable-hash = { package = "cf-gears-toolkit-stable-hash", version = "0.1.0", path = "libs/toolkit-stable-hash" }
-toolkit-transport-grpc = { package = "cf-gears-toolkit-transport-grpc", version = "0.7.0", path = "libs/toolkit-transport-grpc" }
+toolkit-transport-grpc = { package = "cf-gears-toolkit-transport-grpc", version = "0.7.3", path = "libs/toolkit-transport-grpc" }
 toolkit-utils = { package = "cf-gears-toolkit-utils", version = "0.6.4", path = "libs/toolkit-utils" }
-rustls-corecrypto-provider = { package = "cf-gears-rustls-corecrypto-provider", version = "0.1.1", path = "libs/rustls-corecrypto-provider" }
+rustls-corecrypto-provider = { package = "cf-gears-rustls-corecrypto-provider", version = "0.1.2", path = "libs/rustls-corecrypto-provider" }
 rustls-fips-shim = { package = "cf-gears-rustls-fips-shim", version = "0.1.2", path = "libs/rustls-fips-shim" }
 # Windows CNG-backed rustls CryptoProvider (Windows-only FIPS path). Caret-pinned to 0.1.x;
 # re-evaluate per release. See docs/security/fips/adrs/0003-windows-fips-via-rustls-cng-crypto.md.
@@ -279,55 +326,104 @@ rustls-cng-crypto = { version = "0.1", default-features = false, features = ["fi
 pkcs8 = "0.10"
 sec1 = { version = "0.7", default-features = false, features = ["alloc", "der"] }
 
+toolkit-contract = { package = "cf-gears-toolkit-contract", version = "0.2.0", path = "libs/toolkit-contract" }
+toolkit-contract-macros = { package = "cf-gears-toolkit-contract-macros", version = "0.1.2", path = "libs/toolkit-contract-macros" }
+toolkit-contract-protogen = { package = "cf-gears-toolkit-contract-protogen", version = "0.1.2", path = "libs/toolkit-contract-protogen" }
 
-cf-gears-system-sdks = { version = "0.1.40", path = "libs/system-sdks" }
-cf-gears-system-sdk-directory = { version = "0.1.40", path = "libs/system-sdks/sdks/directory" }
+cf-gears-system-sdks = { version = "0.1.43", path = "libs/system-sdks" }
+cf-gears-system-sdk-directory = { version = "0.1.43", path = "libs/system-sdks/sdks/directory" }
 
 # System gears
-types-registry = { package = "cf-gears-types-registry", version = "0.1.26", path = "gears/system/types-registry/types-registry" }
-authn-resolver = { package = "cf-gears-authn-resolver", version = "0.2.21", path = "gears/system/authn-resolver/authn-resolver" }
-authz-resolver = { package = "cf-gears-authz-resolver", version = "0.1.28", path = "gears/system/authz-resolver/authz-resolver" }
-tenant-resolver = { package = "cf-gears-tenant-resolver", version = "0.1.25", path = "gears/system/tenant-resolver/tenant-resolver" }
-resource-group = { package = "cf-gears-resource-group", version = "0.2.2", path = "gears/system/resource-group/resource-group" }
-credstore = { package = "cf-gears-credstore", version = "0.2.1", path = "gears/credstore/credstore" }
-oagw = { package = "cf-gears-oagw", version = "0.3.2", path = "gears/system/oagw/oagw" }
-account-management = { package = "cf-gears-account-management", version = "0.4.2", path = "gears/system/account-management/account-management" }
-usage-collector = { package = "cf-gears-usage-collector", version = "0.2.2", path = "gears/system/usage-collector/usage-collector" }
+types-registry = { package = "cf-gears-types-registry", version = "0.1.35", path = "gears/system/types-registry/types-registry" }
+authn-resolver = { package = "cf-gears-authn-resolver", version = "0.2.29", path = "gears/system/authn-resolver/authn-resolver" }
+authz-resolver = { package = "cf-gears-authz-resolver", version = "0.1.37", path = "gears/system/authz-resolver/authz-resolver" }
+tenant-resolver = { package = "cf-gears-tenant-resolver", version = "0.1.33", path = "gears/system/tenant-resolver/tenant-resolver" }
+resource-group = { package = "cf-gears-resource-group", version = "0.3.1", path = "gears/system/resource-group/resource-group" }
+credstore = { package = "cf-gears-credstore", version = "0.3.1", path = "gears/credstore/credstore" }
+oagw = { package = "cf-gears-oagw", version = "0.4.1", path = "gears/system/oagw/oagw" }
+account-management = { package = "cf-gears-account-management", version = "0.7.0", path = "gears/system/account-management/account-management" }
+usage-collector = { package = "cf-gears-usage-collector", version = "0.2.9", path = "gears/system/usage-collector/usage-collector" }
+cluster = { package = "cf-gears-cluster", version = "0.2.1", path = "gears/system/cluster/cluster" }
 
-cf-gears-cluster-sdk = { version = "0.1.2", path = "gears/system/cluster/cluster-sdk" }
-cf-gears-cluster-conformance = { version = "0.1.2", path = "gears/system/cluster/cluster-conformance" }
+cf-gears-cluster-sdk = { version = "0.2.1", path = "gears/system/cluster/cluster-sdk" }
+cf-gears-cluster-conformance = { version = "0.3.1", path = "gears/system/cluster/cluster-conformance" }
 
 # System gears SDKs
-account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.4.1", path = "gears/system/account-management/account-management-sdk" }
-cluster-sdk = { package = "cf-gears-cluster-sdk", version = "0.1.2", path = "gears/system/cluster/cluster-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.1", path = "gears/system/types-registry/types-registry-sdk" }
-tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.12", path = "gears/system/tenant-resolver/tenant-resolver-sdk" }
-authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.12", path = "gears/system/authz-resolver/authz-resolver-sdk" }
-resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.1", path = "gears/system/resource-group/resource-group-sdk" }
-oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.4", path = "gears/system/oagw/oagw-sdk" }
-usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.0", path = "gears/system/usage-collector/usage-collector-sdk" }
+account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.6.0", path = "gears/system/account-management/account-management-sdk" }
+keycloak-idp-plugin = { package = "cf-gears-keycloak-idp-plugin", version = "0.1.0", path = "gears/system/account-management/plugins/keycloak-idp-plugin" }
+cluster-sdk = { package = "cf-gears-cluster-sdk", version = "0.2.1", path = "gears/system/cluster/cluster-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.6", path = "gears/system/types-registry/types-registry-sdk" }
+tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.21", path = "gears/system/tenant-resolver/tenant-resolver-sdk" }
+authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.21", path = "gears/system/authz-resolver/authz-resolver-sdk" }
+resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.2.7", path = "gears/system/resource-group/resource-group-sdk" }
+oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.9", path = "gears/system/oagw/oagw-sdk" }
+usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.7", path = "gears/system/usage-collector/usage-collector-sdk" }
 
 # BSS gears (ported from vhp-core)
-bss-ledger-sdk = { path = "gears/bss/ledger/ledger-sdk" }
-coord = { path = "gears/bss/libs/coord" }
+bss-ledger-sdk = { package = "cf-gears-bss-ledger-sdk", version = "0.1.3", path = "gears/bss/ledger/ledger-sdk" }
+# No `version` here, unlike the ledger and rate-provider SDKs around it, because
+# `cf-gears-bss-pricing-sdk/Cargo.toml` declares none either — the crate is not a release
+# target yet. `tools/scripts/check_packaging_metadata.py` agrees rather than
+# merely tolerating it: its second pass skips any package with no `[package]
+# version` ("not a release target yet (WIP), so `cargo publish` never runs on
+# it"), and `cf-gears-bss-pricing` is such a package, so its `workspace = true` dependency
+# on this entry is never examined. Asserting a version here that the crate does
+# not declare would be a claim about a release that has not been planned. The day
+# `cf-gears-bss-pricing` takes a `version`, this entry and `pricing-sdk`'s own `[package]`
+# must gain one in the same change or that gate turns red — which is the intended
+# coupling, not a latent trap.
+bss-pricing-sdk = { package = "cf-gears-bss-pricing-sdk", path = "gears/bss/pricing/pricing-sdk" }
+bss-rate-provider-sdk = { package = "cf-gears-bss-rate-provider-sdk", version = "0.1.3", path = "gears/bss/rate-provider/rate-provider-sdk" }
+coord = { package = "cf-gears-bss-coord", path = "gears/bss/libs/coord" }
+# The joint golden conformance fixture corpus. `bss-fixtures` carries no charge
+# arithmetic and is the only one a gear may depend on in production; the
+# conformance harness is a dev-dependency only.
+#
+# `default-features = false` here so a **gear** can inherit the narrow
+# production surface (`ModelKind` + `Registry` + `gate_open_for`): Cargo refuses
+# `default-features = false` on an inherited dependency unless the workspace
+# entry states it, so the default is set narrow and the corpus half is opted
+# into by name where it is actually wanted.
+bss-fixtures = { package = "cf-gears-bss-fixtures", path = "gears/bss/fixtures/bss-fixtures", default-features = false }
+bss-fixtures-conformance = { package = "cf-gears-bss-fixtures-conformance", path = "gears/bss/fixtures/bss-fixtures-conformance" }
 # FIPS-validated SHA-256 for the ledger idempotency payload fingerprint.
 aws-lc-rs = "1.17"
 
 # credstore
-credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.1", path = "gears/credstore/credstore-sdk" }
+credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.9", path = "gears/credstore/credstore-sdk" }
 
 # mini-chat
-mini-chat-sdk = { package = "cf-gears-mini-chat-sdk", version = "0.10.11", path = "gears/mini-chat/mini-chat-sdk" }
+mini-chat-sdk = { package = "cf-gears-mini-chat-sdk", version = "0.10.19", path = "gears/mini-chat/mini-chat-sdk" }
+
+# api-contracts (example: toolkit-contract macros showcased on a Payment API)
+api-contracts-sdk = { package = "cf-api-contracts-sdk", version = "0.1.0", path = "examples/toolkit/api-contracts/api-contracts-sdk" }
 
 # System gears
-grpc_hub = { package = "cf-gears-grpc-hub", version = "0.2.11", path = "gears/system/grpc-hub" }
+grpc_hub = { package = "cf-gears-grpc-hub", version = "0.2.19", path = "gears/system/grpc-hub" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# `toolkit-contract-protogen`'s, and it stays at the major upstream chose for it.
+#
+# **This is an add/add and not a disagreement**: `toml` was in neither side's
+# workspace table at the merge base. Upstream added `0.8` for the protogen tool
+# and this branch added `1` for the golden-fixture corpus
+# (`gears/bss/fixtures/corpus`), which is hand-authored and hand-reviewed as
+# normative text and was written against the 1.x API. Neither crate can be moved
+# onto the other's major by this rebase without a code change nobody has reviewed,
+# so `bss-fixtures` and `bss-fixtures-conformance` name `toml = "1"` directly
+# instead of inheriting. The lockfile already carries both — 0.8.23 and 1.1.2 —
+# so the duplication is upstream's own resolution and not something this adds.
+toml = "0.8"
 serde-saphyr = "0.0.22"
+humantime-serde = "1.1"
 secrecy = { version = "0.10", features = ["serde"] }
 serde_urlencoded = "0.7"
+# Query-string codec shared by the generated REST client and its server
+# extractor. Unlike `serde_urlencoded` it round-trips repeated keys into a
+# sequence, which is what makes `Vec<T>` query fields work end to end.
+serde_html_form = "0.4"
 schemars = { version = "1.2", features = ["derive", "uuid1"] }
 
 # Error handling
@@ -361,12 +457,12 @@ tracing-subscriber = { version = "0.3", features = [
     "local-time",
 ] }
 tracing-log = "0.2"
-tracing-opentelemetry = "0.32"
+tracing-opentelemetry = "0.33"
 tracing-appender = "0.2"
 tracing-test = "0.2"
-opentelemetry = { version = "0.31", features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.31", features = ["trace", "rt-tokio", "metrics"] }
-opentelemetry-otlp = { version = "0.31", features = [
+opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "rt-tokio", "metrics"] }
+opentelemetry-otlp = { version = "0.32", features = [
     "grpc-tonic",
     "http-proto",
 ] }
@@ -446,7 +542,19 @@ clap = { version = "4.5", features = ["derive"] }
 # in any code that calls ServerConfig::builder() without a prior
 # CryptoProvider::install_default() (e.g. tests).
 # TLS is provided separately via sqlx/tls-rustls-aws-lc-rs below.
-sea-orm = { version = "1.1", default-features = false, features = [
+#
+# Since sqlx 0.9 the combined runtime+TLS features (runtime-tokio-rustls, ...) are
+# gone upstream, so the split below is the only form available -- which is exactly
+# what we already wanted.
+#
+# `sqlite-use-returning-for-3_35` is part of sea-orm 2.0's default feature set; we
+# set default-features = false, so it has to be listed explicitly.
+# NOT enabled on purpose:
+#   - `stream`: nothing in the workspace uses ConnectionTrait::stream/StreamTrait.
+#   - `postgres-use-serial-pk`: we never generate DDL from entities (no Schema::new /
+#     create_table_from_entity), so 2.0's serial -> GENERATED BY DEFAULT AS IDENTITY
+#     change cannot affect our schemas; all serial/identity columns are hand-written SQL.
+sea-orm = { version = "2.0", default-features = false, features = [
     "runtime-tokio",
     "with-uuid",
     "with-chrono",
@@ -454,14 +562,15 @@ sea-orm = { version = "1.1", default-features = false, features = [
     "with-json",
     "with-rust_decimal",
     "macros",
+    "sqlite-use-returning-for-3_35",
 ] }
-sea-orm-migration = { version = "1.1", default-features = false, features = [
+sea-orm-migration = { version = "2.0", default-features = false, features = [
     "runtime-tokio",
 ] }
 # sqlx: TLS via aws-lc-rs; runtime-tokio for async.  This is the sole TLS entry
 # point for the DB stack -- sea-orm/sea-orm-migration intentionally use runtime-tokio
 # (not runtime-tokio-rustls) to avoid pulling in ring.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs"] }
 
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
@@ -482,6 +591,10 @@ humantime = "2.3.0"
 # URL parsing
 url = "2.5"
 urlencoding = "2.1"
+# RFC 3986 percent-encoding. Already in the tree via `toolkit-contract`,
+# which uses it to build path segments; promoted to a workspace dep so
+# gears encoding provider-chosen identifiers into URLs share one version.
+percent-encoding = "2"
 
 # Regex for env expansion
 regex = "1.10"
@@ -563,7 +676,7 @@ proc-macro-crate = "3"
 
 # Testing utilities
 trybuild = "1"
-serial_test = "3"
+serial_test = { version = "3", features = ["file_locks"] }
 criterion = { version = "0.8", default-features = false }
 testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
 testcontainers-modules = { version = "0.15", default-features = false, features = ["aws-lc-rs", "postgres", "mysql"] }
@@ -587,10 +700,29 @@ mime = "0.3"
 
 # Document parsing libraries
 docx-rust = "0.1.11"
+# `bundled-pdfium` downloads a prebuilt libpdfium at build time rather than vendoring one;
+# Cargo.lock does not pin it. The version lives in .cargo/config.toml as PDFIUM_VERSION.
 kreuzberg = { version = "=4.9.8", features = ["html", "excel", "office", "pdf", "bundled-pdfium"] }
+# Content-based file type detection (ONNX model, embedded weights). Used
+# only by file-parser's optional `magika` feature.
+magika = "1.1"
+# Pinned to match magika 1.1's own `ort` dependency exactly (`=2.0.0-rc.12`).
+# `load-dynamic` is added on top of magika's own feature set (`ndarray`, `std`) so the
+# ONNX Runtime shared library is resolved via `dlopen` at process start (`ORT_DYLIB_PATH`)
+# instead of being statically linked at build time — the gear's build environment never
+# needs the ONNX Runtime dev headers, only wherever the `magika`-enabled binary runs.
+# `download-binaries` (which would fetch a prebuilt runtime over the network during
+# `cargo build`) stays off; magika's own manifest already builds with default features off.
+# `api-24` is required to compile this rc — without it, `ort`'s own `ep/vitis.rs` (compiled
+# unconditionally, not feature-gated) references an `OrtApi` struct field that only exists
+# at the api-24 ABI level; this is unrelated to which execution providers we actually use.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"] }
 
 # Additional testing utilities
+tokio-test = "0.4"
+mockall = "0.13"
 temp-env = { version = "0.3", features = ["async_closure"] }
+wiremock = "0.6"
 
 # Additional utilities
 nanoid = "0.4"
@@ -620,5 +752,4 @@ ignored = [
     "resource-group",
     "tenant-resolver",
     "types-registry",
-    "usage-collector",
 ]

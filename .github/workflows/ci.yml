@@ -6,6 +6,14 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+  # PR CI only ever validates the ephemeral refs/pull/N/merge ref, so without
+  # this trigger the integrated tip of main is tested nowhere: a semantic
+  # conflict between two PRs merged minutes apart is caught by neither PR's run.
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
   workflow_dispatch:
 
 # NOTE: workflow-level paths-ignore above still skips the entire workflow for
@@ -31,7 +39,8 @@ env:
   SCCACHE_CACHE_SIZE: "2G"
   # Usually better determinism and smaller cache churn in CI.
   CARGO_INCREMENTAL: "0"
-  # Pinned nightly toolchain used by coverage, dylint, and shear jobs.
+  # Pinned nightly toolchain used by the coverage job. Independent of the pin in
+  # shear-nightly.yml — they happen to match today but need not.
   RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-04-16
 
 jobs:
@@ -48,6 +57,7 @@ jobs:
     outputs:
       rust:   ${{ steps.filter.outputs.rust }}
       fips:   ${{ steps.filter.outputs.fips }}
+      magika: ${{ steps.filter.outputs.magika }}
       dylint: ${{ steps.filter.outputs.dylint }}
       deps:   ${{ steps.filter.outputs.deps }}
       ci:     ${{ steps.filter.outputs.ci }}
@@ -67,10 +77,15 @@ jobs:
               - 'Makefile'
               - 'rust-toolchain.toml'
               - '.cargo/**'
+              # Input to `make check-release-config` in the test job: a config-only
+              # edit must still get the release configuration validated.
+              - 'release-plz.toml'
             fips:
               - 'libs/toolkit/**'
               - 'libs/toolkit-http/**'
               - 'libs/rustls-*/**'
+            magika:
+              - 'gears/file-parser/**'
             dylint:
               - 'tools/dylint_lints/**'
             deps:
@@ -112,12 +127,12 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          tool: protoc@3.34.1
 
       - name: Install Go (required for aws-lc-fips-sys FIPS build)
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
           cache: false
@@ -133,14 +148,14 @@ jobs:
           tool: cargo-hack
 
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-clippy-${{ hashFiles('rust-toolchain.toml') }}
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Probe sccache & set RUSTC_WRAPPER
         shell: bash
@@ -194,9 +209,9 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          tool: protoc@3.34.1
 
       - name: Validate gear naming conventions
         run: python3 tools/scripts/validate_gear_names.py
@@ -204,8 +219,11 @@ jobs:
       - name: Validate packaging metadata (readme/license-file paths)
         run: make check-packaging-metadata
 
+      - name: Validate release configuration (publish flags, release-plz.toml)
+        run: make check-release-config
+
       - name: Install Go (required for aws-lc-fips-sys FIPS build)
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
           cache: false
@@ -222,7 +240,7 @@ jobs:
 
       # Cache Cargo registry/git + target/ across platforms.
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           cache-targets: false
@@ -230,7 +248,7 @@ jobs:
 
       # Install sccache (cross-platform)
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
       - name: Probe sccache & set RUSTC_WRAPPER
@@ -245,6 +263,14 @@ jobs:
 
       - name: cargo test (no macros)
         run: make test-no-macros
+
+      # `bss-fixtures` is the only crate in the tree whose *production* surface
+      # is the narrow one: pricing's `FixtureGate` inherits it with
+      # `default-features = false`. `default = ["corpus"]`, so the workspace run
+      # above compiles the wide build, where `tests/production_surface.rs`'s
+      # assertions hold trivially and prove nothing they were written for.
+      - name: cargo test (bss-fixtures narrow production surface)
+        run: make test-fixtures-narrow
 
   integration:
     name: Integration tests
@@ -273,12 +299,12 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          tool: protoc@3.34.1
 
       - name: Install Go (required for aws-lc-fips-sys FIPS build)
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
           cache: false
@@ -294,7 +320,7 @@ jobs:
           tool: nextest
 
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           cache-targets: false
@@ -302,7 +328,7 @@ jobs:
 
       # Install sccache (cross-platform)
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
       - name: Probe sccache & set RUSTC_WRAPPER
@@ -323,6 +349,30 @@ jobs:
 
       - name: Test timescaledb usage-collector plugin (pg integration)
         run: make test-usage-collector-pg
+
+      - name: Test postgres-cluster-plugin (pg integration)
+        run: make test-cluster-pg
+
+      - name: Test resource-group (pg smoke, integration)
+        # Fail if Docker is unreachable instead of letting the suite skip itself
+        # into a green step that asserted nothing.
+        env:
+          RG_PG_REQUIRE_DOCKER: "1"
+        run: make test-rg-pg
+
+      # bss-pricing's Postgres tests are `#[ignore]`d behind Docker and ran in
+      # no job until 2026-08-11 — every concurrency and trigger proof the crate
+      # owns lives in them. This job already has Docker. The target passes
+      # `--no-fail-fast`; see the Makefile for what the default cost on 2026-08-18.
+      - name: Test bss-pricing with Postgres (integration)
+        run: make test-pricing-pg
+
+      # coord's `m0001_…` writes two independent SQL literals and only the
+      # SQLite one is reachable from the in-crate tests — so the `IF NOT EXISTS`
+      # that stops the `bss-pricing`-beside-`bss-ledger` boot crash, and the
+      # `in_schema("bss")` form both gears actually pass, ran in no job.
+      - name: Test coord with Postgres (integration)
+        run: make test-coord-pg
 
       - name: Test toolkit-db (sqlite integration)
         run: make test-sqlite
@@ -373,14 +423,14 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          tool: protoc@3.34.1
 
       # Go is only required for the aws-lc-fips-sys build on the Linux lane.
       - name: Install Go (required for aws-lc-fips-sys FIPS build)
         if: runner.os == 'Linux'
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
           cache: false
@@ -400,7 +450,7 @@ jobs:
       # non-FIPS builds never reuses non-FIPS object files, which would otherwise
       # silently produce a mixed binary that passes tests but isn't a true FIPS build.
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           cache-targets: false
@@ -408,7 +458,7 @@ jobs:
 
       # Install sccache (cross-platform)
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
       - name: Probe sccache & set RUSTC_WRAPPER
@@ -443,12 +493,101 @@ jobs:
         shell: bash
         run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
 
+  # Builds and tests file-parser's optional `magika` feature so it doesn't
+  # silently rot. `ort`'s own `download-binaries` feature is NOT used here —
+  # it always links statically, which conflicts with `load-dynamic` (baked
+  # into the workspace `ort` dependency for production) and reliably
+  # deadlocks `ort` 2.0.0-rc.12 (confirmed via stack sampling: its
+  # error-reporting path for a failed/incompatible runtime recursively
+  # re-enters the same `OnceLock` it's initializing, blocking the thread
+  # forever instead of returning an error). Instead, this job downloads a
+  # real ONNX Runtime shared library and points `ORT_DYLIB_PATH` at it —
+  # exactly the mechanism production uses. `timeout-minutes` on the test step
+  # is a backstop in case a future regression reintroduces that hang.
+  test-magika:
+    name: Magika feature verification
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.magika == 'true'
+      || needs.changes.outputs.deps == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    env:
+      # api-24 (see workspace Cargo.toml `ort` entry) requires an ONNX
+      # Runtime with minor version >= 24; older builds fail `ort`'s version
+      # check on load. Bump alongside `ort`'s pinned version.
+      ONNXRUNTIME_VERSION: "1.29.0"
+      # sha256 of onnxruntime-linux-x64-1.29.0.tgz. Recompute and bump
+      # alongside ONNXRUNTIME_VERSION.
+      ONNXRUNTIME_SHA256: "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-magika
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - name: Probe sccache & set RUSTC_WRAPPER
+        shell: bash
+        run: |
+          if sccache --start-server >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          else
+            echo "sccache failed, falling back to plain rustc"
+          fi
+
+      - name: Fetch ONNX Runtime shared library
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sL --fail -o /tmp/onnxruntime.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz"
+          echo "${ONNXRUNTIME_SHA256}  /tmp/onnxruntime.tgz" | sha256sum --check
+          tar xzf /tmp/onnxruntime.tgz -C /tmp
+          echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+
+      - name: cargo test (file-parser, magika feature)
+        shell: bash
+        timeout-minutes: 10
+        run: cargo test -p cf-gears-file-parser --features magika
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: cargo deny check (magika feature)
+        run: make deny-magika
+
   cfs:
     name: CFS
     uses: ./.github/workflows/cfs.yml
 
   security:
-    name: Security (cargo-deny & cargo-audit on Ubuntu)
+    name: Security (cargo-deny on Ubuntu)
     needs: changes
     if: >-
       !cancelled()
@@ -470,9 +609,9 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:
-          tool: cargo-deny
+          tool: cargo-deny@0.20.2
 
-      # Run deny checks but do not fail CI (as requested).
+      # Blocking gate: advisories, licenses, bans and sources.
       - name: cargo deny check
         run: make deny
 
@@ -504,9 +643,9 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          tool: protoc@3.34.1
 
       - name: Install Rust toolchain (with llvm-tools)
         uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
@@ -520,7 +659,7 @@ jobs:
         run: echo "RUSTUP_TOOLCHAIN=${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}" >> "$GITHUB_ENV"
 
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           cache-targets: false
@@ -541,156 +680,53 @@ jobs:
           cargo llvm-cov clean --workspace
           cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
 
-      # Upload to Codecov; do not fail CI if Codecov is down/misconfigured.
+      # Upload LCOV report as a GitHub Actions artifact so it is always
+      # available, even when Codecov is unavailable or rejects the upload.
+      - name: Upload LCOV artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rust-coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 14
+
+      # Upload to Codecov. OIDC is used for non-fork events (push, dispatch);
+      # for fork PRs the action auto-detects the fork and falls back to
+      # tokenless upload (GitHub does not grant id-token:write for forks).
+      # fail_ci_if_error is true for non-fork events so upload failures are
+      # visible; for fork PRs it is best-effort (tokenless can be rate-limited).
+      # disable_search prevents auto-discovery of unrelated files (e.g.
+      # coverage_guard.rs) — only lcov.info is sent.
       - name: Upload to Codecov
-        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
+          use_oidc: ${{ github.event_name != 'pull_request' }}
           files: lcov.info
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}  # Uncomment if required for private repos
+          disable_search: true
+          fail_ci_if_error: ${{ github.event_name != 'pull_request' }}
 
-  dylint:
-    name: Dylint Tests
-    needs: changes
-    if: >-
-      !cancelled()
-      && (needs.changes.result != 'success'
-      || needs.changes.outputs.dylint == 'true'
-      || needs.changes.outputs.rust == 'true'
-      || needs.changes.outputs.ci == 'true'
-      || github.event_name == 'workflow_dispatch')
+  lint:
+    name: Architecture Lints (cargo gears lint)
     runs-on: ubuntu-latest
     steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Rust nightly toolchain
-        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
-          components: llvm-tools-preview,rustc-dev
-
-      # Override rust-toolchain.toml (which pins stable) for all cargo
-      # commands in this job.
-      - name: Pin nightly for all cargo commands
-        run: echo "RUSTUP_TOOLCHAIN=${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}" >> "$GITHUB_ENV"
-
-      - name: Set Rust nightly for Dylint temp builds
-        run: rustup override set ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }} --path /tmp
-
-      - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-        with:
-          cache-bin: false
-          cache-targets: false
-          shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-dylint
-
-      # NOTE: sccache is intentionally omitted here. Dylint compiles lint
-      # crates that link against rustc-dev via dylint-link; wrapping the
-      # compiler with RUSTC_WRAPPER=sccache can break this toolchain.
-
-      - name: Install nextest
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
-        with:
-          tool: nextest
-
-      - name: Install cargo-dylint and dylint-link from source
-        run: cargo install --locked cargo-dylint dylint-link
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Run dylint tests
-        env:
-          RUSTFLAGS: "-C debuginfo=0"
-        run: make dylint-test
-
-      - name: Run dylint on all crates
-        run: make dylint
-
-  shear:
-    name: Unused Deps (cargo-shear)
-    needs: changes
-    if: >-
-      !cancelled()
-      && (needs.changes.result != 'success'
-      || needs.changes.outputs.rust == 'true'
-      || needs.changes.outputs.ci == 'true'
-      || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    # Advisory only — unused-dep warnings should not block PRs.
-    continue-on-error: true
-    steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install Rust nightly toolchain
-        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
-          components: llvm-tools-preview,rustc-dev
-
-      # Override rust-toolchain.toml (which pins stable) for all cargo
-      # commands in this job.
-      - name: Pin nightly for all cargo commands
-        run: echo "RUSTUP_TOOLCHAIN=${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}" >> "$GITHUB_ENV"
-
-      - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-        with:
-          cache-bin: false
-          cache-targets: false
-          shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-shear
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
-
-      - name: Install dylint-link from source
-        run: cargo install --locked dylint-link
-
-      - name: Install cargo-shear
         uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
         with:
-          tool: cargo-shear@1.13.1
+          tool: protoc@3.34.1
 
-      - name: cargo shear (workspace root + tools/dylint_lints)
-        run: make shear
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-gears
+        run: cargo install --locked cargo-gears
+
+      - name: Run architecture lints
+        run: cargo gears lint --dylint

@@ -1,6 +1,7 @@
 //! Newtype adapter that implements
 //! [`account_management_sdk::AccountManagementClient`] by delegating to
-//! the impl-side [`TenantService`] and [`UserService`].
+//! the impl-side [`TenantService`], [`UserService`], [`ServiceAccountService`],
+//! and [`MetadataService`].
 //!
 //! Construction happens once in
 //! [`crate::gear::AccountManagementGear::init`] (or its bootstrap
@@ -32,6 +33,9 @@
 use std::sync::Arc;
 
 use account_management_sdk::client::AccountManagementClient;
+use account_management_sdk::idp_service_account::{
+    IdpServiceAccountCredentials, IdpServiceAccountSummary,
+};
 use account_management_sdk::idp_user::{IdpNewUser, IdpUser, IdpUserPatch, ListUsersQuery};
 use account_management_sdk::metadata::{MetadataEntry, UpsertMetadataRequest};
 use account_management_sdk::tenant::{CreateTenantRequest, Tenant, UpdateTenantRequest};
@@ -43,6 +47,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::metadata::service::MetadataService;
+use crate::domain::service_account::service::ServiceAccountService;
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant::service::TenantService;
 use crate::domain::user::service::UserService;
@@ -61,22 +66,25 @@ use crate::domain::user::service::UserService;
 pub struct AccountManagementClientImpl<R: TenantRepo> {
     tenant_service: Arc<TenantService<R>>,
     user_service: Arc<UserService>,
+    service_account_service: Arc<ServiceAccountService>,
     metadata_service: Arc<MetadataService>,
 }
 
 impl<R: TenantRepo> AccountManagementClientImpl<R> {
-    /// Build the adapter from the three already-constructed services.
+    /// Build the adapter from the four already-constructed services.
     /// `gear.rs` owns the wiring; this constructor just hooks them
     /// up behind the SDK trait.
     #[must_use]
     pub const fn new(
         tenant_service: Arc<TenantService<R>>,
         user_service: Arc<UserService>,
+        service_account_service: Arc<ServiceAccountService>,
         metadata_service: Arc<MetadataService>,
     ) -> Self {
         Self {
             tenant_service,
             user_service,
+            service_account_service,
             metadata_service,
         }
     }
@@ -230,6 +238,60 @@ where
             .await
             .map_err(CanonicalError::from)
     }
+
+    // -----------------------------------------------------------------
+    // Service accounts
+    // -----------------------------------------------------------------
+
+    // @cpt-begin:cpt-cf-account-management-dod-service-accounts-contract-trait-surface:p1:inst-dod-sa-am-client-forwarding
+    async fn create_service_account(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        name: String,
+        scopes: Vec<String>,
+    ) -> Result<IdpServiceAccountCredentials, CanonicalError> {
+        self.service_account_service
+            .create(ctx, tenant_id, name, scopes)
+            .await
+            .map_err(CanonicalError::from)
+    }
+
+    async fn list_service_accounts(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+    ) -> Result<Vec<IdpServiceAccountSummary>, CanonicalError> {
+        self.service_account_service
+            .list(ctx, tenant_id)
+            .await
+            .map_err(CanonicalError::from)
+    }
+
+    async fn rotate_service_account_secret(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        client_id: &str,
+    ) -> Result<IdpServiceAccountCredentials, CanonicalError> {
+        self.service_account_service
+            .rotate_secret(ctx, tenant_id, client_id)
+            .await
+            .map_err(CanonicalError::from)
+    }
+
+    async fn revoke_service_account(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        client_id: &str,
+    ) -> Result<(), CanonicalError> {
+        self.service_account_service
+            .revoke(ctx, tenant_id, client_id)
+            .await
+            .map_err(CanonicalError::from)
+    }
+    // @cpt-end:cpt-cf-account-management-dod-service-accounts-contract-trait-surface:p1:inst-dod-sa-am-client-forwarding
 
     // -----------------------------------------------------------------
     // Tenant metadata

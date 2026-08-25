@@ -27,11 +27,11 @@ fn normalize_path(path: &Path) -> String {
 pub enum VendorConfigError {
     #[error("vendor '{vendor}' not found in configuration")]
     NotFound { vendor: String },
-    #[error("invalid config for vendor '{vendor}': {source}")]
+    // Intentionally not named `source`; doing so would duplicate chained error output.
+    #[error("invalid config for vendor '{vendor}': {cause}")]
     InvalidConfig {
         vendor: String,
-        #[source]
-        source: serde_json::Error,
+        cause: serde_json::Error,
     },
 }
 
@@ -117,6 +117,13 @@ pub struct AppConfig {
     /// Allows vendors to add their own typed configuration sections.
     #[serde(default)]
     pub vendor: VendorConfig,
+    /// Out-of-process HTTP server configuration.
+    ///
+    /// When present, an `OoP` gear starts an Axum HTTP server (probes,
+    /// gear routes, self-registration, dependency resolution, graceful drain)
+    /// instead of the legacy gRPC-only lifecycle (`cpt-cf-component-oop-bootstrap`).
+    #[serde(default)]
+    pub oop_http: Option<OopHttpConfig>,
 }
 
 impl Default for AppConfig {
@@ -130,8 +137,114 @@ impl Default for AppConfig {
             gears_dir: None,
             gears: HashMap::new(),
             vendor: VendorConfig::new(),
+            oop_http: None,
         }
     }
+}
+
+/// Out-of-process HTTP server configuration (`cpt-cf-component-oop-bootstrap`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OopHttpConfig {
+    /// Address the main HTTP server binds to (gear routes + probes),
+    /// e.g. `"0.0.0.0:8080"`.
+    pub listen_addr: String,
+    /// Optional separate bind address for probe endpoints (sidecar port).
+    /// When set, `/healthz` and `/readyz` are also served here.
+    #[serde(default)]
+    pub probe_bind_addr: Option<String>,
+    /// Maximum seconds to wait for in-flight requests to drain on shutdown.
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+    /// Per-check timeout (ms) for readiness healthchecks on `/readyz`; raise for
+    /// slow dependencies. Mirrors the `api-gateway` `healthcheck_timeout_ms`.
+    #[serde(default = "default_healthcheck_timeout_ms")]
+    pub healthcheck_timeout_ms: u64,
+    /// Base URL other services use to reach this instance (registered as the
+    /// instance's REST endpoint). Defaults to `http://<listen_addr>` with an
+    /// unspecified host (`0.0.0.0`) rewritten to `127.0.0.1`.
+    #[serde(default)]
+    pub advertise_uri: Option<String>,
+    /// Allow a loopback / unspecified `advertise_uri` (`127.0.0.1`, `::1`,
+    /// `localhost`, `0.0.0.0`, `[::]`). Off by default: such an endpoint is
+    /// registered-but-unreachable in multi-host Profile 2 / Profile 3, so
+    /// bootstrap fails fast (`cpt-cf-adr-instance-addressable-discovery`).
+    /// Set `true` only for single-host / local-dev.
+    #[serde(default)]
+    pub allow_loopback_advertise: bool,
+    /// Platform-plane (`InternalAuthenticator`) configuration. When present it
+    /// drives both the *inbound* HTTP validator on the gear's own routes and
+    /// the *outbound* credential attached to the gear's `DirectoryService`
+    /// calls. The `shared_secret` provider works out of the box; the `kube`
+    /// provider's inbound `TokenReview` validator requires the `k8s-auth`
+    /// feature.
+    #[serde(default)]
+    pub internal_auth: Option<toolkit_security::InternalAuthConfig>,
+    /// Stable addressing labels (k8s `matchLabels` style) advertised with this
+    /// instance's directory registration, for label-based instance selection
+    /// (`DirectoryClient::resolve_by_labels`).
+    ///
+    /// Sourced from config (`oop_http.labels.<key>`) or the environment
+    /// (`APP__OOP_HTTP__LABELS__<KEY>`). A bare-numeric env *value* (e.g. a
+    /// `StatefulSet` ordinal injected as `APP__OOP_HTTP__LABELS__SHARD=7`) is
+    /// coerced to a string here rather than aborting the config load. Note:
+    /// environment-sourced keys are still lower-cased by the config loader, so
+    /// keys that must preserve case or contain `.`/`-` should be set in the
+    /// config file rather than via env.
+    #[serde(default, deserialize_with = "de_labels_scalar_to_string")]
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+fn default_drain_timeout_secs() -> u64 {
+    30
+}
+
+fn default_healthcheck_timeout_ms() -> u64 {
+    500
+}
+
+/// Deserialize a label map, coercing scalar values (numbers, booleans) to
+/// strings.
+///
+/// The environment layer parses a bare-numeric value like
+/// `APP__OOP_HTTP__LABELS__SHARD=7` into an integer, which would otherwise fail
+/// to deserialize into a `String` and abort the entire `AppConfig::load_layered`
+/// — precisely on the path a k8s `StatefulSet` ordinal is injected. Accepting the
+/// scalar and rendering it as a string keeps that value load-able as a label.
+fn de_labels_scalar_to_string<'de, D>(
+    deserializer: D,
+) -> Result<std::collections::BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    // Ordering matters for `untagged`: a string input matches `Str`; an integer
+    // matches `I64`/`U64` before `F64`, so `7` renders as `"7"` not `"7.0"`.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Scalar {
+        Str(String),
+        Bool(bool),
+        I64(i64),
+        U64(u64),
+        F64(f64),
+    }
+
+    let raw = std::collections::BTreeMap::<String, Scalar>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, v)| {
+            let value = match v {
+                Scalar::Str(s) => s,
+                Scalar::Bool(b) => b.to_string(),
+                Scalar::I64(i) => i.to_string(),
+                Scalar::U64(u) => u.to_string(),
+                Scalar::F64(f) => f.to_string(),
+            };
+            (k, value)
+        })
+        .collect())
 }
 
 impl ConfigProvider for AppConfig {
@@ -416,7 +529,7 @@ impl AppConfig {
             })?;
         T::deserialize(raw).map_err(|e| VendorConfigError::InvalidConfig {
             vendor: vendor_name.to_owned(),
-            source: e,
+            cause: e,
         })
     }
 
@@ -434,7 +547,7 @@ impl AppConfig {
         };
         T::deserialize(raw).map_err(|e| VendorConfigError::InvalidConfig {
             vendor: vendor_name.to_owned(),
-            source: e,
+            cause: e,
         })
     }
 
@@ -1408,6 +1521,26 @@ mod tests {
         assert!(config.gears.is_empty());
     }
 
+    #[test]
+    fn oop_http_labels_coerce_numeric_and_bool_values_to_strings() {
+        // A bare-numeric env value (e.g. `APP__OOP_HTTP__LABELS__SHARD=7`) is
+        // parsed as an integer by the env layer; it must load as a string
+        // label rather than aborting the config parse.
+        let cfg: OopHttpConfig = serde_json::from_value(serde_json::json!({
+            "listen_addr": "0.0.0.0:8080",
+            "labels": {
+                "shard": 7,
+                "role": "ingest",
+                "canary": true,
+            }
+        }))
+        .expect("numeric/bool label values must deserialize");
+
+        assert_eq!(cfg.labels.get("shard").map(String::as_str), Some("7"));
+        assert_eq!(cfg.labels.get("role").map(String::as_str), Some("ingest"));
+        assert_eq!(cfg.labels.get("canary").map(String::as_str), Some("true"));
+    }
+
     // `#[serial]`: calls load_layered, which reads the APP__ env layer; serialize
     // against the env-override tests that mutate process-global APP__* vars.
     #[test]
@@ -2057,6 +2190,7 @@ logging:
                 pool: None,
                 file: None,
                 path: None,
+                lock_keepalive: None,
                 server: None,
             },
         );
@@ -2981,6 +3115,49 @@ vendor:
 
     #[test]
     #[serial]
+    fn test_oop_http_labels_from_yaml_and_env() {
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_oop_labels"
+oop_http:
+  listen_addr: "0.0.0.0:8080"
+  labels:
+    role: "ingest"
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        // Env layer adds a second label. Env keys are lower-cased by the loader,
+        // so `ZONE` lands as `zone`.
+        with_var("APP__OOP_HTTP__LABELS__ZONE", Some("us-east-1"), || {
+            let config = AppConfig::load_layered(&cfg_path).unwrap();
+            let oop = config.oop_http.expect("oop_http present");
+            assert_eq!(oop.labels.get("role"), Some(&"ingest".to_owned()));
+            assert_eq!(
+                oop.labels.get("zone"),
+                Some(&"us-east-1".to_owned()),
+                "APP__OOP_HTTP__LABELS__ZONE should populate labels[zone]"
+            );
+        });
+
+        // A bare-numeric env value (e.g. a StatefulSet ordinal injected as
+        // `APP__OOP_HTTP__LABELS__SHARD=7`) is coerced to its string
+        // representation by `de_labels_scalar_to_string` rather than failing the
+        // config load, so numeric-looking labels can be set via the environment.
+        with_var("APP__OOP_HTTP__LABELS__SHARD", Some("7"), || {
+            let config = AppConfig::load_layered(&cfg_path).unwrap();
+            let oop = config.oop_http.expect("oop_http present");
+            assert_eq!(
+                oop.labels.get("shard"),
+                Some(&"7".to_owned()),
+                "a bare-numeric env label value should be coerced to the string \"7\""
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
     fn test_gear_config_env_override_underscore_gear_name() {
         // k8s-friendly form: gear name uses underscores in the env var name,
         // which should be remapped to the kebab-case gear key.
@@ -3215,10 +3392,11 @@ vendor:
 
         let invalid = VendorConfigError::InvalidConfig {
             vendor: "bad".to_owned(),
-            source: serde_json::from_str::<TestVendorConfig>("invalid").unwrap_err(),
+            cause: serde_json::from_str::<TestVendorConfig>("invalid").unwrap_err(),
         };
         let msg = invalid.to_string();
         assert!(msg.starts_with("invalid config for vendor 'bad':"));
+        assert!(std::error::Error::source(&invalid).is_none());
     }
 
     #[test]

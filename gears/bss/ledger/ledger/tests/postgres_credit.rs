@@ -2,7 +2,7 @@
 //! (wallet) slice: they drive the REAL `CreditApplicationService` (grant / apply)
 //! through the foundation `PostingService` against a testcontainer Postgres.
 //! Ignored by default; run with
-//! `cargo test -p bss-ledger --test postgres_credit -- --ignored`.
+//! `cargo test -p cf-gears-bss-ledger --test postgres_credit -- --ignored`.
 //!
 //! The credit counterpart to `postgres_payments.rs`. `setup_seller` provisions
 //! the chart (CASH_CLEARING / UNALLOCATED / PSP_FEE_EXPENSE / AR + a stream-less
@@ -136,7 +136,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id
@@ -233,7 +233,7 @@ async fn wallet_subgrain(
     s: &Seller,
     event_type: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_reusable_credit_subbalance \
          WHERE tenant_id='{}' AND payer_tenant_id='{}' AND currency='USD' \
          AND credit_grant_event_type='{}'",
@@ -249,7 +249,7 @@ async fn ar_invoice_balance(
     s: &Seller,
     invoice_id: &str,
 ) -> Option<i64> {
-    raw.query_one(pg(format!(
+    raw.query_one_raw(pg(format!(
         "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id

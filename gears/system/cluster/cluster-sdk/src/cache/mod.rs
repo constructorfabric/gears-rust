@@ -1,6 +1,6 @@
 // Created: 2026-06-03 by Constructor Tech
 //! Distributed cache primitive — the universal compare-and-swap building block
-//! on which leader election, locks, and service discovery are layered.
+//! on which leader election and locks are layered.
 //!
 //! Provides the [`ClusterCacheBackend`] plugin trait, the [`ClusterCacheV1`]
 //! facade, the versioned domain types, the watch-union event shape, and the

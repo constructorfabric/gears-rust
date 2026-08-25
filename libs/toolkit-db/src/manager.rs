@@ -203,6 +203,11 @@ impl DbManager {
             gear_cfg.pool = server_cfg.pool;
         }
 
+        // Lock keepalive: gear takes precedence
+        if gear_cfg.lock_keepalive.is_none() {
+            gear_cfg.lock_keepalive = server_cfg.lock_keepalive;
+        }
+
         // Note: file, path, and server fields are gear-only and not merged
 
         gear_cfg
@@ -255,5 +260,52 @@ impl DbManager {
         }
 
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DbConnConfig, DbManager};
+    use std::time::Duration;
+
+    /// Direct coverage for the `lock_keepalive` merge branch. Exercised here rather than through
+    /// `DbManager::get`, whose `None` case only reaches this code on the way to a connection
+    /// failure and so cannot distinguish "inherited" from "never set".
+    #[test]
+    fn lock_keepalive_is_inherited_from_server_when_gear_leaves_it_unset() {
+        let server = DbConnConfig {
+            lock_keepalive: Some(Duration::from_secs(7)),
+            ..Default::default()
+        };
+        let gear = DbConnConfig {
+            lock_keepalive: None,
+            ..Default::default()
+        };
+
+        let merged = DbManager::merge_server_into_gear(gear, server);
+        assert_eq!(merged.lock_keepalive, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn gear_lock_keepalive_overrides_server() {
+        let server = DbConnConfig {
+            lock_keepalive: Some(Duration::from_secs(7)),
+            ..Default::default()
+        };
+        let gear = DbConnConfig {
+            lock_keepalive: Some(Duration::from_millis(250)),
+            ..Default::default()
+        };
+
+        let merged = DbManager::merge_server_into_gear(gear, server);
+        assert_eq!(merged.lock_keepalive, Some(Duration::from_millis(250)));
+    }
+
+    /// Neither side setting it must stay `None` so the caller resolves the crate default.
+    #[test]
+    fn lock_keepalive_stays_unset_when_neither_side_sets_it() {
+        let merged =
+            DbManager::merge_server_into_gear(DbConnConfig::default(), DbConnConfig::default());
+        assert!(merged.lock_keepalive.is_none());
     }
 }

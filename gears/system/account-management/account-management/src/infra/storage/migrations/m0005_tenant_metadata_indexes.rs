@@ -62,10 +62,9 @@ impl MigrationTrait for Migration {
             sea_orm::DatabaseBackend::Postgres | sea_orm::DatabaseBackend::Sqlite => vec![
                 "CREATE INDEX IF NOT EXISTS idx_tenant_metadata_schema ON tenant_metadata (schema_uuid);",
             ],
-            // @cpt-end:cpt-cf-account-management-dbtable-tenant-metadata:p2:inst-dbtable-tenant-metadata-index-schema
-            sea_orm::DatabaseBackend::MySql => {
+            _ => {
                 return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.to_owned()));
-            }
+            } // @cpt-end:cpt-cf-account-management-dbtable-tenant-metadata:p2:inst-dbtable-tenant-metadata-index-schema
         };
 
         for sql in statements {

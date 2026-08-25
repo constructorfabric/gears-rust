@@ -1,8 +1,10 @@
 //! Tests for [`LazyIdpProvider`].
 //!
-//! Covers the four contract-defining cases of the wrapper, mirroring
-//! the test shape used by `authn-resolver`'s `Service`:
+//! Covers the contract-defining cases of the wrapper, mirroring the test shape
+//! used by `authn-resolver`'s `Service`:
 //!
+//!   * exhaustive forwarding: all ten `IdpPluginClient` methods reach the
+//!     resolved plugin rather than falling into a trait default;
 //!   * happy path: vendor + scope match, forwards to the resolved
 //!     plugin, second call hits the cached `gts_id` (no re-resolution).
 //!   * vendor mismatch: `choose_plugin_instance` returns nothing.
@@ -21,7 +23,15 @@
 use std::sync::Arc;
 use toolkit_gts::gts_id;
 
-use account_management_sdk::{IdpPluginClient, IdpPluginSpecV1, IdpProvisionTenantRequest};
+use account_management_sdk::{
+    IdpDeprovisionFailure, IdpDeprovisionTenantRequest, IdpDeprovisionUserRequest,
+    IdpListServiceAccountsRequest, IdpListUsersRequest, IdpNewUser, IdpPluginClient,
+    IdpPluginSpecV1, IdpProvisionFailure, IdpProvisionResult, IdpProvisionServiceAccountRequest,
+    IdpProvisionTenantRequest, IdpProvisionUserRequest, IdpRevokeServiceAccountRequest,
+    IdpRotateServiceAccountSecretRequest, IdpServiceAccountCredentials, IdpServiceAccountFailure,
+    IdpServiceAccountSummary, IdpTenantContext, IdpUpdateUserRequest, IdpUser,
+    IdpUserOperationFailure, IdpUserPagination, IdpUserPatch,
+};
 use gts::GtsTypeId;
 use toolkit::ClientHub;
 use toolkit::client_hub::ClientScope;
@@ -65,6 +75,244 @@ fn request() -> IdpProvisionTenantRequest {
 
 fn ctx() -> SecurityContext {
     SecurityContext::anonymous()
+}
+
+#[derive(Default)]
+struct RecordingIdpPlugin {
+    calls: parking_lot::Mutex<Vec<&'static str>>,
+}
+
+impl RecordingIdpPlugin {
+    fn record(&self, method: &'static str) {
+        self.calls.lock().push(method);
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl IdpPluginClient for RecordingIdpPlugin {
+    async fn provision_tenant(
+        &self,
+        _ctx: &SecurityContext,
+        _req: &IdpProvisionTenantRequest,
+    ) -> Result<IdpProvisionResult, IdpProvisionFailure> {
+        self.record("provision_tenant");
+        Err(IdpProvisionFailure::UnsupportedOperation {
+            detail: "recorded".into(),
+        })
+    }
+
+    async fn deprovision_tenant(
+        &self,
+        _ctx: &SecurityContext,
+        _req: &IdpDeprovisionTenantRequest,
+    ) -> Result<(), IdpDeprovisionFailure> {
+        self.record("deprovision_tenant");
+        Err(IdpDeprovisionFailure::UnsupportedOperation {
+            detail: "recorded".into(),
+        })
+    }
+
+    async fn provision_user(
+        &self,
+        _ctx: &SecurityContext,
+        _req: &IdpProvisionUserRequest,
+    ) -> Result<IdpUser, IdpUserOperationFailure> {
+        self.record("provision_user");
+        Err(IdpUserOperationFailure::UnsupportedOperation {
+            detail: "recorded".into(),
+        })
+    }
+
+    async fn deprovision_user(
+        &self,
+        _ctx: &SecurityContext,
+        _req: &IdpDeprovisionUserRequest,
+    ) -> Result<(), IdpUserOperationFailure> {
+        self.record("deprovision_user");
+        Err(IdpUserOperationFailure::UnsupportedOperation {
+            detail: "recorded".into(),
+        })
+    }
+
+    async fn update_user(
+        &self,
+        _ctx: &SecurityContext,
+        _req: &IdpUpdateUserRequest,
+    ) -> Result<IdpUser, IdpUserOperationFailure> {
+        self.record("update_user");
+        Err(IdpUserOperationFailure::UnsupportedOperation {
+            detail: "recorded".into(),
+        })
+    }
+
+    async fn list_users(
+        &self,
+        _ctx: &SecurityContext,
+        _req: &IdpListUsersRequest,
+    ) -> Result<toolkit_odata::Page<IdpUser>, IdpUserOperationFailure> {
+        self.record("list_users");
+        Err(IdpUserOperationFailure::UnsupportedOperation {
+            detail: "recorded".into(),
+        })
+    }
+
+    async fn provision_service_account(
+        &self,
+        _ctx: &SecurityContext,
+        _req: &IdpProvisionServiceAccountRequest,
+    ) -> Result<IdpServiceAccountCredentials, IdpServiceAccountFailure> {
+        self.record("provision_service_account");
+        Err(IdpServiceAccountFailure::UnsupportedOperation {
+            detail: "recorded".into(),
+        })
+    }
+
+    async fn rotate_service_account_secret(
+        &self,
+        _ctx: &SecurityContext,
+        _req: &IdpRotateServiceAccountSecretRequest,
+    ) -> Result<IdpServiceAccountCredentials, IdpServiceAccountFailure> {
+        self.record("rotate_service_account_secret");
+        Err(IdpServiceAccountFailure::UnsupportedOperation {
+            detail: "recorded".into(),
+        })
+    }
+
+    async fn revoke_service_account(
+        &self,
+        _ctx: &SecurityContext,
+        _req: &IdpRevokeServiceAccountRequest,
+    ) -> Result<(), IdpServiceAccountFailure> {
+        self.record("revoke_service_account");
+        Err(IdpServiceAccountFailure::UnsupportedOperation {
+            detail: "recorded".into(),
+        })
+    }
+
+    async fn list_service_accounts(
+        &self,
+        _ctx: &SecurityContext,
+        _req: &IdpListServiceAccountsRequest,
+    ) -> Result<Vec<IdpServiceAccountSummary>, IdpServiceAccountFailure> {
+        self.record("list_service_accounts");
+        Err(IdpServiceAccountFailure::UnsupportedOperation {
+            detail: "recorded".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn forwards_every_idp_trait_method_to_the_resolved_plugin() {
+    let (gts_id, instance) = build_instance("cf.builtin.lazy_all.plugin.v1", "cf", 100);
+    let registry = Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
+    let hub = Arc::new(ClientHub::new());
+    let recorder = Arc::new(RecordingIdpPlugin::default());
+    let plugin: Arc<dyn IdpPluginClient> = recorder.clone();
+    hub.register_scoped::<dyn IdpPluginClient>(ClientScope::gts_id(&gts_id), plugin);
+    let lazy = LazyIdpProvider::new(hub, registry, "cf".into(), true);
+    let security = ctx();
+    let tenant_context = || {
+        IdpTenantContext::new(
+            Uuid::from_u128(0xC11D),
+            "child",
+            GtsTypeId::new(gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~")),
+            None,
+        )
+    };
+    let user_id = Uuid::from_u128(0xA11CE);
+
+    drop(lazy.provision_tenant(&security, &request()).await);
+    drop(
+        lazy.deprovision_tenant(
+            &security,
+            &IdpDeprovisionTenantRequest::new(tenant_context()),
+        )
+        .await,
+    );
+    drop(
+        lazy.provision_user(
+            &security,
+            &IdpProvisionUserRequest::new(tenant_context(), IdpNewUser::new("alice")),
+        )
+        .await,
+    );
+    drop(
+        lazy.deprovision_user(
+            &security,
+            &IdpDeprovisionUserRequest::new(tenant_context(), user_id),
+        )
+        .await,
+    );
+    drop(
+        lazy.update_user(
+            &security,
+            &IdpUpdateUserRequest::new(
+                tenant_context(),
+                user_id,
+                IdpUserPatch::new().with_email(Some("alice@example.com".into())),
+            ),
+        )
+        .await,
+    );
+    drop(
+        lazy.list_users(
+            &security,
+            &IdpListUsersRequest::new(tenant_context(), IdpUserPagination::default()),
+        )
+        .await,
+    );
+    drop(
+        lazy.provision_service_account(
+            &security,
+            &IdpProvisionServiceAccountRequest::new(
+                tenant_context(),
+                "ci".into(),
+                vec!["read".into()],
+            ),
+        )
+        .await,
+    );
+    drop(
+        lazy.rotate_service_account_secret(
+            &security,
+            &IdpRotateServiceAccountSecretRequest::new(tenant_context(), "svc-ci".into()),
+        )
+        .await,
+    );
+    drop(
+        lazy.revoke_service_account(
+            &security,
+            &IdpRevokeServiceAccountRequest::new(tenant_context(), "svc-ci".into()),
+        )
+        .await,
+    );
+    drop(
+        lazy.list_service_accounts(
+            &security,
+            &IdpListServiceAccountsRequest::new(tenant_context()),
+        )
+        .await,
+    );
+
+    assert_eq!(
+        recorder.calls(),
+        vec![
+            "provision_tenant",
+            "deprovision_tenant",
+            "provision_user",
+            "deprovision_user",
+            "update_user",
+            "list_users",
+            "provision_service_account",
+            "rotate_service_account_secret",
+            "revoke_service_account",
+            "list_service_accounts",
+        ]
+    );
 }
 
 #[tokio::test]

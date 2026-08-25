@@ -12,11 +12,19 @@ use crate::context::{
     InvalidArgument, NotFound, OutOfRange, PermissionDenied, ResourceExhausted, ServiceUnavailable,
     Unauthenticated, Unimplemented, Unknown,
 };
+use crate::transport::TransportOverrides;
 
 // ---------------------------------------------------------------------------
 // CanonicalError Enum
 // ---------------------------------------------------------------------------
 
+// `overrides: TransportOverrides` below is intentionally `pub(crate)`-typed
+// inside a `pub` enum: it carries no public methods, so external crates that
+// bind it via `{ overrides, .. }` (permitted despite `#[non_exhaustive]`)
+// get an inert value they cannot do anything with. Keeping `TransportOverrides`
+// unexported is deliberate (see `transport.rs`) — only `TransportOverride`/
+// `Http` are part of the public override API.
+#[allow(private_interfaces)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum CanonicalError {
@@ -26,6 +34,7 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
     Unknown {
@@ -33,6 +42,7 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
     InvalidArgument {
@@ -40,6 +50,7 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
     DeadlineExceeded {
@@ -47,6 +58,7 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
     NotFound {
@@ -54,6 +66,7 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
     AlreadyExists {
@@ -61,6 +74,7 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
     PermissionDenied {
@@ -68,6 +82,7 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
     ResourceExhausted {
@@ -75,6 +90,7 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
     FailedPrecondition {
@@ -82,6 +98,7 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
     Aborted {
@@ -89,6 +106,7 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
     OutOfRange {
@@ -96,6 +114,7 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
     Unimplemented {
@@ -103,15 +122,21 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
-    Internal { ctx: Internal, detail: String },
+    Internal {
+        ctx: Internal,
+        detail: String,
+        overrides: TransportOverrides,
+    },
     #[non_exhaustive]
     ServiceUnavailable {
         ctx: ServiceUnavailable,
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
     DataLoss {
@@ -119,6 +144,7 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
     #[non_exhaustive]
     Unauthenticated {
@@ -126,6 +152,7 @@ pub enum CanonicalError {
         detail: String,
         resource_type: Option<String>,
         resource_name: Option<String>,
+        overrides: TransportOverrides,
     },
 }
 
@@ -140,6 +167,7 @@ impl CanonicalError {
             detail: String::from("Operation cancelled by the client"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -151,6 +179,7 @@ impl CanonicalError {
             detail: String::from("An unknown error occurred"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -167,6 +196,7 @@ impl CanonicalError {
             detail,
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -178,6 +208,7 @@ impl CanonicalError {
             detail: String::from("Operation did not complete within the allowed time"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -189,6 +220,7 @@ impl CanonicalError {
             detail: String::from("Resource not found"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -200,6 +232,7 @@ impl CanonicalError {
             detail: String::from("Resource already exists"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -211,6 +244,7 @@ impl CanonicalError {
             detail: String::from("You do not have permission to perform this operation"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -222,6 +256,7 @@ impl CanonicalError {
             detail: String::from("Quota exceeded"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -233,6 +268,7 @@ impl CanonicalError {
             detail: String::from("Operation precondition not met"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -244,6 +280,7 @@ impl CanonicalError {
             detail: String::from("Operation aborted due to concurrency conflict"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -255,6 +292,7 @@ impl CanonicalError {
             detail: String::from("Value out of range"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -266,6 +304,7 @@ impl CanonicalError {
             detail: String::from("This operation is not implemented"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -275,6 +314,7 @@ impl CanonicalError {
         Self::Internal {
             ctx,
             detail: String::from("An internal error occurred. Please retry later."),
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -286,6 +326,7 @@ impl CanonicalError {
             detail: String::from("Service temporarily unavailable"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -297,6 +338,7 @@ impl CanonicalError {
             detail: String::from("Data loss detected"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -308,6 +350,7 @@ impl CanonicalError {
             detail: String::from("Authentication required"),
             resource_type: None,
             resource_name: None,
+            overrides: TransportOverrides::default(),
         }
     }
 
@@ -468,6 +511,57 @@ impl CanonicalError {
         }
     }
 
+    // --- Transport overrides ---
+
+    pub(crate) const fn transport_overrides(&self) -> &TransportOverrides {
+        match self {
+            Self::Cancelled { overrides, .. }
+            | Self::Unknown { overrides, .. }
+            | Self::InvalidArgument { overrides, .. }
+            | Self::DeadlineExceeded { overrides, .. }
+            | Self::NotFound { overrides, .. }
+            | Self::AlreadyExists { overrides, .. }
+            | Self::PermissionDenied { overrides, .. }
+            | Self::ResourceExhausted { overrides, .. }
+            | Self::FailedPrecondition { overrides, .. }
+            | Self::Aborted { overrides, .. }
+            | Self::OutOfRange { overrides, .. }
+            | Self::Unimplemented { overrides, .. }
+            | Self::ServiceUnavailable { overrides, .. }
+            | Self::DataLoss { overrides, .. }
+            | Self::Unauthenticated { overrides, .. }
+            | Self::Internal { overrides, .. } => overrides,
+        }
+    }
+
+    pub(crate) fn transport_overrides_mut(&mut self) -> &mut TransportOverrides {
+        match self {
+            Self::Cancelled { overrides, .. }
+            | Self::Unknown { overrides, .. }
+            | Self::InvalidArgument { overrides, .. }
+            | Self::DeadlineExceeded { overrides, .. }
+            | Self::NotFound { overrides, .. }
+            | Self::AlreadyExists { overrides, .. }
+            | Self::PermissionDenied { overrides, .. }
+            | Self::ResourceExhausted { overrides, .. }
+            | Self::FailedPrecondition { overrides, .. }
+            | Self::Aborted { overrides, .. }
+            | Self::OutOfRange { overrides, .. }
+            | Self::Unimplemented { overrides, .. }
+            | Self::ServiceUnavailable { overrides, .. }
+            | Self::DataLoss { overrides, .. }
+            | Self::Unauthenticated { overrides, .. }
+            | Self::Internal { overrides, .. } => overrides,
+        }
+    }
+
+    /// The HTTP status this occurrence was explicitly overridden to, if any.
+    /// `None` means `status_code()` returns the category's fixed default.
+    #[must_use]
+    pub fn http_status_override(&self) -> Option<u16> {
+        self.transport_overrides().http_status
+    }
+
     // --- Metadata accessors (direct match) ---
 
     #[must_use]
@@ -512,8 +606,12 @@ impl CanonicalError {
         }
     }
 
+    /// The fixed HTTP status for this error's canonical category, ignoring
+    /// any transport override. Used internally by [`Self::status_code`] and
+    /// by `TryFrom<Problem>` to detect when a wire `status` diverges from
+    /// the category default.
     #[must_use]
-    pub fn status_code(&self) -> u16 {
+    pub(crate) const fn default_http_status(&self) -> u16 {
         match self {
             Self::InvalidArgument { .. }
             | Self::FailedPrecondition { .. }
@@ -529,6 +627,28 @@ impl CanonicalError {
             Self::ServiceUnavailable { .. } => 503,
             Self::DeadlineExceeded { .. } => 504,
         }
+    }
+
+    /// The effective HTTP status for this occurrence: the transport override
+    /// if one was set via `.with_override(Http::status_code(..))`, otherwise
+    /// the category's fixed default.
+    #[must_use]
+    pub const fn status_code(&self) -> u16 {
+        match self.transport_overrides().http_status {
+            Some(v) => v,
+            None => self.default_http_status(),
+        }
+    }
+
+    /// `true` if `status` shares the same HTTP status-code class (first
+    /// digit) as this error's category default — e.g. both 4xx or both 5xx.
+    /// Used to catch overrides that would flip an error between
+    /// client-fault and server-fault semantics (different retry behavior
+    /// for HTTP clients, different bucketing for monitoring).
+    #[must_use]
+    #[allow(clippy::integer_division)] // intentional: bucketing into a status-code class, not a lossy calculation
+    pub(crate) const fn is_same_status_class(&self, status: u16) -> bool {
+        status / 100 == self.default_http_status() / 100
     }
 
     #[must_use]
@@ -553,7 +673,7 @@ impl CanonicalError {
         }
     }
 
-    fn category_name(&self) -> &'static str {
+    pub(crate) fn category_name(&self) -> &'static str {
         match self {
             Self::Cancelled { .. } => "cancelled",
             Self::Unknown { .. } => "unknown",

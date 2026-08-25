@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-db"
-version = "0.10.0"
+version = "0.13.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -55,10 +55,17 @@ mysql = [
 
 integration = []
 
-# Transactional outbox pipeline (preview — API may change)
-preview-outbox = ["dep:tokio-util", "dep:futures-util"]
+# Test-only surface for external integration-test suites that need to observe
+# transaction boundaries or attach a SeaORM query-metric callback (e.g. the
+# resource-group DB-behavior audit's `QueryRecorder`). Not used by production
+# code paths; see `connect_db_with_metric_callback` and
+# `secure::in_transaction_for_testing`.
+test-support = ["dep:regex"]
 
 [dependencies]
+# Only used by the `test-support` module's SQL normalizer; optional so a
+# production build never pulls it in.
+regex = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
@@ -85,40 +92,41 @@ serde_json = { workspace = true }
 dashmap = { workspace = true }
 figment = { workspace = true }
 sqlx = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true }
-futures-util = { workspace = true, optional = true }
+# Unconditional: the transactional outbox pipeline is always compiled in.
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
 
 [[example]]
 name = "outbox_transactional"
-required-features = ["sqlite", "preview-outbox"]
+required-features = ["sqlite"]
 
 [[example]]
 name = "outbox_retry_reject"
-required-features = ["sqlite", "preview-outbox"]
+required-features = ["sqlite"]
 
 [[example]]
 name = "outbox_dead_letters"
-required-features = ["sqlite", "preview-outbox"]
+required-features = ["sqlite"]
 
 [[example]]
 name = "outbox_batch_multi_queue"
-required-features = ["sqlite", "preview-outbox"]
+required-features = ["sqlite"]
 
 [[example]]
 name = "outbox_custom_prefix"
-required-features = ["sqlite", "preview-outbox"]
+required-features = ["sqlite"]
 
 [[bench]]
 name = "outbox_throughput"
 harness = false
 # `_any-backend` is a virtual OR over pg/mysql/sqlite (see [features] above).
 # The bench body compile-errors out if no backend is present.
-required-features = ["preview-outbox", "_any-backend"]
+required-features = ["_any-backend"]
 
 [[bench]]
 name = "worker_overhead"
 harness = false
-required-features = ["preview-outbox", "_any-backend"]
+required-features = ["_any-backend"]
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }

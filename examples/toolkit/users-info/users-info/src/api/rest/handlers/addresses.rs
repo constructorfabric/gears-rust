@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use axum::Extension;
-use axum::extract::Path;
 use axum::response::IntoResponse;
 use tracing::field::Empty;
 use uuid::Uuid;
+
+use toolkit::api::rest::extract;
 
 use super::{
     AddressDto, ApiResult, Json, JsonBody, PutAddressReq, SecurityContext, info, no_content,
@@ -20,8 +23,8 @@ use crate::gear::ConcreteAppServices;
 )]
 pub async fn get_user_address(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
-    Path(user_id): Path<Uuid>,
+    Extension(svc): Extension<Arc<ConcreteAppServices>>,
+    extract::Path(user_id): extract::Path<Uuid>,
 ) -> ApiResult<JsonBody<AddressDto>> {
     info!(
         user_id = %user_id,
@@ -48,9 +51,9 @@ pub async fn get_user_address(
 )]
 pub async fn put_user_address(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
-    Path(user_id): Path<Uuid>,
-    Json(req_body): Json<PutAddressReq>,
+    Extension(svc): Extension<Arc<ConcreteAppServices>>,
+    extract::Path(user_id): extract::Path<Uuid>,
+    extract::Json(req_body): extract::Json<PutAddressReq>,
 ) -> ApiResult<impl IntoResponse> {
     info!(
         user_id = %user_id,
@@ -78,8 +81,8 @@ pub async fn put_user_address(
 )]
 pub async fn delete_user_address(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<std::sync::Arc<ConcreteAppServices>>,
-    Path(user_id): Path<Uuid>,
+    Extension(svc): Extension<Arc<ConcreteAppServices>>,
+    extract::Path(user_id): extract::Path<Uuid>,
 ) -> ApiResult<impl IntoResponse> {
     info!(
         user_id = %user_id,

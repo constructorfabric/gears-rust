@@ -79,15 +79,23 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
     // Run the ToolKit runtime with the root cancellation token.
     // Shutdown is driven by the signal handler spawned above, not by ShutdownOptions::Signals.
     // OoP gears are spawned after the start phase (once grpc-hub has bound its port).
-    let run_options = RunOptions {
-        gears_cfg: Arc::new(config),
-        db: db_options,
-        shutdown: ShutdownOptions::Token(cancel.clone()),
-        clients: vec![],
+    //
+    // No `internal_token_provider` is set here on purpose: this is the
+    // in-process (Profile 1) host. Gear-to-gear calls resolve to LOCAL trait
+    // objects through the `ClientHub` — there is no transport, so no
+    // `X-ToolKit-Internal-Token` header/metadata is ever emitted and no outbound
+    // platform credential is needed. The provider is only consulted inside the
+    // generated REST/gRPC transport clients, which the monolith does not use for
+    // co-hosted dependencies. A genuinely remote (directory-resolved) dependency
+    // is the resolving-client path, which threads its own provider
+    // (`cpt-cf-adr-two-plane-auth`).
+    let run_options = RunOptions::new(
+        Arc::new(config),
+        db_options,
+        ShutdownOptions::Token(cancel.clone()),
         instance_id,
-        oop: oop_options,
-        shutdown_deadline: None,
-    };
+    )
+    .with_oop(oop_options);
 
     let result = run(run_options).await;
 

@@ -33,7 +33,7 @@ Provides the ClientHub registration and deregistration helpers (per profile, per
 
 ### 1.2 Purpose
 
-Registration must be keyed consistently per profile per primitive so consumers resolve the right backend, plugins need a discovery contract, and cluster — as foundational infrastructure every module depends on — needs a stable observability contract so consumer dashboards survive plugin minor versions.
+Registration must be keyed consistently per profile per primitive so consumers resolve the right backend, plugins need a registration contract, and cluster — as foundational infrastructure every module depends on — needs a stable observability contract so consumer dashboards survive plugin minor versions.
 
 **Requirements**: `cpt-cf-clst-nfr-observability`
 
@@ -57,7 +57,6 @@ This feature contributes to the in-scope `component-sdk`; that component link is
   - [x] `p2` - `cpt-cf-clst-feature-cache-primitive`
   - [x] `p2` - `cpt-cf-clst-feature-leader-election`
   - [x] `p2` - `cpt-cf-clst-feature-distributed-lock`
-  - [x] `p2` - `cpt-cf-clst-feature-service-discovery`
 
 **Review domains**:
 - Security — not applicable: the SDK contract exposes no authentication or authorization surface; transport authentication, credential wiring, and tenant isolation are backend/plugin concerns deferred to the OOP deployment design (PRD §4.2).
@@ -124,7 +123,7 @@ Not applicable — registration helpers, the GTS spec, and the observability nam
 
 - [x] `p1` - **ID**: `cpt-cf-clst-dod-registration-observability-helpers`
 
-The system **MUST** provide register and deregister helpers for all four primitives that key registration per profile per primitive via the profile scope, such that deregistration causes later resolves to report profile-not-bound.
+The system **MUST** provide register and deregister helpers for all three primitives that key registration per profile per primitive via the profile scope, such that deregistration causes later resolves to report profile-not-bound.
 
 **Implements**:
 - `cpt-cf-clst-flow-registration-observability-register`

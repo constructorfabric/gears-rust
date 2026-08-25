@@ -17,10 +17,6 @@ const ALL_SPANS: &[&str] = &[
     spans::LOCK_LOCK,
     spans::LOCK_RENEW,
     spans::LOCK_RELEASE,
-    spans::DISCOVERY_REGISTER,
-    spans::DISCOVERY_DISCOVER,
-    spans::DISCOVERY_WATCH,
-    spans::DISCOVERY_DEREGISTER,
 ];
 
 const ALL_METRICS: &[&str] = &[
@@ -29,7 +25,6 @@ const ALL_METRICS: &[&str] = &[
     metrics::LOCK_OPS_TOTAL,
     metrics::LOCK_OP_DURATION_SECONDS,
     metrics::LEADER_TRANSITIONS_TOTAL,
-    metrics::DISCOVERY_OPS_TOTAL,
     metrics::WATCH_RESETS_TOTAL,
     metrics::PROVIDER_ERRORS_TOTAL,
 ];
@@ -39,7 +34,6 @@ const ALL_HIGH_CARDINALITY_FIELDS: &[&str] = &[
     fields::attr::NAME,
     fields::attr::LOCK,
     fields::attr::ELECTION,
-    fields::attr::INSTANCE_ID,
     fields::attr::PROFILE,
 ];
 

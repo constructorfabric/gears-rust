@@ -1,19 +1,22 @@
-# Updated: 2026-04-07 by Constructor Tech
-# Dylint Configuration for CF/Gears
+# Configuration for cargo-gears architecture lints.
+# Lints are run via `cargo gears lint --dylint` (see Gears.toml).
+# See https://github.com/constructorfabric/cargo-gears for documentation.
 
-[workspace.metadata.dylint]
-# Path to the local dylint linters
-libraries = [
-    { path = "tools/dylint_lints/de*/de*" }
+[cargo-gears-lints]
+
+# DE0708: Non-FIPS hasher allow-list.
+# Paths where direct sha2/sha1/md5 imports are permitted (substring-matched).
+hasher_allowed_paths = [
+    "gears/file-storage/file-storage/src/infra/content/hash.rs",
 ]
 
 # DE1101: Tests must be in separate files.
-# Remove entries as gears are migrated.
-[de1101_tests_in_separate_files]
 # Maximum number of inline test lines allowed before the lint enforces splitting
 # into a separate `*_tests.rs` file. Set to 0 to always require separation.
 # Default: 100
 max_inline_test_lines = 100
+
+# Remove entries as gears/libs are migrated to separate test files.
 excluded_paths = [
     # libs/
     "libs/toolkit",

@@ -11,7 +11,7 @@
 //!       ONE `cross-tenant-access` forensic record (asserted via the same
 //!       `bss.secured_audit_record` query `postgres_cross_tenant.rs` uses);
 //!       the own-tenant default writes none.
-//! Ignored by default; run with `cargo test -p bss-ledger -- --ignored`.
+//! Ignored by default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -52,7 +52,7 @@ fn pg(sql: impl Into<String>) -> Statement {
 }
 
 async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
-    let row = conn.query_one(pg(sql.to_owned())).await.unwrap();
+    let row = conn.query_one_raw(pg(sql.to_owned())).await.unwrap();
     row.map_or(0, |r| r.try_get_by_index::<i64>(0).unwrap())
 }
 
@@ -120,7 +120,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         })
         .await
         .unwrap();
-    raw.execute(pg(format!(
+    raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status)
          VALUES ('{}','{}','{}','UTC','OPEN')",
         s.tenant, s.tenant, s.period_id

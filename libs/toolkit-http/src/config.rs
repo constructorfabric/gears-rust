@@ -870,6 +870,50 @@ impl HttpClientConfig {
             pool_max_idle_per_host: 1,
         }
     }
+
+    /// Create configuration for a reverse-proxy data plane (e.g. the
+    /// api-gateway edge forwarding to out-of-process gears).
+    ///
+    /// A gateway data plane has different requirements from a general-purpose
+    /// client, because it forwards on behalf of an external caller rather than
+    /// making its own calls:
+    ///
+    /// - **No retries.** The edge must not silently re-send a client's request
+    ///   (duplicating non-idempotent side effects) nor amplify load against an
+    ///   upstream that is already failing. Retry/idempotency is the client's or
+    ///   the upstream's concern.
+    /// - **No client-side rate limit.** A single shared concurrency semaphore
+    ///   across the whole gateway would turn request N+1 into a spurious `503`
+    ///   `Overloaded`; back-pressure belongs to the upstream and the listener.
+    /// - **No response body cap.** [`max_body_size`](Self::max_body_size) is set
+    ///   effectively unbounded so large downloads stream through untruncated
+    ///   (the forwarder streams the body via
+    ///   [`HttpResponse::into_limited_body`](crate::HttpResponse::into_limited_body)).
+    ///   The upstream gear owns its own size limits.
+    /// - **No blanket request timeout.** Set to 24h (the `TimeoutLayer` floor is
+    ///   a finite `Duration`) so long-lived responses — SSE, chat streaming —
+    ///   are not cut off mid-stream at 30s.
+    /// - **No redirect following.** A reverse proxy returns `3xx` to the client
+    ///   verbatim rather than resolving it server-side.
+    #[must_use]
+    pub fn proxy() -> Self {
+        Self {
+            request_timeout: Duration::from_hours(24), // effectively "no blanket timeout"
+            total_timeout: None,
+            max_body_size: usize::MAX, // no cap: stream large downloads untruncated
+            user_agent: DEFAULT_USER_AGENT.to_owned(),
+            retry: None,      // the edge must not re-send or amplify load
+            rate_limit: None, // no gateway-wide concurrency semaphore
+            transport: DEFAULT_TRANSPORT,
+            tls_roots: TlsRootConfig::default(),
+            tls: TlsConfig::default(),
+            otel: false,
+            buffer_capacity: 1024,
+            redirect: RedirectConfig::disabled(), // pass 3xx back to the client
+            pool_idle_timeout: Some(Duration::from_secs(90)),
+            pool_max_idle_per_host: 64, // fan out to many upstream gears
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1164,5 +1208,21 @@ mod tests {
         assert_eq!(config.buffer_capacity, 64);
         assert!(config.pool_idle_timeout.is_none());
         assert_eq!(config.pool_max_idle_per_host, 1);
+    }
+
+    #[test]
+    fn test_http_client_config_proxy() {
+        let config = HttpClientConfig::proxy();
+        // No retries, no client-side rate limit: the edge must not re-send or
+        // impose a gateway-wide concurrency ceiling.
+        assert!(config.retry.is_none());
+        assert!(config.rate_limit.is_none());
+        // No response body cap: large downloads stream untruncated.
+        assert_eq!(config.max_body_size, usize::MAX);
+        // No blanket request timeout that would cut SSE/streaming at 30s.
+        assert_eq!(config.request_timeout, Duration::from_hours(24));
+        assert!(config.total_timeout.is_none());
+        // A reverse proxy returns 3xx to the client rather than following it.
+        assert_eq!(config.redirect.max_redirects, 0);
     }
 }

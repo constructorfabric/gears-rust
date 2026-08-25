@@ -1,14 +1,15 @@
 mod registered_gears;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mimalloc::MiMalloc;
+use serde_json::Value;
 use toolkit::bootstrap::{
     AppConfig, dump_effective_gears_config_json, dump_effective_gears_config_yaml, list_gear_names,
     run_migrate, run_server,
 };
 
-use std::path::PathBuf;
+use std::{collections::hash_map::Entry, path::PathBuf};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -62,6 +63,35 @@ enum Commands {
     Migrate,
 }
 
+fn apply_port_override(config: &mut AppConfig, port: u16) -> Result<()> {
+    let gear = match config.gears.entry("api-gateway".to_owned()) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => entry.insert(serde_json::json!({ "config": {} })),
+    };
+    let gear_obj = gear
+        .as_object_mut()
+        .context("api-gateway config must be a map")?;
+    let config_value = gear_obj
+        .entry("config".to_owned())
+        .or_insert_with(|| serde_json::json!({}));
+    let config_obj = config_value
+        .as_object_mut()
+        .context("api-gateway.config must be a map")?;
+    let host = config_obj
+        .get("bind_addr")
+        .and_then(Value::as_str)
+        .and_then(|bind_addr| bind_addr.rsplit_once(':').map(|(host, _)| host.to_owned()))
+        .unwrap_or_else(|| "127.0.0.1".to_owned());
+    if host.is_empty() {
+        bail!("api-gateway.config.bind_addr has an empty host");
+    }
+    config_obj.insert(
+        "bind_addr".to_owned(),
+        Value::String(format!("{host}:{port}")),
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // The rustls crypto provider is installed inside
@@ -75,6 +105,9 @@ async fn main() -> Result<()> {
     // Also normalizes + creates server.home_dir.
     let mut config = AppConfig::load_or_default(cli.config.as_ref())?;
     config.apply_cli_overrides(cli.verbose);
+    if let Some(port) = cli.port {
+        apply_port_override(&mut config, port)?;
+    }
 
     // Print config and exit if requested
     if cli.print_config {
