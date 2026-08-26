@@ -719,6 +719,15 @@ test-pgq: install-tools
 	cargo nextest run -p cf-gears-toolkit-db --features pgq,integration \
 		-E 'kind(lib) | binary(mod) | binary(ui)'
 
+## Run the graph-storage gear's suites: the in-memory conformance lane (no
+## database) plus the PostgreSQL 19 SQL/PGQ lane. The PG19 lane needs an image
+## carrying both PostgreSQL 19 and pgvector — the platform pin has only the
+## former — so point GEARS_TEST_PG_GRAPH_IMAGE at one; otherwise it skips.
+## GEARS_TEST_PG_GRAPH_REQUIRED=1 turns that skip into a failure.
+test-graph-storage: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-graph-storage
+
 ## Run MySQL integration tests
 test-mysql: install-tools
 	$(call print_target_banner)

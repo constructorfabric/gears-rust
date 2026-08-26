@@ -20,6 +20,7 @@ resource-group = ["dep:resource_group"]
 grpc-hub = ["dep:grpc_hub"]
 oagw = ["dep:api_egress"]
 credstore = ["dep:credstore"]
+graph-storage = ["dep:graph-storage"]
 # FIPS-140-3: use the AWS-LC FIPS-validated crypto module for all cryptographic operations
 fips = ["toolkit/fips", "oagw", "api_egress?/fips"]
 users-info-example = ["dep:users-info"]
@@ -96,6 +97,7 @@ github_mirror = { package = "cf-gears-github-mirror", path = "../../gears/github
 nodes_registry = { package = "cf-gears-nodes-registry", path = "../../gears/system/nodes-registry/nodes-registry", optional = true }
 simple_user_settings = { package = "cf-gears-simple-user-settings", path = "../../gears/simple-user-settings/simple-user-settings", optional = true }
 credstore = { package = "cf-gears-credstore", path = "../../gears/credstore/credstore", optional = true }
+graph-storage = { package = "cf-gears-graph-storage", path = "../../gears/graph-storage/graph-storage", optional = true }
 
 anyhow = { workspace = true }
 tokio = { workspace = true }

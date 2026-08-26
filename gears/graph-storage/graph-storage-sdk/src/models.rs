@@ -1,0 +1,670 @@
+//! Transport-agnostic models of the graph-storage contract.
+//!
+//! These types cross three boundaries — the `ClientHub` trait, the REST DTO
+//! layer (which owns all serde), and the plugin contracts — so they carry no
+//! serde derives, no HTTP types and no database types. Payloads are arbitrary
+//! GTS-validated JSON and travel as [`serde_json::Value`].
+
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
+
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+/// Tenant identity, as carried by the platform security context.
+pub type TenantId = Uuid;
+
+/// Internal node identity. Surrogate and per-tenant: two tenants may both own
+/// a node `17`, so it is never meaningful outside a tenant-scoped call.
+pub type NodeId = i64;
+
+/// Internal edge identity, with the same per-tenant caveat as [`NodeId`].
+pub type EdgeId = i64;
+
+/// Producer-supplied stable node key, unique within a tenant.
+pub type NodeKey = String;
+
+/// Deterministic edge key derived from (type, src, dst, discriminator).
+pub type EdgeKey = String;
+
+/// Canonical GTS type identifier (`gts.vendor.package._.type.v1~` form).
+pub type GtsTypeId = String;
+
+/// Interned label identity.
+pub type LabelId = i32;
+
+// ---------------------------------------------------------------------------
+// Ontology
+// ---------------------------------------------------------------------------
+
+/// Kind of a registrable GTS type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeKind {
+    Node,
+    Edge,
+    Attribute,
+}
+
+impl TypeKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Edge => "edge",
+            Self::Attribute => "attribute",
+        }
+    }
+}
+
+/// One type submitted for registration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeRegistration {
+    /// Canonical GTS identifier; must derive from one of the gear's family
+    /// types (base -> family -> producer type, two derivations max).
+    pub type_id: GtsTypeId,
+    /// The type's draft-07 JSON Schema.
+    pub schema: serde_json::Value,
+}
+
+/// Trait values resolved across the whole derivation chain, stored with the
+/// registered type so batch validation never repeats the walk.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EffectiveTraits {
+    /// `owned` / `reference` / `phantom` for nodes, `static` / `analysis` for
+    /// edges. `None` only on abstract types, which are uninstantiable.
+    pub family: Option<String>,
+    pub scope_managed: bool,
+    pub emit_events: bool,
+    /// JSON-pointer payload paths admitted to `$filter` / `$orderby`.
+    pub index: Vec<String>,
+    /// JSON-pointer payload paths folded into the lexical search text.
+    pub full_text_search: Vec<String>,
+    /// JSON-pointer payload paths folded into the embedding input.
+    pub vector_search: Vec<String>,
+    /// Edge endpoint constraints, GTS patterns (edges only).
+    pub src_types: Vec<String>,
+    pub dst_types: Vec<String>,
+}
+
+/// A registered type as the gear reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeRecord {
+    pub type_id: GtsTypeId,
+    /// Deterministic `UUIDv5` of the GTS identifier (the platform derivation).
+    pub type_uuid: Uuid,
+    pub kind: TypeKind,
+    /// Abstract types (the bases and families) cannot be instantiated.
+    pub is_abstract: bool,
+    pub schema: serde_json::Value,
+    pub effective_traits: EffectiveTraits,
+    pub created_at: OffsetDateTime,
+}
+
+/// Filter for listing registered types.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TypeQuery {
+    pub kind: Option<TypeKind>,
+    /// GTS identifier pattern, resolved by the shared GTS implementation —
+    /// never compiled to SQL text.
+    pub pattern: Option<String>,
+    pub top: Option<u32>,
+    pub cursor: Option<String>,
+}
+
+/// A resolved set of registered types, the single representation on which a
+/// caller's type filter and an authorizing permission's pattern intersect.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TypeIdSet(pub BTreeSet<GtsTypeId>);
+
+impl TypeIdSet {
+    #[must_use]
+    pub fn intersect(&self, other: &Self) -> Self {
+        Self(self.0.intersection(&other.0).cloned().collect())
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn contains(&self, type_id: &str) -> bool {
+        self.0.contains(type_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Revision-bound identity (Read Consistency Contract)
+// ---------------------------------------------------------------------------
+
+/// The snapshot identity every compound read observes and reports: the
+/// deployment-wide, non-reusable source epoch paired with the per-tenant
+/// monotonic revision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GraphRevision {
+    pub source_epoch: i64,
+    pub revision: i64,
+}
+
+/// Handle to one open compound-read snapshot. Opaque to callers; the store
+/// that issued it resolves it back to a live snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadSnapshot {
+    pub id: Uuid,
+    pub revision: GraphRevision,
+}
+
+// ---------------------------------------------------------------------------
+// Ingest
+// ---------------------------------------------------------------------------
+
+/// A node submitted for ingest. An upsert replaces the row's mutable state
+/// wholesale: a field the request omits is cleared, never preserved.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NodeSpec {
+    pub node_key: NodeKey,
+    pub type_id: GtsTypeId,
+    pub name: Option<String>,
+    /// GTS-validated attributes. `None` = no opinion on an existing row's
+    /// payload is *not* offered — ingest is replace, so `None` clears.
+    pub payload: Option<serde_json::Value>,
+    /// Producer-supplied embedding, dimension-checked against the deployment.
+    pub embedding: Option<Vec<f32>>,
+    /// Optional compare-and-set on the node's stored version.
+    pub expected_version: Option<i64>,
+}
+
+/// An edge submitted for ingest, addressed by its endpoint node keys.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EdgeSpec {
+    pub type_id: GtsTypeId,
+    pub src_node_key: NodeKey,
+    pub dst_node_key: NodeKey,
+    /// Distinguishes parallel edges of one type between one endpoint pair.
+    pub discriminator: Option<String>,
+    pub payload: Option<serde_json::Value>,
+}
+
+/// Declarative scope replacement carried by an ingest batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplaceScope {
+    /// Scope attribute of the canonical identity
+    /// `(tenant, owning producer, scope attribute, scope value)`.
+    pub attribute: String,
+    pub value: String,
+    /// Monotonic source generation. Older than the recorded one is rejected as
+    /// stale; equal with identical content is a replay; equal with different
+    /// content conflicts.
+    pub generation: i64,
+}
+
+/// Per-request ingest options.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IngestOptions {
+    /// Create phantom endpoint nodes for edges whose endpoints are not in the
+    /// batch and not stored. `None` = the deployment default (on).
+    pub create_phantoms: Option<bool>,
+    /// Return per-item outcomes on success (errors are always per item).
+    pub report_per_item: bool,
+}
+
+/// One atomic ingest batch.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IngestRequest {
+    pub nodes: Vec<NodeSpec>,
+    pub edges: Vec<EdgeSpec>,
+    pub options: IngestOptions,
+    pub replace_scope: Option<ReplaceScope>,
+    /// Producer-chosen idempotency key (the REST layer reads the same value
+    /// from the `Idempotency-Key` header).
+    pub idempotency_key: Option<String>,
+}
+
+/// Aggregate counters of one committed batch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IngestCounts {
+    pub nodes_inserted: u64,
+    pub nodes_updated: u64,
+    pub nodes_unchanged: u64,
+    pub edges_inserted: u64,
+    pub edges_updated: u64,
+    pub edges_unchanged: u64,
+    pub phantoms_created: u64,
+    pub phantoms_materialized: u64,
+    /// Rows tombstoned by scope replacement.
+    pub scope_removed_nodes: u64,
+    pub scope_removed_edges: u64,
+}
+
+/// Which collection an ingest item belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemFamily {
+    Node,
+    Edge,
+}
+
+/// Per-item outcome, reported when `options.report_per_item` is set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ItemOutcome {
+    Inserted,
+    Updated,
+    Unchanged,
+    Materialized,
+}
+
+/// One per-item validation failure. A batch with any of these commits nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemError {
+    pub index: usize,
+    pub family: ItemFamily,
+    pub gts_type: Option<GtsTypeId>,
+    /// JSON pointer to the offending value, when the failure is positional.
+    pub pointer: Option<String>,
+    pub message: String,
+}
+
+/// Outcome of one ingest call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngestOutcome {
+    /// Revision the graph reached once the batch committed (unchanged when
+    /// the batch converged without modifying anything).
+    pub revision: GraphRevision,
+    /// True when an idempotency receipt answered the call without touching
+    /// state.
+    pub replayed: bool,
+    pub counts: IngestCounts,
+    pub per_item_nodes: Option<Vec<ItemOutcome>>,
+    pub per_item_edges: Option<Vec<ItemOutcome>>,
+}
+
+/// Soft-delete target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeleteRequest {
+    /// Tombstone a node together with its incident edges.
+    Node(NodeKey),
+    /// Tombstone one edge.
+    Edge(EdgeKey),
+}
+
+/// Outcome of a soft delete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    pub revision: GraphRevision,
+    pub tombstoned_nodes: u64,
+    pub tombstoned_edges: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Node read / projection
+// ---------------------------------------------------------------------------
+
+/// Edge incidence direction relative to a node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdjacencySide {
+    Outgoing,
+    Incoming,
+}
+
+/// One incident edge in a node read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdjacencyEntry {
+    pub edge_key: EdgeKey,
+    pub edge_type_id: GtsTypeId,
+    pub side: AdjacencySide,
+    pub neighbor_key: NodeKey,
+    pub neighbor_type_id: GtsTypeId,
+}
+
+/// A node as read paths return it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeView {
+    pub node_key: NodeKey,
+    pub type_id: GtsTypeId,
+    pub name: Option<String>,
+    pub payload: Option<serde_json::Value>,
+    pub has_embedding: bool,
+    pub labels: Vec<String>,
+    pub adjacency: Vec<AdjacencyEntry>,
+    pub adjacency_truncated: bool,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+/// One row of the tabular projection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeRow {
+    pub node_key: NodeKey,
+    pub type_id: GtsTypeId,
+    pub name: Option<String>,
+    pub payload: Option<serde_json::Value>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+/// A page of results with an opaque continuation token bound to the observed
+/// revision (Read Consistency Contract).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+    pub revision: GraphRevision,
+}
+
+/// Filterable-field schema of the node projection.
+///
+/// Never constructed: it exists to feed `#[derive(ODataFilterable)]`, which
+/// generates [`NodeQueryFilterField`] and its `FilterField` impl. Declaring it
+/// here rather than on the REST DTO keeps one authority for what `$filter` and
+/// `$orderby` may name — the store's column mapping is written against this
+/// type, so a field nobody mapped cannot reach a query.
+///
+/// Payload paths are deliberately absent: they are admissible only where a
+/// type's `index` trait declares them *and* an index backs them, which this
+/// iteration does not yet build.
+#[derive(toolkit_odata_macros::ODataFilterable)]
+pub struct NodeQuery {
+    /// The producer-supplied node key.
+    #[odata(filter(kind = "String"))]
+    pub node_key: String,
+    /// The node's display name.
+    #[odata(filter(kind = "String"))]
+    pub name: String,
+    #[odata(filter(kind = "DateTimeUtc"))]
+    pub created_at: time::OffsetDateTime,
+    #[odata(filter(kind = "DateTimeUtc"))]
+    pub updated_at: time::OffsetDateTime,
+}
+
+pub use NodeQueryFilterField as NodeFilterField;
+
+/// Tabular projection query.
+///
+/// Filtering, ordering and pagination are the **platform** `OData` binding —
+/// the parsed [`toolkit_odata::ODataQuery`], carrying the `CursorV1`
+/// continuation token and its filter hash — not a second dialect of our own.
+#[derive(Clone, Debug, Default)]
+pub struct ProjectionRequest {
+    /// Restrict to these types (already intersected with the authorizing
+    /// permission's pattern by the domain layer).
+    pub type_set: Option<TypeIdSet>,
+    /// The accepted system query options, already parsed and validated.
+    pub query: toolkit_odata::ODataQuery,
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+/// Which arm produced a hit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchArm {
+    Lexical,
+    Vector,
+}
+
+/// Search mode. Hybrid runs both arms independently and fuses them with RRF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchMode {
+    Lexical,
+    Vector,
+    Hybrid,
+}
+
+/// One search request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchRequest {
+    pub mode: SearchMode,
+    /// Query text for the lexical arm.
+    pub query: Option<String>,
+    /// Query vector for the vector arm (producer-embedded in this iteration).
+    pub query_vector: Option<Vec<f32>>,
+    /// Per-arm candidate limit before fusion.
+    pub arm_limit: u32,
+    /// Result limit after fusion.
+    pub limit: u32,
+    /// GTS type patterns narrowing the searched set.
+    pub type_patterns: Vec<String>,
+}
+
+/// A hit's per-arm provenance: which arm matched, at what rank and raw score.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArmHit {
+    pub arm: SearchArm,
+    pub rank: u32,
+    pub score: f64,
+}
+
+/// One fused search hit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchHit {
+    pub node_key: NodeKey,
+    pub type_id: GtsTypeId,
+    pub name: Option<String>,
+    /// Fused (RRF) score.
+    pub score: f64,
+    pub arms: Vec<ArmHit>,
+    /// Highlighted snippet from the lexical arm, when it matched.
+    pub snippet: Option<String>,
+}
+
+/// Search response, revision-stamped like every compound read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchResponse {
+    pub hits: Vec<SearchHit>,
+    pub revision: GraphRevision,
+}
+
+// ---------------------------------------------------------------------------
+// Traversal
+// ---------------------------------------------------------------------------
+
+/// Expansion direction. `Either` is the union of the two directed scans in
+/// one semi-join — never the undirected pattern shorthand, which plans as an
+/// all-vertex probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Outgoing,
+    Incoming,
+    Either,
+}
+
+/// Per-hop budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HopBudget {
+    pub max_frontier: u32,
+    pub max_edges_scanned: u64,
+}
+
+/// Why an expansion or traversal stopped early. Never silent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TruncationReason {
+    FrontierCap,
+    EdgeScanCap,
+    NodeBudget,
+}
+
+/// A traversed edge reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EdgeRef {
+    pub edge_key: EdgeKey,
+    pub edge_type_id: GtsTypeId,
+    pub src: NodeKey,
+    pub dst: NodeKey,
+}
+
+/// Label filter placeholder (labels are not shipped in this iteration; the
+/// field exists so the plugin contract does not change when they are).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelFilter {
+    pub any_of: Vec<String>,
+}
+
+/// Seeded, depth-bounded traversal request.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TraverseRequest {
+    pub seeds: Vec<NodeKey>,
+    pub depth: u8,
+    /// Per-hop edge-type restriction (GTS patterns).
+    pub edge_type_patterns: Vec<String>,
+    /// Node-type filter applied to the output set (seeds always survive).
+    pub node_type_patterns: Vec<String>,
+    pub max_nodes: Option<u32>,
+}
+
+/// Bounded neighborhood projection request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NeighborhoodRequest {
+    pub root: NodeKey,
+    pub depth: u8,
+    pub node_budget: Option<u32>,
+    pub include_phantoms: bool,
+}
+
+/// Traversal / neighborhood response.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TraversalResponse {
+    pub nodes: Vec<NodeView>,
+    pub edges: Vec<EdgeRef>,
+    pub truncated: Option<TruncationReason>,
+    pub revision: GraphRevision,
+}
+
+// ---------------------------------------------------------------------------
+// Labels (contract present, implementation deferred)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabelSpec {
+    pub name: String,
+    pub description: Option<String>,
+    pub style: Option<serde_json::Value>,
+    pub applies_to: LabelAppliesTo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelAppliesTo {
+    Node,
+    Edge,
+    Both,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabelRecord {
+    pub id: LabelId,
+    pub spec: LabelSpec,
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelAssignment {
+    pub target: LabelTarget,
+    pub attach: Vec<LabelId>,
+    pub detach: Vec<LabelId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LabelTarget {
+    Node(NodeKey),
+    Edge(EdgeKey),
+}
+
+/// Revision-only outcome for label mutations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RevisionOutcome {
+    pub revision: GraphRevision,
+}
+
+// ---------------------------------------------------------------------------
+// Topology (analytics boundary; capability optional)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TopologyRequest {
+    pub cursor: Option<String>,
+    pub page_size: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopologyPage {
+    pub nodes: Vec<(NodeKey, GtsTypeId)>,
+    pub edges: Vec<EdgeRef>,
+    pub next_cursor: Option<String>,
+    pub schema_version: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities
+// ---------------------------------------------------------------------------
+
+/// What a store implementation provides. Anything absent is answered
+/// `Unsupported`, never approximated.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "a capability set is independent yes/no facts read by name, not a \
+              parameter list; collapsing them into flags would hide which \
+              capability a store lacks at the call site"
+)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreCapabilities {
+    pub scope_replace: bool,
+    pub snapshots: bool,
+    pub vector_search: bool,
+    pub labels: bool,
+    pub chunks: bool,
+    pub topology: bool,
+}
+
+/// What an engine implementation provides beyond one-hop expansion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EngineCapabilities {
+    pub shortest_path: bool,
+    pub match_pattern: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Budget
+// ---------------------------------------------------------------------------
+
+/// What is left of an operation's absolute deadline — never a fresh timeout,
+/// so a slow earlier step shortens the next one rather than extending the
+/// total.
+#[derive(Clone, Copy, Debug)]
+pub struct RemainingBudget {
+    deadline: Instant,
+}
+
+impl RemainingBudget {
+    /// Open a budget expiring `total` from now.
+    #[must_use]
+    pub fn starting_now(total: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + total,
+        }
+    }
+
+    #[must_use]
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        self.remaining().is_zero()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Embedding space
+// ---------------------------------------------------------------------------
+
+/// Full embedding-space identity. Two providers with the same dimension and
+/// different identities produce incomparable vectors, so the identity is more
+/// than a width.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddingSpaceId {
+    /// Canonical hash over the artifact/preprocessing identity below.
+    pub identity_hash: String,
+    pub model_artifact: String,
+    pub tokenizer_artifact: String,
+    pub dimension: u32,
+}

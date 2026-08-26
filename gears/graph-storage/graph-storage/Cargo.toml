@@ -1,0 +1,63 @@
+[package]
+name = "cf-gears-graph-storage"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Graph Storage gear: typed, multi-tenant knowledge graph with search and traversal over a pluggable store"
+
+[lib]
+name = "graph_storage"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+integration = []
+
+[dependencies]
+graph-storage-sdk = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true, features = ["time"] }
+jsonschema = { workspace = true }
+gts = { workspace = true }
+aws-lc-rs = { workspace = true }
+hex = { workspace = true }
+
+axum = { workspace = true, features = ["macros"] }
+http = { workspace = true }
+
+toolkit = { workspace = true }
+authz-resolver = { workspace = true }
+authz-resolver-sdk = { workspace = true }
+toolkit-canonical-errors = { workspace = true, features = ["axum", "utoipa"] }
+toolkit-http = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-gts = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+toolkit-odata-macros = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+sea-orm = { workspace = true, features = ["postgres-vector"] }
+sea-orm-migration = { workspace = true }
+toolkit-db = { workspace = true, features = ["pg", "pgq"] }
+toolkit-db-macros = { workspace = true }
+
+[dev-dependencies]
+cf-gears-test-containers = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+toolkit-db = { workspace = true, features = ["pg", "pgq", "integration"] }

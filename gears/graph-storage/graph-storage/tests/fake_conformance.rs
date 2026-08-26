@@ -1,0 +1,129 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+//! The conformance suite against the in-memory fake.
+//!
+//! This lane needs no database, so it runs everywhere the workspace builds —
+//! which is the point: if an obligation only the `PostgreSQL` store can satisfy
+//! sneaks into the contract, it fails here first.
+
+mod conformance;
+
+use graph_storage::infra::fake_store::FakeGraphStore;
+use graph_storage_sdk::models::ProjectionRequest;
+use uuid::Uuid;
+
+fn store() -> FakeGraphStore {
+    FakeGraphStore::new()
+}
+
+#[tokio::test]
+async fn a_failed_batch_commits_nothing() {
+    conformance::batch_atomicity(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn source_generations_are_fenced_monotonically() {
+    conformance::generation_fencing(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_node_never_outlives_its_incident_edges() {
+    conformance::no_orphan_edges(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_recorded_idempotency_key_replays() {
+    conformance::idempotency(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn an_identical_batch_converges_without_moving_the_revision() {
+    conformance::convergent_replay(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn colliding_node_keys_stay_inside_their_tenants() {
+    conformance::tenant_isolation(&store(), Uuid::now_v7(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn tombstoned_rows_are_absent_from_every_read_path() {
+    conformance::tombstones_are_invisible(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_denied_row_reads_exactly_like_an_absent_one() {
+    conformance::denied_is_indistinguishable_from_absent(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_denying_scope_ranks_nothing() {
+    conformance::search_is_scoped(&store(), Uuid::now_v7()).await;
+}
+
+/// Obligation 5, which only the fake can currently satisfy: two arms of one
+/// read and a hydration after it observe one graph state.
+///
+/// The built-in `PostgreSQL` store declares this capability **absent** — a true
+/// repeatable-read snapshot needs a transaction held across calls, which the
+/// sealed runner cannot express (see `dev/DEVIATIONS.md`). Keeping the case
+/// here, against the implementation that does honour it, is what stops the
+/// obligation from quietly disappearing from the contract.
+#[tokio::test]
+async fn one_snapshot_spans_every_arm_of_one_read() {
+    use graph_storage_sdk::plugin_api::GraphStoreV1;
+    use toolkit_security::AccessScope;
+
+    let store = store();
+    let tenant = Uuid::now_v7();
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+
+    store
+        .register_types(&ctx, conformance::ontology_batch())
+        .await
+        .expect("ontology registers");
+    store
+        .ingest(
+            &ctx,
+            conformance::batch(vec![conformance::node("snap-1", "before")], Vec::new()),
+        )
+        .await
+        .expect("the batch commits");
+
+    let snapshot = store.begin_read(&ctx).await.expect("snapshot opens");
+
+    // A concurrent commit lands between the arms of the compound read.
+    store
+        .ingest(
+            &ctx,
+            conformance::batch(vec![conformance::node("snap-2", "after")], Vec::new()),
+        )
+        .await
+        .expect("the concurrent batch commits");
+
+    let under = conformance::ctx(tenant, &scope, Some(&snapshot));
+    let page = store
+        .project_table(&under, ProjectionRequest::default())
+        .await
+        .expect("projection succeeds");
+    assert!(
+        page.items.iter().all(|row| row.node_key != "snap-2"),
+        "the snapshot must not see a row committed after it opened: {:?}",
+        page.items
+    );
+    // The platform `Page` has no revision slot, so the compound read's
+    // revision is asserted through the arms that do carry it (see
+    // `dev/DEVIATIONS.md` D-005).
+
+    let resolved = store
+        .resolve_node_ids(&under, &["snap-2".to_owned()])
+        .await
+        .expect("resolution succeeds");
+    assert!(
+        resolved.is_empty(),
+        "a second arm of the same read observes the same state"
+    );
+
+    store.end_read(snapshot).await.expect("snapshot closes");
+}
