@@ -32,6 +32,11 @@ async fn a_node_never_outlives_its_incident_edges() {
 }
 
 #[tokio::test]
+async fn a_fresh_tenant_reports_a_usable_revision() {
+    conformance::a_fresh_tenant_reports_a_usable_revision(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
 async fn a_recorded_idempotency_key_replays() {
     conformance::idempotency(&store(), Uuid::now_v7()).await;
 }

@@ -49,6 +49,11 @@ pub async fn walk(
     };
     let mut frontier: Vec<NodeId> = ordered.clone();
     let mut edges: Vec<EdgeRef> = Vec::new();
+    // An edge is reachable from both of its endpoints, so an undirected walk
+    // meets each one twice: once expanding its source, once expanding its
+    // destination. Without this the same edge is reported twice, and a caller
+    // drawing or counting the result is simply wrong.
+    let mut seen_edges: BTreeSet<String> = BTreeSet::new();
     let mut truncated: Option<TruncationReason> = None;
 
     for _ in 0..plan.depth {
@@ -74,7 +79,11 @@ pub async fn walk(
         if response.truncated.is_some() {
             truncated = response.truncated;
         }
-        edges.extend(response.edges);
+        for edge in response.edges {
+            if seen_edges.insert(edge.edge_key.clone()) {
+                edges.push(edge);
+            }
+        }
 
         let mut next: Vec<NodeId> = Vec::new();
         let mut reached = response.reached;
@@ -98,4 +107,133 @@ pub async fn walk(
         edges,
         truncated,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use graph_storage_sdk::models::{
+        EdgeSpec, IngestRequest, NodeSpec, RemainingBudget, TypeRegistration,
+    };
+    use graph_storage_sdk::plugin_api::GraphStoreV1;
+    use tokio_util::sync::CancellationToken;
+    use toolkit_security::AccessScope;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::domain::ontology::BASE_SCHEMAS;
+    use crate::infra::fake_store::{FakeGraphEngine, FakeGraphStore};
+
+    const OWNED: &str =
+        "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~acme.walk._.n.v1~";
+    const LINK: &str =
+        "gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~acme.walk._.e.v1~";
+
+    fn derived(type_id: &str, family: &str) -> TypeRegistration {
+        TypeRegistration {
+            type_id: type_id.to_owned(),
+            schema: serde_json::json!({
+                "$id": format!("gts://{type_id}"),
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "allOf": [{ "$ref": format!("gts://{family}") }],
+            }),
+        }
+    }
+
+    /// A chain `a -> b -> c`, walked two hops from `a`.
+    ///
+    /// The middle node is reached by expanding `a`, and expanding it in turn
+    /// meets the very edge that led there — once as an outgoing edge of `a`,
+    /// once as an incoming edge of `b`. A caller drawing the result must not
+    /// see that edge twice.
+    #[tokio::test]
+    async fn an_edge_met_from_both_ends_is_reported_once() {
+        let store = Arc::new(FakeGraphStore::new());
+        let engine = FakeGraphEngine::new(Arc::clone(&store));
+        let tenant = Uuid::now_v7();
+        let scope = AccessScope::for_tenant(tenant);
+        let ctx = StoreCtx {
+            tenant,
+            scope: &scope,
+            snapshot: None,
+            budget: RemainingBudget::starting_now(Duration::from_secs(30)),
+            cancel: CancellationToken::new(),
+        };
+
+        let mut types: Vec<TypeRegistration> = BASE_SCHEMAS
+            .iter()
+            .map(|(type_id, raw)| TypeRegistration {
+                type_id: (*type_id).to_owned(),
+                schema: serde_json::from_str(raw).unwrap_or_default(),
+            })
+            .collect();
+        types.push(derived(
+            OWNED,
+            "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~",
+        ));
+        types.push(derived(
+            LINK,
+            "gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~",
+        ));
+        store
+            .register_types(&ctx, types)
+            .await
+            .unwrap_or_else(|e| panic!("ontology registers: {e}"));
+
+        let node = |key: &str| NodeSpec {
+            node_key: key.to_owned(),
+            type_id: OWNED.to_owned(),
+            ..NodeSpec::default()
+        };
+        let link = |from: &str, to: &str| EdgeSpec {
+            type_id: LINK.to_owned(),
+            src_node_key: from.to_owned(),
+            dst_node_key: to.to_owned(),
+            ..EdgeSpec::default()
+        };
+        store
+            .ingest(
+                &ctx,
+                IngestRequest {
+                    nodes: vec![node("a"), node("b"), node("c")],
+                    edges: vec![link("a", "b"), link("b", "c")],
+                    ..IngestRequest::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the batch commits: {e}"));
+
+        let seed = store
+            .resolve_node_ids(&ctx, &["a".to_owned()])
+            .await
+            .unwrap_or_else(|e| panic!("resolution succeeds: {e}"))
+            .first()
+            .map_or_else(|| panic!("`a` resolves"), |(_, id)| *id);
+
+        let plan = WalkPlan {
+            depth: 2,
+            max_nodes: 100,
+            max_frontier: 100,
+            max_edges_scanned: 1_000,
+            edge_types: None,
+        };
+        let result = walk(&engine, &ctx, vec![seed], &plan)
+            .await
+            .unwrap_or_else(|e| panic!("the walk runs: {e}"));
+
+        assert_eq!(result.nodes.len(), 3, "the walk reaches every node once");
+        assert_eq!(
+            result.edges.len(),
+            2,
+            "two edges, reported once each: {:?}",
+            result
+                .edges
+                .iter()
+                .map(|e| (e.src.as_str(), e.dst.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
 }

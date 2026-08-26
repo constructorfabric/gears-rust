@@ -170,6 +170,11 @@ pg_case!(
     conformance::no_orphan_edges
 );
 
+pg_case!(
+    a_fresh_tenant_reports_a_usable_revision,
+    conformance::a_fresh_tenant_reports_a_usable_revision
+);
+
 pg_case!(a_recorded_idempotency_key_replays, conformance::idempotency);
 
 pg_case!(an_identical_batch_converges, conformance::convergent_replay);

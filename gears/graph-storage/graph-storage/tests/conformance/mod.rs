@@ -284,6 +284,35 @@ pub async fn no_orphan_edges(store: &dyn GraphStoreV1, tenant: Uuid) {
     );
 }
 
+/// The revision a fresh tenant reports agrees with the one its first write
+/// records: an epoch of zero on the read side would make every receipt read as
+/// belonging to a previous epoch, and therefore expired, from the first retry.
+pub async fn a_fresh_tenant_reports_a_usable_revision(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+
+    let before = store.revision(&ctx).await.expect("revision reads");
+    assert_eq!(before.revision, 0, "a fresh tenant has committed nothing");
+    assert!(
+        before.source_epoch > 0,
+        "the epoch must be a real timeline identifier, not a default zero"
+    );
+
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+    let outcome = store
+        .ingest(&ctx, batch(vec![node("first", "first")], Vec::new()))
+        .await
+        .expect("the batch commits");
+    assert_eq!(
+        outcome.revision.source_epoch, before.source_epoch,
+        "the write path and the read path must agree on the epoch"
+    );
+    assert_eq!(outcome.revision.revision, before.revision + 1);
+}
+
 /// Idempotency: a recorded key replays without touching state, and the same
 /// key with different content is refused rather than silently re-executed.
 pub async fn idempotency(store: &dyn GraphStoreV1, tenant: Uuid) {

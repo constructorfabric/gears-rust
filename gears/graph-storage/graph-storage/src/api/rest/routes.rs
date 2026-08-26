@@ -55,7 +55,9 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .require_license_features::<License>([])
         .json_request::<dto::GraphRegisterTypesRequest>(openapi, "Types to register")
         .handler(handlers::register_types)
-        .json_response_with_schema::<Vec<dto::GraphTypeDto>>(
+        // An array response is emitted inline: registering `Vec<T>` as a
+        // component would name it `Vec`, which every other array resolves to.
+        .json_array_response_with_schema::<dto::GraphTypeDto>(
             openapi,
             http::StatusCode::OK,
             "The registered types with their chain-resolved traits",
@@ -340,4 +342,53 @@ fn query_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .register(router, openapi);
 
     router
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use toolkit::api::OperationSpec;
+
+    /// Registers nothing, but the builder's own schema checks still run — and
+    /// those are what this test is for.
+    struct NoopRegistry;
+
+    impl OpenApiRegistry for NoopRegistry {
+        fn register_operation(&self, _spec: &OperationSpec) {}
+
+        fn ensure_schema_raw(
+            &self,
+            name: &str,
+            _schemas: Vec<(
+                String,
+                utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+            )>,
+        ) -> String {
+            name.to_owned()
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Every route registers its `OpenAPI` schemas without panicking.
+    ///
+    /// The platform refuses a component named `Vec` — every `Vec<T>` resolves
+    /// to it, so two list responses would clobber each other — and it refuses
+    /// it by assertion, at registration time. Without this test that assertion
+    /// fires during boot, which is a long way from the line that caused it.
+    ///
+    /// The service-carrying `register_routes` is deliberately not exercised:
+    /// it only adds the `Extension` layer, and constructing a `PolicyEnforcer`
+    /// would drag a PDP into a test about schemas.
+    #[test]
+    fn every_route_registers_its_schemas() {
+        let registry = NoopRegistry;
+        let router = Router::new();
+        let router = ontology_routes(router, &registry);
+        let router = write_routes(router, &registry);
+        let router = read_routes(router, &registry);
+        drop(query_routes(router, &registry));
+    }
 }

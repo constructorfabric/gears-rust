@@ -48,7 +48,13 @@ pub async fn read_revision(
         .await
         .map_err(map_scope_err)?;
 
-    let mut revision = GraphRevision::default();
+    // An absent epoch row reads as 1, the same value the write path assumes,
+    // so a receipt recorded before an operator ever rotates the epoch is not
+    // instantly "from a previous epoch" and therefore expired.
+    let mut revision = GraphRevision {
+        source_epoch: 1,
+        revision: 0,
+    };
     for row in rows {
         let value = row.value.as_i64().unwrap_or(0);
         if row.key == graph_meta::KEY_GRAPH_REVISION {
