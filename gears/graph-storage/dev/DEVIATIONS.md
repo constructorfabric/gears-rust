@@ -92,6 +92,33 @@ platform lacks an API the documentation assumes.
 - **Implementation:** the type list takes `pattern` and `limit` as plain query parameters. Binding a GTS pattern as `$filter` is refused by the platform lints (DE0802/DE0803) because `$filter` means an OData filter expression over declared columns — which a GTS pattern is not — and the OData extractor would try to parse it as one.
 - **Proposal:** correct DESIGN: the type catalog is not an OData collection; only the node projection is.
 
+## D-012 [doc-gap] A producer type cannot be free-form, and its ids change shape
+
+- **Doc:** DESIGN § 3.1 says a producer derives from a family, never from a base directly, and that `family` is required with no default. It does not say what that means for a producer that already writes types.
+- **Implementation:** every consumer type id gains its family prefix — `gts.cf.studio.kg.file.v1~` becomes `gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~cf.studio.kg.file.v1~` — and each schema grows an `allOf` `$ref` to its family. The v1 gear accepted free-form types and interned them by name, so this is a breaking change for every existing producer, and it is invisible until registration fails.
+- **Why:** without a chain there is nothing to validate an instance against, which is the whole point of the base ontology.
+- **Proposal:** DESIGN should carry a short migration note for producers coming from a free-form registry: the id changes, the schema needs `allOf`, and the searchable paths move from a producer-supplied `search_text` to a `full_text_search` trait.
+
+## D-013 [doc-gap] The base ontology has no stated publication moment
+
+- **Doc:** DESIGN § Base Ontology Publication says the schemas are published, not when or by whom.
+- **Implementation:** published per tenant on first type registration, prepended to the caller's batch. Not at boot: a tenant that never touches the graph gets no rows, and a tenant created later still finds its ancestors.
+- **Why:** without it the very first registration fails on an ancestor nobody registered — the failure a producer sees, not the gear.
+- **Proposal:** state the moment in DESIGN; the conformance suite now supplies only producer types, so the behaviour is pinned either way.
+
+## D-014 [doc-gap] An undirected walk meets each edge twice
+
+- **Doc:** `fr-graph-traversal` says edges are treated as undirected for reachability, and DESIGN's `ExpandResponse` carries `edges`. Neither says whether an edge reachable from both endpoints is reported once or twice.
+- **Implementation:** deduplicated across hops. A two-hop walk expands the seed, reaches the neighbour, and then expanding *that* meets the very edge that led there — once as outgoing, once as incoming. Reported twice, a caller drawing or counting the result is wrong.
+- **Proposal:** say it in DESIGN beside the one-hop primitive; it is not obvious from the trait.
+
+## D-015 [platform-gap] A local `[patch]` and the container image build are mutually exclusive
+
+- **Doc:** the quickstart path is `docker compose up --build`.
+- **Implementation:** studio-web reaches the SQL/PGQ layer through a `[patch]` block pointing at the sibling `gears-rust` checkout, which is outside the image build context — so the backend image cannot be built while the patch is in place. The stand runs the binary natively against the compose PostgreSQL instead (`config/local-stand.yaml`).
+- **Why:** `toolkit-sea-orm-pgq` is unpublished and lives on a branch.
+- **Proposal:** none needed — it resolves itself when PR #4639 merges and the git dependencies move back to `main`. Recorded so the next person does not spend the afternoon finding it.
+
 ---
 
 # Deferred scope (agreed before implementation started)
