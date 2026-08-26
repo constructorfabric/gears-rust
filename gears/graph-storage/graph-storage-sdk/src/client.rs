@@ -78,9 +78,16 @@ pub trait GraphStorageClientV1: Send + Sync {
 
     /// Tabular projection over declared `index` paths, bound to the platform
     /// `OData` options.
+    ///
+    /// `type_patterns` narrows the projection to the types they resolve to;
+    /// the effective set is that intersected with the pattern of the
+    /// permission that authorized the request. Empty means every authorized
+    /// type. Patterns are resolved by the shared GTS implementation, never
+    /// compiled into SQL.
     async fn project_nodes(
         &self,
         ctx: &SecurityContext,
+        type_patterns: &[String],
         query: toolkit_odata::ODataQuery,
     ) -> Result<toolkit_odata::Page<NodeRow>, CanonicalError>;
 

@@ -326,8 +326,8 @@ pub async fn project_table(
         &req.query,
         ("node_key", SortDir::Asc),
         LimitCfg {
-            default: store.config().projection_max_page as u64,
-            max: store.config().projection_max_page as u64,
+            default: u64::from(store.config().projection_max_page),
+            max: u64::from(store.config().projection_max_page),
         },
         |model| model,
     )

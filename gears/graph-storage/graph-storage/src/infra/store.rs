@@ -65,6 +65,11 @@ impl PgGraphStore {
 #[must_use]
 pub fn map_scope_err(error: ScopeError) -> GraphStoreError {
     match error {
+        // Every statement goes through the secure ORM, so a database failure
+        // arrives wrapped. Classifying it here rather than at each call site
+        // is what keeps a unique violation, a live-edge refusal and a
+        // serialization failure from all reading as an internal error.
+        ScopeError::Db(inner) => map_db_err(&inner),
         ScopeError::Denied(_) => GraphStoreError::NotFound,
         ScopeError::UnresolvedScopeProperty { element, property } => {
             GraphStoreError::ScopeUnservable {
@@ -283,5 +288,50 @@ impl GraphStoreV1 for PgGraphStore {
         keys: &[NodeKey],
     ) -> Result<Vec<(NodeKey, NodeId)>, GraphStoreError> {
         reads::resolve_node_ids(self, ctx, keys).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `PostgreSQL` 18 changed the SQLSTATE of an `ON DELETE RESTRICT` refusal
+    /// from `23503` to `23001`. Both must read as a live-edge conflict, or a
+    /// refusal to delete a referenced node surfaces as an internal error on
+    /// PG19 — which is exactly what happened in another gear before this was
+    /// understood.
+    #[test]
+    fn both_restrict_sqlstates_classify_as_a_conflict() {
+        for sqlstate in ["23503", "23001"] {
+            let error = sea_orm::DbErr::Custom(format!(
+                "error returned from database: {sqlstate} update or delete violates foreign key"
+            ));
+            assert!(
+                matches!(map_db_err(&error), GraphStoreError::Conflict { .. }),
+                "SQLSTATE {sqlstate} must classify as a conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scope_wrapped_database_error_is_still_classified() {
+        let inner = sea_orm::DbErr::Custom(
+            "error returned from database: 23505 duplicate key value".to_owned(),
+        );
+        assert!(
+            matches!(
+                map_scope_err(ScopeError::Db(inner)),
+                GraphStoreError::Conflict { .. }
+            ),
+            "a database error wrapped by the secure ORM must not read as internal"
+        );
+    }
+
+    #[test]
+    fn a_denial_is_not_found_rather_than_forbidden() {
+        assert!(matches!(
+            map_scope_err(ScopeError::Denied("nope")),
+            GraphStoreError::NotFound
+        ));
     }
 }

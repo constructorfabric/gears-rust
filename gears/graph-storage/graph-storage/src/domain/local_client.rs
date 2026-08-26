@@ -111,10 +111,11 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
     async fn project_nodes(
         &self,
         ctx: &SecurityContext,
+        type_patterns: &[String],
         query: toolkit_odata::ODataQuery,
     ) -> Result<toolkit_odata::Page<NodeRow>, CanonicalError> {
         self.services
-            .project_nodes(ctx, query)
+            .project_nodes(ctx, type_patterns, query)
             .await
             .map_err(Into::into)
     }

@@ -184,6 +184,11 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .require_license_features::<License>([])
         .query_param_typed("limit", false, "Page size hint", "integer")
         .query_param("cursor", false, "Opaque CursorV1 continuation token")
+        .query_param(
+            "type_pattern",
+            false,
+            "Comma-separated GTS identifier patterns narrowing the projection",
+        )
         .handler(handlers::project_nodes)
         .json_response_with_schema::<toolkit_odata::Page<dto::GraphNodeRowDto>>(
             openapi,

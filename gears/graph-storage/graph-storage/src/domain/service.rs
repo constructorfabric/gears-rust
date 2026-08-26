@@ -97,6 +97,13 @@ impl GraphServices {
             .await?;
         let store_ctx = self.store_ctx(&auth, None);
 
+        // The base ontology is published per tenant on first use rather than
+        // at boot: a tenant that never touches the graph gets no rows, and a
+        // tenant created later still finds its ancestors. Every producer type
+        // derives from a family, so without this the first registration fails
+        // on an ancestor nobody registered.
+        let batch = Self::with_base_ontology(&store_ctx, self.store.as_ref(), batch).await?;
+
         // Resolve every ancestor schema — from the batch first (a batch may
         // carry a family and its producer type together), then from the
         // registered set — and analyze before anything persists.
@@ -130,6 +137,38 @@ impl GraphServices {
         }
 
         Ok(self.store.register_types(&store_ctx, batch).await?)
+    }
+
+    /// Prepend whichever base-ontology schemas this tenant is missing.
+    ///
+    /// Idempotent by construction: a schema already registered byte-identical
+    /// converges, and the base documents are compiled into the binary, so two
+    /// gears of the same version cannot disagree about them.
+    async fn with_base_ontology(
+        store_ctx: &StoreCtx<'_>,
+        store: &dyn GraphStoreV1,
+        batch: Vec<TypeRegistration>,
+    ) -> Result<Vec<TypeRegistration>, DomainError> {
+        let mut prefix: Vec<TypeRegistration> = Vec::new();
+        for (type_id, raw) in ontology::BASE_SCHEMAS {
+            if store.get_type(store_ctx, &type_id.to_owned()).await.is_ok() {
+                continue;
+            }
+            let schema = serde_json::from_str(raw).map_err(|error| {
+                DomainError::internal(format!("base schema `{type_id}` does not parse: {error}"))
+            })?;
+            prefix.push(TypeRegistration {
+                type_id: type_id.to_owned(),
+                schema,
+            });
+        }
+        if prefix.is_empty() {
+            return Ok(batch);
+        }
+        // The caller's types come after their ancestors, in one batch, so the
+        // whole publication is as atomic as the registration it enables.
+        prefix.extend(batch);
+        Ok(prefix)
     }
 
     pub async fn get_type(
@@ -448,20 +487,19 @@ impl GraphServices {
     pub async fn project_nodes(
         &self,
         ctx: &SecurityContext,
+        type_patterns: &[String],
         query: toolkit_odata::ODataQuery,
     ) -> Result<toolkit_odata::Page<NodeRow>, DomainError> {
         let auth = self
             .authorize(ctx, &authz::node_resource(), authz::actions::READ)
             .await?;
         admission::admit_projection(&self.config, &query)?;
+        let type_set = self.resolve_patterns(&auth, type_patterns).await?;
         Ok(self
             .store
             .project_table(
                 &self.store_ctx(&auth, None),
-                ProjectionRequest {
-                    type_set: None,
-                    query,
-                },
+                ProjectionRequest { type_set, query },
             )
             .await?)
     }

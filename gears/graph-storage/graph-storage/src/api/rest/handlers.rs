@@ -46,7 +46,7 @@ pub struct ListTypesParams {
     /// `node`, `edge` or `attribute`.
     pub kind: Option<String>,
     /// GTS identifier pattern, resolved by the platform matcher. Spelled
-    /// `pattern`, not `$filter`: it is not an OData filter over columns, and
+    /// `pattern`, not `$filter`: it is not an `OData` filter over columns, and
     /// binding it as one would promise a filter surface the ontology has not
     /// got.
     pub pattern: Option<String>,
@@ -146,10 +146,26 @@ pub async fn get_node(
 pub async fn project_nodes(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(params): Query<ProjectionTypeParams>,
     OData(query): OData,
 ) -> ApiResult<Json<toolkit_odata::Page<dto::GraphNodeRowDto>>> {
-    let page = services.project_nodes(&ctx, query).await?;
+    let patterns: Vec<String> = params
+        .type_pattern
+        .map(|raw| raw.split(',').map(|p| p.trim().to_owned()).collect())
+        .unwrap_or_default();
+    let page = services.project_nodes(&ctx, &patterns, query).await?;
     Ok(Json(page.map_items(dto::GraphNodeRowDto::from)))
+}
+
+/// The type narrowing of a projection.
+///
+/// A plain parameter rather than an `OData` option: a GTS pattern is not a
+/// filter expression over columns, and the interned type reference the rows
+/// actually carry is not addressable in one either.
+#[derive(Debug, Deserialize)]
+pub struct ProjectionTypeParams {
+    /// Comma-separated GTS identifier patterns.
+    pub type_pattern: Option<String>,
 }
 
 #[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]

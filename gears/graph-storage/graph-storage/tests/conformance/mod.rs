@@ -79,7 +79,6 @@ pub fn ontology_batch() -> Vec<TypeRegistration> {
             ]
         }),
     });
-    let _ = schema_of(PHANTOM);
     batch
 }
 
