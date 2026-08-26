@@ -636,8 +636,12 @@ is the type half of Quota identity, so applicable-Quota lookup uses
 Each subject projection **MUST** declare a required `scope` trait in the base's `x-gts-traits-schema`. Its value
 **MUST** be a `GtsInstanceId` narrowed to `gts.cf.core.qe.subject_scope.v1~*`; the P1 values are
 `gts.cf.core.qe.subject_scope.v1~cf.core.qe.user.v1` and
-`gts.cf.core.qe.subject_scope.v1~cf.core.qe.tenant.v1`. QE **MUST** read the registry-validated effective trait and
-compare the instance ids directly. Scope **MUST NOT** be inferred from the type-id name segment.
+`gts.cf.core.qe.subject_scope.v1~cf.core.qe.tenant.v1`. Each scope value binds one resolution source in the
+authenticated context: the `user` scope **MUST** resolve to the caller's subject identity, and the `tenant` scope to
+the caller's tenant identity, both taken from the SecurityContext (the concrete accessors are a DESIGN concern). When
+the identity a scope requires is missing, the resolution rules of `cpt-cf-quota-enforcement-fr-subject-resolution`
+apply unchanged. QE **MUST** read the registry-validated effective
+trait and compare the instance ids directly. Scope **MUST NOT** be inferred from the type-id name segment.
 
 Each projection **MUST** refine its required `metadata` object and **MUST** declare its admitted metrics through a typed
 `x-gts-traits` value whose entries are metric type ids narrowed by `x-gts-ref`. `x-gts-ref` is pattern-level only: it
@@ -702,7 +706,7 @@ abstract, non-subject, unknown-scope, or non-configured projection, or one that 
 
 Bootstrap **MUST** enforce a 1:1 relationship between configured concrete projections and resolvers, validate every
 admitted metric reference, and fail the Gear on mismatch. It **MUST** also fail when the configured catalogue is
-incompatible with any active Quota or Policy. Resolution logic that inspects `SecurityContext.subject_type` **MUST**
+incompatible with any active Quota or Policy. Resolution logic that inspects the SecurityContext subject-type classification **MUST**
 match the platform's actual short values rather than a GTS identifier. Anonymous contexts and nil UUID subject or tenant
 ids **MUST** be rejected; they are not valid Quota subjects.
 

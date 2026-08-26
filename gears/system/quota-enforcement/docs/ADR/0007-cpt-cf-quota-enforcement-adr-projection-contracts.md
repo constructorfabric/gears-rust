@@ -132,9 +132,14 @@ The abstract bases carry the common properties `type`, `id`, and `metadata`:
   base's `x-gts-traits-schema`. Its value is a `GtsInstanceId` narrowed to
   `gts.cf.core.qe.subject_scope.v1~*`; P1 defines the well-known instances
   `gts.cf.core.qe.subject_scope.v1~cf.core.qe.user.v1` and
-  `gts.cf.core.qe.subject_scope.v1~cf.core.qe.tenant.v1`. QE reads the registry-validated
-  effective trait and compares the instance ids directly. Encoding scope in the type-id name
-  segment would force string parsing, which `guidelines/GTS.md` conventions 14 and 15 rule out.
+  `gts.cf.core.qe.subject_scope.v1~cf.core.qe.tenant.v1`. Each scope names its resolution
+  source: the `user` scope resolves the subject id from `SecurityContext.subject_id()`, the
+  `tenant` scope from `SecurityContext.subject_tenant_id()`. When the identity a scope requires
+  is missing, the existing fail-closed rules apply unchanged: a caller-declared projection that
+  cannot resolve fails before evaluation, an optional scope lacking its field is skipped, and an
+  anonymous/nil identity is rejected outright. QE reads the registry-validated effective trait
+  and compares the instance ids directly. Encoding scope in the type-id name segment would force
+  string parsing, which `guidelines/GTS.md` conventions 14 and 15 rule out.
 * **Each subject projection declares its admitted metrics** through an inherited
   `x-gts-traits` value whose entries are `GtsTypeId`s narrowed via `x-gts-ref` to the platform
   metric base. `x-gts-ref` is **pattern-level only** — it validates that the value is a
@@ -234,8 +239,12 @@ validation cannot prove:
 * operator/cardinality mismatch — comparing `quota.regions: string[]` with
   `request.region: string` using `==` rather than membership.
 
-**At bootstrap**, QE registers its abstract bases, the scope-discriminator type and its P1
-well-known instances, then validates a closed consistency set:
+**At bootstrap**, QE registers its own missing definitions — the abstract bases, the
+scope-discriminator type, and its P1 well-known instances — through `TypesRegistryClient`;
+registration is idempotent and touches only QE-owned definitions. Concrete owner projections
+remain published by their owning Gears, and `types-registry` remains the authoritative source
+throughout — QE's catalogue is only a validated local snapshot. Bootstrap then validates a
+closed consistency set:
 
 * every compiled `SubjectProjectionResolver` names a registered, concrete owner projection
   derived from the QE subject base;
