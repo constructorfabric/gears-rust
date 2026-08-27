@@ -26,7 +26,7 @@
 use std::time::Duration;
 
 use graph_storage_sdk::models::{
-    DeleteRequest, EdgeSpec, IngestOptions, IngestRequest, NodeSpec, ProjectionRequest,
+    DeleteRequest, EdgeSpec, IngestOptions, IngestRequest, ItemFamily, NodeSpec, ProjectionRequest,
     ReadSnapshot, RemainingBudget, ReplaceScope, SearchMode, SearchRequest, TypeRegistration,
 };
 use graph_storage_sdk::plugin_api::{GraphStoreError, GraphStoreV1, StoreCtx};
@@ -39,6 +39,13 @@ pub const OWNED: &str =
     "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~test.gs._.thing.v1~";
 pub const PHANTOM: &str =
     "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.phantom_node.v1~";
+/// An edge type that admits only owned nodes at either end — the constraint
+/// that gives the endpoint check something to refuse.
+pub const OWNED_ONLY: &str = "gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~test.gs._.owned_link.v1~";
+pub const OWNED_FAMILY: &str =
+    "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~";
+/// A node type from a different family, which `OWNED_ONLY` must refuse.
+pub const REFERENCE: &str = "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.reference_node.v1~test.gs._.mirror.v1~";
 pub const LINK: &str =
     "gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~test.gs._.link.v1~";
 
@@ -105,6 +112,10 @@ pub fn edge(src: &str, dst: &str) -> EdgeSpec {
         dst_node_key: dst.to_owned(),
         ..EdgeSpec::default()
     }
+}
+
+pub fn batch_of(nodes: Vec<NodeSpec>, edges: Vec<EdgeSpec>) -> IngestRequest {
+    batch(nodes, edges)
 }
 
 pub fn batch(nodes: Vec<NodeSpec>, edges: Vec<EdgeSpec>) -> IngestRequest {
@@ -386,6 +397,199 @@ pub async fn convergent_replay(store: &dyn GraphStoreV1, tenant: Uuid) {
     assert_eq!(
         second.revision, first.revision,
         "a convergent replay must not move the revision"
+    );
+}
+
+/// An edge type constrains what its endpoints may be, and the constraint is
+/// enforced where DESIGN says it is: inside the ingest transaction.
+///
+/// `fr-type-constraints` and PRD § 9 both name this rejection. The constraint
+/// is a GTS *pattern*, resolved by the platform matcher — a base identifier
+/// admits every type derived from it, which is why the default
+/// (`…node.v1~`) constrains nothing, and a family identifier admits only its
+/// own descendants, which is what gives the check teeth.
+pub async fn endpoint_constraints_are_enforced(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+
+    let mut batch = ontology_batch();
+    batch.push(TypeRegistration {
+        type_id: OWNED_ONLY.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{OWNED_ONLY}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "x-gts-traits": { "src_types": [OWNED_FAMILY], "dst_types": [OWNED_FAMILY] },
+            "type": "object",
+            "allOf": [{ "$ref": "gts://gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~" }]
+        }),
+    });
+    batch.push(TypeRegistration {
+        type_id: REFERENCE.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{REFERENCE}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [{ "$ref": "gts://gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.reference_node.v1~" }]
+        }),
+    });
+    store
+        .register_types(&ctx, batch)
+        .await
+        .expect("ontology registers");
+
+    let mirror = NodeSpec {
+        node_key: "sys:repo:42".to_owned(),
+        type_id: REFERENCE.to_owned(),
+        payload: Some(serde_json::json!({
+            "source": { "system": "sys", "kind": "repo", "native_id": "42" }
+        })),
+        ..NodeSpec::default()
+    };
+    store
+        .ingest(
+            &ctx,
+            batch_of(vec![node("owned-1", "one"), mirror], Vec::new()),
+        )
+        .await
+        .expect("both nodes commit");
+
+    // Owned -> owned is admitted.
+    store
+        .ingest(
+            &ctx,
+            batch_of(
+                Vec::new(),
+                vec![EdgeSpec {
+                    type_id: OWNED_ONLY.to_owned(),
+                    src_node_key: "owned-1".to_owned(),
+                    dst_node_key: "owned-1".to_owned(),
+                    ..EdgeSpec::default()
+                }],
+            ),
+        )
+        .await
+        .expect("an edge between admitted endpoints commits");
+
+    // Owned -> reference is not.
+    let error = store
+        .ingest(
+            &ctx,
+            batch_of(
+                Vec::new(),
+                vec![EdgeSpec {
+                    type_id: OWNED_ONLY.to_owned(),
+                    src_node_key: "owned-1".to_owned(),
+                    dst_node_key: "sys:repo:42".to_owned(),
+                    ..EdgeSpec::default()
+                }],
+            ),
+        )
+        .await
+        .expect_err("an endpoint the edge type does not admit must be refused");
+
+    let GraphStoreError::Validation { items } = error else {
+        panic!("expected a per-item validation failure, got {error}");
+    };
+    let item = items.first().expect("one item error");
+    assert_eq!(item.pointer.as_deref(), Some("/dst_node_key"));
+    assert!(
+        item.message.contains("does not admit"),
+        "the error names what was refused: {}",
+        item.message
+    );
+}
+
+/// A phantom endpoint is admitted at edge time and checked when it becomes
+/// concrete — the Phantom Materialization Contract, rule 3.
+///
+/// An edge may name a node the producer has not sent yet; the store stands a
+/// phantom in its place. A phantom has no concrete type, so the endpoint
+/// constraint cannot be evaluated then — which is exactly why materialization
+/// must evaluate it, or the constraint would be trivially evadable by sending
+/// the edge first.
+pub async fn materializing_a_phantom_revalidates_its_edges(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+
+    let mut batch = ontology_batch();
+    batch.push(TypeRegistration {
+        type_id: OWNED_ONLY.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{OWNED_ONLY}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "x-gts-traits": { "src_types": [OWNED_FAMILY], "dst_types": [OWNED_FAMILY] },
+            "type": "object",
+            "allOf": [{ "$ref": "gts://gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~" }]
+        }),
+    });
+    batch.push(TypeRegistration {
+        type_id: REFERENCE.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{REFERENCE}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [{ "$ref": "gts://gts.cf.core.graph_storage.reference_node.v1~" }]
+        }),
+    });
+    store
+        .register_types(&ctx, batch)
+        .await
+        .expect("ontology registers");
+
+    // The destination does not exist yet: a phantom stands in, and the edge
+    // commits because a phantom carries no type to check.
+    let outcome = store
+        .ingest(
+            &ctx,
+            batch_of(
+                vec![node("owned-1", "one")],
+                vec![EdgeSpec {
+                    type_id: OWNED_ONLY.to_owned(),
+                    src_node_key: "owned-1".to_owned(),
+                    dst_node_key: "not-yet".to_owned(),
+                    ..EdgeSpec::default()
+                }],
+            ),
+        )
+        .await
+        .expect("an edge to an absent node stands up a phantom");
+    assert_eq!(
+        outcome.counts.phantoms_created, 1,
+        "the absent endpoint became a phantom"
+    );
+
+    // Materializing it as a type the edge does not admit is refused: the check
+    // deferred at edge time comes due here.
+    let error = store
+        .ingest(
+            &ctx,
+            batch_of(
+                vec![NodeSpec {
+                    node_key: "not-yet".to_owned(),
+                    type_id: REFERENCE.to_owned(),
+                    payload: Some(serde_json::json!({
+                        "source": { "system": "sys", "kind": "repo", "native_id": "7" }
+                    })),
+                    ..NodeSpec::default()
+                }],
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect_err("materialization must revalidate the edges the phantom accumulated");
+    let GraphStoreError::Validation { items } = error else {
+        panic!("expected a per-item validation failure, got {error}");
+    };
+    assert_eq!(items.first().map(|i| i.family), Some(ItemFamily::Node));
+
+    // Materializing it as an admitted type is accepted.
+    let outcome = store
+        .ingest(&ctx, batch_of(vec![node("not-yet", "late")], Vec::new()))
+        .await
+        .expect("an admitted concrete type materializes the phantom");
+    assert_eq!(
+        outcome.counts.phantoms_materialized, 1,
+        "the phantom became concrete"
     );
 }
 

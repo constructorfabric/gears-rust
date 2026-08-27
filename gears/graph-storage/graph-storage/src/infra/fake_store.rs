@@ -323,7 +323,15 @@ impl GraphStoreV1 for FakeGraphStore {
         let mut changed = false;
 
         for (index, spec) in req.nodes.iter().enumerate() {
-            changed |= apply_node(tenant, &mut nodes, &mut next_id, &mut counts, index, spec)?;
+            changed |= apply_node(
+                tenant,
+                &mut nodes,
+                &edges,
+                &mut next_id,
+                &mut counts,
+                index,
+                spec,
+            )?;
         }
         for (index, spec) in req.edges.iter().enumerate() {
             changed |= apply_edge(
@@ -872,6 +880,7 @@ fn fence(
 fn apply_node(
     tenant: &Tenant,
     nodes: &mut Vec<FakeNode>,
+    edges: &[FakeEdge],
     next_id: &mut i64,
     counts: &mut IngestCounts,
     index: usize,
@@ -956,6 +965,13 @@ fn apply_node(
         return Ok(false);
     }
 
+    if !same_type {
+        // Rule 3 of the Phantom Materialization Contract: the endpoint check
+        // that could not run while this node had no concrete type runs now,
+        // against every edge the phantom accumulated meanwhile.
+        revalidate_incident_edges(tenant, edges, existing.id, &spec.type_id, index)?;
+    }
+
     existing.type_id.clone_from(&spec.type_id);
     existing.name.clone_from(&spec.name);
     existing.payload.clone_from(&spec.payload);
@@ -967,6 +983,56 @@ fn apply_node(
         counts.phantoms_materialized += 1;
     }
     Ok(true)
+}
+
+/// Every edge already incident to a node becoming concrete must still be
+/// admissible under the concrete type.
+fn revalidate_incident_edges(
+    tenant: &Tenant,
+    edges: &[FakeEdge],
+    node_id: i64,
+    concrete_type: &str,
+    index: usize,
+) -> Result<(), GraphStoreError> {
+    for edge in edges.iter().filter(|e| !e.deleted) {
+        let Some(record) = tenant.types.get(&edge.type_id) else {
+            continue;
+        };
+        for (is_end, patterns, which) in [
+            (
+                edge.src == node_id,
+                &record.effective_traits.src_types,
+                "source",
+            ),
+            (
+                edge.dst == node_id,
+                &record.effective_traits.dst_types,
+                "destination",
+            ),
+        ] {
+            if !is_end || patterns.is_empty() {
+                continue;
+            }
+            if !ontology::matches_any_pattern(concrete_type, patterns).unwrap_or(false) {
+                return Err(GraphStoreError::Validation {
+                    items: vec![ItemError {
+                        index,
+                        family: ItemFamily::Node,
+                        gts_type: Some(concrete_type.to_owned()),
+                        pointer: Some("/type".to_owned()),
+                        message: format!(
+                            "materializing this node as `{concrete_type}` would leave edge \
+                             `{}` invalid: `{}` does not admit it as a {which} (accepts {})",
+                            edge.key,
+                            edge.type_id,
+                            patterns.join(", ")
+                        ),
+                    }],
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve one endpoint in the working copy, creating a phantom when allowed.
@@ -1065,6 +1131,53 @@ fn apply_edge(
         create_phantoms,
     )?;
     let mut changed = counts.phantoms_created > before;
+
+    // Endpoint constraints. A phantom endpoint is skipped: its concrete type
+    // is not known yet, and the materialization path revalidates then.
+    for (id, patterns, key, pointer) in [
+        (
+            src,
+            &record.effective_traits.src_types,
+            &spec.src_node_key,
+            "/src_node_key",
+        ),
+        (
+            dst,
+            &record.effective_traits.dst_types,
+            &spec.dst_node_key,
+            "/dst_node_key",
+        ),
+    ] {
+        let Some(endpoint) = nodes.iter().find(|n| n.id == id) else {
+            continue;
+        };
+        let is_phantom = tenant
+            .types
+            .get(&endpoint.type_id)
+            .and_then(|t| t.effective_traits.family.as_deref())
+            == Some("phantom");
+        if is_phantom || patterns.is_empty() {
+            continue;
+        }
+        let admitted = ontology::matches_any_pattern(&endpoint.type_id, patterns).unwrap_or(false);
+        if !admitted {
+            return Err(GraphStoreError::Validation {
+                items: vec![ItemError {
+                    index,
+                    family: ItemFamily::Edge,
+                    gts_type: Some(spec.type_id.clone()),
+                    pointer: Some(pointer.to_owned()),
+                    message: format!(
+                        "endpoint `{key}` is a `{}`, which `{}` does not admit; this edge \
+                         type accepts {}",
+                        endpoint.type_id,
+                        spec.type_id,
+                        patterns.join(", ")
+                    ),
+                }],
+            });
+        }
+    }
 
     let edge_key = identity::derive_edge_key(record.type_uuid, spec);
     match edges.iter_mut().find(|e| e.key == edge_key) {

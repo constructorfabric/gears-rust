@@ -10,8 +10,8 @@
 use std::collections::BTreeMap;
 
 use graph_storage_sdk::models::{
-    DeleteOutcome, DeleteRequest, EdgeSpec, GraphRevision, IngestCounts, IngestOutcome,
-    IngestRequest, ItemError, ItemFamily, NodeSpec, ReplaceScope,
+    DeleteOutcome, DeleteRequest, EdgeSpec, EffectiveTraits, GraphRevision, IngestCounts,
+    IngestOutcome, IngestRequest, ItemError, ItemFamily, NodeSpec, ReplaceScope,
 };
 use graph_storage_sdk::plugin_api::{GraphStoreError, StoreCtx};
 use sea_orm::sea_query::Expr;
@@ -32,6 +32,23 @@ struct TypeInfo {
     uuid: Uuid,
     family: Option<String>,
     full_text_search: Vec<String>,
+    /// Admissible endpoint types, as GTS patterns. Edge types only; the node
+    /// base declares neither, so they arrive empty and constrain nothing.
+    src_types: Vec<String>,
+    dst_types: Vec<String>,
+}
+
+/// An endpoint resolved for an edge: which row, and what type it carries.
+///
+/// The type travels with the id because the endpoint constraint is checked
+/// against it, and re-reading it per edge would mean a query per endpoint per
+/// edge in a batch that may hold twenty thousand of them.
+#[derive(Clone, Copy)]
+struct Endpoint {
+    id: i64,
+    /// Interned type reference, resolved to a GTS identifier and a family
+    /// only when a constraint actually has to be checked.
+    type_id: i32,
 }
 
 fn item_error(index: usize, family: ItemFamily, type_id: &str, message: String) -> GraphStoreError {
@@ -80,6 +97,12 @@ async fn resolve_types(
         .map(|n| n.type_id.clone())
         .chain(request.edges.iter().map(|e| e.type_id.clone()))
         .collect();
+    // The phantom type is never named by a producer — it is `x-gts-final` and
+    // authored only by the gear — so resolving it from the batch's own types
+    // would find it only by accident. It is always this one identifier.
+    if !request.edges.is_empty() {
+        wanted.push(graph_storage_sdk::gts::PHANTOM_NODE_TYPE.to_owned());
+    }
     wanted.sort();
     wanted.dedup();
 
@@ -91,24 +114,16 @@ async fn resolve_types(
                 .get("family")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
-            let full_text_search = traits
-                .get("full_text_search")
-                .and_then(serde_json::Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
+            let resolved = crate::infra::store::types::traits_from_json(&traits);
             (
                 type_id,
                 TypeInfo {
                     id,
                     uuid,
                     family,
-                    full_text_search,
+                    full_text_search: resolved.full_text_search,
+                    src_types: resolved.src_types,
+                    dst_types: resolved.dst_types,
                 },
             )
         })
@@ -294,7 +309,7 @@ async fn ingest_in_tx(
     let types = resolve_types(scope, tx, &request).await?;
     let mut changed = counts.scope_removed_nodes > 0 || counts.scope_removed_edges > 0;
 
-    let mut node_ids: BTreeMap<String, i64> = BTreeMap::new();
+    let mut node_ids: BTreeMap<String, Endpoint> = BTreeMap::new();
     changed |= write_nodes(
         tenant,
         scope,
@@ -449,11 +464,11 @@ enum EdgeWrite {
     Unchanged,
 }
 
-async fn lookup_node_id(
+async fn lookup_endpoint(
     scope: &AccessScope,
     tx: &impl DBRunner,
     key: &str,
-) -> Result<Option<i64>, GraphStoreError> {
+) -> Result<Option<Endpoint>, GraphStoreError> {
     Ok(node::Entity::find()
         .secure()
         .scope_with(scope)
@@ -461,7 +476,156 @@ async fn lookup_node_id(
         .one(tx)
         .await
         .map_err(map_scope_err)?
-        .map(|m| m.id))
+        .map(|m| Endpoint {
+            id: m.id,
+            type_id: m.gts_node_type_id,
+        }))
+}
+
+/// The GTS identifier and family of each interned type named, for the
+/// endpoints of one batch.
+async fn endpoint_types(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    ids: &[i32],
+) -> Result<BTreeMap<i32, (String, Option<String>)>, GraphStoreError> {
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let rows = crate::infra::storage::entity::gts_type::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(crate::infra::storage::entity::gts_type::Column::Id.is_in(ids.to_vec())),
+        )
+        .all(tx)
+        .await
+        .map_err(map_scope_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let family = row
+                .effective_traits
+                .get("family")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            (row.id, (row.gts_type_id, family))
+        })
+        .collect())
+}
+
+/// Revalidate every live edge incident to a node that has just become
+/// concrete.
+///
+/// Edges attached while the node was a phantom could not be endpoint-checked —
+/// the placeholder type names nothing a producer pattern would admit — so the
+/// check is deferred to here. A violation rejects the whole batch with a
+/// per-item error naming the edge; nothing is mutated, because this runs
+/// inside the ingest transaction (Phantom Materialization Contract, rule 3).
+async fn revalidate_incident_edges(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    node_id: i64,
+    concrete_type: &str,
+    index: usize,
+) -> Result<(), GraphStoreError> {
+    let incident = edge::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::any()
+                .add(edge::Column::SrcNodeId.eq(node_id))
+                .add(edge::Column::DstNodeId.eq(node_id)),
+        )
+        .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
+        .all(tx)
+        .await
+        .map_err(map_scope_err)?;
+    if incident.is_empty() {
+        return Ok(());
+    }
+
+    let mut edge_type_ids: Vec<i32> = incident.iter().map(|e| e.gts_edge_type_id).collect();
+    edge_type_ids.sort_unstable();
+    edge_type_ids.dedup();
+    let edge_types = crate::infra::storage::entity::gts_type::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(crate::infra::storage::entity::gts_type::Column::Id.is_in(edge_type_ids)),
+        )
+        .all(tx)
+        .await
+        .map_err(map_scope_err)?;
+    let by_id: BTreeMap<i32, (String, EffectiveTraits)> = edge_types
+        .into_iter()
+        .map(|row| {
+            (
+                row.id,
+                (
+                    row.gts_type_id,
+                    crate::infra::store::types::traits_from_json(&row.effective_traits),
+                ),
+            )
+        })
+        .collect();
+
+    for e in incident {
+        let Some((edge_type, traits)) = by_id.get(&e.gts_edge_type_id) else {
+            continue;
+        };
+        // The node may sit at either end, or both on a self-edge.
+        for (is_end, patterns, which) in [
+            (e.src_node_id == node_id, &traits.src_types, "source"),
+            (e.dst_node_id == node_id, &traits.dst_types, "destination"),
+        ] {
+            if !is_end {
+                continue;
+            }
+            if !endpoint_admitted(concrete_type, None, patterns)? {
+                return Err(GraphStoreError::Validation {
+                    items: vec![ItemError {
+                        index,
+                        family: ItemFamily::Node,
+                        gts_type: Some(concrete_type.to_owned()),
+                        pointer: Some("/type".to_owned()),
+                        message: format!(
+                            "materializing this node as `{concrete_type}` would leave edge \
+                             `{}` invalid: `{edge_type}` does not admit it as a {which} \
+                             (accepts {})",
+                            e.edge_key,
+                            patterns.join(", ")
+                        ),
+                    }],
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether an endpoint's type satisfies the patterns its edge type declares.
+///
+/// A phantom endpoint is **not** checked: it carries the gear's own placeholder
+/// type, which no producer pattern names, and the concrete type it will become
+/// is not known yet. The Phantom Materialization Contract closes that hole from
+/// the other side — every incident edge is revalidated when the phantom becomes
+/// concrete — so skipping here defers the check rather than dropping it.
+fn endpoint_admitted(
+    endpoint_type: &str,
+    family: Option<&str>,
+    patterns: &[String],
+) -> Result<bool, GraphStoreError> {
+    if family == Some("phantom") || patterns.is_empty() {
+        return Ok(true);
+    }
+    crate::domain::ontology::matches_any_pattern(endpoint_type, patterns).map_err(|error| {
+        GraphStoreError::Internal(format!(
+            "endpoint constraint is not a valid pattern: {error}"
+        ))
+    })
 }
 
 async fn upsert_node(
@@ -572,6 +736,10 @@ async fn upsert_node(
         && !materializing;
     if unchanged {
         return Ok((current.id, NodeWrite::Unchanged));
+    }
+
+    if materializing {
+        revalidate_incident_edges(scope, tx, current.id, &spec.type_id, index).await?;
     }
 
     let id = current.id;
@@ -887,7 +1055,7 @@ async fn write_nodes(
     tx: &impl DBRunner,
     request: &IngestRequest,
     types: &BTreeMap<String, TypeInfo>,
-    node_ids: &mut BTreeMap<String, i64>,
+    node_ids: &mut BTreeMap<String, Endpoint>,
     counts: &mut IngestCounts,
 ) -> Result<bool, GraphStoreError> {
     let mut changed = false;
@@ -901,7 +1069,13 @@ async fn write_nodes(
             )
         })?;
         let (id, write) = upsert_node(tenant, scope, tx, spec, info, index).await?;
-        node_ids.insert(spec.node_key.clone(), id);
+        node_ids.insert(
+            spec.node_key.clone(),
+            Endpoint {
+                id,
+                type_id: info.id,
+            },
+        );
         match write {
             NodeWrite::Inserted => {
                 counts.nodes_inserted += 1;
@@ -931,15 +1105,15 @@ async fn resolve_endpoint(
     index: usize,
     type_id: &str,
     types: &BTreeMap<String, TypeInfo>,
-    node_ids: &mut BTreeMap<String, i64>,
+    node_ids: &mut BTreeMap<String, Endpoint>,
     create_phantoms: bool,
     counts: &mut IngestCounts,
 ) -> Result<bool, GraphStoreError> {
     if node_ids.contains_key(key) {
         return Ok(false);
     }
-    if let Some(id) = lookup_node_id(scope, tx, key).await? {
-        node_ids.insert(key.to_owned(), id);
+    if let Some(endpoint) = lookup_endpoint(scope, tx, key).await? {
+        node_ids.insert(key.to_owned(), endpoint);
         return Ok(false);
     }
     if !create_phantoms {
@@ -962,7 +1136,13 @@ async fn resolve_endpoint(
             )
         })?;
     let id = insert_phantom(tenant, scope, tx, key, phantom_type).await?;
-    node_ids.insert(key.to_owned(), id);
+    node_ids.insert(
+        key.to_owned(),
+        Endpoint {
+            id,
+            type_id: phantom_type.id,
+        },
+    );
     counts.phantoms_created += 1;
     Ok(true)
 }
@@ -975,7 +1155,7 @@ async fn write_edges(
     tx: &impl DBRunner,
     request: &IngestRequest,
     types: &BTreeMap<String, TypeInfo>,
-    node_ids: &mut BTreeMap<String, i64>,
+    node_ids: &mut BTreeMap<String, Endpoint>,
     counts: &mut IngestCounts,
 ) -> Result<bool, GraphStoreError> {
     let create_phantoms = request.options.create_phantoms.unwrap_or(true);
@@ -1009,7 +1189,37 @@ async fn write_edges(
 
         let src = node_ids[&spec.src_node_key];
         let dst = node_ids[&spec.dst_node_key];
-        match upsert_edge(tenant, scope, tx, spec, info, src, dst).await? {
+
+        // Endpoint constraints, checked here because this is the only place
+        // both endpoints are resolved and still inside the ingest transaction,
+        // so an endpoint's type cannot change between the check and the commit.
+        let resolved = endpoint_types(scope, tx, &[src.type_id, dst.type_id]).await?;
+        for (end, endpoint, patterns, pointer) in [
+            (&spec.src_node_key, src, &info.src_types, "/src_node_key"),
+            (&spec.dst_node_key, dst, &info.dst_types, "/dst_node_key"),
+        ] {
+            let Some((endpoint_type, family)) = resolved.get(&endpoint.type_id) else {
+                continue;
+            };
+            if !endpoint_admitted(endpoint_type, family.as_deref(), patterns)? {
+                return Err(GraphStoreError::Validation {
+                    items: vec![ItemError {
+                        index,
+                        family: ItemFamily::Edge,
+                        gts_type: Some(spec.type_id.clone()),
+                        pointer: Some(pointer.to_owned()),
+                        message: format!(
+                            "endpoint `{end}` is a `{endpoint_type}`, which `{}` does not admit; \
+                             this edge type accepts {}",
+                            spec.type_id,
+                            patterns.join(", ")
+                        ),
+                    }],
+                });
+            }
+        }
+
+        match upsert_edge(tenant, scope, tx, spec, info, src.id, dst.id).await? {
             EdgeWrite::Inserted => {
                 counts.edges_inserted += 1;
                 changed = true;

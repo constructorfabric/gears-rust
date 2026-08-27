@@ -198,6 +198,16 @@ pg_case!(
     conformance::a_fresh_tenant_reports_a_usable_revision
 );
 
+pg_case!(
+    materializing_a_phantom_revalidates_its_edges,
+    conformance::materializing_a_phantom_revalidates_its_edges
+);
+
+pg_case!(
+    an_edge_type_refuses_an_endpoint_it_does_not_admit,
+    conformance::endpoint_constraints_are_enforced
+);
+
 pg_case!(a_recorded_idempotency_key_replays, conformance::idempotency);
 
 pg_case!(an_identical_batch_converges, conformance::convergent_replay);

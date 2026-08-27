@@ -37,6 +37,16 @@ async fn a_fresh_tenant_reports_a_usable_revision() {
 }
 
 #[tokio::test]
+async fn materializing_a_phantom_revalidates_its_edges() {
+    conformance::materializing_a_phantom_revalidates_its_edges(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn an_edge_type_refuses_an_endpoint_it_does_not_admit() {
+    conformance::endpoint_constraints_are_enforced(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
 async fn a_recorded_idempotency_key_replays() {
     conformance::idempotency(&store(), Uuid::now_v7()).await;
 }

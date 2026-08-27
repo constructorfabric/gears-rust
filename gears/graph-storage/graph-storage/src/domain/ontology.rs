@@ -392,6 +392,36 @@ impl ChainValidator {
 mod tests {
     use super::*;
 
+    /// The endpoint check is only safe because of how the platform matcher
+    /// reads a pattern: a base identifier admits everything derived from it.
+    ///
+    /// The default constraint on every edge type is the bare node base, so
+    /// enabling the check constrains nothing that used to pass; a narrower
+    /// family identifier is what gives it teeth. Both halves are the
+    /// platform's behaviour, not ours, so they are pinned here.
+    #[test]
+    fn a_pattern_admits_what_derives_from_it_and_nothing_else() {
+        let commit = "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.reference_node.v1~acme.scm._.commit.v1~";
+
+        assert_eq!(
+            matches_any_pattern(commit, &["gts.cf.core.graph_storage.node.v1~".to_owned()]).ok(),
+            Some(true),
+            "the base every node type derives from admits them all"
+        );
+        assert_eq!(
+            matches_any_pattern(
+                commit,
+                &[
+                    "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~"
+                        .to_owned()
+                ]
+            )
+            .ok(),
+            Some(false),
+            "a sibling family does not admit a reference node"
+        );
+    }
+
     fn base_schema(id: &str) -> Value {
         let (_, raw) = BASE_SCHEMAS
             .iter()

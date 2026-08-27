@@ -34,7 +34,7 @@ fn kind_from_str(value: &str) -> Result<TypeKind, GraphStoreError> {
 /// Read the stored trait resolution back. Hand-written, like the write side:
 /// the SDK models carry no serde by contract, so the JSON shape is owned here,
 /// beside the column that holds it.
-fn traits_from_json(value: &serde_json::Value) -> EffectiveTraits {
+pub(crate) fn traits_from_json(value: &serde_json::Value) -> EffectiveTraits {
     let strings = |key: &str| {
         value
             .get(key)
