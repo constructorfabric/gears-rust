@@ -51,13 +51,14 @@ accepted scope cuts and need no documentation change.
 - **Proposal:** platform ask — `test-containers` should expose a graph image with pgvector (built once and published, as studio-web's `docker/graph-postgres/Dockerfile` already does), so the lane needs no per-developer environment variable. Until then, DESIGN's testing section should say the two capabilities do not come in one pinned image.
 - **Folded into the docs:** ADR-0001 Consequences records that the PG16/PG19 matrix has no off-the-shelf PG19 half. Stays open: it closes when an image with both is published.
 
-## D-004 [platform-gap] A gear cannot probe the server major
+## D-004 [platform-gap] Readiness cannot name the server major
 
-- **Doc:** DESIGN § Readiness Matrix and ADR-0001 point 2 both describe SQL/PGQ as *probed*: readiness reports it unavailable on an older server, and an operator who explicitly configures it there gets a failure naming the required major.
-- **Implementation:** the migration probes the major (it must, to decide whether to emit the property-graph DDL), but the running gear cannot: the sealed `DBRunner` exposes no statement API, deliberately, so there is no way to issue `SELECT current_setting('server_version_num')` or read `pg_catalog`. The engine assumes the capability and falls back per request — with a logged reason — when a pattern refuses.
-- **Why:** the seal is the point of the secure ORM; a catalog query is exactly the escape hatch it exists to remove.
-- **Proposal:** platform ask — a narrow, read-only server-capability surface on the DB provider (`server_version()`, `has_extension(..)`), or a capability record the migration runner leaves behind for the gear. Related to ADR-0006 ask #4 (statement rendering), which is still open for the same reason.
-- **Folded into the docs:** DESIGN § 2.2, the readiness matrix row and ADR-0001 point 2 now say the migration probes and readiness reports what it recorded. Stays open: a readiness probe needs a platform capability surface.
+- **Doc:** DESIGN § Readiness Matrix and ADR-0001 point 2 describe SQL/PGQ as *probed*: readiness reports it unavailable on an older server, and an operator who explicitly configures it there gets a failure **naming the required major**.
+- **Implementation:** the gear probes by *attempting* — at startup it runs the same pattern every hop uses, under a scope matching no rows, and takes the outcome as the answer. No catalog access is needed, so the sealed runner is not in the way.
+- **Why this entry shrank.** Its first draft said "a gear cannot probe the server major" and concluded the runtime must inherit the migration's decision. The premise is true and the conclusion was wrong: what the hop depends on is whether a pattern executes, not which major answers it. Worse, the implementation matched the wrong conclusion — it assumed the capability, and a missing property graph was classified as an internal error, so **every traversal on the PostgreSQL 16 baseline answered 500** with the data reachable by the other backend the whole time. Found by dropping the property graph on the live stand. Fixed in `d9675f936`, covered by `traversal_answers_on_a_server_without_the_property_graph`, which fails with `relation "kb" does not exist` if either half of the fix is reverted.
+- **What remains:** the attempt reports that the pattern did not run, never *why*. Naming the required major needs a narrow read-only capability surface (`server_version()`, `has_extension(..)`). That is a **diagnostics** gap, not a correctness one — the gear serves the right answers without it.
+- **Proposal:** platform ask, filed as a diagnostics improvement rather than a blocker.
+- **Folded into the docs:** DESIGN § 2.2, the readiness matrix row and ADR-0001 point 2 now say the gear probes by attempting, and separate the reporting gap from the correctness one (`3e88533f1`).
 
 ## D-005 [doc-gap] The platform page envelope has no revision slot
 
