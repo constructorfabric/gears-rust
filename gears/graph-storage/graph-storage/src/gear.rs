@@ -64,7 +64,7 @@ impl Gear for GraphStorage {
         // SQL/PGQ is a probed backend capability, not a gear requirement:
         // the property-graph migration is skipped on an older server, and the
         // engine then serves every hop on the fallback backend.
-        let pgq_available = pgq_expected();
+        let pgq_available = crate::infra::engine::probe_pgq(&db).await;
         if !pgq_available {
             warn!("this server does not provide SQL/PGQ; traversal will use the two-query hop");
         }
@@ -88,18 +88,6 @@ impl Gear for GraphStorage {
         info!(pgq_available, "graph-storage gear initialized");
         Ok(())
     }
-}
-
-/// Whether this deployment is expected to serve `GRAPH_TABLE`.
-///
-/// **Not a probe.** The readiness matrix asks for the server major, but a gear
-/// cannot issue a catalog query: the sealed runner exposes no statement API,
-/// deliberately. The migration already made the real decision — it created
-/// the property graph only when the major allowed — so the engine assumes the
-/// capability and falls back per request, with a logged reason, when a
-/// pattern does not run. See `dev/DEVIATIONS.md` D-004.
-const fn pgq_expected() -> bool {
-    true
 }
 
 impl DatabaseCapability for GraphStorage {

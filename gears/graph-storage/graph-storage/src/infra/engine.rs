@@ -24,12 +24,73 @@ use graph_storage_sdk::plugin_api::{
 use sea_orm::sea_query::{Alias, Expr, ExprTrait as _};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult};
 use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt};
+use toolkit_security::AccessScope;
 use tracing::warn;
 
 use crate::config::HopStrategy;
 use crate::infra::storage::entity::{edge, gts_type, node};
 use crate::infra::storage::graph::KnowledgeGraph;
 use crate::infra::store::PgGraphStore;
+
+/// Whether this server can actually serve `GRAPH_TABLE` over the declared
+/// property graph.
+///
+/// A gear cannot ask the catalog — the secure ORM's runner is sealed, on
+/// purpose — but it does not need to: the capability that matters is not "what
+/// major is this" but "will a pattern over `kb` execute here", and that is
+/// answered by attempting one. The probe runs the same builder every hop uses,
+/// under a scope that matches no rows, so it costs one empty result set and
+/// proves exactly the thing the hop depends on.
+///
+/// Called once at init. On a server without the property graph — `PostgreSQL` 16,
+/// or 19 where the conditional migration skipped the DDL — this returns
+/// `false` and every hop is served by the fallback backend, which is what
+/// ADR-0001 promises. Without it the gear would attempt a pattern per request
+/// and answer `500` on a configuration the specification calls supported.
+pub async fn probe_pgq(db: &toolkit_db::secure::Db) -> bool {
+    let Ok(conn) = db.conn() else {
+        warn!("cannot probe SQL/PGQ: no connection; assuming it is unavailable");
+        return false;
+    };
+    // A tenant that owns nothing: the statement plans and runs, and returns
+    // no rows, so this observes the server's ability to parse and execute the
+    // pattern rather than any tenant's data.
+    let scope = AccessScope::for_tenant(uuid::Uuid::nil());
+    let probe: Result<Vec<Reached>, _> = node::Entity::find()
+        .secure()
+        .scope_with(&scope)
+        .with_graph::<KnowledgeGraph>()
+        .match_path(|p| {
+            p.vertex::<node::Entity>("a")
+                .edge_to::<edge::Entity>("e")
+                .to::<node::Entity>("b")
+        })
+        .column("b", "id", "neighbour")
+        .limit(1)
+        .all_as(&conn)
+        .await;
+
+    match probe {
+        Ok(_) => true,
+        Err(error) => {
+            warn!(
+                %error,
+                "this server does not serve SQL/PGQ over the declared property graph; \
+                 every hop will use the two-query backend"
+            );
+            false
+        }
+    }
+}
+
+/// What one attempt at the pattern hop produced.
+enum PatternOutcome {
+    Answered(ExpandResponse),
+    /// The pattern did not execute here. The two-query hop answers the same
+    /// question, so the request falls back rather than failing — with the
+    /// reason logged, never silently.
+    Unavailable(String),
+}
 
 pub struct PgGraphEngine {
     store: Arc<PgGraphStore>,
@@ -127,10 +188,16 @@ impl GraphEngineV1 for PgGraphEngine {
 
         match self.effective_strategy() {
             HopStrategy::Pgq => match expand_pgq(&self.store, ctx, &req).await {
-                Ok(response) => Ok(response),
+                Ok(PatternOutcome::Answered(response)) => Ok(response),
+                // Two different reasons, one response: the pattern could not
+                // serve this request, and the two-query hop answers the same
+                // question. Falling back is never silent — the reason is
+                // logged either way.
+                Ok(PatternOutcome::Unavailable(reason)) => {
+                    warn!(reason = %reason, "graph pattern did not execute; serving the two-query hop");
+                    expand_two_query(&self.store, ctx, &req).await
+                }
                 Err(GraphEngineError::ScopeNotEnforceable { reason }) => {
-                    // Never a weaker predicate, never a silent substitution:
-                    // the fallback is taken and the reason is logged.
                     warn!(reason = %reason, "graph pattern refused this scope; serving the two-query hop");
                     expand_two_query(&self.store, ctx, &req).await
                 }
@@ -197,7 +264,7 @@ async fn expand_pgq(
     store: &PgGraphStore,
     ctx: &StoreCtx<'_>,
     req: &ExpandRequest,
-) -> Result<ExpandResponse, GraphEngineError> {
+) -> Result<PatternOutcome, GraphEngineError> {
     let conn = store
         .db()
         .conn()
@@ -222,7 +289,7 @@ async fn expand_pgq(
     // Outgoing and incoming are two directed patterns; their results are
     // unioned here rather than expressed as a disjunction in one statement.
     for direction in directions_of(req.direction) {
-        let rows: Vec<Reached> = {
+        let rows: Result<Vec<Reached>, ScopeError> = {
             let select = node::Entity::find()
                 .secure()
                 .scope_with(ctx.scope)
@@ -248,7 +315,19 @@ async fn expand_pgq(
                 .limit(u64::from(req.budget.max_frontier) + 1)
                 .all_as(&conn)
                 .await
-                .map_err(scope_error)?
+        };
+        let rows = match rows {
+            Ok(rows) => rows,
+            // The scope refusals stay distinguishable: those are about *this*
+            // caller and are re-raised so the caller-facing reason survives.
+            Err(error @ (ScopeError::UnresolvedScopeProperty { .. } | ScopeError::Pgq(_))) => {
+                return Err(scope_error(error));
+            }
+            // Anything else the pattern statement did — most often that this
+            // server has no property graph at all, because the conditional
+            // migration skipped the DDL on a major below 19 — means the
+            // pattern cannot serve the request here.
+            Err(error) => return Ok(PatternOutcome::Unavailable(error.to_string())),
         };
         reached.extend(rows.into_iter().map(|r| r.neighbour));
     }
@@ -265,11 +344,11 @@ async fn expand_pgq(
     let truncated = (live.len() as u64 > u64::from(req.budget.max_frontier))
         .then_some(TruncationReason::FrontierCap);
 
-    Ok(ExpandResponse {
+    Ok(PatternOutcome::Answered(ExpandResponse {
         reached: live,
         edges,
         truncated,
-    })
+    }))
 }
 
 fn directions_of(direction: Direction) -> Vec<Direction> {

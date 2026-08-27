@@ -28,6 +28,7 @@ use testcontainers::runners::AsyncRunner as _;
 use testcontainers::{ContainerAsync, ImageExt as _};
 use testcontainers_modules::postgres::Postgres;
 use toolkit_db::migration_runner::run_migrations_for_testing;
+use toolkit_db::secure::Db;
 use toolkit_db::{ConnectOpts, connect_db};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -36,7 +37,23 @@ use uuid::Uuid;
 struct Stand {
     store: Arc<PgGraphStore>,
     engine: PgGraphEngine,
+    db: Arc<Db>,
+    /// Kept so a test can reach the server outside the secure ORM — dropping
+    /// the property graph is operator surgery, not something a gear can do.
+    dsn: String,
     _container: ContainerAsync<Postgres>,
+}
+
+/// Remove the property graph, leaving the tables. This is what a gear sees on
+/// a server whose major cannot create one.
+async fn drop_property_graph(stand: &Stand) {
+    use sea_orm::ConnectionTrait as _;
+    let raw = sea_orm::Database::connect(&stand.dsn)
+        .await
+        .expect("a plain connection for operator surgery");
+    raw.execute_unprepared("DROP PROPERTY GRAPH kb")
+        .await
+        .expect("the property graph is dropped");
 }
 
 /// An image carrying `PostgreSQL` 19 **and** pgvector, when the operator names
@@ -122,11 +139,17 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
         traversal_hop: hop,
         ..GraphStorageConfig::default()
     };
-    let store = Arc::new(PgGraphStore::new(Arc::new(db), config, true));
+    let db = Arc::new(db);
+    // The stand probes exactly as the gear's composition root does, so a
+    // change to the probe is exercised by every case here.
+    let pgq_available = graph_storage::infra::engine::probe_pgq(&db).await;
+    let store = Arc::new(PgGraphStore::new(Arc::clone(&db), config, pgq_available));
     let engine = PgGraphEngine::new(Arc::clone(&store));
     Some(Stand {
         store,
         engine,
+        db,
+        dsn,
         _container: container,
     })
 }
@@ -492,4 +515,119 @@ async fn a_stopped_hop_reports_why() {
         Some(TruncationReason::FrontierCap),
         "a frontier over the cap must be reported, not silently trimmed"
     );
+}
+
+/// The configuration ADR-0001 calls the baseline: a server with no SQL/PGQ.
+///
+/// `PostgreSQL` 16 has no `GRAPH_TABLE`, so the conditional migration emits no
+/// property graph and the gear must serve every hop on the fallback backend
+/// "with no functional difference to the caller". Dropping the property graph
+/// on a PG19 stand reproduces exactly that condition — the capability is
+/// absent — without needing a second image, and it is the condition the gear
+/// got wrong: it attempted a pattern per request and answered `500` on a
+/// configuration the specification supports.
+#[tokio::test]
+async fn traversal_answers_on_a_server_without_the_property_graph() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+
+    stand
+        .store
+        .register_types(&ctx, conformance::ontology_batch())
+        .await
+        .expect("ontology registers");
+    stand
+        .store
+        .ingest(
+            &ctx,
+            conformance::batch(
+                vec![conformance::node("p-a", "a"), conformance::node("p-b", "b")],
+                vec![conformance::edge("p-a", "p-b")],
+            ),
+        )
+        .await
+        .expect("the batch commits");
+
+    let seed = stand
+        .store
+        .resolve_node_ids(&ctx, &["p-a".to_owned()])
+        .await
+        .expect("resolution succeeds")
+        .first()
+        .map_or_else(|| panic!("`p-a` resolves"), |(_, id)| *id);
+
+    // Precondition: with the property graph present, the probe says so and the
+    // pattern hop is what answers. Without this the test could pass on a stand
+    // that never had SQL/PGQ at all, proving nothing.
+    assert!(
+        graph_storage::infra::engine::probe_pgq(stand.store.db()).await,
+        "the stand must start with a working property graph for this test to mean anything"
+    );
+
+    drop_property_graph(&stand).await;
+
+    assert!(
+        !graph_storage::infra::engine::probe_pgq(stand.store.db()).await,
+        "the probe must report the capability as absent once the graph is gone"
+    );
+
+    // The engine was built while the capability was present, so this exercises
+    // the per-request path: the pattern fails, and the hop falls back rather
+    // than failing the request.
+    let response = stand
+        .engine
+        .expand(
+            &ctx,
+            ExpandRequest {
+                frontier: vec![seed],
+                direction: Direction::Outgoing,
+                edge_types: None,
+                labels: None,
+                budget: HopBudget {
+                    max_frontier: 100,
+                    max_edges_scanned: 1_000,
+                },
+            },
+        )
+        .await
+        .expect("a server without SQL/PGQ must still answer, on the fallback backend");
+
+    let reached: Vec<String> = response.edges.iter().map(|e| e.dst.clone()).collect();
+    assert_eq!(
+        reached,
+        vec!["p-b".to_owned()],
+        "the fallback backend answers the same question the pattern would have"
+    );
+
+    // And an engine constructed *after* the capability vanished never attempts
+    // the pattern at all — the probe is what init uses.
+    let unprobed = PgGraphEngine::new(Arc::new(PgGraphStore::new(
+        Arc::clone(&stand.db),
+        GraphStorageConfig {
+            traversal_hop: HopStrategy::Pgq,
+            ..GraphStorageConfig::default()
+        },
+        graph_storage::infra::engine::probe_pgq(stand.store.db()).await,
+    )));
+    let again = unprobed
+        .expand(
+            &ctx,
+            ExpandRequest {
+                frontier: vec![seed],
+                direction: Direction::Outgoing,
+                edge_types: None,
+                labels: None,
+                budget: HopBudget {
+                    max_frontier: 100,
+                    max_edges_scanned: 1_000,
+                },
+            },
+        )
+        .await
+        .expect("the fallback backend answers");
+    assert_eq!(again.edges.len(), 1);
 }
