@@ -8,13 +8,20 @@
 //! fake — so a change only one of them can satisfy fails rather than passes
 //! quietly. That is also why the fake exists at all.
 //!
-//! The five obligations, in the order DESIGN § 3.3 lists them:
+//! The five obligations, in the order DESIGN § 3.3 lists them, and what this
+//! suite does about each:
 //!
-//! 1. batch atomicity across nodes, edges and the idempotency record;
-//! 2. single-writer serialization per scope identity;
-//! 3. monotonic generation fencing under that serialization;
-//! 4. a node with a live incident edge is never removed alone;
-//! 5. one snapshot across every arm of one read.
+//! 1. batch atomicity across nodes, edges and the idempotency record —
+//!    asserted;
+//! 2. single-writer serialization per scope identity — **not asserted**. Two
+//!    concurrent replacements of one scope are never made to race here, so
+//!    this obligation rests on inspection alone. Listed rather than omitted
+//!    so the gap is visible from the suite that is supposed to close it;
+//! 3. monotonic generation fencing under that serialization — asserted;
+//! 4. a node with a live incident edge is never removed alone — asserted;
+//! 5. one snapshot across every arm of one read — asserted on the fake, which
+//!    honours it, and asserted as *declined* on the built-in store, which
+//!    does not (see `the_built_in_store_declines_the_snapshot_obligation`).
 
 use std::time::Duration;
 

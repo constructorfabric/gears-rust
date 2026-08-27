@@ -180,6 +180,82 @@ Both fixed in `05695faa0`.
 
 ---
 
+# Acceptance criteria: what the prototype actually establishes
+
+PRD § 9 is the checklist this gear will be judged against, and nothing here
+recorded where the prototype stands against it. Checked one by one, on the
+live stand and in the suites. Nothing below is a divergence from the
+specification — it is the distance still to cover, written down so it is not
+rediscovered.
+
+**1. Register an ontology, ingest owned nodes, reference nodes and both edge
+families, re-run identically for byte-identical state — *partly*.** The
+registration and the convergence halves hold and are covered end to end: an
+identical batch re-run reports every row unchanged and leaves the revision
+where it was. But only **owned nodes and static edges** were ever ingested.
+Reference nodes (with their `(system, kind, native_id)` key derivation) and
+analysis edges (with their required `provenance`) have validation code and no
+exercise, in the suites or on the stand.
+
+**2. Scope replacement removes stale static content and preserves analysis
+edges — *no*.** Generation fencing works and is covered: an older generation
+is refused, an equal one with different content conflicts. The **replacement
+itself does nothing** — `fence_and_clear_scope` writes the fence row and
+returns `(0, 0)`, removing no stale content, so the half of the criterion
+about preserving analysis edges across a re-sync has nothing to preserve them
+*from*. This was a deliberate cut, and it had not been written down anywhere
+until this sweep.
+
+**3. Four retrieval scenarios within the § 6.1 latency thresholds — *two and
+a half of four, none timed*.** Hybrid narrowing, bounded traversal with
+filtering and the depth-3 neighborhood answer. The criteria table answers its
+*alternative* flow (a filter on an unindexed attribute is refused, naming the
+alternatives) but not its main flow, which is filtering by payload attributes
+— see D-104. And **no scenario was timed against § 6.1 at all**: the stand
+carries five nodes, not the seeded reference graph the criterion names, so the
+thresholds are untested rather than met.
+
+**4. Chain violations, endpoint-constraint violations and wrong-width vectors
+rejected with structured per-item errors — *two of three*.** Chain violations
+come back as per-item field violations addressed by JSON pointer, every
+violation in one response; a wrong-width vector is refused naming both widths.
+**Endpoint constraints are not enforced at all**: `src_types` and `dst_types`
+are resolved into the type's effective traits and then never read — neither in
+the validation path nor in the write path. DESIGN specifies this check runs
+inside the ingest transaction under locks on the endpoint nodes. An edge
+between endpoints its type forbids commits today.
+
+**5. Adversarial multi-tenant tests, zero cross-tenant data in every endpoint
+— *partly*.** Two tenants owning the same node key see only their own row, and
+the cross-tenant trap asserts its own fixture before trusting the pass. But
+that covers the store and the hop, not *every endpoint*: search, projection,
+node read and traversal are each scoped by construction and none has an
+adversarial case of its own.
+
+**6. `cfs validate` passes and CI meets the coverage threshold — *half*.**
+`cfs validate` passes: 238 artifacts, 0 errors. Coverage was never measured —
+`cargo llvm-cov` has not been run against this gear, so the 85 % line-coverage
+threshold in `nfr-code-coverage` is unknown rather than met.
+
+## Two gaps this sweep found that no entry recorded
+
+- **Scope replacement removes nothing** (criterion 2 above). The fencing is
+  real; the replacement is not.
+- **Endpoint constraints are never enforced** (criterion 4 above). Parsed,
+  stored, unread.
+
+## And one claim the suite makes about itself
+
+The conformance module's own header lists five obligations "asserted against
+both the built-in store and the fake". Four are: batch atomicity, generation
+fencing, no-orphan-edges, and the snapshot obligation (asserted on the fake,
+and asserted as *declined* on the PostgreSQL store). **Obligation 2 —
+single-writer serialization per scope identity, held until durable — has no
+case at all.** Two concurrent replacements of one scope are never made to
+race. The header should not claim it until one does.
+
+---
+
 # Deferred scope (agreed before implementation started)
 
 Each of these is a `[deferred]` entry: the docs require it, this iteration
