@@ -631,3 +631,85 @@ async fn traversal_answers_on_a_server_without_the_property_graph() {
         .expect("the fallback backend answers");
     assert_eq!(again.edges.len(), 1);
 }
+
+/// What `StoreCapabilities::snapshots = false` actually means here.
+///
+/// DESIGN § 3.3 obligation 5 asks that every arm of one compound read observe
+/// one graph state. The built-in store declares the capability absent, and
+/// this is the observable consequence: a row committed after `begin_read`
+/// **is** visible to a call carrying that snapshot. The obligation is declined
+/// rather than approximated, which is what the capability mechanism is for —
+/// but "declined" is a claim worth holding to an assertion instead of a
+/// comment, so that a future change which quietly starts honouring it, or
+/// quietly makes it worse, shows up here.
+#[tokio::test]
+async fn the_built_in_store_declines_the_snapshot_obligation() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+
+    assert!(
+        !stand.store.capabilities().snapshots,
+        "the store must declare the capability absent rather than claim it"
+    );
+
+    stand
+        .store
+        .register_types(&ctx, conformance::ontology_batch())
+        .await
+        .expect("ontology registers");
+    stand
+        .store
+        .ingest(
+            &ctx,
+            conformance::batch(vec![conformance::node("snap-before", "before")], Vec::new()),
+        )
+        .await
+        .expect("the first batch commits");
+
+    let snapshot = stand.store.begin_read(&ctx).await.expect("snapshot opens");
+
+    // A concurrent commit, landing between the arms of the compound read.
+    stand
+        .store
+        .ingest(
+            &ctx,
+            conformance::batch(vec![conformance::node("snap-after", "after")], Vec::new()),
+        )
+        .await
+        .expect("the concurrent batch commits");
+
+    let under = conformance::ctx(tenant, &scope, Some(&snapshot));
+    let seen = stand
+        .store
+        .resolve_node_ids(&under, &["snap-after".to_owned()])
+        .await
+        .expect("resolution succeeds");
+
+    assert!(
+        !seen.is_empty(),
+        "the built-in store does not isolate a compound read: this asserts the \
+         *absence* of isolation, so if it ever starts isolating, revisit \
+         StoreCapabilities::snapshots and DESIGN section 3.3 together"
+    );
+    assert_eq!(
+        snapshot.revision.revision + 1,
+        stand
+            .store
+            .revision(&ctx)
+            .await
+            .expect("revision reads")
+            .revision,
+        "the snapshot recorded the revision it opened at, even though it does \
+         not hold it"
+    );
+
+    stand
+        .store
+        .end_read(snapshot)
+        .await
+        .expect("snapshot closes");
+}

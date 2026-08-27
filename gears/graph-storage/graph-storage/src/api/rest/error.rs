@@ -64,6 +64,9 @@ fn client_correctable(error: DomainError) -> Result<CanonicalError, DomainError>
         DomainError::InvalidArgument { message } => GraphNodeError::invalid_argument()
             .with_field_violation("request", message, reasons::LIMIT_COMBINATION)
             .create(),
+        DomainError::InvalidQuery { message } => GraphNodeError::invalid_argument()
+            .with_field_violation("query", message, reasons::SCHEMA_VIOLATION)
+            .create(),
         DomainError::LimitExceeded { what } => GraphNodeError::out_of_range(what.clone())
             .with_field_violation("limit", what, reasons::LIMIT_EXCEEDED)
             .create(),

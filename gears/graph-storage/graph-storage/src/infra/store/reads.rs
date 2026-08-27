@@ -22,6 +22,41 @@ use crate::infra::storage::entity::{edge, graph_meta, gts_type, node};
 use crate::infra::storage::odata_mapper::NodeODataMapper;
 use crate::infra::store::{PgGraphStore, map_db_error, map_scope_err};
 
+/// Classify a failure of the `OData` binding.
+///
+/// A malformed query is not a breached bound: answering "reduce the value" to
+/// a caller who named a field that does not exist sends them the wrong way,
+/// and the two carry different canonical categories. Only the page-size
+/// variant is genuinely `out_of_range`.
+fn map_odata_err(error: toolkit_odata::Error) -> GraphStoreError {
+    use toolkit_odata::Error as E;
+    match error {
+        E::InvalidLimit => GraphStoreError::LimitExceeded {
+            what: error.to_string(),
+        },
+        // The caller named something the projection does not expose. The
+        // declared alternatives are what makes this actionable, so they are
+        // named rather than left for the caller to guess.
+        E::InvalidFilter(_) | E::InvalidOrderByField(_) => GraphStoreError::InvalidQuery {
+            what: format!("{error}; the projection accepts {}", declared_fields()),
+        },
+        other => GraphStoreError::InvalidQuery {
+            what: other.to_string(),
+        },
+    }
+}
+
+/// The fields `$filter` and `$orderby` may name, in the order the filter-field
+/// schema declares them.
+fn declared_fields() -> String {
+    use toolkit_odata::filter::FilterField as _;
+    Field::FIELDS
+        .iter()
+        .map(|f| f.name().to_owned())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The per-tenant revision and the deployment epoch, read together.
 pub async fn revision(
     store: &PgGraphStore,
@@ -338,9 +373,7 @@ pub async fn project_table(
         |model| model,
     )
     .await
-    .map_err(|error| GraphStoreError::LimitExceeded {
-        what: error.to_string(),
-    })?;
+    .map_err(map_odata_err)?;
 
     let mut type_ids: Vec<i32> = page.items.iter().map(|m| m.gts_node_type_id).collect();
     type_ids.sort_unstable();

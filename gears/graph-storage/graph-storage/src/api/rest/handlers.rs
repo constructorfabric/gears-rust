@@ -51,6 +51,12 @@ pub struct ListTypesParams {
     /// got.
     pub pattern: Option<String>,
     pub limit: Option<u32>,
+    /// Anything else the caller sent. Collected so it can be refused: a
+    /// parameter silently ignored is a filter the caller believes is applied,
+    /// which is the failure mode the projection's `OData` binding exists to
+    /// prevent — the catalog owes callers the same.
+    #[serde(flatten)]
+    pub rest: std::collections::BTreeMap<String, String>,
 }
 
 #[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
@@ -59,6 +65,13 @@ pub async fn list_types(
     Extension(services): Extension<Arc<GraphServices>>,
     Query(params): Query<ListTypesParams>,
 ) -> ApiResult<Json<dto::GraphTypeListDto>> {
+    if let Some(unknown) = params.rest.keys().next() {
+        return Err(DomainError::invalid(format!(
+            "`{unknown}` is not an accepted query option; the type catalog takes \
+             `kind`, `pattern` and `limit`"
+        ))
+        .into());
+    }
     let kind = match params.kind.as_deref() {
         None => None,
         Some("node") => Some(m::TypeKind::Node),

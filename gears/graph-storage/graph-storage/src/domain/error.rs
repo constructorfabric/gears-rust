@@ -42,6 +42,14 @@ pub enum DomainError {
     #[error("invalid argument: {message}")]
     InvalidArgument { message: String },
 
+    /// A malformed query: an unknown filter field, an unparseable cursor, an
+    /// ordering the store cannot serve. Its own variant so the stable reason
+    /// says `SCHEMA_VIOLATION` — telling a client that named a field which
+    /// does not exist that they combined limits wrongly sends them the wrong
+    /// way, and `reason` is what a client matches on.
+    #[error("invalid query: {message}")]
+    InvalidQuery { message: String },
+
     /// A documented hard bound exceeded (`out_of_range`); never retry
     /// unchanged.
     #[error("limit exceeded: {what}")]
@@ -137,6 +145,7 @@ impl From<graph_storage_sdk::plugin_api::GraphStoreError> for DomainError {
             E::IdempotencyExpired => Self::IdempotencyExpired,
             E::NotFound => Self::NotFound,
             E::LimitExceeded { what } => Self::LimitExceeded { what },
+            E::InvalidQuery { what } => Self::InvalidQuery { message: what },
             E::Corrupt { reason } => Self::Corrupt { reason },
             E::Unavailable { reason } => Self::Unavailable { detail: reason },
             E::Deadline => Self::Deadline,

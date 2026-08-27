@@ -84,6 +84,13 @@ pub enum GraphStoreError {
     /// A documented hard bound was exceeded.
     #[error("limit exceeded: {what}")]
     LimitExceeded { what: String },
+    /// The query itself is malformed — an unknown filter field, an
+    /// unparseable cursor, an ordering the store cannot serve. Distinct from
+    /// `LimitExceeded`: nothing here is about a bound, and telling a caller
+    /// "reduce the value" when they named a field that does not exist sends
+    /// them the wrong way.
+    #[error("invalid query: {what}")]
+    InvalidQuery { what: String },
     /// Durable corruption detected; operator action.
     #[error("store corrupt: {reason}")]
     Corrupt { reason: String },
