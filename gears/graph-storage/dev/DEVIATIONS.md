@@ -216,14 +216,17 @@ carries five nodes, not the seeded reference graph the criterion names, so the
 thresholds are untested rather than met.
 
 **4. Chain violations, endpoint-constraint violations and wrong-width vectors
-rejected with structured per-item errors — *two of three*.** Chain violations
-come back as per-item field violations addressed by JSON pointer, every
-violation in one response; a wrong-width vector is refused naming both widths.
-**Endpoint constraints are not enforced at all**: `src_types` and `dst_types`
-are resolved into the type's effective traits and then never read — neither in
-the validation path nor in the write path. DESIGN specifies this check runs
-inside the ingest transaction under locks on the endpoint nodes. An edge
-between endpoints its type forbids commits today.
+rejected with structured per-item errors — *met*, after a fix.** Chain
+violations come back as per-item field violations addressed by JSON pointer,
+every violation in one response; a wrong-width vector is refused naming both
+widths. Endpoint constraints were **not enforced at all** when this record was
+first written: `src_types` and `dst_types` were resolved into the type's
+effective traits and then never read, in either the validation or the write
+path, so an edge between endpoints its type forbids committed. Fixed in
+`101ffaa79`, which runs the check where DESIGN puts it — inside the ingest
+transaction, endpoint rows locked — and defers it for a phantom endpoint to
+materialization, per rule 3 of the Phantom Materialization Contract. Two
+conformance cases, one per half, pass against both implementations.
 
 **5. Adversarial multi-tenant tests, zero cross-tenant data in every endpoint
 — *partly*.** Two tenants owning the same node key see only their own row, and
@@ -237,12 +240,19 @@ adversarial case of its own.
 `cargo llvm-cov` has not been run against this gear, so the 85 % line-coverage
 threshold in `nfr-code-coverage` is unknown rather than met.
 
-## Two gaps this sweep found that no entry recorded
+## Gaps this sweep found that no entry recorded
 
 - **Scope replacement removes nothing** (criterion 2 above). The fencing is
-  real; the replacement is not.
-- **Endpoint constraints are never enforced** (criterion 4 above). Parsed,
-  stored, unread.
+  real; the replacement is not. *Open.*
+- **Endpoint constraints were never enforced** (criterion 4 above). Parsed,
+  stored, unread. *Fixed in `101ffaa79`.*
+- **Phantom creation in the PostgreSQL store worked only by accident.** It
+  resolved the phantom node type from the types the batch itself named — and a
+  producer never names it: the type is `x-gts-final` and authored only by the
+  gear. Every phantom that ever appeared did so because some node in the same
+  batch happened to carry that type. Found because the suite had no phantom
+  case at all, which is itself the point: the fake and the store had diverged
+  on a documented contract and nothing was watching. *Fixed in `101ffaa79`.*
 
 ## And one claim the suite makes about itself
 

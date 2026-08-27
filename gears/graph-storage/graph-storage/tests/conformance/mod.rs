@@ -546,7 +546,7 @@ pub async fn materializing_a_phantom_revalidates_its_edges(store: &dyn GraphStor
                 vec![EdgeSpec {
                     type_id: OWNED_ONLY.to_owned(),
                     src_node_key: "owned-1".to_owned(),
-                    dst_node_key: "not-yet".to_owned(),
+                    dst_node_key: "sys:repo:9".to_owned(),
                     ..EdgeSpec::default()
                 }],
             ),
@@ -565,10 +565,10 @@ pub async fn materializing_a_phantom_revalidates_its_edges(store: &dyn GraphStor
             &ctx,
             batch_of(
                 vec![NodeSpec {
-                    node_key: "not-yet".to_owned(),
+                    node_key: "sys:repo:9".to_owned(),
                     type_id: REFERENCE.to_owned(),
                     payload: Some(serde_json::json!({
-                        "source": { "system": "sys", "kind": "repo", "native_id": "7" }
+                        "source": { "system": "sys", "kind": "repo", "native_id": "9" }
                     })),
                     ..NodeSpec::default()
                 }],
@@ -580,11 +580,21 @@ pub async fn materializing_a_phantom_revalidates_its_edges(store: &dyn GraphStor
     let GraphStoreError::Validation { items } = error else {
         panic!("expected a per-item validation failure, got {error}");
     };
-    assert_eq!(items.first().map(|i| i.family), Some(ItemFamily::Node));
+    let item = items.first().expect("one item error");
+    assert_eq!(item.family, ItemFamily::Node);
+    // The reference-node identity rule would refuse a wrong key here too, and
+    // it is a node-family violation just the same. Name the edge, or this case
+    // passes without the revalidation ever running — the key above satisfies
+    // the identity rule precisely so that it cannot.
+    assert!(
+        item.message.contains("would leave edge"),
+        "the refusal must come from the incident edge: {}",
+        item.message
+    );
 
     // Materializing it as an admitted type is accepted.
     let outcome = store
-        .ingest(&ctx, batch_of(vec![node("not-yet", "late")], Vec::new()))
+        .ingest(&ctx, batch_of(vec![node("sys:repo:9", "late")], Vec::new()))
         .await
         .expect("an admitted concrete type materializes the phantom");
     assert_eq!(
