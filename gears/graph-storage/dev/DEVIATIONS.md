@@ -226,7 +226,19 @@ path, so an edge between endpoints its type forbids committed. Fixed in
 `101ffaa79`, which runs the check where DESIGN puts it — inside the ingest
 transaction, endpoint rows locked — and defers it for a phantom endpoint to
 materialization, per rule 3 of the Phantom Materialization Contract. Two
-conformance cases, one per half, pass against both implementations.
+conformance cases, one per half, pass against both implementations, and both
+halves were then exercised on the live stand: the forbidden edge comes back
+`400` with `edges[0]/dst_node_key` and `SCHEMA_VIOLATION`, naming the
+endpoint's actual type and the patterns the edge type accepts; materializing a
+phantom under a type its accumulated edge forbids comes back naming that edge.
+
+The stand also corrected the test. The phantom case first materialized under a
+key the reference-node identity rule already refuses, so the store answered
+before the revalidation ran — and both refusals are node-family item errors,
+so the assertion accepted the wrong one. Caught only because the live run
+printed the message. The case now uses a key the identity rule accepts and
+asserts on the edge named in the message; removing the revalidation call makes
+it fail, which is the check that the first version would have survived.
 
 **5. Adversarial multi-tenant tests, zero cross-tenant data in every endpoint
 — *partly*.** Two tenants owning the same node key see only their own row, and
