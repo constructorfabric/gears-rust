@@ -93,27 +93,23 @@ async fn plan_for(
     ctx: &StoreCtx<'_>,
     request: &IngestRequest,
 ) -> EmbeddingPlan {
-    // The `vector_search` trait of each node's type, resolved the way the
-    // domain service resolves it.
-    let mut paths: std::collections::BTreeMap<String, Vec<String>> =
+    // The type records, resolved as the domain service resolves them, and read
+    // through the same shared function: two copies of this is how the
+    // service's own wiring came to be covered by nothing.
+    let mut records: std::collections::BTreeMap<String, graph_storage_sdk::models::TypeRecord> =
         std::collections::BTreeMap::new();
     for node in &request.nodes {
-        if !paths.contains_key(&node.type_id)
+        if !records.contains_key(&node.type_id)
             && let Ok(record) = store.get_type(ctx, &node.type_id).await
         {
-            paths.insert(node.type_id.clone(), record.effective_traits.vector_search);
+            records.insert(node.type_id.clone(), record);
         }
     }
-    let empty: Vec<String> = Vec::new();
     let nodes = coordinator()
         .plan(
             &request.nodes,
             request.options.embed.unwrap_or(true),
-            |node| {
-                paths
-                    .get(&node.type_id)
-                    .map_or(empty.as_slice(), Vec::as_slice)
-            },
+            |node| graph_storage::domain::embedding::declared_paths(&records, node),
             RemainingBudget::starting_now(Duration::from_secs(30)),
             CancellationToken::new(),
         )

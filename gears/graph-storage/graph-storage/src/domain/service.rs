@@ -20,6 +20,7 @@ use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 
 use crate::config::GraphStorageConfig;
+use crate::domain::embedding;
 use crate::domain::embedding::EmbeddingCoordinator;
 use crate::domain::error::DomainError;
 use crate::domain::traversal::{WalkPlan, walk};
@@ -223,19 +224,12 @@ impl GraphServices {
         // sequence has it (step 5, ahead of step 6). It costs no extra round
         // trip: validation already resolved every type record, so each node's
         // `vector_search` trait is in hand.
-        let no_paths: Vec<String> = Vec::new();
         let plan = self
             .embedding
             .plan(
                 &request.nodes,
                 request.options.embed.unwrap_or(true),
-                |node| {
-                    records
-                        .get(&node.type_id)
-                        .map_or(no_paths.as_slice(), |record| {
-                            record.effective_traits.vector_search.as_slice()
-                        })
-                },
+                |node| embedding::declared_paths(&records, node),
                 store_ctx.budget,
                 store_ctx.cancel.clone(),
             )

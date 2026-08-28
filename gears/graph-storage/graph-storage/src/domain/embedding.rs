@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use aws_lc_rs::digest::{SHA256, digest as sha256};
-use graph_storage_sdk::models::{EmbeddingSpaceId, NodeSpec, RemainingBudget};
+use graph_storage_sdk::models::{EmbeddingSpaceId, NodeSpec, RemainingBudget, TypeRecord};
 use graph_storage_sdk::plugin_api::{
     EmbedRequest, EmbeddingProviderError, EmbeddingProviderV1, NodeEmbedding,
 };
@@ -205,6 +205,27 @@ fn provider_failure(error: EmbeddingProviderError) -> DomainError {
     }
 }
 
+/// The payload paths a node's type declares vectorizable.
+///
+/// Shared rather than inlined at each call site: the domain service and the
+/// conformance suite each resolved this, and while they resolved it
+/// separately the service's version was covered by nothing -- a service that
+/// passed no paths at all would have left every test green.
+///
+/// A type the batch does not resolve yields no paths rather than an error:
+/// validation has already refused unknown types by the time this runs, and a
+/// node with a name and no vectorizable attributes is a legitimate thing to
+/// embed.
+#[must_use]
+pub fn declared_paths<'a>(
+    records: &'a std::collections::BTreeMap<String, TypeRecord>,
+    node: &NodeSpec,
+) -> &'a [String] {
+    records
+        .get(&node.type_id)
+        .map_or(&[], |record| record.effective_traits.vector_search.as_slice())
+}
+
 /// What a store already holds for a node, in the only terms the decision
 /// below needs. Deliberately not the row: the built-in store keeps a
 /// `PgVector` and the fake a `Vec<f32>`, and neither difference matters here.
@@ -342,6 +363,36 @@ mod tests {
             payload: Some(payload),
             expected_version: None,
         }
+    }
+
+    fn record_with(paths: &[&str]) -> TypeRecord {
+        TypeRecord {
+            type_id: "t".to_owned(),
+            type_uuid: uuid::Uuid::nil(),
+            kind: graph_storage_sdk::models::TypeKind::Node,
+            is_abstract: false,
+            schema: serde_json::json!({}),
+            effective_traits: graph_storage_sdk::models::EffectiveTraits {
+                vector_search: paths.iter().map(|p| (*p).to_owned()).collect(),
+                ..graph_storage_sdk::models::EffectiveTraits::default()
+            },
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn declared_paths_come_from_the_node_s_own_type() {
+        let mut records = std::collections::BTreeMap::new();
+        records.insert("t".to_owned(), record_with(&["/payload/summary"]));
+        let node = node("n", serde_json::json!({}));
+        assert_eq!(declared_paths(&records, &node), ["/payload/summary"]);
+    }
+
+    #[test]
+    fn an_unresolved_type_declares_no_paths_rather_than_failing() {
+        let records = std::collections::BTreeMap::new();
+        let node = node("n", serde_json::json!({}));
+        assert!(declared_paths(&records, &node).is_empty());
     }
 
     #[test]
