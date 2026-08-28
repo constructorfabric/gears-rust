@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use graph_storage_sdk::models::{
     ArmHit, SearchArm, SearchHit, SearchMode, SearchRequest, SearchResponse,
 };
-use graph_storage_sdk::plugin_api::{GraphStoreError, StoreCtx};
+use graph_storage_sdk::plugin_api::{GraphStoreError, StoreCtx, VectorArm};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use toolkit_db::secure::{DBRunner, SecureEntityExt};
@@ -32,6 +32,7 @@ pub async fn search(
     store: &PgGraphStore,
     ctx: &StoreCtx<'_>,
     request: SearchRequest,
+    arm: Option<VectorArm>,
 ) -> Result<SearchResponse, GraphStoreError> {
     let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
 
@@ -56,8 +57,13 @@ pub async fn search(
     if matches!(request.mode, SearchMode::Lexical | SearchMode::Hybrid) {
         lexical = lexical_arm(ctx, &conn, &request, type_ids.as_deref()).await?;
     }
-    if matches!(request.mode, SearchMode::Vector | SearchMode::Hybrid) {
-        vector = vector_arm(ctx, &conn, &request, type_ids.as_deref()).await?;
+    // An absent arm is not an empty one by accident: the coordinator resolves
+    // the query vector and the epoch together, and hands over neither when no
+    // comparable space is in force.
+    if let Some(arm) = &arm
+        && matches!(request.mode, SearchMode::Vector | SearchMode::Hybrid)
+    {
+        vector = vector_arm(ctx, &conn, &request, type_ids.as_deref(), arm).await?;
     }
 
     let mut type_name_ids: Vec<i32> = lexical
@@ -136,16 +142,13 @@ async fn vector_arm(
     runner: &impl DBRunner,
     request: &SearchRequest,
     type_ids: Option<&[i32]>,
+    arm: &VectorArm,
 ) -> Result<Vec<node::Model>, GraphStoreError> {
-    let Some(query_vector) = request.query_vector.as_ref() else {
-        return Ok(Vec::new());
-    };
-
     // The literal is the pgvector text form; the cast is what lets the HNSW
     // cosine index serve the ordering.
     let literal = format!(
         "[{}]",
-        query_vector
+        arm.query_vector
             .iter()
             .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
@@ -160,7 +163,13 @@ async fn vector_arm(
         .secure()
         .scope_with(ctx.scope)
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-        .filter(Condition::all().add(node::Column::Embedding.is_not_null()));
+        .filter(Condition::all().add(node::Column::Embedding.is_not_null()))
+        // Only *current* vectors rank (`fr-embedding-pipeline`). A vector of
+        // another epoch was made by another model, and a vector whose input
+        // changed while embedding was skipped carries a NULL epoch: neither
+        // is comparable with this query, and both would rank content that is
+        // no longer stored.
+        .filter(Condition::all().add(node::Column::EmbeddingEpoch.eq(arm.epoch)));
     if let Some(ids) = type_ids {
         select =
             select.filter(Condition::all().add(node::Column::GtsNodeTypeId.is_in(ids.to_vec())));

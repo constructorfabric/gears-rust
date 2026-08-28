@@ -123,6 +123,7 @@ pub async fn ingest(
         options: m::IngestOptions {
             create_phantoms: request.options.create_phantoms,
             report_per_item: request.options.report_per_item,
+            embed: request.options.embed,
         },
         replace_scope: request.replace_scope.map(Into::into),
         idempotency_key: key,
@@ -225,7 +226,6 @@ pub async fn search(
             m::SearchRequest {
                 mode,
                 query: request.query,
-                query_vector: request.query_vector,
                 arm_limit,
                 limit: request.limit.unwrap_or(arm_limit),
                 type_patterns: request.type_patterns,

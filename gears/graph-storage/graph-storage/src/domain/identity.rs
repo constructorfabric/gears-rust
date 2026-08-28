@@ -60,7 +60,6 @@ fn node_value(node: &graph_storage_sdk::models::NodeSpec) -> Value {
         "type": node.type_id,
         "name": node.name,
         "payload": node.payload.as_ref().map(canonicalize),
-        "embedding_len": node.embedding.as_ref().map(Vec::len),
         "expected_version": node.expected_version,
     })
 }
@@ -89,6 +88,10 @@ pub fn ingest_request_hash(request: &IngestRequest) -> String {
             })
         }),
         "create_phantoms": request.options.create_phantoms,
+        // `embed` is part of the request's identity: the same nodes ingested
+        // with and without embedding leave the store in different states, so
+        // a replay of one must not be answered with the other's receipt.
+        "embed": request.options.embed,
     });
     hex::encode(sha256(&SHA256, canonical.to_string().as_bytes()))
 }

@@ -93,6 +93,13 @@ pub enum DomainError {
     #[error("no implementation can serve this scope: {reason}")]
     ScopeUnservable { reason: String },
 
+    /// Stored vectors and the active provider belong to different embedding
+    /// spaces, so nothing can rank one against the other
+    /// (`failed_precondition`). Only the vector arm is affected: every other
+    /// path serves the same rows it always did.
+    #[error("vector search unavailable: {reason}")]
+    VectorSearchUnavailable { reason: String },
+
     /// Capability not supported by the selected implementation
     /// (`unimplemented`).
     #[error("capability unsupported: {what}")]

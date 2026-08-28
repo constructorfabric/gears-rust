@@ -9,6 +9,7 @@
 pub mod ingest;
 pub mod reads;
 pub mod search;
+pub mod spaces;
 pub mod types;
 
 use std::sync::Arc;
@@ -20,7 +21,9 @@ use graph_storage_sdk::models::{
     ReadSnapshot, RevisionOutcome, SearchRequest, SearchResponse, StoreCapabilities, TopologyPage,
     TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
 };
-use graph_storage_sdk::plugin_api::{GraphStoreError, GraphStoreV1, StoreCtx};
+use graph_storage_sdk::plugin_api::{
+    EmbeddingPlan, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
+};
 use toolkit_db::secure::{Db, ScopeError};
 
 use crate::config::GraphStorageConfig;
@@ -187,8 +190,9 @@ impl GraphStoreV1 for PgGraphStore {
         &self,
         ctx: &StoreCtx<'_>,
         req: IngestRequest,
+        embedding: EmbeddingPlan,
     ) -> Result<IngestOutcome, GraphStoreError> {
-        ingest::ingest(self, ctx, req).await
+        ingest::ingest(self, ctx, req, embedding).await
     }
 
     async fn soft_delete(
@@ -260,8 +264,9 @@ impl GraphStoreV1 for PgGraphStore {
         &self,
         ctx: &StoreCtx<'_>,
         req: SearchRequest,
+        vector: Option<VectorArm>,
     ) -> Result<SearchResponse, GraphStoreError> {
-        search::search(self, ctx, req).await
+        search::search(self, ctx, req, vector).await
     }
 
     async fn project_table(

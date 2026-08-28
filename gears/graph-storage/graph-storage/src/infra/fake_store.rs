@@ -14,13 +14,17 @@ use graph_storage_sdk::models::{
     AdjacencyEntry, AdjacencySide, DeleteOutcome, DeleteRequest, GraphRevision, GtsTypeId,
     IngestCounts, IngestOutcome, IngestRequest, ItemError, ItemFamily, LabelAssignment, LabelId,
     LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page, ProjectionRequest,
-    ReadSnapshot, RevisionOutcome, SearchRequest, SearchResponse, StoreCapabilities, TopologyPage,
+    ReadSnapshot, RevisionOutcome, SearchMode, SearchRequest, SearchResponse, StoreCapabilities,
+    TopologyPage,
     TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
 };
-use graph_storage_sdk::plugin_api::{GraphStoreError, GraphStoreV1, StoreCtx};
+use graph_storage_sdk::plugin_api::{
+    EmbeddingPlan, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::domain::embedding::{PlannedVector, StoredVector, VectorOutcome, decide_vector};
 use crate::domain::{identity, ontology};
 
 #[derive(Clone)]
@@ -30,7 +34,13 @@ struct FakeNode {
     type_id: String,
     name: Option<String>,
     payload: Option<serde_json::Value>,
-    has_embedding: bool,
+    /// The real vector, not a flag: the fake serves an actual cosine arm, so
+    /// the acceptance test -- a document retrieved by its own text -- runs
+    /// against both implementations rather than only the one with a database.
+    embedding: Option<Vec<f32>>,
+    /// `None` marks a vector that must not rank: absent, or stale.
+    embedding_epoch: Option<i64>,
+    embedding_input_hash: Option<String>,
     version: i64,
     deleted: bool,
 }
@@ -139,7 +149,8 @@ impl GraphStoreV1 for FakeGraphStore {
         StoreCapabilities {
             scope_replace: true,
             snapshots: true,
-            vector_search: false,
+            // A real cosine arm over the stored vectors, not a stub.
+            vector_search: true,
             labels: false,
             chunks: false,
             topology: false,
@@ -291,6 +302,7 @@ impl GraphStoreV1 for FakeGraphStore {
         &self,
         ctx: &StoreCtx<'_>,
         req: IngestRequest,
+        embedding: EmbeddingPlan,
     ) -> Result<IngestOutcome, GraphStoreError> {
         let mut tenants = self.tenants.lock().map_err(|_| poisoned())?;
         let tenant = tenants.entry(ctx.tenant).or_default();
@@ -322,15 +334,36 @@ impl GraphStoreV1 for FakeGraphStore {
         let mut counts = IngestCounts::default();
         let mut changed = false;
 
+        let mut state = BatchState {
+            next_id: &mut next_id,
+            counts: &mut counts,
+        };
         for (index, spec) in req.nodes.iter().enumerate() {
+            let decided = embedding.nodes.get(index).ok_or_else(|| {
+                GraphStoreError::Internal(format!(
+                    "embedding plan covers {} nodes; the batch has {}",
+                    embedding.nodes.len(),
+                    req.nodes.len()
+                ))
+            })?;
+            // Resolved before the borrow `apply_node` takes, and from the same
+            // shared decision the built-in store uses: a vector state that only
+            // one implementation gets right is one the suite cannot see.
+            let vector = plan_vector(
+                nodes.iter().find(|n| n.key == spec.node_key),
+                PlannedVector {
+                    decided,
+                    active_epoch: embedding.epoch,
+                },
+            );
             changed |= apply_node(
                 tenant,
                 &mut nodes,
                 &edges,
-                &mut next_id,
-                &mut counts,
+                &mut state,
                 index,
                 spec,
+                vector,
             )?;
         }
         for (index, spec) in req.edges.iter().enumerate() {
@@ -338,8 +371,7 @@ impl GraphStoreV1 for FakeGraphStore {
                 tenant,
                 &mut nodes,
                 &mut edges,
-                &mut next_id,
-                &mut counts,
+                &mut state,
                 index,
                 spec,
                 req.options.create_phantoms.unwrap_or(true),
@@ -553,6 +585,7 @@ impl GraphStoreV1 for FakeGraphStore {
         &self,
         ctx: &StoreCtx<'_>,
         req: SearchRequest,
+        vector: Option<VectorArm>,
     ) -> Result<SearchResponse, GraphStoreError> {
         if !scope_admits(ctx.scope, ctx.tenant) {
             return Ok(SearchResponse {
@@ -564,43 +597,67 @@ impl GraphStoreV1 for FakeGraphStore {
             });
         }
         // Substring matching, not a text-search engine: enough to assert that
-        // scoping and revision stamping hold on every arm.
+        // scoping and revision stamping hold on every arm. The vector arm, by
+        // contrast, is real cosine over the stored vectors -- the acceptance
+        // test (a document retrieved by its own text) has to mean the same
+        // thing here as against the database.
         let tenants = self.tenants.lock().map_err(|_| poisoned())?;
         let Some(tenant) = tenants.get(&ctx.tenant) else {
             return Err(GraphStoreError::NotFound);
         };
         let (nodes, _, revision) = visible(tenant, ctx);
-        let needle = req.query.unwrap_or_default().to_lowercase();
-        let hits = nodes
-            .iter()
-            .filter(|n| !n.deleted)
-            .filter(|n| {
-                needle.is_empty()
-                    || n.name
-                        .as_deref()
-                        .unwrap_or_default()
-                        .to_lowercase()
-                        .contains(&needle)
-            })
-            .take(req.limit as usize)
-            .enumerate()
-            .map(|(position, n)| graph_storage_sdk::models::SearchHit {
-                node_key: n.key.clone(),
-                type_id: n.type_id.clone(),
-                name: n.name.clone(),
-                score: 1.0 / (60.0 + f64::from(u32::try_from(position).unwrap_or(u32::MAX)) + 1.0),
-                arms: vec![graph_storage_sdk::models::ArmHit {
-                    arm: graph_storage_sdk::models::SearchArm::Lexical,
-                    rank: u32::try_from(position)
-                        .unwrap_or(u32::MAX)
-                        .saturating_add(1),
-                    score: 1.0,
-                }],
-                snippet: None,
-            })
-            .collect();
+        let live: Vec<&FakeNode> = nodes.iter().filter(|n| !n.deleted).collect();
+
+        let lexical: Vec<&FakeNode> =
+            if matches!(req.mode, SearchMode::Lexical | SearchMode::Hybrid) {
+                let needle = req.query.clone().unwrap_or_default().to_lowercase();
+                live.iter()
+                    .copied()
+                    .filter(|n| {
+                        needle.is_empty()
+                            || n.name
+                                .as_deref()
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .contains(&needle)
+                    })
+                    .take(req.arm_limit as usize)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        let ranked: Vec<&FakeNode> = match &vector {
+            Some(arm) if matches!(req.mode, SearchMode::Vector | SearchMode::Hybrid) => {
+                // Only current vectors rank: a vector of another epoch came
+                // from another model, and one whose input changed carries no
+                // epoch at all.
+                let mut scored: Vec<(f64, &FakeNode)> = live
+                    .iter()
+                    .copied()
+                    .filter(|n| n.embedding_epoch == Some(arm.epoch))
+                    .filter_map(|n| {
+                        n.embedding
+                            .as_ref()
+                            .map(|stored| (cosine_distance(stored, &arm.query_vector), n))
+                    })
+                    .collect();
+                scored.sort_by(|a, b| {
+                    a.0.partial_cmp(&b.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.id.cmp(&b.1.id))
+                });
+                scored
+                    .into_iter()
+                    .map(|(_, n)| n)
+                    .take(req.arm_limit as usize)
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
         Ok(SearchResponse {
-            hits,
+            hits: fuse_arms(&lexical, &ranked, req.limit as usize),
             revision: GraphRevision {
                 source_epoch: self.epoch,
                 revision,
@@ -843,7 +900,7 @@ fn view_of(node: &FakeNode, adjacency: Vec<AdjacencyEntry>, truncated: bool) -> 
         type_id: node.type_id.clone(),
         name: node.name.clone(),
         payload: node.payload.clone(),
-        has_embedding: node.has_embedding,
+        has_embedding: node.embedding.is_some(),
         labels: Vec::new(),
         adjacency,
         adjacency_truncated: truncated,
@@ -877,14 +934,66 @@ fn fence(
 }
 
 /// Apply one node spec to the working copy. Returns whether it changed state.
+/// The mutable bookkeeping one batch carries from item to item: the id
+/// allocator and the running tally. They travel together because every write
+/// touches both, and separately they made every `apply_*` signature two
+/// parameters longer than it had any reason to be.
+struct BatchState<'a> {
+    next_id: &'a mut i64,
+    counts: &'a mut IngestCounts,
+}
+
+/// The vector columns of one fake row, spelled from the shared decision.
+struct VectorWrite {
+    embedding: Option<Vec<f32>>,
+    epoch: Option<i64>,
+    input_hash: Option<String>,
+}
+
+fn plan_vector(
+    current: Option<&FakeNode>,
+    planned: PlannedVector<'_>,
+) -> VectorWrite {
+    let stored = current.map(|row| StoredVector {
+        has_vector: row.embedding.is_some(),
+        input_hash: row.embedding_input_hash.as_deref(),
+    });
+    match decide_vector(stored, planned) {
+        VectorOutcome::Store {
+            vector,
+            epoch,
+            input_hash,
+        } => VectorWrite {
+            embedding: Some(vector),
+            epoch,
+            input_hash: Some(input_hash),
+        },
+        VectorOutcome::Absent { input_hash } => VectorWrite {
+            embedding: None,
+            epoch: None,
+            input_hash: Some(input_hash),
+        },
+        VectorOutcome::Preserve => VectorWrite {
+            embedding: current.and_then(|row| row.embedding.clone()),
+            epoch: current.and_then(|row| row.embedding_epoch),
+            input_hash: current.and_then(|row| row.embedding_input_hash.clone()),
+        },
+        VectorOutcome::Stale => VectorWrite {
+            embedding: current.and_then(|row| row.embedding.clone()),
+            epoch: None,
+            input_hash: current.and_then(|row| row.embedding_input_hash.clone()),
+        },
+    }
+}
+
 fn apply_node(
     tenant: &Tenant,
     nodes: &mut Vec<FakeNode>,
     edges: &[FakeEdge],
-    next_id: &mut i64,
-    counts: &mut IngestCounts,
+    state: &mut BatchState<'_>,
     index: usize,
     spec: &graph_storage_sdk::models::NodeSpec,
+    vector: VectorWrite,
 ) -> Result<bool, GraphStoreError> {
     let record = tenant.types.get(&spec.type_id).ok_or_else(|| {
         validation(
@@ -904,18 +1013,20 @@ fn apply_node(
     }
 
     let Some(existing) = nodes.iter_mut().find(|n| n.key == spec.node_key) else {
-        *next_id += 1;
+        *state.next_id += 1;
         nodes.push(FakeNode {
-            id: *next_id,
+            id: *state.next_id,
             key: spec.node_key.clone(),
             type_id: spec.type_id.clone(),
             name: spec.name.clone(),
             payload: spec.payload.clone(),
-            has_embedding: spec.embedding.is_some(),
+            embedding: vector.embedding,
+            embedding_epoch: vector.epoch,
+            embedding_input_hash: vector.input_hash,
             version: 1,
             deleted: false,
         });
-        counts.nodes_inserted += 1;
+        state.counts.nodes_inserted += 1;
         return Ok(true);
     };
 
@@ -956,12 +1067,17 @@ fn apply_node(
         }
     }
 
+    let vector_unchanged = (
+        &existing.embedding,
+        existing.embedding_epoch,
+        &existing.embedding_input_hash,
+    ) == (&vector.embedding, vector.epoch, &vector.input_hash);
     let unchanged = same_type
         && existing.name == spec.name
         && existing.payload == spec.payload
-        && existing.has_embedding == spec.embedding.is_some();
+        && vector_unchanged;
     if unchanged {
-        counts.nodes_unchanged += 1;
+        state.counts.nodes_unchanged += 1;
         return Ok(false);
     }
 
@@ -975,12 +1091,14 @@ fn apply_node(
     existing.type_id.clone_from(&spec.type_id);
     existing.name.clone_from(&spec.name);
     existing.payload.clone_from(&spec.payload);
-    existing.has_embedding = spec.embedding.is_some();
+    existing.embedding = vector.embedding;
+    existing.embedding_epoch = vector.epoch;
+    existing.embedding_input_hash = vector.input_hash;
     existing.version += 1;
     if same_type {
-        counts.nodes_updated += 1;
+        state.counts.nodes_updated += 1;
     } else {
-        counts.phantoms_materialized += 1;
+        state.counts.phantoms_materialized += 1;
     }
     Ok(true)
 }
@@ -1039,8 +1157,7 @@ fn revalidate_incident_edges(
 fn apply_endpoint(
     tenant: &Tenant,
     nodes: &mut Vec<FakeNode>,
-    next_id: &mut i64,
-    counts: &mut IngestCounts,
+    state: &mut BatchState<'_>,
     index: usize,
     type_id: &str,
     key: &str,
@@ -1069,33 +1186,29 @@ fn apply_endpoint(
                 "an endpoint does not exist and no phantom type is registered",
             )
         })?;
-    *next_id += 1;
+    *state.next_id += 1;
     nodes.push(FakeNode {
-        id: *next_id,
+        id: *state.next_id,
         key: key.to_owned(),
         type_id: phantom_type.type_id.clone(),
         name: None,
         payload: None,
-        has_embedding: false,
+        embedding: None,
+        embedding_epoch: None,
+        embedding_input_hash: None,
         version: 1,
         deleted: false,
     });
-    counts.phantoms_created += 1;
-    Ok(*next_id)
+    state.counts.phantoms_created += 1;
+    Ok(*state.next_id)
 }
 
 /// Apply one edge spec to the working copy. Returns whether it changed state.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the working copies are threaded explicitly so the batch stays \
-              atomic; bundling them into a struct would only rename them"
-)]
 fn apply_edge(
     tenant: &Tenant,
     nodes: &mut Vec<FakeNode>,
     edges: &mut Vec<FakeEdge>,
-    next_id: &mut i64,
-    counts: &mut IngestCounts,
+    state: &mut BatchState<'_>,
     index: usize,
     spec: &graph_storage_sdk::models::EdgeSpec,
     create_phantoms: bool,
@@ -1109,12 +1222,11 @@ fn apply_edge(
         )
     })?;
 
-    let before = counts.phantoms_created;
+    let before = state.counts.phantoms_created;
     let src = apply_endpoint(
         tenant,
         nodes,
-        next_id,
-        counts,
+        state,
         index,
         &spec.type_id,
         &spec.src_node_key,
@@ -1123,14 +1235,13 @@ fn apply_edge(
     let dst = apply_endpoint(
         tenant,
         nodes,
-        next_id,
-        counts,
+        state,
         index,
         &spec.type_id,
         &spec.dst_node_key,
         create_phantoms,
     )?;
-    let mut changed = counts.phantoms_created > before;
+    let mut changed = state.counts.phantoms_created > before;
 
     // Endpoint constraints. A phantom endpoint is skipped: its concrete type
     // is not known yet, and the materialization path revalidates then.
@@ -1182,12 +1293,12 @@ fn apply_edge(
     let edge_key = identity::derive_edge_key(record.type_uuid, spec);
     match edges.iter_mut().find(|e| e.key == edge_key) {
         Some(existing) if existing.payload == spec.payload && !existing.deleted => {
-            counts.edges_unchanged += 1;
+            state.counts.edges_unchanged += 1;
         }
         Some(existing) => {
             existing.payload.clone_from(&spec.payload);
             existing.deleted = false;
-            counts.edges_updated += 1;
+            state.counts.edges_updated += 1;
             changed = true;
         }
         None => {
@@ -1199,7 +1310,7 @@ fn apply_edge(
                 payload: spec.payload.clone(),
                 deleted: false,
             });
-            counts.edges_inserted += 1;
+            state.counts.edges_inserted += 1;
             changed = true;
         }
     }
@@ -1213,4 +1324,72 @@ fn empty_page_info() -> toolkit_odata::page::PageInfo {
         prev_cursor: None,
         limit: 0,
     }
+}
+
+/// Cosine distance, the same measure pgvector's `<=>` operator serves.
+fn cosine_distance(one: &[f32], other: &[f32]) -> f64 {
+    let dot: f64 = one
+        .iter()
+        .zip(other)
+        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+        .sum();
+    let norm = |v: &[f32]| -> f64 { v.iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>().sqrt() };
+    let (left, right) = (norm(one), norm(other));
+    if left == 0.0 || right == 0.0 {
+        return 1.0;
+    }
+    1.0 - dot / (left * right)
+}
+
+/// Reciprocal Rank Fusion over the two arms, with the same constant the
+/// built-in store uses. Hits report which arms matched and at what rank, so a
+/// caller can tell a lexical hit from a semantic one.
+fn fuse_arms(
+    lexical: &[&FakeNode],
+    vector: &[&FakeNode],
+    limit: usize,
+) -> Vec<graph_storage_sdk::models::SearchHit> {
+    use graph_storage_sdk::models::{ArmHit, SearchArm, SearchHit};
+    const K: f64 = 60.0;
+
+    let mut order: Vec<i64> = Vec::new();
+    let mut fused: BTreeMap<i64, (f64, Vec<ArmHit>, &FakeNode)> = BTreeMap::new();
+    for (arm, rows) in [(SearchArm::Lexical, lexical), (SearchArm::Vector, vector)] {
+        for (position, node) in rows.iter().enumerate() {
+            let rank = u32::try_from(position).unwrap_or(u32::MAX).saturating_add(1);
+            let contribution = 1.0 / (K + f64::from(rank));
+            let entry = fused
+                .entry(node.id)
+                .or_insert_with(|| (0.0, Vec::new(), node));
+            if entry.1.is_empty() {
+                order.push(node.id);
+            }
+            entry.0 += contribution;
+            entry.1.push(ArmHit {
+                arm,
+                rank,
+                score: contribution,
+            });
+        }
+    }
+
+    let mut hits: Vec<SearchHit> = order
+        .into_iter()
+        .filter_map(|id| fused.get(&id))
+        .map(|(score, arms, node)| SearchHit {
+            node_key: node.key.clone(),
+            type_id: node.type_id.clone(),
+            name: node.name.clone(),
+            score: *score,
+            arms: arms.clone(),
+            snippet: None,
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(limit);
+    hits
 }

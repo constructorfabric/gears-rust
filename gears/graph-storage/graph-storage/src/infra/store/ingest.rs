@@ -13,7 +13,7 @@ use graph_storage_sdk::models::{
     DeleteOutcome, DeleteRequest, EdgeSpec, EffectiveTraits, GraphRevision, IngestCounts,
     IngestOutcome, IngestRequest, ItemError, ItemFamily, NodeSpec, ReplaceScope,
 };
-use graph_storage_sdk::plugin_api::{GraphStoreError, StoreCtx};
+use graph_storage_sdk::plugin_api::{EmbeddingPlan, GraphStoreError, StoreCtx};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, QueryFilter};
 use time::OffsetDateTime;
@@ -21,6 +21,7 @@ use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureInsertExt, SecureUpdat
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use crate::domain::embedding::{PlannedVector, StoredVector, VectorOutcome, decide_vector};
 use crate::domain::identity;
 use crate::infra::storage::entity::{edge, graph_meta, ingest_idempotency, node, scope_registry};
 use crate::infra::store::types::interned_ids;
@@ -258,6 +259,7 @@ pub async fn ingest(
     store: &PgGraphStore,
     ctx: &StoreCtx<'_>,
     request: IngestRequest,
+    embedding: EmbeddingPlan,
 ) -> Result<IngestOutcome, GraphStoreError> {
     let tenant = ctx.tenant;
     let scope = ctx.scope.clone();
@@ -267,10 +269,11 @@ pub async fn ingest(
         .db()
         .transaction_ref_mapped::<_, IngestOutcome, TxStoreError>(move |tx| {
             let request = request.clone();
+            let embedding = embedding.clone();
             let scope = scope.clone();
             let producer = producer.clone();
             Box::pin(async move {
-                ingest_in_tx(tenant, &scope, &producer, tx, request)
+                ingest_in_tx(tenant, &scope, &producer, tx, request, &embedding)
                     .await
                     .map_err(TxStoreError::from)
             })
@@ -285,6 +288,7 @@ async fn ingest_in_tx(
     producer: &str,
     tx: &impl DBRunner,
     request: IngestRequest,
+    embedding: &EmbeddingPlan,
 ) -> Result<IngestOutcome, GraphStoreError> {
     let epoch = source_epoch(scope, tx).await?;
     let request_hash = identity::ingest_request_hash(&request);
@@ -318,6 +322,7 @@ async fn ingest_in_tx(
         &types,
         &mut node_ids,
         &mut counts,
+        embedding,
     )
     .await?;
 
@@ -628,6 +633,66 @@ fn endpoint_admitted(
     })
 }
 
+/// The three vector columns an upsert writes, resolved together because they
+/// are only meaningful together.
+///
+/// The *decision* is `domain::embedding::decide_vector`, shared with every
+/// other store; this only spells it onto columns. The encoding (recorded in
+/// `dev/DEVIATIONS.md`, since the FR names the states and not their
+/// representation):
+///
+/// | state | `embedding` | `embedding_epoch` | `embedding_input_hash` |
+/// |---|---|---|---|
+/// | embedded and current | the new vector | active epoch | the new input's hash |
+/// | absent | NULL | NULL | the current input's hash |
+/// | preserved | kept | kept | kept |
+/// | stale | kept | **NULL** | kept |
+///
+/// The vector arm reads `embedding_epoch = <active>`, so "only current
+/// vectors are searchable" is one equality rather than a rule every query has
+/// to remember.
+struct VectorWrite {
+    embedding: Option<sea_orm::entity::prelude::PgVector>,
+    epoch: Option<i64>,
+    input_hash: Option<String>,
+}
+
+fn plan_vector(
+    current: Option<&node::Model>,
+    planned: PlannedVector<'_>,
+) -> VectorWrite {
+    let stored = current.map(|row| StoredVector {
+        has_vector: row.embedding.is_some(),
+        input_hash: row.embedding_input_hash.as_deref(),
+    });
+    match decide_vector(stored, planned) {
+        VectorOutcome::Store {
+            vector,
+            epoch,
+            input_hash,
+        } => VectorWrite {
+            embedding: Some(sea_orm::entity::prelude::PgVector::from(vector)),
+            epoch,
+            input_hash: Some(input_hash),
+        },
+        VectorOutcome::Absent { input_hash } => VectorWrite {
+            embedding: None,
+            epoch: None,
+            input_hash: Some(input_hash),
+        },
+        VectorOutcome::Preserve => VectorWrite {
+            embedding: current.and_then(|row| row.embedding.clone()),
+            epoch: current.and_then(|row| row.embedding_epoch),
+            input_hash: current.and_then(|row| row.embedding_input_hash.clone()),
+        },
+        VectorOutcome::Stale => VectorWrite {
+            embedding: current.and_then(|row| row.embedding.clone()),
+            epoch: None,
+            input_hash: current.and_then(|row| row.embedding_input_hash.clone()),
+        },
+    }
+}
+
 async fn upsert_node(
     tenant: Uuid,
     scope: &AccessScope,
@@ -635,6 +700,7 @@ async fn upsert_node(
     spec: &NodeSpec,
     info: &TypeInfo,
     index: usize,
+    planned: PlannedVector<'_>,
 ) -> Result<(i64, NodeWrite), GraphStoreError> {
     let existing = node::Entity::find()
         .secure()
@@ -650,10 +716,7 @@ async fn upsert_node(
         .unwrap_or_else(|| serde_json::json!({}));
     let name = spec.name.clone().unwrap_or_default();
     let search_text = compose_search_text(spec, &info.full_text_search);
-    let embedding = spec
-        .embedding
-        .clone()
-        .map(sea_orm::entity::prelude::PgVector::from);
+    let vector = plan_vector(existing.as_ref(), planned);
     let now = OffsetDateTime::now_utc();
 
     let Some(current) = existing else {
@@ -665,9 +728,9 @@ async fn upsert_node(
             name: ActiveValue::Set(name),
             payload: ActiveValue::Set(payload),
             search_text: ActiveValue::Set(search_text),
-            embedding: ActiveValue::Set(embedding),
-            embedding_epoch: ActiveValue::Set(None),
-            embedding_input_hash: ActiveValue::Set(None),
+            embedding: ActiveValue::Set(vector.embedding),
+            embedding_epoch: ActiveValue::Set(vector.epoch),
+            embedding_input_hash: ActiveValue::Set(vector.input_hash),
             source_namespace: ActiveValue::Set(None),
             owner_principal: ActiveValue::Set(String::new()),
             created_by: ActiveValue::Set(String::new()),
@@ -732,7 +795,9 @@ async fn upsert_node(
     let unchanged = current.name == name
         && current.payload == payload
         && current.search_text == search_text
-        && current.embedding == embedding
+        && current.embedding == vector.embedding
+        && current.embedding_epoch == vector.epoch
+        && current.embedding_input_hash == vector.input_hash
         && !materializing;
     if unchanged {
         return Ok((current.id, NodeWrite::Unchanged));
@@ -749,7 +814,12 @@ async fn upsert_node(
         .col_expr(node::Column::Name, Expr::value(name))
         .col_expr(node::Column::Payload, Expr::value(payload))
         .col_expr(node::Column::SearchText, Expr::value(search_text))
-        .col_expr(node::Column::Embedding, Expr::value(embedding))
+        .col_expr(node::Column::Embedding, Expr::value(vector.embedding))
+        .col_expr(node::Column::EmbeddingEpoch, Expr::value(vector.epoch))
+        .col_expr(
+            node::Column::EmbeddingInputHash,
+            Expr::value(vector.input_hash),
+        )
         .col_expr(node::Column::Version, Expr::value(version))
         .col_expr(node::Column::UpdatedAt, Expr::value(now))
         .filter(Condition::all().add(node::Column::Id.eq(id)))
@@ -1057,6 +1127,7 @@ async fn write_nodes(
     types: &BTreeMap<String, TypeInfo>,
     node_ids: &mut BTreeMap<String, Endpoint>,
     counts: &mut IngestCounts,
+    embedding: &EmbeddingPlan,
 ) -> Result<bool, GraphStoreError> {
     let mut changed = false;
     for (index, spec) in request.nodes.iter().enumerate() {
@@ -1068,7 +1139,29 @@ async fn write_nodes(
                 "type is not registered".into(),
             )
         })?;
-        let (id, write) = upsert_node(tenant, scope, tx, spec, info, index).await?;
+        // Index-aligned with the request's nodes, by the port's contract. A
+        // missing entry would silently unembed a node, so it is a store
+        // failure rather than a default.
+        let decided = embedding.nodes.get(index).ok_or_else(|| {
+            GraphStoreError::Internal(format!(
+                "embedding plan covers {} nodes; the batch has {}",
+                embedding.nodes.len(),
+                request.nodes.len()
+            ))
+        })?;
+        let (id, write) = upsert_node(
+            tenant,
+            scope,
+            tx,
+            spec,
+            info,
+            index,
+            PlannedVector {
+                decided,
+                active_epoch: embedding.epoch,
+            },
+        )
+        .await?;
         node_ids.insert(
             spec.node_key.clone(),
             Endpoint {

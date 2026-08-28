@@ -98,24 +98,24 @@ async fn one_snapshot_spans_every_arm_of_one_read() {
         .register_types(&ctx, conformance::ontology_batch())
         .await
         .expect("ontology registers");
-    store
-        .ingest(
-            &ctx,
-            conformance::batch(vec![conformance::node("snap-1", "before")], Vec::new()),
-        )
-        .await
-        .expect("the batch commits");
+    conformance::ingest_batch(
+        &store,
+        &ctx,
+        conformance::batch(vec![conformance::node("snap-1", "before")], Vec::new()),
+    )
+    .await
+    .expect("the batch commits");
 
     let snapshot = store.begin_read(&ctx).await.expect("snapshot opens");
 
     // A concurrent commit lands between the arms of the compound read.
-    store
-        .ingest(
-            &ctx,
-            conformance::batch(vec![conformance::node("snap-2", "after")], Vec::new()),
-        )
-        .await
-        .expect("the concurrent batch commits");
+    conformance::ingest_batch(
+        &store,
+        &ctx,
+        conformance::batch(vec![conformance::node("snap-2", "after")], Vec::new()),
+    )
+    .await
+    .expect("the concurrent batch commits");
 
     let under = conformance::ctx(tenant, &scope, Some(&snapshot));
     let page = store

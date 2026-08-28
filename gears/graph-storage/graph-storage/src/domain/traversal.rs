@@ -194,6 +194,19 @@ mod tests {
             dst_node_key: to.to_owned(),
             ..EdgeSpec::default()
         };
+        // This case walks edges; vectors are beside the point, so the plan
+        // records three unembedded nodes rather than dragging a provider in.
+        let unembedded = graph_storage_sdk::plugin_api::EmbeddingPlan {
+            epoch: None,
+            nodes: ["a", "b", "c"]
+                .iter()
+                .map(|key| {
+                    graph_storage_sdk::plugin_api::NodeEmbedding::skipped(
+                        crate::domain::embedding::input_hash(key),
+                    )
+                })
+                .collect(),
+        };
         store
             .ingest(
                 &ctx,
@@ -202,6 +215,7 @@ mod tests {
                     edges: vec![link("a", "b"), link("b", "c")],
                     ..IngestRequest::default()
                 },
+                unembedded,
             )
             .await
             .unwrap_or_else(|e| panic!("the batch commits: {e}"));

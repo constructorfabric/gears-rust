@@ -158,7 +158,7 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
 async fn tenant_on(stand: &Stand) -> Uuid {
     let tenant = Uuid::now_v7();
     let scope = AccessScope::for_tenant(tenant);
-    graph_storage::infra::store::ingest::ensure_meta(&stand.store, tenant, &scope)
+    graph_storage::infra::store::ingest::ensure_meta(stand.store.as_ref(), tenant, &scope)
         .await
         .expect("meta rows exist");
     tenant
@@ -256,9 +256,8 @@ async fn the_pattern_hop_walks_the_graph() {
         .register_types(&ctx, conformance::ontology_batch())
         .await
         .expect("ontology registers");
-    stand
-        .store
-        .ingest(
+    conformance::ingest_batch(
+            stand.store.as_ref(),
             &ctx,
             conformance::batch(
                 vec![
@@ -313,9 +312,8 @@ async fn seed_and_expand(stand: &Stand, direction: Direction) -> (Vec<i64>, Vec<
         .register_types(&ctx, conformance::ontology_batch())
         .await
         .expect("ontology registers");
-    stand
-        .store
-        .ingest(
+    conformance::ingest_batch(
+            stand.store.as_ref(),
             &ctx,
             conformance::batch(
                 vec![
@@ -418,9 +416,8 @@ async fn a_hop_never_leaves_its_tenant() {
             .register_types(&ctx, conformance::ontology_batch())
             .await
             .expect("ontology registers");
-        stand
-            .store
-            .ingest(
+        conformance::ingest_batch(
+                stand.store.as_ref(),
                 &ctx,
                 conformance::batch(
                     vec![
@@ -550,9 +547,8 @@ async fn traversal_answers_on_a_server_without_the_property_graph() {
         .register_types(&ctx, conformance::ontology_batch())
         .await
         .expect("ontology registers");
-    stand
-        .store
-        .ingest(
+    conformance::ingest_batch(
+            stand.store.as_ref(),
             &ctx,
             conformance::batch(
                 vec![conformance::node("p-a", "a"), conformance::node("p-b", "b")],
@@ -671,9 +667,8 @@ async fn the_built_in_store_declines_the_snapshot_obligation() {
         .register_types(&ctx, conformance::ontology_batch())
         .await
         .expect("ontology registers");
-    stand
-        .store
-        .ingest(
+    conformance::ingest_batch(
+            stand.store.as_ref(),
             &ctx,
             conformance::batch(vec![conformance::node("snap-before", "before")], Vec::new()),
         )
@@ -683,9 +678,8 @@ async fn the_built_in_store_declines_the_snapshot_obligation() {
     let snapshot = stand.store.begin_read(&ctx).await.expect("snapshot opens");
 
     // A concurrent commit, landing between the arms of the compound read.
-    stand
-        .store
-        .ingest(
+    conformance::ingest_batch(
+            stand.store.as_ref(),
             &ctx,
             conformance::batch(vec![conformance::node("snap-after", "after")], Vec::new()),
         )

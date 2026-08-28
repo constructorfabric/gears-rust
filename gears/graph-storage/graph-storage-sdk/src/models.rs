@@ -168,8 +168,6 @@ pub struct NodeSpec {
     /// GTS-validated attributes. `None` = no opinion on an existing row's
     /// payload is *not* offered — ingest is replace, so `None` clears.
     pub payload: Option<serde_json::Value>,
-    /// Producer-supplied embedding, dimension-checked against the deployment.
-    pub embedding: Option<Vec<f32>>,
     /// Optional compare-and-set on the node's stored version.
     pub expected_version: Option<i64>,
 }
@@ -206,6 +204,11 @@ pub struct IngestOptions {
     pub create_phantoms: Option<bool>,
     /// Return per-item outcomes on success (errors are always per item).
     pub report_per_item: bool,
+    /// Whether this batch's nodes are embedded. `None` = the deployment
+    /// default (on). `false` keeps existing vectors rather than clearing
+    /// them: a metadata-only re-sync should not cost a re-embedding pass, and
+    /// should not silently empty the vector arm either.
+    pub embed: Option<bool>,
 }
 
 /// One atomic ingest batch.
@@ -416,8 +419,6 @@ pub struct SearchRequest {
     pub mode: SearchMode,
     /// Query text for the lexical arm.
     pub query: Option<String>,
-    /// Query vector for the vector arm (producer-embedded in this iteration).
-    pub query_vector: Option<Vec<f32>>,
     /// Per-arm candidate limit before fusion.
     pub arm_limit: u32,
     /// Result limit after fusion.

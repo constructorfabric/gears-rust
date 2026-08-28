@@ -149,10 +149,17 @@ pub trait GraphStoreV1: Send + Sync + 'static {
     /// Nodes, edges and the idempotency record commit together or not at all.
     /// A replay of a recorded key returns `IngestOutcome { replayed: true }`
     /// without touching state.
+    ///
+    /// `embedding` carries one entry per node of `req`, in order: the vector
+    /// to store if this request embedded, and the canonical hash of the text
+    /// it was composed from either way. A store does not compose or embed
+    /// anything — that is the coordinator's, so that ingest and query cannot
+    /// diverge.
     async fn ingest(
         &self,
         ctx: &StoreCtx<'_>,
         req: IngestRequest,
+        embedding: EmbeddingPlan,
     ) -> Result<IngestOutcome, GraphStoreError>;
     /// Tombstone a node with its incident edges, or a single edge.
     async fn soft_delete(
@@ -203,6 +210,7 @@ pub trait GraphStoreV1: Send + Sync + 'static {
         &self,
         ctx: &StoreCtx<'_>,
         req: SearchRequest,
+        vector: Option<VectorArm>,
     ) -> Result<SearchResponse, GraphStoreError>;
     async fn project_table(
         &self,
@@ -329,6 +337,65 @@ pub trait GraphEngineV1: Send + Sync + 'static {
         ctx: &StoreCtx<'_>,
         req: PatternRequest,
     ) -> Result<PatternResponse, GraphEngineError>;
+}
+
+/// What the Embedding Coordinator decided about one node, for the store to
+/// write. Index-aligned with `IngestRequest::nodes` — the same convention
+/// [`EmbedResponse::vectors`] uses, and for the same reason: any other
+/// association would have to be keyed on something a batch may legitimately
+/// repeat.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeEmbedding {
+    /// The vector, or `None` when this request did not ask for embedding.
+    pub vector: Option<Vec<f32>>,
+    /// Canonical hash of the text this node embeds from, computed whether or
+    /// not it was embedded. It is what tells a later ingest whether a
+    /// preserved vector still describes the node — the difference between a
+    /// *preserved* vector and a *stale* one.
+    pub input_hash: String,
+}
+
+impl NodeEmbedding {
+    #[must_use]
+    pub fn computed(vector: Vec<f32>, input_hash: String) -> Self {
+        Self {
+            vector: Some(vector),
+            input_hash,
+        }
+    }
+
+    #[must_use]
+    pub fn skipped(input_hash: String) -> Self {
+        Self {
+            vector: None,
+            input_hash,
+        }
+    }
+}
+
+/// The vector arm of one search, as the coordinator resolved it.
+///
+/// Absent when the request asked for no vector arm, or when no comparable
+/// embedding space is in force. A store never embeds anything itself: query
+/// text and ingest text must go through one provider, and only the
+/// coordinator holds it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorArm {
+    pub query_vector: Vec<f32>,
+    /// Only vectors of this epoch may be ranked. Vectors of any other epoch,
+    /// and vectors whose input has since changed, are not comparable with the
+    /// query and must not appear.
+    pub epoch: i64,
+}
+
+/// The embedding decisions of one ingest batch.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EmbeddingPlan {
+    /// Epoch to stamp new vectors with. `None` means no comparable space is
+    /// in force, so no vector may be written or read.
+    pub epoch: Option<i64>,
+    /// One entry per node of the request, in order.
+    pub nodes: Vec<NodeEmbedding>,
 }
 
 /// Provider-side failure vocabulary. A provider failure fails the ingest

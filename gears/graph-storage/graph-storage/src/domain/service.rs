@@ -10,7 +10,8 @@ use authz_resolver_sdk::pep::PolicyEnforcer;
 use graph_storage_sdk::models::{
     DeleteOutcome, DeleteRequest, EdgeKey, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
     ItemError, ItemFamily, NeighborhoodRequest, NodeKey, NodeRow, NodeView, Page,
-    ProjectionRequest, RemainingBudget, SearchRequest, SearchResponse, TraversalResponse,
+    ProjectionRequest, RemainingBudget, SearchMode, SearchRequest, SearchResponse,
+    TraversalResponse,
     TraverseRequest, TypeIdSet, TypeKind, TypeQuery, TypeRecord, TypeRegistration,
 };
 use graph_storage_sdk::plugin_api::{GraphEngineV1, GraphStoreV1, StoreCtx};
@@ -19,6 +20,7 @@ use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 
 use crate::config::GraphStorageConfig;
+use crate::domain::embedding::EmbeddingCoordinator;
 use crate::domain::error::DomainError;
 use crate::domain::traversal::{WalkPlan, walk};
 use crate::domain::{admission, authz, identity, ontology};
@@ -29,6 +31,7 @@ pub struct GraphServices {
     store: Arc<dyn GraphStoreV1>,
     engine: Arc<dyn GraphEngineV1>,
     enforcer: PolicyEnforcer,
+    embedding: EmbeddingCoordinator,
 }
 
 /// One authorized call: the compiled scope plus the derived per-call context
@@ -44,12 +47,14 @@ impl GraphServices {
         store: Arc<dyn GraphStoreV1>,
         engine: Arc<dyn GraphEngineV1>,
         enforcer: PolicyEnforcer,
+        embedding: EmbeddingCoordinator,
     ) -> Self {
         Self {
             config,
             store,
             engine,
             enforcer,
+            embedding,
         }
     }
 
@@ -212,16 +217,47 @@ impl GraphServices {
         admission::admit_ingest(&self.config, &request)?;
 
         let store_ctx = self.store_ctx(&auth, None);
-        self.validate_batch(&store_ctx, &request).await?;
-        Ok(self.store.ingest(&store_ctx, request).await?)
+        let records = self.validate_batch(&store_ctx, &request).await?;
+
+        // Composed and embedded *before* the transaction, as DESIGN's ingest
+        // sequence has it (step 5, ahead of step 6). It costs no extra round
+        // trip: validation already resolved every type record, so each node's
+        // `vector_search` trait is in hand.
+        let no_paths: Vec<String> = Vec::new();
+        let plan = self
+            .embedding
+            .plan(
+                &request.nodes,
+                request.options.embed.unwrap_or(true),
+                |node| {
+                    records
+                        .get(&node.type_id)
+                        .map_or(no_paths.as_slice(), |record| {
+                            record.effective_traits.vector_search.as_slice()
+                        })
+                },
+                store_ctx.budget,
+                store_ctx.cancel.clone(),
+            )
+            .await?;
+        let plan = graph_storage_sdk::plugin_api::EmbeddingPlan {
+            epoch: self.embedding.active_epoch(),
+            nodes: plan,
+        };
+
+        Ok(self.store.ingest(&store_ctx, request, plan).await?)
     }
 
     /// Chain-validate every item, reporting **all** violations in one answer.
+    ///
+    /// Returns the resolved type records, because the caller needs the same
+    /// ones the validation walked: re-fetching them to read one trait would
+    /// be a second round trip per distinct type for information already held.
     async fn validate_batch(
         &self,
         store_ctx: &StoreCtx<'_>,
         request: &IngestRequest,
-    ) -> Result<(), DomainError> {
+    ) -> Result<BTreeMap<String, TypeRecord>, DomainError> {
         let mut records: BTreeMap<String, TypeRecord> = BTreeMap::new();
         let mut validators: BTreeMap<String, ontology::ChainValidator> = BTreeMap::new();
         let mut errors: Vec<ItemError> = Vec::new();
@@ -285,7 +321,7 @@ impl GraphServices {
         }
 
         if errors.is_empty() {
-            Ok(())
+            Ok(records)
         } else {
             Err(DomainError::Validation { items: errors })
         }
@@ -513,10 +549,28 @@ impl GraphServices {
             .authorize(ctx, &authz::node_resource(), authz::actions::READ)
             .await?;
         admission::admit_search(&self.config, &request)?;
-        Ok(self
-            .store
-            .search(&self.store_ctx(&auth, None), request)
-            .await?)
+        let store_ctx = self.store_ctx(&auth, None);
+
+        // The query is embedded by the same provider ingest used
+        // (`fr-vector-search`). No caller supplies a vector: one that came
+        // from elsewhere could not be compared with anything stored.
+        let arm = if matches!(request.mode, SearchMode::Vector | SearchMode::Hybrid) {
+            let text = request.query.as_deref().unwrap_or_default();
+            let query_vector = self
+                .embedding
+                .embed_query(text, store_ctx.budget, store_ctx.cancel.clone())
+                .await?;
+            self.embedding
+                .active_epoch()
+                .map(|epoch| graph_storage_sdk::plugin_api::VectorArm {
+                    query_vector,
+                    epoch,
+                })
+        } else {
+            None
+        };
+
+        Ok(self.store.search(&store_ctx, request, arm).await?)
     }
 
     pub async fn revision(&self, ctx: &SecurityContext) -> Result<GraphRevision, DomainError> {

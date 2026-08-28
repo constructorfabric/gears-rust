@@ -80,7 +80,6 @@ pub struct GraphNodeSpecDto {
     pub name: Option<String>,
     /// Omitted clears the stored payload: ingest replaces, never merges.
     pub payload: Option<serde_json::Value>,
-    pub embedding: Option<Vec<f32>>,
     pub expected_version: Option<i64>,
 }
 
@@ -100,6 +99,9 @@ pub struct GraphIngestOptionsDto {
     pub create_phantoms: Option<bool>,
     #[serde(default)]
     pub report_per_item: bool,
+    /// `false` skips embedding; existing vectors are kept, not cleared.
+    /// Omitted means the deployment default (on).
+    pub embed: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -205,8 +207,10 @@ pub struct GraphNodeRowDto {
 pub struct GraphSearchRequest {
     /// `lexical`, `vector` or `hybrid`.
     pub mode: String,
+    /// Required by every mode. The vector arm embeds this same text through
+    /// the deployment's provider -- the one ingest used -- so a caller never
+    /// supplies a vector of its own.
     pub query: Option<String>,
-    pub query_vector: Option<Vec<f32>>,
     pub arm_limit: Option<u32>,
     pub limit: Option<u32>,
     #[serde(default)]
@@ -342,7 +346,6 @@ impl From<GraphNodeSpecDto> for m::NodeSpec {
             type_id: value.type_id,
             name: value.name,
             payload: value.payload,
-            embedding: value.embedding,
             expected_version: value.expected_version,
         }
     }

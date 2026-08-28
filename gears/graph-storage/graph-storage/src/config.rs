@@ -29,6 +29,12 @@ pub struct GraphStorageConfig {
     /// migration time; readiness verifies configured == column definition.
     pub embedding_dimension: u32,
 
+    /// Ceiling on the composed text one node embeds from. Embedding cost and
+    /// provider input limits both scale with length, and a node whose payload
+    /// happens to carry a megabyte of prose should cost the same as any
+    /// other.
+    pub embedding_input_max_bytes: u32,
+
     // --- limits (graph-storage.limits.*) ----------------------------------
     pub ingest_max_nodes: u32,
     pub ingest_max_edges: u32,
@@ -52,6 +58,7 @@ impl Default for GraphStorageConfig {
         Self {
             traversal_hop: HopStrategy::default(),
             embedding_dimension: 384,
+            embedding_input_max_bytes: 8 * 1024,
             ingest_max_nodes: 10_000,
             ingest_max_edges: 20_000,
             payload_max_bytes: 64 * 1024,
@@ -92,6 +99,7 @@ impl GraphStorageConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut errors: Vec<String> = Vec::new();
         check_range!(errors, self, embedding_dimension, 1u32, 4_096u32);
+        check_range!(errors, self, embedding_input_max_bytes, 64u32, 262_144u32);
         check_range!(errors, self, ingest_max_nodes, 1u32, 50_000u32);
         check_range!(errors, self, ingest_max_edges, 1u32, 100_000u32);
         check_range!(errors, self, payload_max_bytes, 1_024u32, 1_048_576u32);

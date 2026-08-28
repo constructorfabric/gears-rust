@@ -113,6 +113,16 @@ fn routing_outcome(error: DomainError) -> Result<CanonicalError, DomainError> {
         DomainError::ScopeUnservable { reason } => GraphNodeError::failed_precondition()
             .with_precondition_violation("scope", reason, reasons::SCOPE_UNSERVABLE)
             .create(),
+        // Not `unavailable`: nothing is down and a retry cannot help. The
+        // deployment has to re-embed, and the caller has to hear which
+        // precondition is unmet rather than be told to wait.
+        DomainError::VectorSearchUnavailable { reason } => GraphNodeError::failed_precondition()
+            .with_precondition_violation(
+                "embedding_space",
+                reason,
+                reasons::EMBEDDING_SPACE_MISMATCH,
+            )
+            .create(),
         DomainError::Unsupported { what } => GraphNodeError::unimplemented(what).create(),
         other => return Err(other),
     })

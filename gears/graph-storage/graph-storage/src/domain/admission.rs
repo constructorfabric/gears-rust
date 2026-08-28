@@ -7,7 +7,7 @@
 //! **before hydration**, so no oversized response is ever assembled.
 
 use graph_storage_sdk::models::{
-    IngestRequest, NeighborhoodRequest, SearchMode, SearchRequest, TraverseRequest,
+    IngestRequest, NeighborhoodRequest, SearchRequest, TraverseRequest,
 };
 
 use crate::config::GraphStorageConfig;
@@ -43,15 +43,6 @@ pub fn admit_ingest(cfg: &GraphStorageConfig, request: &IngestRequest) -> Result
                 )));
             }
         }
-        if let Some(embedding) = &node.embedding
-            && embedding.len() != cfg.embedding_dimension as usize
-        {
-            return Err(DomainError::invalid(format!(
-                "node[{index}] embedding has {} dimensions; this deployment's space is {}",
-                embedding.len(),
-                cfg.embedding_dimension
-            )));
-        }
     }
     for (index, edge) in request.edges.iter().enumerate() {
         if let Some(payload) = &edge.payload {
@@ -81,27 +72,11 @@ pub fn admit_search(cfg: &GraphStorageConfig, request: &SearchRequest) -> Result
             cfg.search_max_arm_limit * 2
         )));
     }
-    let needs_text = matches!(request.mode, SearchMode::Lexical | SearchMode::Hybrid);
-    let needs_vector = matches!(request.mode, SearchMode::Vector | SearchMode::Hybrid);
-    if needs_text && request.query.as_deref().is_none_or(str::is_empty) {
+    // Every arm now starts from text: the vector arm embeds the same `query`
+    // through the same provider ingest used, which is what makes a hit
+    // comparable at all (`fr-vector-search`).
+    if request.query.as_deref().is_none_or(str::is_empty) {
         return Err(DomainError::invalid("this search mode requires `query`"));
-    }
-    if needs_vector {
-        match &request.query_vector {
-            None => {
-                return Err(DomainError::invalid(
-                    "this search mode requires `query_vector` (the deployment has no embedding provider)",
-                ));
-            }
-            Some(vector) if vector.len() != cfg.embedding_dimension as usize => {
-                return Err(DomainError::invalid(format!(
-                    "query_vector has {} dimensions; this deployment's space is {}",
-                    vector.len(),
-                    cfg.embedding_dimension
-                )));
-            }
-            Some(_) => {}
-        }
     }
     Ok(())
 }
