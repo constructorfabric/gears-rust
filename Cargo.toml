@@ -90,6 +90,7 @@ members = [
     "gears/credstore/plugins/static-credstore-plugin",
     "gears/graph-storage/graph-storage-sdk",
     "gears/graph-storage/graph-storage",
+    "gears/graph-storage/onnx-embedding-plugin",
     "gears/file-parser/file-parser-sdk",
     "gears/file-parser/file-parser",
     "gears/file-storage/file-storage-sdk",
@@ -408,6 +409,7 @@ credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.12", path =
 # graph-storage
 graph-storage = { package = "cf-gears-graph-storage", version = "0.1.0", path = "gears/graph-storage/graph-storage" }
 graph-storage-sdk = { package = "cf-gears-graph-storage-sdk", version = "0.1.0", path = "gears/graph-storage/graph-storage-sdk" }
+onnx-embedding-plugin = { package = "cf-gears-graph-storage-onnx-embedding-plugin", version = "0.1.0", path = "gears/graph-storage/onnx-embedding-plugin" }
 
 # mini-chat
 mini-chat-sdk = { package = "cf-gears-mini-chat-sdk", version = "0.10.21", path = "gears/mini-chat/mini-chat-sdk" }
@@ -797,6 +799,11 @@ magika = "1.1"
 # unconditionally, not feature-gated) references an `OrtApi` struct field that only exists
 # at the api-24 ABI level; this is unrelated to which execution providers we actually use.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"] }
+# WordPiece tokenization for the MiniLM-class sentence model behind the
+# graph-storage ONNX embedding provider. Default features off deliberately:
+# they pull a progress bar, an HTTP downloader and a C++ suffix-array build,
+# none of which a gear that loads operator-supplied artifacts from disk wants.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 
 # Additional testing utilities
 tokio-test = "0.4"

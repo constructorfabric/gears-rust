@@ -13,7 +13,7 @@ use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::plugin_api::EmbeddingProviderV1;
 
 use crate::api::rest::routes;
-use crate::config::GraphStorageConfig;
+use crate::config::{EmbeddingProviderKind, GraphStorageConfig};
 use crate::domain::local_client::GraphStorageLocalClient;
 use crate::domain::service::GraphServices;
 use crate::domain::embedding::SpaceState;
@@ -80,7 +80,7 @@ impl Gear for GraphStorage {
         let engine = Arc::new(PgGraphEngine::new(Arc::clone(&store)));
         let enforcer = PolicyEnforcer::new(ctx.client_hub().get()?);
 
-        let provider = select_embedding_provider(&cfg);
+        let provider = select_embedding_provider(&cfg).await?;
         let embedding = resolve_embedding_space(&db, provider, &cfg).await?;
 
         let services = Arc::new(GraphServices::new(cfg, store, engine, enforcer, embedding));
@@ -98,17 +98,64 @@ impl Gear for GraphStorage {
 
 /// Pick the deployment's one embedding provider.
 ///
-/// One per deployment, per the single-embedding-space constraint. The
-/// in-process ONNX provider ADR-0005 makes the default lives in its own crate
-/// and registers itself; what this composition root can always build is the
-/// deterministic fake, which is also the only sensible choice when a
-/// deployment has declared no model.
-fn select_embedding_provider(cfg: &GraphStorageConfig) -> Arc<dyn EmbeddingProviderV1> {
-    warn!(
-        "no embedding provider is configured; falling back to the deterministic fake. \
-         Vector search will answer, but its ranking carries no semantics"
+/// One per deployment, per the single-embedding-space constraint. A
+/// misconfigured choice fails the boot rather than falling back: silently
+/// substituting the fake would fill the graph with vectors that rank nothing
+/// meaningfully, and the deployment would look healthy the whole time.
+///
+/// # Errors
+///
+/// An `onnx` deployment whose artifacts are missing or unloadable, or one
+/// built without the `onnx` feature.
+async fn select_embedding_provider(
+    cfg: &GraphStorageConfig,
+) -> anyhow::Result<Arc<dyn EmbeddingProviderV1>> {
+    match cfg.embedding_provider {
+        EmbeddingProviderKind::Fake => {
+            warn!(
+                "graph-storage.embedding_provider is `fake`: vector search will answer, \
+                 but its ranking carries no semantics"
+            );
+            Ok(Arc::new(FakeEmbeddingProvider::new(cfg.embedding_dimension)))
+        }
+        EmbeddingProviderKind::Onnx => onnx_provider(cfg).await,
+    }
+}
+
+#[cfg(feature = "onnx")]
+async fn onnx_provider(cfg: &GraphStorageConfig) -> anyhow::Result<Arc<dyn EmbeddingProviderV1>> {
+    let named = |key: &str, value: &Option<String>| -> anyhow::Result<String> {
+        value.clone().ok_or_else(|| {
+            anyhow::anyhow!("graph-storage.{key} is required by the `onnx` embedding provider")
+        })
+    };
+    let mut config = onnx_embedding_plugin::OnnxProviderConfig::new(
+        named("embedding_model_path", &cfg.embedding_model_path)?,
+        named("embedding_tokenizer_path", &cfg.embedding_tokenizer_path)?,
     );
-    Arc::new(FakeEmbeddingProvider::new(cfg.embedding_dimension))
+    config.dimension = cfg.embedding_dimension;
+
+    // A `RuntimeHung` here has leaked a thread that cannot be joined, so the
+    // process must end rather than retry. Returning the error does that: the
+    // platform aborts the boot.
+    let provider = onnx_embedding_plugin::OnnxEmbeddingProvider::load(config).await?;
+    info!(
+        model = %provider.embedding_space().model_artifact,
+        "loaded the in-process ONNX embedding provider"
+    );
+    Ok(Arc::new(provider))
+}
+
+#[cfg(not(feature = "onnx"))]
+#[expect(
+    clippy::unused_async,
+    reason = "one signature for both builds; the feature-enabled arm is async"
+)]
+async fn onnx_provider(_cfg: &GraphStorageConfig) -> anyhow::Result<Arc<dyn EmbeddingProviderV1>> {
+    anyhow::bail!(
+        "graph-storage.embedding_provider is `onnx` but this binary was built without the \
+         `onnx` feature; rebuild with it or choose another provider"
+    )
 }
 
 /// Reconcile the provider against the space the stored vectors belong to.

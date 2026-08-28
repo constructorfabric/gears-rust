@@ -7,6 +7,23 @@
 
 use serde::Deserialize;
 
+/// Which embedding provider a deployment runs.
+///
+/// One per deployment, per the single-embedding-space constraint: the choice
+/// is a deployment fact, not a per-request option.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingProviderKind {
+    /// The deterministic hash-based provider. Reproducible and free, and its
+    /// ranking carries no meaning whatsoever -- for tests, and for a
+    /// deployment that wants the write path exercised before a model exists.
+    #[default]
+    Fake,
+    /// ADR-0005's default: a `MiniLM`-class model in this process. Needs the
+    /// `onnx` feature at compile time and artifact paths at run time.
+    Onnx,
+}
+
 /// Which backend serves one-hop expansion.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +52,15 @@ pub struct GraphStorageConfig {
     /// other.
     pub embedding_input_max_bytes: u32,
 
+    /// Which provider computes this deployment's vectors.
+    pub embedding_provider: EmbeddingProviderKind,
+    /// Path to the ONNX model artifact. Required by the `onnx` provider; the
+    /// gear reads it and never fetches it, so the embedding-space identity can
+    /// be the hash of the bytes actually loaded (ADR-0005).
+    pub embedding_model_path: Option<String>,
+    /// Path to the matching tokenizer artifact.
+    pub embedding_tokenizer_path: Option<String>,
+
     // --- limits (graph-storage.limits.*) ----------------------------------
     pub ingest_max_nodes: u32,
     pub ingest_max_edges: u32,
@@ -59,6 +85,9 @@ impl Default for GraphStorageConfig {
             traversal_hop: HopStrategy::default(),
             embedding_dimension: 384,
             embedding_input_max_bytes: 8 * 1024,
+            embedding_provider: EmbeddingProviderKind::default(),
+            embedding_model_path: None,
+            embedding_tokenizer_path: None,
             ingest_max_nodes: 10_000,
             ingest_max_edges: 20_000,
             payload_max_bytes: 64 * 1024,

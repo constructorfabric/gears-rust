@@ -1,0 +1,38 @@
+[package]
+name = "cf-gears-graph-storage-onnx-embedding-plugin"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "In-process ONNX embedding provider for the graph-storage gear: the default of ADR-0005"
+
+[lib]
+name = "onnx_embedding_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+graph-storage-sdk = { workspace = true }
+
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
+tracing = { workspace = true }
+aws-lc-rs = { workspace = true }
+hex = { workspace = true }
+
+# The ONNX Runtime is resolved by `dlopen` at first use (`ORT_DYLIB_PATH`), so
+# building this crate needs no runtime headers -- only running it needs the
+# library. The pin and its `api-24` feature are the workspace's; see the root
+# manifest for why both are load-bearing.
+ort = { workspace = true }
+tokenizers = { workspace = true }
+
+[dev-dependencies]
+graph-storage-sdk = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio-util = { workspace = true }
