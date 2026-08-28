@@ -87,7 +87,8 @@ The Engine plugin contract requires (full surface in DESIGN §3.3):
 - **Sandboxed**: no I/O, no nondeterminism beyond `EvaluationContext.time`. The
   sandbox is the absence of unsafe bindings — verifiable by code review.
 - **Cost-bounded**: per-Policy timeout (operator-configurable, default 5 ms); engine
-  internally implements bounding (steps cap / instruction cap / wall-time cap).
+  internally implements bounding (steps cap / instruction cap / wall-time cap). The
+  effective budget reaches the engine as the typed `EvaluationBudget` on `EvaluationContext`.
 - **Pre-compilable**: validated `engine_config` is parsed/compiled once at Policy
   create/update and cached by `(policy_id, policy_version)`; cache miss rebuilds.
 - **Deterministic** given EvaluationContext — required for idempotency replay

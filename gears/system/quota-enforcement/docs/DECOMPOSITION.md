@@ -11,7 +11,7 @@
 - [1. Overview](#1-overview)
 - [2. Entries](#2-entries)
   - [2.1 Gear Foundation, Storage & Coordination ⏳ HIGH](#21-gear-foundation-storage--coordination--high)
-  - [2.2 Projection Contracts & Subject Resolution ⏳ HIGH](#22-projection-contracts--subject-resolution--high)
+  - [2.2 Projection Contracts & Subject Attribution ⏳ HIGH](#22-projection-contracts--subject-attribution--high)
   - [2.3 Quota Lifecycle & Metadata ⏳ HIGH](#23-quota-lifecycle--metadata--high)
   - [2.4 Resolution Policy & Engine ⏳ HIGH](#24-resolution-policy--engine--high)
   - [2.5 Consumption Operations & Idempotency ⏳ HIGH](#25-consumption-operations--idempotency--high)
@@ -47,7 +47,7 @@ not here.
 
 - **Purpose**: Stand up the `quota-enforcement` gear and SDK crates, the `QuotaEnforcementStoragePluginV1` contract
   with its `toolkit-db` reference plugin, the `CoordinationPluginV1` contract with its storage-backed default, gear
-  bootstrap (schema check, seeded global Policy, config-table defaults, and the bootstrap hook later features extend),
+  bootstrap (schema check, config-table defaults, and the bootstrap hook later features extend),
   two-phase PDP authorization, tenant isolation, and the gear-specific telemetry conventions. Every later feature
   builds on these seams.
 
@@ -57,10 +57,11 @@ not here.
   - `quota-enforcement` and `quota-enforcement-sdk` crate skeletons registered in the workspace
   - `QuotaEnforcementStoragePluginV1` trait, closed `StorageError` enum, invariants I1–I13, `toolkit-db` plugin
   - `CoordinationPluginV1` trait (`try_lock`/`renew`/`release`), storage-backed default implementation
-  - Gateway REST registration into the platform `api-gateway`, DTO validation shell, phase-1 PDP admission with LRU
-    cache and fail-closed posture, phase-2 constraint propagation
+  - Gateway REST registration into the platform `api-gateway`, DTO validation shell, phase-1 PDP admission via
+    `PolicyEnforcer` (fail-closed, no QE-side decision cache), phase-2 `AccessScope` pass-through to `SecureConn`
   - Tenant isolation filters at gateway and storage layers
-  - Bootstrap: schema-version check, seeded `global` Policy row, default config-table rows, fail-fast posture
+  - Bootstrap: schema-version check, default config-table rows, fail-fast posture, and the extension hook later
+    features add their bootstrap steps to
   - Telemetry emission conventions with bounded label cardinality
 
 - **Out of scope**:
@@ -76,11 +77,6 @@ not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-authentication`
   - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-authorization`
   - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-tenant-isolation-integrity`
-  - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-fault-tolerance`
-  - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-recovery`
-  - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-availability`
-  - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-subject-scale`
-  - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-quota-density`
 
 - **Design Principles Covered**:
 
@@ -117,32 +113,32 @@ not here.
 
   - [ ] `p1` - `cpt-cf-quota-enforcement-db-schema`
 
-### 2.2 Projection Contracts & Subject Resolution ⏳ HIGH
+### 2.2 Projection Contracts & Subject Attribution ⏳ HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-feature-projection-contracts`
 
-- **Purpose**: Register the abstract QE subject/resource/Quota-attribute bases and the scope-discriminator type,
+- **Purpose**: Register the abstract QE subject/resource/request/constraint bases and the scope-discriminator type,
   resolve owner projections into the immutable `ProjectionContractCatalog`, validate every evaluation request at
-  Gateway ingress against the declared contracts, and derive subject identity server-side from `SecurityContext`.
-  This is the declarative contract surface the whole evaluation pipeline trusts.
+  Gateway ingress, authorize caller-supplied attribution through PDP, and map scope kinds to owner projections. This is
+  the declarative contract surface the whole evaluation pipeline trusts.
 
 - **Depends On**: `cpt-cf-quota-enforcement-feature-foundation`
 
 - **Scope**:
   - Bootstrap registration of the abstract bases and the P1 `user`/`tenant` scope well-known instances
-  - `SubjectProjectionResolver` implementations and the bootstrap consistency set (1:1 resolver mapping, admitted
-    metric registration and derivation, `(metric, scope)` uniqueness, anonymous/nil rejection)
+  - Bootstrap consistency for admitted metric registration/derivation, `(metric, scope)` uniqueness, exactly one
+    request contract per metric, and its attached constraint contract
   - `ProjectionContractCatalog` build and publication, including the authoritative reverse index from each metric
     to its complete configured subject-projection set; catalogue-membership checks on Quota and Policy writes
-  - Server-side projection selection from that reverse index: the caller-declared projection is validated as a
-    member of the metric's set and cannot narrow the applicable set
-  - Ingress validation: registered concrete types, required `metadata`, admitted metric, structural `caller_type`
-    validation and its exclusion from `EvaluationContext`
+  - PDP authorization of the complete caller-supplied tenant/subject/metric/resource tuple, followed by server-side
+    `(metric, kind)` projection mapping from the reverse index
+  - Ingress validation: required operation-level `metadata`, valid `{kind,id}` refs, admitted metric, and optional
+    resource projection; no `caller_type` or caller-selected subject projection
   - Contract-validation telemetry counters
 
 - **Out of scope**:
   - Quota records themselves (feature `quota-lifecycle`)
-  - Engine consumption of projection metadata (feature `resolution-policy-engine`)
+  - Engine consumption of request/resource/arbitration data (feature `resolution-policy-engine`)
   - Breaking projection-version activation (out of P1 per PRD §5.2)
 
 - **Requirements Covered**:
@@ -155,7 +151,7 @@ not here.
 - **Design Principles Covered**:
 
   - [ ] `p1` - `cpt-cf-quota-enforcement-principle-declarative-projection-contracts`
-  - [ ] `p1` - `cpt-cf-quota-enforcement-principle-server-derived-identity`
+  - [ ] `p1` - `cpt-cf-quota-enforcement-principle-pdp-authorized-attribution`
 
 - **Design Constraints Covered**:
 
@@ -165,7 +161,8 @@ not here.
   - `SubjectScope`
   - `SubjectProjectionContract`
   - `ResourceProjectionContract`
-  - `QuotaAttributeContract`
+  - `MetricRequestContract`
+  - `ConstraintContract`
   - `ProjectionContractCatalog`
 
 - **Design Components**:
@@ -174,8 +171,8 @@ not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-component-evaluation-orchestrator`
 
 - **API**:
-  - Evaluation request contract fields (`subject_projection_type`, `subject_metadata`, `resource_projection_type`,
-    `resource_metadata`, `caller_type`) on every write/preview DTO
+  - Consumer request fields (`tenant_id`, `subjects: Vec<SubjectRef>`, `metadata`, optional `resource`) on debit,
+    reserve, preview, and every batch item
   - No registration endpoint: contracts are published through `types-registry`
 
 - **Sequences**:
@@ -202,7 +199,7 @@ not here.
   - `QuotaManagementService` with transactional CRUD via the storage plugin
   - Metric existence/kind/mode validation through `TypesRegistryClient` with LRU cache, fail-closed
   - Cap semantics (`CAP_MUST_BE_NON_NEGATIVE`, `cap = 0`, `cap = null`, `CAP_BELOW_CONSUMED` at commit time)
-  - Quota Metadata validation against the owner's Quota-attribute contract at write time only
+  - Quota Metadata validation against the owner's constraint contract at write time only
   - Validity-window storage and `currently_within_window` computation
   - Deactivation cascade marking leases resolved-by-deactivation
   - `rate` quota-type rejection with canonical `Unimplemented`
@@ -266,11 +263,13 @@ not here.
 - **Scope**:
   - `PolicyService` with scope precedence (per-metric over `global`) and version lifecycle
     (`active`/`superseded`/`rolled_back`/`deleted`), optimistic `if_match_version` concurrency
-  - `EngineRegistry` with fail-fast bootstrap registration
+  - `EngineRegistry` with fail-fast bootstrap registration; seeding of the `global` Policy
+    (`most-restrictive-wins`, version 1) as this feature's bootstrap extension, so no active Policy ever references an
+    unregistered Engine
   - Engine contract: `id`/`validate_config`/`evaluate`, `ValidatedConfig` cache keyed by `(policy_id, policy_version)`
   - Debit-Plan invariant enforcement at the Engine boundary with violation telemetry
   - `most-restrictive-wins` binding-Quota selection and validity-window prefilter; sandboxed cost-bounded `cel`
-  - Static CEL checking against snapshotted request and Quota-attribute schemas, including pair compatibility
+  - Static CEL checking against snapshotted request and constraint schemas, including pair compatibility
   - Operator-only Policy surface (`QuotaOperatorClientV1`)
 
 - **Out of scope**:
@@ -363,6 +362,10 @@ not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-fr-quota-type-consumption`
   - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-evaluation-latency`
   - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-throughput`
+  - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-subject-scale`
+  - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-quota-density`
+  - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-availability`
+  - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-fault-tolerance`
   - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-idempotency-guarantee`
 
 - **Design Principles Covered**:
@@ -391,7 +394,7 @@ not here.
   - POST /v1/quota-enforcement/operations/credit
   - POST /v1/quota-enforcement/operations/rollback
   - POST /v1/quota-enforcement/operations/preview
-  - `QuotaEnforcementClientV1` (`debit`, `rollback`, `evaluate_preview`); `QuotaManagerClientV1` (`credit`)
+  - `QuotaEnforcementClientV1` (`debit`, `credit`, `rollback`, `evaluate_preview`)
 
 - **Sequences**:
 
@@ -433,6 +436,7 @@ not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-fr-lease-commit`
   - [ ] `p1` - `cpt-cf-quota-enforcement-fr-lease-release`
   - [ ] `p1` - `cpt-cf-quota-enforcement-fr-lease-timeout`
+  - [ ] `p1` - `cpt-cf-quota-enforcement-nfr-recovery`
 
 - **Design Principles Covered**:
 
@@ -583,7 +587,8 @@ not here.
 - **Depends On**: `cpt-cf-quota-enforcement-feature-foundation`
 
 - **Scope**:
-  - `notification_outbox` drain under a coordination lock; at-least-once dispatch with per-sink timeout
+  - Dispatch as a `toolkit-db` Outbox leased handler (framework-owned claiming, retries, acks, dead letters, and
+    lease fencing); at-least-once delivery with per-sink timeout and permitted duplicates
   - `QuotaNotificationSinkV1` trait and `DispatchError` retry/dead-letter policy
   - Event catalog payloads and discriminators; threshold upward-transition semantics with per-period markers
   - Dispatch-failure and outbox telemetry
@@ -744,7 +749,8 @@ are intentional:
   feature that adds tables to the one versioned schema; `cpt-cf-quota-enforcement-component-gateway` is stood up by
   `cpt-cf-quota-enforcement-feature-foundation` and extended with ingress validation by
   `cpt-cf-quota-enforcement-feature-projection-contracts`; `cpt-cf-quota-enforcement-component-evaluation-orchestrator`
-  is established by `cpt-cf-quota-enforcement-feature-consumption-operations` and extended by
+  is established by `cpt-cf-quota-enforcement-feature-consumption-operations`, consumes the subject-resolution
+  extension that `cpt-cf-quota-enforcement-feature-projection-contracts` defines, and is extended by
   `cpt-cf-quota-enforcement-feature-batch-debit` and `cpt-cf-quota-enforcement-feature-rate-quotas`;
   `cpt-cf-quota-enforcement-component-quota-enforcement-service` is shared by
   `cpt-cf-quota-enforcement-feature-consumption-operations` and `cpt-cf-quota-enforcement-feature-snapshot-reads`;
@@ -799,7 +805,7 @@ cpt-cf-quota-enforcement-feature-foundation
   `cpt-cf-quota-enforcement-feature-quota-lifecycle` for the single-item CRUD it wraps and
   `cpt-cf-quota-enforcement-feature-lease-operations` because bulk deactivation atomically resolves the active leases
   of every Quota in the batch.
-- `cpt-cf-quota-enforcement-feature-notifications` requires only the foundation outbox and coordination lock; it is
+- `cpt-cf-quota-enforcement-feature-notifications` requires only the foundation outbox integration; the dispatcher is fenced by the Outbox lease itself, and it is
   independent of the evaluation pipeline and can proceed in parallel with
   `cpt-cf-quota-enforcement-feature-projection-contracts` and everything downstream.
 - Parallelization: after foundation, `cpt-cf-quota-enforcement-feature-notifications` and
