@@ -238,8 +238,59 @@ pub fn gts_type_schema(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Strips the wrapper-only `open_payload = true|false` argument from the
+/// attribute token stream before it is forwarded to the upstream
+/// `struct_to_gts_schema` macro (which rejects unknown attributes).
+///
+/// `open_payload = true` marks the generated schema's payload as OPEN: the
+/// inventory `schema_fn` post-processes the upstream JSON and sets
+/// `additionalProperties: true` at the schema root. Envelope bases (e.g.
+/// account-management's `tenant_metadata.v1~`) need this so the OP#12
+/// chain-narrowing check lets derived schemas declare typed payload
+/// properties — the upstream emitter otherwise closes the object, which the
+/// attribute surface gives no way to override.
+fn strip_open_payload(attr: &TokenStream2) -> (TokenStream2, bool) {
+    use proc_macro2::TokenTree;
+    let mut out = TokenStream2::new();
+    let mut open = false;
+    let mut iter = attr.clone().into_iter().peekable();
+    while let Some(tt) = iter.next() {
+        if let TokenTree::Ident(id) = &tt {
+            if id == "open_payload" {
+                let eq = iter.next();
+                let val = iter.next();
+                let is_eq = matches!(&eq, Some(TokenTree::Punct(p)) if p.as_char() == '=');
+                let truthy = matches!(&val, Some(TokenTree::Ident(v)) if v == "true");
+                let falsy = matches!(&val, Some(TokenTree::Ident(v)) if v == "false");
+                if is_eq && (truthy || falsy) {
+                    open = truthy;
+                    // Swallow the following comma so upstream sees a clean list.
+                    if matches!(iter.peek(), Some(TokenTree::Punct(p)) if p.as_char() == ',') {
+                        iter.next();
+                    }
+                    continue;
+                }
+                // Malformed usage: re-emit consumed tokens verbatim so the
+                // upstream parser reports its canonical error.
+                out.extend([tt]);
+                if let Some(e) = eq {
+                    out.extend([e]);
+                }
+                if let Some(v) = val {
+                    out.extend([v]);
+                }
+                continue;
+            }
+        }
+        out.extend([tt]);
+    }
+    (out, open)
+}
+
 fn expand_gts_type_schema(attr: &TokenStream2, input: &ItemStruct) -> syn::Result<TokenStream2> {
     let crate_path = resolve_crate_path()?;
+    let (attr, open_payload) = strip_open_payload(attr);
+    let attr = &attr;
     let type_id_input = extract_type_id(attr)?;
     let type_id = type_id_input.emitted_expr(&crate_path);
     let struct_name = &input.ident;
@@ -266,10 +317,23 @@ fn expand_gts_type_schema(attr: &TokenStream2, input: &ItemStruct) -> syn::Resul
         ));
     }
     let has_generics = type_param_count == 1;
-    let schema_fn_body = if has_generics {
+    let raw_schema_call = if has_generics {
         quote! { <#struct_name::<()>>::gts_schema_with_refs_as_string() }
     } else {
         quote! { <#struct_name>::gts_schema_with_refs_as_string() }
+    };
+    let schema_fn_body = if open_payload {
+        // Post-process the upstream schema: open the payload at the root so
+        // OP#12 chain-narrowing admits typed properties in derived schemas.
+        quote! {{
+            let mut schema: #crate_path::serde_json::Value =
+                #crate_path::serde_json::from_str(&#raw_schema_call)
+                    .expect("gts_type_schema: macro-generated schema must be valid JSON");
+            schema["additionalProperties"] = #crate_path::serde_json::Value::Bool(true);
+            schema.to_string()
+        }}
+    } else {
+        raw_schema_call
     };
 
     Ok(quote! {
