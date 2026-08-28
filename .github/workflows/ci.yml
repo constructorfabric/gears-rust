@@ -58,6 +58,7 @@ jobs:
       rust:   ${{ steps.filter.outputs.rust }}
       fips:   ${{ steps.filter.outputs.fips }}
       magika: ${{ steps.filter.outputs.magika }}
+      onnx_embedding: ${{ steps.filter.outputs.onnx_embedding }}
       dylint: ${{ steps.filter.outputs.dylint }}
       deps:   ${{ steps.filter.outputs.deps }}
       ci:     ${{ steps.filter.outputs.ci }}
@@ -91,6 +92,9 @@ jobs:
               - 'libs/rustls-*/**'
             magika:
               - 'gears/file-parser/**'
+            onnx_embedding:
+              - 'gears/graph-storage/onnx-embedding-plugin/**'
+              - 'gears/graph-storage/graph-storage-sdk/**'
             dylint:
               - 'tools/dylint_lints/**'
             deps:
@@ -525,6 +529,90 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
+
+  # Runs the graph-storage ONNX embedding provider against a real model, which
+  # is the only way this crate is checked at all: without artifacts its tests
+  # skip, and a skipped test proves nothing about pooling, tokenization or the
+  # vectors that come out. Both downloads are pinned by SHA-256; the runtime is
+  # fetched the same way `test-magika` fetches it, and for the same reason
+  # (`ort`'s `download-binaries` conflicts with the workspace's `load-dynamic`
+  # and deadlocks the rc we pin).
+  test-onnx-embedding:
+    name: ONNX embedding provider
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.onnx_embedding == 'true'
+      || needs.changes.outputs.deps == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    env:
+      ONNXRUNTIME_VERSION: "1.29.0"
+      ONNXRUNTIME_SHA256: "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba"
+      # sentence-transformers/all-MiniLM-L6-v2: the MiniLM-class model
+      # ADR-0005 names, 384 dimensions, mean-pooled and L2-normalized.
+      MODEL_URL: "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
+      MODEL_SHA256: "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452"
+      TOKENIZER_URL: "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+      TOKENIZER_SHA256: "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-onnx
+
+      - name: Fetch ONNX Runtime shared library
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sL --fail -o /tmp/onnxruntime.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz"
+          echo "${ONNXRUNTIME_SHA256}  /tmp/onnxruntime.tgz" | sha256sum --check
+          tar xzf /tmp/onnxruntime.tgz -C /tmp
+          echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+
+      - name: Fetch the model and tokenizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/minilm
+          curl -sL --fail -o /tmp/minilm/model.onnx "${MODEL_URL}"
+          curl -sL --fail -o /tmp/minilm/tokenizer.json "${TOKENIZER_URL}"
+          echo "${MODEL_SHA256}  /tmp/minilm/model.onnx" | sha256sum --check
+          echo "${TOKENIZER_SHA256}  /tmp/minilm/tokenizer.json" | sha256sum --check
+          echo "GRAPH_STORAGE_ONNX_MODEL=/tmp/minilm/model.onnx" >> "$GITHUB_ENV"
+          echo "GRAPH_STORAGE_ONNX_TOKENIZER=/tmp/minilm/tokenizer.json" >> "$GITHUB_ENV"
+
+      # REQUIRED turns a skip into a failure: this lane exists to run the
+      # model, and a green run that quietly skipped it is worse than no lane.
+      - name: cargo test (ONNX embedding provider)
+        shell: bash
+        timeout-minutes: 15
+        env:
+          GRAPH_STORAGE_ONNX_REQUIRED: "1"
+        run: cargo test -p cf-gears-graph-storage-onnx-embedding-plugin
+
+      - name: cargo check (graph-storage with the onnx feature)
+        run: cargo check -p cf-gears-graph-storage --features onnx
 
   # Builds and tests file-parser's optional `magika` feature so it doesn't
   # silently rot. `ort`'s own `download-binaries` feature is NOT used here —
