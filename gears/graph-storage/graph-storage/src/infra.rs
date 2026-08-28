@@ -6,6 +6,7 @@
 //! entity, a statement or a connection: the only way out of `domain/` is
 //! through the ports in `graph_storage_sdk::plugin_api`.
 
+pub mod embedding;
 pub mod engine;
 pub mod fake_store;
 pub mod storage;

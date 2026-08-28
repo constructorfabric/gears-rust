@@ -57,6 +57,9 @@ toolkit-db-macros = { workspace = true }
 
 [dev-dependencies]
 cf-gears-test-containers = { workspace = true }
+# The executable plugin contracts: every provider and store implementation
+# proves itself against the same assertions, wherever it lives.
+graph-storage-sdk = { workspace = true, features = ["test-support"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

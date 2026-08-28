@@ -660,11 +660,166 @@ impl RemainingBudget {
 /// Full embedding-space identity. Two providers with the same dimension and
 /// different identities produce incomparable vectors, so the identity is more
 /// than a width.
+///
+/// The fields below are exactly the ones the `embedding_space` table records
+/// (DESIGN § Table `embedding_space`), so a provider's declaration and the
+/// durable row cannot describe different things.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmbeddingSpaceId {
-    /// Canonical hash over the artifact/preprocessing identity below.
+    /// Canonical hash over the artifact/preprocessing identity below. Derived
+    /// by [`EmbeddingSpaceId::new`] — never assembled by hand, or two
+    /// providers describing one space would disagree about its name.
     pub identity_hash: String,
+    /// Exact model artifact: name plus version or content hash.
     pub model_artifact: String,
+    /// Exact tokenizer artifact, on the same terms.
     pub tokenizer_artifact: String,
+    /// Declared preprocessing, pooling and normalization configuration. A
+    /// different pooling rule over identical weights still yields vectors
+    /// that must not be compared, so these are part of the identity rather
+    /// than documentation of it.
+    pub preprocessing: serde_json::Value,
+    pub pooling: serde_json::Value,
+    pub normalization: serde_json::Value,
     pub dimension: u32,
+}
+
+impl EmbeddingSpaceId {
+    /// Build an identity and derive its canonical hash.
+    ///
+    /// The hash lives here rather than in each provider because it is the name
+    /// readiness compares against: the ONNX plugin, a remote plugin and the
+    /// deterministic fake must all arrive at the same string for the same
+    /// space, and at different strings for different ones.
+    #[must_use]
+    pub fn new(
+        model_artifact: impl Into<String>,
+        tokenizer_artifact: impl Into<String>,
+        preprocessing: serde_json::Value,
+        pooling: serde_json::Value,
+        normalization: serde_json::Value,
+        dimension: u32,
+    ) -> Self {
+        let model_artifact = model_artifact.into();
+        let tokenizer_artifact = tokenizer_artifact.into();
+        let identity_hash = identity_hash(
+            &model_artifact,
+            &tokenizer_artifact,
+            &preprocessing,
+            &pooling,
+            &normalization,
+            dimension,
+        );
+        Self {
+            identity_hash,
+            model_artifact,
+            tokenizer_artifact,
+            preprocessing,
+            pooling,
+            normalization,
+            dimension,
+        }
+    }
+}
+
+/// Recursively sort object keys so two semantically identical configurations
+/// hash identically regardless of member order.
+fn canonical(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, inner)| (key.clone(), canonical(inner)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn identity_hash(
+    model_artifact: &str,
+    tokenizer_artifact: &str,
+    preprocessing: &serde_json::Value,
+    pooling: &serde_json::Value,
+    normalization: &serde_json::Value,
+    dimension: u32,
+) -> String {
+    // `aws-lc-rs` is the workspace's FIPS-capable backend; a pure-Rust hasher
+    // is refused by the DE0708 lint. Field boundaries are length-prefixed so
+    // no concatenation of distinct identities can collide.
+    let mut hasher = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    let preprocessing = canonical(preprocessing).to_string();
+    let pooling = canonical(pooling).to_string();
+    let normalization = canonical(normalization).to_string();
+    for part in [
+        model_artifact.as_bytes(),
+        tokenizer_artifact.as_bytes(),
+        preprocessing.as_bytes(),
+        pooling.as_bytes(),
+        normalization.as_bytes(),
+        &dimension.to_be_bytes(),
+    ] {
+        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    hex::encode(hasher.finish())
+}
+
+#[cfg(test)]
+mod embedding_space_tests {
+    use super::EmbeddingSpaceId;
+
+    fn space(pooling: &str, dimension: u32) -> EmbeddingSpaceId {
+        EmbeddingSpaceId::new(
+            "all-MiniLM-L6-v2@sha256:abc",
+            "bert-wordpiece@sha256:def",
+            serde_json::json!({ "lowercase": true }),
+            serde_json::json!({ "strategy": pooling }),
+            serde_json::json!({ "l2": true }),
+            dimension,
+        )
+    }
+
+    #[test]
+    fn the_same_identity_hashes_the_same_however_the_json_is_ordered() {
+        let one = EmbeddingSpaceId::new(
+            "m",
+            "t",
+            serde_json::json!({ "a": 1, "b": 2 }),
+            serde_json::json!({}),
+            serde_json::json!({}),
+            384,
+        );
+        let other = EmbeddingSpaceId::new(
+            "m",
+            "t",
+            serde_json::json!({ "b": 2, "a": 1 }),
+            serde_json::json!({}),
+            serde_json::json!({}),
+            384,
+        );
+        assert_eq!(one.identity_hash, other.identity_hash);
+    }
+
+    /// The case ADR-0005 exists for: same weights, same width, different
+    /// pooling — incomparable vectors that a dimension check cannot see.
+    #[test]
+    fn pooling_alone_changes_the_identity() {
+        assert_ne!(
+            space("mean", 384).identity_hash,
+            space("cls", 384).identity_hash
+        );
+    }
+
+    #[test]
+    fn dimension_alone_changes_the_identity() {
+        assert_ne!(
+            space("mean", 384).identity_hash,
+            space("mean", 768).identity_hash
+        );
+    }
 }

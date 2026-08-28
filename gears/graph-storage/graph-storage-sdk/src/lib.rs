@@ -17,6 +17,9 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+/// Executable plugin contracts for implementors; see [`contract`].
+#[cfg(feature = "test-support")]
+pub mod contract;
 pub mod gts;
 pub mod models;
 pub mod plugin_api;

@@ -13,10 +13,20 @@ name = "graph_storage_sdk"
 [lints]
 workspace = true
 
+[features]
+default = []
+# The executable form of the plugin contracts, for crates implementing them.
+# Off by default: a consumer of the client trait has no use for it.
+test-support = []
+
 [dependencies]
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+# The embedding-space identity hash is derived here rather than per provider:
+# every plugin must arrive at the same name for the same space (ADR-0005).
+aws-lc-rs = { workspace = true }
+hex = { workspace = true }
 time = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
