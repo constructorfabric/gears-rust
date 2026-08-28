@@ -11,8 +11,8 @@ use graph_storage_sdk::models::{
     DeleteOutcome, DeleteRequest, EdgeKey, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
     ItemError, ItemFamily, NeighborhoodRequest, NodeKey, NodeRow, NodeView, Page,
     ProjectionRequest, RemainingBudget, SearchMode, SearchRequest, SearchResponse,
-    TraversalResponse,
-    TraverseRequest, TypeIdSet, TypeKind, TypeQuery, TypeRecord, TypeRegistration,
+    TraversalResponse, TraverseRequest, TypeIdSet, TypeKind, TypeQuery, TypeRecord,
+    TypeRegistration,
 };
 use graph_storage_sdk::plugin_api::{GraphEngineV1, GraphStoreV1, StoreCtx};
 use tokio_util::sync::CancellationToken;

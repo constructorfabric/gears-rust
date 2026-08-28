@@ -136,9 +136,7 @@ impl EmbeddingCoordinator {
                     .to_owned(),
             });
         }
-        let mut vectors = self
-            .embed(vec![query.to_owned()], budget, cancel)
-            .await?;
+        let mut vectors = self.embed(vec![query.to_owned()], budget, cancel).await?;
         // One input, one vector: `embed` has already refused a short answer.
         Ok(vectors.swap_remove(0))
     }
@@ -221,9 +219,9 @@ pub fn declared_paths<'a>(
     records: &'a std::collections::BTreeMap<String, TypeRecord>,
     node: &NodeSpec,
 ) -> &'a [String] {
-    records
-        .get(&node.type_id)
-        .map_or(&[], |record| record.effective_traits.vector_search.as_slice())
+    records.get(&node.type_id).map_or(&[], |record| {
+        record.effective_traits.vector_search.as_slice()
+    })
 }
 
 /// What a store already holds for a node, in the only terms the decision
@@ -412,7 +410,11 @@ mod tests {
             "Finding",
             serde_json::json!({ "summary": "leaked key", "rule": "SEC-014" }),
         );
-        let one = input_hash(&compose_input(&node, &["/payload/summary".to_owned()], 1024));
+        let one = input_hash(&compose_input(
+            &node,
+            &["/payload/summary".to_owned()],
+            1024,
+        ));
         let other = input_hash(&compose_input(&node, &["/payload/rule".to_owned()], 1024));
         assert_ne!(one, other);
     }
@@ -440,10 +442,7 @@ mod tests {
         // U+00E9, two bytes in UTF-8, so an odd ceiling lands mid-character
         // and a naive slice would panic rather than truncate.
         let wide = '\u{e9}';
-        let node = node(
-            wide.to_string().repeat(10).as_str(),
-            serde_json::json!({}),
-        );
+        let node = node(wide.to_string().repeat(10).as_str(), serde_json::json!({}));
         let cut = compose_input(&node, &[], 5);
         assert_eq!(cut.len(), 4, "cut {cut:?} did not fall back to a boundary");
         assert!(cut.chars().all(|c| c == wide));

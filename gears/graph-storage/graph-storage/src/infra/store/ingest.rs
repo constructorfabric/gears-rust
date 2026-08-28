@@ -657,10 +657,7 @@ struct VectorWrite {
     input_hash: Option<String>,
 }
 
-fn plan_vector(
-    current: Option<&node::Model>,
-    planned: PlannedVector<'_>,
-) -> VectorWrite {
+fn plan_vector(current: Option<&node::Model>, planned: PlannedVector<'_>) -> VectorWrite {
     let stored = current.map(|row| StoredVector {
         has_vector: row.embedding.is_some(),
         input_hash: row.embedding_input_hash.as_deref(),

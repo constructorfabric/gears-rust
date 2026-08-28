@@ -200,9 +200,10 @@ impl OnnxEmbeddingProvider {
 }
 
 fn artifact_name(path: &Path, digest: &str) -> String {
-    let name = path
-        .file_name()
-        .map_or_else(|| "unnamed".to_owned(), |n| n.to_string_lossy().into_owned());
+    let name = path.file_name().map_or_else(
+        || "unnamed".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     format!("{name}@sha256:{digest}")
 }
 

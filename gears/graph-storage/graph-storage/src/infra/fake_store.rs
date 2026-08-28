@@ -15,8 +15,7 @@ use graph_storage_sdk::models::{
     IngestCounts, IngestOutcome, IngestRequest, ItemError, ItemFamily, LabelAssignment, LabelId,
     LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page, ProjectionRequest,
     ReadSnapshot, RevisionOutcome, SearchMode, SearchRequest, SearchResponse, StoreCapabilities,
-    TopologyPage,
-    TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
+    TopologyPage, TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
 };
 use graph_storage_sdk::plugin_api::{
     EmbeddingPlan, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
@@ -356,15 +355,7 @@ impl GraphStoreV1 for FakeGraphStore {
                     active_epoch: embedding.epoch,
                 },
             );
-            changed |= apply_node(
-                tenant,
-                &mut nodes,
-                &edges,
-                &mut state,
-                index,
-                spec,
-                vector,
-            )?;
+            changed |= apply_node(tenant, &mut nodes, &edges, &mut state, index, spec, vector)?;
         }
         for (index, spec) in req.edges.iter().enumerate() {
             changed |= apply_edge(
@@ -950,10 +941,7 @@ struct VectorWrite {
     input_hash: Option<String>,
 }
 
-fn plan_vector(
-    current: Option<&FakeNode>,
-    planned: PlannedVector<'_>,
-) -> VectorWrite {
+fn plan_vector(current: Option<&FakeNode>, planned: PlannedVector<'_>) -> VectorWrite {
     let stored = current.map(|row| StoredVector {
         has_vector: row.embedding.is_some(),
         input_hash: row.embedding_input_hash.as_deref(),
@@ -1333,7 +1321,12 @@ fn cosine_distance(one: &[f32], other: &[f32]) -> f64 {
         .zip(other)
         .map(|(a, b)| f64::from(*a) * f64::from(*b))
         .sum();
-    let norm = |v: &[f32]| -> f64 { v.iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>().sqrt() };
+    let norm = |v: &[f32]| -> f64 {
+        v.iter()
+            .map(|x| f64::from(*x) * f64::from(*x))
+            .sum::<f64>()
+            .sqrt()
+    };
     let (left, right) = (norm(one), norm(other));
     if left == 0.0 || right == 0.0 {
         return 1.0;
@@ -1356,7 +1349,9 @@ fn fuse_arms(
     let mut fused: BTreeMap<i64, (f64, Vec<ArmHit>, &FakeNode)> = BTreeMap::new();
     for (arm, rows) in [(SearchArm::Lexical, lexical), (SearchArm::Vector, vector)] {
         for (position, node) in rows.iter().enumerate() {
-            let rank = u32::try_from(position).unwrap_or(u32::MAX).saturating_add(1);
+            let rank = u32::try_from(position)
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
             let contribution = 1.0 / (K + f64::from(rank));
             let entry = fused
                 .entry(node.id)

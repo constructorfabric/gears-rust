@@ -277,19 +277,19 @@ async fn the_pattern_hop_walks_the_graph() {
         .await
         .expect("ontology registers");
     conformance::ingest_batch(
-            stand.store.as_ref(),
-            &ctx,
-            conformance::batch(
-                vec![
-                    conformance::node("a", "a"),
-                    conformance::node("b", "b"),
-                    conformance::node("c", "c"),
-                ],
-                vec![conformance::edge("a", "b"), conformance::edge("b", "c")],
-            ),
-        )
-        .await
-        .expect("the batch commits");
+        stand.store.as_ref(),
+        &ctx,
+        conformance::batch(
+            vec![
+                conformance::node("a", "a"),
+                conformance::node("b", "b"),
+                conformance::node("c", "c"),
+            ],
+            vec![conformance::edge("a", "b"), conformance::edge("b", "c")],
+        ),
+    )
+    .await
+    .expect("the batch commits");
 
     let ids = stand
         .store
@@ -333,22 +333,22 @@ async fn seed_and_expand(stand: &Stand, direction: Direction) -> (Vec<i64>, Vec<
         .await
         .expect("ontology registers");
     conformance::ingest_batch(
-            stand.store.as_ref(),
-            &ctx,
-            conformance::batch(
-                vec![
-                    conformance::node("hub", "hub"),
-                    conformance::node("spoke-1", "one"),
-                    conformance::node("spoke-2", "two"),
-                ],
-                vec![
-                    conformance::edge("hub", "spoke-1"),
-                    conformance::edge("spoke-2", "hub"),
-                ],
-            ),
-        )
-        .await
-        .expect("the batch commits");
+        stand.store.as_ref(),
+        &ctx,
+        conformance::batch(
+            vec![
+                conformance::node("hub", "hub"),
+                conformance::node("spoke-1", "one"),
+                conformance::node("spoke-2", "two"),
+            ],
+            vec![
+                conformance::edge("hub", "spoke-1"),
+                conformance::edge("spoke-2", "hub"),
+            ],
+        ),
+    )
+    .await
+    .expect("the batch commits");
 
     let seed = stand
         .store
@@ -437,18 +437,18 @@ async fn a_hop_never_leaves_its_tenant() {
             .await
             .expect("ontology registers");
         conformance::ingest_batch(
-                stand.store.as_ref(),
-                &ctx,
-                conformance::batch(
-                    vec![
-                        conformance::node("shared-key", "start"),
-                        conformance::node(far, far),
-                    ],
-                    vec![conformance::edge("shared-key", far)],
-                ),
-            )
-            .await
-            .expect("the batch commits");
+            stand.store.as_ref(),
+            &ctx,
+            conformance::batch(
+                vec![
+                    conformance::node("shared-key", "start"),
+                    conformance::node(far, far),
+                ],
+                vec![conformance::edge("shared-key", far)],
+            ),
+        )
+        .await
+        .expect("the batch commits");
     }
 
     // Precondition: the trap exists on the other side.
@@ -568,15 +568,15 @@ async fn traversal_answers_on_a_server_without_the_property_graph() {
         .await
         .expect("ontology registers");
     conformance::ingest_batch(
-            stand.store.as_ref(),
-            &ctx,
-            conformance::batch(
-                vec![conformance::node("p-a", "a"), conformance::node("p-b", "b")],
-                vec![conformance::edge("p-a", "p-b")],
-            ),
-        )
-        .await
-        .expect("the batch commits");
+        stand.store.as_ref(),
+        &ctx,
+        conformance::batch(
+            vec![conformance::node("p-a", "a"), conformance::node("p-b", "b")],
+            vec![conformance::edge("p-a", "p-b")],
+        ),
+    )
+    .await
+    .expect("the batch commits");
 
     let seed = stand
         .store
@@ -688,23 +688,23 @@ async fn the_built_in_store_declines_the_snapshot_obligation() {
         .await
         .expect("ontology registers");
     conformance::ingest_batch(
-            stand.store.as_ref(),
-            &ctx,
-            conformance::batch(vec![conformance::node("snap-before", "before")], Vec::new()),
-        )
-        .await
-        .expect("the first batch commits");
+        stand.store.as_ref(),
+        &ctx,
+        conformance::batch(vec![conformance::node("snap-before", "before")], Vec::new()),
+    )
+    .await
+    .expect("the first batch commits");
 
     let snapshot = stand.store.begin_read(&ctx).await.expect("snapshot opens");
 
     // A concurrent commit, landing between the arms of the compound read.
     conformance::ingest_batch(
-            stand.store.as_ref(),
-            &ctx,
-            conformance::batch(vec![conformance::node("snap-after", "after")], Vec::new()),
-        )
-        .await
-        .expect("the concurrent batch commits");
+        stand.store.as_ref(),
+        &ctx,
+        conformance::batch(vec![conformance::node("snap-after", "after")], Vec::new()),
+    )
+    .await
+    .expect("the concurrent batch commits");
 
     let under = conformance::ctx(tenant, &scope, Some(&snapshot));
     let seen = stand

@@ -14,9 +14,9 @@ use graph_storage_sdk::plugin_api::EmbeddingProviderV1;
 
 use crate::api::rest::routes;
 use crate::config::{EmbeddingProviderKind, GraphStorageConfig};
+use crate::domain::embedding::SpaceState;
 use crate::domain::local_client::GraphStorageLocalClient;
 use crate::domain::service::GraphServices;
-use crate::domain::embedding::SpaceState;
 use crate::infra::embedding::fake::FakeEmbeddingProvider;
 use crate::infra::engine::PgGraphEngine;
 use crate::infra::store::{PgGraphStore, spaces};
@@ -116,7 +116,9 @@ async fn select_embedding_provider(
                 "graph-storage.embedding_provider is `fake`: vector search will answer, \
                  but its ranking carries no semantics"
             );
-            Ok(Arc::new(FakeEmbeddingProvider::new(cfg.embedding_dimension)))
+            Ok(Arc::new(FakeEmbeddingProvider::new(
+                cfg.embedding_dimension,
+            )))
         }
         EmbeddingProviderKind::Onnx => onnx_provider(cfg).await,
     }

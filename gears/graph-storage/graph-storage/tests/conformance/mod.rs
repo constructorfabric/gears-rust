@@ -25,12 +25,12 @@
 
 use std::time::Duration;
 
+use graph_storage::domain::embedding::{EmbeddingCoordinator, SpaceState};
+use graph_storage::infra::embedding::fake::FakeEmbeddingProvider;
 use graph_storage_sdk::models::{
     DeleteRequest, EdgeSpec, IngestOptions, IngestRequest, ItemFamily, NodeSpec, ProjectionRequest,
     ReadSnapshot, RemainingBudget, ReplaceScope, SearchMode, SearchRequest, TypeRegistration,
 };
-use graph_storage::domain::embedding::{EmbeddingCoordinator, SpaceState};
-use graph_storage::infra::embedding::fake::FakeEmbeddingProvider;
 use graph_storage_sdk::plugin_api::{EmbeddingPlan, GraphStoreError, GraphStoreV1, StoreCtx};
 use tokio_util::sync::CancellationToken;
 use toolkit_security::AccessScope;
@@ -244,8 +244,7 @@ pub async fn batch_atomicity(store: &dyn GraphStoreV1, tenant: Uuid) {
     "gts.test.unregistered._.nope.v1~".clone_into(&mut doomed.edges[0].type_id);
     doomed.idempotency_key = Some("atomic-key".to_owned());
 
-    let error = ingest_batch(
-            store,&ctx, doomed)
+    let error = ingest_batch(store, &ctx, doomed)
         .await
         .expect_err("an unregistered edge type must fail the batch");
     assert!(
@@ -271,7 +270,9 @@ pub async fn batch_atomicity(store: &dyn GraphStoreV1, tenant: Uuid) {
         request.idempotency_key = Some("atomic-key".to_owned());
         request
     };
-    let outcome = ingest_batch(store, &ctx, retry).await.expect("the retry commits");
+    let outcome = ingest_batch(store, &ctx, retry)
+        .await
+        .expect("the retry commits");
     assert!(
         !outcome.replayed,
         "the failed batch must not have left a receipt to replay"
@@ -299,13 +300,11 @@ pub async fn generation_fencing(store: &dyn GraphStoreV1, tenant: Uuid) {
         ..IngestRequest::default()
     };
 
-    ingest_batch(
-            store,&ctx, replace(5, "at five"))
+    ingest_batch(store, &ctx, replace(5, "at five"))
         .await
         .expect("generation 5 commits");
 
-    let stale = ingest_batch(
-            store,&ctx, replace(4, "at four"))
+    let stale = ingest_batch(store, &ctx, replace(4, "at four"))
         .await
         .expect_err("an older generation must be refused");
     assert!(
@@ -319,8 +318,7 @@ pub async fn generation_fencing(store: &dyn GraphStoreV1, tenant: Uuid) {
         "expected stale-generation fencing, got {stale}"
     );
 
-    let divergent = ingest_batch(
-            store,&ctx, replace(5, "different at five"))
+    let divergent = ingest_batch(store, &ctx, replace(5, "different at five"))
         .await
         .expect_err("an equal generation with different content must conflict");
     assert!(
@@ -328,8 +326,7 @@ pub async fn generation_fencing(store: &dyn GraphStoreV1, tenant: Uuid) {
         "expected a conflict, got {divergent}"
     );
 
-    ingest_batch(
-            store,&ctx, replace(6, "at six"))
+    ingest_batch(store, &ctx, replace(6, "at six"))
         .await
         .expect("a newer generation commits");
 }
@@ -345,15 +342,15 @@ pub async fn no_orphan_edges(store: &dyn GraphStoreV1, tenant: Uuid) {
         .expect("ontology registers");
 
     ingest_batch(
-            store,
-            &ctx,
-            batch(
-                vec![node("orphan-a", "a"), node("orphan-b", "b")],
-                vec![edge("orphan-a", "orphan-b")],
-            ),
-        )
-        .await
-        .expect("the batch commits");
+        store,
+        &ctx,
+        batch(
+            vec![node("orphan-a", "a"), node("orphan-b", "b")],
+            vec![edge("orphan-a", "orphan-b")],
+        ),
+    )
+    .await
+    .expect("the batch commits");
 
     let outcome = store
         .soft_delete(&ctx, DeleteRequest::Node("orphan-a".to_owned()))
@@ -395,8 +392,7 @@ pub async fn a_fresh_tenant_reports_a_usable_revision(store: &dyn GraphStoreV1, 
         .register_types(&ctx, ontology_batch())
         .await
         .expect("ontology registers");
-    let outcome = ingest_batch(
-            store,&ctx, batch(vec![node("first", "first")], Vec::new()))
+    let outcome = ingest_batch(store, &ctx, batch(vec![node("first", "first")], Vec::new()))
         .await
         .expect("the batch commits");
     assert_eq!(
@@ -422,11 +418,15 @@ pub async fn idempotency(store: &dyn GraphStoreV1, tenant: Uuid) {
         request
     };
 
-    let first = ingest_batch(store, &ctx, request()).await.expect("first commits");
+    let first = ingest_batch(store, &ctx, request())
+        .await
+        .expect("first commits");
     assert!(!first.replayed);
     assert_eq!(first.counts.nodes_inserted, 1);
 
-    let second = ingest_batch(store, &ctx, request()).await.expect("retry replays");
+    let second = ingest_batch(store, &ctx, request())
+        .await
+        .expect("retry replays");
     assert!(second.replayed, "a recorded key must replay");
     assert_eq!(
         second.revision, first.revision,
@@ -435,8 +435,7 @@ pub async fn idempotency(store: &dyn GraphStoreV1, tenant: Uuid) {
 
     let mut divergent = batch(vec![node("idem-1", "different")], Vec::new());
     divergent.idempotency_key = Some("idem-key".to_owned());
-    let error = ingest_batch(
-            store,&ctx, divergent)
+    let error = ingest_batch(store, &ctx, divergent)
         .await
         .expect_err("the same key with different content must be refused");
     assert!(
@@ -462,11 +461,15 @@ pub async fn convergent_replay(store: &dyn GraphStoreV1, tenant: Uuid) {
         )
     };
 
-    let first = ingest_batch(store, &ctx, request()).await.expect("first commits");
+    let first = ingest_batch(store, &ctx, request())
+        .await
+        .expect("first commits");
     assert_eq!(first.counts.nodes_inserted, 2);
     assert_eq!(first.counts.edges_inserted, 1);
 
-    let second = ingest_batch(store, &ctx, request()).await.expect("second commits");
+    let second = ingest_batch(store, &ctx, request())
+        .await
+        .expect("second commits");
     assert_eq!(second.counts.nodes_unchanged, 2, "nothing changed");
     assert_eq!(second.counts.edges_unchanged, 1);
     assert_eq!(
@@ -521,46 +524,46 @@ pub async fn endpoint_constraints_are_enforced(store: &dyn GraphStoreV1, tenant:
         ..NodeSpec::default()
     };
     ingest_batch(
-            store,
-            &ctx,
-            batch_of(vec![node("owned-1", "one"), mirror], Vec::new()),
-        )
-        .await
-        .expect("both nodes commit");
+        store,
+        &ctx,
+        batch_of(vec![node("owned-1", "one"), mirror], Vec::new()),
+    )
+    .await
+    .expect("both nodes commit");
 
     // Owned -> owned is admitted.
     ingest_batch(
-            store,
-            &ctx,
-            batch_of(
-                Vec::new(),
-                vec![EdgeSpec {
-                    type_id: OWNED_ONLY.to_owned(),
-                    src_node_key: "owned-1".to_owned(),
-                    dst_node_key: "owned-1".to_owned(),
-                    ..EdgeSpec::default()
-                }],
-            ),
-        )
-        .await
-        .expect("an edge between admitted endpoints commits");
+        store,
+        &ctx,
+        batch_of(
+            Vec::new(),
+            vec![EdgeSpec {
+                type_id: OWNED_ONLY.to_owned(),
+                src_node_key: "owned-1".to_owned(),
+                dst_node_key: "owned-1".to_owned(),
+                ..EdgeSpec::default()
+            }],
+        ),
+    )
+    .await
+    .expect("an edge between admitted endpoints commits");
 
     // Owned -> reference is not.
     let error = ingest_batch(
-            store,
-            &ctx,
-            batch_of(
-                Vec::new(),
-                vec![EdgeSpec {
-                    type_id: OWNED_ONLY.to_owned(),
-                    src_node_key: "owned-1".to_owned(),
-                    dst_node_key: "sys:repo:42".to_owned(),
-                    ..EdgeSpec::default()
-                }],
-            ),
-        )
-        .await
-        .expect_err("an endpoint the edge type does not admit must be refused");
+        store,
+        &ctx,
+        batch_of(
+            Vec::new(),
+            vec![EdgeSpec {
+                type_id: OWNED_ONLY.to_owned(),
+                src_node_key: "owned-1".to_owned(),
+                dst_node_key: "sys:repo:42".to_owned(),
+                ..EdgeSpec::default()
+            }],
+        ),
+    )
+    .await
+    .expect_err("an endpoint the edge type does not admit must be refused");
 
     let GraphStoreError::Validation { items } = error else {
         panic!("expected a per-item validation failure, got {error}");
@@ -614,20 +617,20 @@ pub async fn materializing_a_phantom_revalidates_its_edges(store: &dyn GraphStor
     // The destination does not exist yet: a phantom stands in, and the edge
     // commits because a phantom carries no type to check.
     let outcome = ingest_batch(
-            store,
-            &ctx,
-            batch_of(
-                vec![node("owned-1", "one")],
-                vec![EdgeSpec {
-                    type_id: OWNED_ONLY.to_owned(),
-                    src_node_key: "owned-1".to_owned(),
-                    dst_node_key: "sys:repo:9".to_owned(),
-                    ..EdgeSpec::default()
-                }],
-            ),
-        )
-        .await
-        .expect("an edge to an absent node stands up a phantom");
+        store,
+        &ctx,
+        batch_of(
+            vec![node("owned-1", "one")],
+            vec![EdgeSpec {
+                type_id: OWNED_ONLY.to_owned(),
+                src_node_key: "owned-1".to_owned(),
+                dst_node_key: "sys:repo:9".to_owned(),
+                ..EdgeSpec::default()
+            }],
+        ),
+    )
+    .await
+    .expect("an edge to an absent node stands up a phantom");
     assert_eq!(
         outcome.counts.phantoms_created, 1,
         "the absent endpoint became a phantom"
@@ -636,22 +639,22 @@ pub async fn materializing_a_phantom_revalidates_its_edges(store: &dyn GraphStor
     // Materializing it as a type the edge does not admit is refused: the check
     // deferred at edge time comes due here.
     let error = ingest_batch(
-            store,
-            &ctx,
-            batch_of(
-                vec![NodeSpec {
-                    node_key: "sys:repo:9".to_owned(),
-                    type_id: REFERENCE.to_owned(),
-                    payload: Some(serde_json::json!({
-                        "source": { "system": "sys", "kind": "repo", "native_id": "9" }
-                    })),
-                    ..NodeSpec::default()
-                }],
-                Vec::new(),
-            ),
-        )
-        .await
-        .expect_err("materialization must revalidate the edges the phantom accumulated");
+        store,
+        &ctx,
+        batch_of(
+            vec![NodeSpec {
+                node_key: "sys:repo:9".to_owned(),
+                type_id: REFERENCE.to_owned(),
+                payload: Some(serde_json::json!({
+                    "source": { "system": "sys", "kind": "repo", "native_id": "9" }
+                })),
+                ..NodeSpec::default()
+            }],
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect_err("materialization must revalidate the edges the phantom accumulated");
     let GraphStoreError::Validation { items } = error else {
         panic!("expected a per-item validation failure, got {error}");
     };
@@ -669,9 +672,12 @@ pub async fn materializing_a_phantom_revalidates_its_edges(store: &dyn GraphStor
 
     // Materializing it as an admitted type is accepted.
     let outcome = ingest_batch(
-            store,&ctx, batch_of(vec![node("sys:repo:9", "late")], Vec::new()))
-        .await
-        .expect("an admitted concrete type materializes the phantom");
+        store,
+        &ctx,
+        batch_of(vec![node("sys:repo:9", "late")], Vec::new()),
+    )
+    .await
+    .expect("an admitted concrete type materializes the phantom");
     assert_eq!(
         outcome.counts.phantoms_materialized, 1,
         "the phantom became concrete"
@@ -694,9 +700,12 @@ pub async fn tenant_isolation(store: &dyn GraphStoreV1, one: Uuid, two: Uuid) {
             .await
             .expect("ontology registers");
         ingest_batch(
-                store,&ctx, batch(vec![node("colliding-key", name)], Vec::new()))
-            .await
-            .expect("the batch commits");
+            store,
+            &ctx,
+            batch(vec![node("colliding-key", name)], Vec::new()),
+        )
+        .await
+        .expect("the batch commits");
     }
 
     // The colliding key is the trap: a leak shows up as the *other* tenant's
@@ -746,8 +755,7 @@ pub async fn tombstones_are_invisible(store: &dyn GraphStoreV1, tenant: Uuid) {
         .register_types(&ctx, ontology_batch())
         .await
         .expect("ontology registers");
-    ingest_batch(
-            store,&ctx, batch(vec![node("gone", "here")], Vec::new()))
+    ingest_batch(store, &ctx, batch(vec![node("gone", "here")], Vec::new()))
         .await
         .expect("the batch commits");
     store
@@ -779,8 +787,7 @@ pub async fn tombstones_are_invisible(store: &dyn GraphStoreV1, tenant: Uuid) {
         "a tombstoned node must not appear in a projection"
     );
 
-    let error = ingest_batch(
-            store,&ctx, batch(vec![node("gone", "back")], Vec::new()))
+    let error = ingest_batch(store, &ctx, batch(vec![node("gone", "back")], Vec::new()))
         .await
         .expect_err("a tombstoned key is not reusable before purge");
     assert!(
@@ -799,9 +806,12 @@ pub async fn denied_is_indistinguishable_from_absent(store: &dyn GraphStoreV1, t
         .await
         .expect("ontology registers");
     ingest_batch(
-            store,&ctx, batch(vec![node("private", "secret")], Vec::new()))
-        .await
-        .expect("the batch commits");
+        store,
+        &ctx,
+        batch(vec![node("private", "secret")], Vec::new()),
+    )
+    .await
+    .expect("the batch commits");
 
     let denied = AccessScope::deny_all();
     let denied_ctx = self::ctx(tenant, &denied, None);
@@ -827,12 +837,12 @@ pub async fn search_is_scoped(store: &dyn GraphStoreV1, tenant: Uuid) {
         .await
         .expect("ontology registers");
     ingest_batch(
-            store,
-            &ctx,
-            batch(vec![node("searchable", "findable thing")], Vec::new()),
-        )
-        .await
-        .expect("the batch commits");
+        store,
+        &ctx,
+        batch(vec![node("searchable", "findable thing")], Vec::new()),
+    )
+    .await
+    .expect("the batch commits");
 
     let request = || SearchRequest {
         mode: SearchMode::Lexical,
