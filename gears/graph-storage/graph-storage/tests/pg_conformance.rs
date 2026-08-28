@@ -209,6 +209,26 @@ pg_case!(
 );
 
 pg_case!(a_recorded_idempotency_key_replays, conformance::idempotency);
+pg_case!(
+    a_document_is_retrieved_by_its_own_text,
+    conformance::a_document_is_retrieved_by_its_own_text
+);
+pg_case!(
+    a_declared_path_reaches_the_vector,
+    conformance::a_declared_path_reaches_the_vector
+);
+pg_case!(
+    a_skipped_re_ingest_preserves_the_vector,
+    conformance::a_skipped_re_ingest_preserves_the_vector
+);
+pg_case!(
+    a_stale_vector_stops_ranking_but_the_node_stays,
+    conformance::a_stale_vector_stops_ranking_but_the_node_stays
+);
+pg_case!(
+    only_the_active_epoch_ranks,
+    conformance::only_the_active_epoch_ranks
+);
 
 pg_case!(an_identical_batch_converges, conformance::convergent_replay);
 

@@ -77,10 +77,15 @@ pub fn coordinator() -> EmbeddingCoordinator {
     EmbeddingCoordinator::new(provider(), SpaceState::Active { epoch: EPOCH }, 8 * 1024)
 }
 
-/// Vector width and epoch the suite runs under. The epoch is arbitrary but
-/// non-default on purpose: a store that ignored it and stamped, say, 1 would
-/// still satisfy a suite that used 1.
-pub const DIMENSION: u32 = 8;
+/// Vector width the suite runs under. Not a free choice: the built-in store's
+/// column is `VECTOR(n)` for the width the schema was migrated with, and it
+/// refuses anything else. The fake accepts any width, so a suite that picked
+/// its own would pass there and fail on the first real server.
+pub const DIMENSION: u32 = graph_storage::infra::store::ingest::migrated_embedding_dimension();
+
+/// The epoch the suite writes and reads under. Arbitrary but non-default on
+/// purpose: a store that ignored the plan and stamped, say, 1 would still
+/// satisfy a suite that used 1.
 pub const EPOCH: i64 = 42;
 
 async fn plan_for(
@@ -146,7 +151,10 @@ pub fn ontology_batch() -> Vec<TypeRegistration> {
         schema: serde_json::json!({
             "$id": format!("gts://{OWNED}"),
             "$schema": "http://json-schema.org/draft-07/schema#",
-            "x-gts-traits": { "full_text_search": ["/name"] },
+            "x-gts-traits": {
+                "full_text_search": ["/name"],
+                "vector_search": ["/payload/summary"]
+            },
             "type": "object",
             "allOf": [
                 { "$ref": "gts://gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~" }
@@ -857,5 +865,257 @@ pub async fn search_is_scoped(store: &dyn GraphStoreV1, tenant: Uuid) {
         denied_hits.hits.is_empty(),
         "a denying scope must rank nothing: {:?}",
         denied_hits.hits
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Vector search
+// ---------------------------------------------------------------------------
+
+/// Query the vector arm the way the domain service does: embed the text with
+/// the same provider ingest used, and rank only the active epoch.
+async fn search_vector(
+    store: &(impl GraphStoreV1 + ?Sized),
+    ctx: &StoreCtx<'_>,
+    text: &str,
+    epoch: i64,
+) -> Vec<String> {
+    let query_vector = coordinator()
+        .embed_query(
+            text,
+            RemainingBudget::starting_now(Duration::from_secs(30)),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the deterministic provider always embeds");
+    store
+        .search(
+            ctx,
+            SearchRequest {
+                mode: SearchMode::Vector,
+                query: Some(text.to_owned()),
+                arm_limit: 10,
+                limit: 10,
+                type_patterns: Vec::new(),
+            },
+            Some(graph_storage_sdk::plugin_api::VectorArm {
+                query_vector,
+                epoch,
+            }),
+        )
+        .await
+        .expect("search succeeds")
+        .hits
+        .into_iter()
+        .map(|hit| hit.node_key)
+        .collect()
+}
+
+fn summarized(key: &str, name: &str, summary: &str) -> NodeSpec {
+    NodeSpec {
+        node_key: key.to_owned(),
+        type_id: OWNED.to_owned(),
+        name: Some(name.to_owned()),
+        payload: Some(serde_json::json!({ "summary": summary })),
+        ..NodeSpec::default()
+    }
+}
+
+/// ADR-0005's own acceptance test: "a document ingested and then queried with
+/// its own text ranks first in the vector arm".
+pub async fn a_document_is_retrieved_by_its_own_text(store: &impl GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![
+                summarized("doc-1", "Hardcoded credential", "in the deploy script"),
+                summarized("doc-2", "Unrelated", "something else entirely"),
+            ],
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect("the batch commits");
+
+    // The text the node itself composes: its name plus the payload path its
+    // type declares vectorizable.
+    let hits = search_vector(
+        store,
+        &ctx,
+        "Hardcoded credential in the deploy script",
+        EPOCH,
+    )
+    .await;
+    assert_eq!(
+        hits.first().map(String::as_str),
+        Some("doc-1"),
+        "a document must rank first for its own text: {hits:?}"
+    );
+}
+
+/// The `vector_search` trait is what decides the input, so a value at a
+/// declared path must reach the vector. If it did not, the two documents below
+/// would embed identically and the query could not tell them apart.
+pub async fn a_declared_path_reaches_the_vector(store: &impl GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![
+                summarized("same-1", "Same name", "first summary"),
+                summarized("same-2", "Same name", "second summary"),
+            ],
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect("the batch commits");
+
+    let hits = search_vector(store, &ctx, "Same name second summary", EPOCH).await;
+    assert_eq!(
+        hits.first().map(String::as_str),
+        Some("same-2"),
+        "two nodes sharing a name are told apart only by the declared path: {hits:?}"
+    );
+}
+
+/// `embed = false` with unchanged content preserves the vector: a
+/// metadata-only re-sync must not cost a re-embedding pass, and must not empty
+/// the vector arm either.
+pub async fn a_skipped_re_ingest_preserves_the_vector(store: &impl GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+
+    let spec = || summarized("keep", "Kept", "unchanged text");
+    ingest_batch(store, &ctx, batch(vec![spec()], Vec::new()))
+        .await
+        .expect("the first batch commits");
+
+    let mut skipped = batch(vec![spec()], Vec::new());
+    skipped.options.embed = Some(false);
+    ingest_batch(store, &ctx, skipped)
+        .await
+        .expect("the skipped batch commits");
+
+    let hits = search_vector(store, &ctx, "Kept unchanged text", EPOCH).await;
+    assert_eq!(
+        hits.first().map(String::as_str),
+        Some("keep"),
+        "a skipped re-ingest must keep the vector, not clear it: {hits:?}"
+    );
+}
+
+/// `embed = false` with *changed* content leaves the vector stale: it stays
+/// stored, so re-embedding can replace it, but it stops ranking. "A stored
+/// vector can never rank content that is no longer stored."
+pub async fn a_stale_vector_stops_ranking_but_the_node_stays(
+    store: &impl GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![summarized("drift", "Drifting", "the original text")],
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect("the first batch commits");
+    assert_eq!(
+        search_vector(store, &ctx, "Drifting the original text", EPOCH)
+            .await
+            .first()
+            .map(String::as_str),
+        Some("drift"),
+        "precondition: the node ranks for its own text before it drifts"
+    );
+
+    let mut changed = batch(
+        vec![summarized("drift", "Drifting", "an entirely new text")],
+        Vec::new(),
+    );
+    changed.options.embed = Some(false);
+    ingest_batch(store, &ctx, changed)
+        .await
+        .expect("the skipped batch commits");
+
+    let hits = search_vector(store, &ctx, "Drifting the original text", EPOCH).await;
+    assert!(
+        !hits.iter().any(|key| key == "drift"),
+        "a vector describing text the node no longer carries must not rank: {hits:?}"
+    );
+
+    // Only the vector arm loses it. The node is present as ever.
+    let view = store
+        .get_node(&ctx, &"drift".to_owned(), 10)
+        .await
+        .expect("the node is still readable");
+    assert_eq!(view.node_key, "drift");
+    assert!(
+        view.has_embedding,
+        "the vector is kept for re-embedding, only barred from ranking"
+    );
+}
+
+/// Vectors of another epoch were produced by another model. They must not be
+/// ranked against this query, however similar the numbers look.
+pub async fn only_the_active_epoch_ranks(store: &impl GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![summarized("epochal", "Epochal", "written under one epoch")],
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect("the batch commits");
+
+    let text = "Epochal written under one epoch";
+    assert_eq!(
+        search_vector(store, &ctx, text, EPOCH)
+            .await
+            .first()
+            .map(String::as_str),
+        Some("epochal"),
+        "precondition: the node ranks under the epoch it was written with"
+    );
+    assert!(
+        search_vector(store, &ctx, text, EPOCH + 1).await.is_empty(),
+        "a vector of another epoch must not rank"
     );
 }

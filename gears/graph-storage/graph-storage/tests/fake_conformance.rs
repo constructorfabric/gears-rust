@@ -76,6 +76,31 @@ async fn a_denying_scope_ranks_nothing() {
     conformance::search_is_scoped(&store(), Uuid::now_v7()).await;
 }
 
+#[tokio::test]
+async fn a_document_is_retrieved_by_its_own_text() {
+    conformance::a_document_is_retrieved_by_its_own_text(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_declared_path_reaches_the_vector() {
+    conformance::a_declared_path_reaches_the_vector(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_skipped_re_ingest_preserves_the_vector() {
+    conformance::a_skipped_re_ingest_preserves_the_vector(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_stale_vector_stops_ranking_but_the_node_stays() {
+    conformance::a_stale_vector_stops_ranking_but_the_node_stays(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn only_the_active_epoch_ranks() {
+    conformance::only_the_active_epoch_ranks(&store(), Uuid::now_v7()).await;
+}
+
 /// Obligation 5, which only the fake can currently satisfy: two arms of one
 /// read and a hydration after it observe one graph state.
 ///
