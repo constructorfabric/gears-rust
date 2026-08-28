@@ -1,4 +1,4 @@
-<!-- Updated: 2026-08-03 by Constructor Tech -->
+<!-- Updated: 2026-08-27 by Constructor Tech -->
 
 # Technical Design — Model Registry
 
@@ -43,7 +43,7 @@
 
 Model Registry provides a centralized catalog of AI models with tenant-level availability and approval status. The service is the authoritative source for model metadata, capabilities, API resolution (provider routing and OAGW alias), default inference parameters, context window limits, cost data, and tenant access control. LLM Gateway queries the registry to resolve model identifiers to provider routing and to read the tenant's approval state for a model.
 
-The architecture follows the Gears SDK pattern with clear separation between public API surface (`model-registry-sdk`) and implementation (`model-registry`). The system is optimized for high read throughput (1000:1 read:write ratio) behind a cache-first read path abstracted by the `CacheService` trait. **P1 implements exactly one backend — the in-process, local `InMemoryCache`.** Whether a distributed backend is added at all, and which technology it would be, is an **open question deferred beyond P1** (§4 Technical Debt & Roadmap). Provider API calls for model discovery are made by the discovery plugin, not by the registry, and route through Outbound API Gateway (`cpt-cf-model-registry-adr-oagw-provider-access`); that is a P2 capability — P1 invokes no plugin and populates the catalog exclusively from admin writes.
+The architecture follows the Gears SDK pattern with clear separation between public API surface (`model-registry-sdk`) and implementation (`model-registry`). The system serves a 1000:1 read:write ratio from indexed queries, caching only the requester's tenant ancestor chain (§2.1 "Resolution Caching"). The cache is the platform `cluster` gear's `ClusterCacheV1` primitive, reached through the `ResolutionCache` domain trait, so the backend is an operator binding rather than a compile-time choice this module owns. Provider API calls for model discovery route through Outbound API Gateway; that is a P2 capability — P1 makes no outbound provider calls at all and populates the catalog exclusively from admin writes.
 
 The design emphasizes tenant isolation with hierarchical inheritance. Providers and models are visible additively over the tenant ancestor chain resolved from `tenant-resolver`. Shadowing is keyed on the **provider slug and only on the provider slug** — a child tenant that registers a provider under an inherited slug takes that slug over for its subtree, and the shadowed provider's entire model set leaves with it. There is no model-level shadow. Model visibility is then set membership on `provider_id`; the algorithm all three read paths share is §3.5 "Tenant Visibility Resolution". Cache isolation ensures tenant data separation via a tenant-ID key prefix, a single TTL-based expiry (10 minutes), and whole-tenant invalidation on every write.
 
@@ -55,10 +55,10 @@ The design emphasizes tenant isolation with hierarchical inheritance. Providers 
 
 Drivers marked `p1` are the P1 scope; drivers marked `p2`/`p3`/`p4` are designed below but intentionally absent from the P1 SDK trait and REST surface until their phase is scheduled.
 
-- [ ] `p1` — `cpt-cf-model-registry-fr-tenant-isolation` — `AccessScope` applied to every `SecureConn` query, plus a tenant-ID prefix on every cache key
+- [ ] `p1` — `cpt-cf-model-registry-fr-tenant-isolation` — `AccessScope` applied to every `SecureConn` query; every cache entry is keyed by a single tenant ID and holds only that tenant's own rows
 - [ ] `p1` — `cpt-cf-model-registry-fr-authorization` — every service method derives its `AccessScope` from the `authz-resolver` PDP through `PolicyEnforcer` (resource types `model_registry.provider` / `model_registry.model`; actions `get`, `list`, `create`, `update`, `delete`)
 - [ ] `p1` — `cpt-cf-model-registry-fr-input-validation` — wire-string → enum parsing in the REST layer with a field-violation problem on an unknown value; slug, display-name, discovery-interval and lifecycle-transition validation in the service; identity fields structurally absent from the update request types. The display-name bound is the stored column's (1-255 characters of free-form text, counted in characters); the character-class rule belongs to the slug alone
-- [ ] `p1` — `cpt-cf-model-registry-fr-cache-isolation` — Cache key format `mr:{tenant_id}:{entity}:{id}`, one `cache_ttl_seconds` expiry on every entry, `invalidate_tenant` scoped by key prefix. The check covers the isolation guarantee itself — per-tenant keying, expiry, prefix invalidation on write. Prefix invalidation also satisfies the PRD's ancestor-write rule without a subtree walk: keys are prefixed by the tenant that owns the row, and descendants read those same entries (§4 Cache Invalidation Strategy, item 1). Tenant re-parenting is out of PRD scope (PRD Open Question #7), so no event handler is in the check
+- [ ] `p1` — `cpt-cf-model-registry-fr-cache-isolation` — One cache entity keyed by one tenant ID: `chain/{tenant_id}`, holding that tenant's ancestor chain, TTL-expired and never invalidated (§4 Cache Invalidation Strategy). The check covers the isolation guarantee: the entry holds tenant IDs only, is keyed by the tenant whose chain it describes, and no read reaches an entry keyed by another tenant. It does **not** cover the `tenant.reparented` invalidation the PRD folds into the same FR — that ships with `cpt-cf-model-registry-fr-tenant-reparenting` (P3)
 - [ ] `p1` — `cpt-cf-model-registry-fr-get-tenant-model` — Cache-first lookup across the tenant chain with DB fallback; the read is a **fail-closed access gate** — a model that is not `approved` is refused with `ModelNotApproved` (403), never returned with its status for the caller to interpret (§3.5). The lookup first resolves the winning provider for the `canonical_id`'s slug and then reads the model under that winner's tenant only, requiring `provider_id == winner.id` — see §3.5 "Tenant Visibility Resolution" for the algorithm and its failure semantics
 - [ ] `p1` — `cpt-cf-model-registry-fr-list-tenant-models` — Cursor pagination with `$filter` / `$orderby` over real columns (`$select` is rejected — see §3.3), merged additively across the ancestor chain. Visibility is `provider_id ∈ allow_list` AND `approval_status = approved` AND not `deprecated`/`sunset` — the first predicate carries both the shadow gate and the disabled-provider gate (§3.5 "Tenant Visibility Resolution"), and non-approved rows are excluded from the eval page outright rather than returned with their status. Deduping ancestor rows by `canonical_id` is not that predicate: an ancestor model with no colliding `canonical_id` at the closer tenant survives a dedupe even though its provider's slug has been shadowed. The predicate is **unconditional and mandatory**, ANDed onto the caller's query — not a default that a `$filter` clause can switch off (§3.3 "Two listing endpoints — eval vs management")
 - [ ] `p1` — `cpt-cf-model-registry-fr-manual-model-management` — Admin CRUD on models with `approval_status` patched via `update_model`; the same REST surface continues to accept admin calls in P2 but routes them through the Approval Service. Model creation MUST resolve `provider_slug` within the caller's own tenant only — a model's `tenant_id` MUST equal its provider's `tenant_id` — rejecting an inherited (ancestor-owned) provider with a new `provider_not_owned` error (§3.1 Invariants, §4 Error Handling)
@@ -74,7 +74,8 @@ Drivers marked `p1` are the P1 scope; drivers marked `p2`/`p3`/`p4` are designed
 - [ ] `p3` — `cpt-cf-model-registry-fr-alias-management` — Alias table with tenant hierarchy resolution
 - [ ] `p3` — `cpt-cf-model-registry-fr-tag-management` — `tags` table with tenant hierarchy resolution (same inheritance/shadowing model as aliases); managed independently of the model catalog
 - [ ] `p3` — `cpt-cf-model-registry-fr-model-tagging` — `model_tags` join table (many-to-many, tenant-scoped); OData `tag` filter via join; cascade removal on tag delete
-- [ ] `p3` — `cpt-cf-model-registry-fr-degraded-mode` — Tiered behavior when the **database** is unavailable: metadata from cache, approval check fails with `service_unavailable`. The metadata half is already what a warm `get_tenant_model` does today (§3.5 "Reads that complete without the database"); what P3 adds is the failing approval check and the 503 form of the failure (§4 Error Handling). Not to be confused with provider unreachability (§3.5 "Discovery Failure"), which is carried by `cpt-cf-model-registry-nfr-availability`
+- [ ] `p3` — `cpt-cf-model-registry-fr-degraded-mode` — Tiered behavior when the **database** is unavailable: metadata from cache, approval check fails with `service_unavailable`. P1 delivers neither half — catalog rows are not cached (§2.1 "Resolution Caching"), so P3 owes the whole behavior. Not to be confused with provider unreachability (§3.5 "Discovery Failure"), which is carried by `cpt-cf-model-registry-nfr-availability`
+- [ ] `p3` — `cpt-cf-model-registry-fr-tenant-reparenting` — Cache invalidation on `tenant.reparented` event
 - [ ] `p4` — `cpt-cf-model-registry-fr-user-group-approval` — Group-scoped approval restriction layer
 - [ ] `p4` — `cpt-cf-model-registry-fr-user-level-override` — User-level override takes precedence over group/tenant
 
@@ -82,9 +83,9 @@ Drivers marked `p1` are the P1 scope; drivers marked `p2`/`p3`/`p4` are designed
 
 | NFR ID | NFR Summary | Allocated To | Design Response | P1 status | Verification Approach |
 |--------|-------------|--------------|-----------------|-----------|----------------------|
-| `cpt-cf-model-registry-nfr-performance` | `get_tenant_model` 2ms/10ms, `list_tenant_models` 10ms/50ms, `approve_model` 100ms P99, per-provider discovery call 30s | Cache Layer + Repository | Cache-first single-entity reads with a single TTL on every entry (`cache_ttl_seconds`, default 10 min). List reads are **not** cached (§2.1) and meet their target through indexed columns and the per-ancestor query path. `approve_model` is one PDP decision, a single indexed `UPDATE` on `models` and a tenant-prefix cache invalidation — no Approval Service call sits on the P1 write path, so the whole budget covers work this module does. The per-provider discovery budget is P2 and is allocated to the OAGW call only (§4 Dependency SLAs); the reconciliation writes that follow it are outside that figure | In-process `InMemoryCache` — the only P1 backend; adopting a distributed backend is an open question (§4 Technical Debt & Roadmap) | Benchmarks deferred — no measured P99 yet (§4 Technical Debt) |
-| `cpt-cf-model-registry-nfr-availability` | 99.9% uptime | Service + Cache | Stateless design, cache miss falls through to DB. The approval gate reads the `models.approval_status` column, so failing closed on it costs no dependency call and cannot be made unavailable by an outage | P1 scope | Availability monitoring, SLO dashboards (platform) |
-| `cpt-cf-model-registry-nfr-scale` | 10K tenants, 2M models | Repository + Cache | Cache isolation by tenant, B-tree indexes on every filterable column, `SecureConn` pooling | Schema and indexes in place | Load testing at scale targets — not yet run |
+| `cpt-cf-model-registry-nfr-performance` | `get_tenant_model` 2ms/10ms, `list_tenant_models` 10ms/50ms, `approve_model` 100ms P99, per-provider discovery call 30s | Cache Layer + Repository | The ancestor chain is cached (§2.1); provider and model rows are served by indexed queries per request. Caching the chain matters because under the `rg` tenant-resolver plugin `get_ancestors` is a paginated call to an external service on every read and write. `approve_model` is one PDP decision plus one indexed `UPDATE` on `models`, with no cache invalidation and no Approval Service call on the P1 write path. The per-provider discovery budget is P2 and covers the OAGW call only (§4 Dependency SLAs); the reconciliation writes that follow are outside it | `ClusterCacheV1` from the `cluster` gear, standalone (in-process) provider (§3.3 Cache interface) | Benchmarks deferred — no measured P99 yet (§4 Technical Debt) |
+| `cpt-cf-model-registry-nfr-availability` | 99.9% uptime | Service + Cache | Stateless design; a cache miss, a decode failure, or an unavailable cache backend falls through to the underlying dependency, so the cache is never load-bearing (§4 Fault Tolerance Policies). The approval gate reads the `models.approval_status` column on a row fetched per request, so failing closed on it costs no dependency call, cannot be made unavailable by an outage, and can never answer from a stale cached value | P1 scope | Availability monitoring, SLO dashboards (platform) |
+| `cpt-cf-model-registry-nfr-scale` | 10K tenants, 2M models | Repository + Cache | B-tree indexes on every filterable column, `SecureConn` pooling. Cache footprint is one entry of tenant IDs per tenant, so it is bounded by tenant count and the 2M-model target adds nothing to it (§4 Capacity & Cost) | Schema and indexes in place | Load testing at scale targets — not yet run |
 
 **Error budgets & alerting thresholds** (target posture; the signals themselves land with platform observability integration): availability NFR `99.9%` translates to a 30-day error budget of ~43 minutes of downtime per month; latency NFR `<10ms P99 on get_tenant_model` is alerted on a 5-minute rolling window above `15ms` (warn) / `25ms` (page). The management model listing (§3.3) carries no latency SLO. The discovery path is excluded from the user-facing latency SLO — its budget is end-to-end discovery latency above the configured `discovery_interval_seconds` per provider. Module-level alerting routes to the platform observability stack (see §4 Out of Scope "Observability") so dashboards/alerts/runbooks live alongside the platform's other modules.
 
@@ -94,7 +95,7 @@ The following ADRs capture the load-bearing decisions that shape this design. Ea
 
 | ADR ID | Decision | Materialized By | P1 status |
 |--------|----------|-----------------|-----------|
-| `cpt-cf-model-registry-adr-pluggable-cache` | Pluggable cache behind the `CacheService` trait with TTL-based expiry | `cpt-cf-model-registry-principle-cache-first` | Trait + `InMemoryCache` — the only P1 backend. Any further backend is an open question (§4 Technical Debt & Roadmap) |
+| `cpt-cf-model-registry-adr-pluggable-cache` | Cache the tenant ancestor chain and nothing else, behind the `ResolutionCache` trait, realized on the `cluster` gear's `ClusterCacheV1` primitive; every provider and model row is read per request | `cpt-cf-model-registry-principle-cache-first` | P1 scope. Supersedes the original decision (a bespoke `CacheService` with feature-gated backends, three row-caching entities, and prefix invalidation) — ADR-0001 is to be rewritten to match |
 | `cpt-cf-model-registry-adr-tenant-inheritance` | Additive provider/model inheritance with slug-keyed child-shadowing semantics | `cpt-cf-model-registry-principle-additive-inheritance`, `cpt-cf-model-registry-seq-resolve-tenant-visibility` | P1 scope: provider-slug shadowing on provider reads (`domain/inheritance.rs`), same-tenant-only model creation, and the `provider_id`-keyed model visibility rule (§3.5) — `ChainProviders` resolves on every read path |
 | `cpt-cf-model-registry-adr-approval-delegation` | Delegate approval workflow (state machine, notifications, audit) to generic Approval Service | `cpt-cf-model-registry-principle-approval-delegation` | P2. P1 writes `models.approval_status` directly from `update_model`, keeping the seam intact. Enforcement of the status on the eval reads stays in this module in every phase (§3.5) |
 | `cpt-cf-model-registry-adr-oagw-provider-access` | All provider API calls route through Outbound API Gateway (no direct provider calls) | `cpt-cf-model-registry-constraint-oagw-dependency` | P2. P1 makes no outbound calls, so the constraint is vacuously held |
@@ -110,21 +111,25 @@ graph TB
     end
 
     subgraph Application["Application Layer — domain"]
-        SVC[Service&lt;R, M, C&gt;]
+        SVC[Service&lt;R, M&gt;]
         INHERIT[inheritance.rs]
     end
 
     subgraph Domain["Domain Layer — domain"]
         REPO[ProviderRepository / ModelRepository traits]
-        CACHE[CacheService trait]
+        CACHE[ResolutionCache trait]
         CLIENT[LocalClient]
     end
 
-    subgraph Infrastructure["Infrastructure Layer — infra/storage"]
+    subgraph Infrastructure["Infrastructure Layer — infra"]
         REPO_IMPL[ProviderRepositoryImpl / ModelRepositoryImpl]
-        MEMCACHE[InMemoryCache]
+        CLUSTERCACHE[ClusterResolutionCache]
         STORAGE[(PostgreSQL / SQLite)]
         OAGW[Outbound API GW — P2]
+    end
+
+    subgraph Platform["Platform Gears"]
+        CLUSTER[cluster — ClusterCacheV1]
     end
 
     REST --> DTO
@@ -134,7 +139,8 @@ graph TB
     SVC --> REPO
     CLIENT --> SVC
     REPO_IMPL -.implements.-> REPO
-    MEMCACHE -.implements.-> CACHE
+    CLUSTERCACHE -.implements.-> CACHE
+    CLUSTERCACHE --> CLUSTER
     REPO_IMPL --> STORAGE
     SVC -.P2.-> OAGW
 ```
@@ -142,11 +148,11 @@ graph TB
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
 | API | Request/response handling, wire-string parsing, `OData` query extraction, `Problem` mapping | REST/OpenAPI via `OperationBuilder`, Axum handlers, `utoipa` DTOs |
-| Application | Authorization, cache orchestration, inheritance resolution, validation | `Service<R, M, C>` generic over both repository traits and the cache backend |
-| Domain | Repository traits, cache trait, domain errors, SDK client impl | Rust traits, `async-trait`; `LocalClient` registered in ClientHub as `dyn ModelRegistryClientV1` |
-| Infrastructure | Data persistence, entity ↔ SDK mapping, `OData` field binding, in-process cache | SeaORM entities + migrations, `SecureConn`/`AccessScope`, `InMemoryCache` |
+| Application | Authorization, resolution caching, inheritance resolution, validation | `Service<R, M>` generic over both repository traits; the cache is held as `Arc<dyn ResolutionCache>` |
+| Domain | Repository traits, `ResolutionCache` trait, domain errors, SDK client impl | Rust traits, `async-trait`; `LocalClient` registered in ClientHub as `dyn ModelRegistryClientV1` |
+| Infrastructure | Data persistence, entity ↔ SDK mapping, `OData` field binding, cache-primitive binding | SeaORM entities + migrations, `SecureConn`/`AccessScope`, `ClusterResolutionCache` over `cluster-sdk`'s `ClusterCacheV1` |
 
-The service is generic over `(ProviderRepository, ModelRepository, CacheService)`; the gear wires the concrete triple `Service<ProviderRepositoryImpl, ModelRepositoryImpl, InMemoryCache>`, and tests substitute mock tenant/authz clients against the same generic surface.
+The service is generic over `(ProviderRepository, ModelRepository)` and holds the cache as `Arc<dyn ResolutionCache>`; the gear wires `Service<ProviderRepositoryImpl, ModelRepositoryImpl>`, and tests substitute mock tenant/authz clients and a stub cache against the same surface. The cache is a trait object rather than a type parameter because the concrete implementation is a runtime choice — `ClusterResolutionCache` or `NoopResolutionCache`, decided by config and by whether a backend is bound — and because it keeps `cluster-sdk` and byte-level serialization out of the domain layer: the trait's methods are typed in domain terms (`Vec<Uuid>`), and only `ClusterResolutionCache` in `infra/` knows there is a distributed primitive underneath.
 
 ## 2. Principles & Constraints
 
@@ -156,17 +162,32 @@ The service is generic over `(ProviderRepository, ModelRepository, CacheService)
 
 **ID**: `cpt-cf-model-registry-principle-tenant-isolation`
 
-All operations are scoped by tenant context. Cache keys include tenant ID prefix. Query filters enforce tenant hierarchy visibility. Write operations validate tenant ownership. Admin operations verify actor role for target tenant.
+All operations are scoped by tenant context. Every cache entry is keyed by exactly one tenant ID and holds only rows belonging to that tenant. Query filters enforce tenant hierarchy visibility. Write operations validate tenant ownership. Admin operations verify actor role for target tenant.
 
 Realization: every service method first calls the `authz-resolver` PDP to obtain an `AccessScope`, every repository trait method takes that scope as a required parameter, and every query in both implementations is issued through `.secure().scope_with(scope)` rather than a raw SeaORM query — so an unscoped query is visible as a missing `.secure()` call at review time. Reads that consult ancestor tenants build an explicit `AccessScope::for_tenant(ancestor_id)` per ancestor rather than widening the caller's own scope.
 
-#### Cache-First Reads
+#### Resolution Caching
 
 **ID**: `cpt-cf-model-registry-principle-cache-first`
 
-Read operations check the cache before the database. *Which* tenants get probed depends on the entity, and the difference is load-bearing: provider-slug ownership is resolved by walking the chain closest-first and stopping at the first owner, whereas a model is read under the winning provider's tenant **only** — probing the chain closest-first for a model and returning on the first hit would serve a cached ancestor row to a subtree that has shadowed its provider, since the hit path performs no slug resolution (§3.5 sub-decision 2). Cache misses populate the cache from DB. TTL-based expiry prevents stale data accumulation. **One TTL governs every entry** (`cache_ttl_seconds`, default 10 minutes). A single value is the only coherent choice, because a cache key is prefixed by the tenant that *owns* the row: one entry is shared by that tenant and its entire subtree and so cannot carry two different expiries, and varying the expiry per reader would require a reader-side staleness bound on every read. Varying it would also buy nothing — within a process every write drops the owning tenant's whole prefix for owner and descendants alike, so TTL only backstops cross-replica and out-of-band changes, which are symmetric across ownership classes. `Ownership` classifies rows for visibility merging and has no bearing on expiry. The backend sits behind the `CacheService` trait — **P1 implements the local in-process `InMemoryCache` only.** The trait keeps the seam open so a further backend can be added without touching the service, but whether to add one and which technology to pick is an open question deferred beyond P1 (§4 Technical Debt & Roadmap).
+One cache entity — the requester's tenant ancestor chain. Provider and model rows are read from the database on every request.
 
-Three cache entities exist: `mr:{tenant_id}:provider:{provider_id}`, `mr:{tenant_id}:model:{canonical_id}`, and `mr:{tenant_id}:provider_slug:{slug}` — the last one keyed by slug rather than UUID so `get_tenant_model` can resolve slug ownership per chain hop without a DB round-trip, and storing negative results as well as positive ones (§3.5 sub-decision 3). List responses are **not** cached — only single-entity reads are. A list result is a function of the caller's PDP-derived `AccessScope`, not of the reader tenant alone: the same tenant yields different row sets for callers holding different grants, so a page cached under the tenant would serve one caller's visibility to another. Until the registry can key an entry by the exact scope that produced it, list reads go to the database on every call, and `list_tenant_models` meets its latency target through indexes and the per-ancestor query path rather than the cache. Invalidation is coarse: any write invalidates the writer tenant's whole key prefix (see §4 Cache Invalidation Strategy).
+| Entity | Key | Value | TTL |
+|--------|-----|-------|-----|
+| Tenant chain | `chain/{tenant_id}` | ordered ancestor tenant IDs, closest first | `chain_cache_ttl_seconds`, default 30 |
+
+The entry expires by TTL; no write invalidates it. `ChainProviders(T0)` (§3.5) is built per request from the cached chain plus a provider query per chain tenant, with `winner` and `allow_list` computed in memory.
+
+Requirements on every cache read:
+
+- **An empty value is a hit.** The root tenant has no ancestors; its entry is an empty list and MUST NOT fall through to `tenant-resolver`.
+- **The entry is keyed by tenant ID alone** and is valid for every caller of that tenant. This holds only while `BarrierMode::Respect` is fixed at the single `get_ancestors` call site; a call site that varied it would have to key by it.
+- **The cache is never load-bearing.** A miss, a decode failure, a backend error, or an unbound backend falls through to `tenant-resolver` and is logged, never propagated (§4 Fault Tolerance Policies).
+- **Ancestor-scoped queries use `AccessScope::for_tenant(ancestor)`**, never a widened caller scope.
+
+List pages are not cached: `$filter` / `$orderby` / cursor compile to SQL through `FieldToColumn`, and the toolkit has no in-memory evaluator for the filter AST.
+
+Backend: the `cluster` gear's `ClusterCacheV1`, reached through the `ResolutionCache` domain trait (§3.2). Cache keys admit only slash-separated `[a-zA-Z0-9_-]` segments, which `chain/{uuid}` satisfies. Contract and bindings in §3.3 "Cache".
 
 #### Additive Inheritance
 
@@ -174,7 +195,7 @@ Three cache entities exist: `mr:{tenant_id}:provider:{provider_id}`, `mr:{tenant
 
 Providers and models inherit down the tenant hierarchy additively. Child tenants see their ancestors' providers and models plus their own. A child shadows an inherited provider by creating one with the same slug; shadowing replaces the parent's provider **and every model attached to it** for that tenant and its descendants. Child tenants cannot expand beyond parent's permissions.
 
-Realization: `resolve_ancestors` fetches the chain from `tenant-resolver` on every read; slug resolution runs over the chain's providers (§3.5); the own-tenant model query carries the caller's `OData` filter and pagination, each ancestor query carries the same filter with pagination removed so the merge sees each ancestor's complete visible set, and the merged result is then truncated to the caller's limit. Ownership classification (`Own` vs `Inherited`) selects the cache TTL.
+Realization: `resolve_ancestors` returns the chain — cache-first, from `chain/{tenant_id}` (§2.1 "Resolution Caching"); slug resolution then queries the chain's providers per tenant (§3.5); the own-tenant model query carries the caller's `OData` filter and pagination, each ancestor query carries the same filter with pagination removed so the merge sees each ancestor's complete visible set, and the merged result is then truncated to the caller's limit. Ownership classification (`Own` vs `Inherited`) drives visibility merging only; it has no bearing on caching, since the only cached entity holds tenant IDs and carries no rows at all.
 
 **Model ownership is same-tenant-only**: a model always belongs to exactly one provider, and a model's `tenant_id` MUST equal its provider's `tenant_id`. There is no independent "model-level shadow" distinct from provider shadowing — a colliding `canonical_id` at a closer tenant is simply a consequence of that tenant owning its own provider of the same slug. Concretely this means:
 
@@ -205,7 +226,7 @@ Model Registry does not hard-code provider-specific discovery protocols. Each pr
 
 #### Conflict Ordering
 
-When two principles produce conflicting guidance, resolve in this order: **tenant-isolation > approval-delegation > additive-inheritance > cache-first**. Tenant isolation is non-negotiable; approval delegation overrides inheritance when an Approval Service decision is authoritative; additive inheritance overrides cache-first when an inherited row must be re-fetched after an invalidation event.
+When two principles produce conflicting guidance, resolve in this order: **tenant-isolation > approval-delegation > additive-inheritance > resolution-caching**. Tenant isolation is non-negotiable; approval delegation overrides inheritance when an Approval Service decision is authoritative; additive inheritance overrides resolution-caching whenever serving a cached entry would widen visibility — which is why a provider write invalidates the owner's set before returning success, and why provider resolution fails closed on error rather than falling through to the next ancestor (§3.5 sub-decision 1).
 
 ### 2.2 Constraints
 
@@ -248,7 +269,7 @@ Provider cost data and model capabilities are not PII, but discovery responses m
 The constraint families below are explicitly **not applicable** to Model Registry v1. They are recorded here so reviewers can distinguish "considered and excluded" from "forgotten":
 
 - **Regulatory constraints**: Not applicable in v1 — Model Registry stores model metadata, provider routing, and approval status, but no PII, PHI, PCI, or other regulated data. Revisit when EU/HIPAA/FedRAMP tenants onboard or if discovery surfaces start carrying regulated content.
-- **Vendor / licensing constraints**: Not applicable — all shipped dependencies (`SeaORM`, `axum`, `gts`, `tokio`, `serde`, `utoipa`, `chrono`, `uuid` plus the workspace `toolkit-*` crates) are MIT/Apache-2.0 dual-licensed and pass `make deny`. No proprietary, copyleft, or restrictive components are introduced; no vendor exclusivity clauses apply. No external cache-client dependency is introduced in P1 — the cache is in-process.
+- **Vendor / licensing constraints**: Not applicable — all shipped dependencies (`SeaORM`, `axum`, `gts`, `tokio`, `serde`, `utoipa`, `chrono`, `uuid` plus the workspace `toolkit-*` crates) are MIT/Apache-2.0 dual-licensed and pass `make deny`. No proprietary, copyleft, or restrictive components are introduced; no vendor exclusivity clauses apply. The cache introduces no new external dependency of its own: it binds to the platform `cluster` gear, whose backend plugins are workspace crates under the same license policy.
 - **Data-residency constraints**: Not applicable at the Model Registry layer. Storage residency is delegated to the platform's chosen PostgreSQL deployment; the registry does not pin a region. Tenant-level residency policy, when introduced, will live at the platform deployment layer rather than inside this module.
 - **Resource constraints (budget / team / time)**: Not applicable as architectural constraints. Resource planning is owned by program management and is not a property the design encodes; engineering capacity for the v1 scope is tracked outside this document.
 - **Legacy-integration constraints**: Not applicable — Model Registry is a new module with no legacy database, no migration from a prior catalog, and no backward-compatibility commitment to a pre-existing Model Registry contract. The pre-GTS `AnyProviderSettings` / `ProviderKind` carrier was removed in the same change set as this design (see [`cpt-cf-model-registry-adr-gts-typed-provider-settings`](./ADR/0005-cpt-cf-model-registry-adr-gts-typed-provider-settings.md)) and never shipped to production.
@@ -528,7 +549,7 @@ The trade-off comparison against the rejected alternatives — a tagged enum (`A
 **`ProviderV1`** is the tenant-scoped configuration record for one provider instance. It carries no credentials and no generic endpoint field — whatever connection routing a provider kind needs lives in its GTS-typed settings, and secrets stay in OAGW (§2.2 "No Credential Storage").
 
 - **id** (`Uuid`) — primary key
-- **tenant_id** (`Uuid`) — owning tenant. For an inherited provider this is an ancestor tenant, not the reader's — it is the tenant whose cache prefix and write scope govern the row
+- **tenant_id** (`Uuid`) — owning tenant. For an inherited provider this is an ancestor tenant, not the reader's — it is the tenant whose write scope governs the row
 - **slug** (`String`) — human-readable identifier, 1-64 chars lowercase alphanumeric + hyphen, unique within the tenant and immutable after creation. It is the shadowing key (§2.1 "Additive Inheritance") and the left half of every `canonical_id`
 - **name** (`String`) — display name. Free-form text: no character-class rule and no uniqueness requirement
 - **gts_type** (`gts::GtsTypeId`) — GTS type identifying the provider kind (e.g. `gts.cf.genai.model.provider.v1~cf.genai._.openai.v1~`). Mirrored by each of its models' `ModelInfoV1.gts_type`, and the key the P2 discovery plugin is selected by
@@ -550,7 +571,7 @@ There is no `provider_settings` on Provider — the polymorphic payload is per *
 - **Terminal lifecycle states are read-only**: `deprecated` and `sunset` accept no transition out, and no approval change may be applied to a model already in either state (`InvalidTransition`). Every other lifecycle transition — including demotion — is permitted.
 - **Tenant-scoped uniqueness**: `(tenant_id, slug)` is unique per provider, `(tenant_id, canonical_id)` is unique per model, `(tenant_id, name)` is unique per alias, `(tenant_id, lower(name))` is unique per tag (case-insensitive), and `(tenant_id, model_id, tag_id)` is unique per tag assignment.
 - **Tag managed independently of models**: a tag's lifecycle (create/update/delete) is decoupled from the catalog; deleting a tag cascades only to its `model_tags` rows within the owning tenant scope and never mutates `models`.
-- **Cache-key tenant prefix**: every cache key is prefixed with `mr:{tenant_id}:` — no tenantless keys exist.
+- **Every cache key names exactly one tenant**: `chain/{tenant_id}` is the only shape — no tenantless key exists, and the only cached value is a list of tenant IDs (§2.1 "Resolution Caching").
 - **Model-provider tenant match**: a model's `tenant_id` MUST equal its `provider_id`'s owning tenant. Model creation MUST resolve `provider_slug` within the caller's own tenant only, returning `provider_not_owned` (403) when the slug resolves only in an ancestor. Read-only provider lookups (get/list provider) are unaffected and keep resolving across the ancestor chain.
 - **Approval status gates model eval-availability**: a model whose `approval_status` is not `approved` MUST NOT be available for eval. `list_tenant_models` excludes it as a mandatory predicate; `get_tenant_model` fails with `ModelNotApproved` (403). The gate reads `models.approval_status` directly — there is no Approval Service call on the read path in any phase — and it is evaluated **after** the provider gates, so a caller learns "not approved" only for a model it could otherwise observe (§3.5 "Tenant Visibility Resolution"). The management listing is the one read that returns non-approved rows, marked `available_for_eval = false`.
 - **Provider status gates model eval-availability**: a model attached to a `disabled` provider MUST NOT be available for eval (`get_tenant_model` / `list_tenant_models`), independent of its own `approval_status`. Enforced by the same predicate that enforces shadowing — a disabled provider is absent from the requester's allow-list, so none of its models resolve (§3.5 "Tenant Visibility Resolution"). `providers.status` is the only source of truth for this; it is not denormalized onto `models`.
@@ -573,18 +594,18 @@ graph TB
         end
 
         subgraph Domain["domain"]
-            SERVICE[Service&lt;R, M, C&gt;]
+            SERVICE[Service&lt;R, M&gt;]
             LOCAL[LocalClient]
             REPO_TRAIT[ProviderRepository + ModelRepository]
-            CACHE_SVC[CacheService]
-            MEMCACHE[InMemoryCache]
+            CACHE_TRAIT[ResolutionCache trait]
         end
 
-        subgraph Infra["infra/storage"]
+        subgraph Infra["infra"]
             PROV_IMPL[ProviderRepositoryImpl]
             MODEL_IMPL[ModelRepositoryImpl]
             ENTITIES[SeaORM Entities + per-entity mappers]
             MIGRATIONS[Migrations]
+            CLUSTER_CACHE[ClusterResolutionCache]
         end
     end
 
@@ -593,15 +614,17 @@ graph TB
         APPROVAL[Approval Service — P2]
         TENANT[Tenant Resolver]
         AUTHZ[AuthZ Resolver]
+        CLUSTER[cluster — ClusterCacheV1]
         PG[(PostgreSQL / SQLite)]
     end
 
     HANDLERS --> SERVICE
     LOCAL --> SERVICE
     LOCAL -.implements.-> TRAIT
-    SERVICE --> CACHE_SVC
+    SERVICE --> CACHE_TRAIT
     SERVICE --> REPO_TRAIT
-    MEMCACHE -.implements.-> CACHE_SVC
+    CLUSTER_CACHE -.implements.-> CACHE_TRAIT
+    CLUSTER_CACHE --> CLUSTER
     PROV_IMPL -.implements.-> REPO_TRAIT
     MODEL_IMPL -.implements.-> REPO_TRAIT
     PROV_IMPL --> ENTITIES
@@ -626,7 +649,7 @@ SDK crate containing public API surface. Transport-agnostic trait, models, and e
 
 **ID**: `cpt-cf-model-registry-component-service`
 
-Application service orchestrating authorization, caching, inheritance resolution, validation, and persistence. Declared as `Service<R, M, C>` generic over `ProviderRepository`, `ModelRepository`, and `CacheService`, so unit tests inject mocks against the same code path the gear runs. Holds the `DBProvider`, both repositories, the cache, the `tenant-resolver` client, a `PolicyEnforcer`, and the gear config. OAGW calls for discovery and Approval Service integration are P2 additions to this component.
+Application service orchestrating authorization, caching, inheritance resolution, validation, and persistence. Declared as `Service<R, M>` generic over `ProviderRepository` and `ModelRepository`, so unit tests inject repository mocks against the same code path the gear runs. Holds the `DBProvider`, both repositories, an `Arc<dyn ResolutionCache>`, the `tenant-resolver` client, a `PolicyEnforcer`, and the gear config. OAGW calls for discovery and Approval Service integration are P2 additions to this component.
 
 **Interface**: Internal domain methods (`get_provider`, `list_providers`, `create_provider`, `update_provider`, `delete_provider`, `get_tenant_model`, `list_tenant_models`, `create_model`, `update_model`, `delete_model`) returning `Result<_, DomainError>`. Emits no events in P1.
 
@@ -642,13 +665,22 @@ Local client implementing the `ModelRegistryClientV1` trait over `Arc<Service<�
 
 **Interface**: Implements `ModelRegistryClientV1` (all eleven P1 methods). `list_tenant_models_management` sits on the same trait as the eval methods rather than on a separate admin client, per PRD §12 — one client, two method groups differentiated by authorization.
 
-#### CacheService
+#### ResolutionCache
 
 **ID**: `cpt-cf-model-registry-component-cache`
 
-Cache abstraction. Handles cache key generation with tenant prefix, TTL management, and prefix invalidation. Backends are compiled in via Cargo feature flags (not runtime plugins). **P1 implements exactly one backend — the local, in-process `InMemoryCache`** (TTL-aware `HashMap` behind an async `RwLock`, values stored as serialized JSON, expired entries lazily evicted on read). Single-node, cache-infrastructure-free deployment is therefore the P1 operating posture — the in-memory backend avoids the operational overhead of running a separate cache service, while the database's own query cache provides comparable latency for moderate-scale setups. A distributed backend becomes beneficial at high scale (10K+ tenants, 2M+ models) where cross-instance cache consistency and horizontal scaling matter; **which backend that would be is an open question** (§4 Technical Debt & Roadmap), and until one exists a multi-replica deployment sees per-replica caches bounded by the TTL rather than a shared view.
+The resolution cache: one entity — the tenant ancestor chain — behind a domain trait, realized on the `cluster` gear's `ClusterCacheV1`.
 
-**Interface**: `get`, `set`, `delete`, `invalidate_tenant`.
+The trait is typed in domain terms (`get_chain(tenant_id) -> Option<Vec<Uuid>>`) rather than generic over `serde`, so key construction lives in one place and `cluster-sdk` and byte encoding stay out of the domain layer. It MUST stay dyn-compatible: `Service` holds it as `Arc<dyn ResolutionCache>`, so no method may be generic over its value type.
+
+Two implementations:
+
+- **`ClusterResolutionCache`** (`infra/cache.rs`) — JSON-encodes the value, writes it with `chain_cache_ttl_seconds`, and delegates to a `ClusterCacheV1` scoped to `model-registry` (backend key `model-registry/chain/{uuid}`). Declares no `CacheCapability`, so it binds to any registered backend. Reports every `ClusterError` to its caller as a miss.
+- **`NoopResolutionCache`** — always misses, never stores. Installed when the cluster cache profile is unbound or `cache_enabled` is `false`. Selecting between the two at runtime is why the cache is a trait object rather than a `Service` type parameter.
+
+**Resolution MUST be lazy.** The `cluster` gear registers its backends during `start`, model-registry builds its `Service` during `init`, and the toolkit runs every `init` before any `start` — so eager resolution in `init` always fails. `ClusterResolutionCache` holds a `OnceCell<ClusterCacheV1>` and resolves on first cache use. Resolving in model-registry's own `start` is not an alternative: `run_start_phase` orders by system priority and neither gear declares the system capability, so their relative order is registration order.
+
+**Interface**: `get_chain`, `put_chain`. There is no invalidation method; a `delete_chain` arrives with the P3 `tenant.reparented` handler.
 
 #### Repository Implementations
 
@@ -662,7 +694,7 @@ SeaORM-based persistence, split one implementation type per trait (Parnas inform
 
 The module exposes four deliberate extension points and two API stability zones:
 
-- **Pluggable cache backend** (compile-time): `CacheService` trait with feature-gated implementations. `InMemoryCache` is the only implementation in P1; new backends plug in via Cargo feature flag, no runtime plugin loading. No second backend is designed — the choice is an open question (§4 Technical Debt & Roadmap).
+- **Pluggable cache backend** (runtime, operator-bound): the `ResolutionCache` trait names *what* is cached; *where* it lives is the `cluster` gear's concern. An operator picks the backend per profile in cluster config, and a new backend is a cluster plugin rather than a change here — this module ships no cache backend of its own and no cache-backend feature flag.
 - **Open-ended provider settings** (runtime via GTS): per-provider settings types live under `model-registry-sdk/src/models/providers/` (one file per provider — `OpenAiSettingsV1`, `AnthropicSettingsV1`, …). Adding a new provider does **not** require touching shared code; operators can also wire unknown providers through the raw-JSON default carrier (`serde_json::Value`) without an SDK release.
 - **ClientHub trait surfaces**: `ModelRegistryClientV1` is the SDK-stable trait that consumers depend on; in-process consumers resolve it via ClientHub, OoP consumers via gRPC. New transports plug in without changing the trait.
 - **Pluggable discovery plugins (P2, runtime registration)**: per-provider discovery plugins implement the `DiscoveryPlugin` trait (`cpt-cf-model-registry-contract-discovery-plugin`). Plugins register a `GtsTypeId` (the provider GTS type they serve) and a `GtsTypeId` (the discovery-settings schema they accept). Plugin selection is by exact match on the provider's GTS type; a missing plugin for one provider fails that provider's discovery run only and MUST NOT block other providers (`cpt-cf-model-registry-nfr-discovery-plugin-isolation`). New providers onboard by adding a plugin registration — no edits to existing plugins or the core discovery path (`cpt-cf-model-registry-nfr-discovery-plugin-extensibility`). Discovery-settings payloads are validated against the plugin's declared GTS schema before any network call.
@@ -725,7 +757,7 @@ PRD `fr-list-tenant-models` and `fr-list-tenant-models-management` are served by
 | **Mandatory predicates** | `provider_id IN allow_list`, `approval_status = approved`, and not `deprecated`/`sunset` — three predicates, all unconditional (§3.5 "Tenant Visibility Resolution") | none |
 | **Response type** | `ModelDto` | `ModelManagementDto` |
 
-Each endpoint is registered with its own `OperationBuilder` policy. Neither endpoint widens its result set for a caller holding the other's role: the eval listing returns the same rows to an admin as to any tenant member. Shadowed and disabled-provider rows are excluded from the eval listing by the allow-list predicate the repository query carries (§3.5); the management listing runs the same query without it and marks the rows instead. List responses are not cached on either endpoint (§2.1), and only the eval listing is on the `nfr-performance` latency budget (§1.2).
+Each endpoint is registered with its own `OperationBuilder` policy. Neither endpoint widens its result set for a caller holding the other's role: the eval listing returns the same rows to an admin as to any tenant member. Shadowed and disabled-provider rows are excluded from the eval listing by the allow-list predicate the repository query carries (§3.5); the management listing runs the same query without it and marks the rows instead. Neither endpoint caches its page, and both read their rows from the database on every request (§2.1); only the eval listing is on the `nfr-performance` latency budget (§1.2).
 
 **The narrowing invariant**: `$filter` / `$orderby` only ever **narrow** a result set. Visibility is decided by the endpoint — authorization, candidate row set, and mandatory predicates — and the caller's filter is ANDed onto that. No filter clause can widen visibility, and no filter clause disables a mandatory predicate. Consequences:
 
@@ -761,6 +793,7 @@ In-process SDK consumers do not assemble `$filter` text at all. The SDK also pub
 | `authz-resolver` | `AuthZResolverClient` wrapped in `PolicyEnforcer` via ClientHub | Per-operation authorization decision and the compiled `AccessScope` used by every query | P1 |
 | `approval-service` | SDK client via ClientHub | Manage approval workflow, query status | P2 |
 | `outbound-api-gateway` | SDK client via ClientHub | Execute provider API calls for discovery | P2 |
+| `cluster` | `ClusterCacheV1` via ClientHub | Backs the tenant-chain cache (§2.1 "Resolution Caching") | P1 |
 | `cluster` | `DistributedLockV1` via ClientHub | Per-provider mutual exclusion on discovery — at most one in-flight run per provider per cluster, whoever triggers it | P2 |
 
 **Dependency Rules**:
@@ -772,19 +805,33 @@ The gear declares `deps = ["tenant-resolver", "authz-resolver"]` and `capabiliti
 
 #### External Interfaces
 
-##### Cache (in-process in P1 — no external cache system)
+##### Cache (the `cluster` gear's `ClusterCacheV1`)
 
 **ID**: `cpt-cf-model-registry-interface-cache`
 
-**Phase**: P1 implements **one backend only — the local in-process `InMemoryCache`**. The module opens no connection to any external cache system, so in P1 there is no external cache interface to specify. Whether a distributed backend is adopted at all, and which technology it would be, is an **open question deferred beyond P1** (§4 Technical Debt & Roadmap). The key format and TTL contract below are backend-independent and already honored by the in-memory backend, so adopting a backend later changes no call site.
+**Type**: In-process trait call to a platform gear; a network hop follows only under a remote backend binding
+**Direction**: outbound — this module is a consumer and registers no cache surface
+**Protocol / Driver**: `cluster_sdk::ClusterCacheV1`, resolved from ClientHub via `ClusterCacheV1::resolver(hub).profile(…).resolve()`
+**Data Format**: JSON in the primitive's opaque `Vec<u8>`
 
-**Type**: In-process (no network interface in P1)
-**Direction**: n/a — library calls behind the `CacheService` trait
-**Data Format**: JSON-serialized cache entries
+**Cache Key Format**: `chain/{tenant_id}`, under a facade scoped to `model-registry` (backend key `model-registry/chain/{uuid}`). The only key shape.
 
-**Cache Key Format**: `mr:{tenant_id}:{entity}:{id}` where `entity` is `provider` (keyed by UUID), `model` (keyed by canonical ID), or `provider_slug` (keyed by provider slug; may hold a tombstone — see §3.5)
+`cluster_sdk`'s `CACHE_KEY_RULE` admits slash-separated `[a-zA-Z0-9_-]` segments up to 255 bytes, so any key carrying a `canonical_id` or a `::` separator is rejected. The API has no prefix deletion, so invalidation can only ever be per-key.
 
-**TTL Strategy** (configurable — `cache_ttl_seconds`): one value for every entry, default 10 minutes. Keys are prefixed by the owning tenant, so an entry is shared by that tenant and its whole subtree and carries a single expiry for all readers.
+**TTL Strategy**: `chain_cache_ttl_seconds` (default 30), passed as `Ttl::Of(…)` on each `put`. Per-entity, not global — a second entity would get its own value.
+
+**Profile binding**: `default`, as a compile-time constant. `CacheResolverBuilder::profile` takes a typed `ClusterProfile` marker whose `NAME` is a `const &'static str` and `profile_scope` is crate-private, so the profile cannot be selected from this module's YAML. An operator wanting the registry on a dedicated profile renames the cluster profile.
+
+**Capabilities required**: none — no path uses compare-and-swap or a prefix watch, so any backend qualifies regardless of declared `CacheConsistency`.
+
+**Backend bindings**:
+
+| Binding | Entries | Notes |
+|---------|---------|-------|
+| `standalone` (in-process) | per-replica `HashMap`, lazy TTL plus background sweeper | The recommended binding and the one §1.2's latency allocation assumes. Per-replica entries cost nothing here — the entry is never invalidated, so each replica refreshes its own copy on expiry. |
+| `postgres` | `cluster_cache` table | Usable; costs a query per read and buys nothing over `standalone`. |
+
+**Absent backend**: no bound cache backend makes `resolve()` return `ProfileNotBound`. The gear logs a warning once and installs `NoopResolutionCache`, so every read resolves its chain through `tenant-resolver`. This is a degradation, not a startup failure — the cache is never load-bearing, and the SQLite dev and test targets do not run the cluster gear. `cache_enabled: false` selects the same path.
 
 ##### External Interface: PostgreSQL
 
@@ -816,6 +863,7 @@ The gear declares `deps = ["tenant-resolver", "authz-resolver"]` and `capabiliti
 | `authz-resolver` | `AuthZResolverClient` + `PolicyEnforcer` via ClientHub | Authorization decisions and `AccessScope` derivation | P1 |
 | `approval-service` | SDK client via ClientHub | Manage approval workflow, query status | P2 |
 | `outbound-api-gateway` | SDK client via ClientHub | Execute provider API calls for discovery | P2 |
+| `cluster` | `ClusterCacheV1` via ClientHub | Backs the tenant-chain cache (§2.1 "Resolution Caching") | P1 |
 | `cluster` | `DistributedLockV1` via ClientHub | Per-provider mutual exclusion on discovery — at most one in-flight run per provider per cluster, whoever triggers it | P2 |
 
 **Dependency Rules**:
@@ -854,6 +902,22 @@ Two derived views over the same structure:
   provider_disabled(p) = p.status == disabled                          -- management flag
 ```
 
+**How the structure is populated.** The chain is cache-first and is the only cached input (§2.1 "Resolution Caching"); the provider rows are queried per request:
+
+```text
+chain(T0)     := cache get chain/{T0}
+                 else tenant-resolver.get_ancestors(T0, BarrierMode::Respect)
+                      -- store the ordered ancestor ids under chain/{T0}, ttl = chain_cache_ttl_seconds
+                      -- an empty list (root tenant) is a value, not an absence
+
+providers(T)  := DB SELECT … FROM providers (scope = AccessScope::for_tenant(T))
+                 -- per request, every time; the shape differs per path:
+                 --   get_tenant_model: by slug, closest-first, stopping at the first owner
+                 --   list paths:       the complete set, for every chain tenant
+```
+
+`winner` and `allow_list` are computed per request; no derived value is cached.
+
 **The rule, stated once.** A model row is eval-visible to requester `T0` **if and only if `model.provider_id ∈ allow_list(T0)`**, and it additionally passes the lifecycle and approval gates in the table below. No read path substitutes a different visibility predicate.
 
 Note that `winner` turns on ownership alone and `allow_list` ANDs `status == active` on top of it. Splitting the two that way is what makes a **`disabled` shadow behave correctly**: the shadowing provider still wins its slug, so the ancestor's models are excluded because they lost — and the child's own models under that slug are excluded too, because the winner is not `active`. Folding status into `winner` would hand the slug back to the ancestor and re-expose exactly the models the shadow exists to hide, inverting the ADR's compliance-isolation guarantee.
@@ -872,36 +936,30 @@ Slug parsing survives in exactly one place: `get_tenant_model` parses the caller
 
 ```text
 slug := canonical_id.split_once("::").0          -- PRD parsing rule; malformed → ModelNotFound
-winner := first tenant T in [T0, parent(T0), …, root] that owns a provider with `slug`
-          (cache-first per hop: mr:{T}:provider_slug:{slug}; DB on miss)
+winner := first tenant T in chain(T0) that owns a provider with `slug`
+          -- one indexed query on (tenant_id, slug) per hop; stop at the first owner
           -- resolved on ownership alone; status is not consulted yet
 if no winner                       -> ProviderNotFoundBySlug
 
--- look the model up under the winner's tenant ONLY
-model := cache get mr:{winner.owner_tenant}:model:{canonical_id}
-         else DB SELECT … WHERE canonical_id (scope = winner.owner_tenant)
+-- read the model under the winner's tenant ONLY
+model := DB SELECT … WHERE canonical_id (scope = AccessScope::for_tenant(winner.owner_tenant))
 if none                                  -> ModelNotFound
-if model.provider_id != winner.id        -> ModelNotFound   -- stale row under a superseded provider
+if model.provider_id != winner.id        -> ModelNotFound   -- defensive; see below
 
 -- gates, in this order
-if model.lifecycle_status in {deprecated, sunset} -> ModelDeprecated       -- keep cache key
-if winner.status == disabled                      -> drop cache key; ProviderDisabled
-if model.approval_status != approved              -> ModelNotApproved      -- keep cache key
+if model.lifecycle_status in {deprecated, sunset} -> ModelDeprecated
+if winner.status == disabled                      -> ProviderDisabled
+if model.approval_status != approved              -> ModelNotApproved
 return model
 ```
 
+The gate order is normative. In particular, resolution MUST NOT exit early when the winning provider is `disabled`: that would answer `ProviderDisabled` for a `canonical_id` naming no model of that provider, disclosing provider status through an id that resolves to nothing.
+
+`model.provider_id != winner.id` is a defensive check: given `UNIQUE (tenant_id, slug)`, immutable slugs, a model's tenant equalling its provider's, and no `provider_id` in `UpdateModelRequestV1`, a row found by `canonical_id` under the winner's tenant belongs to the winner by construction. Keep it — it fails closed for the cost of a `Uuid` comparison.
+
 The gates run **after** the row is found, not before it. A disabled winner is therefore reported as `ProviderDisabled` only for a `canonical_id` that genuinely resolves to one of its models; a `canonical_id` that resolves to nothing yields `ModelNotFound` either way, so provider status is never disclosed for a model the caller could not otherwise observe. The same reasoning puts approval **last**: `ModelNotApproved` is only ever returned for a live model on a visible, active provider, so the answer discloses nothing beyond the approval decision itself. It matches PRD §6 `fr-get-tenant-model`, whose resolution order is provider status then approval.
 
-**Which gates evict the cache entry, and why.** The rule is whether the gate's verdict depends on state the cached entry does not contain:
-
-| Gate | Evicts | Reason |
-|------|--------|--------|
-| `provider_id != winner.id` | yes | the entry contradicts the provider chain resolved this request — it is a row cached under a provider that has since been superseded, so it is stale by construction |
-| `winner.status == disabled` | yes | the verdict comes from the `providers` row, not from the cached model; the entry says nothing about it and re-reading is the only way the model becomes resolvable again when the provider is re-enabled |
-| terminal `lifecycle_status` | no | the verdict is a column on the cached row and the state is terminal — no transition out exists (§3.1 Invariants), so re-reading from the DB can only ever produce the same `ModelDeprecated` |
-| `approval_status != approved` | no | the verdict is a column on the cached row, and every write that changes it — `update_model` in P1, the `approval.status_changed` handler in P2 — drops the owning tenant's whole cache prefix before the change is observable (§4 Cache Invalidation Strategy) |
-
-So the two provider-derived gates evict and the two row-derived gates do not. A non-approved model is not a stale entry: it accurately holds the row the DB holds, and the next eval read owes the caller the same 403.
+Every value a gate reads — `lifecycle_status`, `winner.status`, `approval_status` — is a column on a row fetched within the request, so no gate consults cached state and none evicts anything.
 
 **`list_tenant_models(T0, …)`** (eval) — builds the full `ChainProviders(T0)`, then queries per tenant with that tenant's slice of the allow-list as a mandatory predicate:
 
@@ -960,8 +1018,8 @@ The two keys agree whenever the closer tenant happens to own a model of the same
 ##### Sub-decisions
 
 1. **Provider resolution fails closed.** A provider query that fails at *any* tenant in the chain fails the whole read (`DomainError::Internal`); it is never logged-and-skipped. This is deliberately the inverse of the partial-results rule for ancestor *model* queries (§3.4): dropping ancestor model rows only ever narrows what the caller sees, whereas skipping a closer tenant's provider row **widens** it — a failed query would silently un-shadow the ancestor and serve the models the shadow exists to hide. This follows the ADR's fail-closed consequence rather than introducing a new rule.
-2. **The cache is probed under the winning tenant only.** `get_tenant_model` resolves the winner first and probes `mr:{winner}:model:{canonical_id}` for that one tenant, rather than probing every tenant in the chain closest-first and returning on the first hit. A closest-first probe has no shadow check on the hit path, so a cached ancestor model would be served to a subtree that has since shadowed its provider — for the remainder of the TTL, with no DB query to catch it.
-3. **Cache entity `mr:{tenant_id}:provider_slug:{slug}` → `ProviderV1`.** The provider entity keyed by UUID (§2.1) cannot answer a slug lookup, so without this key every `get_tenant_model` would take a DB round-trip per chain hop against the `<10ms P99` NFR. The entry stores **negative results too** — a tombstone marking "this tenant owns no provider with this slug" — because the common case is precisely that the closer tenants do *not* shadow, and an absence that is not cached is a DB miss per hop on every request. Both polarities take the same `cache_ttl_seconds` expiry as every other entry, and both are dropped by that tenant's ordinary `invalidate_tenant`. The staleness this introduces lands inside the shadow-propagation window §4 Cache Invalidation Strategy already documents; it opens no new one.
+2. **The model is read under the winning tenant only.** `get_tenant_model` resolves the winner first, then issues one query scoped to that tenant. Searching the chain for a `canonical_id` and returning on the first hit performs no slug resolution, so it would serve an ancestor's row to a subtree that has shadowed its provider.
+3. **Provider resolution is not cached.** Slug ownership costs one indexed query per chain hop. A provider cache would have to be owner-keyed to be shared by the inheriting subtree, making resolution N cache reads for an N-deep chain — the same count as the queries it replaces. Deferred (§4 Technical Debt & Roadmap).
 4. **`provider_id IN (…)` is a repository-level mandatory predicate.** It is ANDed onto the query inside `ModelRepository`, alongside the lifecycle exclusion — not exposed as an OData field and not bindable through `FieldToColumn`, which maps each filter field to exactly one real column and has no set-literal form. A caller's `$filter` can only narrow the result further (§3.3 "The narrowing invariant").
 
 #### Get Tenant Model
@@ -978,53 +1036,46 @@ sequenceDiagram
     participant MR as ModelRegistry
     participant PDP as AuthZResolver
     participant Tenant as TenantResolver
-    participant Cache as CacheService
+    participant Cache as ResolutionCache
     participant DB as PostgreSQL
 
     LLMGateway->>MR: get_tenant_model(ctx, canonical_id)
     MR->>PDP: access_scope(ctx, model, "get")
     PDP-->>MR: AccessScope
-    MR->>Tenant: get_ancestors(tenant_id)
-    Tenant-->>MR: [parent, ..., root]
+
+    MR->>Cache: get_chain(tenant_id)
+    alt miss
+        MR->>Tenant: get_ancestors(tenant_id, Respect)
+        Tenant-->>MR: [parent, ..., root]
+        MR->>Cache: put_chain(tenant_id, ids, chain_cache_ttl_seconds)
+    end
 
     note over MR: slug := canonical_id up to the first ::
 
-    loop tenant chain, closest first — stop at first hit
-        MR->>Cache: get(mr:{tenant}:provider_slug:{slug})
-        alt miss
-            MR->>DB: SELECT provider WHERE slug (tenant scope)
-            DB-->>MR: provider row or none
-            MR->>Cache: set(mr:{tenant}:provider_slug:{slug}, row or tombstone)
-        end
+    loop tenant chain, closest first — stop at first owner
+        MR->>DB: SELECT provider WHERE slug (scope = for_tenant(tenant))
+        DB-->>MR: provider row or none
     end
+    note over MR,DB: provider rows are never cached — always a committed read
     note over MR: query error at ANY hop → fail closed (Internal)
     note over MR: no owner anywhere → ProviderNotFoundBySlug
 
-    MR->>Cache: get(mr:{winner.tenant}:model:{canonical_id})
-    alt Cache Miss
-        MR->>DB: SELECT … WHERE canonical_id (winner.tenant scope)
-        DB-->>MR: row or none
-        MR->>Cache: set(mr:{winner.tenant}:model:{id}, cache_ttl_seconds)
-    end
+    MR->>DB: SELECT … WHERE canonical_id (scope = for_tenant(winner.tenant))
+    DB-->>MR: row or none
     note over MR: none, or provider_id ≠ winner.id → ModelNotFound
-    note over MR: then, in order — deprecated/sunset → ModelDeprecated (key kept)<br/>then winner.status = disabled → drop key, ProviderDisabled<br/>then approval_status ≠ approved → ModelNotApproved (key kept)
+    note over MR: then, in order — deprecated/sunset → ModelDeprecated<br/>then winner.status = disabled → ProviderDisabled<br/>then approval_status ≠ approved → ModelNotApproved
     MR-->>LLMGateway: Model (approved, on an active winning provider)
 ```
 
-**Description**: Resolves a canonical model ID for a tenant, applying the primitive from "Tenant Visibility Resolution" above in its single-slug form. The PDP decision and the ancestor chain are resolved first. The `canonical_id` is then split on its first `::` and that one slug is resolved closest-first, stopping at the first tenant that owns it — the whole `ChainProviders` map is not materialized here, because this path carries the `<10ms P99` NFR. Both polarities of each hop are cached under `mr:{tenant}:provider_slug:{slug}`, so the common case (no closer tenant shadows the slug) costs cache reads rather than a DB round-trip per hop.
+**Description**: Resolves a canonical model ID for a tenant, applying the primitive from "Tenant Visibility Resolution" above in its single-slug form. The PDP decision comes first, then the ancestor chain (cache-first). The `canonical_id` is split on its first `::` and that one slug is resolved closest-first, stopping at the first tenant that owns it — the whole `ChainProviders` map is not materialized here, because this path carries the `<10ms P99` NFR. Each hop is one lookup on the `(tenant_id, slug)` unique index.
 
-The model is then read under the winning tenant's scope **only** — not probed across the chain closest-first — and is returned only when its `provider_id` matches the winner. Probing every tenant and returning on the first hit would serve a cached ancestor model to a subtree that has since shadowed its provider, with no DB query on that path to catch it. The row that answers is cached under its owning tenant's key with the single `cache_ttl_seconds` expiry.
+The model is then read under the winning tenant's scope **only** and is returned only when its `provider_id` matches the winner. Searching the chain for the `canonical_id` and returning on the first hit would serve an ancestor's model to a subtree that has since shadowed its provider, because that path performs no slug resolution.
 
 Failure semantics are fail-closed: a provider query that errors at any hop fails the read rather than falling through to the next ancestor (sub-decision 1 above). The outcomes are `ProviderNotFoundBySlug` when no tenant in the chain owns the slug, and `ModelNotFound` when the winner owns no such model — which is also the answer when a closer tenant has shadowed the slug, since the ancestor that owns the model is then not the winner and is never queried. `ProviderDisabled` is the last gate rather than the first: the winner is resolved on ownership alone, and its status is consulted only once a row has been found and cleared the lifecycle check, so a disabled provider is never disclosed through a `canonical_id` that resolves to nothing.
 
 `approval_status` is read from the `models` row and **enforced**: `pending`, `rejected` and `revoked` all fail closed with `ModelNotApproved` (403), so a successful return means "approved, live, on an active winning provider" and the LLM Gateway needs no second decision of its own. The gate makes no Approval Service call in any phase — the column is the source of truth for reads (§3.1 Invariants), which is what keeps a fail-closed gate off the critical path of the `<10ms P99` NFR and immune to an approval-service outage.
 
-**Reads that complete without the database.** Every hop on this path is cache-first, and acquiring a connection from the pool does not itself contact the server, so a `get_tenant_model` whose slug-ownership entries and model entry are all warm returns a `ModelV1` having issued **zero** queries. This is deliberate — it is what buys the `<10ms P99` NFR — and it means the read stays available across a database outage for up to `cache_ttl_seconds` (default 10 min) per entry. Two consequences are accepted as designed rather than mitigated:
-
-- The PRD's P1/P2 fail-closed contract — answer while cache suffices, fail as soon as the database must be read — lands as: `list_tenant_models` is uncached (§2.1) and therefore always queries, as do the management listing and every write path, while `get_tenant_model` on warm entries does not query at all. The P3 `cpt-cf-model-registry-fr-degraded-mode` formalizes for metadata what this path already does; what it adds is the failing approval check, which P1 cannot express because that check reads a column on the cached row rather than making a call.
-- `approval_status` is consequently served from cache, not re-verified against the DB per request. The staleness window is bounded by `cache_ttl_seconds` and closed early by write-time `invalidate_tenant` on any status change this process performs (§4 "Cache Invalidation Strategy" item 1). A change the process never observes — another replica's write against the in-process cache backend, a direct DB edit, or the P2 `approval.status_changed` event before its handler lands — falls through to the TTL. Revocation is therefore eventually consistent within one TTL rather than immediate. The gate never fails open on an *absent* answer — an entry that is missing or undeserializable falls through to the DB (§4 Fault Tolerance Policies, "Cache is never load-bearing") — but a stale `approved` entry does keep answering for the remainder of its TTL, and a stale non-`approved` one keeps refusing for the same window.
-
-Approval is the last gate, so `ModelNotApproved` never doubles as a disclosure about a model the caller could not otherwise see: an unresolvable slug is `ProviderNotFoundBySlug`, a shadowed or absent row is `ModelNotFound`, a terminal row is `ModelDeprecated`, and a disabled winner is `ProviderDisabled` — all of them decided first. A model in a terminal lifecycle state yields `ModelDeprecated`. Neither that gate nor the approval gate evicts the cached row — both read columns the entry already carries — while the two provider-derived gates do; the table under "Tenant Visibility Resolution" above gives the rule and the reason for each.
+Approval is the last gate, so `ModelNotApproved` never doubles as a disclosure about a model the caller could not otherwise see: an unresolvable slug is `ProviderNotFoundBySlug`, a shadowed or absent row is `ModelNotFound`, a terminal row is `ModelDeprecated`, and a disabled winner is `ProviderDisabled` — all of them decided first. A model in a terminal lifecycle state yields `ModelDeprecated`.
 
 #### Management Model Listing
 
@@ -1076,7 +1127,7 @@ sequenceDiagram
 
 Provider resolution is fail-closed here too: an errored provider query fails the request rather than yielding a page whose `shadowed` flags are quietly wrong.
 
-Authorization is the admin grant from the matrix in §4 Security → Authorization; a non-admin caller is refused with `403` before any query runs. List responses are not cached (§2.1), so the view always reflects the current catalog.
+Authorization is the admin grant from the matrix in §4 Security → Authorization; a non-admin caller is refused with `403` before any query runs. Model rows are read from the database on every request and list pages are not a cache entity (§2.1), so the view always reflects the committed catalog; only the provider flags it computes come from cached resolution state.
 
 #### Model Discovery
 
@@ -1100,7 +1151,7 @@ sequenceDiagram
     participant Provider as ProviderAPI
     participant DB as PostgreSQL
     participant Approval as ApprovalService
-    participant Cache as CacheService
+    participant Cache as ResolutionCache
 
     Admin->>MR: trigger_discovery(provider_id)
     MR->>DB: SELECT provider WHERE id
@@ -1132,7 +1183,7 @@ sequenceDiagram
             end
         end
 
-        MR->>Cache: invalidate_tenant(owner) - drops mr:{owner}:*
+        note over MR,Cache: no cache invalidation — discovery writes model rows only,<br/>and model rows are not a cache entity
         MR-->>Admin: discovery_result
     end
 ```
@@ -1231,7 +1282,7 @@ sequenceDiagram
     participant MR as ModelRegistry
     participant PDP as AuthZResolver
     participant DB as PostgreSQL
-    participant Cache as CacheService
+    participant Cache as ResolutionCache
 
     TenantAdmin->>MR: PATCH /models/{canonical_id} {approval_status}
     MR->>PDP: access_scope(ctx, model, "update")
@@ -1242,7 +1293,7 @@ sequenceDiagram
         MR-->>TenantAdmin: 400 problem+json (invalid_argument)
     else
         MR->>DB: UPDATE models SET approval_status, updated_at
-        MR->>Cache: invalidate_tenant(owner) - drops mr:{owner}:*
+        note over MR,Cache: no cache invalidation — the next read re-fetches the row
         MR-->>TenantAdmin: 200 ModelDto
     end
 ```
@@ -1255,18 +1306,18 @@ sequenceDiagram
     participant ApprovalUI as ApprovalServiceUI
     participant Approval as ApprovalService
     participant MR as ModelRegistry
-    participant Cache as CacheService
+    participant Cache as ResolutionCache
 
     TenantAdmin->>ApprovalUI: approve model
     ApprovalUI->>Approval: approve(resource_type=model, resource_id)
     Approval->>Approval: update status, record decision
     Approval-->>MR: event: approval_status_changed
-    MR->>Cache: invalidate_tenant(owner) - drops mr:{owner}:*
+    note over MR,Cache: nothing to invalidate — approval_status is read<br/>from the models row on every eval read
 ```
 
-**Description**: In P1 the admin PATCHes `approval_status` on the model endpoint; the service authorizes the call, refuses the change when the model is in a terminal lifecycle state, writes the column, and invalidates the tenant's cache prefix. There is no workflow state machine, no decision record, and no notification in this module. In P2 the approval workflow moves to the Approval Service, which owns the state machine and audit trail; Model Registry then consumes status-change events and invalidates the affected cache entries, while the `models.approval_status` column continues to serve reads and `$filter`.
+**Description**: In P1 the admin PATCHes `approval_status` on the model endpoint; the service authorizes the call, refuses the change when the model is in a terminal lifecycle state, and writes the column. There is no cache invalidation, no workflow state machine, no decision record, and no notification in this module. In P2 the approval workflow moves to the Approval Service, which owns the state machine and audit trail; the `models.approval_status` column continues to serve reads and `$filter`.
 
-The cache invalidation is what makes the eval approval gate (§3.5) flip: both the P1 PATCH and the P2 event drop the owning tenant's whole key prefix before the change is observable, so the next `get_tenant_model` re-reads the row and the model starts — or stops — resolving. In-process that is immediate; across replicas it is bounded by `cache_ttl_seconds`, the same window §4 Consistency Model records for every other write. List reads are uncached, so the eval listing reflects an approval change on the next request either way.
+No invalidation is required for the eval approval gate (§3.5) to flip: `get_tenant_model` reads the `models` row per call and `list_tenant_models` carries `approval_status = 'approved'` as a mandatory SQL predicate, so both observe the committed column on the next request.
 
 #### Tag Assignment & Tag-Filtered List
 
@@ -1293,7 +1344,7 @@ sequenceDiagram
     else all tags resolve
         DB-->>MR: resolved tags
         MR->>DB: UPSERT model_tags(tenant_id, model_id, tag_id)
-        note over MR: no cache invalidation - tags are not part of ModelV1<br/>and list responses are not cached
+        note over MR: no cache invalidation - tags are not a cache entity,<br/>and no cached entity carries them
         MR-->>Admin: updated model tag set
     end
 
@@ -1324,7 +1375,7 @@ sequenceDiagram
     participant Provider as ProviderAPI
     participant Health as ProviderHealth
     participant DB as PostgreSQL
-    participant Cache as CacheService
+    participant Cache as ResolutionCache
 
     Admin->>MR: trigger_discovery(provider_id)
     MR->>DB: SELECT provider WHERE id
@@ -1339,23 +1390,25 @@ sequenceDiagram
 
     note over MR,Cache: catalog rows untouched; existing models stay readable.
     LLMGateway->>MR: get_tenant_model(ctx, canonical_id)
-    MR->>Cache: get(mr:{tenant}:model:{id})
-    Cache-->>MR: cached Model (last successful sync)
+    MR->>Cache: get_chain (resolution)
+    MR->>DB: SELECT provider WHERE slug, then … WHERE canonical_id
+    DB-->>MR: Model (last successful sync)
     MR-->>LLMGateway: Model (catalog read, unaffected by the provider outage)
 ```
 
-**Description**: When a provider call fails, OAGW surfaces the error to Model Registry, which records the failure on `provider_health` (`consecutive_failures`, `last_error`, `last_error_message`). No catalog rows are mutated and no cache entries are invalidated. Tenant reads (`get_tenant_model`, `list_tenant_models`) continue to serve cached and persisted catalog data: a provider being unreachable reaches neither the DB nor the cache, so the read path is untouched by it. That continuity is carried by `cpt-cf-model-registry-nfr-availability` and by the OAGW-outage mitigation in §4 "Technology Risks" — it is **not** `cpt-cf-model-registry-fr-degraded-mode`, which is scoped to *database* unavailability and stays P3 and unanswered (§4 Error Handling). Repeated failures flip provider health to `unhealthy`, which is exposed via `GET /providers/{id}/health` so operators can see provider-level issues without inferring them from discovery latency. Reads are unaffected by an approval-service outage because `approval_status` is served from the `models` column, not fetched per request; only the future explicit access-gate path fails closed (§4 Fault Tolerance Policies).
+**Description**: When a provider call fails, OAGW surfaces the error to Model Registry, which records the failure on `provider_health` (`consecutive_failures`, `last_error`, `last_error_message`). No catalog rows are mutated and no cache entries are invalidated. Tenant reads (`get_tenant_model`, `list_tenant_models`) continue to serve the persisted catalog — the rows from the last successful sync: a provider being unreachable reaches neither the DB nor the cache, so the read path is untouched by it. That continuity is carried by `cpt-cf-model-registry-nfr-availability` and by the OAGW-outage mitigation in §4 "Technology Risks" — it is **not** `cpt-cf-model-registry-fr-degraded-mode`, which is scoped to *database* unavailability and stays P3 and unanswered (§4 Error Handling). Repeated failures flip provider health to `unhealthy`, which is exposed via `GET /providers/{id}/health` so operators can see provider-level issues without inferring them from discovery latency. Reads are unaffected by an approval-service outage because `approval_status` is a column on the `models` row the read already fetches, never a call to the Approval Service (§4 Fault Tolerance Policies).
 
 #### Event Catalog
 
-**P1 status**: Model Registry subscribes to **no** events and emits none. The gear has no event handlers; the table below is the planned inbound surface, each row landing with the phase that needs it. Until then, cache freshness rests entirely on write-time tenant invalidation plus the TTLs.
+**P1 status**: Model Registry subscribes to **no** events and emits none. The gear has no event handlers; the table below is the planned inbound surface, each row landing with the phase that needs it.
 
 | Event | Producer | Consumer (this module) | Schema location | Phase | Ordering / Replay |
 |-------|----------|------------------------|-----------------|-------|-------------------|
-| `approval.status_changed` | approval-service | Cache invalidation handler | `approval-service-sdk` events module | P2 | Per-`(tenant_id, model_id)` ordered; replay re-invalidates the same keys |
-| `tenant.deleted` | platform tenant lifecycle | Hard-delete cascade + `invalidate_tenant` | platform tenant-lifecycle SDK | P2 | At-least-once; idempotent — second delivery is a no-op against an empty tenant |
+| `tenant.reparented` | tenant-resolver | Chain-cache invalidation handler — deletes `chain/{tenant}` for every tenant in the moved subtree | `tenant-resolver-sdk` events module | P3 | Per-tenant ordered; idempotent — replay drops an already-cold key harmlessly |
+| `approval.status_changed` | approval-service | Read-model consumer; no cache work | `approval-service-sdk` events module | P2 | Per-`(tenant_id, model_id)` ordered; idempotent |
+| `tenant.deleted` | platform tenant lifecycle | Hard-delete cascade + drop `chain/{tenant}` | platform tenant-lifecycle SDK | P2 | At-least-once; idempotent — second delivery is a no-op against an empty tenant and an absent key |
 
-Producers own the event schemas; Model Registry treats them as upstream contracts. The module emits no events of its own in v1 — derived state lives only in cache and DB. When/if an outbound event surface is added it will be registered alongside the producer SDK following the same per-`(tenant_id, resource_id)` ordering pattern.
+Producers own the event schemas; Model Registry treats them as upstream contracts. The module emits no events of its own in v1. When/if an outbound event surface is added it will be registered alongside the producer SDK following the same per-`(tenant_id, resource_id)` ordering pattern.
 
 ### 3.6 Database schemas & tables
 
@@ -1572,7 +1625,7 @@ The polymorphic JSONB column `provider_settings` versions its **payload** shape 
 Three module-level technology risks are tracked:
 
 - **SeaORM major-version churn**: SeaORM has shipped breaking changes between minor releases historically. Mitigation: pin minor version in `Cargo.toml`, gate upgrades behind the integration test suite, encapsulate SeaORM behind the repository trait so call sites do not depend on SeaORM types.
-- **Distributed-cache operational cost at scale**: at the 10K+ tenants × 2M+ models target, whichever managed cache service is eventually chosen becomes a meaningful infra line item. Mitigation: pluggable cache (`cpt-cf-model-registry-adr-pluggable-cache`) lets small deployments run on `InMemoryCache` with no cache infrastructure at all; large deployments accept the cost as the documented trade-off. The backend is not selected yet (§4 Technical Debt & Roadmap), so the cost is not yet quantified.
+- **Distributed-cache operational cost at scale**: no longer a material risk for this module. The cache footprint scales with tenants rather than models (§4 Capacity & Cost), the recommended binding is in-process and free, and a shared backend would buy only a narrower cross-replica window on provider state — catalog reads go to the database either way. If a remote-cache cluster plugin is introduced, the cost and its operational surface belong to the `cluster` gear's decision, not this one (`cpt-cf-model-registry-adr-pluggable-cache`).
 - **OAGW single point of egress**: every provider call routes through OAGW (`cpt-cf-model-registry-constraint-oagw-dependency`); an OAGW outage halts all discovery. Mitigation: catalog reads continue from cache and DB (§3.5 Discovery Failure); discovery resumes on the next manual trigger or external scheduler tick once OAGW recovers.
 
 ## 4. Additional Context
@@ -1620,26 +1673,26 @@ Errors deferred to a later phase, listed here with the phase that introduces the
 | `tag_not_found` | 404 | `not_found` | P3 | The tag surface. |
 | `tag_already_exists` | 409 | `already_exists` | P3 | The tag surface. |
 
-A DB outage surfaces as `DomainError::Database` → 500 `internal` in P1 and P2, not as a 503. That satisfies the PRD's fail-closed DB-unavailability contract in substance — the request fails rather than serving something a healthy DB would have refused — but not in form. The target posture is `service_unavailable` (503), recorded against the PostgreSQL row in §4 "Dependency SLAs" and landing as `database_unavailable` in the table above alongside the P3 tiered mode. One read path does not fail at all while its cache entries are warm — see §3.5 "Reads that complete without the database".
+A DB outage surfaces as `DomainError::Database` → 500 `internal` in P1 and P2, not as a 503. That satisfies the PRD's fail-closed DB-unavailability contract in substance — the request fails rather than serving something a healthy DB would have refused — but not in form. The target posture is `service_unavailable` (503), recorded against the PostgreSQL row in §4 "Dependency SLAs" and landing as `database_unavailable` in the table above alongside the P3 tiered mode. No read path survives a database outage: every request that returns a catalog row queries for it.
 
 ### Cache Invalidation Strategy
 
-P1 invalidation is deliberately coarse — the write paths are admin-rate, the read paths are not, and a whole-prefix drop is impossible to get subtly wrong:
+The tenant chain entry (`chain/{tenant_id}`, §2.1) is invalidated by TTL only — `chain_cache_ttl_seconds`, default 30. No provider or model write performs a cache operation, since no provider or model state is cached.
 
-1. **Write operations**: every successful `create` / `update` / `delete` on a provider or model calls `invalidate_tenant(owner_tenant_id)` — the tenant that owns the affected **row**, read back from the repository, not `ctx.subject_tenant_id()`. The two differ whenever the caller's `AccessScope` permits a write outside its own tenant (a `platform-admin` grant over own + descendants), and invalidating the caller's prefix would then leave the owner's entry stale for a full TTL. Dropping the whole `mr:{tenant_id}:` prefix is preferred over computing the affected key set. No subtree walk is needed to reach descendants: keys are prefixed by the owning tenant, so descendants read the very entries this drops. Only a change this process never observes — another replica's write, or a direct DB edit — falls through to the TTL.
-2. **Stale-entry eviction on read**: `get_tenant_model` deletes the cached model key on the two gates whose verdict comes from outside the cached row — a `provider_id` that no longer matches the winning provider, and a winning provider that is `disabled` — so neither keeps answering from cache for the rest of its TTL. The two gates that read the row's own columns (terminal `lifecycle_status`, non-`approved` `approval_status`) keep the entry: it is not stale, and the writes that would change either verdict drop the whole prefix anyway (item 1). The per-gate rationale is in §3.5 "Tenant Visibility Resolution".
-3. **Slug-ownership entries, positive and negative (designed)**: `mr:{tenant_id}:provider_slug:{slug}` caches whether that tenant owns a provider under that slug, and a miss is cached as a **tombstone** rather than left uncached — the common case on a chain hop is that the tenant owns nothing under the slug, and an uncached absence costs a DB round-trip per hop on every `get_tenant_model` (§3.5 sub-decision 3). Both polarities take the same `cache_ttl_seconds` expiry as every other entry, and both are dropped by that tenant's own `invalidate_tenant` on any provider write — including the create that installs a shadow, which is what flips a tombstone to a hit. Descendants still pick the change up through the entry's TTL rather than an explicit walk, exactly as for the other two entities, so this adds no propagation window beyond the one item 1 already describes.
-4. **Discovery sync (P2)**: invalidate the owning tenant's key prefix after a sync.
-5. **Approval status change (P2)**: invalidate the owning tenant's key prefix on the `approval.status_changed` event.
-6. **Tag assignment / deletion (P3)**: no invalidation required. Tags are not carried on `ModelV1` and list responses are not cached, so no tag write can leave a cached entry stale.
+Two future handlers delete the entry explicitly:
 
-Items 4-6 need an event-handling surface the gear does not have yet (§3.5 Event Catalog).
+| Phase | Trigger | Action |
+|-------|---------|--------|
+| P2 | `tenant.deleted` | delete `chain/{tenant}` after the hard-delete cascade |
+| P3 | `tenant.reparented` | delete `chain/{tenant}` for every tenant in the moved subtree |
 
-Tenant re-parenting is out of scope (PRD Open Question #7): the hierarchy a read resolves against is assumed stable, so no invalidation is defined for it.
+Both need the event-handling surface the gear does not have yet (§3.5 Event Catalog). Until then a tenant-tree change is reflected within one TTL.
+
+A cache write that fails (encode error, backend error) is logged and skipped; the next read resolves the chain from `tenant-resolver` (§4 Fault Tolerance Policies).
 
 ### Security Considerations
 
-- **Tenant isolation**: Cache keys prefixed with `tenant_id`; queries filter by tenant hierarchy via `SecureConn` + `AccessScope`. Every read path validates tenant scope before touching cache or DB.
+- **Tenant isolation**: the single cache key names one tenant (`chain/{tenant_id}`) and its value is a list of tenant IDs; no row data is cached. Queries filter by tenant hierarchy via `SecureConn` + `AccessScope`, and each ancestor-scoped read uses an explicitly constructed `AccessScope::for_tenant(ancestor)` rather than a widened caller scope (§2.1).
 - **Credential protection**: Provider credentials are never stored in this module — `cpt-cf-model-registry-constraint-no-credentials`. OAGW owns credential storage and injection per `cpt-cf-model-registry-adr-oagw-provider-access`.
 
 #### Authentication
@@ -1677,27 +1730,35 @@ All admin-surface operations (model/provider/alias/tag create/update/delete/disc
 
 Encryption and PII handling follow the platform's enterprise-data baseline; Model Registry inherits the platform contract rather than introducing its own scheme.
 
-- **Encryption at rest**: PostgreSQL data — including the polymorphic `provider_settings` JSONB column and the five JSONB sub-object columns — relies on the platform's database-disk encryption (PostgreSQL TDE / cloud-managed volume encryption). In P1 the cache is local and in-process, so no cache data reaches disk at all; any future distributed backend would inherit platform-managed disk encryption. Model Registry does not perform application-layer field encryption because no row column carries user PII or regulated data — provider routing aliases, capability flags, and pricing are operationally sensitive but not regulated.
-- **Encryption in transit**: REST traffic terminates at the platform's gateway/ingress over TLS 1.2+; intra-cluster traffic to PostgreSQL uses SSL with certificate verification (`sslmode=verify-full` in connection strings). Any future distributed cache backend must use TLS plus authentication where it is exposed beyond a private subnet; the concrete scheme lands with the backend decision (§4 Technical Debt & Roadmap), and P1 has no such link because the cache is in-process. The OAGW link is enforced by Outbound API Gateway and is out of scope here.
-- **Key-management ownership**: Delegated to the platform. Database encryption keys, TLS certificates, and any future cache-backend credentials are owned and rotated by the platform's secrets/KMS layer; Model Registry consumes them through configuration injection and never embeds, exports, or rotates keys itself. Provider credentials are owned and rotated by OAGW per `cpt-cf-model-registry-constraint-no-credentials`.
+- **Encryption at rest**: PostgreSQL data — including the polymorphic `provider_settings` JSONB column and the five JSONB sub-object columns — relies on the platform's database-disk encryption (PostgreSQL TDE / cloud-managed volume encryption). The only cached value is a list of tenant UUIDs. It reaches disk only under the `postgres` cluster backend, where `cluster_cache` is an ordinary table covered by the same database-disk encryption; under `standalone` it stays in process memory. Model Registry does not perform application-layer field encryption because no row column carries user PII or regulated data — provider routing aliases, capability flags, and pricing are operationally sensitive but not regulated.
+- **Encryption in transit**: REST traffic terminates at the platform's gateway/ingress over TLS 1.2+; intra-cluster traffic to PostgreSQL uses SSL with certificate verification (`sslmode=verify-full` in connection strings). The cache adds no new link: `standalone` is in-process and `postgres` reuses the same `sslmode=verify-full` connection. A remote cluster backend would carry its transport security in the cluster gear's contract, not here. The OAGW link is enforced by Outbound API Gateway and is out of scope here.
+- **Key-management ownership**: Delegated to the platform. Database encryption keys, TLS certificates, and any cache-backend credentials (owned by the `cluster` gear's backend binding, not this module) are owned and rotated by the platform's secrets/KMS layer; Model Registry consumes them through configuration injection and never embeds, exports, or rotates keys itself. Provider credentials are owned and rotated by OAGW per `cpt-cf-model-registry-constraint-no-credentials`.
 - **PII classification**: Model Registry data is classified as **non-PII operational metadata**. Tenant identifiers and actor identifiers (`created_by`) are pseudonymous UUIDs scoped to the platform; they reference identity records owned by the IAM/tenant-resolver subsystem. No free-form user content, message bodies, prompts, or completions are persisted in Model Registry tables.
-- **Secure data disposal** (P2 — the event handler does not exist in P1): When a tenant is deleted by the platform, Model Registry receives the platform's tenant-deletion event and performs a hard-delete cascade across `providers`, `models`, `provider_health`, `aliases`, `tags`, and `model_tags` for the affected `tenant_id`, then issues `invalidate_tenant` against the cache backend. Soft-delete columns (`deprecated_at`) are preserved for in-tenant lifecycle transitions only and do not satisfy data-disposal contracts. Until the handler ships, tenant purge is an operator-run DB action.
+- **Secure data disposal** (P2 — the event handler does not exist in P1): When a tenant is deleted by the platform, Model Registry receives the platform's tenant-deletion event and performs a hard-delete cascade across `providers`, `models`, `provider_health`, `aliases`, `tags`, and `model_tags` for the affected `tenant_id`, then deletes that tenant's cache key (`chain/{tenant}`). Soft-delete columns (`deprecated_at`) are preserved for in-tenant lifecycle transitions only and do not satisfy data-disposal contracts. Until the handler ships, tenant purge is an operator-run DB action.
 
 ### Consistency Model
 
 The registry serves a high read:write ratio and chooses a deliberate consistency posture per data path.
 
-- **Overall model — eventual consistency, TTL-bounded**: cache values trail authoritative state by at most `cache_ttl_seconds` (default 10 minutes, §2.1 "Cache-First Reads"), for own and inherited views alike. Read-after-write within the same instance is strongly consistent because every write drops the owning tenant's whole cache prefix before returning success — and since keys are owner-prefixed, that covers descendants reading the row as inherited data, not just the owner. **In P1 the cache is per-replica**, so read-after-write across instances is bounded by the TTL rather than by an invalidation-propagation delay: a second replica can serve a stale read for up to the TTL after another replica's write. A single-replica deployment does not have this window, which is why the in-memory backend is the documented posture for small deployments and a distributed backend is the prerequisite for multi-replica scale-out. The §3.5 sequences ("Get Tenant Model", "Model Approval Integration") encode this behavior.
+- **Catalog reads are strongly consistent; hierarchy resolution is eventually consistent** (§2.1 "Resolution Caching"):
+
+  | What | Consistency | Bound |
+  |------|-------------|-------|
+  | model rows — `approval_status`, `lifecycle_status` | strong, every read, every replica | none; fetched per request |
+  | provider rows — `status`, slug ownership hence shadowing | strong, every read, every replica | none; fetched per request |
+  | tenant chain — ancestry and barrier boundaries | eventual | `chain_cache_ttl_seconds` (default 30) |
+
+  Catalog writes are visible to every replica on the next read regardless of replica count or cache binding, since no catalog state is cached. Eventual consistency is confined to tenant ancestry. The §3.5 sequences ("Get Tenant Model", "Model Approval Integration") encode this behavior.
 - **Idempotency of the P1 write paths**: `create_model` rejects a duplicate derived `canonical_id` within the tenant rather than upserting, so creates are not idempotent by design — a repeated create is a `Validation` error, not a silent overwrite. `update_model` and `delete_model` are idempotent in effect: a PATCH re-applying the same values converges, and soft-deleting an already-deprecated model leaves it deprecated. The discovery upsert loop below is P2.
 - **Idempotency — discovery upsert loop (P2)**: Each iteration of the discovery loop in `cpt-cf-model-registry-seq-model-discovery` performs an upsert keyed on `(tenant_id, canonical_id)` — the unique index declared on `models` in §3.6 — where `canonical_id = {provider_slug}::{provider_model_id}`. That key is equivalent to the natural key `(provider_id, provider_model_id)` and needs no second unique index to enforce it: `providers` is `UNIQUE (tenant_id, slug)`, and a model's `tenant_id` always equals its provider's (§3.1 Invariants), so one `(tenant_id, canonical_id)` pair can only ever denote one `(provider_id, provider_model_id)` pair. Re-running discovery is therefore idempotent on the catalog, per the reconciliation table in §3.5: a model that already exists is updated in place, a model that disappears from the provider's response is marked `lifecycle_status = deprecated` / `deprecated_at = now()`, and a new model is inserted `pending` / `preview`. Approval registrations (`Approval.register_approvable`) are also idempotent on `(tenant_id, model_id)` per the Approval Service contract.
-- **Transaction boundaries**: every P1 operation is a single-row write, so no operation spans a multi-statement transaction; the repositories take the connection per call and leave transaction control to the caller, which keeps the seam available for P2. Cache invalidation happens after the write returns success — a write that fails leaves the cache untouched, and the coarse prefix drop means a partially-applied invalidation cannot leave one entity stale while a sibling is fresh. P2 adds a single transaction per provider per discovery run so inserts, updates, and deprecation marks for one catalog snapshot commit together, with the cache invalidation deferred to commit. Cross-tenant writes (e.g. a parent's provider change reflected in a child's read view) are not transactional in any phase — child views reconcile through the TTL described above.
+- **Transaction boundaries**: every P1 operation is a single-row write, so no operation spans a multi-statement transaction; the repositories take the connection per call and leave transaction control to the caller, which keeps the seam available for P2. No write performs a cache operation, so there is no commit-versus-invalidate ordering. P2 adds a single transaction per provider per discovery run so inserts, updates, and deprecation marks for one catalog snapshot commit together. Cross-tenant writes (a parent's provider change reflected in a child's read view) are not transactional in any phase but are immediately visible, since the child's next read queries the parent's provider rows directly.
 
 ### Capacity & Cost
 
 This subsection records the capacity-planning, cost-allocation, and cost-data-lifecycle posture for v1; it materializes ARCH-DESIGN-010 and is bounded by the NFR allocation in §1.2.
 
-- **Capacity planning**: Targets are 10 000 tenants × 200 models = 2 million catalog rows (`cpt-cf-model-registry-nfr-scale`) and the `cpt-cf-model-registry-nfr-performance` budgets (≤ 10 ms P99 on `get_tenant_model`, ≤ 50 ms P99 on `list_tenant_models`, ≤ 100 ms P99 on `approve_model`) at 99.9% availability (`cpt-cf-model-registry-nfr-availability`). The hot path is fronted by the cache, sized for ~5% working-set of the catalog at 99.9% hit rate; the database is sized for the full 2M rows with the indexes listed in §3.6. Per-tenant model counts above 10× the median (~2 000 models) are treated as outliers and trigger an operator review of the tenant's discovery scope rather than a capacity expansion. Discovery throughput is bounded by the per-provider distributed lock — at most one in-flight discovery per provider per cluster regardless of caller (admin or external scheduler); aggregate provider load is OAGW's concern via its rate-limit configuration.
-- **Cost-allocation strategy by scale**: The `CacheService` backend is selected at compile time per deployment profile. Small / single-node deployments (<1K tenants, <100K models) use `InMemoryCache` and pay no cache infrastructure cost — the database's own query cache provides comparable latency at this scale. This is the **only** profile P1 supports: no distributed backend is in P1 scope, and selecting one is an open question (§4 Technical Debt & Roadmap). Production deployments (10K+ tenants, 2M+ models) need a distributed backend for cross-instance cache consistency and horizontal scale; that is the only configuration where cache infrastructure cost (managed cache cluster, network, replication) becomes a line item, and quantifying it is deferred to the backend decision. The trade-off is documented in `cpt-cf-model-registry-adr-pluggable-cache`.
+- **Capacity planning**: Targets are 10 000 tenants × 200 models = 2 million catalog rows (`cpt-cf-model-registry-nfr-scale`) and the `cpt-cf-model-registry-nfr-performance` budgets (≤ 10 ms P99 on `get_tenant_model`, ≤ 50 ms P99 on `list_tenant_models`, ≤ 100 ms P99 on `approve_model`) at 99.9% availability (`cpt-cf-model-registry-nfr-availability`). Cache footprint is one entry of tenant UUIDs per tenant — roughly a megabyte at 10 000 tenants, independent of catalog size. The database is sized for the full 2M rows with the indexes listed in §3.6 and carries every catalog read: one indexed lookup per chain hop for slug resolution plus one per model read. Size the database for that read volume rather than assuming a cache in front of it. Per-tenant model counts above 10× the median (~2 000 models) are treated as outliers and trigger an operator review of the tenant's discovery scope rather than a capacity expansion. Discovery throughput is bounded by the per-provider distributed lock — at most one in-flight discovery per provider per cluster regardless of caller (admin or external scheduler); aggregate provider load is OAGW's concern via its rate-limit configuration.
+- **Cost-allocation strategy by scale**: The cache backend is an operator binding in cluster config, not a compile-time choice this module makes. Every deployment size binds the `standalone` (in-process) cluster cache and pays no cache infrastructure cost at any scale (§4 Capacity & Cost). The cost that scales is database read capacity, not cache infrastructure. The trade-off is documented in `cpt-cf-model-registry-adr-pluggable-cache`.
 - **AICredits cost-data lifecycle**: Per-model token and built-in-tool pricing live in each provider settings struct's nested `cost` block (`OpenAiCost`, `AnthropicCost`) as `u64` micro-credits (×1 000 000 scaling) and are persisted inside the polymorphic `provider_settings` JSONB column. In P1 that data arrives only through admin `POST` / `PATCH` on the model surface — there is no discovery write path and no cost-sync job. Historical pricing is not retained inside the registry; price changes overwrite in place. The AICredits accounting subsystem consumes the registry's current cost view at gateway request time and is responsible for its own historical ledger. When a model is deprecated, its `cost` block is preserved on the row (soft delete only mutates `lifecycle_status` and `deprecated_at`) so in-flight billing reconciliation can still resolve the price that applied at the time of consumption.
 
 ### Fault Tolerance Policies
@@ -1705,7 +1766,7 @@ This subsection records the capacity-planning, cost-allocation, and cost-data-li
 **P1 posture.** The only dependency calls P1 makes are in-process ClientHub calls to `tenant-resolver` and `authz-resolver`, and they are unwrapped: no retry layer, no per-call timeout, no circuit breaker. A PDP or tenant-resolver failure fails the request (`Forbidden` or `Internal`). Two degradations are deliberate:
 
 - **Partial-result tolerance on ancestor model list queries**: an ancestor-scoped **model** `list` that errors is logged at `warn` and skipped, so a failing ancestor narrows the visible set instead of failing the caller's list. Two reads are not tolerated this way: the own-tenant query, and **any provider query** — shadow resolution fails closed, because a skipped provider row widens visibility rather than narrowing it (§3.5 sub-decision 1).
-- **Cache is never load-bearing**: a cache miss, a deserialization mismatch, or a serialization failure on write degrades to the DB path rather than erroring; `InMemoryCache::set` logs and skips on failure instead of propagating.
+- **Cache is never load-bearing**: a miss, a decode mismatch, an encode failure, a `ClusterError`, or an unbound profile all degrade to a `tenant-resolver` call and are logged rather than propagated. `ClusterResolutionCache` reports every backend error as a plain miss, so no read path has a cache-specific failure mode. Not covered: a cache read that hangs rather than fails. Under a remote binding that needs the timeout named in the target posture below, which P1 does not implement.
 
 There is no in-module bulkhead. The approval gate on the eval reads **is** fail-closed, and cheaply so: it compares a column already on the row being returned, so there is no dependency to time out and no state in which it can fail open (§3.5).
 
@@ -1714,7 +1775,7 @@ There is no in-module bulkhead. The approval gate on the eval reads **is** fail-
 - **Retries on dependency calls**: ClientHub-mediated calls to `tenant-resolver`, `approval-service`, and `outbound-api-gateway` use 3 attempts with exponential backoff (50ms → 200ms → 800ms) and ±25% jitter. Reads are always retryable; writes are retried only on transport-level failures (connection reset, 5xx with `Retry-After`) — never on 4xx, never on `ApprovalService` 409 conflicts.
 - **Timeouts**: `tenant-resolver.get_ancestors` 200ms; `approval-service.get_status` 200ms; OAGW discovery 30s per provider with circuit-breaking delegated to OAGW (`cpt-cf-model-registry-constraint-oagw-dependency`); cache `get` 50ms with DB fallback.
 - **Bulkheads**: The per-provider distributed lock on discovery is the explicit bulkhead — at most one in-flight discovery per provider per cluster, regardless of caller (admin or external scheduler). Cache-write fan-out on tenant-deletion is bounded by an N-key batch invalidation rather than a per-key loop.
-- **Fail-closed on approval check**: the eval reads deny on anything other than `approved`. Because the decision is a column on the model row rather than a call, an approval-service outage cannot affect it in either direction — a cached row keeps answering with the status it was cached with, bounded by `cache_ttl_seconds`, and the P2 Approval Service integration replaces the *write* path only (§2.1 "Approval Service Delegation").
+- **Fail-closed on approval check**: the eval reads deny on anything other than `approved`. Because the decision is a column on the model row the request itself fetched, an approval-service outage cannot affect it in either direction, and neither can cache staleness — there is no cached copy of the status to go stale. The P2 Approval Service integration replaces the *write* path only (§2.1 "Approval Service Delegation").
 
 ### Dependency SLAs
 
@@ -1722,12 +1783,12 @@ Targets are the design intent; the "P1 behavior" column records what the code do
 
 | Dependency | Target P99 | Behavior on SLO miss | P1 behavior |
 |------------|------------|----------------------|-------------|
-| `tenant-resolver.get_ancestors` | <50ms | Retry policy above; on terminal failure, fail-closed (cannot resolve inheritance → 503) | Single unwrapped in-process call; failure → `Internal` (500). No retry, no timeout |
+| `tenant-resolver.get_ancestors` | <50ms | Retry policy above; on terminal failure, fail-closed (cannot resolve inheritance → 503) | Single unwrapped in-process call on a chain-cache miss; failure → `Internal` (500). No retry, no timeout. The `rg` plugin fans out paginated requests to an external service, so the target is aspirational there |
 | `authz-resolver` (PDP decision) | <50ms | Retry policy; terminal failure → deny | Single call per operation; `Denied` → 403, evaluation/compile failure → 500 |
 | `approval-service.get_status` | <100ms | Retry policy; terminal failure → the P2 admin/workflow surface reports the outage. It cannot deny an eval read, which gates on the `models.approval_status` column instead (§3.5) | Not called in any phase by the read path — approval status is a column; P2 adds the write-side integration only |
 | `outbound-api-gateway` (discovery) | <30s per provider | Discovery degrades to "last known" (§3.5 Discovery Failure); catalog reads unaffected | Not called (P2) |
-| Cache backend | <10ms | Fall through to DB; warm cache in background | In-process map behind an async `RwLock`; miss falls through to DB |
-| PostgreSQL | <50ms (point read), <200ms (filtered list) | Surface `database_unavailable` (503) to caller (§4 Error Handling); no in-process retry on connection-pool exhaustion | `DbError` → `DomainError::Database` → 500; no in-process retry. A warm `get_tenant_model` issues no query and so does not fail at all (§3.5) |
+| Cache backend (`cluster` / `ClusterCacheV1`) | <10ms | Fall through to `tenant-resolver`; no retry | `standalone` in-process backend; miss, error, or unbound profile falls through to `tenant-resolver`. No per-call timeout — see Fault Tolerance Policies |
+| PostgreSQL | <50ms (point read), <200ms (filtered list) | Surface `database_unavailable` (503) to caller (§4 Error Handling); no in-process retry on connection-pool exhaustion | `DbError` → `DomainError::Database` → 500; no in-process retry |
 
 ### Technical Debt & Roadmap
 
@@ -1735,15 +1796,21 @@ Known module-level debt is tracked here for visibility. Each item names what clo
 
 Carried out of P1:
 
-- **No distributed cache backend — open question**: P1 implements the local in-process `InMemoryCache` and nothing else. A multi-replica deployment therefore has per-replica caches, and read-after-write across replicas is TTL-bounded rather than invalidation-bounded (§4 Consistency Model) — the single largest blocker to the scale NFR. **Whether to add a distributed backend, and which technology to use, is undecided.** The crate manifest declares an empty `redis = []` feature as a placeholder; that name pre-judges the decision and should be revisited when a backend is actually chosen, since the candidates are not limited to Redis (a platform-provided cache service, or a coordination-free design that leans on a shorter TTL, are both live options).
+- **Provider resolution is uncached**: slug resolution costs one indexed lookup per chain hop, and both list paths query every chain tenant's provider rows, so read cost is O(chain depth) rather than constant. A provider cache must be owner-keyed to be shared by the inheriting subtree, which makes it N cache reads for an N-deep chain — the same count as the queries it replaces. Revisit only if per-hop lookups appear in a measured P99 at realistic tenant depth.
 - **Ancestor merge is not a stable paginated order**: ancestor rows are fetched without pagination, merged, then truncated to the page size, so the cursor anchors on own-tenant rows only (§3.3). A tenant inheriting a large catalog cannot walk the merged set page by page. Fixing it needs either a UNION-based query across the scope set or a merge-aware cursor.
-- **Ancestor fan-out is one query per ancestor**: `get_provider` / `get_tenant_model` / both list paths issue a query per ancestor tenant, so read cost grows linearly with tenant depth. An `AccessScope` spanning the whole chain plus a single ordered query would collapse this, at the cost of losing per-row ownership classification (which currently drives visibility merging).
-- **List reads are uncached**: `list_tenant_models` queries the database on every call, so its latency rests entirely on indexes and the per-ancestor fan-out below. Caching it is deferred, not rejected: a list result is a function of the caller's PDP-derived `AccessScope`, and the registry cannot currently key an entry by the exact scope that produced it, so any tenant-keyed page risks serving one caller's visibility to another. Unlocking it needs a stable scope fingerprint in the cache key (plus a decision on whether to cache finished pages under the reader or per-ancestor row fragments under each owner, the latter being the only variant that preserves the owner-prefix invalidation invariant).
-- **Whole-tenant cache invalidation**: every write drops the tenant's entire cache prefix (§4 Cache Invalidation Strategy). Correct and cheap to reason about, wasteful under write bursts; narrowing it needs per-entity key computation on the write paths.
+- **Ancestor fan-out is one query per ancestor**: `get_provider`, `get_tenant_model` and both list paths issue a query per ancestor tenant, for providers and (on the list paths) for models, so read cost grows linearly with tenant depth. `ChainProviders` being materialized in memory makes the fix reachable: a single chain-wide query filtered on `provider_id IN allow_list` would replace the model fan-out, and per-row ownership classification can be recomputed from the resolved provider map (`model.provider_id → owner_tenant`) rather than from which query returned the row. Doing so would also make the merged order stable, closing the item above. Not attempted here — it changes the repository query shape and the cursor contract, and this change set is scoped to the cache.
+- **List pages are not cached**: both list endpoints query the database on every call. Caching a page needs an in-memory evaluator for the OData filter AST, which the toolkit does not have (`FieldToColumn` compiles straight to SeaORM columns), plus in-memory ordering and keyset-cursor semantics matching SQL's collation and null handling. Serving only unfiltered requests from a cached set is a cheaper intermediate step, rejected here because it gives one endpoint two latency and consistency profiles depending on the query.
 - **Whole-row re-projection on PATCH**: any PATCH touching an `info.*` field rewrites all scalar and JSONB columns (§3.6). Keeps shadows consistent by construction; produces verbose SQL.
 - **No measured performance**: the `<10ms P99` NFR has no benchmark and no load test behind it (§1.2).
-- **Cross-replica cache TTL trade-off**: within a process, owner-prefixed keys mean a write reaches descendants without a subtree walk — including the write that installs a shadow, which drops the shadowing tenant's slug tombstone and so takes effect on a descendant's next read. Across replicas nothing propagates, so any reader trails by up to `cache_ttl_seconds`. That window matters most for a new shadow, which is a compliance-isolation lever rather than an ordinary catalog edit. Closing it needs a distributed backend — not yet chosen (§4 Technical Debt & Roadmap) — rather than an O(tenant-tree) walk.
+- **Chain entries expire but are never invalidated**: `chain/{tenant_id}` is keyed by the reader, so a reparent or `self_managed` barrier flip cannot be propagated by a write without enumerating descendants. `chain_cache_ttl_seconds` (default 30) is the bound; the P3 `tenant.reparented` handler removes it (§3.5 Event Catalog).
 - **MySQL backend — future work**: PostgreSQL and SQLite are the supported backends (§3.3 Compatibility). Adding MySQL means extending the migration's per-backend type dispatch and DDL rendering, and giving the gear a MySQL test target alongside the SQLite one.
+- **`AccessScope` does not narrow provider resolution — open question**: each chain tenant's provider rows are read under `AccessScope::for_tenant(T)`, so slug resolution and the allow-list are identical for every caller with access to that tenant. If a grant should ever hide a *provider* from a caller who can otherwise read the tenant, resolution has to move behind the caller's scope. Catalog-row queries are unaffected.
+- **The `cluster` gear is not wired into the platform build**: it is a workspace member but appears in neither `apps/cf-gears-example-server`'s manifest nor its `registered_gears.rs`, and no shipped `config/*.yaml` carries a `cluster:` section (`ClusterConfig::profiles` defaults to empty, binding no backend). Landing this design includes registering the gear, adding a `default` profile with `cache: { provider: standalone }`, and covering the degraded path when it is absent.
+- **No single-flight on a cold entry**: N concurrent requests missing the same `chain/{tenant}` key each call `tenant-resolver`. Results stay correct (the call is idempotent), but every 30-second expiry lets the fan-out recur under load. A per-key in-flight map would collapse them.
+- **No timeout on a cache read**: `ClusterCacheV1` calls are unwrapped. Under the in-process binding that is fine; under `postgres` a cache get is a network round-trip and a hung one hangs the request. The target posture in §4 Fault Tolerance names a 50ms cache timeout with dependency fallback; P1 does not implement it.
+- **No cache size bound**: neither shipped backend evicts on size — `standalone` is an unbounded map swept only by TTL, `postgres` a table reaped only by expiry. Tolerable at one small entry per tenant (§4 Capacity & Cost); any future entity caching rows would change that.
+- **No cache observability**: chain hit/miss ratio, `tenant-resolver` call rate, and `NoopResolutionCache` selection are not instrumented, so neither the TTL nor the uncached-provider decision can be validated against real traffic.
+- **Hierarchy caching belongs upstream**: no `tenant-resolver` plugin caches anything, so every consumer caches the chain privately, as this module now does. `tenant-resolver` owns the data and can invalidate on write, so a chain cache there would serve every gear and close the reparent window. Recorded as an upstream request (`docs/UPSTREAM_REQS.md`).
 
 ### Documentation Strategy
 
@@ -1759,11 +1826,11 @@ The module follows the platform documentation model:
 
 | Test layer | Approach | Location | P1 status |
 |------------|----------|----------|-----------|
-| Unit | `#[cfg(test)] mod tests` next to module code, plus `*_test.rs` sibling files for the larger suites (mapper, DTO, error mapping); `InMemoryCache` as the real backend; mock `TenantResolverClient` / authz clients via trait impls | `model-registry/src/**` | P1 scope |
-| Integration | In-memory SQLite via `toolkit-db`'s `sqlite` feature, migrations applied per test; real repositories + real service + mocked inter-gear clients | `model-registry/tests/integration.rs` | P1 scope — provider/model CRUD, `OData` filter and pagination, soft-delete hiding, approval read/write, tenant isolation, parent/child inheritance and shadowing, cache-first read, full `ModelInfoV1` storage round-trip |
+| Unit | `#[cfg(test)] mod tests` next to module code, plus `*_test.rs` sibling files for the larger suites (mapper, DTO, error mapping); a stub `ResolutionCache` (and `NoopResolutionCache` for the uncached path) rather than a live cluster backend; mock `TenantResolverClient` / authz clients via trait impls | `model-registry/src/**` | P1 scope |
+| Integration | In-memory SQLite via `toolkit-db`'s `sqlite` feature, migrations applied per test; real repositories + real service + mocked inter-gear clients | `model-registry/tests/integration.rs` | P1 scope — provider/model CRUD, `OData` filter and pagination, soft-delete hiding, approval read/write, tenant isolation, parent/child inheritance and shadowing, full `ModelInfoV1` storage round-trip. Cache behavior is covered against a stub `ResolutionCache`: a warm chain issues no `tenant-resolver` call, a root tenant's empty ancestor list is a hit rather than a miss, an expired or absent entry falls through to the resolver, and no write of any kind touches the cache |
 | Contract | SDK trait conformance — every `ModelRegistryClientV1` impl (Local, gRPC) runs a shared trait test suite | `model-registry-sdk/tests/` | Not written. `LocalClient` delegation and error mapping are covered by unit tests instead; a shared suite is only worth building once a second impl (gRPC) exists |
 | End-to-end | Python suite driving REST endpoints against a running server with seeded providers/models | `testing/e2e/` | Skipped — the repo's e2e harness is not currently operational. The integration suite exercises the same paths through the service layer; the REST layer is covered by handler and DTO unit tests |
-| Performance | Criterion benches on cache hit-path and `OData` filter compilation; load test in pre-prod against the scale NFR | `model-registry/benches/`, `testing/load/` | Not written (§4 Technical Debt) |
+| Performance | Criterion benches on the resolution hit-path and `OData` filter compilation; load test in pre-prod against the scale NFR | `model-registry/benches/`, `testing/load/` | Not written (§4 Technical Debt) |
 | Security | Tenant-isolation tests (no cross-tenant read on get or list, cross-tenant `canonical_id` invisible), immutability-rejection tests, error-mapping tests over every `DomainError` variant | unit + integration | P1 scope, except the authorization-matrix tests (role × endpoint), which belong with the `authz-resolver` policy fixtures rather than this crate |
 
 Test data fixtures are constructed via factory functions using plain struct literals (the SDK entity structs are not `#[non_exhaustive]`, so a new field breaks the fixtures at compile time); no fixture files are committed. Each test gets its own in-memory database, so there is no shared state between tests. The DB-setup helpers are intentionally duplicated between the two repository test modules to keep each self-contained.
@@ -1789,7 +1856,7 @@ Several Design checklist domains are intentionally **not addressed** by this DES
 - **Threat-model — Not applicable at module level**: A module-scoped threat model is not produced for v1. The platform-level threat model covers transport, identity, tenant isolation, and outbound provider access (the OAGW boundary). Module-specific threat surfaces — discovery responses parsed as untrusted JSON, JSONB injection via provider settings, cache-key collision across tenants — are addressed by the §2.1 isolation principles, the §4 Data Protection contract, and the OAGW boundary; revisit when this module gains a non-platform-mediated trust boundary.
 - **Frontend session management — Not applicable**: This module owns no frontend, no cookies, no CSRF surface, and no browser session state.
 - **Observability (OPS-DESIGN-001/002) — Deferred to platform**: Logs, metrics, traces, and alerting integration follow the platform observability stack — structured tracing via the platform's OpenTelemetry pipeline, metrics exported through the platform's Prometheus endpoint, and dashboards/alerts defined alongside the platform's other modules. Module-specific signal taxonomy (per-tenant cache hit rate, discovery latency P99 per provider, approval-check fail-closed counter) is defined with the phase that emits those signals.
-- **Dead-letter / poison-message handling — Not applicable**: Model Registry consumes no events at all in P1, and the planned inbound surface (`approval.status_changed`, `tenant.deleted`) is a small set of handlers that are idempotent and re-deliverable by design. There is no module-owned message bus and no work queue in any phase; DLQ semantics are owned by the producer SDKs (Approval Service, tenant lifecycle) and the platform event bus.
+- **Dead-letter / poison-message handling — Not applicable**: Model Registry consumes no events at all in P1, and the planned inbound surface (`tenant.reparented`, `approval.status_changed`, `tenant.deleted`) is a small set of handlers that are idempotent and re-deliverable by design. There is no module-owned message bus and no work queue in any phase; DLQ semantics are owned by the producer SDKs (Approval Service, tenant lifecycle) and the platform event bus.
 - **Resource pooling, vertical scaling limits, fine-grained CPU/memory/storage/bandwidth efficiency (PERF-DESIGN-001/002/004 details) — Deferred to platform**: connection pooling is provided by `toolkit-db`'s `SecureConn` pool; horizontal scaling is the documented strategy (§4 Capacity & Cost) and vertical limits are dictated by the platform's instance-class catalog. Resource-efficiency tuning (per-allocation profiling, page-cache sizing, storage tiering) is owned by the platform deployment plan rather than this module.
 - **Rate limiting — Deferred to platform/infrastructure**: the gear defines and enforces no request-rate limits on any surface. Admin- and discovery-endpoint throttling is applied at `api-gateway` / ingress, and aggregate provider load is bounded by OAGW's own rate-limit configuration (see PRD §4 Out of Scope). The module's only internal throughput bound is the per-provider distributed lock on discovery (§3.5). No `nfr` in the PRD allocates rate limiting to this module.
 - **CORS, network segmentation, output encoding (SEC-DESIGN-004 details) — Deferred to platform**: REST traffic terminates at `api-gateway` which owns CORS policy, ingress filtering, network segmentation (private subnet for module → DB / OAGW links), and HTML/text output encoding. Model Registry returns JSON only; bytes are not transformed downstream.
@@ -1810,5 +1877,4 @@ Several Design checklist domains are intentionally **not addressed** by this DES
   - OQ#4 (tag access rights) — §4 Security Considerations, "Tag management": the access matrix encodes the working default and names the question as still open.
   - OQ#6 (per-plugin failure isolation / retry policy) — §4 Fault Tolerance Policies; recorded as resolved in the PRD.
   - OQ#3 (provider plugin retry policies) — near-duplicate of OQ#6; same answer, §4 Fault Tolerance Policies; recorded as resolved in the PRD.
-  - OQ#7 (tenant re-parenting) — out of scope by PRD decision; §4 Cache Invalidation Strategy states that no invalidation is defined for it.
   - OQ#1 (approval concurrency), OQ#2 (per-endpoint QPS), OQ#5 (discovery-settings GTS namespace) — **not answered here**. Each lands with the phase that needs it: OQ#1 and OQ#2 with the approval and load-testing work, OQ#5 with P2 discovery.
