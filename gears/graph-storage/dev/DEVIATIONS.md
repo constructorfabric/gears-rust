@@ -16,7 +16,10 @@ Entry format:
 
 Categories: `[deferred]` conscious scope cut for this iteration,
 `[doc-gap]` the documentation is silent or wrong, `[platform-gap]` the
-platform lacks an API the documentation assumes.
+platform lacks an API the documentation assumes, `[impl-gap]` the
+implementation ships something the documentation does not sanction — the
+category D-019 needed, since a mode the docs do not describe is neither a
+silent document nor an agreed cut.
 
 **Every entry below has been checked against a running system**, not only
 against the source. Where a claim was testable it was tested — on a live
@@ -26,10 +29,12 @@ more than the evidence supported and are corrected; the method that produced
 them was writing the conclusion before running the experiment, so each entry
 now records how it was verified.
 
-**Status.** Every `[doc-gap]` below is now folded into PR #4523 (commit
-`facd5da29` on `feature/graph-storage-prd-adr`), marked in the documents as
-"Found while building the prototype" so a reader can tell a decision taken up
-front from one the implementation forced. The `[platform-gap]` entries are
+**Status.** Every `[doc-gap]` below **up to D-016** is folded into PR #4523
+(commit `facd5da29` on `feature/graph-storage-prd-adr`), marked in the
+documents as "Found while building the prototype" so a reader can tell a
+decision taken up front from one the implementation forced. **D-017 and D-018
+are not**: they came out of building vector search after that sweep, and doc
+edits are agreed before they are published. The `[platform-gap]` entries are
 recorded in the documents too — at the place where they bite — but they close
 only with platform work, so they stay open here. The `[deferred]` entries are
 accepted scope cuts and need no documentation change.
@@ -183,6 +188,29 @@ Both fixed in `05695faa0`.
 
 ---
 
+## D-017 [doc-gap] The four vector states are named, not encoded
+`fr-embedding-pipeline` fixes the states a vector may be in after an upsert — embedded and current, absent, preserved, stale — and says similarity search must consider only current ones. It does not say how a store distinguishes them, and the columns DESIGN gives (`embedding`, `embedding_epoch`, `embedding_input_hash`) admit more than one encoding.
+
+**Chosen:** `embedding_input_hash` describes the *stored vector's* input, never the node's current text, which is what lets a later ingest tell a preserved vector from a stale one. `embedding_epoch` carries currency: the active epoch for a current vector, `NULL` for one that is absent or stale. The arm then reads `embedding_epoch = <active>`, so "only current vectors rank" is one equality rather than a rule every query has to remember, and the HNSW index is partial on `embedding_epoch IS NOT NULL` so a stale row does not occupy a slot in the candidate set.
+
+**Why it is worth stating:** the encoding is a store-visible contract. An external `GraphStoreV1` plugin has to arrive at the same distinctions, and the FR alone does not tell it how. The decision itself lives in `domain::embedding::decide_vector`, shared by both implementations, so the two cannot drift — the lesson of the endpoint-constraint entry above.
+
+**Proposal:** DESIGN's `node`/`chunk` table notes should say what `embedding_epoch = NULL` means beside a non-NULL `embedding`, since that is the only state the column names cannot be read off.
+
+## D-018 [doc-gap] `embedding_space` is deployment-wide, and every runtime read is scoped
+DESIGN's `embedding_space` table has `epoch` as its primary key and no tenant column: it is deployment-wide, correctly. But every runtime read in this gear goes through the secure ORM, which needs a scopable entity, and there is no unscoped read API — by design.
+
+**Implementation:** the table carries a `tenant_id` holding the nil UUID, and boot reads it under a nil-tenant scope. This is the gear's existing device rather than a new one: `graph_meta` already holds deployment-level keys the same way, and `probe_pgq` already reads under a nil-tenant scope. Nothing reads the table per request — the active epoch is resolved once at boot and carried in memory — so the column costs one write at first boot and nothing thereafter.
+
+**Proposal:** either DESIGN notes the column for stores built on a scope-enforcing ORM, or the platform offers an explicit deployment-scope read. The second is the better shape; the first is what the prototype could do.
+
+## D-019 [impl-gap] The gear's default embedding provider carries no semantics
+A deployment that does not configure `graph-storage.embedding_provider = onnx` gets the deterministic fake, and vector search then answers with rankings that mean nothing — reproducible, well-formed, and semantically arbitrary. Boot says so at `warn` level and that is all.
+
+ADR-0005 has no such mode: its three providers are ONNX, remote and "a deterministic fake for CI". Shipping the CI fake as the *runtime default* is this prototype's choice, made so the write path, the epoch bookkeeping and the four vector states could be exercised before a deployment has model artifacts. It is defensible for a prototype and wrong for a release: the failure it produces is a quiet quality loss, which is the exact failure mode ADR-0005 is written to prevent.
+
+**Proposal:** before release, either make `onnx` the compiled-in default with no fallback, or make an unconfigured provider a boot failure. A warning in a log is not a guard.
+
 # Acceptance criteria: what the prototype actually establishes
 
 PRD § 9 is the checklist this gear will be judged against, and nothing here
@@ -211,7 +239,10 @@ until this sweep.
 
 **3. Four retrieval scenarios within the § 6.1 latency thresholds — *two and
 a half of four, none timed*.** Hybrid narrowing, bounded traversal with
-filtering and the depth-3 neighborhood answer. The criteria table answers its
+filtering and the depth-3 neighborhood answer. Hybrid narrowing answers with
+*meaning* only since the gear started computing its own vectors (D-103): while
+they arrived from the producer, the vector arm ranked whatever it was handed
+against whatever it was handed, and nothing tied the two to one model. The criteria table answers its
 *alternative* flow (a filter on an unindexed attribute is refused, naming the
 alternatives) but not its main flow, which is filtering by payload attributes
 — see D-104. And **no scenario was timed against § 6.1 at all**: the stand
@@ -221,8 +252,11 @@ thresholds are untested rather than met.
 **4. Chain violations, endpoint-constraint violations and wrong-width vectors
 rejected with structured per-item errors — *met*, after a fix.** Chain
 violations come back as per-item field violations addressed by JSON pointer,
-every violation in one response; a wrong-width vector is refused naming both
-widths. Endpoint constraints were **not enforced at all** when this record was
+every violation in one response. The wrong-width vector this criterion names
+is no longer a producer's to send: vectors are computed by the gear, and the
+width check moved to what the provider returns, per batch, where the FR puts
+it. A provider whose declared width is not the migrated one fails the boot
+instead, which is the earlier and better place for a configuration error. Endpoint constraints were **not enforced at all** when this record was
 first written: `src_types` and `dst_types` were resolved into the type's
 effective traits and then never read, in either the validation or the write
 path, so an edge between endpoints its type forbids committed. Fixed in
@@ -261,6 +295,33 @@ threshold in `nfr-code-coverage` is unknown rather than met.
   real; the replacement is not. *Open.*
 - **Endpoint constraints were never enforced** (criterion 4 above). Parsed,
   stored, unread. *Fixed in `101ffaa79`.*
+- **The `vector_search` trait was published and unread.** Resolved across the
+  derivation chain, stored with the type's effective traits and served through
+  `GET /types` with the description "Paths composed into the embedding
+  input" — while nothing composed anything from it. A producer reading the
+  catalogue was told the paths it declared did something. They now do; found
+  while answering a question about how vectorization worked, which is to say
+  by looking rather than by any test. *Fixed in `2b74dfef5`.*
+- **`embedding_epoch` and `embedding_input_hash` were written `NULL` on every
+  path.** Both columns existed from the initial schema and neither was ever
+  populated, so the states `fr-embedding-pipeline` requires had nowhere to
+  live. *Fixed in `2b74dfef5`.*
+- **The conformance suite's vector width was its own invention.** It picked 8,
+  the fake accepted it, and every case failed on the first real server with
+  `expected 384 dimensions, not 8`. The suite now takes the width the schema
+  was migrated with. Two implementations caught this; inspection had not.
+  *Fixed in `c1da5fde3`.*
+- **Two ONNX provider tests measured nothing.** `MiniLM`'s tokenizer pads to a
+  fixed 128, so a same-batch comparison is padded identically either way and
+  held with mean pooling ignoring the attention mask entirely — and so did
+  `related > unrelated`, by 0.85 to 0.52, because 122 padding vectors make
+  everything resemble everything. Masked, the same pair scores 0.72 to 0.02.
+  Found by deliberately breaking the mask and watching the tests pass.
+  *Fixed in `5c809f83b`.*
+- **The domain service's own wiring was covered by nothing.** The service and
+  the conformance suite each resolved a type's declared vector paths, and
+  while they resolved it separately a service that passed no paths at all
+  would have left every test green. *Fixed in `f3c781270`.*
 - **Phantom creation in the PostgreSQL store worked only by accident.** It
   resolved the phantom node type from the types the batch itself named — and a
   producer never names it: the type is `x-gts-final` and authored only by the
@@ -297,8 +358,25 @@ does not ship it, and the API/schema leave room for it.
 ## D-102 [deferred] Change events via transactional outbox
 `fr-change-events` (PRD §5.2). The `emit_events` trait is stored with effective traits; nothing is published.
 
-## D-103 [deferred] Embedding pipeline and built-in providers
-`fr-embedding-pipeline` (PRD §5.4), ADR-0005 (ONNX default, remote plugin, model-change lifecycle). This iteration: embeddings are producer-supplied, dimension-guarded on ingest (`fr-embedding-dim-guard` partially: dimension check yes, embedding-space identity registry no — table `embedding_space` deferred). `EmbeddingProviderV1` ships as a trait only.
+## D-103 [was deferred, now built] Embedding pipeline and the in-process ONNX provider
+`fr-embedding-pipeline` (PRD §5.4), `fr-embedding-dim-guard`, `fr-vector-search`, ADR-0005.
+
+**What this entry used to record.** Embeddings were producer-supplied and dimension-guarded on ingest; `EmbeddingProviderV1` shipped as a trait with no implementation anywhere in the repository; the `embedding_space` table was deferred, so the identity half of `fr-embedding-dim-guard` was absent. That is no longer the state, and the entry is kept rather than deleted because what it was hiding is worth reading.
+
+**Producer-supplied vectors were not a small deferral.** They are option **C** of ADR-0005 — the option it rejects, in the words *"nothing enforces that all producers and the query side use the same model — mixed-model vector spaces silently break similarity ranking, and the gear cannot embed query text at all without a model"*. The prototype had exactly that shape: `NodeSpec.embedding` and `SearchRequest.query_vector`, width-checked and otherwise unexamined. Two producers with different models would have ranked against each other with nothing to detect it.
+
+**Built (`99e3c87bf`, `2b74dfef5`, `5c809f83b`):**
+- The Embedding Coordinator (`domain/embedding.rs`), composing each node's input from its name plus the payload paths its type declares in `vector_search`, hashing it canonically, and calling the provider once per batch. Composition and embedding happen **before** the transaction, which is where DESIGN's ingest sequence puts them (step 5, ahead of step 6) and costs nothing: validation has already resolved every type record.
+- The `embedding_space` table, and with it the identity half of `fr-embedding-dim-guard`. Boot compares the active provider's identity against the recorded one; on a mismatch the vector arm refuses (`EMBEDDING_SPACE_MISMATCH`, `failed_precondition`) instead of ranking across two spaces. Every other path is untouched, because only vectors are incomparable.
+- The four vector states, on the `embedding_epoch` / `embedding_input_hash` columns that were previously written `NULL` unconditionally.
+- Both producer-facing vector fields removed; `options.embed` added in their place.
+- The in-process ONNX provider (`gears/graph-storage/onnx-embedding-plugin`), behind the gear's off-by-default `onnx` feature, verified against `all-MiniLM-L6-v2` rather than only compiled.
+
+**Still deferred, and now the whole of what is left:**
+- **The model-change lifecycle.** `requested → scanning → embedding → validating → cutover → complete`, its administrative API, the resumable backfill and per-tenant progress. Nothing opens a second epoch: a boot that finds a different identity reports it and blocks the arm, which is the safe half of the lifecycle without the recovery half. The gear has no background task of any kind, so this is a new capability rather than a missing branch.
+- **The remote provider and its egress policy.** ADR-0005 requires a default-deny per-tenant policy over vendor, endpoint, region, data classes and vectorized fields before node text or user queries may leave a deployment. Building the plugin without that policy would be building the part that is easy to get wrong.
+- **Chunk embeddings.** The `chunk` table is deferred (D-100), so "and every content chunk" has nothing to embed, and the "bounded content prefix" of the composed text is a prefix of name-plus-attributes only.
+- **The readiness surface** that should report the active identity and dimension. The *behaviour* the FR asks for is enforced — at boot, and per request on the vector arm — but there is nowhere to read it from (D-109).
 
 ## D-104 [deferred] Index-activation lifecycle, dynamic index DDL — and payload filtering entirely
 `fr-index-admission` (PRD §5.1), ADR-0003 point 5 (`requested → building → active`, `CREATE INDEX CONCURRENTLY` worker, DDL queue keys). No runtime DDL, as recorded.
