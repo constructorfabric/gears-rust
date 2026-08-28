@@ -74,7 +74,7 @@ Drivers marked `p1` are the P1 scope; drivers marked `p2`/`p3`/`p4` are designed
 - [ ] `p3` — `cpt-cf-model-registry-fr-alias-management` — Alias table with tenant hierarchy resolution
 - [ ] `p3` — `cpt-cf-model-registry-fr-tag-management` — `tags` table with tenant hierarchy resolution (same inheritance/shadowing model as aliases); managed independently of the model catalog
 - [ ] `p3` — `cpt-cf-model-registry-fr-model-tagging` — `model_tags` join table (many-to-many, tenant-scoped); OData `tag` filter via join; cascade removal on tag delete
-- [ ] `p3` — `cpt-cf-model-registry-fr-degraded-mode` — Tiered behavior when the **database** is unavailable: metadata from cache, approval check fails with `service_unavailable`. P1 delivers neither half — catalog rows are not cached (§2.1 "Resolution Caching"), so P3 owes the whole behavior. Not to be confused with provider unreachability (§3.5 "Discovery Failure"), which is carried by `cpt-cf-model-registry-nfr-availability`
+- [ ] `p3` — `cpt-cf-model-registry-fr-degraded-mode` — Fail-closed behavior when the **database** is unavailable: every read and write fails with `service_unavailable`. Catalog rows are not cached (§2.1 "Resolution Caching"), so there is no partial-availability tier to build; P1 and P2 surface the same condition as `500 internal`, and P3 owes the explicit 503 contract. Not to be confused with provider unreachability (§3.5 "Discovery Failure"), which is carried by `cpt-cf-model-registry-nfr-availability`
 - [ ] `p3` — `cpt-cf-model-registry-fr-tenant-reparenting` — Cache invalidation on `tenant.reparented` event
 - [ ] `p4` — `cpt-cf-model-registry-fr-user-group-approval` — Group-scoped approval restriction layer
 - [ ] `p4` — `cpt-cf-model-registry-fr-user-level-override` — User-level override takes precedence over group/tenant
@@ -1673,7 +1673,7 @@ Errors deferred to a later phase, listed here with the phase that introduces the
 | `tag_not_found` | 404 | `not_found` | P3 | The tag surface. |
 | `tag_already_exists` | 409 | `already_exists` | P3 | The tag surface. |
 
-A DB outage surfaces as `DomainError::Database` → 500 `internal` in P1 and P2, not as a 503. That satisfies the PRD's fail-closed DB-unavailability contract in substance — the request fails rather than serving something a healthy DB would have refused — but not in form. The target posture is `service_unavailable` (503), recorded against the PostgreSQL row in §4 "Dependency SLAs" and landing as `database_unavailable` in the table above alongside the P3 tiered mode. No read path survives a database outage: every request that returns a catalog row queries for it.
+A DB outage surfaces as `DomainError::Database` → 500 `internal` in P1 and P2, not as a 503. That satisfies the PRD's fail-closed DB-unavailability contract in substance — the request fails rather than serving something a healthy DB would have refused — but not in form. The target posture is `service_unavailable` (503), recorded against the PostgreSQL row in §4 "Dependency SLAs" and landing as `database_unavailable` in the table above in P3. No read path survives a database outage: every request that returns a catalog row queries for it.
 
 ### Cache Invalidation Strategy
 

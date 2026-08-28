@@ -48,7 +48,7 @@
   - [UC-011: Get Provider Discovery Health](#uc-011-get-provider-discovery-health)
   - [UC-012: Create Alias](#uc-012-create-alias)
   - [UC-013: Resolve Alias](#uc-013-resolve-alias)
-  - [UC-014: Handle Degraded Mode](#uc-014-handle-degraded-mode)
+  - [UC-014: Handle Database Unavailability](#uc-014-handle-database-unavailability)
   - [UC-015: Handle Tenant Re-parenting](#uc-015-handle-tenant-re-parenting)
   - [UC-016: Bulk Approve Models](#uc-016-bulk-approve-models)
   - [UC-017: Trigger Discovery](#uc-017-trigger-discovery)
@@ -624,13 +624,15 @@ The system must integrate with the generic Approval Service for tenant-level mod
 
 **Model Registry responsibilities**:
 - Register discovered models as approvable resources with Approval Service
-- Query approval status from Approval Service when resolving models
-- React to approval status change events
+- React to approval status change events, updating `approval_status` on the model row
+- Resolve models against that local status — model resolution does not call the Approval Service
 
 **Approval Service responsibilities** (out of Model Registry scope):
 - Approval workflow engine (state machine, concurrency control)
 - Approval UI and notifications
 - Audit trail for approval decisions
+
+**Authority by phase**: In P1 there is no Approval Service — `approval_status` on the model row is the system of record, and an admin decision takes effect on the next read. From P2 the Approval Service is the system of record and the model row is its local projection, so a decision takes effect once the corresponding status-change event is applied. Reads are always served from the row in both phases, so an Approval Service outage cannot block model resolution.
 
 Approval granularity (P2): Tenant-level — approval grants access to all users in tenant. (Same as P1; finer granularity arrives in P4.)
 
@@ -806,16 +808,15 @@ The system must support assigning and removing tags on models, and filtering mod
 
 **Actors**: `cpt-cf-model-registry-actor-tenant-admin`, `cpt-cf-model-registry-actor-platform-admin`
 
-#### Degraded Mode
+#### Database Unavailability
 
 - [ ] `p3` - **ID**: `cpt-cf-model-registry-fr-degraded-mode`
 
-The system must define tiered behavior when database is unavailable.
+The system must fail closed when the database is unavailable: every read and every write fails, with no partial availability tier.
 
-- Model capabilities and metadata: serve from stale cache (up to the configured TTL)
-- Approval verification: fail request with `service_unavailable` error
+Only tenant-hierarchy resolution is cached (see §8 Performance); provider and model rows are read per request, so no catalog metadata can be served without the database.
 
-P1 and P2 behavior: DB unavailable = fail-closed, with no partial availability. The tiered degraded mode above therefore lands whole in P3: it owes both the served-from-cache metadata half and the explicit `service_unavailable` on the approval check, neither of which exists earlier.
+P1 and P2 surface the failure as a generic internal error. This requirement owes the explicit `service_unavailable` (503) contract, which lands in P3.
 
 #### Tenant Re-parenting
 
@@ -899,9 +900,7 @@ Caching: only tenant-hierarchy resolution is cached, under a configurable TTL; p
 
 Target: 99.9% availability.
 
-P1 & P2: DB unavailable = fail-closed — every read fails, since none can be answered from cache alone.
-
-P3: Tiered degraded mode (metadata from cache, approval check fails).
+DB unavailable = fail-closed in every phase — every read fails, since none can be answered from cache alone. P3 adds the explicit `service_unavailable` (503) contract (`cpt-cf-model-registry-fr-degraded-mode`).
 
 Cache unavailable: fall back to resolving from the authoritative source per request (higher latency, unchanged results).
 
@@ -924,9 +923,9 @@ The two ceilings are per-entity maxima, not simultaneous ones: a tenant sitting 
 
 - [ ] `p2` - **ID**: `cpt-cf-model-registry-nfr-discovery-plugin-isolation`
 
-A runtime failure (panic, timeout, or unrecoverable error) in one discovery plugin MUST NOT terminate or corrupt the discovery run for any other provider. The registry MUST record the failure for the affected provider (updating provider discovery health accordingly) and continue processing remaining providers.
+Discovery is invoked per (tenant, provider) pair, and each invocation executes exactly one plugin. A runtime failure (panic, timeout, or unrecoverable error) in one discovery plugin MUST be returned to the caller and MUST leave the affected provider's catalog unchanged; it MUST NOT terminate or corrupt discovery for any other provider. Persisting the failure against provider discovery health arrives with `cpt-cf-model-registry-fr-health-monitoring` (P3).
 
-- **Rationale**: Providers are independently operated; a defect or outage at one provider's endpoint must not cascade to halt discovery for all other providers in the same scheduler tick. This property is measurable: when discovery is triggered for N providers and one plugin fails, exactly N−1 other providers' catalog entries MUST be updated (or confirmed unchanged) in the same run.
+- **Rationale**: Providers are independently operated; a defect or outage at one provider's endpoint must not cascade to halt discovery for other providers. Sequencing across providers belongs to the caller — an admin or the external scheduler (§4 Out of Scope). This property is measurable: when discovery is triggered for N providers and one plugin fails, the other N−1 providers' catalog entries MUST still be updated (or confirmed unchanged).
 
 ### Discovery Plugin Extensibility
 
@@ -967,7 +966,7 @@ Error responses follow RFC 9457 Problem Details standard. Each status above is f
 | Cache poisoning | TTL-based expiry; cached entries are never keyed by user-controlled input |
 | Provider credential exposure | Credentials handled by OAGW, not stored in Model Registry |
 | Privilege escalation via hierarchy | Child tenants can only restrict, not expand parent permissions |
-| Stale approval served | Approval status is enforced fail-closed on every read, from the model row that read fetches. It is never cached, so a revocation takes effect on the next read on every replica — there is no TTL window and nothing to invalidate |
+| Stale approval served | Approval status is enforced fail-closed on every read, from the model row that read fetches. It is never cached, so there is no TTL window and nothing to invalidate. P1: the row is the system of record, so a decision takes effect on the next read on every replica. P2+: the Approval Service is the system of record and the row is its projection, so a revocation takes effect once the status-change event is applied — bounded by event delivery, not by a cache TTL |
 
 ## 11. Consumers
 
@@ -1090,7 +1089,7 @@ Key interfaces:
 1. Tenant admin reviews pending models via Approval Service (or Model Registry API proxying to Approval Service)
 2. Admin approves or rejects via Approval Service
 3. Approval Service updates status and emits event
-4. Model Registry serves the new status on the next read — no cached approval state exists to invalidate
+4. Model Registry applies the event to the model row and serves the new status on subsequent reads — no cached approval state exists to invalidate
 
 **Postconditions**: Model approval status updated in Approval Service.
 
@@ -1112,7 +1111,7 @@ Key interfaces:
 1. Tenant admin selects approved model
 2. Admin initiates revocation via Approval Service
 3. Approval Service updates status to `revoked` and emits event
-4. Model Registry serves the new status on the next read — no cached approval state exists to invalidate
+4. Model Registry applies the event to the model row and serves the new status on subsequent reads — no cached approval state exists to invalidate
 
 **Postconditions**: Model access revoked.
 
@@ -1290,7 +1289,7 @@ Key interfaces:
 - Resolution order: tenant → parent → ... → root → canonical ID
 - Non-existent alias falls through to canonical ID lookup
 
-### UC-014: Handle Degraded Mode
+### UC-014: Handle Database Unavailability
 
 - [ ] `p3` - **ID**: `cpt-cf-model-registry-usecase-degraded-mode`
 
@@ -1301,15 +1300,14 @@ Key interfaces:
 **Flow**:
 1. Gateway requests model info
 2. Registry detects DB unavailable
-3. For metadata: serve from stale cache (up to TTL)
-4. For approval check: return `service_unavailable` error
+3. Registry returns `service_unavailable` — no provider or model metadata is cached, so nothing can be served
 
-**Postconditions**: Partial response or error returned.
+**Postconditions**: Error returned; no partial response.
 
 **Acceptance criteria**:
-- Metadata served from cache (best-effort)
-- Approval verification always fails when DB unavailable
-- Error clearly indicates degraded state
+- Every read and write fails while the database is unavailable
+- No provider or model metadata is served from cache
+- Error clearly indicates the database is unreachable
 
 ### UC-015: Handle Tenant Re-parenting
 
@@ -1417,7 +1415,7 @@ Key interfaces:
 **Note**: P2 discovery does not persist health metrics. Health storage is a P3 capability (`cpt-cf-model-registry-fr-health-monitoring`).
 
 **Acceptance criteria**:
-- Each model definition produced by the plugin results in exactly one catalog create, update, or deprecation.
+- Each model definition produced by the plugin results in at most one catalog create, update, or deprecation; a definition matching the stored row is a no-op.
 - Approval status is not changed by discovery for models already in the catalog.
 - A plugin failure (timeout, provider error) leaves the catalog unchanged for the affected provider.
 - A plugin failure for one provider does not prevent discovery for other providers in the same scheduler tick (per `cpt-cf-model-registry-nfr-discovery-plugin-isolation`).
