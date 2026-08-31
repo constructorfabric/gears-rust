@@ -82,8 +82,9 @@ Model Registry is the authoritative source for model metadata, capabilities, pro
 
 **Key Concepts**:
 
-- **Canonical Model ID**: Deterministic identifier in format `{provider_slug}::{provider_model_id}` (e.g., `openai-prod::gpt-4o`, `ollama-us-west::mistral`). Parsing rule: split on **first** `::` occurrence.
-- **Provider Slug**: Human-readable unique identifier for a specific provider configuration (instance). Different instances of the same provider type have different slugs (e.g., `azure-corp-global`, `azure-rnd-team`, `ollama-us-west`, `ollama-us-east`). Each slug represents a separate provider with its own credentials and configuration.
+- **Canonical Model ID**: Deterministic identifier in format `{provider_slug}::{provider_model_id}` (e.g., `openai-prod::gpt-4o`, `ollama-us-west::mistral`). Parsing rule: split on **first** `::` occurrence. It is a **lookup key for the eval read only**, not an addressing key: because provider slugs shadow down the hierarchy, one canonical ID names different models for different tenants.
+- **Provider Slug**: Human-readable unique identifier for a specific provider configuration (instance). Different instances of the same provider type have different slugs (e.g., `azure-corp-global`, `azure-rnd-team`, `ollama-us-west`, `ollama-us-east`). Each slug represents a separate provider with its own credentials and configuration. Unique within a tenant, not across the hierarchy.
+- **Identifier split**: the eval read (`get_tenant_model`) takes a canonical model ID, because an inference caller holds nothing else. Every management operation — read, create, update, soft-delete, on both models and providers — takes the entity's **UUID `id`**. Slugs and canonical IDs appear in management requests only where a name is being *assigned* (a provider's `slug` on create), and in responses.
 - **Tenant Hierarchy**: Tree structure with root tenant at top; providers and approvals inherit down the tree (additive only)
 - **Provider Plugins**: Each provider type has its own plugin; all requests route through Outbound API Gateway
 
@@ -248,7 +249,9 @@ Represents a configured AI provider instance for a tenant.
 - Shadowing completely replaces the parent's provider **and every model attached to it** for that tenant and its descendants — those inherited models become unavailable in the child's subtree; the shadowing provider starts with no models of its own until the child creates them (manually) or discovers them (auto-discovery)
 - Resolution order: tenant → parent → ... → root (first match wins)
 
-**Model creation is same-tenant only**: A model always belongs to exactly one provider, and a model's `tenant_id` MUST equal its provider's `tenant_id`. Child tenants can never create a model — manually or via auto-discovery — against a provider owned by an ancestor tenant, whether or not that provider is shadowed. The only way a child tenant changes what it sees from an ancestor's provider is by shadowing the provider itself (above); there is no per-model shadowing.
+**A model belongs to its provider's tenant**: A model always belongs to exactly one provider, and a model's `tenant_id` MUST equal its provider's `tenant_id`. Creation names its provider by `id`, resolves it within the caller's access scope, and writes the model into that provider's tenant — so a tenant admin holding an own-tenant-only grant cannot create a model against another tenant's provider, whether or not that provider is shadowed. The only way a child tenant changes what it sees from an ancestor's provider is by shadowing the provider itself (above); there is no per-model shadowing.
+
+**Inheritance applies to the eval reads only**: additive visibility and provider shadowing govern `GET /v1/models` and `GET /v1/models/{canonical_id}`. The admin endpoints operate on the tenants the PDP grants and never walk the hierarchy (see §6 Authorization).
 
 **Disabling a provider**: Disabling a provider — whether it is the tenant's own provider or a shadow of an inherited one — makes **every model attached to it unavailable for eval** in that tenant's subtree, in addition to suspending auto-discovery and refusing creation of new models against it. Disabled providers and their models remain visible via management/admin listing (see `cpt-cf-model-registry-fr-list-tenant-models-management`) so admins can audit and re-enable them. Re-enabling restores eval availability for its models (each still subject to its own approval status).
 
@@ -406,16 +409,21 @@ The system must enforce tenant isolation for all operations.
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-fr-authorization`
 
-The system must enforce role-based and GTS-based authorization.
+The system must enforce role-based and GTS-based authorization. Every operation is decided by the `authz-resolver` PDP, which returns the tenant scope the operation runs under; the system applies that scope to every query and adds no reach of its own.
 
 **Role-based access** (operations):
-| Operation | Required Role |
-|-----------|---------------|
-| List/Get models | Any authenticated user |
-| Request model approval | Tenant member |
-| Approve/Reject request | Tenant admin |
-| List all tenant models (management) | Tenant admin |
-| Manage providers | Platform admin (root tenant providers) or tenant admin (own tenant's providers, including shadowing) |
+| Operation | Endpoint zone | Required Role | Tenant reach |
+|-----------|---------------|---------------|--------------|
+| List/Get models for eval (`list`, `get`) | eval | Any authenticated user | own tenant + ancestors, by additive inheritance |
+| List all tenant models with management flags (`list_management`) | admin | Tenant admin | as granted by the PDP |
+| Get one model without eval gates (`get_management`) | admin | Tenant admin | as granted by the PDP |
+| Manage models — create / update / delete (incl. approve / reject / revoke) | admin | Tenant admin | as granted by the PDP |
+| List/Get providers (`list`, `get`) | admin | Tenant admin | as granted by the PDP |
+| Manage providers — create / update / delete | admin | Platform admin (root tenant providers) or tenant admin (own tenant's providers, including shadowing) | as granted by the PDP |
+
+The management actions (`list_management`, `get_management`) are separate from the eval `list` / `get` so that a grant to read `pending`, `rejected`, `deprecated`, or disabled-provider rows can be given independently of the open eval-read grant. Point operations supply the resource `id` to the PDP, so a policy may return `id`-scoped constraints.
+
+Additive inheritance (see §5 Domain Model) applies to the eval reads alone. The admin zone returns and mutates exactly the rows the PDP scope covers, so a tenant admin holding an own-tenant-only grant sees an ancestor's models through `GET /v1/models` and not through any `/v1/admin/…` endpoint.
 
 **GTS-based access** (model/provider access control):
 | Access Type | GTS Claim Required | Example |
@@ -438,8 +446,9 @@ The system must validate all input data.
 
 | Field | Validation |
 |-------|------------|
-| Canonical ID | Must match pattern `{provider_slug}::{model_id}`, provider with slug must exist. Parse on first `::`. |
-| Provider slug | 1-64 chars, lowercase alphanumeric + hyphen. Unique within tenant. Immutable. |
+| Canonical ID | Must match pattern `{provider_slug}::{model_id}`, provider with slug must exist. Parse on first `::`. Supplied by a caller only on the eval read; on create it is derived server-side from the resolved provider. |
+| Provider slug | 1-64 chars, lowercase alphanumeric + hyphen. Unique within tenant. Immutable. Supplied only when creating a provider. |
+| Provider ID (on model create) | Must be a UUID naming a provider within the caller's access scope (`provider_not_found` when no in-scope provider carries the id). The created model takes that provider's tenant. |
 | Provider name | 1-255 chars of free-form display text (bound matches the stored column) |
 | Cost values | Non-negative (AICredits); the field set is provider-specific and validated against the provider settings schema |
 
@@ -489,7 +498,7 @@ Follows OData pagination standard. Supports OData `$filter` for filtering by cap
 
 Capability filtering uses subset matching: model must have AT LEAST requested capabilities.
 
-This is the **eval-facing (user) API**. For the management/admin view — including unapproved models, models on disabled providers, models hidden by shadowed ancestor providers, and (optionally) deprecated models — see `cpt-cf-model-registry-fr-list-tenant-models-management`.
+This is the **eval-facing (user) API**. For the management/admin view — including unapproved models, models on disabled providers, and (optionally) deprecated models — see `cpt-cf-model-registry-fr-list-tenant-models-management`.
 
 **Actors**: `cpt-cf-model-registry-actor-llm-gateway`
 
@@ -502,10 +511,10 @@ The system must provide a management (admin) view of a tenant's model catalog, d
 Includes, in addition to everything `list_tenant_models` returns:
 - Models pending approval, rejected, or revoked (not just `approved`)
 - Models attached to a disabled provider (the tenant's own, or inherited)
-- Models attached to an ancestor provider that has been shadowed by this tenant (or an intermediate tenant between this one and that ancestor) — otherwise fully invisible to normal resolution — surfaced read-only and clearly marked as shadowed/unavailable, for audit purposes
+- Models on a disabled provider, marked `provider_disabled`, for audit purposes
 - Deprecated models, when the caller opts in via an explicit request flag (excluded by default). The eval view excludes them unconditionally and offers no such flag.
 
-This view never grants write access to models the requesting tenant doesn't own: shadowed-ancestor models and models on ancestor-owned providers remain read-only (see Domain Model → Provider → Inheritance & Shadowing → "Model creation is same-tenant only").
+The view covers exactly the tenants the caller's access scope names; it neither widens to ancestors nor narrows within the scope. Reported availability (`available_for_eval`) does not account for provider shadowing, which is defined relative to a requester's ancestor chain — `GET /v1/models` is the authority on what a given tenant sees.
 
 This is a **separate operation from `list_tenant_models`, not a wider mode of it.** The two differ in required role, in which rows are candidates at all (the management view keeps rows hidden by provider shadowing), and in what each row reports. An admin must still be able to call `list_tenant_models` and see exactly what an ordinary tenant member sees, so the eval view MUST NOT widen its result set for admin callers. Filter parameters on either operation only ever narrow a result set; they never expand visibility beyond what the operation grants.
 
@@ -519,9 +528,10 @@ This is a **separate operation from `list_tenant_models`, not a wider mode of it
 
 The system must allow admins to manually create, update, and remove model catalog entries without auto-discovery or an external workflow service.
 
-**Operations**:
-- **Create model** — admin supplies `provider_slug` + `provider_model_id` (registry derives `canonical_id`), display fields, capabilities, limits, provider cost, and lifecycle status. `provider_slug` MUST resolve to a provider owned by the creating tenant itself; an inherited (ancestor-owned) provider — shadowed or not — is not a valid target, even for the tenant admin that owns it (returns `provider_not_owned`).
-- **Update model** — admin edits any mutable field; `canonical_id` remains immutable after creation.
+**Operations** (all addressed by the model's UUID `id`, never by `canonical_id` — see Key Concepts):
+- **Create model** — admin supplies `provider_id` + `provider_model_id` (registry derives `canonical_id` from the resolved provider's slug), display fields, capabilities, limits, provider cost, and lifecycle status. `provider_id` is resolved within the caller's access scope (`provider_not_found` otherwise) and the created model belongs to that provider's tenant.
+- **Get model** — admin reads one model by `id` with no eval gates: a `pending`, `rejected`, `deprecated`, or disabled-provider row is returned, because an admin has to see a row before acting on it. Resolves within the caller's access scope.
+- **Update model** — admin edits any mutable field on a model owned by their own tenant; `canonical_id` and `provider_id` remain immutable after creation.
 - **Soft-delete model** — admin marks model as `deprecated`; record retained, hidden from default `list_tenant_models`.
 
 **Approval status (P1)**:
@@ -535,7 +545,7 @@ The system must allow admins to manually create, update, and remove model catalo
 - The one approval change the registry refuses is structural: a model whose `lifecycle_status` is
   `deprecated` or `sunset` accepts no approval change (`invalid_transition`), because terminal
   lifecycle states are read-only.
-- Approval granularity in P1: tenant-level — approval grants access to all users in tenant (and, by inheritance, descendant tenants, unless shadowed).
+- Approval granularity in P1: tenant-level — approval grants eval access to all users in tenant (and, by inheritance, descendant tenants, unless shadowed).
 - A model that is not `approved` (i.e. `pending`, `rejected`, or `revoked`) is not available for eval — see `cpt-cf-model-registry-fr-get-tenant-model` / `cpt-cf-model-registry-fr-list-tenant-models`.
 
 **Authorization**:
@@ -559,7 +569,7 @@ Provider inheritance:
 - Providers inherit down tenant hierarchy (additive only)
 - Child tenant sees parent's providers + own providers
 - Child CAN shadow inherited provider by creating provider with same slug (overrides for that tenant and descendants), regardless of the shadow's `status` — shadowing hides every model attached to the inherited provider, not just the provider record itself
-- Child tenant CANNOT create a model — manually or via auto-discovery — against a provider owned by an ancestor tenant, shadowed or not; model creation always requires the model's tenant to match its provider's tenant (`provider_not_owned` if attempted)
+- Model creation always requires the model's tenant to match its provider's tenant; the provider is resolved within the caller's access scope and the model is written into that provider's tenant
 - Disabling a provider (own, or a shadow of an inherited one) makes every model attached to it unavailable for eval, in addition to suspending auto-discovery and refusing new model creation against it
 
 Provider config:
@@ -940,14 +950,13 @@ The registry MUST support adding a new provider's discovery capability without m
 
 | Code | HTTP Status | Description |
 |------|-------------|-------------|
-| `model_not_found` | 404 | Model identifier does not exist in catalog |
+| `model_not_found` | 404 | Model identifier does not exist in catalog. The problem's `resource` carries whichever identifier the caller supplied — a `canonical_id` on the eval read, a UUID on the management read and on the CRUD operations |
 | `model_not_approved` | 403 | Model exists but not approved for tenant |
 | `model_deprecated` | 404 | Model was soft-deleted — removed by the provider, or deprecated by an admin. 404 and not 410: the platform's canonical error categories have no gone-resource category, so the deprecation is carried in the problem detail rather than the status |
 | `provider_not_found` | 404 | Provider identifier does not exist |
 | `tag_not_found` | 404 | Tag does not exist for tenant (own or inherited) |
 | `tag_already_exists` | 409 | Tag with the same name already exists in tenant |
 | `provider_disabled` | 403 | Provider exists but is disabled — the requested operation (e.g. creating a model against it, running discovery) is refused. `get_tenant_model` also returns it for a model whose winning provider is disabled, since disabling makes all of that provider's models unavailable for eval. `list_tenant_models` returns no such error: it silently omits those models from the page, the same way it omits non-approved ones |
-| `provider_not_owned` | 403 | Provider exists (inherited from an ancestor tenant) but a model can only be created against a provider owned by the same tenant |
 | `invalid_transition` | 400 | Transition refused: a `lifecycle_status` change out of a terminal state (`deprecated` / `sunset`), or an approval change on a model already in one. A state precondition, not a resource collision — hence 400 `failed_precondition`, not 409 |
 | `provider_has_models` | 400 | Provider still has models attached; they must be removed before the provider can be deleted. Soft-deleted (deprecated) models still count |
 | `validation_error` | 400 | Input validation failed |
@@ -982,8 +991,8 @@ To be defined in DESIGN.md.
 
 Key interfaces:
 - `ModelRegistryClient` — the single SDK client used by every consumer (LLM Gateway, Chat Engine, Tenant Admin UI). There is no separate admin client: read and admin operations are methods on the same trait, differentiated by authorization rather than by client type. Two method groups:
-  - **Eval-facing (user) methods** — `get_tenant_model`, `list_tenant_models`. Resolve/list only models that are approved AND attached to an active provider. Callable by any authenticated user in the tenant hierarchy. This is the "resolve model name / list available models for tenant" surface.
-  - **Management methods** — `list_tenant_models_management` (full-visibility listing: any approval status, disabled-provider models, models hidden behind a shadowed ancestor provider, optionally deprecated) plus the catalog- and provider-mutation calls (create/update/soft-delete model, register/disable/enable/shadow provider, approve/reject/revoke). Tenant admin or platform admin only.
+  - **Eval-facing (user) methods** — `get_tenant_model`, `list_tenant_models`. Resolve/list only models that are approved AND attached to an active provider. Callable by any authenticated user in the tenant hierarchy. This is the "resolve model name / list available models for tenant" surface, and the only one keyed by canonical model ID.
+  - **Management methods** — `get_model` and `list_tenant_models_management` (full visibility within the caller's access scope: any approval status, disabled-provider models, optionally deprecated) plus the catalog- and provider-mutation calls (create/update/soft-delete model, register/disable/enable/shadow provider, approve/reject/revoke), and the provider reads (`get_provider`, `list_providers`). Tenant admin or platform admin only. All keyed by UUID.
 
 ### External Integration Contracts
 
@@ -1468,8 +1477,8 @@ Key interfaces:
 **Preconditions**: Provider exists for the model (registered via UC-006).
 
 **Flow**:
-1. Admin submits a create / update / soft-delete request with model fields (`provider_slug`, `provider_model_id`, capabilities, limits, provider cost, lifecycle status)
-2. Registry validates input (canonical ID format derived from `provider_slug::provider_model_id`, GTS lifecycle type, immutability of `canonical_id`)
+1. Admin submits a create request with model fields (`provider_id`, `provider_model_id`, capabilities, limits, provider cost, lifecycle status), or an update / soft-delete request addressed by the model's `id`
+2. Registry resolves `provider_id` within the admin's own tenant, derives `canonical_id` as `{provider.slug}::{provider_model_id}`, and validates the remaining input (GTS lifecycle type, immutability of `canonical_id`)
 3. Registry persists model entry
 4. For create: admin sets initial approval status — defaults to `pending`; admin may pass `status=approved` to approve in the same call
 5. For update of an existing model: admin may directly set status to `approved`, `rejected`, or `revoked` (P1 has no workflow engine)
@@ -1479,14 +1488,16 @@ Key interfaces:
 
 **Acceptance criteria**:
 - Manual creation does NOT call out to an Approval Service in P1
-- `canonical_id` is immutable after creation; rename requires delete + recreate
+- `canonical_id` is immutable after creation; rename requires delete + recreate. It is derived by the registry, never supplied by the admin
+- Update and soft-delete address the model by `id`; a canonical ID is not accepted, because it does not identify one row independently of the caller's tenant chain
 - Any approval status may be set directly; the registry validates no transition order (§5, and
   `cpt-cf-model-registry-fr-manual-model-management`)
 - An approval change on a model already in a terminal lifecycle state (`deprecated` / `sunset`) is
   refused with `invalid_transition`
 - Soft-delete sets status to `deprecated` without purging the record; resurrection allowed by re-creating with same `canonical_id` only if previous record purged
 - Tenant admin can manage models for own providers only; platform admin can manage any, always within that provider's owning tenant
-- Creating a model against a provider owned by an ancestor tenant returns `provider_not_owned`, regardless of actor role
+- A `provider_id` that names no provider in the caller's access scope returns `provider_not_found` (404), regardless of actor role
+- When a tenant and its ancestor both own a provider under one slug, `provider_id` selects unambiguously which of the two the model attaches to
 - In P2, the same admin endpoints route through the Approval Service; the API surface remains backward-compatible
 
 ### UC-027: List All Tenant Models (Management)
@@ -1500,16 +1511,16 @@ Key interfaces:
 **Flow**:
 1. Admin sends `list_tenant_models_management(ctx)` with OData query params, optionally setting the `include_deprecated` flag
 2. Registry collects all models for the tenant (direct + inherited), regardless of approval_status or provider status
-3. Registry additionally collects models attached to providers that this tenant (or an intermediate tenant) has shadowed, marking them as shadowed and unavailable
+3. Registry collects every model row the caller's access scope covers, applying no eval gates
 4. Registry applies OData filters and pagination
-5. Registry returns the full list, with each model's approval_status, provider status, and shadowed flag visible
+5. Registry returns the full list, with each model's approval_status, provider status, and `available_for_eval` visible
 
 **Postconditions**: Full tenant model catalog view returned, unfiltered by approval or provider-active status.
 
 **Acceptance criteria**:
 - Returns models in every approval_status (`pending`, `approved`, `rejected`, `revoked`), not just `approved`
 - Returns models attached to disabled providers, marked accordingly
-- Returns models attached to shadowed ancestor providers, marked as shadowed and unavailable for eval
+- Returns models on disabled providers, marked `provider_disabled` and unavailable for eval
 - Excludes deprecated models unless the caller sets `include_deprecated` — an explicit request flag, not a side effect of an OData `$filter` clause
 - Returns `unauthorized` (403) for a caller without tenant-admin (or platform-admin) role
 - Follows OData pagination standard
@@ -1606,7 +1617,7 @@ Key interfaces:
 | Security | Authorization checks pass for all protected endpoints | P1 |
 | Integration | LLM Gateway can resolve models and check availability | P1 |
 | Integration | Tenant Admin UI can manage approvals | P1 |
-| Integration | Tenant Admin UI can list the full tenant model catalog (unapproved, disabled-provider, and shadowed-ancestor models) via the management API | P1 |
+| Integration | Tenant Admin UI can list the full model catalog in its access scope (including unapproved and disabled-provider models) via the management API | P1 |
 | Discovery | Discovery for an unrecognized provider GTS type (no plugin capability available) returns a `validation_error` (400) and invokes no plugin | P2 |
 | Discovery | A plugin failure for one provider does not prevent discovery from completing for any other provider in the same run | P2 |
 | Discovery | A discovery run for the same (tenant, provider) pair is idempotent: consecutive runs with identical plugin output produce no catalog mutations | P2 |

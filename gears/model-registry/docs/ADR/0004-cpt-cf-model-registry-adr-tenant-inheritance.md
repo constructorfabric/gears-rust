@@ -35,7 +35,7 @@ Model Registry operates in a multi-tenant hierarchy where child tenants inherit 
 
 * `cpt-cf-model-registry-fr-provider-management` — Provider CRUD with inheritance
 * `cpt-cf-model-registry-fr-tenant-isolation` — Tenant-scoped operations
-* `cpt-cf-model-registry-fr-manual-model-management` — model creation resolves `provider_slug` in the caller's own tenant only
+* `cpt-cf-model-registry-fr-manual-model-management` — model creation resolves `provider_id` in the caller's own tenant only
 * PRD requirement: "Child tenant can only restrict, not expand parent permissions"
 * PRD requirement: "Model creation is same-tenant only" — a model's `tenant_id` always equals its provider's `tenant_id`
 * Compliance isolation — tenants may need to exclude certain providers
@@ -51,6 +51,8 @@ Model Registry operates in a multi-tenant hierarchy where child tenants inherit 
 
 Chosen option: "Additive Inheritance with Shadowing", because it provides the flexibility needed for compliance isolation while maintaining the "restrict only" security model.
 
+**Scope: the eval reads.** Additive visibility and shadowing govern `GET /v1/models` and `GET /v1/models/{canonical_id}` — the surface an inference caller uses. The admin endpoints under `/v1/admin/…` operate on the tenant set the `authz-resolver` PDP grants and perform no hierarchy walk. The two mechanisms are independent: how far an admin reaches is a policy decision, and it neither widens nor narrows what a tenant's eval reads return.
+
 **Shadowing is keyed on the provider slug, and only on the provider slug.** A child tenant registers a provider under an inherited slug and thereby takes that slug over for itself and its descendants. Because a model always belongs to exactly one provider owned by the same tenant, the shadowed ancestor provider's **entire model set** leaves the child's subtree along with the provider record. There is no per-model shadow and no per-model override: a colliding `canonical_id` at a closer tenant is a *consequence* of that tenant owning its own provider of the same slug, never a mechanism of its own.
 
 This holds regardless of the shadowing provider's `status`. An `active` shadow hides the ancestor's models and lets the child populate its own under the slug; a `disabled` shadow hides the ancestor's models and additionally blocks the child from creating or evaluating any of its own.
@@ -64,16 +66,16 @@ This holds regardless of the shadowing provider's `status`. An `active` shadow h
 * Neutral, because the override is all-or-nothing per slug — a tenant that wants to keep most of an ancestor provider's catalog but drop one model must shadow the provider and re-create the models it wants to keep
 * Bad, because resolution logic is more complex: whether a given model row is visible depends on the requester's whole ancestor chain, so it is not a property of the row and cannot be stored on it — it has to be recomputed per request
 * Bad, because the resolution must fail closed. Shadowing is a compliance-isolation lever, so a read that cannot establish who wins a slug must be refused rather than answered: falling through to an ancestor on an unresolved closer tenant would serve exactly the models the shadow exists to hide
-* Bad, because shadowing is silent from the child's point of view — models that resolved yesterday vanish the moment a provider with a colliding slug is registered. Mitigated by the management listing, which retains the hidden rows marked `shadowed` and read-only for audit
+* Bad, because shadowing is silent from the child's point of view — models that resolved yesterday vanish the moment a provider with a colliding slug is registered. The management listing does not surface the hidden rows either: it is scoped by the PDP, and shadowing has no meaning without a reference chain, so an ancestor's shadowed models are visible only to a caller granted that ancestor's tenant
 
 ### Confirmation
 
 * Unit tests verify inheritance resolution order (tenant → parent → ... → root, first match wins per slug)
 * Unit tests verify a child provider with a colliding slug shadows the ancestor's provider **and hides every model attached to it**, for both `active` and `disabled` shadows
 * Unit tests verify an ancestor model is excluded when its provider's slug is shadowed by a closer tenant **even though no colliding `canonical_id` exists there** — the case a `canonical_id`-keyed merge silently gets wrong
-* Unit tests verify `create_model` against an ancestor-owned provider slug is refused with `provider_not_owned`, shadowed or not
+* Unit tests verify `create_model` writes the model into its resolved provider's tenant, and that a provider outside the caller's access scope is refused with `provider_not_found`
 * Unit tests verify a disabled provider makes every model attached to it unavailable for eval, independent of each model's own approval status
-* Integration tests verify compliance isolation end to end, and that the management listing still returns shadowed and disabled-provider rows, marked and read-only
+* Integration tests verify compliance isolation end to end, and that the admin endpoints return exactly the rows the PDP scope covers while the eval listing still shadows
 
 ## Pros and Cons of the Options
 
@@ -88,7 +90,7 @@ Inheritance model:
 
 Model ownership:
 - A model's `tenant_id` always equals its provider's `tenant_id`
-- A child can never create a model — manually or via auto-discovery — against an ancestor-owned provider, shadowed or not (`provider_not_owned`)
+- A model is created in its provider's tenant; the provider is resolved within the caller's access scope
 - There is no per-model shadow, per-model override, or per-model exclusion
 
 Approval:
@@ -165,7 +167,7 @@ This decision directly addresses:
 
 * `cpt-cf-model-registry-fr-provider-management` — Inheritance with shadowing support
 * `cpt-cf-model-registry-fr-tenant-isolation` — Tenant-scoped resolution
-* `cpt-cf-model-registry-fr-manual-model-management` — Same-tenant-only model creation (`provider_not_owned`) and own-tenant-only approval authority
+* `cpt-cf-model-registry-fr-manual-model-management` — A model is created in its provider's tenant; approval authority belongs to that tenant
 * `cpt-cf-model-registry-fr-get-tenant-model` — Shadow-aware single-model resolution
 * `cpt-cf-model-registry-fr-list-tenant-models` — Shadow-aware additive merge across the ancestor chain
 * `cpt-cf-model-registry-fr-list-tenant-models-management` — Shadowed rows retained, marked, and read-only for audit

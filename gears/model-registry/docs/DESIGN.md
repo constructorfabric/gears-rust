@@ -45,7 +45,7 @@ Model Registry provides a centralized catalog of AI models with tenant-level ava
 
 The architecture follows the Gears SDK pattern with clear separation between public API surface (`model-registry-sdk`) and implementation (`model-registry`). The system serves a 1000:1 read:write ratio from indexed queries, caching only the requester's tenant ancestor chain (§2.1 "Resolution Caching"). The cache is the platform `cluster` gear's `ClusterCacheV1` primitive, reached through the `ResolutionCache` domain trait, so the backend is an operator binding rather than a compile-time choice this module owns. Provider API calls for model discovery route through Outbound API Gateway; that is a P2 capability — P1 makes no outbound provider calls at all and populates the catalog exclusively from admin writes.
 
-The design emphasizes tenant isolation with hierarchical inheritance. Providers and models are visible additively over the tenant ancestor chain resolved from `tenant-resolver`. Shadowing is keyed on the **provider slug and only on the provider slug** — a child tenant that registers a provider under an inherited slug takes that slug over for its subtree, and the shadowed provider's entire model set leaves with it. There is no model-level shadow. Model visibility is then set membership on `provider_id`; the algorithm all three read paths share is §3.5 "Tenant Visibility Resolution". Cache isolation ensures tenant data separation via a tenant-ID key prefix, a single TTL-based expiry (10 minutes), and whole-tenant invalidation on every write.
+The design emphasizes tenant isolation with hierarchical inheritance. Providers and models are visible additively over the tenant ancestor chain resolved from `tenant-resolver`. Shadowing is keyed on the **provider slug and only on the provider slug** — a child tenant that registers a provider under an inherited slug takes that slug over for its subtree, and the shadowed provider's entire model set leaves with it. There is no model-level shadow. Model visibility is then set membership on `provider_id`; the algorithm the two eval read paths share is §3.5 "Tenant Visibility Resolution". The admin zone does not participate: it reads and writes exactly what its PDP `AccessScope` covers (§4 Authorization). Cache isolation ensures tenant data separation via a tenant-ID key prefix, a single TTL-based expiry (10 minutes), and whole-tenant invalidation on every write.
 
 **Phase scope**: the P1 scope is the whole of §1.2, §3.3, and §3.6, carried by the gear crate [`model-registry/`](../model-registry/) (package `cf-gears-model-registry`, feature-gated in `cf-gears-example-server`). Sections and rows marked P2/P3/P4 are forward-looking design and stay out of both the `ModelRegistryClientV1` trait and the REST surface until their phase is scheduled.
 
@@ -56,14 +56,14 @@ The design emphasizes tenant isolation with hierarchical inheritance. Providers 
 Drivers marked `p1` are the P1 scope; drivers marked `p2`/`p3`/`p4` are designed below but intentionally absent from the P1 SDK trait and REST surface until their phase is scheduled.
 
 - [ ] `p1` — `cpt-cf-model-registry-fr-tenant-isolation` — `AccessScope` applied to every `SecureConn` query; every cache entry is keyed by a single tenant ID and holds only that tenant's own rows
-- [ ] `p1` — `cpt-cf-model-registry-fr-authorization` — every service method derives its `AccessScope` from the `authz-resolver` PDP through `PolicyEnforcer` (resource types `model_registry.provider` / `model_registry.model`; actions `get`, `list`, `create`, `update`, `delete`)
+- [ ] `p1` — `cpt-cf-model-registry-fr-authorization` — every service method derives its `AccessScope` from the `authz-resolver` PDP through `PolicyEnforcer` (resource types `model_registry.provider` / `model_registry.model`; actions `get`, `list`, `create`, `update`, `delete`, `list_management`, `get_management`), passing the resource `id` on every point operation
 - [ ] `p1` — `cpt-cf-model-registry-fr-input-validation` — wire-string → enum parsing in the REST layer with a field-violation problem on an unknown value; slug, display-name, discovery-interval and lifecycle-transition validation in the service; identity fields structurally absent from the update request types. The display-name bound is the stored column's (1-255 characters of free-form text, counted in characters); the character-class rule belongs to the slug alone
 - [ ] `p1` — `cpt-cf-model-registry-fr-cache-isolation` — One cache entity keyed by one tenant ID: `chain/{tenant_id}`, holding that tenant's ancestor chain, TTL-expired and never invalidated (§4 Cache Invalidation Strategy). The check covers the isolation guarantee: the entry holds tenant IDs only, is keyed by the tenant whose chain it describes, and no read reaches an entry keyed by another tenant. It does **not** cover the `tenant.reparented` invalidation the PRD folds into the same FR — that ships with `cpt-cf-model-registry-fr-tenant-reparenting` (P3)
 - [ ] `p1` — `cpt-cf-model-registry-fr-get-tenant-model` — Cache-first lookup across the tenant chain with DB fallback; the read is a **fail-closed access gate** — a model that is not `approved` is refused with `ModelNotApproved` (403), never returned with its status for the caller to interpret (§3.5). The lookup first resolves the winning provider for the `canonical_id`'s slug and then reads the model under that winner's tenant only, requiring `provider_id == winner.id` — see §3.5 "Tenant Visibility Resolution" for the algorithm and its failure semantics
-- [ ] `p1` — `cpt-cf-model-registry-fr-list-tenant-models` — Cursor pagination with `$filter` / `$orderby` over real columns (`$select` is rejected — see §3.3), merged additively across the ancestor chain. Visibility is `provider_id ∈ allow_list` AND `approval_status = approved` AND not `deprecated`/`sunset` — the first predicate carries both the shadow gate and the disabled-provider gate (§3.5 "Tenant Visibility Resolution"), and non-approved rows are excluded from the eval page outright rather than returned with their status. Deduping ancestor rows by `canonical_id` is not that predicate: an ancestor model with no colliding `canonical_id` at the closer tenant survives a dedupe even though its provider's slug has been shadowed. The predicate is **unconditional and mandatory**, ANDed onto the caller's query — not a default that a `$filter` clause can switch off (§3.3 "Two listing endpoints — eval vs management")
-- [ ] `p1` — `cpt-cf-model-registry-fr-manual-model-management` — Admin CRUD on models with `approval_status` patched via `update_model`; the same REST surface continues to accept admin calls in P2 but routes them through the Approval Service. Model creation MUST resolve `provider_slug` within the caller's own tenant only — a model's `tenant_id` MUST equal its provider's `tenant_id` — rejecting an inherited (ancestor-owned) provider with a new `provider_not_owned` error (§3.1 Invariants, §4 Error Handling)
+- [ ] `p1` — `cpt-cf-model-registry-fr-list-tenant-models` — Cursor pagination with `$filter` / `$orderby` over real columns (`$select` is rejected — see §3.3), resolved additively across the ancestor chain by one query scoped to every chain tenant, so ordering and cursors span own and inherited rows alike. Visibility is `provider_id ∈ allow_list` AND `approval_status = approved` AND not `deprecated`/`sunset` — the first predicate carries both the shadow gate and the disabled-provider gate (§3.5 "Tenant Visibility Resolution"), and non-approved rows are excluded from the eval page outright rather than returned with their status. Deduping ancestor rows by `canonical_id` is not that predicate: an ancestor model with no colliding `canonical_id` at the closer tenant survives a dedupe even though its provider's slug has been shadowed. The predicate is **unconditional and mandatory**, ANDed onto the caller's query — not a default that a `$filter` clause can switch off (§3.3 "Two listing endpoints — eval vs management")
+- [ ] `p1` — `cpt-cf-model-registry-fr-manual-model-management` — Admin CRUD on models, addressed by UUID `id`, with `approval_status` patched via `update_model`; the same REST surface continues to accept admin calls in P2 but routes them through the Approval Service. Model creation takes `provider_id`, resolves it within the caller's access scope — `provider_not_found` (404) when no in-scope provider carries the id — and writes the row with that provider's `tenant_id`, since a model's `tenant_id` MUST equal its provider's (§3.1 Invariants, §4 Error Handling). A companion `get_model(id)` serves the ungated single-row read (§3.3)
 - [ ] `p1` — `cpt-cf-model-registry-fr-provider-management` — CRUD with inheritance/shadowing support, and a referential pre-check that refuses to delete a provider that still owns models. Shadowing a provider (slug-keyed, closest-tenant-wins resolution) must also hide every model attached to it from `list_tenant_models` / `get_tenant_model`, and disabling a provider must make its models unavailable for eval. Both effects fall out of one mechanism — the provider loses its place in `allow_list`, so no model carrying its `provider_id` resolves (§3.5 "Tenant Visibility Resolution")
-- [ ] `p1` — `cpt-cf-model-registry-fr-list-tenant-models-management` — A **second listing endpoint** (`GET /model-registry/v1/admin/models`), separate from `list_tenant_models`: tenant-admin/platform-admin authorization, a wider candidate row set (it keeps the rows whose provider *lost* slug resolution, and the rows on a disabled provider, both marked), none of the eval mandatory predicates, and its own response type carrying `shadowed` / `provider_disabled` / `available_for_eval` — all three computed from the same `ChainProviders` structure the eval path filters on (§3.5 "Tenant Visibility Resolution"). Deprecated rows arrive through an explicit `include_deprecated` flag, never through `$filter`. The OData field enum, `FieldToColumn` binding, cursor encoding and ancestor-merge code are shared with `list_tenant_models` via one repository query parameterized by a visibility mode — see §3.3 "Two listing endpoints — eval vs management"
+- [ ] `p1` — `cpt-cf-model-registry-fr-list-tenant-models-management` — A **second listing endpoint** (`GET /model-registry/v1/admin/models`), separate from `list_tenant_models`: tenant-admin/platform-admin authorization, every row in the caller's `AccessScope`, none of the eval mandatory predicates, and its own response type carrying `provider_disabled` / `available_for_eval` computed from the providers backing the page (§3.5 "Management Model Listing"). Deprecated rows arrive through an explicit `include_deprecated` flag, never through `$filter`. The OData field enum, `FieldToColumn` binding and cursor encoding are shared with `list_tenant_models` via one repository query parameterized by a visibility mode — see §3.3 "Two listing endpoints — eval vs management"
 - [ ] `p1` — `cpt-cf-model-registry-fr-model-pricing` — AICredits cost data whose **shape follows the provider's own cost structure** (`OpenAiCost`, `AnthropicCost`, …) — rate dimensions, tiers and units differ per provider and there is no cross-provider normalized cost schema (§3.1). Storage only in P1: the `cost` block rides nested inside each model's `provider_settings` and travels with model info; there is no separate pricing surface and no AICredits integration
 - [ ] `p2` — `cpt-cf-model-registry-fr-model-discovery` — OAGW integration, provider plugin abstraction
 - [ ] `p2` — `cpt-cf-model-registry-fr-model-approval` — Approval Service integration, event-driven status sync; replaces P1 admin-direct status writes on the same endpoints
@@ -164,7 +164,7 @@ The service is generic over `(ProviderRepository, ModelRepository)` and holds th
 
 All operations are scoped by tenant context. Every cache entry is keyed by exactly one tenant ID and holds only rows belonging to that tenant. Query filters enforce tenant hierarchy visibility. Write operations validate tenant ownership. Admin operations verify actor role for target tenant.
 
-Realization: every service method first calls the `authz-resolver` PDP to obtain an `AccessScope`, every repository trait method takes that scope as a required parameter, and every query in both implementations is issued through `.secure().scope_with(scope)` rather than a raw SeaORM query — so an unscoped query is visible as a missing `.secure()` call at review time. Reads that consult ancestor tenants build an explicit `AccessScope::for_tenant(ancestor_id)` per ancestor rather than widening the caller's own scope.
+Realization: every service method first calls the `authz-resolver` PDP to obtain an `AccessScope`, every repository trait method takes that scope as a required parameter, and every query in both implementations is issued through `.secure().scope_with(scope)` rather than a raw SeaORM query — so an unscoped query is visible as a missing `.secure()` call at review time. The eval reads, which consult ancestor tenants, build an explicit `AccessScope::for_tenant(ancestor_id)` per ancestor rather than widening the caller's own scope. The admin surface issues every query under the PDP scope alone.
 
 #### Resolution Caching
 
@@ -176,14 +176,14 @@ One cache entity — the requester's tenant ancestor chain. Provider and model r
 |--------|-----|-------|-----|
 | Tenant chain | `chain/{tenant_id}` | ordered ancestor tenant IDs, closest first | `chain_cache_ttl_seconds`, default 30 |
 
-The entry expires by TTL; no write invalidates it. `ChainProviders(T0)` (§3.5) is built per request from the cached chain plus a provider query per chain tenant, with `winner` and `allow_list` computed in memory.
+The entry expires by TTL; no write invalidates it. `ChainProviders(T0)` (§3.5) is built per request from the cached chain plus **one** provider query scoped to the whole chain, with `winner` and `allow_list` computed in memory.
 
 Requirements on every cache read:
 
 - **An empty value is a hit.** The root tenant has no ancestors; its entry is an empty list and MUST NOT fall through to `tenant-resolver`.
 - **The entry is keyed by tenant ID alone** and is valid for every caller of that tenant. This holds only while `BarrierMode::Respect` is fixed at the single `get_ancestors` call site; a call site that varied it would have to key by it.
 - **The cache is never load-bearing.** A miss, a decode failure, a backend error, or an unbound backend falls through to `tenant-resolver` and is logged, never propagated (§4 Fault Tolerance Policies).
-- **Ancestor-scoped queries use `AccessScope::for_tenant(ancestor)`**, never a widened caller scope.
+- **Ancestor-scoped queries use `AccessScope::for_tenant(ancestor)`**, never a widened caller scope. Only the eval reads issue them.
 
 List pages are not cached: `$filter` / `$orderby` / cursor compile to SQL through `FieldToColumn`, and the toolkit has no in-memory evaluator for the filter AST.
 
@@ -193,15 +193,17 @@ Backend: the `cluster` gear's `ClusterCacheV1`, reached through the `ResolutionC
 
 **ID**: `cpt-cf-model-registry-principle-additive-inheritance`
 
-Providers and models inherit down the tenant hierarchy additively. Child tenants see their ancestors' providers and models plus their own. A child shadows an inherited provider by creating one with the same slug; shadowing replaces the parent's provider **and every model attached to it** for that tenant and its descendants. Child tenants cannot expand beyond parent's permissions.
+**Applies to the eval reads only** — `get_tenant_model` and `list_tenant_models` (§3.3 "Endpoints Overview"). The admin zone reads and writes exactly the rows its PDP `AccessScope` covers; how far an admin reaches across tenants is a policy decision, not a hierarchy walk (§4 Authorization).
 
-Realization: `resolve_ancestors` returns the chain — cache-first, from `chain/{tenant_id}` (§2.1 "Resolution Caching"); slug resolution then queries the chain's providers per tenant (§3.5); the own-tenant model query carries the caller's `OData` filter and pagination, each ancestor query carries the same filter with pagination removed so the merge sees each ancestor's complete visible set, and the merged result is then truncated to the caller's limit. Ownership classification (`Own` vs `Inherited`) drives visibility merging only; it has no bearing on caching, since the only cached entity holds tenant IDs and carries no rows at all.
+On the eval path, providers and models inherit down the tenant hierarchy additively. Child tenants see their ancestors' providers and models plus their own. A child shadows an inherited provider by creating one with the same slug; shadowing replaces the parent's provider **and every model attached to it** for that tenant and its descendants. Child tenants cannot expand beyond parent's permissions.
+
+Realization: `resolve_ancestors` returns the chain — cache-first, from `chain/{tenant_id}` (§2.1 "Resolution Caching"). Both eval reads then issue **one** query per entity, scoped to every chain tenant at once via `AccessScope::for_tenants`, and attribute each returned row to its own `tenant_id` rather than to whichever query produced it (§3.5). The eval listing's single model query carries the caller's `OData` filter, ordering and cursor, so pagination is a stable ordered walk of the whole visible set with no in-memory merge or truncation step. Caching is unaffected either way: the only cached entity holds tenant IDs and carries no rows at all. The whole mechanism lives in `domain/inheritance.rs` and has no admin-path caller.
 
 **Model ownership is same-tenant-only**: a model always belongs to exactly one provider, and a model's `tenant_id` MUST equal its provider's `tenant_id`. There is no independent "model-level shadow" distinct from provider shadowing — a colliding `canonical_id` at a closer tenant is simply a consequence of that tenant owning its own provider of the same slug. Concretely this means:
 
-- **Model creation is scoped to the caller's own tenant's providers only.** A child tenant can never create a model — manually or via auto-discovery — against a provider owned by an ancestor tenant, shadowed or not. Model creation's provider lookup MUST resolve `provider_slug` within the caller's own tenant only, returning `provider_not_owned` when the slug resolves only in an ancestor (§3.1 Invariants, §4 Error Handling).
-- **Shadowing a provider hides every model attached to it, not just the provider record.** A model row is visible only when its `provider_id` is the winning provider for its slug in the requester's tenant chain. Matching purely on `canonical_id` is not sufficient: an ancestor's model whose provider slug has been shadowed by a closer tenant must be excluded even when no colliding `canonical_id` exists at that closer tenant. The management listing is the one read that deliberately keeps these rows, marked `shadowed` and read-only (§3.3).
-- **Disabling a provider makes every model attached to it unavailable for eval.** `get_tenant_model` / `list_tenant_models` MUST treat every model of a disabled provider as unavailable, independent of that model's own `approval_status`. The management listing again keeps them, with the flag visible instead of filtering them out (§3.3).
+- **A model is created in its provider's tenant.** Creation names its provider by `id` and resolves it within the caller's `model_registry.provider` / `get` scope, returning `provider_not_found` (404) when no in-scope provider carries the id. The created row takes `provider.tenant_id`, and the write is issued under the `model_registry.model` / `create` scope, so a provider whose tenant that scope does not cover is refused as `forbidden` (403). Addressing the provider by id also removes an ambiguity the slug carried: when two tenants own a provider under one slug, `provider_id` names exactly which of the two the model attaches to.
+- **Shadowing a provider hides every model attached to it, not just the provider record.** A model row is eval-visible only when its `provider_id` is the winning provider for its slug in the requester's tenant chain. Matching purely on `canonical_id` is not sufficient: an ancestor's model whose provider slug has been shadowed by a closer tenant must be excluded even when no colliding `canonical_id` exists at that closer tenant. Shadowing is a property of a requester's chain, so it is not reported on the admin listing (§3.3).
+- **Disabling a provider makes every model attached to it unavailable for eval.** `get_tenant_model` / `list_tenant_models` MUST treat every model of a disabled provider as unavailable, independent of that model's own `approval_status`. The management listing keeps them, with `provider_disabled` set instead of filtering them out (§3.3).
 - **A model that is not `approved` is not available for eval either.** The two eval reads are access gates, not status reporters: `list_tenant_models` excludes every row whose `approval_status` is not `approved`, and `get_tenant_model` refuses it with `ModelNotApproved` (403). This is orthogonal to the provider gates above — approval is a per-model grant inside a tenant, provider status and shadowing are provider-scoped — so it is a separate predicate rather than another input to `allow_list` (§3.5 "Tenant Visibility Resolution"). The management listing keeps non-approved rows, reporting `available_for_eval = false`.
 
 Both exclusions are one mechanism, not two: a shadowed provider and a disabled provider alike fail to enter the requester's allow-list, so no model carrying their `provider_id` resolves. The algorithm — the `ChainProviders` structure, the `provider_id ∈ allow_list` rule, per-path pseudocode, failure semantics, and the cache entities it needs — is specified once in §3.5 "Tenant Visibility Resolution" and is not restated here.
@@ -549,7 +551,7 @@ The trade-off comparison against the rejected alternatives — a tagged enum (`A
 **`ProviderV1`** is the tenant-scoped configuration record for one provider instance. It carries no credentials and no generic endpoint field — whatever connection routing a provider kind needs lives in its GTS-typed settings, and secrets stay in OAGW (§2.2 "No Credential Storage").
 
 - **id** (`Uuid`) — primary key
-- **tenant_id** (`Uuid`) — owning tenant. For an inherited provider this is an ancestor tenant, not the reader's — it is the tenant whose write scope governs the row
+- **tenant_id** (`Uuid`) — owning tenant. A reader may see a row whose `tenant_id` is not its own: an ancestor's, through the eval reads, or any tenant its `AccessScope` covers, through the admin reads
 - **slug** (`String`) — human-readable identifier, 1-64 chars lowercase alphanumeric + hyphen, unique within the tenant and immutable after creation. It is the shadowing key (§2.1 "Additive Inheritance") and the left half of every `canonical_id`
 - **name** (`String`) — display name. Free-form text: no character-class rule and no uniqueness requirement
 - **gts_type** (`gts::GtsTypeId`) — GTS type identifying the provider kind (e.g. `gts.cf.genai.model.provider.v1~cf.genai._.openai.v1~`). Mirrored by each of its models' `ModelInfoV1.gts_type`, and the key the P2 discovery plugin is selected by
@@ -566,14 +568,14 @@ There is no `provider_settings` on Provider — the polymorphic payload is per *
 
 - **Provider slug immutability**: once a provider is created, its `slug` cannot change — changing it would invalidate every `canonical_id = {provider_slug}::{provider_model_id}` referencing it. Enforced structurally: `UpdateProviderRequestV1` has no `slug` field, so the update projection never writes the column.
 - **Canonical model ID format**: `{provider_slug}::{provider_model_id}` is the only canonical form; aliases resolve to canonical IDs but never to other aliases.
-- **`info.gts_type` discriminator immutability**: once a model is created, `gts_type` cannot change without a model replacement — it determines the on-disk shape of `provider_settings` and the typed view consumers narrow to. Enforced structurally rather than by a check: `UpdateModelRequestV1` and the corresponding REST DTO carry **no fields** for `gts_type`, `canonical_id`, `provider_slug`, or `provider_model_id`, so the update projection has nothing to write and an attempt to send them is simply ignored by deserialization.
+- **`info.gts_type` discriminator immutability**: once a model is created, `gts_type` cannot change without a model replacement — it determines the on-disk shape of `provider_settings` and the typed view consumers narrow to. Enforced structurally rather than by a check: `UpdateModelRequestV1` and the corresponding REST DTO carry **no fields** for `gts_type`, `canonical_id`, `provider_id`, or `provider_model_id`, so the update projection has nothing to write and an attempt to send them is simply ignored by deserialization.
 - **Approval status lives on `models`**: `ModelV1::approval_status` is read from and written to the `models.approval_status` column — there is no separate approvals table in P1. Updates flow through `Service::update_model` → `ModelRepository::update` → mapper; the mapper projects the new status from `UpdateModelRequestV1::approval_status` when present. Creates default to `pending` unless `CreateModelRequestV1::approval_status` is supplied. P2 swaps the write path to the Approval Service while the same column continues to serve reads and `OData` filtering. The discovery write path never writes approval state.
 - **Terminal lifecycle states are read-only**: `deprecated` and `sunset` accept no transition out, and no approval change may be applied to a model already in either state (`InvalidTransition`). Every other lifecycle transition — including demotion — is permitted.
 - **Tenant-scoped uniqueness**: `(tenant_id, slug)` is unique per provider, `(tenant_id, canonical_id)` is unique per model, `(tenant_id, name)` is unique per alias, `(tenant_id, lower(name))` is unique per tag (case-insensitive), and `(tenant_id, model_id, tag_id)` is unique per tag assignment.
 - **Tag managed independently of models**: a tag's lifecycle (create/update/delete) is decoupled from the catalog; deleting a tag cascades only to its `model_tags` rows within the owning tenant scope and never mutates `models`.
 - **Every cache key names exactly one tenant**: `chain/{tenant_id}` is the only shape — no tenantless key exists, and the only cached value is a list of tenant IDs (§2.1 "Resolution Caching").
-- **Model-provider tenant match**: a model's `tenant_id` MUST equal its `provider_id`'s owning tenant. Model creation MUST resolve `provider_slug` within the caller's own tenant only, returning `provider_not_owned` (403) when the slug resolves only in an ancestor. Read-only provider lookups (get/list provider) are unaffected and keep resolving across the ancestor chain.
-- **Approval status gates model eval-availability**: a model whose `approval_status` is not `approved` MUST NOT be available for eval. `list_tenant_models` excludes it as a mandatory predicate; `get_tenant_model` fails with `ModelNotApproved` (403). The gate reads `models.approval_status` directly — there is no Approval Service call on the read path in any phase — and it is evaluated **after** the provider gates, so a caller learns "not approved" only for a model it could otherwise observe (§3.5 "Tenant Visibility Resolution"). The management listing is the one read that returns non-approved rows, marked `available_for_eval = false`.
+- **Model-provider tenant match**: a model's `tenant_id` MUST equal its `provider_id`'s owning tenant. Model creation resolves `req.provider_id` under the `model_registry.provider` / `get` scope — `provider_not_found` (404) when no in-scope provider carries the id — and writes the row with `provider.tenant_id` under the `model_registry.model` / `create` scope, which refuses a tenant it does not cover with `forbidden` (403). Because the request carries an id rather than a slug, the service hands the resolved provider to the repository, which performs no lookup of its own — the slug reaching `canonical_id` is the resolved provider's, never a caller-supplied string.
+- **Approval status gates model eval-availability**: a model whose `approval_status` is not `approved` MUST NOT be available for eval. `list_tenant_models` excludes it as a mandatory predicate; `get_tenant_model` fails with `ModelNotApproved` (403). The gate reads `models.approval_status` directly — there is no Approval Service call on the read path in any phase — and it is evaluated **after** the provider gates, so a caller learns "not approved" only for a model it could otherwise observe (§3.5 "Tenant Visibility Resolution"). The management listing returns non-approved rows, marked `available_for_eval = false`.
 - **Provider status gates model eval-availability**: a model attached to a `disabled` provider MUST NOT be available for eval (`get_tenant_model` / `list_tenant_models`), independent of its own `approval_status`. Enforced by the same predicate that enforces shadowing — a disabled provider is absent from the requester's allow-list, so none of its models resolve (§3.5 "Tenant Visibility Resolution"). `providers.status` is the only source of truth for this; it is not denormalized onto `models`.
 
 ### 3.2 Component Model
@@ -653,9 +655,9 @@ Application service orchestrating authorization, caching, inheritance resolution
 
 **Interface**: Internal domain methods (`get_provider`, `list_providers`, `create_provider`, `update_provider`, `delete_provider`, `get_tenant_model`, `list_tenant_models`, `create_model`, `update_model`, `delete_model`) returning `Result<_, DomainError>`. Emits no events in P1.
 
-`list_tenant_models_management` completes the P1 method set, required by `cpt-cf-model-registry-fr-list-tenant-models-management` — full-visibility listing (any `approval_status`, disabled-provider models marked, shadowed-ancestor models marked, deprecated on opt-in), gated to tenant-admin/platform-admin. It is a **separate method from `list_tenant_models`**, differing in authorization, candidate row set, and response type (§3.3 "Two listing endpoints — eval vs management").
+`list_tenant_models_management` completes the P1 method set, required by `cpt-cf-model-registry-fr-list-tenant-models-management` — full-visibility listing over the caller's `AccessScope` (any `approval_status`, disabled-provider models marked, deprecated on opt-in), gated to tenant-admin/platform-admin. It is a **separate method from `list_tenant_models`**, differing in authorization, candidate row set, and response type (§3.3 "Two listing endpoints — eval vs management").
 
-Internally the two are one code path. Both delegate to a single `ModelRepository` list query parameterized by a visibility mode (`Eval` | `Management`); the mode selects the mandatory predicate set, whether shadow-resolution losers are kept or dropped, and which response type is projected. The OData field enum, `FieldToColumn` binding, cursor encoding, and ancestor-merge logic are shared, not duplicated.
+Internally the two are one code path. Both delegate to a single `ModelRepository` list query parameterized by a visibility mode (`Eval` | `Management`); the mode selects the mandatory predicate set, whether shadow-resolution losers are kept or dropped, and which response type is projected. The OData field enum, `FieldToColumn` binding and cursor encoding are shared, not duplicated. Neither path merges anything in memory: the eval listing widens its `AccessScope` across the tenant chain instead, so both are a single scoped query.
 
 #### LocalClient
 
@@ -710,9 +712,12 @@ The module exposes four deliberate extension points and two API stability zones:
 
 **Location**: Auto-generated via `utoipa` from `OperationBuilder` registrations in `api/rest/routes.rs`
 
-**Phase scope**: eleven endpoints are **P1** (the ten original operations plus the management listing added by the shadowing upgrade). P2 (discovery, bulk approval) and P3 (provider health, aliases, tags) endpoints below are **postponed** — they are retained in this table as forward-looking design but are intentionally absent from the `ModelRegistryClientV1` SDK trait and the REST surface until their phases are scheduled.
+**Phase scope**: twelve endpoints are **P1** (the ten original operations, the management listing added by the shadowing upgrade, and the id-keyed management read added with the identifier change). P2 (discovery, bulk approval) and P3 (provider health, aliases, tags) endpoints below are **postponed** — they are retained in this table as forward-looking design but are intentionally absent from the `ModelRegistryClientV1` SDK trait and the REST surface until their phases are scheduled.
 
-Read endpoints come in two authorization zones: `/model-registry/v1/…` for the eval-facing surface any authenticated tenant member may call, and `/model-registry/v1/admin/…` for admin-only reads (see "Two listing endpoints" below).
+Endpoints come in two authorization zones, and the zone determines the identifier:
+
+- **`/model-registry/v1/…`** — the eval-facing read surface any authenticated tenant member may call. Keyed by `canonical_id`, because that is the only identifier an inference caller holds, and resolved across the caller's tenant ancestor chain (§2.1 "Additive Inheritance").
+- **`/model-registry/v1/admin/…`** — the management surface (tenant-admin / platform-admin): the management listing, all model CRUD, and every provider operation. Keyed by the entity's UUID `id` throughout, and bounded by the PDP `AccessScope` alone — the ancestor chain is not consulted, so how far an admin reaches across tenants is a policy decision (§4 Authorization).
 
 Every P1 operation is registered with `.authenticated()` and a license-feature requirement, declares its `utoipa` request/response schema, and registers the error responses it can actually produce (`400`, `401`, `403`, `404`, `409`, `422`, `500` as applicable). Creates return `201` with the entity; deletes return `204` with no body.
 
@@ -721,19 +726,20 @@ Every P1 operation is registered with `.authenticated()` and a license-feature r
 | Method | Path | Description | Priority |
 |--------|------|-------------|----------|
 | `GET` | `/model-registry/v1/models` | List tenant models with OData filtering — **eval-facing**: approved models on active providers only | P1 |
-| `GET` | `/model-registry/v1/models/{canonical_id}` | Get model by canonical ID — **eval-facing**: approved on an active provider, else `model_not_approved` / `provider_disabled` | P1 |
-| `GET` | `/model-registry/v1/admin/models` | Management listing → `Page<ModelManagementDto>`: any `approval_status`, disabled-provider models marked, shadowed-ancestor-provider models marked `shadowed` (read-only), deprecated models via `include_deprecated=true`. Tenant-admin/platform-admin only | P1 |
-| `POST` | `/model-registry/v1/models` | Create model (manual catalog entry) | P1 |
-| `PATCH` | `/model-registry/v1/models/{canonical_id}` | Update model fields and `approval_status` (`pending`/`approved`/`rejected`/`revoked`). Scalar display/infrastructure fields patch individually (nullable ones accept explicit `null` to clear); the sub-objects `performance`, `capabilities`, `disabled_capabilities`, `context_window`, `default_parameters`, `allow_extra_params`, and `provider_settings` are **replaced wholesale**, not deep-merged. `canonical_id`, `provider_slug`, `provider_model_id`, and `gts_type` are immutable. `additional_info` is **not patchable**: the request body carries no field for it, so it is written on create and then preserved untouched by every subsequent PATCH — replacing it requires a soft-delete and recreate. P1: direct DB write; P2 onward: status changes route via Approval Service while other field updates remain direct | P1 |
-| `DELETE` | `/model-registry/v1/models/{canonical_id}` | Soft-delete model (mark `deprecated`) | P1 |
-| `GET` | `/model-registry/v1/providers` | List tenant providers | P1 |
-| `GET` | `/model-registry/v1/providers/{id}` | Get provider by ID | P1 |
-| `POST` | `/model-registry/v1/providers` | Register new provider (P1 body: `slug`, `name`, `gts_type`, `managed`, `metadata`, `discovery_enabled`, `discovery_interval_seconds`; `status` is **not** accepted — new providers are always created `active`. **P2** also accepts `discovery_settings`, validated against the selected plugin's settings GTS schema with `validation_error` (400) on mismatch) | P1 (+P2 `discovery_settings`) |
-| `PATCH` | `/model-registry/v1/providers/{id}` | Update provider (`name`, `status`, `managed`, `metadata`, `discovery_enabled`, `discovery_interval_seconds`; **P2** `discovery_settings`). `slug` is immutable and ignored if present | P1 (+P2 `discovery_settings`) |
-| `DELETE` | `/model-registry/v1/providers/{id}` | Delete provider | P1 |
-| `POST` | `/model-registry/v1/providers/{id}/discover` | Trigger model discovery for one provider. **Synchronous**: the response carries the reconciliation outcome (models added / updated / deprecated, or the failure reason). There is no job entity and no status endpoint — the module owns no work queue in any phase | P2 |
-| `POST` | `/model-registry/v1/models/bulk-approve` | Batch approve models (`approve_models([])`, `reject_models([])`) via Approval Service | P2 |
-| `GET` | `/model-registry/v1/providers/{id}/health` | Get provider discovery health | P3 |
+| `GET` | `/model-registry/v1/models/{canonical_id}` | Get model by canonical ID — **eval-facing**: approved on an active provider, else `model_not_approved` / `provider_disabled`. The one endpoint that interprets a slug | P1 |
+| `GET` | `/model-registry/v1/admin/models` | Management listing → `Page<ModelManagementDto>`: every model in the caller's access scope, any `approval_status`, disabled-provider models marked `provider_disabled`, deprecated models via `include_deprecated=true`. Tenant-admin/platform-admin only | P1 |
+| `GET` | `/model-registry/v1/admin/models/{id}` | Get model by UUID — **management**: no lifecycle / provider-status / approval gates, resolved within the caller's access scope, so a `pending`, `rejected`, `deprecated`, or disabled-provider row is readable. The single-row counterpart of the management listing; authorized under its own `get_management` action | P1 |
+| `POST` | `/model-registry/v1/admin/models` | Create model (manual catalog entry). Body carries `provider_id`, resolved within the caller's access scope (`provider_not_found`, 404, otherwise); the created model takes that provider's tenant. The server derives `canonical_id` from the resolved provider's slug plus `provider_model_id` | P1 |
+| `PATCH` | `/model-registry/v1/admin/models/{id}` | Update model fields and `approval_status` (`pending`/`approved`/`rejected`/`revoked`). Scalar display/infrastructure fields patch individually (nullable ones accept explicit `null` to clear); the sub-objects `performance`, `capabilities`, `disabled_capabilities`, `context_window`, `default_parameters`, `allow_extra_params`, and `provider_settings` are **replaced wholesale**, not deep-merged. `canonical_id`, `provider_id`, `provider_model_id`, and `gts_type` are immutable. `additional_info` is **not patchable**: the request body carries no field for it, so it is written on create and then preserved untouched by every subsequent PATCH — replacing it requires a soft-delete and recreate. P1: direct DB write; P2 onward: status changes route via Approval Service while other field updates remain direct | P1 |
+| `DELETE` | `/model-registry/v1/admin/models/{id}` | Soft-delete model (mark `deprecated`) | P1 |
+| `GET` | `/model-registry/v1/admin/providers` | List the providers in the caller's access scope | P1 |
+| `GET` | `/model-registry/v1/admin/providers/{id}` | Get provider by ID within the caller's access scope | P1 |
+| `POST` | `/model-registry/v1/admin/providers` | Register new provider (P1 body: `slug`, `name`, `gts_type`, `managed`, `metadata`, `discovery_enabled`, `discovery_interval_seconds`; `status` is **not** accepted — new providers are always created `active`. **P2** also accepts `discovery_settings`, validated against the selected plugin's settings GTS schema with `validation_error` (400) on mismatch). `slug` is the tenant-unique natural key being created; every later operation addresses the provider by the returned `id` | P1 (+P2 `discovery_settings`) |
+| `PATCH` | `/model-registry/v1/admin/providers/{id}` | Update provider (`name`, `status`, `managed`, `metadata`, `discovery_enabled`, `discovery_interval_seconds`; **P2** `discovery_settings`). `slug` is immutable and ignored if present | P1 (+P2 `discovery_settings`) |
+| `DELETE` | `/model-registry/v1/admin/providers/{id}` | Delete provider | P1 |
+| `POST` | `/model-registry/v1/admin/providers/{id}/discover` | Trigger model discovery for one provider. **Synchronous**: the response carries the reconciliation outcome (models added / updated / deprecated, or the failure reason). There is no job entity and no status endpoint — the module owns no work queue in any phase | P2 |
+| `POST` | `/model-registry/v1/admin/models/bulk-approve` | Batch approve models (`approve_models([])`, `reject_models([])`) via Approval Service. Model ids in the body | P2 |
+| `GET` | `/model-registry/v1/admin/providers/{id}/health` | Get provider discovery health | P3 |
 | `GET` | `/model-registry/v1/aliases` | List tenant aliases | P3 |
 | `POST` | `/model-registry/v1/aliases` | Create alias | P3 |
 | `DELETE` | `/model-registry/v1/aliases/{name}` | Delete alias | P3 |
@@ -741,10 +747,16 @@ Every P1 operation is registered with `.authenticated()` and a license-feature r
 | `POST` | `/model-registry/v1/tags` | Create tag (name supplied in body) | P3 |
 | `PATCH` | `/model-registry/v1/tags/{tag_id}` | Update tag description | P3 |
 | `DELETE` | `/model-registry/v1/tags/{tag_id}` | Delete tag (cascades `model_tags`) | P3 |
-| `POST` | `/model-registry/v1/models/{canonical_id}/tags` | Assign one or more tags to a model (tag ids in body) | P3 |
-| `DELETE` | `/model-registry/v1/models/{canonical_id}/tags/{tag_id}` | Remove a tag from a model | P3 |
+| `POST` | `/model-registry/v1/admin/models/{id}/tags` | Assign one or more tags to a model (tag ids in body) | P3 |
+| `DELETE` | `/model-registry/v1/admin/models/{id}/tags/{tag_id}` | Remove a tag from a model | P3 |
 
-**Tag identifier in the API**: tags are addressed by their UUID `id` in path parameters and request bodies — **never** by `name`. A tag `name` is free-form (may contain spaces and other characters that do not round-trip safely as a URL path segment), so it is supplied only in the create/update request body and returned in responses, while `{tag_id}` is the stable, URL-safe handle for all path-addressed operations.
+**Identifiers in the API**: every path-addressed management operation takes the entity's UUID `id`. Human-readable names — a provider `slug`, a model `canonical_id`, a tag `name` — are supplied only in create request bodies and returned in responses; they never key a write. Three reasons, in order of weight:
+
+1. **A `canonical_id` is chain-relative, a UUID is not.** `canonical_id` is `{provider_slug}::{provider_model_id}` and shadowing is slug-keyed (§2.1), so the same string resolves to a different row for a parent and a child, and to nothing at all for a tenant whose chain does not own the slug. A write key must identify one row independently of who is asking; a UUID does, a `canonical_id` does not.
+2. **PDP resource constraints bind to `id`.** `model_registry.provider` and `model_registry.model` declare `pep_properties::RESOURCE_ID`, which the ORM resolves to `resource_col = "id"` (§4 Authorization). A point operation supplies `Some(id)` to `PolicyEnforcer::access_scope`, so a policy can scope a decision to specific resources. A slug-keyed operation has no id to supply until after it has resolved one, which is too late for the decision that authorizes the resolution.
+3. **A UUID is URL-safe.** `::` must be percent-encoded in a path segment, and `cluster_sdk`'s cache-key rule rejects any key containing it (§3.2). A tag `name` is worse still — free-form, spaces included.
+
+The one exception is deliberate: `GET /model-registry/v1/models/{canonical_id}`, the eval read, is keyed by `canonical_id` because an inference caller holds nothing else. That endpoint is where slug interpretation is confined (§3.5).
 
 **Two listing endpoints — eval vs management**:
 
@@ -753,19 +765,22 @@ PRD `fr-list-tenant-models` and `fr-list-tenant-models-management` are served by
 | | eval — `GET /v1/models` | management — `GET /v1/admin/models` |
 |---|---|---|
 | **Authorization** | any authenticated member of the tenant hierarchy | tenant-admin / platform-admin |
-| **Candidate row set** | rows whose `provider_id` is in the requester's allow-list — the provider won its slug **and** is `active` (§3.5 "Tenant Visibility Resolution") | every row in the chain, including the rows whose provider **lost** its slug or is `disabled`, marked `shadowed` / `provider_disabled` |
+| **Tenant reach** | the caller's tenant plus every ancestor (§2.1 "Additive Inheritance") | whatever the PDP `AccessScope` covers |
+| **Candidate row set** | rows whose `provider_id` is in the requester's allow-list — the provider won its slug **and** is `active` (§3.5 "Tenant Visibility Resolution") | every row in the access scope, including those on a `disabled` provider, marked `provider_disabled` |
 | **Mandatory predicates** | `provider_id IN allow_list`, `approval_status = approved`, and not `deprecated`/`sunset` — three predicates, all unconditional (§3.5 "Tenant Visibility Resolution") | none |
 | **Response type** | `ModelDto` | `ModelManagementDto` |
 
-Each endpoint is registered with its own `OperationBuilder` policy. Neither endpoint widens its result set for a caller holding the other's role: the eval listing returns the same rows to an admin as to any tenant member. Shadowed and disabled-provider rows are excluded from the eval listing by the allow-list predicate the repository query carries (§3.5); the management listing runs the same query without it and marks the rows instead. Neither endpoint caches its page, and both read their rows from the database on every request (§2.1); only the eval listing is on the `nfr-performance` latency budget (§1.2).
+Each endpoint is registered with its own `OperationBuilder` policy. Neither endpoint widens its result set for a caller holding the other's role: the eval listing returns the same rows to an admin as to any tenant member. Shadowed and disabled-provider rows are excluded from the eval listing by the allow-list predicate the repository query carries (§3.5); the management listing runs its query without that predicate. Neither endpoint caches its page, and both read their rows from the database on every request (§2.1); only the eval listing is on the `nfr-performance` latency budget (§1.2).
 
 **The narrowing invariant**: `$filter` / `$orderby` only ever **narrow** a result set. Visibility is decided by the endpoint — authorization, candidate row set, and mandatory predicates — and the caller's filter is ANDed onto that. No filter clause can widen visibility, and no filter clause disables a mandatory predicate. Consequences:
 
 - Every field is filterable on both endpoints, from one shared field enum — including the fields an eval mandatory predicate pins. On the eval endpoint those can only narrow: `$filter=approval_status eq 'pending'` returns an empty page, and `$filter=approval_status ne 'approved'` does too — the same shape as `lifecycle_status`, whose predicate excludes `deprecated`/`sunset` while the field stays filterable across the rest of its domain. Both fields stay filterable on the eval endpoint because the management endpoint shares the enum and needs them, not because an eval caller can reach the excluded rows.
 - Candidate-set changes are **explicit non-OData query parameters**, never filter side effects. `include_deprecated` (boolean, default `false`) is the only one in P1; it applies to the management endpoint alone, where it satisfies UC-027's "excluded by default unless the caller requests them". The eval endpoint has no such flag — its lifecycle exclusion is unconditional.
-- `shadowed` and `provider_disabled` are **response fields only**, not filter fields. Both are computed per request from `ChainProviders` (§3.5) rather than read from a column: `shadowed` depends on the requester's tenant chain, and `provider_disabled` reads `providers.status`, which lives on the other table and cannot be joined. `FieldToColumn` binds each filter field to exactly one real `models` column, so neither is bindable. Management callers always receive both kinds of row and narrow client-side — the same rule for both flags.
+- `provider_disabled` and `available_for_eval` are **response fields only**, not filter fields. Both are computed per request rather than read from a `models` column: they derive from `providers.status`, which lives on the other table and cannot be joined. `FieldToColumn` binds each filter field to exactly one real `models` column, so neither is bindable. Management callers always receive both kinds of row and narrow client-side.
 
-**`ModelManagementDto`** is `ModelDto` plus three read-only fields: `shadowed` (bool — the row's provider lost slug resolution in this requester's chain), `provider_disabled` (bool — the row's provider is `disabled`), and `available_for_eval` (bool — the server-computed conjunction of every eval mandatory predicate, so consumers do not re-implement the visibility rule). All three come from the same `ChainProviders` structure the eval path filters on (§3.5). The eval endpoint's `ModelDto` is unchanged, keeping v1's additive-only promise intact.
+**`ModelManagementDto`** is `ModelDto` plus two read-only fields: `provider_disabled` (bool — the row's provider is `disabled`) and `available_for_eval` (bool — the row is `approved`, on a non-terminal lifecycle, and its provider is `active`). Both are computed from the providers backing the returned page, fetched by id under an `AccessScope` built from the tenants of those rows: a model's tenant always equals its provider's (§3.1 Invariants), so no query reaches a tenant the caller was not already authorized to read. A provider that cannot be read leaves both flags `false`.
+
+`available_for_eval` does **not** account for provider shadowing. Shadowing is defined relative to a requester's ancestor chain (§2.1), and the admin surface has no reference chain — the same row is shadowed for one tenant and winning for another. A row marked `available_for_eval` may still be hidden from a given tenant's eval listing by a closer provider owning the same slug; `GET /v1/models` is the authority on what a specific tenant sees. The eval endpoint's `ModelDto` is unchanged, keeping v1's additive-only promise intact.
 
 **OData Support**:
 
@@ -778,18 +793,18 @@ In-process SDK consumers do not assemble `$filter` text at all. The SDK also pub
 - **Not filterable in v1**: `provider_settings.*`, `default_parameters.*`, `additional_info.*`, `capabilities_full` sub-fields, and the `MediaCapability.supported_mime_types` arrays (with the analogous `file_input` / `image_generation` / `audio_input` / `audio_output` `enabled` flags). The filter layer maps each field to one flat column; per-MIME predicates need array-membership semantics and the per-provider JSONB shapes vary, so both filter spaces are deferred.
 - `$filter` on `tag` / `tag_id` is **P3** and arrives with the `model_tags` table. It is not an `info`-JSONB path — tags are relational, so the filter compiles to a join/`EXISTS` against `model_tags` scoped to the **tenant chain** — the same scope every other read uses, so an inherited tag assignment is visible to a descendant (subset matching: a model matches when it carries all requested tags). The `tag` predicate matches the tag **name** as a quoted OData literal (e.g. `tag eq 'best for reasoning'`); that is a URL-encoded query-string value, not a path segment, so free-form names round-trip safely here — the id-only rule applies to path-addressed operations. `tag_id eq '<uuid>'` is also accepted for callers that already hold the id.
 - `$select` is **not supported**. The REST endpoints reject a request carrying it with a `400` field violation on `$select` (reason `UNSUPPORTED_SELECT`): responses are whole `ModelDto` / `ProviderDto` values and there is no projection stage, so silently ignoring the clause would return more than the caller asked for. The service layer rejects it independently with a validation error, so the in-process SDK path behaves the same — including a query built by `QueryBuilder::select`, which this gear cannot honour since `list_tenant_models` / `list_providers` / `list_tenant_models_management` return typed `Page<ModelV1>` / `Page<ProviderV1>` / `Page<ModelManagementV1>`.
-- `$orderby`: sorting over the same field set as `$filter`. Pagination is **cursor-based** (`$top` plus an opaque cursor). Both bounds come from config — `default_page_size` (default 20) applies when the request omits `$top`, `max_page_size` (default 100) caps it — and reach the queries as the `PageLimits` the repositories are constructed with; each is floored at 1 and the default is capped at the maximum. The default sort key is `canonical_id asc` for models and `slug asc` for providers.
+- `$orderby`: sorting over the same field set as `$filter`. Pagination is **cursor-based** (`$top` plus an opaque cursor). Both bounds come from config — `default_page_size` (default 20) applies when the request omits `$top`, `max_page_size` (default 100) caps it — and reach the queries as the `PageLimits` the repositories are constructed with; each is floored at 1 and the default is capped at the maximum. The default sort key is `canonical_id asc` for models and `slug asc` for providers. On the eval listing `canonical_id` orders and tiebreaks the **whole chain's** rows, not just the caller's own: keyset cursors need the sort key unique over the queried set, and the Corollary in §3.5 is what guarantees that across tenants.
 - **Lifecycle exclusion (eval, unconditional)**: `list_tenant_models` excludes `deprecated` and `sunset` rows as a mandatory predicate. A caller's `$filter` on `lifecycle_status` is ANDed onto it and cannot switch it off — `$filter=lifecycle_status ne 'sunset'` returns live rows only, and `$filter=lifecycle_status eq 'deprecated'` returns an empty page. There is no escape hatch, matching PRD UC-002's flat "Excludes deprecated models". A filter that merely *mentions* `lifecycle_status` does not suppress the exclusion — no narrowing-looking filter may widen visibility. Direct `get` by canonical ID does not hide these rows — it returns `ModelDeprecated` instead.
 - **Approval exclusion (eval, unconditional)**: `list_tenant_models` carries `approval_status = 'approved'` as a mandatory predicate, matching PRD UC-002's "Returns only approved models, unconditionally". A caller's `$filter` on `approval_status` is ANDed onto it, so it can only narrow within the approved set — `$filter=approval_status eq 'rejected'` returns an empty page rather than the rejected rows. The predicate lands on the existing single-column `(approval_status)` index (§3.6). Direct `get` by canonical ID does not hide these rows silently — it returns `ModelNotApproved` (403) instead, so a caller that holds a stale canonical ID learns why it stopped resolving.
 - **Provider-visibility exclusion (eval, unconditional)**: `list_tenant_models` carries `provider_id IN allow_list` as a mandatory predicate, which excludes both shadowed-provider and disabled-provider models in one clause (§3.5 "Tenant Visibility Resolution"). It is not an OData field and cannot be relaxed by a `$filter` clause; `get_tenant_model` returns `provider_disabled` on a direct `get` against a disabled winner.
-- **Management listing applies none of the three**: `list_tenant_models_management` has no mandatory predicates. Non-approved rows, disabled-provider rows and shadowed rows all come back, with `available_for_eval` and the two flags reporting why each one is not eval-visible instead of it being filtered out; `deprecated`/`sunset` rows come back when `include_deprecated=true`, which is a plain query parameter rather than a `$filter` side effect.
-- **Inheritance interacts with pagination**: the own-tenant query carries the caller's filter, order, and pagination; each ancestor query carries the same filter and order with pagination removed. Provider-slug resolution itself does **not** depend on that — it runs over `ChainProviders`, built from the `providers` tables of the whole chain independently of any model page (§3.5) — but the per-tenant allow-list slices still have to be applied to complete ancestor result sets before the merge, so the unpaginated ancestor queries stay. The merged list is then truncated to the own page's effective limit (`$top` already clamped to `max_page_size`, or `default_page_size` when `$top` is absent), so an unpaginated ancestor fan-out cannot hand back a page above the configured bound. Consequence: the cursor anchors on own-tenant rows, so paging past the first page of a tenant that inherits heavily is not a stable ordered walk of the merged set (§4 Technical Debt).
+- **Management listing applies none of the three**: `list_tenant_models_management` has no mandatory predicates. Non-approved and disabled-provider rows come back, with `available_for_eval` and `provider_disabled` reporting eval-availability instead of the rows being filtered out; `deprecated`/`sunset` rows come back when `include_deprecated=true`, which is a plain query parameter rather than a `$filter` side effect.
+- **Inheritance does not interact with pagination**: the eval listing paginates exactly like the admin listing. Its single model query is scoped across the tenant chain and carries the caller's filter, order and cursor, so own and inherited rows are one globally ordered set and the cursor is a stable ordered walk of it. Provider-slug resolution is independent of any model page — it runs over `ChainProviders`, built from the whole chain's `providers` rows (§3.5). One consequence is worth stating: the cursor's `filter_hash` covers the caller's `$filter` only, not the mandatory `provider_id IN allow_list` predicate, so shadowing or disabling a provider mid-walk changes later pages silently. That is ordinary keyset behaviour over mutable data, not an inheritance artefact.
 
 **Versioning Policy**: All endpoints carry a `/v1/` URL prefix. v1 is **additive-only** — new optional fields, new endpoints, and new enum variants may ship without a major bump. Breaking changes (renamed fields, removed endpoints, narrowed enum sets, semantic changes) ship as `/v2/` with `/v1/` retained for one platform release as the deprecation window. Per-provider GTS leaves are versioned independently from the URL path: `OpenAiSettingsV1` and a future `OpenAiSettingsV2` may coexist in the catalog and are discriminated at runtime by `gts_type`; consumers narrow to whichever generation matches.
 
 | Dependency Gear    | Interface Used | Purpose | Phase |
 |-------------------|----------------|---------|-------|
-| `tenant-resolver` | `TenantResolverClient` via ClientHub | Resolve tenant hierarchy (ancestor chain) for additive inheritance and ownership classification | P1 |
+| `tenant-resolver` | `TenantResolverClient` via ClientHub | Resolve tenant hierarchy (ancestor chain) for additive inheritance on the eval reads | P1 |
 | `authz-resolver` | `AuthZResolverClient` wrapped in `PolicyEnforcer` via ClientHub | Per-operation authorization decision and the compiled `AccessScope` used by every query | P1 |
 | `approval-service` | SDK client via ClientHub | Manage approval workflow, query status | P2 |
 | `outbound-api-gateway` | SDK client via ClientHub | Execute provider API calls for discovery | P2 |
@@ -859,7 +874,7 @@ The gear declares `deps = ["tenant-resolver", "authz-resolver"]` and `capabiliti
 
 | Dependency Module | Interface Used | Purpose | Phase |
 |-------------------|----------------|---------|-------|
-| `tenant-resolver` | `TenantResolverClient` via ClientHub | Resolve tenant hierarchy (ancestor chain) | P1 |
+| `tenant-resolver` | `TenantResolverClient` via ClientHub | Resolve tenant hierarchy (ancestor chain) for the eval reads | P1 |
 | `authz-resolver` | `AuthZResolverClient` + `PolicyEnforcer` via ClientHub | Authorization decisions and `AccessScope` derivation | P1 |
 | `approval-service` | SDK client via ClientHub | Manage approval workflow, query status | P2 |
 | `outbound-api-gateway` | SDK client via ClientHub | Execute provider API calls for discovery | P2 |
@@ -871,7 +886,7 @@ The gear declares `deps = ["tenant-resolver", "authz-resolver"]` and `capabiliti
 - Always use SDK modules for inter-module communication
 - `SecurityContext` must be propagated across all in-process calls
 
-**Failure behavior in P1**: an ancestor-scoped **model** list query that fails is logged and skipped — the caller receives the partial (own-tenant + surviving ancestors) result rather than an error, because dropping ancestor model rows only ever narrows what the caller sees. **Provider queries are the deliberate exception and fail closed**: a provider read that fails at any tenant in the chain fails the whole request, since skipping one would un-shadow an ancestor and *widen* visibility (§3.5 sub-decision 1). A `tenant-resolver` or PDP failure surfaces as `DomainError::Internal` / `Forbidden` and fails the request.
+**Failure behavior in P1**: both eval reads fail closed. Each issues one chain-wide query per entity, so there is no partial outcome to degrade to — a provider or model query that fails fails the whole request as `DomainError::Internal`. Failing closed is required for providers regardless: serving a page while a provider read had failed would un-shadow an ancestor and *widen* visibility (§3.5 sub-decision 1). A `tenant-resolver` or PDP failure surfaces as `DomainError::Internal` / `Forbidden` and fails the request.
 
 ### 3.5 Interactions & Sequences
 
@@ -879,13 +894,15 @@ The gear declares `deps = ["tenant-resolver", "authz-resolver"]` and `capabiliti
 
 **ID**: `cpt-cf-model-registry-seq-resolve-tenant-visibility`
 
-**Use cases**: `cpt-cf-model-registry-usecase-get-tenant-model`, `cpt-cf-model-registry-usecase-list-tenant-models`, `cpt-cf-model-registry-usecase-list-all-tenant-models-management`
+**Use cases**: `cpt-cf-model-registry-usecase-get-tenant-model`, `cpt-cf-model-registry-usecase-list-tenant-models`
 
 **Actors**: `cpt-cf-model-registry-actor-llm-gateway`, `cpt-cf-model-registry-actor-tenant-admin`, `cpt-cf-model-registry-actor-platform-admin`
 
-This subsection implements [`cpt-cf-model-registry-adr-tenant-inheritance`](./ADR/0004-cpt-cf-model-registry-adr-tenant-inheritance.md). The ADR decides *what* shadowing means; the algorithm below is *how* every read satisfies it. The three read paths that follow — `get_tenant_model`, `list_tenant_models`, `list_tenant_models_management` — apply this one primitive rather than each deriving the rule again.
+This subsection implements [`cpt-cf-model-registry-adr-tenant-inheritance`](./ADR/0004-cpt-cf-model-registry-adr-tenant-inheritance.md). The ADR decides *what* shadowing means; the algorithm below is *how* the eval reads satisfy it. The two eval read paths — `get_tenant_model` and `list_tenant_models` — apply this one primitive rather than each deriving the rule again.
 
-**The shared primitive.** Whether a model row is visible is not a property of the row: it depends on the requester's whole ancestor chain, so it is recomputed per request from one structure.
+**Scope of this algorithm**: the eval zone only. The admin zone reads and writes under its PDP `AccessScope` and never builds `ChainProviders` (§3.3, §4 Authorization).
+
+**The shared primitive.** Whether a model row is eval-visible is not a property of the row: it depends on the requester's whole ancestor chain, so it is recomputed per request from one structure.
 
 ```text
 ChainProviders(T0) = every provider row owned by any tenant in [T0, parent(T0), …, root],
@@ -895,12 +912,17 @@ ChainProviders(T0) = every provider row owned by any tenant in [T0, parent(T0), 
                owning a provider with slug p.slug
                -- ownership ONLY; status is deliberately not a factor here
 
-Two derived views over the same structure:
+Derived views over the same structure:
 
   allow_list(T0)       = { p.id : winner(p) AND p.status == active }   -- eval visibility
-  shadowed(p)          = NOT winner(p)                                 -- management flag
+  winner_for_slug(s)   = the unique p with winner(p) AND p.slug == s   -- single-read entry point
+  shadowed(p)          = NOT winner(p)                                 -- eval exclusion
   provider_disabled(p) = p.status == disabled                          -- management flag
 ```
+
+`winner_for_slug` deliberately ignores `status`, so `get_tenant_model` can resolve a
+`disabled` winner and report `ProviderDisabled` **after** the model is found — see
+"Eval gates" below, where that ordering is normative.
 
 **How the structure is populated.** The chain is cache-first and is the only cached input (§2.1 "Resolution Caching"); the provider rows are queried per request:
 
@@ -910,10 +932,15 @@ chain(T0)     := cache get chain/{T0}
                       -- store the ordered ancestor ids under chain/{T0}, ttl = chain_cache_ttl_seconds
                       -- an empty list (root tenant) is a value, not an absence
 
-providers(T)  := DB SELECT … FROM providers (scope = AccessScope::for_tenant(T))
-                 -- per request, every time; the shape differs per path:
-                 --   get_tenant_model: by slug, closest-first, stopping at the first owner
-                 --   list paths:       the complete set, for every chain tenant
+providers(chain) := DB SELECT … FROM providers
+                    (scope = AccessScope::for_tenants([T0, parent(T0), …, root]))
+                    -- ONE query per request, spanning the whole chain. Each row is
+                    -- attributed to its own providers.tenant_id and ranked by that
+                    -- tenant's distance from T0, so `winner` is decided by chain
+                    -- position rather than by which query returned the row.
+                    -- The two paths differ only in whether the query is slug-filtered:
+                    --   get_tenant_model: AND slug = <parsed slug>   (≤ 1 row per tenant)
+                    --   list paths:       unfiltered, the complete set
 ```
 
 `winner` and `allow_list` are computed per request; no derived value is cached.
@@ -926,19 +953,23 @@ Note that `winner` turns on ownership alone and `allow_list` ANDs `status == act
 
 Slug parsing survives in exactly one place: `get_tenant_model` parses the caller's `canonical_id` to learn *which* slug to resolve (split on the **first** `::`, per PRD Key Concepts). The predicate it then applies is still `provider_id == winner.id`.
 
+This is now the *only* caller-supplied slug anywhere in the API. Every management operation is keyed by UUID (§3.3 "Identifiers in the API"), so `create_model` resolves its provider by id and hands the resolved row to the repository — the slug that forms `canonical_id` comes from that row, never from a request. A management write is therefore never ambiguous between two tenants' providers of the same slug, and `ProviderRepository::find_all_by_slug` has exactly one caller left: this resolution step.
+
 **Consequence for the SDK**: `ModelV1` carries `provider_id: Uuid`. The column and the FK already exist (§3.6); the SDK entity is the one place the field is missing, and PRD Domain Model → Model already lists it under Identification. Adding it is wire-additive and, per §3.1, a deliberate compile break for downstream struct literals — the SDK entity structs are not `#[non_exhaustive]` precisely so a new field surfaces at compile time.
 
-**Corollary — cross-tenant `canonical_id` collisions cannot survive resolution.** A `canonical_id` is `{provider_slug}::{provider_model_id}`, and a model's tenant always equals its provider's tenant (§3.1 Invariants). Two rows in one chain therefore share a `canonical_id` only when two tenants own the same slug — which is exactly the case where at most one of them wins. Every losing row is dropped by the `allow_list` membership test before any dedupe step runs. Deduping the merged result by `canonical_id` is a redundant safety net, not the mechanism; a merge that dedupes *instead of* testing membership is the shipped bug recorded in §4 Technical Debt.
+**Corollary — cross-tenant `canonical_id` collisions cannot survive resolution.** A `canonical_id` is `{provider_slug}::{provider_model_id}`, and a model's tenant always equals its provider's tenant (§3.1 Invariants). Two rows in one chain therefore share a `canonical_id` only when two tenants own the same slug — which is exactly the case where at most one of them wins. Every losing row is dropped by the `allow_list` membership test, so no dedupe step is needed at all — and a merge that dedupes *instead of* testing membership is a bug, not a simplification: an ancestor model with no colliding `canonical_id` at the closer tenant survives a dedupe even though its provider's slug has been shadowed.
 
 ##### Per-path application
 
-**`get_tenant_model(T0, canonical_id)`** — resolves one slug rather than building the whole map, because this path carries the `<10ms P99` latency NFR (§1.2):
+**`get_tenant_model(T0, canonical_id)`** — builds `ChainProviders` over the slug-filtered rows only, which keeps the map bounded by chain depth while still costing a single round trip (`<10ms P99`, §1.2):
 
 ```text
 slug := canonical_id.split_once("::").0          -- PRD parsing rule; malformed → ModelNotFound
-winner := first tenant T in chain(T0) that owns a provider with `slug`
-          -- one indexed query on (tenant_id, slug) per hop; stop at the first owner
-          -- resolved on ownership alone; status is not consulted yet
+rows := DB SELECT … FROM providers
+        WHERE slug = :slug (scope = AccessScope::for_tenants(chain(T0)))
+        -- ONE indexed query on (tenant_id, slug); at most one row per chain tenant
+winner := winner_for_slug(ChainProviders(rows), slug)
+          -- the closest owner, on ownership alone; status is not consulted yet
 if no winner                       -> ProviderNotFoundBySlug
 
 -- read the model under the winner's tenant ONLY
@@ -961,34 +992,26 @@ The gates run **after** the row is found, not before it. A disabled winner is th
 
 Every value a gate reads — `lifecycle_status`, `winner.status`, `approval_status` — is a column on a row fetched within the request, so no gate consults cached state and none evicts anything.
 
-**`list_tenant_models(T0, …)`** (eval) — builds the full `ChainProviders(T0)`, then queries per tenant with that tenant's slice of the allow-list as a mandatory predicate:
+**`list_tenant_models(T0, …)`** (eval) — builds the full `ChainProviders(T0)`, then applies the chain-wide allow-list as a mandatory predicate on **one** query:
 
 ```text
 chain := ChainProviders(T0);  allow := allow_list(T0)
-for T in [T0, parent(T0), …, root]:
-    slice := { p.id ∈ allow : p.owner_tenant == T }
-    if slice is empty: skip T entirely            -- every provider of T lost or is disabled
-    rows(T) := SELECT … WHERE provider_id IN slice
-                 AND lifecycle_status NOT IN (deprecated, sunset)
-                 AND approval_status = 'approved'
-                 AND <caller $filter>             -- own tenant also carries $orderby + page
-merge rows in chain order (closest first); truncate to the caller's page size
+if allow is empty: return an empty page          -- nothing in the chain can match, and
+                                                 -- `IN ()` has no portable rendering
+rows := SELECT … WHERE provider_id IN allow
+          AND lifecycle_status NOT IN (deprecated, sunset)
+          AND approval_status = 'approved'
+          AND <caller $filter>
+        (scope = <caller PDP scope> OR owner_tenant_id IN (ancestors))
+        ORDER BY <caller $orderby>, canonical_id
+        LIMIT <clamped $top>  -- plus the caller's cursor predicate
 ```
 
-**`list_tenant_models_management(T0, …)`** — the same walk with **no** allow-list filter, because the losing rows are the point of the endpoint. `ChainProviders(T0)` is still built, and is used only to compute the per-row flags:
+There is no merge and no truncation step: the allow-list already carries the shadow
+and disabled-provider gates for every tenant at once, so the database returns the
+merged set already ordered and paginated.
 
-```text
-chain := ChainProviders(T0)
-rows  := every model row across the chain (caller $filter; include_deprecated gates terminal rows)
-for each row, with p := chain[row.provider_id]:
-    row.shadowed          := shadowed(p)
-    row.provider_disabled := provider_disabled(p)
-    row.available_for_eval := p.id ∈ allow_list(T0)
-                              AND row.lifecycle_status NOT IN (deprecated, sunset)
-                              AND row.approval_status == approved
-```
-
-`available_for_eval` is the exact conjunction of the three eval mandatory predicates, so it answers "would `list_tenant_models` return this row, and would `get_tenant_model` resolve it?" with one boolean and consumers never re-derive the rule. The three flags decompose the answer: `shadowed` and `provider_disabled` name the two provider-derived reasons, and a row with `available_for_eval = false` while both flags are `false` is a row held back by its own `lifecycle_status` or `approval_status`, both of which the row already carries.
+**`list_tenant_models_management(T0, …)`** builds no `ChainProviders` — it is an admin read. See "Management Model Listing" below.
 
 ##### Eval gates
 
@@ -1017,9 +1040,9 @@ The two keys agree whenever the closer tenant happens to own a model of the same
 
 ##### Sub-decisions
 
-1. **Provider resolution fails closed.** A provider query that fails at *any* tenant in the chain fails the whole read (`DomainError::Internal`); it is never logged-and-skipped. This is deliberately the inverse of the partial-results rule for ancestor *model* queries (§3.4): dropping ancestor model rows only ever narrows what the caller sees, whereas skipping a closer tenant's provider row **widens** it — a failed query would silently un-shadow the ancestor and serve the models the shadow exists to hide. This follows the ADR's fail-closed consequence rather than introducing a new rule.
+1. **Provider resolution fails closed.** The chain-wide provider query is a single statement, so a failure fails the whole read (`DomainError::Internal`); it is never logged-and-skipped. That is required rather than incidental: serving a page while a provider row was missing would silently un-shadow an ancestor and hand back the models the shadow exists to hide — a **widening**, which the ADR's fail-closed consequence forbids. Model queries fail closed for the same structural reason (§3.4): with one query per entity there is no partial result to fall back to.
 2. **The model is read under the winning tenant only.** `get_tenant_model` resolves the winner first, then issues one query scoped to that tenant. Searching the chain for a `canonical_id` and returning on the first hit performs no slug resolution, so it would serve an ancestor's row to a subtree that has shadowed its provider.
-3. **Provider resolution is not cached.** Slug ownership costs one indexed query per chain hop. A provider cache would have to be owner-keyed to be shared by the inheriting subtree, making resolution N cache reads for an N-deep chain — the same count as the queries it replaces. Deferred (§4 Technical Debt & Roadmap).
+3. **Provider resolution is not cached.** Slug ownership costs one indexed query over the chain. A provider cache would have to be owner-keyed to be shared by the inheriting subtree, making resolution N cache reads for an N-deep chain — strictly worse than the single query it would replace. Deferred (§4 Technical Debt & Roadmap).
 4. **`provider_id IN (…)` is a repository-level mandatory predicate.** It is ANDed onto the query inside `ModelRepository`, alongside the lifecycle exclusion — not exposed as an OData field and not bindable through `FieldToColumn`, which maps each filter field to exactly one real column and has no set-literal form. A caller's `$filter` can only narrow the result further (§3.3 "The narrowing invariant").
 
 #### Get Tenant Model
@@ -1040,7 +1063,7 @@ sequenceDiagram
     participant DB as PostgreSQL
 
     LLMGateway->>MR: get_tenant_model(ctx, canonical_id)
-    MR->>PDP: access_scope(ctx, model, "get")
+    MR->>PDP: access_scope(ctx, model, "get", None)
     PDP-->>MR: AccessScope
 
     MR->>Cache: get_chain(tenant_id)
@@ -1067,7 +1090,7 @@ sequenceDiagram
     MR-->>LLMGateway: Model (approved, on an active winning provider)
 ```
 
-**Description**: Resolves a canonical model ID for a tenant, applying the primitive from "Tenant Visibility Resolution" above in its single-slug form. The PDP decision comes first, then the ancestor chain (cache-first). The `canonical_id` is split on its first `::` and that one slug is resolved closest-first, stopping at the first tenant that owns it — the whole `ChainProviders` map is not materialized here, because this path carries the `<10ms P99` NFR. Each hop is one lookup on the `(tenant_id, slug)` unique index.
+**Description**: Resolves a canonical model ID for a tenant, applying the primitive from "Tenant Visibility Resolution" above in its single-slug form. The PDP decision comes first, then the ancestor chain (cache-first). The `canonical_id` is split on its first `::` and that one slug is resolved with a single lookup on the `(tenant_id, slug)` unique index, scoped across the whole chain at once. `ChainProviders` **is** materialized here, but only over the slug-filtered rows — at most one per chain tenant — which costs less than the per-hop round trips it replaces and keeps this path inside its `<10ms P99` NFR.
 
 The model is then read under the winning tenant's scope **only** and is returned only when its `provider_id` matches the winner. Searching the chain for the `canonical_id` and returning on the first hit would serve an ancestor's model to a subtree that has since shadowed its provider, because that path performs no slug resolution.
 
@@ -1090,44 +1113,34 @@ sequenceDiagram
     actor TenantAdmin
     participant MR as ModelRegistry
     participant PDP as AuthZResolver
-    participant Tenant as TenantResolver
     participant DB as PostgreSQL
 
     TenantAdmin->>MR: GET /v1/admin/models ($filter, $orderby, $top, cursor, include_deprecated)
-    MR->>PDP: access_scope(ctx, model, "list") + admin grant
+    MR->>PDP: access_scope(ctx, model, "list_management", None) + admin grant
     alt not tenant-admin / platform-admin
         PDP-->>MR: denied
         MR-->>TenantAdmin: 403 unauthorized
     else admin
         PDP-->>MR: AccessScope
-        MR->>Tenant: get_ancestors(tenant_id)
-        Tenant-->>MR: [parent, ..., root]
 
-        MR->>DB: SELECT providers (own + every ancestor scope)
-        DB-->>MR: provider rows
-        note over MR: build ChainProviders: tag each provider<br/>{owner_tenant, slug, status, winner}<br/>any query error → fail closed (Internal)
-
-        MR->>DB: SELECT models (own scope, caller filter + order + page)
-        loop each ancestor
-            MR->>DB: SELECT models (ancestor scope, caller filter + order, no page)
-        end
-        DB-->>MR: own rows + inherited rows
-
-        note over MR: NO allow-list predicate — the losing rows<br/>are the point of this endpoint<br/>(the eval listing ANDs it into the query)
+        MR->>DB: SELECT models (AccessScope, caller filter + order + page)
         note over MR: no mandatory predicates;<br/>drop deprecated/sunset only when include_deprecated = false
-        note over MR: per row, from ChainProviders[row.provider_id]:<br/>shadowed = NOT winner, provider_disabled = status disabled,<br/>available_for_eval = in allow_list AND approved<br/>AND not terminal lifecycle
+        DB-->>MR: model rows
+
+        MR->>DB: SELECT providers WHERE id IN (page provider_ids)<br/>scope = for_tenants(page tenant_ids)
+        DB-->>MR: provider rows
+        note over MR: per row, from its provider:<br/>provider_disabled = status disabled,<br/>available_for_eval = provider active AND approved<br/>AND not terminal lifecycle
         MR-->>TenantAdmin: 200 page of ModelManagementDto
     end
 ```
 
-**Description**: Same shape as the eval listing and the same `ChainProviders` structure (§3.5 "Tenant Visibility Resolution") — one own-tenant model query carrying the caller's filter, order and pagination, one unpaginated query per ancestor so the merge sees each ancestor's complete set, then a truncation to the page size (§2.1). Two steps differ:
+**Description**: One scoped `SELECT` over `models`, then one `SELECT` over the providers backing that page. No ancestor chain is resolved and no `ChainProviders` is built — the endpoint returns exactly the rows the caller's `AccessScope` covers, paginated normally (§2.1). Three properties define it:
 
-1. **The allow-list predicate is not applied.** The eval query ANDs `provider_id IN allow_list` into every per-tenant `SELECT`; here it is omitted, so the rows whose provider lost its slug or is `disabled` survive. They come back with `shadowed` / `provider_disabled` set and are read-only — a management caller cannot mutate a model owned by an ancestor tenant (§2.1 "Model creation is scoped to the caller's own tenant's providers only"). This is a wider candidate set, not a looser `WHERE` clause: the same `ChainProviders` is still built, and is what computes the flags.
-2. **No mandatory predicates.** Rows in every `approval_status` come back — this is the only read that returns a `pending` / `rejected` / `revoked` model at all, since the eval listing excludes them and `get_tenant_model` refuses them with `ModelNotApproved` (§3.5 "Tenant Visibility Resolution"). They arrive with `available_for_eval = false` rather than being filtered out. The only exclusion is `deprecated`/`sunset` when `include_deprecated=false` (the default), and it is driven by that explicit parameter, never by the shape of the caller's `$filter`.
+1. **No mandatory predicates.** Rows in every `approval_status` come back — this is the only read that returns a `pending` / `rejected` / `revoked` model at all, since the eval listing excludes them and `get_tenant_model` refuses them with `ModelNotApproved` (§3.5 "Tenant Visibility Resolution"). They arrive with `available_for_eval = false` rather than being filtered out. Rows on a `disabled` provider likewise survive, marked `provider_disabled`. The only exclusion is `deprecated`/`sunset` when `include_deprecated=false` (the default), driven by that explicit parameter and never by the shape of the caller's `$filter`.
+2. **Flags are computed from the page's own providers.** They are fetched by id under `AccessScope::for_tenants(<tenant ids of the returned rows>)`. A model's tenant always equals its provider's (§3.1 Invariants), so this reaches no tenant the caller was not already authorized to read; the model scope itself cannot be reused, since its constraints bind to `models` columns. A provider that cannot be read leaves both flags `false`.
+3. **`shadowed` is not reported.** Shadowing is defined against a requester's ancestor chain (§2.1) and this endpoint has no reference chain — a row that loses its slug for one tenant wins it for another. `available_for_eval` therefore answers "is this row approved, live, and on an active provider?", not "would tenant X's eval listing return it?". `GET /v1/models` is the authority on the latter.
 
-Provider resolution is fail-closed here too: an errored provider query fails the request rather than yielding a page whose `shadowed` flags are quietly wrong.
-
-Authorization is the admin grant from the matrix in §4 Security → Authorization; a non-admin caller is refused with `403` before any query runs. Model rows are read from the database on every request and list pages are not a cache entity (§2.1), so the view always reflects the committed catalog; only the provider flags it computes come from cached resolution state.
+Authorization is the admin grant from the matrix in §4 Security → Authorization; a non-admin caller is refused with `403` before any query runs. Rows are read from the database on every request and list pages are not a cache entity (§2.1), so the view always reflects the committed catalog.
 
 #### Model Discovery
 
@@ -1284,8 +1297,8 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant Cache as ResolutionCache
 
-    TenantAdmin->>MR: PATCH /models/{canonical_id} {approval_status}
-    MR->>PDP: access_scope(ctx, model, "update")
+    TenantAdmin->>MR: PATCH /admin/models/{id} {approval_status}
+    MR->>PDP: access_scope(ctx, model, "update", Some(id))
     PDP-->>MR: AccessScope
     MR->>DB: SELECT … WHERE canonical_id
     DB-->>MR: existing row
@@ -1532,10 +1545,10 @@ Write-path consequence: because the projection is whole-row, any PATCH that touc
 
 #### Provider-derived visibility is not stored on `models`
 
-Neither `shadowed` nor `provider_disabled` is a column. Both are computed per request from `ChainProviders` (§3.5 "Tenant Visibility Resolution"), and the reason is the same for both: they are properties of the requester's view, or of the *other* table, rather than of the row.
+Neither shadowing nor `provider_disabled` is a column. Both are computed per request, and the reason is the same for both: they are properties of the requester's view, or of the *other* table, rather than of the row.
 
-- **`shadowed` cannot be stored at all.** Whether an ancestor's model is shadowed depends on the requester's own tenant chain — the same row is shadowed for one subtree and not for another — so there is no value a column could hold.
-- **`provider_disabled` could be denormalized, and deliberately is not.** `providers.status` is the source of truth. Because `ChainProviders` has to be built on every read regardless (to resolve shadowing, which *is* unstorable), each provider's `status` is already in memory when the models are filtered; the disabled gate collapses into the same `provider_id IN allow_list` predicate as the shadow gate at zero marginal cost. A shadow column would duplicate that state on disk and add a write-path sync obligation — `UPDATE models SET … WHERE provider_id = ?` in-transaction on every provider status change — whose failure mode is a silently wrong answer. Provider sets are small (vendor-account configs, a handful per tenant), so the IN-list stays short. This would flip only if winning-provider sets reached the hundreds, or if a future single-UNION eval query across the chain removed the need to materialize the provider set at all; neither holds today.
+- **Shadowing cannot be stored at all.** Whether an ancestor's model is shadowed depends on the requester's own tenant chain — the same row is shadowed for one subtree and not for another — so there is no value a column could hold. This is also why the admin listing, which has no reference chain, does not report it (§3.5 "Management Model Listing").
+- **`provider_disabled` could be denormalized, and deliberately is not.** `providers.status` is the source of truth. Because `ChainProviders` has to be built on every read regardless (to resolve shadowing, which *is* unstorable), each provider's `status` is already in memory when the models are filtered; the disabled gate collapses into the same `provider_id IN allow_list` predicate as the shadow gate at zero marginal cost. A shadow column would duplicate that state on disk and add a write-path sync obligation — `UPDATE models SET … WHERE provider_id = ?` in-transaction on every provider status change — whose failure mode is a silently wrong answer. Provider sets are small (vendor-account configs, a handful per tenant), so the IN-list stays short. This would flip only if winning-provider sets reached the hundreds. The chain-wide eval query does not change that: it still resolves shadowing from the materialized provider set and then applies it as one `provider_id IN allow_list` predicate.
 
 Consequently neither flag is an OData filter field: `FieldToColumn` binds each filter field to exactly one real `models` column, and neither has one (§3.3). Both are read-only fields on `ModelManagementDto`, and management callers narrow on them client-side.
 
@@ -1646,7 +1659,6 @@ Error codes follow the RFC 9457 Problem Details standard, produced through `tool
 | ModelNotApproved | ModelNotApproved | 403 | `permission_denied` |
 | Forbidden | Forbidden | 403 | `permission_denied` |
 | ProviderDisabled | ProviderDisabled | 403 | `permission_denied` |
-| ProviderNotOwned | ProviderNotOwned | 403 | `permission_denied` |
 | ProviderConflict | ProviderConflict | 409 | `already_exists` |
 | ProviderHasModels | ProviderHasModels | 400 | `failed_precondition` |
 | InvalidTransition | InvalidTransition | 400 | `failed_precondition` |
@@ -1660,8 +1672,8 @@ Notes on the mapping:
 - **`ModelNotApproved` is the eval read's approval gate** — `get_tenant_model` returns it (403) for any model whose `approval_status` is not `approved`, evaluated after the provider and lifecycle gates (§3.5). `list_tenant_models` has no such error to return: it excludes those rows through its mandatory predicate, the same way it handles a disabled provider. The status still travels on the model for the management listing, which returns non-approved rows by design.
 - **`Unauthenticated` (401)** exists on the SDK error enum but is not constructed by this module: authentication is enforced by `OperationBuilder::authenticated()` before a handler runs, so the 401 comes from the toolkit's auth layer. `DomainError` has no `Unauthenticated` variant for that reason.
 - **`ProviderDisabled` is 403, not 404** — the provider exists and the caller may see it; what is refused is creating a model against it. `get_tenant_model` must also return `ProviderDisabled`, not only `create_model` — for a `canonical_id` that resolves to a live model whose winning provider is `disabled`, checked after the lifecycle gate so an unresolvable ID still yields `ModelNotFound` (§3.5 "Tenant Visibility Resolution"). `list_tenant_models` has no such error to return: it drops those rows from the page via the allow-list predicate.
-- **`ProviderNotOwned`**: a 403 variant for `create_model` when `provider_slug` resolves only in an ancestor tenant, not the caller's own. Distinct from `ProviderNotFound` (the provider genuinely doesn't exist anywhere in the chain) and from `Forbidden` (a role/PDP denial) — this is a structural ownership rule, not an authorization decision.
-- **Duplicate `canonical_id`** on create is a `Validation` (400), not a 409: the conflict is in the *derived* identity (`provider_slug` + `provider_model_id`), so it reads as a bad request body rather than a resource collision.
+- **Two model not-found variants**: `ModelNotFound { canonical_id }` is returned by the eval read, which was given a `canonical_id`; `ModelNotFoundById { id }` by `get_model` / `update_model` / `delete_model`, which were given a UUID. Both map to 404 with the supplied identifier as the problem's `resource`. They are separate variants rather than one opaque string so an error never reports an identifier the caller did not send.
+- **Duplicate `canonical_id`** on create is a `Validation` (400), not a 409: the conflict is in the *derived* identity (the resolved provider's slug + `provider_model_id`), so it reads as a bad request body rather than a resource collision.
 - **`ProviderHasModels` and `InvalidTransition` are `failed_precondition` (400), not `already_exists` (409) or `invalid_argument` (400).** Both refuse an operation because of the target row's current state, which is what `failed_precondition` means; `already_exists` would claim a collision when nothing already exists, and `invalid_argument` would blame the request body when it is well-formed. The reason travels as a `violations[]` entry — `subject` is the discriminator (`provider` / `model`), `type` is the finer token (`PROVIDER_HAS_MODELS` / `INVALID_TRANSITION`) — so callers dispatch on structure instead of parsing the detail string. `ProviderHasModels` also carries the provider id as `resource_name`; its violation description states the referencing-model count, except on the FK-violation fallback where the count is unknown (`provider_repo::delete`). This is the same shape `account-management` uses for `TenantHasChildren` / `AlreadyResolved`.
 
 Errors deferred to a later phase, listed here with the phase that introduces them so they are scoped rather than undocumented. None is a `DomainError` or `ModelRegistryError` variant today:
@@ -1692,7 +1704,7 @@ A cache write that fails (encode error, backend error) is logged and skipped; th
 
 ### Security Considerations
 
-- **Tenant isolation**: the single cache key names one tenant (`chain/{tenant_id}`) and its value is a list of tenant IDs; no row data is cached. Queries filter by tenant hierarchy via `SecureConn` + `AccessScope`, and each ancestor-scoped read uses an explicitly constructed `AccessScope::for_tenant(ancestor)` rather than a widened caller scope (§2.1).
+- **Tenant isolation**: the single cache key names one tenant (`chain/{tenant_id}`) and its value is a list of tenant IDs; no row data is cached. Every query is filtered via `SecureConn` + `AccessScope`. The admin zone uses the PDP scope unchanged; the eval reads additionally issue ancestor queries under an explicitly constructed `AccessScope::for_tenant(ancestor)` rather than a widened caller scope (§2.1).
 - **Credential protection**: Provider credentials are never stored in this module — `cpt-cf-model-registry-constraint-no-credentials`. OAGW owns credential storage and injection per `cpt-cf-model-registry-adr-oagw-provider-access`.
 
 #### Authentication
@@ -1701,22 +1713,36 @@ End-user authentication is **delegated** to the platform: `api-gateway` terminat
 
 #### Authorization
 
-Authorization is evaluated **per operation** by the `authz-resolver` PDP, not by hand-rolled role checks in this module. Each service method calls `PolicyEnforcer::access_scope(ctx, resource, action, None)` and receives an `AccessScope` that is then applied to every query for that request; a denied decision surfaces as `DomainError::Forbidden` → 403. The resource types are `model_registry.provider` and `model_registry.model` (both declaring the `owner_tenant_id` and `resource_id` properties); the actions are `get`, `list`, `create`, `update`, `delete`, `list_management`.
+Authorization is evaluated **per operation** by the `authz-resolver` PDP, not by hand-rolled role checks in this module. Each service method calls `PolicyEnforcer::access_scope(ctx, resource, action, resource_id)` and receives an `AccessScope` that is then applied to every query for that request; a denied decision surfaces as `DomainError::Forbidden` → 403. The resource types are `model_registry.provider` and `model_registry.model` (both declaring the `owner_tenant_id` and `resource_id` properties); the actions are `get`, `list`, `create`, `update`, `delete`, `list_management`, `get_management`.
 
-The matrix below is the **intended policy** — it is configured in `authz-resolver`, not encoded in this gear. What the gear guarantees structurally is narrower and independent of policy content: no query escapes its `AccessScope`, and ancestor reads use an explicitly constructed ancestor scope rather than a widened caller scope.
+`resource_id` is `Some(id)` for every point operation — `get_provider`, `update_provider`, `delete_provider`, `get_model`, `update_model`, `delete_model` — and `None` for the collection operations (both listings, both creates) and for `get_tenant_model`, which holds a `canonical_id` rather than an id at decision time. Supplying the id is what makes the declared `resource_id` property usable: a policy may return `id`-scoped constraints, which the ORM binds to `resource_col = "id"`, and a management write is authorized against the specific row it will touch rather than against the resource type alone.
 
-| Role | Read Models / Providers | Manage Providers (CRUD) | Manage Models (CRUD) | Approve / Reject / Revoke | Trigger Discovery | Manage Aliases |
-|------|-------------------------|--------------------------|----------------------|---------------------------|-------------------|----------------|
-| `platform-admin` | own + descendants | own + descendants | own + descendants | yes (any) | yes (any) | own + descendants |
-| `tenant-admin` | own tenant + inherited | own tenant only | own tenant only | own tenant only | own tenant only | own tenant only |
-| `llm-gateway-svc` | own tenant + inherited (read-only) | — | — | — | — | — |
-| anonymous / other | — | — | — | — | — | — |
+`get_management` is a distinct action from `get` for the same reason `list_management` is distinct from `list`: it returns rows the eval read refuses — `pending`, `rejected`, `deprecated`, or on a disabled provider — so a principal holding only the open eval-read grant must not be able to observe them by switching identifier.
 
-**Management model listing** (`GET /v1/admin/models`) is the one read operation that does **not** follow the "Read Models / Providers" row: it requires the same grant as the write columns — `platform-admin` over own + descendants, `tenant-admin` over own tenant + inherited — and `llm-gateway-svc` is refused, while `GET /v1/models` stays open to any tenant member (§3.3 "Two listing endpoints"). The rows it returns for ancestor-owned providers are read-only regardless of the caller's role, since model writes require the model's tenant to match its provider's tenant (§2.1).
+The matrix below is the **intended policy** — it is configured in `authz-resolver`, not encoded in this gear. What the gear guarantees structurally is narrower and independent of policy content: no query escapes its `AccessScope`, the admin zone issues every query under the PDP scope alone, and the eval reads use an explicitly constructed ancestor scope rather than a widened caller scope.
+
+**The admin zone's tenant reach is the PDP's decision.** Whether a tenant-admin can read or write rows in an ancestor or a descendant is decided entirely by the scope the PDP returns; the gear performs no hierarchy walk to widen it and no ownership check to narrow it. The two mechanisms are independent: additive inheritance governs what the *eval* reads return (§2.1), and a policy that grants an admin nothing beyond its own tenant leaves inherited rows readable through `GET /v1/models` and absent from every `/v1/admin/…` response.
+
+The "Read Models (eval)" column is the eval zone — `GET /v1/models` and `GET /v1/models/{canonical_id}` — and is the only column open to a non-admin tenant member. Everything under `/v1/admin/…`, including the provider reads, requires an admin grant.
+
+The "Read Models (eval)" column describes the reach the eval reads produce, which is the caller's tenant plus its ancestors regardless of role. Every other column is the tenant set the PDP puts in the returned `AccessScope`.
+
+| Role | Read Models (eval) | Read Providers | Manage Providers (CRUD) | Manage Models (CRUD) | Approve / Reject / Revoke | Trigger Discovery | Manage Aliases |
+|------|--------------------|----------------|--------------------------|----------------------|---------------------------|-------------------|----------------|
+| `platform-admin` | own + inherited | own + descendants | own + descendants | own + descendants | own + descendants | own + descendants | own + descendants |
+| `tenant-admin` | own + inherited | own tenant only | own tenant only | own tenant only | own tenant only | own tenant only | own tenant only |
+| `llm-gateway-svc` | own + inherited (read-only) | — | — | — | — | — | — |
+| anonymous / other | — | — | — | — | — | — | — |
+
+**Provider reads live in the admin zone** (§3.3): `GET /v1/admin/providers` and `GET /v1/admin/providers/{id}` require an admin grant — `platform-admin` over own + descendants, `tenant-admin` over its own tenant — and `llm-gateway-svc` is refused. A tenant-admin therefore cannot read the ancestor provider rows behind the models its eval listing inherits. Nothing in the eval path needs them: the gateway resolves a model and reads `info.gts_type` to pick its plugin, never a provider row.
+
+`create_model` consults both provider and model policy: the provider is resolved under `model_registry.provider` / `get`, and the row is written under `model_registry.model` / `create` with the resolved provider's `tenant_id`. Creating a model in another tenant therefore requires that tenant in both scopes.
+
+**Management model reads** (`GET /v1/admin/models`, `GET /v1/admin/models/{id}`) require the same grant as the model write column, under the `list_management` / `get_management` actions, while the eval reads stay open to any tenant member (§3.3 "Two listing endpoints"). Read and write reach can differ, because `get_management` and `update` are separate decisions — a policy granting the first over a wider tenant set than the second yields rows that are readable but not writable.
 
 **Tag management** (P3 — create/update/delete tags, assign/remove tags on models) follows the same row as "Manage Aliases": `platform-admin` over own + descendants, `tenant-admin` over own tenant only; reads (list tags, tags on a model) follow the read-models row. The final create/delete grant is an **open question** tracked in PRD Open Question #4; the matrix above encodes the working default and will be reconciled when that question resolves.
 
-GTS-typed scoping further narrows write access by provider/lifecycle type when policies require it (e.g. only `platform-admin` may create `lifecycle_status = production`). All decisions follow least-privilege: read endpoints accept the lowest role that can prove tenant membership; write endpoints require an admin role for the target tenant; discovery and bulk-approve require explicit admin grants. Privilege escalation is prevented by the additive-inheritance rule (§2.1) — child tenants can never expand beyond a parent's permissions.
+GTS-typed scoping further narrows write access by provider/lifecycle type when policies require it (e.g. only `platform-admin` may create `lifecycle_status = production`). All decisions follow least-privilege: read endpoints accept the lowest role that can prove tenant membership; write endpoints require an admin role for the target tenant; discovery and bulk-approve require explicit admin grants.
 
 #### Audit & Compliance
 
@@ -1757,7 +1783,7 @@ The registry serves a high read:write ratio and chooses a deliberate consistency
 
 This subsection records the capacity-planning, cost-allocation, and cost-data-lifecycle posture for v1; it materializes ARCH-DESIGN-010 and is bounded by the NFR allocation in §1.2.
 
-- **Capacity planning**: Targets are 10 000 tenants × 200 models = 2 million catalog rows (`cpt-cf-model-registry-nfr-scale`) and the `cpt-cf-model-registry-nfr-performance` budgets (≤ 10 ms P99 on `get_tenant_model`, ≤ 50 ms P99 on `list_tenant_models`, ≤ 100 ms P99 on `approve_model`) at 99.9% availability (`cpt-cf-model-registry-nfr-availability`). Cache footprint is one entry of tenant UUIDs per tenant — roughly a megabyte at 10 000 tenants, independent of catalog size. The database is sized for the full 2M rows with the indexes listed in §3.6 and carries every catalog read: one indexed lookup per chain hop for slug resolution plus one per model read. Size the database for that read volume rather than assuming a cache in front of it. Per-tenant model counts above 10× the median (~2 000 models) are treated as outliers and trigger an operator review of the tenant's discovery scope rather than a capacity expansion. Discovery throughput is bounded by the per-provider distributed lock — at most one in-flight discovery per provider per cluster regardless of caller (admin or external scheduler); aggregate provider load is OAGW's concern via its rate-limit configuration.
+- **Capacity planning**: Targets are 10 000 tenants × 200 models = 2 million catalog rows (`cpt-cf-model-registry-nfr-scale`) and the `cpt-cf-model-registry-nfr-performance` budgets (≤ 10 ms P99 on `get_tenant_model`, ≤ 50 ms P99 on `list_tenant_models`, ≤ 100 ms P99 on `approve_model`) at 99.9% availability (`cpt-cf-model-registry-nfr-availability`). Cache footprint is one entry of tenant UUIDs per tenant — roughly a megabyte at 10 000 tenants, independent of catalog size. The database is sized for the full 2M rows with the indexes listed in §3.6 and carries every catalog read: one chain-wide indexed lookup for slug resolution plus one per model read, independent of tenant depth. Size the database for that read volume rather than assuming a cache in front of it. Per-tenant model counts above 10× the median (~2 000 models) are treated as outliers and trigger an operator review of the tenant's discovery scope rather than a capacity expansion. Discovery throughput is bounded by the per-provider distributed lock — at most one in-flight discovery per provider per cluster regardless of caller (admin or external scheduler); aggregate provider load is OAGW's concern via its rate-limit configuration.
 - **Cost-allocation strategy by scale**: The cache backend is an operator binding in cluster config, not a compile-time choice this module makes. Every deployment size binds the `standalone` (in-process) cluster cache and pays no cache infrastructure cost at any scale (§4 Capacity & Cost). The cost that scales is database read capacity, not cache infrastructure. The trade-off is documented in `cpt-cf-model-registry-adr-pluggable-cache`.
 - **AICredits cost-data lifecycle**: Per-model token and built-in-tool pricing live in each provider settings struct's nested `cost` block (`OpenAiCost`, `AnthropicCost`) as `u64` micro-credits (×1 000 000 scaling) and are persisted inside the polymorphic `provider_settings` JSONB column. In P1 that data arrives only through admin `POST` / `PATCH` on the model surface — there is no discovery write path and no cost-sync job. Historical pricing is not retained inside the registry; price changes overwrite in place. The AICredits accounting subsystem consumes the registry's current cost view at gateway request time and is responsible for its own historical ledger. When a model is deprecated, its `cost` block is preserved on the row (soft delete only mutates `lifecycle_status` and `deprecated_at`) so in-flight billing reconciliation can still resolve the price that applied at the time of consumption.
 
@@ -1796,15 +1822,14 @@ Known module-level debt is tracked here for visibility. Each item names what clo
 
 Carried out of P1:
 
-- **Provider resolution is uncached**: slug resolution costs one indexed lookup per chain hop, and both list paths query every chain tenant's provider rows, so read cost is O(chain depth) rather than constant. A provider cache must be owner-keyed to be shared by the inheriting subtree, which makes it N cache reads for an N-deep chain — the same count as the queries it replaces. Revisit only if per-hop lookups appear in a measured P99 at realistic tenant depth.
-- **Ancestor merge is not a stable paginated order**: ancestor rows are fetched without pagination, merged, then truncated to the page size, so the cursor anchors on own-tenant rows only (§3.3). A tenant inheriting a large catalog cannot walk the merged set page by page. Fixing it needs either a UNION-based query across the scope set or a merge-aware cursor.
-- **Ancestor fan-out is one query per ancestor**: `get_provider`, `get_tenant_model` and both list paths issue a query per ancestor tenant, for providers and (on the list paths) for models, so read cost grows linearly with tenant depth. `ChainProviders` being materialized in memory makes the fix reachable: a single chain-wide query filtered on `provider_id IN allow_list` would replace the model fan-out, and per-row ownership classification can be recomputed from the resolved provider map (`model.provider_id → owner_tenant`) rather than from which query returned the row. Doing so would also make the merged order stable, closing the item above. Not attempted here — it changes the repository query shape and the cursor contract, and this change set is scoped to the cache.
+- **Provider resolution is uncached**: every eval read queries the chain's provider rows from the database. Query *count* is now constant — one chain-wide statement rather than one per hop — so what remains is the round trip itself, not O(chain depth) round trips. A provider cache must be owner-keyed to be shared by the inheriting subtree, which makes it N cache reads for an N-deep chain, strictly worse than the single query it would replace. Revisit only if that one lookup appears in a measured P99 at realistic tenant depth.
 - **List pages are not cached**: both list endpoints query the database on every call. Caching a page needs an in-memory evaluator for the OData filter AST, which the toolkit does not have (`FieldToColumn` compiles straight to SeaORM columns), plus in-memory ordering and keyset-cursor semantics matching SQL's collation and null handling. Serving only unfiltered requests from a cached set is a cheaper intermediate step, rejected here because it gives one endpoint two latency and consistency profiles depending on the query.
 - **Whole-row re-projection on PATCH**: any PATCH touching an `info.*` field rewrites all scalar and JSONB columns (§3.6). Keeps shadows consistent by construction; produces verbose SQL.
 - **No measured performance**: the `<10ms P99` NFR has no benchmark and no load test behind it (§1.2).
 - **Chain entries expire but are never invalidated**: `chain/{tenant_id}` is keyed by the reader, so a reparent or `self_managed` barrier flip cannot be propagated by a write without enumerating descendants. `chain_cache_ttl_seconds` (default 30) is the bound; the P3 `tenant.reparented` handler removes it (§3.5 Event Catalog).
 - **MySQL backend — future work**: PostgreSQL and SQLite are the supported backends (§3.3 Compatibility). Adding MySQL means extending the migration's per-backend type dispatch and DDL rendering, and giving the gear a MySQL test target alongside the SQLite one.
-- **`AccessScope` does not narrow provider resolution — open question**: each chain tenant's provider rows are read under `AccessScope::for_tenant(T)`, so slug resolution and the allow-list are identical for every caller with access to that tenant. If a grant should ever hide a *provider* from a caller who can otherwise read the tenant, resolution has to move behind the caller's scope. Catalog-row queries are unaffected.
+- **`AccessScope` does not narrow eval provider resolution — open question**: on the eval path each chain tenant's provider rows are read under `AccessScope::for_tenant(T)`, so slug resolution and the allow-list are identical for every caller with access to that tenant. The admin zone is not affected — it issues every query under the PDP scope — but a grant that should hide a *provider* from a caller who can otherwise read the tenant would not change which provider wins a slug in that caller's eval listing. Fixing it means moving chain resolution behind the caller's scope. Catalog-row queries are unaffected.
+- **An `InTenantSubtree` scope cannot satisfy a create**: `ScopeFilter::values()` returns empty for that variant, so `validate_insert_scope` denies any insert whose scope carries one. The gear builds its enforcer with `PolicyEnforcer::new(authz)` and advertises no `Capability::TenantHierarchy`, so no PDP emits `InTenantSubtree` for it today; advertising that capability would break `create_provider` and `create_model`.
 - **The `cluster` gear is not wired into the platform build**: it is a workspace member but appears in neither `apps/cf-gears-example-server`'s manifest nor its `registered_gears.rs`, and no shipped `config/*.yaml` carries a `cluster:` section (`ClusterConfig::profiles` defaults to empty, binding no backend). Landing this design includes registering the gear, adding a `default` profile with `cache: { provider: standalone }`, and covering the degraded path when it is absent.
 - **No single-flight on a cold entry**: N concurrent requests missing the same `chain/{tenant}` key each call `tenant-resolver`. Results stay correct (the call is idempotent), but every 30-second expiry lets the fan-out recur under load. A per-key in-flight map would collapse them.
 - **No timeout on a cache read**: `ClusterCacheV1` calls are unwrapped. Under the in-process binding that is fine; under `postgres` a cache get is a network round-trip and a hung one hangs the request. The target posture in §4 Fault Tolerance names a 50ms cache timeout with dependency fallback; P1 does not implement it.
