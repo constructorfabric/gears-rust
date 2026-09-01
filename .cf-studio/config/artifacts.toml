@@ -1,4 +1,8 @@
 [[ignore]]
+reason = "Ignore github-mirror ALGORITHMS.md — algorithm companion reference, not a Constructor Studio SDLC artifact."
+patterns = ["gears/github-mirror/docs/ALGORITHMS.md"]
+
+[[ignore]]
 reason = "Ignore rust-traits.md — reference document for planned Rust SDK contracts, not a Constructor Studio SDLC artifact."
 patterns = ["gears/system/resource-group/docs/rust-traits.md"]
 
