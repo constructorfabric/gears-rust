@@ -41,7 +41,8 @@
 
 Registers the abstract QE subject/resource/request/constraint bases and the scope-discriminator type, resolves the
 deployment's owner projections into the immutable `ProjectionContractCatalog` at bootstrap, validates every evaluation
-request at Gateway ingress, authorizes caller-supplied attribution through PDP, and maps scope kinds to owner
+request's public shape at Gateway ingress, authorizes caller-supplied attribution through PDP, and then validates
+contracts and maps scope kinds to owner
 projections. This is the declarative contract surface the whole evaluation pipeline trusts.
 
 ### 1.2 Purpose
@@ -49,7 +50,8 @@ projections. This is the declarative contract surface the whole evaluation pipel
 Without enforced contracts, a Policy expression can silently miss because a request key is absent, misspelled, or of the
 wrong type, and per-caller projection taxonomies would fragment one shared counter into many. This feature turns those
 failures into save-time, bootstrap-time, or ingress-time errors: the metric owner declares the projection, the caller
-supplies logical attribution, PDP authorizes it, and QE performs deterministic catalogue mapping. It also defines the
+supplies logical attribution, QE checks its public shape, PDP authorizes it, and QE performs deterministic catalogue
+mapping and contract validation. It also defines the
 mapped-subject set that the consumption-operations feature consumes inside its `EvaluationOrchestrator` pipeline.
 
 **Scope**: bootstrap registration of the abstract bases and the P1 `user`/`tenant` scope well-known instances;
@@ -141,29 +143,36 @@ only; the Quota write itself is owned by the quota-lifecycle feature)
 **Actor**: `cpt-cf-quota-enforcement-actor-quota-consumer`
 
 **Success Scenarios**:
-- A conforming S2S request is authorized by PDP, mapped through the catalogue, and proceeds with one validated metadata object
+- A conforming S2S request passes public request-shape checks, is authorized by PDP, is mapped through the
+  catalogue, and proceeds with one validated metadata object
 
 **Error Scenarios**:
-- Missing/duplicate/unknown/unadmitted subject kind, missing `metadata`, schema mismatch, or inadmissible metric:
-  canonical `InvalidArgument` with a stable field-level reason, never `Decision::Denied`
-- PDP denies the supplied attribution tuple: canonical `PermissionDenied`
+- Missing required fields, wrong public container types, missing or empty ids, duplicate kinds, or repeated tenant scope:
+  canonical `InvalidArgument` before PDP
+- PDP denies a structurally valid supplied attribution tuple: canonical `PermissionDenied` before catalogue or
+  contract lookup
+- Authorized request with an unknown/unadmitted subject kind, contract-schema mismatch, or inadmissible metric: canonical
+  `InvalidArgument` with a stable field-level reason, never `Decision::Denied`
 
 **Steps**:
 1. [ ] - `p1` - Caller sends a subject-based evaluation operation carrying `tenant_id`, additional
-   `subjects: [{kind,id}]`, one operation-level `metadata`, and optional `resource`; foundation admission has
-   authenticated the service principal - `inst-ing-request`
-2. [ ] - `p1` - Send the complete untrusted tenant/subject/metric/resource tuple to PDP and attach the returned
+   `subjects: [{kind,id}]`, one operation-level `metadata`, and optional `resource`; platform admission has
+   authenticated the service principal and deserialized the DTO - `inst-ing-request`
+2. [ ] - `p1` - Validate public request shape: require all required top-level fields and their declared container types,
+   require non-empty `tenant_id` and subject ids, reject duplicate kinds, and reject tenant scope repeated in `subjects`;
+   return canonical `InvalidArgument` before PDP on failure - `inst-ing-shape`
+3. [ ] - `p1` - Send the complete untrusted tenant/subject/metric/resource tuple to PDP and attach the returned
    `AccessScope`; fail closed on denial or PDP unavailability - `inst-ing-authz`
-3. [ ] - `p1` - Validate non-empty ids, reject duplicate or repeated tenant scope, and map each `(metric, kind)` through
-   the process-local `ProjectionContractCatalog`; no registry call occurs on this path - `inst-ing-lookup`
-4. [ ] - `p1` - Validate required operation-level `metadata` against the metric request contract and validate the
-   optional resource when declared; absent `metadata` is never defaulted to `{}` - `inst-ing-metadata`
-5. [ ] - `p1` - **IF** any kind is unknown or does not admit the request metric - `inst-ing-metric-if`
+4. [ ] - `p1` - Map each authorized `(metric, kind)` through the process-local `ProjectionContractCatalog`; no registry
+   call occurs on this path - `inst-ing-lookup`
+5. [ ] - `p1` - Validate operation-level `metadata` against the metric request contract and validate the optional
+   resource when declared; absent `metadata` was rejected before PDP and is never defaulted to `{}` - `inst-ing-metadata`
+6. [ ] - `p1` - **IF** any kind is unknown or does not admit the request metric - `inst-ing-metric-if`
    1. [ ] - `p1` - **RETURN** canonical `InvalidArgument`; increment `admitted_metric_violations_total` by closed
       validation surface - `inst-ing-metric`
-6. [ ] - `p1` - Materialize tenant scope from `tenant_id`, combine it with the mapped additional subjects, and exclude
+7. [ ] - `p1` - Materialize tenant scope from `tenant_id`, combine it with the mapped additional subjects, and exclude
    attribution and authenticated principal data from Policy input `{request, resource, arbitration}` - `inst-ing-map`
-7. [ ] - `p1` - **RETURN** the validated, authorized, catalogue-mapped request to the evaluation pipeline; this validation runs at ingress of every
+8. [ ] - `p1` - **RETURN** the validated, authorized, catalogue-mapped request to the evaluation pipeline; this validation runs at ingress of every
    debit, reserve, preview, and each batch item, and its failures are canonical errors, never
    `Decision::Denied` (`cpt-cf-quota-enforcement-fr-contract-validation`) - `inst-ing-forward`
 
@@ -331,8 +340,9 @@ no QE-side table exists.
 
 The system **MUST** extend the foundation Gateway with fail-closed validation of debit, reserve, preview, and each batch
 item: explicit `tenant_id`, additional `{kind,id}` subjects, one operation-level `metadata` object
-never defaulted to `{}`, admitted metric, and optional resource projection. It **MUST** authorize the complete supplied
-attribution tuple through PDP, then map each `(metric, kind)` through the process-local catalogue. Failures **MUST** map
+never defaulted to `{}`, admitted metric, and optional resource projection. It **MUST** reject malformed public request
+shape before PDP, authorize the complete supplied tuple through PDP, and only then map each `(metric, kind)`
+and validate request/resource contracts through the process-local catalogue. Failures **MUST** map
 to the appropriate canonical error and **MUST NOT** be encoded as `Decision::Denied`. Consumer DTOs contain no
 `caller_type` or concrete subject projection type.
 
@@ -349,9 +359,9 @@ to the appropriate canonical error and **MUST NOT** be encoded as `Decision::Den
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-subject-resolution`
 
-The system **MUST** validate and PDP-authorize caller-supplied `tenant_id`, additional `{kind,id}` subjects, metric, and
-optional resource, materialize tenant scope from `tenant_id`, and map every `(metric, kind)` through the catalogue's
-unique index. It rejects duplicate, unknown, or unadmitted kinds and returns the complete
+The system **MUST** shape-check caller-supplied `tenant_id` and additional `{kind,id}` subjects, PDP-authorize the
+complete tenant/subject/metric/resource tuple, materialize tenant scope from `tenant_id`, and then map every
+`(metric, kind)` through the catalogue's unique index. It rejects duplicate, unknown, or unadmitted kinds and returns the complete
 `(projection_type, subject_id)` set consumed by `EvaluationOrchestrator`. The caller cannot select a concrete
 projection; no resolver trait exists.
 
@@ -431,6 +441,9 @@ NOT** appear as label values; permitted dimensions are the closed `surface` and 
   exactly `{(owner-tenant-projection, T), (owner-user-projection, U)}` without a caller-selected projection
 - [ ] The complete supplied attribution tuple is sent to PDP; changing `tenant_id`, subjects, metric, or resource to an
   unauthorized target produces `PermissionDenied` before evaluation and no storage mutation
+- [ ] Error precedence is stable: malformed public request shape returns `InvalidArgument` before PDP; a
+  structurally valid unauthorized tuple returns `PermissionDenied` before catalogue or contract lookup; an authorized
+  tuple with an unknown/unadmitted kind or invalid contract payload returns `InvalidArgument`
 - [ ] The catalogue-membership check rejects a Quota or Policy reference to a registered but non-configured projection
   with `PROJECTION_NOT_RESOLVABLE`, and rejects a Quota reference whose projection does not admit the Quota's metric
 - [ ] Metrics scrape shows no metric name, projection type, or caller attribution as a label value on

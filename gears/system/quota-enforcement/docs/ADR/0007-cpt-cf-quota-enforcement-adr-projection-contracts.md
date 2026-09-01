@@ -202,7 +202,9 @@ The resource base retains `type`, optional `id`, and `metadata`.
 * **PDP authorizes the explicit attribution tuple.** Consumer `tenant_id`, subject refs,
   metric, and optional resource are caller-supplied and untrusted until PDP grants the
   authenticated service principal access to that tuple. QE never derives them from
-  `SecurityContext` and fails closed on PDP unavailability.
+  `SecurityContext` and fails closed on PDP unavailability. QE rejects malformed public
+  request shape before the PDP call, but resolves no catalogue or contract information
+  until authorization succeeds.
 * **Management remains on the user plane.** Quota CRUD, Policy administration, manager/operator
   reads, and management previews retain explicit target identity in their DTOs and PDP scope.
 * **There is no `caller_type` field.** The authenticated service identity is already intrinsic
@@ -230,8 +232,8 @@ Contracts are resolved and snapshotted **outside** the evaluation transaction:
 **`EvaluationOrchestrator` performs no live registry lookup, deliberately.** Four reasons, each
 independently sufficient:
 
-* The canonical pipeline — attribution validation and catalogue mapping → idempotency lookup → locked applicable-Quota
-  read → Policy lookup → Engine evaluation → Debit-Plan validation → mutation →
+* The canonical pipeline — public request-shape checks → PDP authorization → catalogue/contract validation and
+  mapping → idempotency lookup → locked applicable-Quota read → Policy lookup → Engine evaluation → Debit-Plan validation → mutation →
   idempotency/outbox persistence → commit — has no registry step today.
 * The `ProjectionContractCatalog` is process-local and the `TypesRegistryClient` cache belongs
   to Quota CRUD, so there is no hot-path cache to reuse.
@@ -246,12 +248,14 @@ arbitration values are captured with the locked Quota row.
 | Surface | Validation point | Rule |
 |---------|------------------|------|
 | `quota.metadata` | Quota create/update | Resolve the constraint contract attached to the metric request contract and validate once before persistence. Stored arbitration data is not revalidated during evaluation. |
-| Consumer evaluation attribution, operation metadata, and optional resource | Gateway ingress of debit, reserve, preview, and each batch item | Require caller-supplied `tenant_id`, non-empty unique subject refs with registered scope kinds, complete catalogue mapping, required operation `metadata`, request/resource schema conformance, and admitted metric; authorize the full tuple through PDP. |
-| Consumer snapshot attribution | Gateway ingress of snapshot reads | Require caller-supplied tenant/subject/metric filters, map scope kinds through the catalogue, and authorize the complete target through PDP; no operation metadata is required. |
+| Consumer evaluation attribution, operation metadata, and optional resource | Gateway ingress of debit, reserve, preview, and each batch item | First reject malformed public request shape: missing required fields, wrong public container types, missing or empty ids, duplicate kinds, and repeated tenant scope. Next authorize the complete tuple through PDP. Only then require registered/admitted scope kinds, complete catalogue mapping, and request/resource schema conformance. |
+| Consumer snapshot attribution | Gateway ingress of snapshot reads | First reject malformed public tenant/subject/metric filter shape. Next authorize the complete target through PDP. Only then map scope kinds through the catalogue; no operation metadata is required. |
 | Direct-operation target | Gateway ingress of credit, rollback, commit, and release | Authorize the explicit tenant plus Quota, original-operation, or lease identity through PDP; reuse persisted subject attribution where required for idempotency. |
 
-A request with an unknown/unadmitted subject kind, schema mismatch, missing metadata, or inadmissible metric maps to
-`InvalidArgument` / HTTP 400 with a stable field-level reason. It returns a
+A request with malformed public request shape maps to `InvalidArgument` before PDP. For structurally valid input,
+PDP denial maps to `PermissionDenied` before any catalogue or contract lookup. After authorization, an
+unknown/unadmitted subject kind, schema mismatch, missing metadata, or inadmissible metric maps to
+`InvalidArgument` / HTTP 400 with a stable field-level reason. Contract rejection returns a
 platform-canonical error, never `Decision::Denied`; the two surfaces remain mutually exclusive.
 A Quota/Policy referring to a contract that exists but is not usable in that lifecycle state
 maps to `FailedPrecondition`. No new response envelope is introduced.

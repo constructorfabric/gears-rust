@@ -126,20 +126,23 @@ consumption-operations feature)
 
 **Error Scenarios**:
 - Unauthenticated request: rejected by the platform `api-gateway` before any QE handler runs
-- PDP denies: canonical `PermissionDenied`, no partial operation
+- Malformed public request/target shape: canonical `InvalidArgument` before PDP
+- PDP denies a structurally valid target: canonical `PermissionDenied`, no partial operation
 - PDP unreachable: canonical `ServiceUnavailable`, fail-closed, nothing mutated
 
 **Steps**:
 1. [ ] - `p1` - Caller sends an operation request with a platform bearer token - `inst-adm-request`
 2. [ ] - `p1` - Platform `api-gateway` authenticates and populates the service principal in `SecurityContext`; target
    attribution remains untrusted request data - `inst-adm-authn`
-3. [ ] - `p1` - API: call `PolicyEnforcer::access_scope(...)` with the requested operation and explicit target — the in-process PEP evaluates against `authz-resolver`
+3. [ ] - `p1` - Deserialize the request and run the operation's documented public target-shape checks; reject malformed
+   shape with canonical `InvalidArgument` before any PDP call - `inst-adm-shape`
+4. [ ] - `p1` - API: call `PolicyEnforcer::access_scope(...)` with the requested operation and explicit target — the in-process PEP evaluates against `authz-resolver`
    and compiles the response itself, returning `AccessScope` or `EnforcerError`; QE never sees the raw decision and
    keeps no PDP decision cache of its own - `inst-adm-pdp`
-4. [ ] - `p1` - **IF** the call returns `EnforcerError` (denied, compile-failed, or PDP unreachable) - `inst-adm-deny-if`
+5. [ ] - `p1` - **IF** the call returns `EnforcerError` (denied, compile-failed, or PDP unreachable) - `inst-adm-deny-if`
    1. [ ] - `p1` - **RETURN** the canonical error (`PermissionDenied` / `ServiceUnavailable`); no handler runs - `inst-adm-deny`
-5. [ ] - `p1` - Carry the returned `AccessScope` unmodified to the operation handler for `SecureConn` consumption - `inst-adm-scope`
-6. [ ] - `p1` - **RETURN** control to the operation handler with `SecurityContext` and `AccessScope` attached; the
+6. [ ] - `p1` - Carry the returned `AccessScope` unmodified to the operation handler for `SecureConn` consumption - `inst-adm-scope`
+7. [ ] - `p1` - **RETURN** control to the operation handler with `SecurityContext` and `AccessScope` attached; the
    in-process SDK client enters at this same admission step, so both transports share one authorization boundary - `inst-adm-forward`
 
 ## 3. Processes / Business Logic (CDSL)
@@ -186,16 +189,17 @@ consumption-operations feature)
 
 **Input**: A gear-specific counter, histogram, or gauge observation with candidate labels
 
-**Output**: Emitted metric with only bounded-enum labels
+**Output**: Emitted metric with only catalogue-declared, deployment-bounded labels
 
 **Steps**:
 1. [ ] - `p1` - Emit via `tracing` macros directly from the owning component (no adapter wrapper, no runtime filtering
    layer) - `inst-tel-emit`
-2. [ ] - `p1` - Emission sites use only the fixed PRD §5.16 instrument catalogue with its deployment-bounded label
-   enums — `engine_id`, `operation`, validation `surface`, `invariant`, and closed `reason` sets - `inst-tel-closed`
-3. [ ] - `p1` - `tenant_id`, `subject_id`, `quota_id`, `policy_id`, `idempotency_key`, `lease_token`, metric,
-   projection type, and caller attribution never appear as label values; conformance is enforced by tests and code
-   review at each emission site - `inst-tel-highcard`
+2. [ ] - `p1` - Emission sites use only the fixed PRD §5.16 instrument catalogue and the deployment-bounded labels
+   declared there; canonical registered `metric` is permitted only on instruments that declare it - `inst-tel-closed`
+3. [ ] - `p1` - `tenant_id`, `subject_id`, `quota_id`, `policy_id`, `idempotency_key`, `lease_token`, projection type,
+   caller attribution, and raw/unregistered metric input never appear as label values; a declared `metric` label is
+   populated only after registry/catalogue validation with the canonical registered identity; conformance is enforced
+   by tests and code review at each emission site - `inst-tel-highcard`
 4. [ ] - `p1` - **RETURN** the observation to the platform OTLP export when the `otel` feature is enabled - `inst-tel-export`
 
 ## 4. States (CDSL)
@@ -359,7 +363,8 @@ ever used as a label value.
   restart with zero data loss — the durable-commit contract input consumed by the consumption-operations end-to-end
   RPO drill
 - [ ] Metrics scrape shows no `tenant_id`, `subject_id`, `quota_id`, `policy_id`, `idempotency_key`, `lease_token`,
-  metric, projection-type, or caller label on any gear-specific instrument
+  projection-type, caller, or raw/unregistered metric label on any gear-specific instrument; a canonical registered
+  `metric` label appears only on instruments that declare it in PRD §5.16
 - [ ] Chaos test kills gateway pods during sustained readiness/health traffic: requests fail over to surviving
   replicas with no readiness flap — the gateway-failover input consumed by the consumption-operations feature, which
   owns the end-to-end 99.95% evaluation-endpoint availability criterion; the subject-scale and quota-density

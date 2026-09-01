@@ -113,29 +113,32 @@ reads are PRD requirement surfaces without a dedicated use case)
 - A filter matching no Quota returns an empty page (not an error)
 
 **Error Scenarios**:
+- Malformed public filter shape: canonical `InvalidArgument` before PDP
 - PDP denial or PDP unreachability at admission: canonical error from the foundation admission flow, fail-closed
 - Rows outside the caller's tenant or `AccessScope` are unreachable by construction; they are absent, not errors
 - Every error is a `Problem` envelope; a snapshot read never produces a Decision shape
 
 **Steps**:
 1. [ ] - `p1` - Caller sends `POST /v1/quota-enforcement/snapshot` with a `SnapshotRequest` carrying target
-   `tenant_id`, `1..N` logical `{kind,id,metric}` filters, and page parameters; foundation admission
-   (`cpt-cf-quota-enforcement-flow-authorized-admission`) has attached `SecurityContext` and `AccessScope` - `inst-snp-request`
+   `tenant_id`, `1..N` logical `{kind,id,metric}` filters, and page parameters; platform authentication has attached
+   `SecurityContext` - `inst-snp-request`
 2. [ ] - `p1` - Treat single and bulk as degenerate cases of the one request shape: `subjects.len() == 1` realises
    `cpt-cf-quota-enforcement-fr-quota-snapshot-read`, `subjects.len() >= 1` realises
-   `cpt-cf-quota-enforcement-fr-bulk-quota-snapshot-read`; there is no separate REST path - `inst-snp-shape`
-3. [ ] - `p1` - PDP authorizes the complete explicit target against the authenticated principal; QE maps each
-   `(metric, kind)` through the catalogue, then calls `bulk_read_quota_snapshot(pairs, page)` under the returned `AccessScope` per
+   `cpt-cf-quota-enforcement-fr-bulk-quota-snapshot-read`; reject malformed public target/filter shape before PDP;
+   there is no separate REST path - `inst-snp-shape`
+3. [ ] - `p1` - PDP authorizes the complete structurally valid explicit target against the authenticated principal - `inst-snp-authz`
+4. [ ] - `p1` - QE maps each authorized `(metric, kind)` through the catalogue, then calls
+   `bulk_read_quota_snapshot(pairs, page)` under the returned `AccessScope` per
    `cpt-cf-quota-enforcement-algo-pdp-constraint-composition` (foundation), reading the `quotas` rows and their
    counter rows; the read is read-only (I3) - `inst-snp-read`
-4. [ ] - `p1` - **IF** a consumption Quota's current-period counter row is missing or its boundary has passed
+5. [ ] - `p1` - **IF** a consumption Quota's current-period counter row is missing or its boundary has passed
    (`now() >= period_end`) - `inst-snp-lazy-if`
    1. [ ] - `p1` - Materialize the new period row lazily per `cpt-cf-quota-enforcement-algo-period-rollover`
       (consumption-operations feature), the single permitted I3 write exception on this read path; the snapshot then
       reflects the fresh period - `inst-snp-lazy`
-5. [ ] - `p1` - Assemble each returned Quota's state per `cpt-cf-quota-enforcement-algo-snapshot-state` - `inst-snp-assemble`
-6. [ ] - `p1` - Apply `cpt-cf-quota-enforcement-algo-snapshot-pagination` to the result set - `inst-snp-page`
-7. [ ] - `p1` - **RETURN** `200` with the `PageResult<QuotaSnapshot>` page; an empty applicable set returns an empty
+6. [ ] - `p1` - Assemble each returned Quota's state per `cpt-cf-quota-enforcement-algo-snapshot-state` - `inst-snp-assemble`
+7. [ ] - `p1` - Apply `cpt-cf-quota-enforcement-algo-snapshot-pagination` to the result set - `inst-snp-page`
+8. [ ] - `p1` - **RETURN** `200` with the `PageResult<QuotaSnapshot>` page; an empty applicable set returns an empty
    page; the SDK path is `QuotaEnforcementClientV1::snapshot(req)` returning `PageResult<QuotaSnapshot>` - `inst-snp-return`
 
 ### Consumer-Backed Self-Service Snapshot
@@ -153,24 +156,27 @@ calls Quota Enforcement directly)
 - An end user with no applicable Quotas receives an empty page, which Quota Manager renders as "no quotas apply"
 
 **Error Scenarios**:
+- Malformed public target shape: canonical `InvalidArgument` before PDP
 - The backend supplies a tenant or user outside its service principal's PDP scope: canonical `PermissionDenied`
 
 **Steps**:
 1. [ ] - `p1` - The consuming backend calls `POST /v1/quota-enforcement/snapshot` with its authenticated service
    principal plus explicit target `tenant_id` and user `{kind,id}` - `inst-eus-request`
-2. [ ] - `p1` - PDP authorizes the complete target tuple; QE then maps tenant and user kinds through the catalogue - `inst-eus-fix`
-3. [ ] - `p1` - **IF** any target lies outside the backend's authorized scope - `inst-eus-broaden-if`
+2. [ ] - `p1` - Reject malformed public target shape before PDP - `inst-eus-target-shape`
+3. [ ] - `p1` - PDP authorizes the complete structurally valid target tuple; QE then maps the authorized tenant and user
+   kinds through the catalogue - `inst-eus-fix`
+4. [ ] - `p1` - **IF** any target lies outside the backend's authorized scope - `inst-eus-broaden-if`
    1. [ ] - `p1` - **RETURN** canonical `PermissionDenied` before storage - `inst-eus-broaden`
-4. [ ] - `p1` - DB: the gateway and storage pipeline are otherwise identical to
+5. [ ] - `p1` - DB: the gateway and storage pipeline are otherwise identical to
    `cpt-cf-quota-enforcement-flow-snapshot-read`, including the lazy period materialization and the read-only
    guarantee - `inst-eus-read`
-5. [ ] - `p1` - Return every applicable active Quota under that scope, and only Quotas applicable to that set:
+6. [ ] - `p1` - Return every applicable active Quota under that scope, and only Quotas applicable to that set:
    Quotas that govern a subject's consumption are transparent to that subject, and no per-Quota or per-key
    invisibility primitive exists - `inst-eus-all`
-6. [ ] - `p1` - The per-Quota state shape is identical to the operator-side call and carries no Policy attribution;
+7. [ ] - `p1` - The per-Quota state shape is identical to the operator-side call and carries no Policy attribution;
    the applicable-Quotas filter is the only difference between the two cases
    (`cpt-cf-quota-enforcement-fr-end-user-quota-snapshot-read`) - `inst-eus-shape`
-7. [ ] - `p1` - **RETURN** the `PageResult<QuotaSnapshot>` page for Quota Manager to render; the end-user
+8. [ ] - `p1` - **RETURN** the `PageResult<QuotaSnapshot>` page for Quota Manager to render; the end-user
    authentication and rate-limit story is owned by Quota Manager, not by QE - `inst-eus-return`
 
 ## 3. Processes / Business Logic (CDSL)
@@ -294,9 +300,10 @@ across the operator-side and end-user cases.
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-end-user-scope`
 
-The system **MUST** keep snapshot access S2S. A consuming backend supplies explicit tenant/user attribution and PDP
-**MUST** authorize that complete target against its authenticated service principal before catalogue mapping or
-storage. End users never authenticate to QE directly. For an authorized target, QE **MUST** return every applicable
+The system **MUST** keep snapshot access S2S. A consuming backend supplies explicit tenant/user attribution. QE **MUST**
+reject malformed public target shape before PDP; PDP **MUST** authorize the complete structurally valid target against
+its authenticated service principal before catalogue mapping or storage. End users never authenticate to QE directly.
+For an authorized target, QE **MUST** return every applicable
 Quota (no per-Quota invisibility filtering); cross-user or cross-tenant targets are rejected. End-user authentication,
 presentation, and rate limiting stay with the consuming product.
 

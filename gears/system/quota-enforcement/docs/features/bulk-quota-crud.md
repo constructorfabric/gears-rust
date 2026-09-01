@@ -437,7 +437,7 @@ no lease semantics are re-specified here.
     three endpoints as P2. This document uses the PRD operation names (`bulk_create_quotas`, `bulk_update_quotas`,
     `bulk_deactivate_quotas`) as logical operation names only; the SDK trait extension and the request/response DTO
     definitions are tracked upstream DESIGN items, and no new Rust type or method name is introduced here.
-  - PRD §5.8 defines the idempotency scope `(tenant_id, subject, operation_type, key)` and its subject-slot rules for
+  - PRD §5.8 defines the idempotency scope `(tenant_id, idempotency_subject_key, operation_type, key)` and its subject-slot rules for
     the consumption write operations; Quota CRUD operations carry no single-item idempotency key, and the PRD does
     not define the subject slot for a management envelope whose items can span multiple subjects. This document
     reuses the established machinery under the three bulk operation types and leaves the envelope scope's

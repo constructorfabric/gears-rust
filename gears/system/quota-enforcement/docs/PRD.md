@@ -284,8 +284,9 @@ of scope for this PRD); Quota Manager translates their workflows into QE API cal
 | `cpt-cf-quota-enforcement-actor-monitoring-system` | Read observability endpoints (`/health/*`, metrics scrape)                                                                                                                                                                                                                                                                                                                                                                                                                                                | Modifying counters or definitions                                                                                                                                                                                                         |
 
 Authorization is enforced via the platform PDP (`authz-resolver`) on all read and write operations. Unauthenticated
-requests are rejected before any authorization check. Failures result in immediate rejection with no partial operation
-(fail-closed; see §3.4 — "Quota Enforcement itself fails closed on internal errors").
+requests are rejected before any authorization check. Authenticated requests have their public request/target shape
+checked before PDP; catalogue and contract validation follows authorization. Failures result in immediate rejection with
+no partial operation (fail-closed; see §3.4 — "Quota Enforcement itself fails closed on internal errors").
 
 ## 3. Operational Concept & Environment
 
@@ -294,8 +295,8 @@ requests are rejected before any authorization check. Failures result in immedia
 Every Quota is bound to a concrete subject identified by `(projection_type, subject_id)`. The projection is a concrete
 GTS type derived from QE's abstract `gts.cf.core.qe.subj.v1~` base and declared by the Gear that owns the metric.
 Consumer requests supply `tenant_id` and additional `{kind,id}` subjects; QE maps `(metric, kind)` to the concrete
-projection only after PDP authorizes the complete tuple for the authenticated service principal. A resource projection
-may also be supplied, but resource is not part of the P1 counter key.
+projection only after public request-shape checks pass and PDP authorizes the complete tuple for the authenticated
+service principal. A resource projection may also be supplied, but resource is not part of the P1 counter key.
 
 An owner publishes separate scope projections, for example
 `gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~` and
@@ -720,9 +721,11 @@ when the configured catalogue is incompatible with any active Quota or Policy.
 
 Every subject-based consumer evaluation request **MUST** carry `tenant_id`, `subjects: [{kind, id}]`, and one operation-level `metadata` object.
 The tenant scope is materialized from `tenant_id`; `subjects` carries additional applicable scopes and **MUST NOT**
-repeat the tenant scope. `kind` is a registered QE scope instance and `id` is an opaque non-empty string. Before any
-catalogue mapping or evaluation, PDP **MUST** authorize the complete caller-supplied tenant/subject/metric/resource tuple
-against the authenticated service principal.
+repeat the tenant scope. `id` is an opaque non-empty string. QE **MUST** first reject malformed public request shape:
+missing required fields, wrong public container types, empty ids, duplicate kinds, or tenant scope repeated in
+`subjects`. It **MUST** then ask PDP to authorize the complete
+caller-supplied tenant/subject/metric/resource tuple against the authenticated service principal. Only after authorization
+may QE establish that `kind` is a registered, admitted QE scope instance or resolve any catalogue/contract information.
 
 QE **MUST** map every authorized `(metric, kind)` through `ProjectionContractCatalog`, fetch every active Quota for the
 resulting `(projection_type, subject_id)` set, and forward the complete set to multi-quota evaluation. Missing,
@@ -820,7 +823,8 @@ deactivating the original Quota and creating a new one.
 Activating a breaking projection-version change is **out of scope for P1**. The current version remains active. A
 replacement contract may be registered, but Quota and Policy writes referencing it and deployments whose configured
 catalogue is incompatible with any active Quota or Policy **MUST** be rejected; writes return
-`PROJECTION_NOT_RESOLVABLE`. P1 provides no projection alias or Quota/counter migration operation.
+`PROJECTION_NOT_RESOLVABLE`. P1 provides no projection alias or Quota/counter migration operation. Any future activation
+mechanism **MUST** also satisfy the catalogue/retry compatibility rule in §5.8.
 
 **Cap reductions guard.** A Quota update that would reduce `cap` strictly below the Quota's current consumed amount (
 consumption-type Quotas, within the active period) or current in-flight count (allocation-type Quotas) **MUST** be
@@ -1378,8 +1382,10 @@ contention); the normative timeout and telemetry are stated here once.
 
 **Contention telemetry.** The system **MUST** expose:
 
-- a counter `lease_contention_rejected_total` incremented on every `LEASE_CONTENTION_TIMEOUT` rejection,
-- a histogram `lease_acquisition_wait_seconds` covering the wait time before successful acquisition or rejection.
+- a counter `lease_contention_rejected_total` incremented on every `LEASE_CONTENTION_TIMEOUT` rejection, labelled by
+  canonical registered `metric`,
+- a histogram `lease_acquisition_wait_seconds` covering the wait time before successful acquisition or rejection,
+  labelled by canonical registered `metric`.
 
 These counters belong to the §5.16 telemetry surface. They let operators detect hot-key contention (single-row write
 hotspot per the §12 risk) before it manifests as user-visible latency, and they let Quota Manager surface
@@ -1580,6 +1586,11 @@ write operation and prevent caller-selected projections from fragmenting an appl
 not support breaking projection-catalogue activation; lease follow-up operations remain
 stable because they reuse the acquisition key (`cpt-cf-quota-enforcement-nfr-idempotency-guarantee`).
 
+Any future breaking projection-catalogue activation **MUST** preserve the previous mapping from logical attribution to
+`idempotency_subject_key` for every unexpired idempotency record until that record's configured retention window expires.
+A retry within the window **MUST** compute the original key and return the stored outcome; catalogue activation
+**MUST NOT** move it into a new idempotency scope or cause a second counter effect.
+
 Within a single `(tenant, idempotency_subject_key, operation_type, key)` scope, a submitted key falls into one of two
 cases:
 
@@ -1601,7 +1612,7 @@ fields if present, regardless of which branch above would otherwise apply.
 
 The system **MUST** preserve the idempotency guarantee for a configurable retention window (default: 24 hours)
 sufficient to bound legitimate retry windows. The retention window is operator-configurable per `(tenant, metric)` —
-matching the scope of the idempotency key itself (`(tenant_id, subject, operation_type, key)` per the scoping rule
+matching the scope of the idempotency key itself (`(tenant_id, idempotency_subject_key, operation_type, key)` per the scoping rule
 above; metric is the natural axis along which retry-window practice differs across consuming services). Replays
 attempted after the window has expired for a given key **MUST** be treated as new operations (re-evaluated against
 current state) — this is intended behavior since legitimate retries fall well within the window.
@@ -2225,9 +2236,10 @@ rejection with no partial operation; the system **MUST** fail closed (see §3.4 
 on internal errors").
 
 Consumer operations **MUST** supply the target `tenant_id`, subject refs, metric, and optional resource. QE **MUST**
-send that complete untrusted tuple to PDP and proceed only when PDP authorizes it for the authenticated service
-principal. Management operations likewise carry an explicit target and apply PDP-returned scope. End-user principals
-never call QE consumer endpoints directly.
+reject malformed public request/target shape before authorization, send the complete structurally valid untrusted tuple to PDP,
+and proceed only when PDP authorizes it for the authenticated service principal. Catalogue and contract validation
+**MUST** occur only after authorization. Management operations likewise carry an explicit target and apply PDP-returned
+scope. End-user principals never call QE consumer endpoints directly.
 
 The authenticated service principal is the caller identity; QE **MUST NOT** accept a second self-declared caller
 identity. Neither principal data nor attribution identifiers may influence Policy branching, quota apportionment,
@@ -2325,14 +2337,18 @@ gauges that surface QE-internal policy decisions and guard-rail rejections invis
 
 - **`denial_total`** — count of admission denials by closed reason kind.
 - **`lease_contention_rejected_total`** — acquisitions rejected due to acquisition contention timeout per
-  `cpt-cf-quota-enforcement-fr-lease-acquire`.
+  `cpt-cf-quota-enforcement-fr-lease-acquire`, by canonical registered `metric`.
 - **`lease_acquisition_wait_seconds`** — histogram of wait times during lease acquisition (both successful waits and
-  rejected ones).
+  rejected ones), by canonical registered `metric`.
 - **`lease_inflight_limit_exceeded_total`** — acquisitions rejected by the per-`(tenant, metric)` active-lease cap per
-  `cpt-cf-quota-enforcement-fr-lease-timeout`.
+  `cpt-cf-quota-enforcement-fr-lease-timeout`, by canonical registered `metric`.
+- **`lease_unreclaimed_expired`** — count of expired-but-unreclaimed leases, by canonical registered `metric`.
 - **`engine_bootstrap_failures_total`** — Engine registration failures at gear bootstrap per
   `cpt-cf-quota-enforcement-fr-quota-resolution-engine`.
 - **`engine_evaluation_seconds`** — Engine evaluation latency.
+- **`policy_version_transitions_total`** — Policy-version create, update, rollback, and delete transitions, labelled by
+  `transition_kind` from the closed set `{create, update, rollback, delete}`.
+- **`policy_version_conflict_rejections_total`** — Policy writes rejected with `VERSION_CONFLICT`; no labels.
 - **`debit_plan_invariant_violations_total`** — Decisions rejected for violating Debit-Plan invariants per
   `cpt-cf-quota-enforcement-fr-quota-resolution-engine`, labelled by invariant from the closed set
   `{quota_id_outside_applicable_set, negative_amount, amount_exceeds_request_amount, result_plan_inconsistency}`.
@@ -2348,16 +2364,20 @@ gauges that surface QE-internal policy decisions and guard-rail rejections invis
 - **`outbox_rejections_total`** — handler `Reject` outcomes, by `queue`; this is not a durable dead-letter row count.
 
 Labels **MUST NOT** include high/unbounded-cardinality identifiers (`tenant_id`, `subject_id`, `quota_id`, `policy_id`,
-`idempotency_key`, `lease_token`, metric, projection type, caller attribution). Permitted dimensions are deployment-
-bounded enums — `engine_id`, `operation`, validation `surface`, `invariant`, closed `reason` enums, `sink_id` (the
-deployment-registered sink set), `event_kind` (the closed event catalog), and `queue` (the fixed outbox queue set).
-Caller attribution is retained on sampled traces/diagnostics, not metrics.
+`idempotency_key`, `lease_token`), projection type, caller attribution, or raw/unregistered metric input. Permitted
+dimensions are deployment-bounded values — canonical registered `metric` only on instruments that declare it above,
+`engine_id`, `operation`, `transition_kind`, validation `surface`, `invariant`, closed `reason` enums, `sink_id` (the
+deployment-registered sink set), `event_kind` (the closed event catalog), and `queue` (the fixed outbox queue set). A
+`metric` label **MUST** be populated only after registry/catalogue validation and **MUST** use the canonical registered
+identity; unknown or unadmitted caller input **MUST NOT** appear as a label. Caller attribution is retained on sampled
+traces/diagnostics, not metrics.
 
 - **Rationale**: The framework baseline already covers HTTP-server-level observability and health endpoints uniformly
   across gears; restating it here would duplicate convention. The instruments above expose policy-decision and
   guard-rail signals unique to QE and invisible to the framework — they are the difference between "gateway is up" and
   "quota arbitration is healthy". Bounding label cardinality at the PRD level prevents a 100M-subject deployment from
-  creating per-tenant time series that exhaust the metrics backend.
+  creating per-tenant time series that exhaust the metrics backend, while selected registered-metric labels remain
+  bounded by the deployment catalogue and preserve operational localization.
 - **Actors**: `cpt-cf-quota-enforcement-actor-monitoring-system`, `cpt-cf-quota-enforcement-actor-platform-operator`
 
 ## 6. Non-Functional Requirements
@@ -2850,7 +2870,8 @@ on behalf of a tenant administrator)
 **Main Flow**:
 
 1. Consumer calls `debit(tenant_id, subjects, metric, amount, metadata, resource?, idempotency_key)`
-1. PDP authorizes the supplied attribution; QE maps each `(metric, kind)` to an owner projection
+1. QE rejects malformed public request shape; PDP authorizes the complete structurally valid tuple
+1. QE maps each authorized `(metric, kind)` to an owner projection and validates request/resource contracts
 1. Quota Enforcement fetches all applicable Quotas for the operation's metric
 1. Quota Enforcement selects the active Quota Resolution Policy by most-specific-scope precedence, then invokes that
    Policy's Engine (e.g., `most-restrictive-wins` or `cel`) against the applicable-Quotas set; the Engine returns a
@@ -2928,7 +2949,8 @@ on behalf of a tenant administrator)
 
 1. End user requests their personal quota state through the product
 1. The product backend calls QE's S2S snapshot endpoint with explicit `tenant_id` and user `{kind,id}`
-1. PDP authorizes the target against the backend service principal; QE maps tenant/user kinds through the catalogue
+1. QE checks the public target shape; PDP authorizes the complete structurally valid target against the backend service principal
+1. QE maps the authorized tenant/user kinds through the catalogue
 1. Quota Enforcement fetches all active Quotas for these subjects
 1. Quota Enforcement returns per-Quota state for every applicable authorized Quota per
    `cpt-cf-quota-enforcement-fr-end-user-quota-snapshot-read` (state contract identical to the base
@@ -2992,6 +3014,9 @@ on behalf of a tenant administrator)
   the metric owner's projections; tenant-scoped Quotas constrain every user in the tenant and remain shared across callers
 - [ ] PDP authorizes the complete caller-supplied tenant/subject/metric/resource tuple against the authenticated service
   principal before catalogue mapping or evaluation
+- [ ] Ingress error precedence is stable: malformed public request shape returns `InvalidArgument` before PDP;
+  structurally valid unauthorized attribution returns `PermissionDenied` before catalogue or contract lookup; authorized
+  unknown/unadmitted kinds and invalid contract payloads return `InvalidArgument`
 - [ ] Every subject-based consumer evaluation request sends required operation-level `metadata` and only registered, admitted scope
   kinds; violations return canonical `InvalidArgument`, never `Decision::Denied`
 - [ ] Two different services debiting one owner metric use the same owner projection and resolve the same applicable-
@@ -3097,8 +3122,8 @@ on behalf of a tenant administrator)
 - [ ] Idempotency replay returns the original Decision (including `debit_plan`); client-submitted Decision-shaped fields
   in a replay payload are silently ignored per the trust-boundary discipline (§3.4)
 - [ ] Lease rows are physically reclaimed by the sweeper within the operator-configured interval after expiry ( default:
-  ≤ 1 hour); telemetry surfaces unreclaimed-expired-lease count; sweeper outage does not affect correctness (lazy expiry
-  semantic)
+  ≤ 1 hour); telemetry surfaces unreclaimed-expired-lease count by canonical registered `metric`; sweeper outage does
+  not affect correctness (lazy expiry semantic)
 - [ ] Per-`(tenant, metric)` active-lease cap (default: 1000) is enforced at acquisition time; requests exceeding the
   cap are rejected with `LEASE_INFLIGHT_LIMIT_EXCEEDED`; expired leases do not count toward the cap
 - [ ] Lease TTL is required on every acquire request and **MUST** fall within the operator-configurable
@@ -3111,8 +3136,9 @@ on behalf of a tenant administrator)
   multi-Quota lease traffic does not deadlock the acquisition path
 - [ ] Acquisition contention timeout (operator-configurable, default: 0 ms / fail-fast) bounds wait time on row
   contention; exceeded timeouts produce `LEASE_CONTENTION_TIMEOUT` rejection with no holds;
-  `lease_contention_rejected_total` and `lease_acquisition_wait_seconds` metrics are populated and let operators
-  distinguish contention-driven denials from cap-exceeded, not-active, and Engine-Denied rejections
+  `lease_contention_rejected_total` and `lease_acquisition_wait_seconds` metrics are populated by canonical registered
+  `metric` and let operators distinguish and localize contention-driven denials from cap-exceeded, not-active, and
+  Engine-Denied rejections
 - [ ] Quota deactivation while leases are outstanding: active leases are marked `resolved-by-deactivation` atomically
   with the deactivation transaction; subsequent `commit` / `release` against those leases return `LEASE_NOT_ACTIVE`; a
   `lease-resolved-by-deactivation` notification event is emitted per affected lease
@@ -3186,14 +3212,15 @@ on behalf of a tenant administrator)
   `consumed` 30 → 85 with `notification_thresholds = [50, 80, 100]` emits 1 event (`crossed=[50,80]`, `highest=80`);
   subsequent `consumed` 85 → 90 emits 0 events; period rollover resets, new-period `consumed` 0 → 60 emits 1 event
   (`crossed=[50]`, `highest=50`)
-- [ ] Idempotency-key uniqueness is scoped per `(tenant_id, subject, operation_type, key)` with consumer attribution
+- [ ] Idempotency-key uniqueness is scoped per `(tenant_id, idempotency_subject_key, operation_type, key)` with consumer attribution
   accepted only after PDP authorization; the same key string reused across any of the four scope dimensions — different
-  `tenant_id`, different `subject`, or different `operation_type` — creates independent idempotency records and is never
-  cross-matched; payload divergence within the **same** `(tenant_id, subject, operation_type, key)` scope is rejected
+  `tenant_id`, different `idempotency_subject_key`, or different `operation_type` — creates independent idempotency records and is never
+  cross-matched; payload divergence within the **same** `(tenant_id, idempotency_subject_key, operation_type, key)` scope is rejected
   with `IDEMPOTENCY_PAYLOAD_MISMATCH` per `cpt-cf-quota-enforcement-fr-idempotency`
 - [ ] Telemetry counters for lease-inflight-limit and Debit-Plan-invariant rejection paths are exposed:
   `lease_inflight_limit_exceeded_total`, `debit_plan_invariant_violations_total` (with documented invariant values);
-  each counter increments on its corresponding rejection path and is queryable via the standard metrics scrape
+  each counter increments on its corresponding rejection path and is queryable via the standard metrics scrape;
+  `lease_inflight_limit_exceeded_total` is labelled by canonical registered `metric`
 - [ ] Operations targeting a Quota whose metric is classified `Direct` in `types-registry` are rejected with
   `METRIC_NOT_QUOTA_GATED` for every write/preview entry-point (`debit`, `credit`, `rollback`, `reserve`, `commit`,
   `release`, batch-debit, `evaluate-preview`) — counters are not mutated, no idempotency record / operation log entry /

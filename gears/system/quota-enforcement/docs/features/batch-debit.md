@@ -320,7 +320,7 @@ PDP, and synchronization between concurrent instances stays delegated to the sto
 
 The system **MUST** enforce envelope idempotency under the established scope
 `IdempotencyScope { tenant_id, subject_key, operation_type, idem_key }`, where `subject_key` fingerprints the canonical
-sorted, deduplicated union of every item's complete server-resolved applicable-subject set. An exact envelope replay
+sorted, deduplicated union of every item's complete authorized, catalogue-mapped applicable-subject set. An exact envelope replay
 **MUST** return the stored `BatchDecision` verbatim without re-invoking the Engine and without a second counter effect;
 a divergent payload **MUST** return `IDEMPOTENCY_PAYLOAD_MISMATCH` (409) leaving the original record untouched. Each
 item **MUST** carry its own idempotency key for individual identification per

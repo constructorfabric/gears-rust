@@ -360,7 +360,7 @@ full evaluation
 
 **Steps**:
 1. [ ] - `p1` - Construct `IdempotencySubjectKey` as the SHA-256 fingerprint of the canonical sorted, deduplicated
-   subject set: debit uses the complete server-resolved applicable set; credit and rollback use the owning Quota's
+   subject set: debit uses the complete authorized, catalogue-mapped applicable set; credit and rollback use the owning Quota's
    persisted `(projection_type, subject_id)` pair read under the mutation row lock. The caller never supplies or
    narrows the subject key, and `quota_id` is not part of it (`cpt-cf-quota-enforcement-fr-idempotency`) - `inst-idem-scope`
 2. [ ] - `p1` - Different tenants, subject keys, or operation types using the same key string create independent records;
