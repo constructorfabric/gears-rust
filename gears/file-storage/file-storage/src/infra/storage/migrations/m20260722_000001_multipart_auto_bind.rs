@@ -98,6 +98,13 @@ impl MigrationTrait for Migration {
                     "file-storage migrations support Postgres and SQLite only".to_owned(),
                 ));
             }
+            // DatabaseBackend is #[non_exhaustive], so a future backend must be
+            // refused explicitly rather than as a panic-on-uncovered-pattern.
+            _ => {
+                return Err(DbErr::Custom(
+                    "file-storage migrations support Postgres and SQLite only".to_owned(),
+                ));
+            }
         };
         conn.execute_unprepared(sql).await?;
         Ok(())
@@ -111,6 +118,9 @@ impl MigrationTrait for Migration {
                 Ok(())
             }
             sea_orm::DatabaseBackend::MySql => Err(DbErr::Custom(
+                "file-storage migrations support Postgres and SQLite only".to_owned(),
+            )),
+            _ => Err(DbErr::Custom(
                 "file-storage migrations support Postgres and SQLite only".to_owned(),
             )),
         }
