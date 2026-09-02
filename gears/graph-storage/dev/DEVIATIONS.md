@@ -14,6 +14,10 @@ Entry format:
 - **Why:** the reason for the divergence.
 - **Proposal:** fix the code / fix the doc / accept the cut.
 
+The vector-search work has its own companion report,
+[`VECTOR-SEARCH.md`](./VECTOR-SEARCH.md): what was chosen and why, the
+difficulties it hit, and what a live PostgreSQL 19 stand proved about it.
+
 Categories: `[deferred]` conscious scope cut for this iteration,
 `[doc-gap]` the documentation is silent or wrong, `[platform-gap]` the
 platform lacks an API the documentation assumes, `[impl-gap]` the
