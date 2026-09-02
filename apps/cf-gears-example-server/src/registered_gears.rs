@@ -11,7 +11,7 @@ use authn_resolver as _;
 use authz_resolver as _;
 #[cfg(feature = "credstore")]
 use credstore as _;
-#[cfg(all(feature = "file-parser", not(feature = "oop-example")))]
+#[cfg(feature = "file-parser")]
 use file_parser as _;
 #[cfg(feature = "file-storage")]
 use file_storage as _;
@@ -24,7 +24,7 @@ use grpc_hub as _;
 use nodes_registry as _;
 #[cfg(feature = "resource-group")]
 use resource_group as _;
-#[cfg(all(feature = "simple-user-settings", not(feature = "oop-example")))]
+#[cfg(feature = "simple-user-settings")]
 use simple_user_settings as _;
 use tenant_resolver as _;
 use types_registry as _;
@@ -68,12 +68,6 @@ use chat_engine as _;
 
 #[cfg(feature = "users-info-example")]
 use users_info as _;
-
-#[cfg(feature = "oop-example")]
-use calculator_gateway as _;
-
-#[cfg(feature = "oop-example")]
-use calculator as _;
 
 #[cfg(feature = "static-idp")]
 use static_idp_plugin as _;
