@@ -40,6 +40,9 @@ pub struct GraphServices {
 struct Authorized {
     tenant: uuid::Uuid,
     scope: AccessScope,
+    /// Resolved once per request beside the scope, so every stage of that
+    /// request stamps the same subject on the elements it writes.
+    subject: graph_storage_sdk::models::Subject,
 }
 
 impl GraphServices {
@@ -74,6 +77,7 @@ impl GraphServices {
         Ok(Authorized {
             tenant: ctx.subject_tenant_id(),
             scope,
+            subject: graph_storage_sdk::models::Subject::from_security_context(ctx),
         })
     }
 
@@ -85,6 +89,7 @@ impl GraphServices {
         StoreCtx {
             tenant: auth.tenant,
             scope: &auth.scope,
+            subject: auth.subject.clone(),
             snapshot,
             budget: RemainingBudget::starting_now(self.config.deadline_interactive()),
             cancel: CancellationToken::new(),
@@ -390,18 +395,22 @@ impl GraphServices {
             _ => {}
         }
 
-        let mut envelope = serde_json::json!({
-            "id": node.node_key,
+        // The instance validated is the producer-authored document only. The
+        // gear-assigned envelope -- tenant, timestamps, subjects, tombstone,
+        // revision -- is described by the API schema and is deliberately not
+        // part of the GTS type (DESIGN § API element envelope).
+        let mut instance = serde_json::json!({
+            "node_key": node.node_key,
             "type": node.type_id,
         });
         if let Some(name) = &node.name {
-            envelope["name"] = serde_json::json!(name);
+            instance["name"] = serde_json::json!(name);
         }
         if let Some(payload) = &node.payload {
-            envelope["payload"] = payload.clone();
+            instance["payload"] = payload.clone();
         }
         if let Some(validator) = validators.get(&node.type_id) {
-            for (pointer, message) in validator.validate(&envelope) {
+            for (pointer, message) in validator.validate(&instance) {
                 push(Some(pointer), message);
             }
         }
@@ -440,21 +449,22 @@ impl GraphServices {
             return;
         }
 
-        let edge_key = identity::derive_edge_key(record.type_uuid, edge);
-        let mut envelope = serde_json::json!({
-            "id": edge_key,
+        // The edge base declares no key: `edge_key` is derived by the gear
+        // from the type, the endpoints and the discriminator, so it is
+        // envelope rather than body and is not offered for validation.
+        let mut instance = serde_json::json!({
             "type": edge.type_id,
             "src_node_key": edge.src_node_key,
             "dst_node_key": edge.dst_node_key,
         });
         if let Some(discriminator) = &edge.discriminator {
-            envelope["discriminator"] = serde_json::json!(discriminator);
+            instance["discriminator"] = serde_json::json!(discriminator);
         }
         if let Some(payload) = &edge.payload {
-            envelope["payload"] = payload.clone();
+            instance["payload"] = payload.clone();
         }
         if let Some(validator) = validators.get(&edge.type_id) {
-            for (pointer, message) in validator.validate(&envelope) {
+            for (pointer, message) in validator.validate(&instance) {
                 push(Some(pointer), message);
             }
         }

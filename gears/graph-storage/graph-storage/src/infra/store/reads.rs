@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use graph_storage_sdk::models::NodeFilterField as Field;
 use graph_storage_sdk::models::{
-    AdjacencyEntry, AdjacencySide, GraphRevision, NodeId, NodeKey, NodeRow, NodeView,
-    ProjectionRequest, ReadSnapshot,
+    AdjacencyEntry, AdjacencySide, ElementEnvelope, GraphRevision, NodeId, NodeKey, NodeRow,
+    NodeView, ProjectionRequest, ReadSnapshot, Subject,
 };
 use graph_storage_sdk::plugin_api::{GraphStoreError, StoreCtx};
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
@@ -161,12 +161,56 @@ async fn type_names(
     Ok(rows.into_iter().map(|r| (r.id, r.gts_type_id)).collect())
 }
 
+/// The gear-assigned envelope of a node row (`fr-audit-envelope`).
+///
+/// `key` repeats `node_key` deliberately: the envelope is the same shape for
+/// a node and an edge, and an edge has no key of its own in its body -- the
+/// gear derives it. The producer-authored `node_key` stays on the body, where
+/// its type declares it, so a document read back can be sent to ingest
+/// unchanged.
+fn envelope_of_node(model: &node::Model, revision: GraphRevision) -> ElementEnvelope {
+    ElementEnvelope {
+        tenant_id: model.tenant_id,
+        key: model.node_key.clone(),
+        created_at: model.created_at,
+        created_by: Subject {
+            subject_id: model.created_by_subject_id,
+            subject_type: model.created_by_subject_type.clone(),
+        },
+        updated_at: model.updated_at,
+        updated_by: Subject {
+            subject_id: model.updated_by_subject_id,
+            subject_type: model.updated_by_subject_type.clone(),
+        },
+        deleted_at: model.deleted_at,
+        deleted_by: model.deleted_by_subject_id.map(|subject_id| Subject {
+            subject_id,
+            subject_type: model.deleted_by_subject_type.clone(),
+        }),
+        graph_revision: revision,
+    }
+}
+
+/// The revision a read observes: the one its compound-read snapshot pinned,
+/// or the current one when the read stands alone.
+async fn observed_revision(
+    ctx: &StoreCtx<'_>,
+    runner: &impl DBRunner,
+) -> Result<GraphRevision, GraphStoreError> {
+    match ctx.snapshot {
+        Some(snapshot) => Ok(snapshot.revision),
+        None => read_revision(ctx, runner).await,
+    }
+}
+
 fn to_view(
     model: node::Model,
     type_id: String,
     adjacency: Vec<AdjacencyEntry>,
     truncated: bool,
+    revision: GraphRevision,
 ) -> NodeView {
+    let envelope = envelope_of_node(&model, revision);
     NodeView {
         node_key: model.node_key,
         type_id,
@@ -176,8 +220,7 @@ fn to_view(
         labels: Vec::new(),
         adjacency,
         adjacency_truncated: truncated,
-        created_at: model.created_at,
-        updated_at: model.updated_at,
+        envelope,
     }
 }
 
@@ -290,7 +333,8 @@ pub async fn get_node(
         .get(&model.gts_node_type_id)
         .cloned()
         .unwrap_or_else(unknown);
-    Ok(to_view(model, type_id, adjacency, truncated))
+    let revision = observed_revision(ctx, &conn).await?;
+    Ok(to_view(model, type_id, adjacency, truncated, revision))
 }
 
 pub async fn hydrate_nodes(
@@ -318,6 +362,7 @@ pub async fn hydrate_nodes(
 
     // Preserve the caller's order — the walk's order is deterministic and
     // callers rely on seeds coming first.
+    let revision = observed_revision(ctx, &conn).await?;
     let mut by_id: BTreeMap<i64, node::Model> = models.into_iter().map(|m| (m.id, m)).collect();
     let mut views = Vec::new();
     for id in ids {
@@ -326,7 +371,7 @@ pub async fn hydrate_nodes(
                 .get(&model.gts_node_type_id)
                 .cloned()
                 .unwrap_or_default();
-            views.push(to_view(model, type_id, Vec::new(), false));
+            views.push(to_view(model, type_id, Vec::new(), false, revision));
         }
     }
     Ok(views)
@@ -375,6 +420,12 @@ pub async fn project_table(
     .await
     .map_err(map_odata_err)?;
 
+    // The page wrapper is the platform's `toolkit_odata::Page`, which carries
+    // items and cursors and nothing else -- so the revision this projection
+    // observed rides on each row's envelope or is not reported at all
+    // (PRD § fr-tabular-projection).
+    let revision = observed_revision(ctx, &conn).await?;
+
     let mut type_ids: Vec<i32> = page.items.iter().map(|m| m.gts_node_type_id).collect();
     type_ids.sort_unstable();
     type_ids.dedup();
@@ -386,11 +437,10 @@ pub async fn project_table(
             .into_iter()
             .map(|m| NodeRow {
                 type_id: names.get(&m.gts_node_type_id).cloned().unwrap_or_default(),
+                envelope: envelope_of_node(&m, revision),
                 node_key: m.node_key,
                 name: (!m.name.is_empty()).then_some(m.name),
                 payload: Some(m.payload),
-                created_at: m.created_at,
-                updated_at: m.updated_at,
             })
             .collect(),
         page_info: page.page_info,

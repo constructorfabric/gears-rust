@@ -167,3 +167,8 @@ async fn one_snapshot_spans_every_arm_of_one_read() {
 
     store.end_read(snapshot).await.expect("snapshot closes");
 }
+
+#[tokio::test]
+async fn the_envelope_records_the_subject_of_each_verb() {
+    conformance::the_envelope_records_the_subject_of_each_verb(&store(), Uuid::now_v7()).await;
+}

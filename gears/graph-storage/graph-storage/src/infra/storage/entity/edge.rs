@@ -28,8 +28,22 @@ pub struct Model {
     /// GTS-validated attributes, including provenance for analysis edges.
     pub payload: Json,
     pub created_at: OffsetDateTime,
+    /// An edge carries the same audit columns as a node. A re-synced static
+    /// edge is rewritten rather than versioned, so `updated_by` records the
+    /// last producer to assert the relationship -- which is the question
+    /// asked when two producers claim the same one.
+    pub updated_at: OffsetDateTime,
     /// Soft-delete tombstone; `NULL` for live rows.
     pub deleted_at: Option<OffsetDateTime>,
+    /// Subject that first wrote the row (DESIGN § API element envelope).
+    pub created_by_subject_id: Uuid,
+    pub created_by_subject_type: Option<String>,
+    /// Subject of the most recent write.
+    pub updated_by_subject_id: Uuid,
+    pub updated_by_subject_type: Option<String>,
+    /// Subject that tombstoned the row; `NULL` while live.
+    pub deleted_by_subject_id: Option<Uuid>,
+    pub deleted_by_subject_type: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -29,7 +29,8 @@ use graph_storage::domain::embedding::{EmbeddingCoordinator, SpaceState};
 use graph_storage::infra::embedding::fake::FakeEmbeddingProvider;
 use graph_storage_sdk::models::{
     DeleteRequest, EdgeSpec, IngestOptions, IngestRequest, ItemFamily, NodeSpec, ProjectionRequest,
-    ReadSnapshot, RemainingBudget, ReplaceScope, SearchMode, SearchRequest, TypeRegistration,
+    ReadSnapshot, RemainingBudget, ReplaceScope, SearchMode, SearchRequest, Subject,
+    TypeRegistration,
 };
 use graph_storage_sdk::plugin_api::{EmbeddingPlan, GraphStoreError, GraphStoreV1, StoreCtx};
 use tokio_util::sync::CancellationToken;
@@ -37,19 +38,17 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 /// Producer types the suite registers on top of the base ontology.
-pub const OWNED: &str =
-    "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~test.gs._.thing.v1~";
-pub const PHANTOM: &str =
-    "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.phantom_node.v1~";
+pub const OWNED: &str = "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~test.gs._.thing.v1~";
+pub const PHANTOM: &str = "gts.cf.core.graph.node.v1~cf.core.graph.phantom_node.v1~";
 /// An edge type that admits only owned nodes at either end — the constraint
 /// that gives the endpoint check something to refuse.
-pub const OWNED_ONLY: &str = "gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~test.gs._.owned_link.v1~";
-pub const OWNED_FAMILY: &str =
-    "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~";
+pub const OWNED_ONLY: &str =
+    "gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~test.gs._.owned_link.v1~";
+pub const OWNED_FAMILY: &str = "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~";
 /// A node type from a different family, which `OWNED_ONLY` must refuse.
-pub const REFERENCE: &str = "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.reference_node.v1~test.gs._.mirror.v1~";
-pub const LINK: &str =
-    "gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~test.gs._.link.v1~";
+pub const REFERENCE: &str =
+    "gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~test.gs._.mirror.v1~";
+pub const LINK: &str = "gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~test.gs._.link.v1~";
 
 /// Ingest through the real Embedding Coordinator, as the domain service does.
 ///
@@ -153,7 +152,7 @@ pub fn ontology_batch() -> Vec<TypeRegistration> {
             },
             "type": "object",
             "allOf": [
-                { "$ref": "gts://gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~" }
+                { "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~" }
             ]
         }),
     });
@@ -164,7 +163,7 @@ pub fn ontology_batch() -> Vec<TypeRegistration> {
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "allOf": [
-                { "$ref": "gts://gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~" }
+                { "$ref": "gts://gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~" }
             ]
         }),
     });
@@ -203,6 +202,23 @@ pub fn batch(nodes: Vec<NodeSpec>, edges: Vec<EdgeSpec>) -> IngestRequest {
     }
 }
 
+/// The subject every obligation writes as, unless it deliberately writes as
+/// someone else. Fixed rather than random so an envelope assertion can name
+/// the value it expects.
+pub const WRITER: Uuid = uuid::uuid!("11111111-1111-1111-1111-111111111111");
+
+/// The subject type that subject carries, so the optional half of the pair is
+/// exercised rather than left `None` on every path.
+pub const WRITER_TYPE: &str = "gts.cf.core.security.subject_user.v1~";
+
+#[must_use]
+pub fn writer() -> Subject {
+    Subject {
+        subject_id: WRITER,
+        subject_type: Some(WRITER_TYPE.to_owned()),
+    }
+}
+
 /// Build a per-call context. Tests own the scope explicitly so an assertion
 /// about isolation is an assertion about the store, not about a PDP.
 pub fn ctx<'a>(
@@ -210,9 +226,21 @@ pub fn ctx<'a>(
     scope: &'a AccessScope,
     snapshot: Option<&'a ReadSnapshot>,
 ) -> StoreCtx<'a> {
+    ctx_as(tenant, scope, snapshot, writer())
+}
+
+/// The same, writing as a named subject -- what an envelope obligation needs
+/// to tell one writer's mark from another's.
+pub fn ctx_as<'a>(
+    tenant: Uuid,
+    scope: &'a AccessScope,
+    snapshot: Option<&'a ReadSnapshot>,
+    subject: Subject,
+) -> StoreCtx<'a> {
     StoreCtx {
         tenant,
         scope,
+        subject,
         snapshot,
         budget: RemainingBudget::starting_now(Duration::from_secs(30)),
         cancel: CancellationToken::new(),
@@ -498,7 +526,7 @@ pub async fn endpoint_constraints_are_enforced(store: &dyn GraphStoreV1, tenant:
             "$schema": "http://json-schema.org/draft-07/schema#",
             "x-gts-traits": { "src_types": [OWNED_FAMILY], "dst_types": [OWNED_FAMILY] },
             "type": "object",
-            "allOf": [{ "$ref": "gts://gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~" }]
+            "allOf": [{ "$ref": "gts://gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~" }]
         }),
     });
     batch.push(TypeRegistration {
@@ -507,7 +535,7 @@ pub async fn endpoint_constraints_are_enforced(store: &dyn GraphStoreV1, tenant:
             "$id": format!("gts://{REFERENCE}"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
-            "allOf": [{ "$ref": "gts://gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.reference_node.v1~" }]
+            "allOf": [{ "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~" }]
         }),
     });
     store
@@ -597,7 +625,7 @@ pub async fn materializing_a_phantom_revalidates_its_edges(store: &dyn GraphStor
             "$schema": "http://json-schema.org/draft-07/schema#",
             "x-gts-traits": { "src_types": [OWNED_FAMILY], "dst_types": [OWNED_FAMILY] },
             "type": "object",
-            "allOf": [{ "$ref": "gts://gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~" }]
+            "allOf": [{ "$ref": "gts://gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~" }]
         }),
     });
     batch.push(TypeRegistration {
@@ -606,7 +634,7 @@ pub async fn materializing_a_phantom_revalidates_its_edges(store: &dyn GraphStor
             "$id": format!("gts://{REFERENCE}"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
-            "allOf": [{ "$ref": "gts://gts.cf.core.graph_storage.reference_node.v1~" }]
+            "allOf": [{ "$ref": "gts://gts.cf.core.graph.reference_node.v1~" }]
         }),
     });
     store
@@ -1123,5 +1151,125 @@ pub async fn only_the_active_epoch_ranks(store: &impl GraphStoreV1, tenant: Uuid
     assert!(
         search_vector(store, &ctx, text, EPOCH + 1).await.is_empty(),
         "a vector of another epoch must not rank"
+    );
+}
+
+/// `fr-audit-envelope`: every element a read returns carries the gear-assigned
+/// envelope, and the subject on it is the one that performed each verb.
+///
+/// The obligation is written against two different writers on purpose. A store
+/// that stamps the caller's subject on creation but forgets it on update
+/// passes every single-writer assertion, and the question the envelope exists
+/// to answer -- *who touched this last* -- is exactly the one it then gets
+/// wrong.
+pub async fn the_envelope_records_the_subject_of_each_verb(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let author = ctx(tenant, &scope, None);
+    let editor_subject = Subject {
+        subject_id: uuid::uuid!("22222222-2222-2222-2222-222222222222"),
+        // An automation carries no subject type, which is the case the
+        // optional half of the pair exists for.
+        subject_type: None,
+    };
+    let editor = ctx_as(tenant, &scope, None, editor_subject.clone());
+
+    store
+        .register_types(&author, ontology_batch())
+        .await
+        .expect("ontology registers");
+    ingest_batch(
+        store,
+        &author,
+        batch(vec![node("audited", "first")], Vec::new()),
+    )
+    .await
+    .expect("the batch commits");
+
+    let created = store
+        .get_node(&author, &"audited".to_owned(), 10)
+        .await
+        .expect("the node reads")
+        .envelope;
+    assert_eq!(created.key, "audited", "the envelope keys the element");
+    assert_eq!(created.tenant_id, tenant, "the envelope carries the tenant");
+    assert_eq!(created.created_by, writer(), "the creator is recorded");
+    assert_eq!(
+        created.updated_by,
+        writer(),
+        "a fresh element's last writer is its creator"
+    );
+    assert!(
+        created.deleted_at.is_none() && created.deleted_by.is_none(),
+        "a live element carries no tombstone"
+    );
+    assert!(
+        created.graph_revision.revision > 0,
+        "the envelope reports the revision the read observed"
+    );
+
+    // A second subject rewrites it. Creation must not move; the update must.
+    ingest_batch(
+        store,
+        &editor,
+        batch(vec![node("audited", "second")], Vec::new()),
+    )
+    .await
+    .expect("the second batch commits");
+
+    let updated = store
+        .get_node(&author, &"audited".to_owned(), 10)
+        .await
+        .expect("the node reads")
+        .envelope;
+    assert_eq!(
+        updated.created_by,
+        writer(),
+        "an update must not rewrite who created the element"
+    );
+    assert_eq!(
+        updated.created_at, created.created_at,
+        "an update must not move the creation time"
+    );
+    assert_eq!(
+        updated.updated_by, editor_subject,
+        "the last writer is the subject that performed the update"
+    );
+
+    // The projection carries the same envelope -- and on that path it is the
+    // only carrier of the observed revision, since the page wrapper has no
+    // member for one.
+    let page = store
+        .project_table(&author, ProjectionRequest::default())
+        .await
+        .expect("projection succeeds");
+    let row = page
+        .items
+        .iter()
+        .find(|row| row.node_key == "audited")
+        .expect("the node is projected");
+    assert_eq!(
+        row.envelope.updated_by, editor_subject,
+        "the projection reports the same last writer as the node read"
+    );
+    assert!(
+        row.envelope.graph_revision.revision > 0,
+        "the projection reports its observed revision on the element"
+    );
+
+    // A tombstone names its own subject, and leaves the other two alone.
+    store
+        .soft_delete(&editor, DeleteRequest::Node("audited".to_owned()))
+        .await
+        .expect("the delete succeeds");
+    // A tombstoned element reads as absent, so the assertion that it recorded
+    // the deleting subject cannot be made through a read surface. That the
+    // three verbs are stored separately is asserted above; that delete writes
+    // its own pair is asserted by the store's own tests.
+    assert!(
+        matches!(
+            store.get_node(&author, &"audited".to_owned(), 10).await,
+            Err(GraphStoreError::NotFound)
+        ),
+        "a tombstoned node reads as absent"
     );
 }

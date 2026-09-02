@@ -22,8 +22,8 @@ use crate::models::{
     GraphRevision, GtsTypeId, HopBudget, IngestOutcome, IngestRequest, ItemError, LabelAssignment,
     LabelFilter, LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page,
     ProjectionRequest, ReadSnapshot, RemainingBudget, RevisionOutcome, SearchRequest,
-    SearchResponse, StoreCapabilities, TenantId, TopologyPage, TopologyRequest, TruncationReason,
-    TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
+    SearchResponse, StoreCapabilities, Subject, TenantId, TopologyPage, TopologyRequest,
+    TruncationReason, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
 };
 
 /// Per-call context. The compiled scope is mandatory, not optional:
@@ -39,6 +39,9 @@ use crate::models::{
 pub struct StoreCtx<'a> {
     pub tenant: TenantId,
     pub scope: &'a AccessScope,
+    /// The acting subject, stamped onto the audit envelope of every element a
+    /// write in this call creates, updates or tombstones (`fr-audit-envelope`).
+    pub subject: Subject,
     /// Present when the call participates in a compound read that must
     /// observe one graph state (Read Consistency Contract).
     pub snapshot: Option<&'a ReadSnapshot>,

@@ -276,11 +276,16 @@ mod tests {
             embedding_input_hash: None,
             source_namespace: None,
             owner_principal: String::new(),
-            created_by: String::new(),
             version: 1,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             updated_at: time::OffsetDateTime::UNIX_EPOCH,
             deleted_at: None,
+            created_by_subject_id: uuid::Uuid::nil(),
+            created_by_subject_type: None,
+            updated_by_subject_id: uuid::Uuid::nil(),
+            updated_by_subject_type: None,
+            deleted_by_subject_id: None,
+            deleted_by_subject_type: None,
         }
     }
 

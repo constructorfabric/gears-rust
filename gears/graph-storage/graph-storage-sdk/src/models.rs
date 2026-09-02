@@ -155,6 +155,68 @@ pub struct ReadSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// Element envelope (fr-audit-envelope)
+// ---------------------------------------------------------------------------
+
+/// The party behind a write, in the platform's own vocabulary rather than in
+/// a vocabulary of this gear's own: `SecurityContext`'s `subject_id` and
+/// optional `subject_type`.
+///
+/// A subject and not a user because most writes into this gear arrive from an
+/// automation or a service integration, so a `user_id` member would be empty
+/// on the majority of rows and would need a second member beside it for the
+/// rest (DESIGN § API element envelope).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Subject {
+    pub subject_id: Uuid,
+    /// GTS type of the acting subject, e.g.
+    /// `gts.cf.core.security.subject_user.v1~`. Optional, matching
+    /// `SecurityContext`, which does not always carry one.
+    pub subject_type: Option<GtsTypeId>,
+}
+
+impl Subject {
+    /// The subject a `SecurityContext` names.
+    #[must_use]
+    pub fn from_security_context(ctx: &toolkit_security::SecurityContext) -> Self {
+        Self {
+            subject_id: ctx.subject_id(),
+            subject_type: ctx.subject_type().map(ToOwned::to_owned),
+        }
+    }
+}
+
+/// The gear-assigned half of an element, identical for every node and every
+/// edge and described by the API schema rather than by the element's GTS type
+/// -- a producer can neither supply nor extend it, and a type registered
+/// statically in the types-registry has nothing to put in it.
+///
+/// It is read-only on every write surface: an envelope member a producer
+/// sends is ignored rather than rejected, so a document read from the API can
+/// be sent back unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElementEnvelope {
+    pub tenant_id: Uuid,
+    /// The element's key: a node's producer-supplied `node_key`, an edge's
+    /// gear-derived `edge_key`.
+    pub key: String,
+    pub created_at: OffsetDateTime,
+    pub created_by: Subject,
+    pub updated_at: OffsetDateTime,
+    pub updated_by: Subject,
+    /// Soft-delete tombstone; absent on a live element.
+    pub deleted_at: Option<OffsetDateTime>,
+    pub deleted_by: Option<Subject>,
+    /// The revision the read that produced this element observed.
+    ///
+    /// Per element rather than per response because the tabular projection
+    /// answers inside `toolkit_odata::Page`, which carries items and cursors
+    /// and nothing else -- so this is the only place that read path can
+    /// report the snapshot it observed (PRD § fr-tabular-projection).
+    pub graph_revision: GraphRevision,
+}
+
+// ---------------------------------------------------------------------------
 // Ingest
 // ---------------------------------------------------------------------------
 
@@ -329,8 +391,8 @@ pub struct NodeView {
     pub labels: Vec<String>,
     pub adjacency: Vec<AdjacencyEntry>,
     pub adjacency_truncated: bool,
-    pub created_at: OffsetDateTime,
-    pub updated_at: OffsetDateTime,
+    /// Gear-assigned audit envelope (`fr-audit-envelope`).
+    pub envelope: ElementEnvelope,
 }
 
 /// One row of the tabular projection.
@@ -340,8 +402,10 @@ pub struct NodeRow {
     pub type_id: GtsTypeId,
     pub name: Option<String>,
     pub payload: Option<serde_json::Value>,
-    pub created_at: OffsetDateTime,
-    pub updated_at: OffsetDateTime,
+    /// Gear-assigned audit envelope (`fr-audit-envelope`). On this path it is
+    /// also the only carrier of the observed revision: the page wrapper is
+    /// the platform's and has no member for one.
+    pub envelope: ElementEnvelope,
 }
 
 /// A page of results with an opaque continuation token bound to the observed

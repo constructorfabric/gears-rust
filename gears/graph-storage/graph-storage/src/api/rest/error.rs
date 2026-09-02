@@ -13,11 +13,11 @@ use toolkit_canonical_errors::{CanonicalError, resource_error};
 use crate::domain::error::{DomainError, reasons};
 
 /// Errors attributable to a graph node as a resource.
-#[resource_error(gts_id!("cf.core.graph_storage.node.v1~"))]
+#[resource_error(gts_id!("cf.core.graph.node.v1~"))]
 pub struct GraphNodeError;
 
 /// Errors attributable to a registered ontology type.
-#[resource_error(gts_id!("cf.core.graph_storage.type.v1~"))]
+#[resource_error(gts_id!("cf.core.graph.type.v1~"))]
 pub struct GraphTypeError;
 
 /// The field name a per-item violation is reported under: which collection,

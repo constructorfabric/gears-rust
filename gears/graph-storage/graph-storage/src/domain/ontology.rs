@@ -23,50 +23,50 @@ use crate::domain::error::DomainError;
 pub const BASE_SCHEMAS: [(&str, &str); 9] = [
     (
         graph_storage_sdk::gts::NODE_BASE_TYPE,
-        include_str!("../../../docs/schemas/gts.cf.core.graph_storage.node.v1~.schema.json"),
+        include_str!("../../../docs/schemas/gts.cf.core.graph.node.v1~.schema.json"),
     ),
     (
         graph_storage_sdk::gts::EDGE_BASE_TYPE,
-        include_str!("../../../docs/schemas/gts.cf.core.graph_storage.edge.v1~.schema.json"),
+        include_str!("../../../docs/schemas/gts.cf.core.graph.edge.v1~.schema.json"),
     ),
     (
         graph_storage_sdk::gts::ATTRIBUTE_BASE_TYPE,
-        include_str!("../../../docs/schemas/gts.cf.core.graph_storage.attribute.v1~.schema.json"),
+        include_str!("../../../docs/schemas/gts.cf.core.graph.attribute.v1~.schema.json"),
     ),
     (
         graph_storage_sdk::gts::OWNED_NODE_TYPE,
         include_str!(
-            "../../../docs/schemas/gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~.schema.json"
+            "../../../docs/schemas/gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~.schema.json"
         ),
     ),
     (
         graph_storage_sdk::gts::REFERENCE_NODE_TYPE,
         include_str!(
-            "../../../docs/schemas/gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.reference_node.v1~.schema.json"
+            "../../../docs/schemas/gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~.schema.json"
         ),
     ),
     (
         graph_storage_sdk::gts::PHANTOM_NODE_TYPE,
         include_str!(
-            "../../../docs/schemas/gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.phantom_node.v1~.schema.json"
+            "../../../docs/schemas/gts.cf.core.graph.node.v1~cf.core.graph.phantom_node.v1~.schema.json"
         ),
     ),
     (
         graph_storage_sdk::gts::STATIC_EDGE_TYPE,
         include_str!(
-            "../../../docs/schemas/gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~.schema.json"
+            "../../../docs/schemas/gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~.schema.json"
         ),
     ),
     (
         graph_storage_sdk::gts::ANALYSIS_EDGE_TYPE,
         include_str!(
-            "../../../docs/schemas/gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.analysis_edge.v1~.schema.json"
+            "../../../docs/schemas/gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~.schema.json"
         ),
     ),
     (
         graph_storage_sdk::gts::PROVENANCE_ATTRIBUTE_TYPE,
         include_str!(
-            "../../../docs/schemas/gts.cf.core.graph_storage.attribute.v1~cf.core.graph_storage.provenance.v1~.schema.json"
+            "../../../docs/schemas/gts.cf.core.graph.attribute.v1~cf.core.graph.provenance.v1~.schema.json"
         ),
     ),
 ];
@@ -401,20 +401,18 @@ mod tests {
     /// platform's behaviour, not ours, so they are pinned here.
     #[test]
     fn a_pattern_admits_what_derives_from_it_and_nothing_else() {
-        let commit = "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.reference_node.v1~acme.scm._.commit.v1~";
+        let commit =
+            "gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~acme.scm._.commit.v1~";
 
         assert_eq!(
-            matches_any_pattern(commit, &["gts.cf.core.graph_storage.node.v1~".to_owned()]).ok(),
+            matches_any_pattern(commit, &["gts.cf.core.graph.node.v1~".to_owned()]).ok(),
             Some(true),
             "the base every node type derives from admits them all"
         );
         assert_eq!(
             matches_any_pattern(
                 commit,
-                &[
-                    "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~"
-                        .to_owned()
-                ]
+                &["gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~".to_owned()]
             )
             .ok(),
             Some(false),

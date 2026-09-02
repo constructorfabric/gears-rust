@@ -126,10 +126,8 @@ mod tests {
     use crate::domain::ontology::BASE_SCHEMAS;
     use crate::infra::fake_store::{FakeGraphEngine, FakeGraphStore};
 
-    const OWNED: &str =
-        "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~acme.walk._.n.v1~";
-    const LINK: &str =
-        "gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~acme.walk._.e.v1~";
+    const OWNED: &str = "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.walk._.n.v1~";
+    const LINK: &str = "gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~acme.walk._.e.v1~";
 
     fn derived(type_id: &str, family: &str) -> TypeRegistration {
         TypeRegistration {
@@ -158,6 +156,10 @@ mod tests {
         let ctx = StoreCtx {
             tenant,
             scope: &scope,
+            subject: graph_storage_sdk::models::Subject {
+                subject_id: Uuid::nil(),
+                subject_type: None,
+            },
             snapshot: None,
             budget: RemainingBudget::starting_now(Duration::from_secs(30)),
             cancel: CancellationToken::new(),
@@ -172,11 +174,11 @@ mod tests {
             .collect();
         types.push(derived(
             OWNED,
-            "gts.cf.core.graph_storage.node.v1~cf.core.graph_storage.owned_node.v1~",
+            "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~",
         ));
         types.push(derived(
             LINK,
-            "gts.cf.core.graph_storage.edge.v1~cf.core.graph_storage.static_edge.v1~",
+            "gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~",
         ));
         store
             .register_types(&ctx, types)

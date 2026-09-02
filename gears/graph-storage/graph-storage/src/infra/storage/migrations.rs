@@ -11,6 +11,7 @@ use sea_orm_migration::prelude::*;
 pub mod m0001_initial_schema;
 pub mod m0002_property_graph;
 pub mod m0003_embedding_space;
+pub mod m0004_element_envelope;
 
 /// Text-search configuration used for both the GIN index expression and every
 /// lexical query. One constant, so predicate and index cannot drift apart —
@@ -25,6 +26,7 @@ impl MigratorTrait for Migrator {
             Box::new(m0001_initial_schema::Migration),
             Box::new(m0002_property_graph::Migration),
             Box::new(m0003_embedding_space::Migration),
+            Box::new(m0004_element_envelope::Migration),
         ]
     }
 }

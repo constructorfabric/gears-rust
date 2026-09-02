@@ -69,6 +69,45 @@ pub struct GraphRevisionDto {
 }
 
 // ---------------------------------------------------------------------------
+// Element envelope
+// ---------------------------------------------------------------------------
+
+/// The acting party behind a write, in the platform's subject vocabulary
+/// rather than as a user id -- most writes into this gear come from an
+/// automation or a service integration.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphSubjectDto {
+    pub subject_id: String,
+    /// GTS type of the subject, e.g. `gts.cf.core.security.subject_user.v1~`.
+    /// Absent when the security context carries none.
+    pub subject_type: Option<String>,
+}
+
+/// The gear-assigned half of an element (`fr-audit-envelope`): identical for
+/// every node and every edge, described here rather than by the element's GTS
+/// type, and read-only on every write surface.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphElementEnvelopeDto {
+    pub tenant_id: String,
+    /// A node's producer-supplied `node_key`, an edge's derived `edge_key`.
+    pub key: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    pub created_by: GraphSubjectDto,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
+    pub updated_by: GraphSubjectDto,
+    /// Soft-delete tombstone; absent on a live element.
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub deleted_at: Option<time::OffsetDateTime>,
+    pub deleted_by: Option<GraphSubjectDto>,
+    /// The revision the read that produced this element observed.
+    pub graph_revision: GraphRevisionDto,
+}
+
+// ---------------------------------------------------------------------------
 // Ingest
 // ---------------------------------------------------------------------------
 
@@ -181,6 +220,7 @@ pub struct GraphNodeDto {
     pub has_embedding: bool,
     pub adjacency: Vec<GraphAdjacencyEntryDto>,
     pub adjacency_truncated: bool,
+    pub envelope: GraphElementEnvelopeDto,
 }
 
 /// One projection row. What `$filter` and `$orderby` may name is declared
@@ -192,10 +232,9 @@ pub struct GraphNodeRowDto {
     pub type_id: String,
     pub name: Option<String>,
     pub payload: Option<serde_json::Value>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: time::OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: time::OffsetDateTime,
+    /// On this path the envelope is also the only carrier of the observed
+    /// revision: the page wrapper is the platform's and has no member for one.
+    pub envelope: GraphElementEnvelopeDto,
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +456,31 @@ impl From<m::AdjacencyEntry> for GraphAdjacencyEntryDto {
     }
 }
 
+impl From<m::Subject> for GraphSubjectDto {
+    fn from(value: m::Subject) -> Self {
+        Self {
+            subject_id: value.subject_id.to_string(),
+            subject_type: value.subject_type,
+        }
+    }
+}
+
+impl From<m::ElementEnvelope> for GraphElementEnvelopeDto {
+    fn from(value: m::ElementEnvelope) -> Self {
+        Self {
+            tenant_id: value.tenant_id.to_string(),
+            key: value.key,
+            created_at: value.created_at,
+            created_by: value.created_by.into(),
+            updated_at: value.updated_at,
+            updated_by: value.updated_by.into(),
+            deleted_at: value.deleted_at,
+            deleted_by: value.deleted_by.map(Into::into),
+            graph_revision: value.graph_revision.into(),
+        }
+    }
+}
+
 impl From<m::NodeView> for GraphNodeDto {
     fn from(value: m::NodeView) -> Self {
         Self {
@@ -427,6 +491,7 @@ impl From<m::NodeView> for GraphNodeDto {
             has_embedding: value.has_embedding,
             adjacency: value.adjacency.into_iter().map(Into::into).collect(),
             adjacency_truncated: value.adjacency_truncated,
+            envelope: value.envelope.into(),
         }
     }
 }
@@ -438,8 +503,7 @@ impl From<m::NodeRow> for GraphNodeRowDto {
             type_id: value.type_id,
             name: value.name,
             payload: value.payload,
-            created_at: value.created_at,
-            updated_at: value.updated_at,
+            envelope: value.envelope.into(),
         }
     }
 }

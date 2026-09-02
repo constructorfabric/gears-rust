@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use graph_storage_sdk::models::{
     DeleteOutcome, DeleteRequest, EdgeSpec, EffectiveTraits, GraphRevision, IngestCounts,
-    IngestOutcome, IngestRequest, ItemError, ItemFamily, NodeSpec, ReplaceScope,
+    IngestOutcome, IngestRequest, ItemError, ItemFamily, NodeSpec, ReplaceScope, Subject,
 };
 use graph_storage_sdk::plugin_api::{EmbeddingPlan, GraphStoreError, StoreCtx};
 use sea_orm::sea_query::Expr;
@@ -263,6 +263,7 @@ pub async fn ingest(
 ) -> Result<IngestOutcome, GraphStoreError> {
     let tenant = ctx.tenant;
     let scope = ctx.scope.clone();
+    let subject = ctx.subject.clone();
     let producer = String::new();
 
     store
@@ -271,25 +272,47 @@ pub async fn ingest(
             let request = request.clone();
             let embedding = embedding.clone();
             let scope = scope.clone();
+            let subject = subject.clone();
             let producer = producer.clone();
             Box::pin(async move {
-                ingest_in_tx(tenant, &scope, &producer, tx, request, &embedding)
-                    .await
-                    .map_err(TxStoreError::from)
+                ingest_in_tx(
+                    Writer {
+                        tenant,
+                        scope: &scope,
+                        subject: &subject,
+                    },
+                    &producer,
+                    tx,
+                    request,
+                    &embedding,
+                )
+                .await
+                .map_err(TxStoreError::from)
             })
         })
         .await
         .map_err(|error| error.0)
 }
 
-async fn ingest_in_tx(
+/// The three values every write in a batch carries and never carries apart:
+/// whose graph, under what compiled scope, and on whose behalf. Threaded as
+/// one because the alternative -- three parameters -- made four signatures
+/// wider than they had any reason to be.
+#[derive(Clone, Copy)]
+struct Writer<'a> {
     tenant: Uuid,
-    scope: &AccessScope,
+    scope: &'a AccessScope,
+    subject: &'a Subject,
+}
+
+async fn ingest_in_tx(
+    w: Writer<'_>,
     producer: &str,
     tx: &impl DBRunner,
     request: IngestRequest,
     embedding: &EmbeddingPlan,
 ) -> Result<IngestOutcome, GraphStoreError> {
+    let (tenant, scope) = (w.tenant, w.scope);
     let epoch = source_epoch(scope, tx).await?;
     let request_hash = identity::ingest_request_hash(&request);
 
@@ -315,8 +338,7 @@ async fn ingest_in_tx(
 
     let mut node_ids: BTreeMap<String, Endpoint> = BTreeMap::new();
     changed |= write_nodes(
-        tenant,
-        scope,
+        w,
         tx,
         &request,
         &types,
@@ -326,16 +348,7 @@ async fn ingest_in_tx(
     )
     .await?;
 
-    changed |= write_edges(
-        tenant,
-        scope,
-        tx,
-        &request,
-        &types,
-        &mut node_ids,
-        &mut counts,
-    )
-    .await?;
+    changed |= write_edges(w, tx, &request, &types, &mut node_ids, &mut counts).await?;
 
     // The revision advances if and only if stored state actually changed.
     let revision_value = if changed {
@@ -691,14 +704,14 @@ fn plan_vector(current: Option<&node::Model>, planned: PlannedVector<'_>) -> Vec
 }
 
 async fn upsert_node(
-    tenant: Uuid,
-    scope: &AccessScope,
+    w: Writer<'_>,
     tx: &impl DBRunner,
     spec: &NodeSpec,
     info: &TypeInfo,
     index: usize,
     planned: PlannedVector<'_>,
 ) -> Result<(i64, NodeWrite), GraphStoreError> {
+    let (tenant, scope, subject) = (w.tenant, w.scope, w.subject);
     let existing = node::Entity::find()
         .secure()
         .scope_with(scope)
@@ -730,11 +743,16 @@ async fn upsert_node(
             embedding_input_hash: ActiveValue::Set(vector.input_hash),
             source_namespace: ActiveValue::Set(None),
             owner_principal: ActiveValue::Set(String::new()),
-            created_by: ActiveValue::Set(String::new()),
             version: ActiveValue::Set(1),
             created_at: ActiveValue::Set(now),
             updated_at: ActiveValue::Set(now),
             deleted_at: ActiveValue::Set(None),
+            created_by_subject_id: ActiveValue::Set(subject.subject_id),
+            created_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
+            updated_by_subject_id: ActiveValue::Set(subject.subject_id),
+            updated_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
+            deleted_by_subject_id: ActiveValue::Set(None),
+            deleted_by_subject_type: ActiveValue::Set(None),
         };
         let model = node::Entity::insert(active)
             .secure()
@@ -819,6 +837,14 @@ async fn upsert_node(
         )
         .col_expr(node::Column::Version, Expr::value(version))
         .col_expr(node::Column::UpdatedAt, Expr::value(now))
+        .col_expr(
+            node::Column::UpdatedBySubjectId,
+            Expr::value(subject.subject_id),
+        )
+        .col_expr(
+            node::Column::UpdatedBySubjectType,
+            Expr::value(subject.subject_type.clone()),
+        )
         .filter(Condition::all().add(node::Column::Id.eq(id)))
         .secure()
         .scope_with(scope)
@@ -862,12 +888,12 @@ async fn is_phantom_type(
 }
 
 async fn insert_phantom(
-    tenant: Uuid,
-    scope: &AccessScope,
+    w: Writer<'_>,
     tx: &impl DBRunner,
     key: &str,
     info: &TypeInfo,
 ) -> Result<i64, GraphStoreError> {
+    let (tenant, scope, subject) = (w.tenant, w.scope, w.subject);
     let now = OffsetDateTime::now_utc();
     let active = node::ActiveModel {
         tenant_id: ActiveValue::Set(tenant),
@@ -882,11 +908,18 @@ async fn insert_phantom(
         embedding_input_hash: ActiveValue::Set(None),
         source_namespace: ActiveValue::Set(None),
         owner_principal: ActiveValue::Set(String::new()),
-        created_by: ActiveValue::Set(String::new()),
         version: ActiveValue::Set(1),
         created_at: ActiveValue::Set(now),
         updated_at: ActiveValue::Set(now),
         deleted_at: ActiveValue::Set(None),
+        // A phantom is materialized by the edge that named it, so the subject
+        // that wrote that edge is the one that brought this row into being.
+        created_by_subject_id: ActiveValue::Set(subject.subject_id),
+        created_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
+        updated_by_subject_id: ActiveValue::Set(subject.subject_id),
+        updated_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
+        deleted_by_subject_id: ActiveValue::Set(None),
+        deleted_by_subject_type: ActiveValue::Set(None),
     };
     let model = node::Entity::insert(active)
         .secure()
@@ -899,15 +932,16 @@ async fn insert_phantom(
 }
 
 async fn upsert_edge(
-    tenant: Uuid,
-    scope: &AccessScope,
+    w: Writer<'_>,
     tx: &impl DBRunner,
     spec: &EdgeSpec,
     info: &TypeInfo,
     src: i64,
     dst: i64,
 ) -> Result<EdgeWrite, GraphStoreError> {
+    let (tenant, scope, subject) = (w.tenant, w.scope, w.subject);
     let edge_key = identity::derive_edge_key(info.uuid, spec);
+    let now = OffsetDateTime::now_utc();
     let payload = spec
         .payload
         .clone()
@@ -931,8 +965,15 @@ async fn upsert_edge(
             dst_node_id: ActiveValue::Set(dst),
             discriminator: ActiveValue::Set(spec.discriminator.clone()),
             payload: ActiveValue::Set(payload),
-            created_at: ActiveValue::Set(OffsetDateTime::now_utc()),
+            created_at: ActiveValue::Set(now),
+            updated_at: ActiveValue::Set(now),
             deleted_at: ActiveValue::Set(None),
+            created_by_subject_id: ActiveValue::Set(subject.subject_id),
+            created_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
+            updated_by_subject_id: ActiveValue::Set(subject.subject_id),
+            updated_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
+            deleted_by_subject_id: ActiveValue::Set(None),
+            deleted_by_subject_type: ActiveValue::Set(None),
         };
         edge::Entity::insert(active)
             .secure()
@@ -951,9 +992,26 @@ async fn upsert_edge(
     let id = current.id;
     edge::Entity::update_many()
         .col_expr(edge::Column::Payload, Expr::value(payload))
+        .col_expr(edge::Column::UpdatedAt, Expr::value(now))
+        .col_expr(
+            edge::Column::UpdatedBySubjectId,
+            Expr::value(subject.subject_id),
+        )
+        .col_expr(
+            edge::Column::UpdatedBySubjectType,
+            Expr::value(subject.subject_type.clone()),
+        )
         .col_expr(
             edge::Column::DeletedAt,
             Expr::value(Option::<OffsetDateTime>::None),
+        )
+        .col_expr(
+            edge::Column::DeletedBySubjectId,
+            Expr::value(Option::<Uuid>::None),
+        )
+        .col_expr(
+            edge::Column::DeletedBySubjectType,
+            Expr::value(Option::<String>::None),
         )
         .filter(Condition::all().add(edge::Column::Id.eq(id)))
         .secure()
@@ -971,12 +1029,14 @@ pub async fn soft_delete(
 ) -> Result<DeleteOutcome, GraphStoreError> {
     let tenant = ctx.tenant;
     let scope = ctx.scope.clone();
+    let subject = ctx.subject.clone();
 
     store
         .db()
         .transaction_ref_mapped::<_, DeleteOutcome, TxStoreError>(move |tx| {
             let request = request.clone();
             let scope = scope.clone();
+            let subject = subject.clone();
             Box::pin(async move {
                 let epoch = source_epoch(&scope, tx).await?;
                 let now = OffsetDateTime::now_utc();
@@ -1012,6 +1072,14 @@ pub async fn soft_delete(
                         for e in incident {
                             edge::Entity::update_many()
                                 .col_expr(edge::Column::DeletedAt, Expr::value(Some(now)))
+                                .col_expr(
+                                    edge::Column::DeletedBySubjectId,
+                                    Expr::value(Some(subject.subject_id)),
+                                )
+                                .col_expr(
+                                    edge::Column::DeletedBySubjectType,
+                                    Expr::value(subject.subject_type.clone()),
+                                )
                                 .filter(Condition::all().add(edge::Column::Id.eq(e.id)))
                                 .secure()
                                 .scope_with(&scope)
@@ -1023,6 +1091,14 @@ pub async fn soft_delete(
 
                         node::Entity::update_many()
                             .col_expr(node::Column::DeletedAt, Expr::value(Some(now)))
+                            .col_expr(
+                                node::Column::DeletedBySubjectId,
+                                Expr::value(Some(subject.subject_id)),
+                            )
+                            .col_expr(
+                                node::Column::DeletedBySubjectType,
+                                Expr::value(subject.subject_type.clone()),
+                            )
                             .filter(Condition::all().add(node::Column::Id.eq(model.id)))
                             .secure()
                             .scope_with(&scope)
@@ -1043,6 +1119,14 @@ pub async fn soft_delete(
                             .ok_or(GraphStoreError::NotFound)?;
                         edge::Entity::update_many()
                             .col_expr(edge::Column::DeletedAt, Expr::value(Some(now)))
+                            .col_expr(
+                                edge::Column::DeletedBySubjectId,
+                                Expr::value(Some(subject.subject_id)),
+                            )
+                            .col_expr(
+                                edge::Column::DeletedBySubjectType,
+                                Expr::value(subject.subject_type.clone()),
+                            )
                             .filter(Condition::all().add(edge::Column::Id.eq(model.id)))
                             .secure()
                             .scope_with(&scope)
@@ -1117,8 +1201,7 @@ pub const fn migrated_embedding_dimension() -> u32 {
 /// Upsert every node of the batch, recording its id and how it landed.
 /// Returns whether any stored state changed.
 async fn write_nodes(
-    tenant: Uuid,
-    scope: &AccessScope,
+    w: Writer<'_>,
     tx: &impl DBRunner,
     request: &IngestRequest,
     types: &BTreeMap<String, TypeInfo>,
@@ -1147,8 +1230,7 @@ async fn write_nodes(
             ))
         })?;
         let (id, write) = upsert_node(
-            tenant,
-            scope,
+            w,
             tx,
             spec,
             info,
@@ -1188,8 +1270,7 @@ async fn write_nodes(
 /// Resolve one edge endpoint: from this batch, from storage, or — when the
 /// request allows it — as a freshly created phantom.
 async fn resolve_endpoint(
-    tenant: Uuid,
-    scope: &AccessScope,
+    w: Writer<'_>,
     tx: &impl DBRunner,
     key: &str,
     index: usize,
@@ -1202,7 +1283,7 @@ async fn resolve_endpoint(
     if node_ids.contains_key(key) {
         return Ok(false);
     }
-    if let Some(endpoint) = lookup_endpoint(scope, tx, key).await? {
+    if let Some(endpoint) = lookup_endpoint(w.scope, tx, key).await? {
         node_ids.insert(key.to_owned(), endpoint);
         return Ok(false);
     }
@@ -1225,7 +1306,7 @@ async fn resolve_endpoint(
                 format!("endpoint `{key}` does not exist and no phantom node type is registered"),
             )
         })?;
-    let id = insert_phantom(tenant, scope, tx, key, phantom_type).await?;
+    let id = insert_phantom(w, tx, key, phantom_type).await?;
     node_ids.insert(
         key.to_owned(),
         Endpoint {
@@ -1240,8 +1321,7 @@ async fn resolve_endpoint(
 /// Upsert every edge of the batch, materialising phantom endpoints as needed.
 /// Returns whether any stored state changed.
 async fn write_edges(
-    tenant: Uuid,
-    scope: &AccessScope,
+    w: Writer<'_>,
     tx: &impl DBRunner,
     request: &IngestRequest,
     types: &BTreeMap<String, TypeInfo>,
@@ -1263,8 +1343,7 @@ async fn write_edges(
 
         for key in [&spec.src_node_key, &spec.dst_node_key] {
             changed |= resolve_endpoint(
-                tenant,
-                scope,
+                w,
                 tx,
                 key,
                 index,
@@ -1283,7 +1362,7 @@ async fn write_edges(
         // Endpoint constraints, checked here because this is the only place
         // both endpoints are resolved and still inside the ingest transaction,
         // so an endpoint's type cannot change between the check and the commit.
-        let resolved = endpoint_types(scope, tx, &[src.type_id, dst.type_id]).await?;
+        let resolved = endpoint_types(w.scope, tx, &[src.type_id, dst.type_id]).await?;
         for (end, endpoint, patterns, pointer) in [
             (&spec.src_node_key, src, &info.src_types, "/src_node_key"),
             (&spec.dst_node_key, dst, &info.dst_types, "/dst_node_key"),
@@ -1309,7 +1388,7 @@ async fn write_edges(
             }
         }
 
-        match upsert_edge(tenant, scope, tx, spec, info, src.id, dst.id).await? {
+        match upsert_edge(w, tx, spec, info, src.id, dst.id).await? {
             EdgeWrite::Inserted => {
                 counts.edges_inserted += 1;
                 changed = true;

@@ -11,11 +11,11 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use graph_storage_sdk::models::{
-    AdjacencyEntry, AdjacencySide, DeleteOutcome, DeleteRequest, GraphRevision, GtsTypeId,
-    IngestCounts, IngestOutcome, IngestRequest, ItemError, ItemFamily, LabelAssignment, LabelId,
-    LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page, ProjectionRequest,
+    AdjacencyEntry, AdjacencySide, DeleteOutcome, DeleteRequest, ElementEnvelope, GraphRevision,
+    GtsTypeId, IngestCounts, IngestOutcome, IngestRequest, ItemError, ItemFamily, LabelAssignment,
+    LabelId, LabelRecord, LabelSpec, NodeId, NodeKey, NodeRow, NodeView, Page, ProjectionRequest,
     ReadSnapshot, RevisionOutcome, SearchMode, SearchRequest, SearchResponse, StoreCapabilities,
-    TopologyPage, TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
+    Subject, TopologyPage, TopologyRequest, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
 };
 use graph_storage_sdk::plugin_api::{
     EmbeddingPlan, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
@@ -42,6 +42,11 @@ struct FakeNode {
     embedding_input_hash: Option<String>,
     version: i64,
     deleted: bool,
+    /// The audit envelope's storage. The fake tracks it for real rather than
+    /// reporting a constant: an envelope only one implementation fills in is
+    /// an envelope the conformance suite cannot see -- the same lesson the
+    /// endpoint-constraint episode taught earlier in this prototype.
+    audit: FakeAudit,
 }
 
 #[derive(Clone)]
@@ -52,6 +57,59 @@ struct FakeEdge {
     dst: i64,
     payload: Option<serde_json::Value>,
     deleted: bool,
+    audit: FakeAudit,
+}
+
+/// What `fr-audit-envelope` asks a store to remember per element: the last
+/// writer of each of the three verbs, and when.
+#[derive(Clone)]
+struct FakeAudit {
+    created_at: OffsetDateTime,
+    created_by: Subject,
+    updated_at: OffsetDateTime,
+    updated_by: Subject,
+    deleted_at: Option<OffsetDateTime>,
+    deleted_by: Option<Subject>,
+}
+
+impl FakeAudit {
+    fn created(subject: &Subject) -> Self {
+        let now = OffsetDateTime::now_utc();
+        Self {
+            created_at: now,
+            created_by: subject.clone(),
+            updated_at: now,
+            updated_by: subject.clone(),
+            deleted_at: None,
+            deleted_by: None,
+        }
+    }
+
+    fn updated(&mut self, subject: &Subject) {
+        self.updated_at = OffsetDateTime::now_utc();
+        self.updated_by = subject.clone();
+        self.deleted_at = None;
+        self.deleted_by = None;
+    }
+
+    fn tombstoned(&mut self, subject: &Subject) {
+        self.deleted_at = Some(OffsetDateTime::now_utc());
+        self.deleted_by = Some(subject.clone());
+    }
+
+    fn envelope(&self, key: String, tenant_id: Uuid, revision: GraphRevision) -> ElementEnvelope {
+        ElementEnvelope {
+            tenant_id,
+            key,
+            created_at: self.created_at,
+            created_by: self.created_by.clone(),
+            updated_at: self.updated_at,
+            updated_by: self.updated_by.clone(),
+            deleted_at: self.deleted_at,
+            deleted_by: self.deleted_by.clone(),
+            graph_revision: revision,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -336,6 +394,7 @@ impl GraphStoreV1 for FakeGraphStore {
         let mut state = BatchState {
             next_id: &mut next_id,
             counts: &mut counts,
+            subject: &ctx.subject,
         };
         for (index, spec) in req.nodes.iter().enumerate() {
             let decided = embedding.nodes.get(index).ok_or_else(|| {
@@ -421,10 +480,12 @@ impl GraphStoreV1 for FakeGraphStore {
                 for edge in &mut tenant.edges {
                     if !edge.deleted && (edge.src == id || edge.dst == id) {
                         edge.deleted = true;
+                        edge.audit.tombstoned(&ctx.subject);
                         tombstoned += 1;
                     }
                 }
                 tenant.nodes[index].deleted = true;
+                tenant.nodes[index].audit.tombstoned(&ctx.subject);
                 (1u64, tombstoned)
             }
             DeleteRequest::Edge(key) => {
@@ -433,6 +494,7 @@ impl GraphStoreV1 for FakeGraphStore {
                     return Err(GraphStoreError::NotFound);
                 };
                 edge.deleted = true;
+                edge.audit.tombstoned(&ctx.subject);
                 (0u64, 1u64)
             }
         };
@@ -513,7 +575,7 @@ impl GraphStoreV1 for FakeGraphStore {
         }
         let tenants = self.tenants.lock().map_err(|_| poisoned())?;
         let tenant = tenants.get(&ctx.tenant).ok_or(GraphStoreError::NotFound)?;
-        let (nodes, edges, _) = visible(tenant, ctx);
+        let (nodes, edges, revision) = visible(tenant, ctx);
         let node = nodes
             .iter()
             .find(|n| &n.key == key && !n.deleted)
@@ -549,7 +611,16 @@ impl GraphStoreV1 for FakeGraphStore {
                 neighbor_type_id: neighbour.type_id.clone(),
             });
         }
-        Ok(view_of(node, adjacency, truncated))
+        Ok(view_of(
+            node,
+            ctx.tenant,
+            GraphRevision {
+                source_epoch: self.epoch,
+                revision,
+            },
+            adjacency,
+            truncated,
+        ))
     }
 
     async fn hydrate_nodes(
@@ -564,11 +635,15 @@ impl GraphStoreV1 for FakeGraphStore {
         let Some(tenant) = tenants.get(&ctx.tenant) else {
             return Ok(Vec::new());
         };
-        let (nodes, _, _) = visible(tenant, ctx);
+        let (nodes, _, revision) = visible(tenant, ctx);
+        let revision = GraphRevision {
+            source_epoch: self.epoch,
+            revision,
+        };
         Ok(ids
             .iter()
             .filter_map(|id| nodes.iter().find(|n| n.id == *id && !n.deleted))
-            .map(|n| view_of(n, Vec::new(), false))
+            .map(|n| view_of(n, ctx.tenant, revision, Vec::new(), false))
             .collect())
     }
 
@@ -671,7 +746,7 @@ impl GraphStoreV1 for FakeGraphStore {
         let Some(tenant) = tenants.get(&ctx.tenant) else {
             return Err(GraphStoreError::NotFound);
         };
-        let (nodes, _, _) = visible(tenant, ctx);
+        let (nodes, _, revision) = visible(tenant, ctx);
         // Filter and ordering are the platform's on the real store; the fake
         // answers the unfiltered page, which is all the obligations need.
         let limit = req.query.limit.unwrap_or(200);
@@ -685,12 +760,18 @@ impl GraphStoreV1 for FakeGraphStore {
             })
             .take(usize::try_from(limit).unwrap_or(usize::MAX))
             .map(|n| NodeRow {
+                envelope: n.audit.envelope(
+                    n.key.clone(),
+                    ctx.tenant,
+                    GraphRevision {
+                        source_epoch: self.epoch,
+                        revision,
+                    },
+                ),
                 node_key: n.key.clone(),
                 type_id: n.type_id.clone(),
                 name: n.name.clone(),
                 payload: n.payload.clone(),
-                created_at: OffsetDateTime::UNIX_EPOCH,
-                updated_at: OffsetDateTime::UNIX_EPOCH,
             })
             .collect();
         Ok(toolkit_odata::Page {
@@ -885,7 +966,13 @@ fn validation(index: usize, family: ItemFamily, type_id: &str, message: &str) ->
     }
 }
 
-fn view_of(node: &FakeNode, adjacency: Vec<AdjacencyEntry>, truncated: bool) -> NodeView {
+fn view_of(
+    node: &FakeNode,
+    tenant_id: Uuid,
+    revision: GraphRevision,
+    adjacency: Vec<AdjacencyEntry>,
+    truncated: bool,
+) -> NodeView {
     NodeView {
         node_key: node.key.clone(),
         type_id: node.type_id.clone(),
@@ -895,8 +982,7 @@ fn view_of(node: &FakeNode, adjacency: Vec<AdjacencyEntry>, truncated: bool) -> 
         labels: Vec::new(),
         adjacency,
         adjacency_truncated: truncated,
-        created_at: OffsetDateTime::UNIX_EPOCH,
-        updated_at: OffsetDateTime::UNIX_EPOCH,
+        envelope: node.audit.envelope(node.key.clone(), tenant_id, revision),
     }
 }
 
@@ -932,6 +1018,8 @@ fn fence(
 struct BatchState<'a> {
     next_id: &'a mut i64,
     counts: &'a mut IngestCounts,
+    /// The subject stamped on every element this batch writes.
+    subject: &'a Subject,
 }
 
 /// The vector columns of one fake row, spelled from the shared decision.
@@ -1013,6 +1101,7 @@ fn apply_node(
             embedding_input_hash: vector.input_hash,
             version: 1,
             deleted: false,
+            audit: FakeAudit::created(state.subject),
         });
         state.counts.nodes_inserted += 1;
         return Ok(true);
@@ -1083,6 +1172,7 @@ fn apply_node(
     existing.embedding_epoch = vector.epoch;
     existing.embedding_input_hash = vector.input_hash;
     existing.version += 1;
+    existing.audit.updated(state.subject);
     if same_type {
         state.counts.nodes_updated += 1;
     } else {
@@ -1186,6 +1276,9 @@ fn apply_endpoint(
         embedding_input_hash: None,
         version: 1,
         deleted: false,
+        // A phantom is brought into being by the edge that named it, so the
+        // subject writing that edge is the one recorded here.
+        audit: FakeAudit::created(state.subject),
     });
     state.counts.phantoms_created += 1;
     Ok(*state.next_id)
@@ -1286,6 +1379,7 @@ fn apply_edge(
         Some(existing) => {
             existing.payload.clone_from(&spec.payload);
             existing.deleted = false;
+            existing.audit.updated(state.subject);
             state.counts.edges_updated += 1;
             changed = true;
         }
@@ -1297,6 +1391,7 @@ fn apply_edge(
                 dst,
                 payload: spec.payload.clone(),
                 deleted: false,
+                audit: FakeAudit::created(state.subject),
             });
             state.counts.edges_inserted += 1;
             changed = true;
