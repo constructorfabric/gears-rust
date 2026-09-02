@@ -55054,7 +55054,8 @@
             "created_at asc",
             "created_at desc"
           ]
-        }
+        },
+        "x-toolkit-visibility": "exposed"
       },
       "post": {
         "description": "Create a new city with the provided information",
@@ -55170,7 +55171,8 @@
         "summary": "Create a new city",
         "tags": [
           "Users Info Cities"
-        ]
+        ],
+        "x-toolkit-visibility": "exposed"
       }
     },
     "/users-info/v1/cities/{id}": {
@@ -55248,7 +55250,8 @@
         "summary": "Delete city",
         "tags": [
           "Users Info Cities"
-        ]
+        ],
+        "x-toolkit-visibility": "exposed"
       },
       "get": {
         "description": "Retrieve a specific city by UUID",
@@ -55333,7 +55336,8 @@
         "summary": "Get city by ID",
         "tags": [
           "Users Info Cities"
-        ]
+        ],
+        "x-toolkit-visibility": "exposed"
       },
       "patch": {
         "description": "Partially update a city with the provided fields",
@@ -55470,7 +55474,8 @@
         "summary": "Update city",
         "tags": [
           "Users Info Cities"
-        ]
+        ],
+        "x-toolkit-visibility": "exposed"
       }
     },
     "/users-info/v1/users": {
@@ -55600,7 +55605,8 @@
             "created_at asc",
             "created_at desc"
           ]
-        }
+        },
+        "x-toolkit-visibility": "exposed"
       },
       "post": {
         "description": "Create a new user with the provided information",
@@ -55716,7 +55722,8 @@
         "summary": "Create a new user",
         "tags": [
           "Users Info"
-        ]
+        ],
+        "x-toolkit-visibility": "exposed"
       }
     },
     "/users-info/v1/users/events": {
@@ -55743,7 +55750,8 @@
         "summary": "User events stream (SSE)",
         "tags": [
           "Users Info Events"
-        ]
+        ],
+        "x-toolkit-visibility": "exposed"
       }
     },
     "/users-info/v1/users/{id}": {
@@ -55821,7 +55829,8 @@
         "summary": "Delete user",
         "tags": [
           "Users Info"
-        ]
+        ],
+        "x-toolkit-visibility": "exposed"
       },
       "get": {
         "description": "Retrieve a specific user by their UUID",
@@ -55906,7 +55915,8 @@
         "summary": "Get user by ID",
         "tags": [
           "Users Info"
-        ]
+        ],
+        "x-toolkit-visibility": "exposed"
       },
       "patch": {
         "description": "Partially update a user with the provided fields",
@@ -56043,7 +56053,8 @@
         "summary": "Update user",
         "tags": [
           "Users Info"
-        ]
+        ],
+        "x-toolkit-visibility": "exposed"
       }
     },
     "/users-info/v1/users/{id}/address": {
@@ -56121,7 +56132,8 @@
         "summary": "Delete user address",
         "tags": [
           "Users Info Addresses"
-        ]
+        ],
+        "x-toolkit-visibility": "exposed"
       },
       "get": {
         "description": "Retrieve the address for a specific user",
@@ -56197,7 +56209,8 @@
         "summary": "Get user address",
         "tags": [
           "Users Info Addresses"
-        ]
+        ],
+        "x-toolkit-visibility": "exposed"
       },
       "put": {
         "description": "Create or replace the address for a specific user",
@@ -56324,7 +56337,8 @@
         "summary": "Upsert user address",
         "tags": [
           "Users Info Addresses"
-        ]
+        ],
+        "x-toolkit-visibility": "exposed"
       }
     }
   },
