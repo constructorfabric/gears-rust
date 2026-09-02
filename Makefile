@@ -701,14 +701,18 @@ test-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-toolkit-db --features pg,integration
 
-## Run SQL/PGQ tests: the unit suites gated behind the `pgq` feature plus the
-## PostgreSQL 19 integration suite (Docker required; the suite spins up its own
-## postgres container via testcontainers, and skips itself while the pre-GA
-## PG19 image is unavailable — set GEARS_TEST_PG_GRAPH_REQUIRED=1 to turn that
-## skip into a failure once the lane is expected to be green).
+## Run the SQL/PGQ lane: toolkit-db's unit suites under the `pgq` feature (the
+## secure graph builder and its tests compile only there), the PostgreSQL 19
+## integration suite (tests/pg, Docker required; a testcontainers PG19) and the
+## trybuild guards. `pgq` implies `pg`, so without the filter this would re-run
+## every PG18 Docker suite `make test-pg` just ran; the filter keeps only what
+## this lane adds. The PG19 suite skips itself while the pre-GA image is
+## unavailable; CI sets GEARS_TEST_PG_GRAPH_REQUIRED=1 so there the skip is a
+## failure — do the same locally once the image is expected to be present.
 test-pgq: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-toolkit-db --features pgq,integration
+	cargo nextest run -p cf-gears-toolkit-db --features pgq,integration \
+		-E 'kind(lib) | binary(mod) | binary(ui)'
 
 ## Run MySQL integration tests
 test-mysql: install-tools
